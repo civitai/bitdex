@@ -377,10 +377,6 @@ impl ConcurrentEngine {
                 // Compact filter diffs every N flush cycles (~5s at 100μs interval).
                 // Keeps diff layers small so apply_diff/fused stay fast.
                 const COMPACTION_INTERVAL: u64 = 50;
-                // Track cycle timing for seconds→cycles conversion
-                let mut eviction_cycle_start = Instant::now();
-                let mut eviction_cycles_elapsed: u64 = 0;
-                let mut observed_cycles_per_second: f64 = 10_000.0; // initial estimate
 
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(current_sleep);
@@ -537,7 +533,6 @@ impl ConcurrentEngine {
                             }
                             flush_cycle += 1;
                             flush_cycle_clone.store(flush_cycle, Ordering::Relaxed);
-                            eviction_cycles_elapsed += 1;
 
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
                             inner.store(Arc::new(staging.clone()));
@@ -564,27 +559,23 @@ impl ConcurrentEngine {
                     }
                     was_loading = is_loading;
 
-                    // --- Idle eviction sweep ---
+                    // --- Idle eviction sweep (wall-clock based) ---
+                    // Runs every eviction_sweep_interval flush cycles. Stamps are
+                    // wall-clock millis set by query threads on read, so values stay
+                    // alive as long as they're being queried — independent of write
+                    // activity.
                     if !is_loading && !eviction_configs.is_empty()
                         && flush_cycle > 0 && flush_cycle % eviction_sweep_interval == 0
                     {
-                        // Update observed cycle rate for seconds→cycles conversion
-                        let now = Instant::now();
-                        let elapsed_secs = eviction_cycle_start.elapsed().as_secs_f64();
-                        if elapsed_secs > 0.1 {
-                            observed_cycles_per_second =
-                                eviction_cycles_elapsed as f64 / elapsed_secs;
-                            eviction_cycle_start = now;
-                            eviction_cycles_elapsed = 0;
-                        }
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
 
                         let mut any_evicted = false;
                         for (field_name, idle_seconds) in &eviction_configs {
-                            let idle_cycles = (*idle_seconds * observed_cycles_per_second) as u64;
-                            if idle_cycles == 0 {
-                                continue;
-                            }
-                            let cutoff = flush_cycle.saturating_sub(idle_cycles);
+                            let idle_ms = (*idle_seconds * 1000.0) as u64;
+                            let cutoff_ms = now_ms.saturating_sub(idle_ms);
 
                             // Collect values to evict
                             let field = match staging.filters.get_field(field_name) {
@@ -601,11 +592,11 @@ impl ConcurrentEngine {
                                             return false;
                                         }
                                     }
-                                    // Check stamp
+                                    // Check stamp (wall-clock millis)
                                     let key = (field_name_arc.clone(), *value);
                                     flush_eviction_stamps
                                         .get(&key)
-                                        .map(|entry| entry.value().load(Ordering::Relaxed) < cutoff)
+                                        .map(|entry| entry.value().load(Ordering::Relaxed) < cutoff_ms)
                                         .unwrap_or(true) // no stamp = never touched = evict
                                 })
                                 .copied()
@@ -628,8 +619,8 @@ impl ConcurrentEngine {
                                     .fetch_add(count as u64, Ordering::Relaxed);
 
                                 eprintln!(
-                                    "Evicted {} idle values from filter '{}' (cycle={}, idle_cycles={}, rate={:.0} cyc/s)",
-                                    count, field_name, flush_cycle, idle_cycles, observed_cycles_per_second
+                                    "Evicted {} idle values from filter '{}' (idle_ms={}, now={})",
+                                    count, field_name, idle_ms, now_ms
                                 );
                                 any_evicted = true;
                             }
@@ -1219,10 +1210,14 @@ impl ConcurrentEngine {
             }
         }
 
-        // Stamp accessed values for idle eviction tracking.
-        // This runs for ALL queried values (already-loaded and new).
+        // Stamp accessed values for idle eviction tracking (wall-clock millis).
+        // This runs for ALL queried values (already-loaded and new), ensuring
+        // that reads keep values alive independent of write activity.
         if !needed_values.is_empty() {
-            let cycle = self.flush_cycle.load(Ordering::Relaxed);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
             for (field_name, values) in &needed_values {
                 // Only stamp eviction-enabled fields
                 if self.config.filter_fields.iter()
@@ -1232,8 +1227,8 @@ impl ConcurrentEngine {
                     for &value in values {
                         self.eviction_stamps
                             .entry((field_arc.clone(), value))
-                            .or_insert_with(|| AtomicU64::new(cycle))
-                            .store(cycle, Ordering::Relaxed);
+                            .or_insert_with(|| AtomicU64::new(now_ms))
+                            .store(now_ms, Ordering::Relaxed);
                     }
                 }
             }
@@ -2203,7 +2198,17 @@ impl ConcurrentEngine {
         let skip_sorts = self.pending_sort_loads.lock().clone();
         let skip_filters = self.pending_filter_loads.lock().clone();
         let skip_lazy = self.lazy_value_fields.lock().clone();
-        Self::write_snapshot_to_store(store, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)
+        Self::write_snapshot_to_store(store, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)?;
+
+        // Persist named cursors alongside bitmaps so they survive process restart.
+        // The merge thread also writes cursors periodically, but save_snapshot() is
+        // used by the bulk loader which exits immediately after saving.
+        let cursor_snapshot = self.cursors.lock().clone();
+        for (name, value) in &cursor_snapshot {
+            store.write_cursor(name, value)?;
+        }
+
+        Ok(())
     }
 
     /// Save a full snapshot of the current published state to a BitmapFs at a custom path.
