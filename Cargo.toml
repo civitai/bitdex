@@ -81,6 +81,10 @@ tempfile = "3"
 name = "engine_bench"
 harness = false
 
+[[bench]]
+name = "radix_sort_bench"
+harness = false
+
 [[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
