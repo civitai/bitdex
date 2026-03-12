@@ -98,17 +98,21 @@ async fn main() {
             eprintln!("Starting bulk load...");
 
             // Build engine with storage paths matching the server's layout:
-            //   {data_dir}/indexes/{name}/bitmaps/
-            //   {data_dir}/indexes/{name}/docs/
-            let index_storage_dir = sync_config.data_dir.join("indexes").join(&index_def.name);
+            //   {data_dir}/{index_subdir}/{name}/{bitmap_subdir}/
+            //   {data_dir}/{index_subdir}/{name}/{docs_subdir}/
+            let index_storage_dir = sync_config
+                .data_dir
+                .join(&sync_config.index_subdir)
+                .join(&index_def.name);
             std::fs::create_dir_all(&index_storage_dir).ok();
 
             let mut engine_config = index_def.config.clone();
-            engine_config.storage.bitmap_path = Some(index_storage_dir.join("bitmaps"));
+            engine_config.storage.bitmap_path =
+                Some(index_storage_dir.join(&sync_config.bitmap_subdir));
 
             let engine = ConcurrentEngine::new_with_path(
                 engine_config,
-                &index_storage_dir.join("docs"),
+                &index_storage_dir.join(&sync_config.docs_subdir),
             )
             .unwrap_or_else(|e| {
                 eprintln!("Failed to create engine: {e}");

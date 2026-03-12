@@ -20,6 +20,16 @@ pub struct PgSyncConfig {
     pub index_dir: PathBuf,
     /// Data directory for engine storage (bitmaps + docstore).
     pub data_dir: PathBuf,
+    /// Subdirectory under data_dir for indexes (default: "indexes").
+    /// Must match the server's layout so it can find persisted data.
+    #[serde(default = "default_index_subdir")]
+    pub index_subdir: String,
+    /// Subdirectory within each index dir for bitmap storage (default: "bitmaps").
+    #[serde(default = "default_bitmap_subdir")]
+    pub bitmap_subdir: String,
+    /// Subdirectory within each index dir for document storage (default: "docs").
+    #[serde(default = "default_docs_subdir")]
+    pub docs_subdir: String,
     /// Number of PG connections in the pool.
     #[serde(default = "default_pg_pool_size")]
     pub pg_pool_size: u32,
@@ -37,6 +47,15 @@ pub struct PgSyncConfig {
     pub metrics_poll_interval_secs: u64,
 }
 
+fn default_index_subdir() -> String {
+    "indexes".to_string()
+}
+fn default_bitmap_subdir() -> String {
+    "bitmaps".to_string()
+}
+fn default_docs_subdir() -> String {
+    "docs".to_string()
+}
 fn default_pg_pool_size() -> u32 {
     10
 }
