@@ -262,17 +262,23 @@ impl WriteBatch {
         filters: &mut FilterIndex,
         sorts: &mut SortIndex,
     ) {
+        // Apply filter removes BEFORE inserts.
+        // On upsert, diff_document emits remove-old + insert-new for changed
+        // multi_value fields.  When a value is kept across the upsert (e.g.
+        // tagIds [10,20] → [10,30], value 10 appears in both remove and insert),
+        // applying inserts first makes the insert a no-op and the subsequent
+        // remove deletes the slot — losing the value.  Removes-first is safe:
+        // the remove clears the bit, then the insert re-sets it.
+        for (key, slot_ids) in &self.filter_removes {
+            if let Some(field) = filters.get_field_mut(&key.field) {
+                field.remove_bulk(key.value, slot_ids);
+            }
+        }
+
         // Apply filter inserts in bulk
         for (key, slot_ids) in &self.filter_inserts {
             if let Some(field) = filters.get_field_mut(&key.field) {
                 field.insert_bulk(key.value, slot_ids.iter().copied());
-            }
-        }
-
-        // Apply filter removes in bulk
-        for (key, slot_ids) in &self.filter_removes {
-            if let Some(field) = filters.get_field_mut(&key.field) {
-                field.remove_bulk(key.value, slot_ids);
             }
         }
 
