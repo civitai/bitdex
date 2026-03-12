@@ -346,3 +346,79 @@ node tools/e2e-unified-cache.mjs --results-dir docs/test-results
 ```
 
 The automated runner (`tools/run-e2e.mjs`) writes a combined results file to `docs/test-results/e2e-{timestamp}.json`.
+
+---
+
+## E2E Coverage Gap Analysis
+
+Prioritized list of missing E2E test scenarios identified via codebase analysis (2026-03-12). Build new test suites from the top down.
+
+### HIGH PRIORITY — Query & Filter Paths
+
+| # | Scenario | Why it matters |
+|---|----------|---------------|
+| 1 | **NotEq filter** | Uses `alive - eq_bitmap`; stale alive or wrong eq = wrong results |
+| 2 | **NotIn filter** | `alive - In(values)` union; overlapping values could break |
+| 3 | **Not(And(...)) nested negation** | Recursive evaluation of complex clause trees |
+| 4 | **Or with empty branches** | Branch returning empty bitmap must not corrupt union |
+| 5 | **Range filters (Gt/Gte/Lt/Lte)** | `range_scan()` iterates field bitmaps; VersionedBitmap fusing untested |
+| 6 | **Offset pagination** | `fetch_limit = limit + offset`, then `split_off(offset)`. Off-by-one risk at boundaries |
+| 7 | **Offset + sort direction** | Offset applied after sort; wrong iteration order = silent data corruption |
+
+### HIGH PRIORITY — Persistence & Startup
+
+| # | Scenario | Why it matters |
+|---|----------|---------------|
+| 8 | **Full restart cycle** | Load → save → stop → restart → query: core production scenario |
+| 9 | **Cursor persistence across restart** | pg-sync loses CDC position if cursors don't survive |
+| 10 | **include_docs after restore** | Docstore/bitmap mismatch = wrong documents returned |
+| 11 | **Index delete → recreate** | Leftover state, file handle leaks, old data bleeding through |
+| 12 | **Loading mode transitions** | enter/exit loading mode + cache invalidation correctness |
+
+### HIGH PRIORITY — Edge Cases & Error Handling
+
+| # | Scenario | Why it matters |
+|---|----------|---------------|
+| 13 | **Invalid JSON / malformed requests** | Should return 400, not panic or 500 |
+| 14 | **Unknown index name** | All endpoints should return 404 cleanly |
+| 15 | **Duplicate index creation** | Should return 409, not corrupt existing index |
+| 16 | **Empty index queries** | 0 docs: div-by-zero, nil pointer, or incorrect total_matched |
+| 17 | **Single document** | Off-by-one in pagination, sort with 1 item |
+| 18 | **Max page size enforcement** | limit > max_page_size should be capped |
+| 19 | **Slot recycling (delete → reinsert same ID)** | "Clean deletes" principle: stale bits must not leak |
+| 20 | **Type mismatch in filter values** | String value on integer field should error, not silently return 0 |
+
+### MEDIUM PRIORITY
+
+| # | Scenario | Why it matters |
+|---|----------|---------------|
+| 21 | Cursor pagination during concurrent filter mutation | Cursor slot_id may leave filter bitmap between pages |
+| 22 | Sort without filter (all docs) | alive bitmap correctness as universe |
+| 23 | Metrics accuracy under mutations | Prometheus counters must stay in sync |
+| 24 | Empty value Eq (non-existent key) | Returns empty bitmap; VersionedBitmap fusing correctness |
+| 25 | In() with duplicate values | Union should be idempotent |
+| 26 | Boolean filter field | Bool→0/1 mapping correctness |
+| 27 | Lazy field first-query latency | First touch loads from disk; second should be fast |
+| 28 | Concurrent snapshot + writes | save_snapshot during active mutations |
+| 29 | Load status transitions | loading → complete progression |
+| 30 | Concurrent load requests | Second load while first running should reject |
+
+### LOW PRIORITY
+
+| # | Scenario | Why it matters |
+|---|----------|---------------|
+| 31 | Range filter on unknown field | Should error cleanly |
+| 32 | Deeply nested clause trees | Stack overflow protection |
+| 33 | include_docs with offset | Docs must match offset-adjusted IDs |
+| 34 | Sort-only cache invalidation skip | Sort field change without filter change |
+| 35 | Index creation with invalid config | Negative max_page_size, zero-bit sort fields |
+| 36 | Delete of non-existent slot | Idempotent or 404, not panic |
+
+### Suggested New E2E Test Suites
+
+Based on the gaps above, the following new test files would close the most critical gaps:
+
+1. **`tools/e2e-query-operators.mjs`** — Gaps 1-7: All filter operators (NotEq, NotIn, Not, Or, Range), offset pagination, sort direction + offset interaction
+2. **`tools/e2e-persistence.mjs`** — Gaps 8-12: Full restart cycle, cursor persistence, include_docs after restore, index lifecycle, loading mode
+3. **`tools/e2e-error-handling.mjs`** — Gaps 13-20: Invalid input, unknown index, empty index, single doc, max page size, slot recycling, type mismatches
+4. **`tools/e2e-metrics.mjs`** — Gaps 23, 27: Prometheus counter accuracy, lazy loading metrics
