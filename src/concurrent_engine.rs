@@ -102,6 +102,9 @@ pub struct ConcurrentEngine {
     flush_duration_nanos: Arc<AtomicU64>,
     /// Flush loop stats: most recent flush duration in nanoseconds.
     flush_last_duration_nanos: Arc<AtomicU64>,
+    /// Named cursors: opaque key-value pairs persisted at checkpoint time.
+    /// Callers (e.g. pg-sync sidecars) use these to track replication progress.
+    cursors: Arc<parking_lot::Mutex<HashMap<String, String>>>,
 }
 
 impl ConcurrentEngine {
@@ -254,6 +257,14 @@ impl ConcurrentEngine {
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
         let dirty_flag = Arc::new(AtomicBool::new(false));
+
+        // Load named cursors from disk (if any exist).
+        let initial_cursors = if let Some(ref store) = bitmap_store {
+            store.load_all_cursors().unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        let cursors = Arc::new(parking_lot::Mutex::new(initial_cursors));
 
         // Lazy load channel: query threads send loaded field data here for staging sync.
         let (lazy_tx, lazy_rx): (Sender<LazyLoad>, Receiver<LazyLoad>) =
@@ -630,6 +641,7 @@ impl ConcurrentEngine {
             let merge_pending_filters = Arc::clone(&pending_filter_loads);
             let merge_lazy_values = Arc::clone(&lazy_value_fields);
             let merge_time_buckets = time_buckets.as_ref().map(Arc::clone);
+            let merge_cursors = Arc::clone(&cursors);
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
@@ -727,6 +739,16 @@ impl ConcurrentEngine {
                                 }
                             }
                         }
+
+                        // Persist named cursors alongside bitmap data
+                        {
+                            let cursor_snapshot = merge_cursors.lock().clone();
+                            for (name, value) in &cursor_snapshot {
+                                if let Err(e) = store.write_cursor(name, value) {
+                                    eprintln!("merge thread: cursor write failed for {name}: {e}");
+                                }
+                            }
+                        }
                     }
                     } // needs_write
                 }
@@ -758,6 +780,7 @@ impl ConcurrentEngine {
             flush_publish_count,
             flush_duration_nanos,
             flush_last_duration_nanos,
+            cursors,
         })
     }
 
@@ -1598,6 +1621,26 @@ impl ConcurrentEngine {
     /// Get the high-water mark slot counter (lock-free snapshot).
     pub fn slot_counter(&self) -> u32 {
         self.snapshot().slots.slot_counter()
+    }
+
+    // ---- Named cursors ----
+
+    /// Set a named cursor value. The value is persisted to disk at the next
+    /// merge thread checkpoint, atomically alongside bitmap snapshots.
+    pub fn set_cursor(&self, name: String, value: String) {
+        self.cursors.lock().insert(name, value);
+        // Mark dirty so the merge thread will write at next cycle.
+        self.dirty_since_snapshot.store(true, Ordering::Release);
+    }
+
+    /// Get a named cursor value (in-memory, not from disk).
+    pub fn get_cursor(&self, name: &str) -> Option<String> {
+        self.cursors.lock().get(name).cloned()
+    }
+
+    /// Get all named cursors.
+    pub fn get_all_cursors(&self) -> HashMap<String, String> {
+        self.cursors.lock().clone()
     }
 
     /// Retrieve a stored document by slot ID from the docstore.
@@ -4031,4 +4074,62 @@ mod tests {
         }
     }
 
+    // ---- Named cursor tests ----
+
+    #[test]
+    fn test_cursor_set_and_get() {
+        let engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // No cursor initially
+        assert!(engine.get_cursor("pg-sync-0").is_none());
+        assert!(engine.get_all_cursors().is_empty());
+
+        // Set a cursor
+        engine.set_cursor("pg-sync-0".to_string(), "12345".to_string());
+        assert_eq!(engine.get_cursor("pg-sync-0").unwrap(), "12345");
+
+        // Set another
+        engine.set_cursor("pg-sync-1".to_string(), "12300".to_string());
+        let all = engine.get_all_cursors();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["pg-sync-0"], "12345");
+        assert_eq!(all["pg-sync-1"], "12300");
+
+        // Overwrite
+        engine.set_cursor("pg-sync-0".to_string(), "12400".to_string());
+        assert_eq!(engine.get_cursor("pg-sync-0").unwrap(), "12400");
+    }
+
+    #[test]
+    fn test_cursor_persists_via_merge_thread() {
+        // Create engine with on-disk bitmap store so merge thread can persist
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let doc_path = dir.path().join("docs");
+        std::fs::create_dir_all(&bitmap_path).unwrap();
+        std::fs::create_dir_all(&doc_path).unwrap();
+
+        let mut config = test_config();
+        config.storage.bitmap_path = Some(bitmap_path.clone());
+        config.merge_interval_ms = 100; // fast merge for test
+
+        let engine = ConcurrentEngine::new_with_path(config.clone(), &doc_path).unwrap();
+
+        // Set a cursor
+        engine.set_cursor("pg-sync-0".to_string(), "99999".to_string());
+
+        // Wait for merge thread to checkpoint (merge interval + margin)
+        thread::sleep(Duration::from_millis(300));
+
+        // Verify cursor was written to disk
+        let store = BitmapFs::new(&bitmap_path).unwrap();
+        let on_disk = store.load_cursor("pg-sync-0").unwrap();
+        assert_eq!(on_disk.unwrap(), "99999");
+
+        drop(engine);
+
+        // Create a new engine from the same path — cursor should be loaded
+        let engine2 = ConcurrentEngine::new_with_path(config, &doc_path).unwrap();
+        assert_eq!(engine2.get_cursor("pg-sync-0").unwrap(), "99999");
+    }
 }

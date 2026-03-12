@@ -85,6 +85,28 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER bitdex_model_trg AFTER UPDATE ON "Model"
   FOR EACH ROW EXECUTE FUNCTION bitdex_model_notify();
 ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_trg;
+
+-- Cursor tracking table for multi-replica outbox consumption
+CREATE TABLE IF NOT EXISTS bitdex_cursors (
+    replica_id TEXT PRIMARY KEY,
+    last_outbox_id BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Auto-cleanup trigger: when any replica reports its cursor, delete outbox rows
+-- that ALL replicas have already consumed.
+CREATE OR REPLACE FUNCTION cleanup_bitdex_outbox() RETURNS trigger AS $$
+BEGIN
+    DELETE FROM "BitdexOutbox"
+    WHERE id < (SELECT MIN(last_outbox_id) FROM bitdex_cursors);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_cleanup_bitdex_outbox ON bitdex_cursors;
+CREATE TRIGGER trg_cleanup_bitdex_outbox
+    AFTER INSERT OR UPDATE ON bitdex_cursors
+    FOR EACH ROW EXECUTE FUNCTION cleanup_bitdex_outbox();
 "#;
 
 // ---------------------------------------------------------------------------
@@ -317,4 +339,51 @@ pub async fn delete_outbox(pool: &PgPool, max_id: i64) -> Result<u64, sqlx::Erro
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+/// Poll outbox rows after a cursor position (FIFO — oldest first).
+pub async fn poll_outbox_from_cursor(
+    pool: &PgPool,
+    cursor: i64,
+    limit: i64,
+) -> Result<Vec<OutboxRow>, sqlx::Error> {
+    sqlx::query_as::<_, OutboxRow>(
+        r#"SELECT id, entity_id, event FROM "BitdexOutbox"
+        WHERE id > $1
+        ORDER BY id ASC
+        LIMIT $2"#,
+    )
+    .bind(cursor)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Report a replica's cursor to PG for outbox cleanup tracking.
+pub async fn upsert_cursor(
+    pool: &PgPool,
+    replica_id: &str,
+    last_outbox_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO bitdex_cursors (replica_id, last_outbox_id, updated_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (replica_id)
+        DO UPDATE SET last_outbox_id = $2, updated_at = now()"#,
+    )
+    .bind(replica_id)
+    .bind(last_outbox_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Get the current max outbox ID (for cursor seeding during bulk load).
+pub async fn get_max_outbox_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (Option<i64>,) = sqlx::query_as(
+        r#"SELECT MAX(id) FROM "BitdexOutbox""#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0.unwrap_or(0))
 }

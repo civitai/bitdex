@@ -45,6 +45,10 @@ pub struct PgSyncConfig {
     /// ClickHouse metrics poll interval in seconds.
     #[serde(default = "default_metrics_poll_interval_secs")]
     pub metrics_poll_interval_secs: u64,
+    /// Replica identifier for cursor tracking.
+    /// Defaults to "default". Override via BITDEX_REPLICA_ID env var (e.g. from StatefulSet pod name).
+    #[serde(default = "default_replica_id")]
+    pub replica_id: String,
 }
 
 fn default_index_subdir() -> String {
@@ -70,6 +74,9 @@ fn default_outbox_batch_limit() -> i64 {
 }
 fn default_metrics_poll_interval_secs() -> u64 {
     60
+}
+fn default_replica_id() -> String {
+    "default".to_string()
 }
 
 impl PgSyncConfig {
@@ -100,6 +107,9 @@ impl PgSyncConfig {
         }
         if let Ok(pass) = std::env::var("CLICKHOUSE_PASSWORD") {
             config.clickhouse_password = Some(pass);
+        }
+        if let Ok(replica) = std::env::var("BITDEX_REPLICA_ID") {
+            config.replica_id = replica;
         }
 
         Ok(config)

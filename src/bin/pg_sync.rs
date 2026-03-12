@@ -95,6 +95,14 @@ async fn main() {
         }
 
         Commands::Load => {
+            // Ensure outbox table, triggers, and cursor table exist
+            queries::run_setup(&pool)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Setup failed: {e}");
+                    std::process::exit(1);
+                });
+
             eprintln!("Starting bulk load...");
 
             // Build engine with storage paths matching the server's layout:
@@ -129,6 +137,28 @@ async fn main() {
                 }
             }
 
+            // Snapshot the current outbox head BEFORE bulk load.
+            // This becomes the cursor's starting point — anything that changes
+            // during bulk load will be in the outbox after this ID and will be
+            // picked up when the sidecar starts polling.
+            let cursor_name = format!("pg-sync-{}", sync_config.replica_id);
+            let outbox_head = queries::get_max_outbox_id(&pool)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to get max outbox ID: {e}");
+                    std::process::exit(1);
+                });
+            engine.set_cursor(cursor_name.clone(), outbox_head.to_string());
+            eprintln!("Seeded cursor '{cursor_name}' at outbox head {outbox_head}");
+
+            // Also register in PG so outbox cleanup knows about this replica
+            queries::upsert_cursor(&pool, &cursor_name, outbox_head)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to register cursor in PG: {e}");
+                    std::process::exit(1);
+                });
+
             engine.enter_loading_mode();
 
             let progress = Arc::new(AtomicU64::new(0));
@@ -162,11 +192,13 @@ async fn main() {
             eprintln!("Starting sync (bitdex={bitdex_url})...");
 
             // Run outbox poller and metrics poller concurrently
+            let cursor_name = format!("pg-sync-{}", sync_config.replica_id);
             let outbox_fut = outbox_poller::run_outbox_poller(
                 &pool,
                 &bitdex_client,
                 sync_config.poll_interval_secs,
                 sync_config.outbox_batch_limit,
+                &cursor_name,
             );
 
             if let Some(ref ch_url) = sync_config.clickhouse_url {

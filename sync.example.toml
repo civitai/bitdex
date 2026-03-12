@@ -34,3 +34,7 @@ outbox_batch_limit = 5000
 
 # ClickHouse metrics poll interval in seconds (default: 60)
 metrics_poll_interval_secs = 60
+
+# Replica identifier for cursor tracking (default: "default")
+# In K8s, override via BITDEX_REPLICA_ID env var (e.g. from StatefulSet pod name)
+# replica_id = "bitdex-0"

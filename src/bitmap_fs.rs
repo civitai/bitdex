@@ -561,6 +561,56 @@ impl BitmapFs {
         }
         Ok(count)
     }
+
+    // ---- Named cursors (opaque string key-value pairs) ----
+    //
+    // Layout: cursors/{name}
+    // Each file contains the cursor value as UTF-8 text.
+
+    /// Write a named cursor value atomically.
+    pub fn write_cursor(&self, name: &str, value: &str) -> Result<()> {
+        let dir = self.root.join("cursors");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| BitdexError::DocStore(format!("create cursors dir: {e}")))?;
+        Self::write_bytes_atomic(&dir.join(name), value.as_bytes())
+    }
+
+    /// Load a single named cursor. Returns None if it doesn't exist.
+    pub fn load_cursor(&self, name: &str) -> Result<Option<String>> {
+        let path = self.root.join("cursors").join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(BitdexError::DocStore(format!("read cursor {name}: {e}"))),
+        }
+    }
+
+    /// Load all named cursors from disk.
+    pub fn load_all_cursors(&self) -> Result<HashMap<String, String>> {
+        let dir = self.root.join("cursors");
+        let mut result = HashMap::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+            Err(e) => return Err(BitdexError::DocStore(format!("read cursors dir: {e}"))),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    // Skip tmp files from atomic writes
+                    if name.ends_with(".tmp") {
+                        continue;
+                    }
+                    let value = std::fs::read_to_string(&path)
+                        .map_err(|e| BitdexError::DocStore(format!("read cursor {name}: {e}")))?;
+                    result.insert(name.to_string(), value);
+                }
+            }
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -760,5 +810,48 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[&1], bm1);
         assert_eq!(loaded[&512], bm3);
+    }
+
+    #[test]
+    fn test_cursor_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitmapFs::new(dir.path()).unwrap();
+
+        // No cursors initially
+        assert!(store.load_all_cursors().unwrap().is_empty());
+        assert!(store.load_cursor("pg-sync-0").unwrap().is_none());
+
+        // Write a cursor
+        store.write_cursor("pg-sync-0", "48291537").unwrap();
+        assert_eq!(store.load_cursor("pg-sync-0").unwrap().unwrap(), "48291537");
+
+        // Write another cursor
+        store.write_cursor("pg-sync-1", "48291200").unwrap();
+
+        // Load all
+        let all = store.load_all_cursors().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["pg-sync-0"], "48291537");
+        assert_eq!(all["pg-sync-1"], "48291200");
+
+        // Overwrite
+        store.write_cursor("pg-sync-0", "48291600").unwrap();
+        assert_eq!(store.load_cursor("pg-sync-0").unwrap().unwrap(), "48291600");
+    }
+
+    #[test]
+    fn test_cursor_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitmapFs::new(dir.path()).unwrap();
+
+        store.write_cursor("my-cursor", "12345").unwrap();
+
+        // Reopen from same dir
+        let store2 = BitmapFs::new(dir.path()).unwrap();
+        assert_eq!(store2.load_cursor("my-cursor").unwrap().unwrap(), "12345");
+
+        let all = store2.load_all_cursors().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all["my-cursor"], "12345");
     }
 }

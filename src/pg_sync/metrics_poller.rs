@@ -108,7 +108,7 @@ async fn poll_metrics_and_push(
     let count = docs.len();
 
     if !docs.is_empty() {
-        bitdex_client.upsert_batch(&docs).await?;
+        bitdex_client.upsert_batch(&docs, None).await?;
     }
 
     Ok(count)
