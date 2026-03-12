@@ -260,6 +260,20 @@ pub struct UnifiedCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub memory_bytes: usize,
+    pub meta_index_entries: usize,
+    pub meta_index_bytes: usize,
+}
+
+/// Per-entry diagnostic detail.
+pub struct UnifiedEntryDetail {
+    pub sort_field: String,
+    pub direction: String,
+    pub filter_count: usize,
+    pub cardinality: u64,
+    pub capacity: usize,
+    pub max_capacity: usize,
+    pub has_more: bool,
+    pub min_tracked_value: u32,
 }
 
 /// The unified cache: flat HashMap keyed by (filters, sort, direction).
@@ -286,6 +300,12 @@ impl UnifiedCache {
     /// Increments hit/miss counters.
     pub fn lookup(&mut self, key: &UnifiedKey) -> Option<&mut UnifiedEntry> {
         if let Some(entry) = self.entries.get_mut(key) {
+            if entry.needs_rebuild {
+                // Entry is stale (alive/filter change) — treat as miss.
+                // The caller will do a full traversal and re-form the entry.
+                self.misses += 1;
+                return None;
+            }
             self.hits += 1;
             entry.touch();
             Some(entry)
@@ -405,7 +425,25 @@ impl UnifiedCache {
             hits: self.hits,
             misses: self.misses,
             memory_bytes: self.total_memory_bytes(),
+            meta_index_entries: self.meta.entry_count(),
+            meta_index_bytes: self.meta.memory_bytes(),
         }
+    }
+
+    /// Return per-entry detail for diagnostics/testing.
+    pub fn entry_details(&self) -> Vec<UnifiedEntryDetail> {
+        self.entries.iter().map(|(key, entry)| {
+            UnifiedEntryDetail {
+                sort_field: key.sort_field.to_string(),
+                direction: format!("{:?}", key.direction),
+                filter_count: key.filter_clauses.len(),
+                cardinality: entry.bitmap.len(),
+                capacity: entry.capacity,
+                max_capacity: entry.max_capacity,
+                has_more: entry.has_more,
+                min_tracked_value: entry.min_tracked_value,
+            }
+        }).collect()
     }
 
     /// Reset hit/miss counters without clearing entries.
@@ -544,6 +582,16 @@ impl UnifiedCache {
                     entry.add_slot(slot);
                 }
             }
+        }
+    }
+
+    /// Remove a deleted slot from all cache entries.
+    ///
+    /// Called by the flush thread when a document is deleted. Targeted removal
+    /// avoids marking all entries for rebuild, preserving cache effectiveness.
+    pub fn remove_slot_from_all(&mut self, slot: u32) {
+        for (_, entry) in self.entries.iter_mut() {
+            entry.remove_slot(slot);
         }
     }
 

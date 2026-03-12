@@ -436,10 +436,15 @@ pub(crate) fn extract_filter_value(
         }
         FieldValueType::MappedString => {
             if let Some(s) = raw.as_str() {
+                let lookup = if mapping.case_sensitive {
+                    std::borrow::Cow::Borrowed(s)
+                } else {
+                    std::borrow::Cow::Owned(s.to_lowercase())
+                };
                 let n = mapping
                     .string_map
                     .as_ref()
-                    .and_then(|m| m.get(s).copied())
+                    .and_then(|m| m.get(lookup.as_ref()).copied())
                     .unwrap_or(0);
                 field_map
                     .entry(n as u64)
@@ -640,7 +645,12 @@ fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<Fiel
         FieldValueType::MappedString => {
             let s = raw.as_str()?;
             let map = mapping.string_map.as_ref()?;
-            let n = map.get(s).copied().unwrap_or(0);
+            let lookup = if mapping.case_sensitive {
+                std::borrow::Cow::Borrowed(s)
+            } else {
+                std::borrow::Cow::Owned(s.to_lowercase())
+            };
+            let n = map.get(lookup.as_ref()).copied().unwrap_or(0);
             Some(FieldValue::Single(Value::Integer(n)))
         }
         FieldValueType::IntegerArray => {
@@ -686,6 +696,7 @@ mod tests {
                 string_map: None,
                 doc_only: false,
                 truncate_u32: false,
+                case_sensitive: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 42, "count": 100});
@@ -712,6 +723,7 @@ mod tests {
                 string_map: None,
                 doc_only: false,
                 truncate_u32: false,
+                case_sensitive: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "secondary": 99});
@@ -738,6 +750,7 @@ mod tests {
                 string_map: Some(map),
                 doc_only: false,
                 truncate_u32: false,
+                case_sensitive: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "type": "image"});
@@ -745,6 +758,82 @@ mod tests {
         assert_eq!(
             doc.fields.get("type"),
             Some(&FieldValue::Single(Value::Integer(1)))
+        );
+    }
+
+    #[test]
+    fn test_json_to_stored_doc_mapped_string_case_insensitive() {
+        let mut map = HashMap::new();
+        map.insert("Image".into(), 1);
+        map.insert("Video".into(), 2);
+
+        let mut schema = DataSchema {
+            id_field: "id".into(),
+            fields: vec![FieldMapping {
+                source: "type".into(),
+                target: "type".into(),
+                value_type: FieldValueType::MappedString,
+                fallback: None,
+                string_map: Some(map),
+                doc_only: false,
+                truncate_u32: false,
+                case_sensitive: false, // default
+            }],
+        };
+        schema.normalize_string_maps();
+
+        // Uppercase input matches lowercase-normalized map key
+        let json: serde_json::Value = serde_json::json!({"id": 1, "type": "IMAGE"});
+        let doc = json_to_stored_doc(&json, &schema);
+        assert_eq!(
+            doc.fields.get("type"),
+            Some(&FieldValue::Single(Value::Integer(1)))
+        );
+
+        // Mixed case input also matches
+        let json2: serde_json::Value = serde_json::json!({"id": 2, "type": "Video"});
+        let doc2 = json_to_stored_doc(&json2, &schema);
+        assert_eq!(
+            doc2.fields.get("type"),
+            Some(&FieldValue::Single(Value::Integer(2)))
+        );
+    }
+
+    #[test]
+    fn test_json_to_stored_doc_mapped_string_case_sensitive() {
+        let mut map = HashMap::new();
+        map.insert("Image".into(), 1);
+        map.insert("Video".into(), 2);
+
+        let mut schema = DataSchema {
+            id_field: "id".into(),
+            fields: vec![FieldMapping {
+                source: "type".into(),
+                target: "type".into(),
+                value_type: FieldValueType::MappedString,
+                fallback: None,
+                string_map: Some(map),
+                doc_only: false,
+                truncate_u32: false,
+                case_sensitive: true,
+            }],
+        };
+        schema.normalize_string_maps();
+
+        // Exact case matches
+        let json: serde_json::Value = serde_json::json!({"id": 1, "type": "Image"});
+        let doc = json_to_stored_doc(&json, &schema);
+        assert_eq!(
+            doc.fields.get("type"),
+            Some(&FieldValue::Single(Value::Integer(1)))
+        );
+
+        // Wrong case falls back to 0
+        let json2: serde_json::Value = serde_json::json!({"id": 2, "type": "image"});
+        let doc2 = json_to_stored_doc(&json2, &schema);
+        assert_eq!(
+            doc2.fields.get("type"),
+            Some(&FieldValue::Single(Value::Integer(0)))
         );
     }
 
@@ -760,6 +849,7 @@ mod tests {
                 string_map: None,
                 doc_only: false,
                 truncate_u32: false,
+                case_sensitive: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "hasMeta": true});
@@ -782,6 +872,7 @@ mod tests {
                 string_map: None,
                 doc_only: false,
                 truncate_u32: false,
+                case_sensitive: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "tagIds": [10, 20, 30]});
@@ -808,6 +899,7 @@ mod tests {
                 string_map: None,
                 doc_only: false,
                 truncate_u32: true,
+                case_sensitive: false,
             }],
         };
         let big_val: i64 = 5_000_000_000;
@@ -832,6 +924,7 @@ mod tests {
                 string_map: None,
                 doc_only: true,
                 truncate_u32: false,
+                case_sensitive: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "url": "http://example.com"});
@@ -856,6 +949,7 @@ mod tests {
                 string_map: None,
                 doc_only: false,
                 truncate_u32: false,
+                case_sensitive: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1});
@@ -875,6 +969,7 @@ mod tests {
                 string_map: None,
                 doc_only: false,
                 truncate_u32: false,
+                case_sensitive: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "val": null});
@@ -894,6 +989,7 @@ mod tests {
                 string_map: None,
                 doc_only: false,
                 truncate_u32: false,
+                case_sensitive: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "tags": []});

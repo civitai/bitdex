@@ -478,6 +478,47 @@ impl BitmapFs {
         }
     }
 
+    // ---- Time bucket bitmaps ----
+    //
+    // Layout: time_buckets/{name}.roar
+    // One roaring bitmap per time bucket (24h, 7d, 30d, 1y).
+
+    fn time_bucket_path(&self, bucket_name: &str) -> PathBuf {
+        self.root.join("time_buckets").join(format!("{bucket_name}.roar"))
+    }
+
+    /// Write a single time bucket bitmap.
+    pub fn write_time_bucket(&self, bucket_name: &str, bitmap: &RoaringBitmap) -> Result<()> {
+        let path = self.time_bucket_path(bucket_name);
+        let mut buf = Vec::with_capacity(bitmap.serialized_size());
+        bitmap.serialize_into(&mut buf)
+            .map_err(|e| BitdexError::DocStore(format!("time bucket serialize: {e}")))?;
+        Self::write_bytes_atomic(&path, &buf)
+    }
+
+    /// Load all time bucket bitmaps. Returns (name, bitmap) pairs for each found bucket.
+    pub fn load_time_buckets(&self) -> Result<Vec<(String, RoaringBitmap)>> {
+        let dir = self.root.join("time_buckets");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(BitdexError::DocStore(format!("read time_buckets dir: {e}"))),
+        };
+        let mut result = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| BitdexError::DocStore(format!("dir entry: {e}")))?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("roar") {
+                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    if let Some(bm) = Self::read_bitmap(&path)? {
+                        result.push((name.to_string(), bm));
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     // ---- Full snapshot ----
 
     /// Write all engine state: filter bitmaps, alive, sort layers, slot counter.

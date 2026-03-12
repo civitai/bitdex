@@ -562,24 +562,35 @@ fn restore_engine(data_dir: &str, index_name: &str) -> bitdex_v2::concurrent_eng
     if let Some(schema) = full_json.get("data_schema") {
         if let Some(fields) = schema.get("fields").and_then(|f| f.as_array()) {
             let mut string_maps = std::collections::HashMap::new();
+            let mut cs_fields = std::collections::HashSet::new();
             for field in fields {
                 if let (Some(name), Some(sm)) = (
                     field.get("name").and_then(|n| n.as_str()),
                     field.get("string_map").and_then(|s| s.as_object()),
                 ) {
+                    let case_sensitive = field.get("case_sensitive")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let mut map = std::collections::HashMap::new();
                     for (k, v) in sm {
                         if let Some(n) = v.as_i64() {
-                            map.insert(k.clone(), n);
+                            let key = if case_sensitive { k.clone() } else { k.to_lowercase() };
+                            map.insert(key, n);
                         }
                     }
                     if !map.is_empty() {
                         string_maps.insert(name.to_string(), map);
                     }
+                    if case_sensitive {
+                        cs_fields.insert(name.to_string());
+                    }
                 }
             }
             if !string_maps.is_empty() {
                 engine.set_string_maps(string_maps);
+            }
+            if !cs_fields.is_empty() {
+                engine.set_case_sensitive_fields(cs_fields);
             }
         }
     }

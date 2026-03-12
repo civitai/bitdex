@@ -105,6 +105,25 @@ impl TimeBucketManager {
         }
     }
 
+    /// Load persisted bitmaps into matching buckets. Sets last_refreshed to now
+    /// so the periodic refresh timer starts from the restore point.
+    pub fn load_persisted(&mut self, persisted: &[(String, RoaringBitmap)], now: u64) {
+        for (name, bitmap) in persisted {
+            if let Some(bucket) = self.buckets.get_mut(name.as_str()) {
+                bucket.bitmap = bitmap.clone();
+                bucket.last_refreshed = now;
+            }
+        }
+    }
+
+    /// Returns an iterator over all (name, bitmap) pairs for persistence.
+    pub fn all_buckets(&self) -> impl Iterator<Item = (&str, &RoaringBitmap)> {
+        self.sorted_names.iter().map(move |name| {
+            let bucket = &self.buckets[name.as_str()];
+            (name.as_str(), &bucket.bitmap)
+        })
+    }
+
     /// Returns the names of buckets that need a refresh at the given time.
     pub fn refresh_due(&self, now: u64) -> Vec<&str> {
         self.sorted_names

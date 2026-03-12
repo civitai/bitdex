@@ -466,6 +466,24 @@ pub struct FieldMapping {
     /// If true, cast the value to u32 before storing (for unix timestamps that exceed u32::MAX).
     #[serde(default)]
     pub truncate_u32: bool,
+    /// If true, string matching is case-sensitive. Default false (case-insensitive).
+    /// Applies to MappedString fields: both ingest (string_map lookup) and query resolution.
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+impl DataSchema {
+    /// Normalize string_map keys to lowercase for case-insensitive MappedString fields.
+    /// Call once after deserialization, before use in loader/docstore/server.
+    pub fn normalize_string_maps(&mut self) {
+        for mapping in &mut self.fields {
+            if mapping.value_type == FieldValueType::MappedString && !mapping.case_sensitive {
+                if let Some(ref mut map) = mapping.string_map {
+                    *map = map.drain().map(|(k, v)| (k.to_lowercase(), v)).collect();
+                }
+            }
+        }
+    }
 }
 
 /// How a field value should be interpreted during NDJSON loading.

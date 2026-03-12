@@ -157,8 +157,20 @@ pub fn snap_range_clauses(
 fn snap_clause(clause: &FilterClause, ctx: &BucketSnapContext<'_>) -> FilterClause {
     match clause {
         FilterClause::Gt(field, Value::Integer(ts)) | FilterClause::Gte(field, Value::Integer(ts)) => {
-            try_snap_to_bucket(field, *ts, ctx)
-                .unwrap_or_else(|| clause.clone())
+            if let Some(snapped) = try_snap_to_bucket(field, *ts, ctx) {
+                snapped
+            } else if ctx.managers.contains_key(field.as_str()) {
+                // Field is a time bucket field but the requested range doesn't match any
+                // pre-computed bucket (duration too far from any configured bucket).
+                // Return an empty bitmap — no results for this range.
+                FilterClause::BucketBitmap {
+                    field: field.clone(),
+                    bucket_name: "_none".to_string(),
+                    bitmap: Arc::new(RoaringBitmap::new()),
+                }
+            } else {
+                clause.clone()
+            }
         }
 
         // Recurse into And/Or — but not Not (semantics differ)
@@ -291,8 +303,8 @@ mod tests {
         let clauses = vec![FilterClause::Gt("sortAt".to_string(), Value::Integer(ts))];
         let snapped = snap_range_clauses(&clauses, &ctx);
 
-        // Should remain unchanged — no snap
-        assert!(matches!(&snapped[0], FilterClause::Gt(_, _)));
+        // Field IS a time bucket field but outside tolerance — becomes empty BucketBitmap
+        assert!(matches!(&snapped[0], FilterClause::BucketBitmap { bitmap, .. } if bitmap.is_empty()));
     }
 
     #[test]

@@ -28,11 +28,6 @@ pub struct Metrics {
     pub cache_misses_total: IntGaugeVec,
     pub cache_entries: IntGaugeVec,
     pub cache_bytes: IntGaugeVec,
-    pub bound_cache_entries: IntGaugeVec,
-    pub bound_cache_bytes: IntGaugeVec,
-    pub meta_index_entries: IntGaugeVec,
-    pub meta_index_bytes: IntGaugeVec,
-
     // -- Bitmap memory --
     pub filter_bitmap_bytes: IntGaugeVec,
     pub filter_bitmap_count: IntGaugeVec,
@@ -115,30 +110,6 @@ impl Metrics {
 
         let cache_bytes = IntGaugeVec::new(
             Opts::new("bitdex_cache_bytes", "Unified cache memory bytes"),
-            &["index"],
-        )
-        .unwrap();
-
-        let bound_cache_entries = IntGaugeVec::new(
-            Opts::new("bitdex_bound_cache_entries", "Bound cache entry count"),
-            &["index"],
-        )
-        .unwrap();
-
-        let bound_cache_bytes = IntGaugeVec::new(
-            Opts::new("bitdex_bound_cache_bytes", "Bound cache memory bytes"),
-            &["index"],
-        )
-        .unwrap();
-
-        let meta_index_entries = IntGaugeVec::new(
-            Opts::new("bitdex_meta_index_entries", "Meta-index entry count"),
-            &["index"],
-        )
-        .unwrap();
-
-        let meta_index_bytes = IntGaugeVec::new(
-            Opts::new("bitdex_meta_index_bytes", "Meta-index memory bytes"),
             &["index"],
         )
         .unwrap();
@@ -229,18 +200,6 @@ impl Metrics {
         registry.register(Box::new(cache_entries.clone())).unwrap();
         registry.register(Box::new(cache_bytes.clone())).unwrap();
         registry
-            .register(Box::new(bound_cache_entries.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(bound_cache_bytes.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(meta_index_entries.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(meta_index_bytes.clone()))
-            .unwrap();
-        registry
             .register(Box::new(filter_bitmap_bytes.clone()))
             .unwrap();
         registry
@@ -277,10 +236,6 @@ impl Metrics {
             cache_misses_total,
             cache_entries,
             cache_bytes,
-            bound_cache_entries,
-            bound_cache_bytes,
-            meta_index_entries,
-            meta_index_bytes,
             filter_bitmap_bytes,
             filter_bitmap_count,
             sort_bitmap_bytes,

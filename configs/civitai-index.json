@@ -17,7 +17,7 @@
       { "name": "minor", "field_type": "boolean" },
       { "name": "isPublished", "field_type": "boolean" },
       { "name": "isRemix", "field_type": "boolean" },
-      { "name": "hasBlockedFor", "field_type": "boolean" },
+      { "name": "blockedFor", "field_type": "single_value" },
       { "name": "tagIds", "field_type": "multi_value" },
       { "name": "modelVersionIds", "field_type": "multi_value" },
       { "name": "modelVersionIdsManual", "field_type": "multi_value" },
@@ -32,7 +32,17 @@
       { "name": "publishedAt", "bits": 32 },
       { "name": "id", "bits": 32 }
     ],
-    "max_page_size": 200
+    "max_page_size": 200,
+    "time_buckets": {
+      "filter_field": "sortAtUnix",
+      "sort_field": "sortAt",
+      "range_buckets": [
+        { "name": "24h", "duration_secs": 86400, "refresh_interval_secs": 300 },
+        { "name": "7d", "duration_secs": 604800, "refresh_interval_secs": 3600 },
+        { "name": "30d", "duration_secs": 2592000, "refresh_interval_secs": 3600 },
+        { "name": "1y", "duration_secs": 31536000, "refresh_interval_secs": 86400 }
+      ]
+    }
   },
   "data_schema": {
     "id_field": "id",
@@ -56,7 +66,9 @@
       { "source": "remixOfId", "target": "remixOfId", "value_type": "integer" },
       { "source": "publishedAtUnix", "target": "isPublished", "value_type": "exists_boolean" },
       { "source": "remixOfId", "target": "isRemix", "value_type": "exists_boolean" },
-      { "source": "blockedFor", "target": "hasBlockedFor", "value_type": "exists_boolean" },
+      { "source": "blockedFor", "target": "blockedFor", "value_type": "mapped_string", "string_map": {
+        "tos": 1, "moderated": 2, "CSAM": 3, "AiNotVerified": 4
+      }},
       { "source": "hasMeta", "target": "hasMeta", "value_type": "boolean" },
       { "source": "onSite", "target": "onSite", "value_type": "boolean" },
       { "source": "poi", "target": "poi", "value_type": "boolean" },

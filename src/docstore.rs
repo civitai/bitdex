@@ -82,6 +82,11 @@ impl DocStore {
         })
     }
 
+    /// Get the root path of this docstore.
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
     // ---- Shard path helpers ----
 
     pub(crate) fn shard_id(slot_id: u32) -> u32 {
@@ -337,6 +342,41 @@ impl DocStore {
             Some(compressed) => Ok(Some(self.decode_doc(&compressed)?)),
             None => Ok(None),
         }
+    }
+
+    /// Read all documents from a single shard, decoded.
+    ///
+    /// Decompresses the shard once and returns all (slot_id, StoredDoc) pairs.
+    /// Much faster than calling `get()` for each slot when you need all docs in a shard.
+    pub fn get_shard(&self, shard_id: u32) -> Result<Vec<(u32, StoredDoc)>> {
+        if self.in_memory {
+            let start = shard_id << SHARD_SHIFT;
+            let end = start + (1 << SHARD_SHIFT);
+            let mut out = Vec::new();
+            for slot in start..end {
+                if let Some(data) = self.memory_store.get(&slot) {
+                    out.push((slot, self.decode_doc(data)?));
+                }
+            }
+            return Ok(out);
+        }
+        let path = Self::shard_path(&self.root, shard_id);
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
+        };
+        let (entries, decompressed) = Self::read_shard_file(&data)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (slot_id, offset, length) in &entries {
+            let start = *offset as usize;
+            let end = start + *length as usize;
+            if end > decompressed.len() {
+                continue;
+            }
+            out.push((*slot_id, self.decode_doc(&decompressed[start..end])?));
+        }
+        Ok(out)
     }
 
     /// Store a single document. Reads the existing shard, merges, and rewrites.
@@ -693,10 +733,15 @@ fn json_to_packed(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<Pac
         FieldValueType::String => Some(PackedValue::S(raw.as_str()?.to_string())),
         FieldValueType::MappedString => {
             let s = raw.as_str()?;
+            let lookup = if mapping.case_sensitive {
+                std::borrow::Cow::Borrowed(s)
+            } else {
+                std::borrow::Cow::Owned(s.to_lowercase())
+            };
             let n = mapping
                 .string_map
                 .as_ref()
-                .and_then(|m| m.get(s).copied())
+                .and_then(|m| m.get(lookup.as_ref()).copied())
                 .unwrap_or(0);
             Some(PackedValue::I(n))
         }

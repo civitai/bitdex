@@ -8,6 +8,7 @@
  *
  * Usage:
  *   node tools/e2e-unified-cache.mjs [--url http://localhost:3000] [--index models] [--verbose]
+ *   node tools/e2e-unified-cache.mjs --bench [--iterations 200] [--warmup 10]
  */
 
 const BASE_URL = process.argv.includes('--url')
@@ -17,6 +18,13 @@ const INDEX = process.argv.includes('--index')
   ? process.argv[process.argv.indexOf('--index') + 1]
   : 'civitai';
 const VERBOSE = process.argv.includes('--verbose');
+const BENCH = process.argv.includes('--bench');
+const ITERATIONS = process.argv.includes('--iterations')
+  ? Number(process.argv[process.argv.indexOf('--iterations') + 1])
+  : 200;
+const WARMUP = process.argv.includes('--warmup')
+  ? Number(process.argv[process.argv.indexOf('--warmup') + 1])
+  : 10;
 
 const api = (path, opts) => `${BASE_URL}/api/indexes/${INDEX}${path}`;
 
@@ -202,30 +210,76 @@ async function testC_DeepPagination() {
 
   let cursor = null;
   const pageSize = 20;
-  const targetPages = 5; // 100 results — enough to test expansion
+  // Page through past the first expansion boundary (1000 slots / 20 per page = page 50)
+  // and past the second boundary (2000 / 20 = page 100) to verify expansion works
+  const targetPages = 110;
   const allIds = [];
 
   const pageTimes = [];
+  let shortPages = [];
+  let slowPages = []; // pages > 100ms (excluding first page which triggers lazy loading)
   for (let page = 1; page <= targetPages; page++) {
     const r = await query(filters, sort, pageSize, cursor);
-    assert(r.ids.length === pageSize, `page ${page}: expected ${pageSize}, got ${r.ids.length}`);
+    if (r.ids.length !== pageSize) {
+      shortPages.push({ page, count: r.ids.length });
+    }
     allIds.push(...r.ids);
     pageTimes.push(r.elapsed_us);
+    // Track slow pages (>100ms) after page 1 (page 1 may trigger lazy field loading)
+    if (page > 1 && r.elapsed_us > 100000) {
+      slowPages.push({ page, us: r.elapsed_us });
+    }
     cursor = r.cursor;
     if (!cursor) {
       log(`  Pagination ended at page ${page} (no cursor)`);
       break;
     }
   }
-  log(`  Page latencies: ${pageTimes.map((t, i) => `p${i + 1}=${fmt_us(t)}`).join(', ')}`);
+
+  // Show expansion boundary pages
+  const boundaryPages = [1, 2, 49, 50, 51, 52, 99, 100, 101, 102, 110];
+  log('  Page latencies at boundaries:');
+  for (const p of boundaryPages) {
+    if (p <= pageTimes.length) {
+      log(`    p${String(p).padStart(3)}: ${fmt_us(pageTimes[p - 1]).padStart(8)}`);
+    }
+  }
 
   const uniqueIds = new Set(allIds);
   assert(uniqueIds.size === allIds.length, `duplicates in deep pagination: ${allIds.length} total, ${uniqueIds.size} unique`);
-  log(`  [1] ${targetPages} pages, ${uniqueIds.size} unique results, no duplicates`);
+  log(`  [1] ${pageTimes.length} pages, ${uniqueIds.size} unique results, no duplicates`);
 
-  // Verify no stuck pagination (all pages returned full results)
-  assert(allIds.length === targetPages * pageSize, `expected ${targetPages * pageSize} total, got ${allIds.length}`);
-  log(`  [2] No stuck pagination — all ${targetPages} pages returned ${pageSize} results`);
+  // All pages must return exactly pageSize results (no short pages)
+  assert(shortPages.length === 0,
+    `${shortPages.length} short pages: ${shortPages.map(p => `p${p.page}=${p.count}`).join(', ')}`);
+  log(`  [2] No short pages — all ${pageTimes.length} pages returned ${pageSize} results`);
+
+  // Verify cache entry details show proper expansion
+  const s = await stats();
+  const details = s.unified_cache_entry_details || [];
+  const entry = details.find(e => e.sort_field === 'reactionCount' && e.direction === 'Desc');
+  if (entry) {
+    log(`  [3] Cache entry: capacity=${entry.capacity}, cardinality=${entry.cardinality}, has_more=${entry.has_more}`);
+    // After paging through 110 pages (2200 results), capacity should be at least 4000
+    // Initial 1000 → expand to 2000 at ~page 50 → expand to 4000 at ~page 100
+    assert(entry.capacity >= 4000,
+      `expected capacity >= 4000 after ${targetPages} pages, got ${entry.capacity}`);
+    log(`  [4] Cache capacity expanded correctly: ${entry.capacity} >= 4000`);
+    // Cardinality should be close to capacity (actual slots stored)
+    assert(entry.cardinality >= 2000,
+      `expected cardinality >= 2000, got ${entry.cardinality}`);
+    log(`  [5] Cache cardinality: ${entry.cardinality}`);
+  } else {
+    log(`  [3] WARNING: Could not find cache entry details for reactionCount/Desc`);
+  }
+
+  // Slow pages should only be expansion boundaries (at most 2-3)
+  if (slowPages.length > 0) {
+    log(`  [6] Expansion pages (>100ms): ${slowPages.map(p => `p${p.page}=${fmt_us(p.us)}`).join(', ')}`);
+  }
+  assert(slowPages.length <= 3,
+    `too many slow pages (expected <=3 expansion boundaries): ${slowPages.length}`);
+  log(`  [7] Expansion boundaries within budget: ${slowPages.length} slow pages`);
 }
 
 async function testD_MutationMaintenance() {
@@ -414,6 +468,140 @@ async function testG_MultipleFilterCombos() {
   assert(newHits >= queries.length, `expected >=${queries.length} new hits, got ${newHits}`);
 }
 
+// ----- Bench Mode -----
+
+function percentile(sorted, p) {
+  const idx = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, idx)];
+}
+
+function printPercentiles(label, samples) {
+  const sorted = [...samples].sort((a, b) => a - b);
+  const p50 = percentile(sorted, 50);
+  const p80 = percentile(sorted, 80);
+  const p95 = percentile(sorted, 95);
+  const p99 = percentile(sorted, 99);
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+  const mean = (samples.reduce((a, b) => a + b, 0) / samples.length);
+  log(`  ${label}`);
+  log(`    min=${fmt_us(min)}  p50=${fmt_us(p50)}  p80=${fmt_us(p80)}  p95=${fmt_us(p95)}  p99=${fmt_us(p99)}  max=${fmt_us(max)}  mean=${fmt_us(Math.round(mean))}`);
+  return { label, min, p50, p80, p95, p99, max, mean, n: samples.length };
+}
+
+async function runBench() {
+  log(`\nBench Mode: ${WARMUP} warmup + ${ITERATIONS} iterations per query`);
+
+  const benchQueries = [
+    {
+      label: 'nsfwLevel=1, sort=reactionCount desc',
+      filters: [{ Eq: ['nsfwLevel', { Integer: 1 }] }],
+      sort: { field: 'reactionCount', direction: 'Desc' },
+    },
+    {
+      label: 'nsfwLevel=1 + type=image, sort=reactionCount desc',
+      filters: [{ Eq: ['nsfwLevel', { Integer: 1 }] }, { Eq: ['type', { String: 'image' }] }],
+      sort: { field: 'reactionCount', direction: 'Desc' },
+    },
+    {
+      label: 'nsfwLevel=1, sort=reactionCount asc',
+      filters: [{ Eq: ['nsfwLevel', { Integer: 1 }] }],
+      sort: { field: 'reactionCount', direction: 'Asc' },
+    },
+    {
+      label: 'nsfwLevel=1, sort=sortAt desc',
+      filters: [{ Eq: ['nsfwLevel', { Integer: 1 }] }],
+      sort: { field: 'sortAt', direction: 'Desc' },
+    },
+    {
+      label: 'nsfwLevel=1 + type=image, sort=sortAt desc',
+      filters: [{ Eq: ['nsfwLevel', { Integer: 1 }] }, { Eq: ['type', { String: 'image' }] }],
+      sort: { field: 'sortAt', direction: 'Desc' },
+    },
+  ];
+
+  const allResults = [];
+
+  for (const bq of benchQueries) {
+    log(`\n--- ${bq.label} ---`);
+
+    // Ensure cache is populated (first call is a miss)
+    await clearCache();
+    const miss = await query(bq.filters, bq.sort, 20);
+    log(`  Cold miss: ${fmt_us(miss.elapsed_us)} (${miss.ids.length} results, total_matched=${miss.total_matched})`);
+
+    // Warmup
+    for (let i = 0; i < WARMUP; i++) {
+      await query(bq.filters, bq.sort, 20);
+    }
+    log(`  Warmup: ${WARMUP} iterations done`);
+
+    // Timed iterations (cache hits)
+    const hitSamples = [];
+    for (let i = 0; i < ITERATIONS; i++) {
+      const r = await query(bq.filters, bq.sort, 20);
+      hitSamples.push(r.elapsed_us);
+    }
+
+    const result = printPercentiles('Cache HIT', hitSamples);
+    result.miss_us = miss.elapsed_us;
+    result.label = bq.label;
+    allResults.push(result);
+
+    // Also bench pagination p2 (cursor-based, tests bound traversal)
+    const p1 = await query(bq.filters, bq.sort, 20);
+    if (p1.cursor) {
+      // Warmup pagination
+      for (let i = 0; i < WARMUP; i++) {
+        await query(bq.filters, bq.sort, 20, p1.cursor);
+      }
+      const pageSamples = [];
+      for (let i = 0; i < ITERATIONS; i++) {
+        const r = await query(bq.filters, bq.sort, 20, p1.cursor);
+        pageSamples.push(r.elapsed_us);
+      }
+      const pageResult = printPercentiles('Page 2 (cursor)', pageSamples);
+      pageResult.label = `${bq.label} [page 2]`;
+      allResults.push(pageResult);
+    }
+  }
+
+  // Summary table
+  log(`\n${'='.repeat(95)}`);
+  log('Percentile Summary (server-reported elapsed_us)');
+  log(`${'='.repeat(95)}`);
+  log(`${'Query'.padEnd(45)} ${'Miss'.padStart(9)} ${'p50'.padStart(8)} ${'p80'.padStart(8)} ${'p95'.padStart(8)} ${'p99'.padStart(8)} ${'max'.padStart(8)}`);
+  log(`${'-'.repeat(45)} ${'-'.repeat(9)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(8)} ${'-'.repeat(8)}`);
+  for (const r of allResults) {
+    const miss = r.miss_us != null ? fmt_us(r.miss_us) : '-';
+    log(`${r.label.slice(0, 45).padEnd(45)} ${miss.padStart(9)} ${fmt_us(r.p50).padStart(8)} ${fmt_us(r.p80).padStart(8)} ${fmt_us(r.p95).padStart(8)} ${fmt_us(r.p99).padStart(8)} ${fmt_us(r.max).padStart(8)}`);
+  }
+  log(`${'='.repeat(95)}`);
+  log(`\n${ITERATIONS} iterations per query after ${WARMUP} warmup`);
+
+  await printStats();
+}
+
+async function printStats() {
+  const s = await stats();
+  log(`\n${'='.repeat(50)}`);
+  log('Server Stats');
+  log(`${'='.repeat(50)}`);
+  log(`  Alive docs:             ${s.alive_count?.toLocaleString()}`);
+  log(`  Slot count:             ${s.slot_count?.toLocaleString()}`);
+  log(`  Unified cache entries:  ${s.unified_cache_entries}`);
+  log(`  Unified cache hits:     ${s.unified_cache_hits?.toLocaleString()}`);
+  log(`  Unified cache misses:   ${s.unified_cache_misses?.toLocaleString()}`);
+  log(`  Unified cache memory:   ${(s.unified_cache_bytes / 1024).toFixed(1)} KB`);
+  const hitRate = s.unified_cache_hits + s.unified_cache_misses > 0
+    ? ((s.unified_cache_hits / (s.unified_cache_hits + s.unified_cache_misses)) * 100).toFixed(1)
+    : '0.0';
+  log(`  Unified cache hit rate: ${hitRate}%`);
+  log(`  Meta-index entries:     ${s.unified_cache_meta_entries}`);
+  log(`  Meta-index memory:      ${(s.unified_cache_meta_bytes / 1024).toFixed(1)} KB`);
+  log(`${'='.repeat(50)}`);
+}
+
 // ----- Runner -----
 
 const groups = [
@@ -441,6 +629,11 @@ async function main() {
     log(`\nStart the server first:`);
     log(`  cargo run --release --features server --bin server -- --port 3000`);
     process.exit(1);
+  }
+
+  if (BENCH) {
+    await runBench();
+    process.exit(0);
   }
 
   for (const [id, name, fn] of groups) {
@@ -473,6 +666,8 @@ async function main() {
     }
     log(`${'='.repeat(70)}`);
   }
+
+  await printStats();
 
   log(`\nResults: ${passed} passed, ${failed} failed out of ${groups.length}`);
 

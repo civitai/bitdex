@@ -1,7 +1,5 @@
-use parking_lot::Mutex;
 use std::path::Path;
 
-use crate::cache::TrieCache;
 use crate::concurrency::InFlightTracker;
 use crate::config::Config;
 use crate::docstore::DocStore;
@@ -23,7 +21,6 @@ pub struct Engine {
     slots: SlotAllocator,
     filters: FilterIndex,
     sorts: SortIndex,
-    cache: Mutex<TrieCache>,
     in_flight: InFlightTracker,
     docstore: DocStore,
     config: Config,
@@ -37,7 +34,6 @@ impl Engine {
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let cache = TrieCache::new(config.cache.clone());
         let docstore = DocStore::open(docstore_path)?;
 
         for fc in &config.filter_fields {
@@ -51,7 +47,6 @@ impl Engine {
             slots,
             filters,
             sorts,
-            cache: Mutex::new(cache),
             in_flight: InFlightTracker::new(),
             docstore,
             config,
@@ -65,7 +60,6 @@ impl Engine {
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let cache = TrieCache::new(config.cache.clone());
         let docstore = DocStore::open_temp()?;
 
         for fc in &config.filter_fields {
@@ -79,7 +73,6 @@ impl Engine {
             slots,
             filters,
             sorts,
-            cache: Mutex::new(cache),
             in_flight: InFlightTracker::new(),
             docstore,
             config,
@@ -91,13 +84,6 @@ impl Engine {
     pub fn put(&mut self, id: u32, doc: &Document) -> Result<()> {
         // Mark in-flight before mutation
         self.in_flight.mark_in_flight(id);
-
-        // Invalidate cache for all filter fields in the document
-        for field_name in doc.fields.keys() {
-            if self.filters.get_field(field_name).is_some() {
-                self.cache.lock().invalidate_field(field_name);
-            }
-        }
 
         let result = {
             let mut engine = MutationEngine::new(
@@ -131,13 +117,6 @@ impl Engine {
         // Mark in-flight before mutation
         self.in_flight.mark_in_flight(id);
 
-        // Invalidate cache for changed filter fields
-        for field_name in patch.fields.keys() {
-            if self.filters.get_field(field_name).is_some() {
-                self.cache.lock().invalidate_field(field_name);
-            }
-        }
-
         let result = {
             let mut engine = MutationEngine::new(
                 &mut self.slots,
@@ -168,14 +147,6 @@ impl Engine {
     /// Marks the slot as in-flight during the mutation.
     pub fn delete(&mut self, id: u32) -> Result<()> {
         self.in_flight.mark_in_flight(id);
-
-        // Invalidate cache for all filter fields (clean delete changes filter bitmaps)
-        {
-            let mut c = self.cache.lock();
-            for fc in &self.config.filter_fields {
-                c.invalidate_field(&fc.name);
-            }
-        }
 
         let result = {
             let mut engine = MutationEngine::new(
@@ -208,26 +179,17 @@ impl Engine {
             &self.sorts,
             u32::MAX as usize,
         );
-        let result = executor.execute_with_cache(
+        let result = executor.execute(
             filters,
             None,
             u32::MAX as usize,
             None,
-            &mut self.cache.lock(),
         )?;
 
         // Build a bitmap of matching slots
         let mut matching = roaring::RoaringBitmap::new();
         for id in &result.ids {
             matching.insert(*id as u32);
-        }
-
-        // Invalidate cache for all filter fields (clean delete changes filter bitmaps)
-        {
-            let mut c = self.cache.lock();
-            for fc in &self.config.filter_fields {
-                c.invalidate_field(&fc.name);
-            }
         }
 
         // Now delete them
@@ -269,12 +231,11 @@ impl Engine {
         };
         let fetch_limit = query.limit.saturating_add(offset);
 
-        let mut result = executor.execute_with_cache(
+        let mut result = executor.execute(
             &query.filters,
             query.sort.as_ref(),
             fetch_limit,
             query.cursor.as_ref(),
-            &mut self.cache.lock(),
         )?;
 
         // Apply offset: drop the first N results
@@ -305,8 +266,7 @@ impl Engine {
             &self.sorts,
             self.config.max_page_size,
         );
-        let mut result =
-            executor.execute_with_cache(filters, sort, limit, None, &mut self.cache.lock())?;
+        let mut result = executor.execute(filters, sort, limit, None)?;
 
         // Post-validation: check for in-flight write overlap and revalidate
         self.post_validate(&mut result, filters, &executor)?;
@@ -407,16 +367,6 @@ impl Engine {
     /// Get a mutable reference to the sort index (for autovac).
     pub fn sorts_mut(&mut self) -> &mut SortIndex {
         &mut self.sorts
-    }
-
-    /// Get a reference to the cache (for stats/admin).
-    pub fn cache(&self) -> &Mutex<TrieCache> {
-        &self.cache
-    }
-
-    /// Run cache maintenance cycle (decay + eviction).
-    pub fn cache_maintenance(&self) {
-        self.cache.lock().maintenance_cycle();
     }
 
     /// Get a reference to the in-flight tracker (for concurrent access).

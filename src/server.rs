@@ -3,6 +3,7 @@
 //! Feature-gated behind `server`. Provides `BitdexServer` which starts blank
 //! and creates indexes via API.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,10 +21,12 @@ use tower_http::cors::CorsLayer;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{Config, DataSchema, FieldValueType};
-use crate::executor::StringMaps;
+use crate::docstore::StoredDoc;
+use crate::executor::{CaseSensitiveFields, StringMaps};
 use crate::loader;
 use crate::metrics::Metrics;
-use crate::query::BitdexQuery;
+use crate::mutation::FieldValue;
+use crate::query::{BitdexQuery, Value};
 
 // ---------------------------------------------------------------------------
 // Server state
@@ -124,11 +127,148 @@ fn default_docstore_batch_size() -> usize {
 #[derive(Deserialize)]
 struct DocumentRequest {
     slot_id: u32,
+    #[serde(default)]
+    fields: IncludeDocs,
 }
 
 #[derive(Deserialize)]
 struct DocumentBatchRequest {
     slot_ids: Vec<u32>,
+    #[serde(default)]
+    fields: IncludeDocs,
+}
+
+// ---------------------------------------------------------------------------
+// Field selection for document retrieval
+// ---------------------------------------------------------------------------
+
+/// Controls which document fields to return.
+///
+/// - `false` / omitted → no documents
+/// - `true` / `["*"]` → all fields
+/// - `["field1", "field2"]` → only those fields
+#[derive(Debug, Clone)]
+enum IncludeDocs {
+    None,
+    All,
+    Fields(Vec<String>),
+}
+
+impl Default for IncludeDocs {
+    fn default() -> Self {
+        IncludeDocs::None
+    }
+}
+
+impl<'de> Deserialize<'de> for IncludeDocs {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct IncludeDocsVisitor;
+
+        impl<'de> de::Visitor<'de> for IncludeDocsVisitor {
+            type Value = IncludeDocs;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("bool or array of field names")
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> std::result::Result<IncludeDocs, E> {
+                Ok(if v { IncludeDocs::All } else { IncludeDocs::None })
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<IncludeDocs, A::Error> {
+                let mut fields = Vec::new();
+                while let Some(s) = seq.next_element::<String>()? {
+                    if s == "*" {
+                        return Ok(IncludeDocs::All);
+                    }
+                    fields.push(s);
+                }
+                if fields.is_empty() {
+                    Ok(IncludeDocs::None)
+                } else {
+                    Ok(IncludeDocs::Fields(fields))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(IncludeDocsVisitor)
+    }
+}
+
+impl IncludeDocs {
+    fn is_none(&self) -> bool {
+        matches!(self, IncludeDocs::None)
+    }
+}
+
+/// Fuse schema defaults into a stored document and apply field selection.
+///
+/// Schema fields that were elided at write time (absent from StoredDoc) are
+/// filled with their type's default value so callers always see the full shape.
+fn format_document(
+    doc: &StoredDoc,
+    schema: &DataSchema,
+    selection: &IncludeDocs,
+) -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+
+    // Always include "id" if present
+    if let Some(id_val) = doc.fields.get("id") {
+        fields.insert("id".to_string(), field_value_to_json(id_val));
+    }
+
+    for mapping in &schema.fields {
+        // Apply field selection filter
+        match selection {
+            IncludeDocs::Fields(ref selected) => {
+                if !selected.iter().any(|s| s == &mapping.target) {
+                    continue;
+                }
+            }
+            IncludeDocs::All => {}
+            IncludeDocs::None => continue,
+        }
+
+        let value = if let Some(fv) = doc.fields.get(&mapping.target) {
+            field_value_to_json(fv)
+        } else {
+            // Fuse schema default for elided fields
+            default_json_for_type(&mapping.value_type)
+        };
+        fields.insert(mapping.target.clone(), value);
+    }
+
+    serde_json::Value::Object(fields)
+}
+
+fn field_value_to_json(fv: &FieldValue) -> serde_json::Value {
+    match fv {
+        FieldValue::Single(v) => value_to_json(v),
+        FieldValue::Multi(vs) => serde_json::Value::Array(vs.iter().map(value_to_json).collect()),
+    }
+}
+
+fn value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Integer(i) => serde_json::json!(i),
+        Value::Float(f) => serde_json::json!(f),
+        Value::Bool(b) => serde_json::json!(b),
+        Value::String(s) => serde_json::json!(s),
+    }
+}
+
+fn default_json_for_type(vt: &FieldValueType) -> serde_json::Value {
+    match vt {
+        FieldValueType::Integer | FieldValueType::MappedString => serde_json::json!(0),
+        FieldValueType::Boolean | FieldValueType::ExistsBoolean => serde_json::json!(false),
+        FieldValueType::String => serde_json::json!(""),
+        FieldValueType::IntegerArray => serde_json::json!([]),
+    }
 }
 
 #[derive(Deserialize)]
@@ -139,6 +279,20 @@ struct UpsertRequest {
 #[derive(Deserialize)]
 struct DeleteDocsRequest {
     ids: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct RebuildRequest {
+    #[serde(default)]
+    sort_fields: Option<Vec<String>>,
+    #[serde(default)]
+    filter_fields: Option<Vec<String>>,
+    #[serde(default = "default_save_snapshot")]
+    save_snapshot: bool,
+}
+
+fn default_save_snapshot() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +341,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
             .route("/api/indexes/{name}/stats", get(handle_stats))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
+            .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
             // Utility
             .route("/api/health", get(handle_health))
             .route("/metrics", get(handle_metrics))
@@ -228,7 +383,8 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         }
 
         let json = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
-        let def: IndexDefinition = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        let mut def: IndexDefinition = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        def.data_schema.normalize_string_maps();
 
         // Create engine from persisted config
         let docstore_path = path.join("docs");
@@ -241,9 +397,12 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
         // Build string_maps from DataSchema for MappedString field reverse lookup
-        let string_maps = build_string_maps(&def.data_schema);
+        let (string_maps, cs_fields) = build_string_maps(&def.data_schema);
         if !string_maps.is_empty() {
             engine.set_string_maps(string_maps);
+        }
+        if !cs_fields.is_empty() {
+            engine.set_case_sensitive_fields(cs_fields);
         }
 
         let alive = engine.alive_count();
@@ -281,16 +440,27 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Build reverse string maps from DataSchema for MappedString field query resolution.
-fn build_string_maps(schema: &DataSchema) -> StringMaps {
+fn build_string_maps(schema: &DataSchema) -> (StringMaps, CaseSensitiveFields) {
     let mut maps = StringMaps::new();
+    let mut cs_fields = CaseSensitiveFields::new();
     for mapping in &schema.fields {
         if mapping.value_type == FieldValueType::MappedString {
             if let Some(ref string_map) = mapping.string_map {
-                maps.insert(mapping.target.clone(), string_map.clone());
+                if mapping.case_sensitive {
+                    cs_fields.insert(mapping.target.clone());
+                    maps.insert(mapping.target.clone(), string_map.clone());
+                } else {
+                    // Normalize keys to lowercase for case-insensitive matching
+                    let normalized: HashMap<String, i64> = string_map
+                        .iter()
+                        .map(|(k, v)| (k.to_lowercase(), *v))
+                        .collect();
+                    maps.insert(mapping.target.clone(), normalized);
+                }
             }
         }
     }
-    maps
+    (maps, cs_fields)
 }
 
 async fn handle_create_index(
@@ -334,10 +504,12 @@ async fn handle_create_index(
     }
 
     // Persist config
+    let mut data_schema = req.data_schema;
+    data_schema.normalize_string_maps();
     let definition = IndexDefinition {
         name: req.name.clone(),
         config: req.config.clone(),
-        data_schema: req.data_schema,
+        data_schema,
     };
     let config_json = serde_json::to_string_pretty(&definition).unwrap();
     let config_path = index_dir.join("config.json");
@@ -364,9 +536,12 @@ async fn handle_create_index(
     };
 
     // Build string_maps from DataSchema for MappedString field reverse lookup
-    let string_maps = build_string_maps(&definition.data_schema);
+    let (string_maps, cs_fields) = build_string_maps(&definition.data_schema);
     if !string_maps.is_empty() {
         engine.set_string_maps(string_maps);
+    }
+    if !cs_fields.is_empty() {
+        engine.set_case_sensitive_fields(cs_fields);
     }
 
     *state.index.lock() = Some(IndexState {
@@ -612,13 +787,14 @@ async fn handle_load_status(
 // Handlers: Query & documents
 // ---------------------------------------------------------------------------
 
-/// Query request with optional include_docs flag.
+/// Query request with optional field selection for document retrieval.
 #[derive(Deserialize)]
 struct QueryRequest {
     #[serde(flatten)]
     query: BitdexQuery,
+    /// `true` → all fields, `["field1","field2"]` → selected fields, `false`/omitted → IDs only.
     #[serde(default)]
-    include_docs: bool,
+    include_docs: IncludeDocs,
 }
 
 async fn handle_query(
@@ -626,10 +802,13 @@ async fn handle_query(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    let engine = {
+    let (engine, schema) = {
         let guard = state.index.lock();
         match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            Some(idx) if idx.definition.name == name => (
+                Arc::clone(&idx.engine),
+                idx.definition.data_schema.clone(),
+            ),
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -651,19 +830,15 @@ async fn handle_query(
                 .observe(elapsed.as_secs_f64());
             let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
 
-            let documents = if req.include_docs {
+            let documents = if !req.include_docs.is_none() {
                 let mut docs = Vec::with_capacity(result.ids.len());
                 for &id in &result.ids {
                     let doc = engine.get_document(id as u32);
                     docs.push(match doc {
-                        Ok(Some(stored)) => serde_json::json!({
-                            "id": id,
-                            "fields": serde_json::to_value(&stored.fields).unwrap_or_default(),
-                        }),
-                        _ => serde_json::json!({
-                            "id": id,
-                            "fields": null,
-                        }),
+                        Ok(Some(stored)) => {
+                            format_document(&stored, &schema, &req.include_docs)
+                        }
+                        _ => serde_json::json!({ "id": id }),
                     });
                 }
                 Some(docs)
@@ -701,10 +876,13 @@ async fn handle_document(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<DocumentRequest>,
 ) -> impl IntoResponse {
-    let engine = {
+    let (engine, schema) = {
         let guard = state.index.lock();
         match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            Some(idx) if idx.definition.name == name => (
+                Arc::clone(&idx.engine),
+                idx.definition.data_schema.clone(),
+            ),
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -714,8 +892,9 @@ async fn handle_document(
         }
     };
 
+    let selection = if req.fields.is_none() { &IncludeDocs::All } else { &req.fields };
     match engine.get_document(req.slot_id) {
-        Ok(Some(doc)) => Json(serde_json::json!({"fields": doc.fields})).into_response(),
+        Ok(Some(doc)) => Json(format_document(&doc, &schema, selection)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
@@ -726,10 +905,13 @@ async fn handle_documents_batch(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<DocumentBatchRequest>,
 ) -> impl IntoResponse {
-    let engine = {
+    let (engine, schema) = {
         let guard = state.index.lock();
         match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            Some(idx) if idx.definition.name == name => (
+                Arc::clone(&idx.engine),
+                idx.definition.data_schema.clone(),
+            ),
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -739,12 +921,13 @@ async fn handle_documents_batch(
         }
     };
 
+    let selection = if req.fields.is_none() { &IncludeDocs::All } else { &req.fields };
     let mut docs = Vec::with_capacity(req.slot_ids.len());
     for slot_id in &req.slot_ids {
         match engine.get_document(*slot_id) {
-            Ok(Some(doc)) => docs.push(serde_json::json!({"slot_id": slot_id, "fields": doc.fields})),
-            Ok(None) => docs.push(serde_json::json!({"slot_id": slot_id, "fields": null})),
-            Err(_) => docs.push(serde_json::json!({"slot_id": slot_id, "fields": null})),
+            Ok(Some(doc)) => docs.push(format_document(&doc, &schema, selection)),
+            Ok(None) => docs.push(serde_json::json!({"id": slot_id})),
+            Err(_) => docs.push(serde_json::json!({"id": slot_id})),
         }
     }
     Json(serde_json::json!({"documents": docs})).into_response()
@@ -866,19 +1049,29 @@ async fn handle_stats(
         }
     };
 
-    let (bound_entries, bound_bytes, meta_entries, meta_bytes) = engine.bound_cache_stats();
     let uc = engine.unified_cache_stats();
+    let entries: Vec<serde_json::Value> = engine.unified_cache_entry_details().into_iter().map(|e| {
+        serde_json::json!({
+            "sort_field": e.sort_field,
+            "direction": e.direction,
+            "filter_count": e.filter_count,
+            "cardinality": e.cardinality,
+            "capacity": e.capacity,
+            "max_capacity": e.max_capacity,
+            "has_more": e.has_more,
+            "min_tracked_value": e.min_tracked_value,
+        })
+    }).collect();
     Json(serde_json::json!({
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
-        "bound_cache_entries": bound_entries,
-        "bound_cache_bytes": bound_bytes,
-        "meta_index_entries": meta_entries,
-        "meta_index_bytes": meta_bytes,
         "unified_cache_entries": uc.entries,
         "unified_cache_hits": uc.hits,
         "unified_cache_misses": uc.misses,
         "unified_cache_bytes": uc.memory_bytes,
+        "unified_cache_meta_entries": uc.meta_index_entries,
+        "unified_cache_meta_bytes": uc.meta_index_bytes,
+        "unified_cache_entry_details": entries,
     })).into_response()
 }
 
@@ -901,6 +1094,131 @@ async fn handle_clear_cache(
 
     engine.clear_unified_cache();
     Json(serde_json::json!({"cleared": true})).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Rebuild
+// ---------------------------------------------------------------------------
+
+async fn handle_rebuild(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<RebuildRequest>,
+) -> impl IntoResponse {
+    let (engine, config, load_progress, load_status, load_started_at) = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => {
+                // Check if already loading, saving, or rebuilding
+                {
+                    let status = idx.load_status.lock();
+                    if matches!(*status, LoadStatus::Loading { .. } | LoadStatus::Saving { .. }) {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": "Already loading, saving, or rebuilding"})),
+                        ).into_response();
+                    }
+                }
+                (
+                    Arc::clone(&idx.engine),
+                    idx.definition.config.clone(),
+                    Arc::clone(&idx.load_progress),
+                    Arc::clone(&idx.load_status),
+                    Arc::clone(&idx.load_started_at),
+                )
+            }
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    // Validate field names
+    if let Some(ref sort_names) = req.sort_fields {
+        for name in sort_names {
+            if !config.sort_fields.iter().any(|sc| &sc.name == name) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Unknown sort field: {}", name)})),
+                ).into_response();
+            }
+        }
+    }
+    if let Some(ref filter_names) = req.filter_fields {
+        for name in filter_names {
+            if !config.filter_fields.iter().any(|fc| &fc.name == name) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Unknown filter field: {}", name)})),
+                ).into_response();
+            }
+        }
+    }
+
+    // Reset progress and record start time
+    load_progress.store(0, Ordering::Release);
+    *load_started_at.lock() = Some(Instant::now());
+    *load_status.lock() = LoadStatus::Loading {
+        records_loaded: 0,
+        elapsed_secs: 0.0,
+    };
+
+    let sort_fields = req.sort_fields;
+    let filter_fields = req.filter_fields;
+    let save = req.save_snapshot;
+    let progress = Arc::clone(&load_progress);
+    let status = Arc::clone(&load_status);
+
+    // Spawn blocking rebuild task
+    tokio::task::spawn_blocking(move || {
+        match engine.rebuild_fields_from_docstore(sort_fields, filter_fields, progress.clone()) {
+            Ok((slots, fields)) => {
+                let elapsed = {
+                    let started = load_started_at.lock();
+                    started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
+                };
+
+                if save {
+                    *status.lock() = LoadStatus::Saving {
+                        records_loaded: slots,
+                        elapsed_secs: elapsed,
+                    };
+
+                    let snap_start = Instant::now();
+                    if let Err(e) = engine.save_snapshot() {
+                        eprintln!("rebuild: failed to save bitmap snapshot: {e}");
+                    } else {
+                        eprintln!("rebuild: bitmap snapshot saved in {:.1}s", snap_start.elapsed().as_secs_f64());
+                    }
+                }
+
+                let final_elapsed = {
+                    let started = load_started_at.lock();
+                    started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
+                };
+                *status.lock() = LoadStatus::Complete {
+                    records_loaded: slots,
+                    elapsed_secs: final_elapsed,
+                };
+
+                eprintln!("rebuild: done — {} slots, {} fields in {:.1}s",
+                    slots, fields.len(), final_elapsed);
+            }
+            Err(e) => {
+                *status.lock() = LoadStatus::Error {
+                    message: format!("Rebuild failed: {}", e),
+                };
+            }
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status": "rebuilding"})),
+    ).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -943,22 +1261,6 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.cache_misses_total
                 .with_label_values(&[name])
                 .set(uc.misses as i64);
-
-            // Bound cache + meta-index gauges
-            let (bound_entries, bound_bytes, meta_entries, meta_bytes) =
-                engine.bound_cache_stats();
-            m.bound_cache_entries
-                .with_label_values(&[name])
-                .set(bound_entries as i64);
-            m.bound_cache_bytes
-                .with_label_values(&[name])
-                .set(bound_bytes as i64);
-            m.meta_index_entries
-                .with_label_values(&[name])
-                .set(meta_entries as i64);
-            m.meta_index_bytes
-                .with_label_values(&[name])
-                .set(meta_bytes as i64);
 
             // Per-field bitmap memory gauges
             let (slot_bytes, _filter_bytes, _sort_bytes, _ce, _cb, filter_details, sort_details) =

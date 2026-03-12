@@ -212,6 +212,11 @@ impl FilterField {
     }
 
     /// Merge only dirty VersionedBitmaps.
+    /// Returns true if any bitmap in this field has unmerged diffs.
+    pub fn has_dirty(&self) -> bool {
+        self.bitmaps.values().any(|vb| vb.is_dirty())
+    }
+
     pub fn merge_dirty(&mut self) {
         for vb in self.bitmaps.values_mut() {
             if vb.is_dirty() {

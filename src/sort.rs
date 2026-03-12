@@ -351,6 +351,11 @@ impl SortField {
         }
     }
 
+    /// Returns true if any bit layer has unmerged diffs.
+    pub fn has_dirty(&self) -> bool {
+        self.bit_layers.iter().any(|layer| layer.is_dirty())
+    }
+
     /// Merge only dirty bit layers (those with pending diffs).
     pub fn merge_dirty(&mut self) {
         for layer in &mut self.bit_layers {

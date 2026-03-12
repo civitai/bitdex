@@ -1,10 +1,7 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
-use crate::bound_cache::{BoundCacheManager, BoundKey};
-use crate::cache::{self, CacheLookup, CacheKey, TrieCache};
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
 use crate::planner;
@@ -25,7 +22,12 @@ fn value_to_bitmap_key(val: &Value) -> Option<u64> {
 
 /// Pre-computed reverse string maps: field_name → (string_value → integer_key).
 /// Built from the DataSchema's FieldMapping string_map entries.
+/// For case-insensitive fields (the default), keys are stored lowercase.
 pub type StringMaps = HashMap<String, HashMap<String, i64>>;
+
+/// Set of field names where string matching is case-sensitive.
+/// Fields not in this set use case-insensitive matching (lowercase normalization).
+pub type CaseSensitiveFields = std::collections::HashSet<String>;
 
 /// Query executor: computes filter intersections and sort traversals.
 /// Uses the query planner for cardinality-based clause ordering.
@@ -36,9 +38,8 @@ pub struct QueryExecutor<'a> {
     max_page_size: usize,
     time_buckets: Option<&'a crate::time_buckets::TimeBucketManager>,
     now_unix: u64,
-    bound_cache: Option<&'a parking_lot::Mutex<BoundCacheManager>>,
     string_maps: Option<&'a StringMaps>,
-    bound_target_size: usize,
+    case_sensitive_fields: Option<&'a CaseSensitiveFields>,
 }
 
 impl<'a> QueryExecutor<'a> {
@@ -55,9 +56,8 @@ impl<'a> QueryExecutor<'a> {
             max_page_size,
             time_buckets: None,
             now_unix: 0,
-            bound_cache: None,
             string_maps: None,
-            bound_target_size: 10_000,
+            case_sensitive_fields: None,
         }
     }
 
@@ -68,17 +68,9 @@ impl<'a> QueryExecutor<'a> {
         self
     }
 
-    /// Attach a bound cache for sort working set reduction (D5).
-    /// Bounds shrink the candidate set before sort traversal.
-    pub fn with_bound_cache(mut self, bc: &'a parking_lot::Mutex<BoundCacheManager>) -> Self {
-        self.bound_cache = Some(bc);
-        self
-    }
-
-    /// Set the bound target size (number of slots to fetch when forming a new bound).
-    /// Defaults to 10,000.
-    pub fn with_bound_target_size(mut self, size: usize) -> Self {
-        self.bound_target_size = size;
+    /// Attach case-sensitive field set for string matching control.
+    pub fn with_case_sensitive_fields(mut self, fields: &'a CaseSensitiveFields) -> Self {
+        self.case_sensitive_fields = Some(fields);
         self
     }
 
@@ -101,6 +93,7 @@ impl<'a> QueryExecutor<'a> {
     }
 
     /// Resolve a Value to a bitmap key, consulting string_maps for MappedString fields.
+    /// Applies case-insensitive normalization (lowercase) unless the field is in case_sensitive_fields.
     fn resolve_value_key(&self, field: &str, val: &Value) -> Option<u64> {
         // Try direct conversion first (Integer, Bool)
         if let Some(key) = value_to_bitmap_key(val) {
@@ -110,7 +103,14 @@ impl<'a> QueryExecutor<'a> {
         if let Value::String(s) = val {
             if let Some(maps) = self.string_maps {
                 if let Some(field_map) = maps.get(field) {
-                    return field_map.get(s.as_str()).map(|&v| v as u64);
+                    let is_case_sensitive = self.case_sensitive_fields
+                        .map_or(false, |cs| cs.contains(field));
+                    let lookup = if is_case_sensitive {
+                        std::borrow::Cow::Borrowed(s.as_str())
+                    } else {
+                        std::borrow::Cow::Owned(s.to_lowercase())
+                    };
+                    return field_map.get(lookup.as_ref()).map(|&v| v as u64);
                 }
             }
         }
@@ -186,232 +186,6 @@ impl<'a> QueryExecutor<'a> {
             cursor: next_cursor,
             total_matched,
         })
-    }
-
-    /// Execute a query with trie cache integration.
-    /// Checks cache first, falls back to computation, stores results.
-    pub fn execute_with_cache(
-        &self,
-        filters: &[FilterClause],
-        sort: Option<&SortClause>,
-        limit: usize,
-        cursor: Option<&crate::query::CursorPosition>,
-        cache: &mut TrieCache,
-    ) -> Result<QueryResult> {
-        let limit = limit.min(self.max_page_size);
-
-        // Step 1: Plan the query (reorder clauses by cardinality)
-        let plan = planner::plan_query(filters, self.filters, self.slots);
-
-        // Step 2: Try cache lookup using canonical key (C5: use bucket-stable keys when available)
-        let cache_key = if let Some(tb) = self.time_buckets {
-            cache::canonicalize_with_buckets(&plan.ordered_clauses, Some(tb), self.now_unix)
-        } else {
-            cache::canonicalize(&plan.ordered_clauses)
-        };
-
-        let filter_arc = if let Some(ref key) = cache_key {
-            match cache.lookup(key) {
-                CacheLookup::ExactHit(cached_arc) => {
-                    // Cache hit — Arc clone (~1ns), no deep copy
-                    cached_arc
-                }
-                CacheLookup::PrefixHit { bitmap: prefix_arc, matched_prefix_len } => {
-                    // Partial cache hit — compute remaining clauses against cached prefix
-                    let remaining = &plan.ordered_clauses[matched_prefix_len..];
-                    let mut result = (*prefix_arc).clone();
-                    for clause in remaining {
-                        let clause_bitmap = self.evaluate_clause(clause)?;
-                        result &= &clause_bitmap;
-                    }
-                    // Store the full result in cache
-                    let arc = Arc::new(result);
-                    cache.store(key, arc.clone());
-                    arc
-                }
-                CacheLookup::Miss => {
-                    // Full miss — compute from scratch
-                    let result = self.compute_filters(&plan.ordered_clauses)?;
-                    let arc = Arc::new(result);
-                    cache.store(key, arc.clone());
-                    arc
-                }
-            }
-        } else {
-            // Uncacheable query (contains compound clauses) — compute without cache
-            Arc::new(self.compute_filters(&plan.ordered_clauses)?)
-        };
-
-        // Filter bitmaps are kept clean (no stale bits from deleted docs),
-        // so no alive AND is needed.
-        let total_matched = filter_arc.len();
-
-        // Step 3: Sort and paginate — with optional bound cache (D5)
-        let (ids, next_cursor) = if let Some(sort_clause) = sort {
-            // D5: Try to narrow working set with bound cache before sort traversal
-            let (sort_candidates, did_use_bound, escalated_tier) = self.apply_bound_if_available(
-                &filter_arc,
-                &cache_key,
-                sort_clause,
-                cursor,
-            );
-
-            // When bound was exhausted by cursor pagination, fetch extra results
-            // so the new bound covers enough range for subsequent pages.
-            let needs_bound_formation = escalated_tier > 0 && !did_use_bound;
-            let fetch_limit = if needs_bound_formation {
-                limit.max(self.bound_target_size)
-            } else {
-                limit
-            };
-
-            let (mut result_ids, result_cursor) = if plan.use_simple_sort && !did_use_bound {
-                self.simple_sort_and_paginate(&sort_candidates, sort_clause, fetch_limit, cursor)?
-            } else {
-                self.sort_and_paginate(&sort_candidates, sort_clause, fetch_limit, cursor)?
-            };
-
-            // D2: Form or update bound from sort results (promotion_threshold = 0)
-            // If cursor was past all existing tiers, form a bound at the escalated tier
-            // using the extra results fetched above.
-            if let (Some(bc), Some(ref key)) = (&self.bound_cache, &cache_key) {
-                self.form_or_update_bound(bc, key, sort_clause, &result_ids, escalated_tier);
-            }
-
-            // Trim back to the user's requested limit
-            if result_ids.len() > limit {
-                result_ids.truncate(limit);
-            }
-
-            // Recompute cursor from the last actually-returned ID
-            let actual_cursor = if result_ids.len() == limit {
-                let last_slot = *result_ids.last().unwrap() as u32;
-                let sort_field = self.sorts.get_field(&sort_clause.field);
-                sort_field.map(|sf| crate::query::CursorPosition {
-                    sort_value: sf.reconstruct_value(last_slot) as u64,
-                    slot_id: last_slot,
-                })
-            } else {
-                result_cursor
-            };
-
-            (result_ids, actual_cursor)
-        } else {
-            // No sort: return in descending slot order (newest first)
-            self.slot_order_paginate(&filter_arc, limit, cursor)
-        };
-
-        Ok(QueryResult {
-            ids,
-            cursor: next_cursor,
-            total_matched,
-        })
-    }
-
-    /// D5: Check bound cache and narrow candidates if a matching bound exists.
-    /// Returns (narrowed_candidates, did_use_bound, escalated_tier).
-    /// `escalated_tier` is the tier to form a bound at if cursor was past all existing tiers.
-    fn apply_bound_if_available(
-        &self,
-        candidates: &RoaringBitmap,
-        cache_key: &Option<CacheKey>,
-        sort_clause: &SortClause,
-        cursor: Option<&crate::query::CursorPosition>,
-    ) -> (RoaringBitmap, bool, u32) {
-        let Some(bc_mutex) = self.bound_cache else {
-            return (candidates.clone(), false, 0);
-        };
-        let Some(ref filter_key) = cache_key else {
-            return (candidates.clone(), false, 0);
-        };
-
-        let mut try_key = BoundKey {
-            filter_key: filter_key.clone(),
-            sort_field: sort_clause.field.clone(),
-            direction: sort_clause.direction,
-            tier: 0,
-        };
-
-        let mut bc = bc_mutex.lock();
-        let max_tiers = 4u32;
-        let mut highest_exhausted_tier = 0u32;
-        for _tier in 0..max_tiers {
-            let Some(entry) = bc.lookup_mut(&try_key) else {
-                break;
-            };
-
-            if entry.needs_rebuild() {
-                break; // Let query do full traversal and rebuild
-            }
-
-            // D6: If cursor is past this tier's range, try next tier
-            let cursor_past = if let Some(cursor) = cursor {
-                let cursor_val = cursor.sort_value as u32;
-                match sort_clause.direction {
-                    SortDirection::Desc => cursor_val < entry.min_tracked_value(),
-                    SortDirection::Asc => cursor_val > entry.min_tracked_value(),
-                }
-            } else {
-                false
-            };
-
-            if cursor_past {
-                highest_exhausted_tier = try_key.tier + 1;
-                try_key = BoundKey {
-                    filter_key: try_key.filter_key,
-                    sort_field: try_key.sort_field,
-                    direction: try_key.direction,
-                    tier: try_key.tier + 1,
-                };
-                continue;
-            }
-
-            entry.touch();
-            let narrowed = candidates & entry.bitmap();
-            return (narrowed, true, 0);
-        }
-
-        (candidates.clone(), false, highest_exhausted_tier.min(max_tiers - 1))
-    }
-
-    /// D2: Form or update a bound from sort results.
-    /// Called after every sort query with promotion_threshold = 0.
-    /// `target_tier` is the tier to form/update — usually 0, but higher when
-    /// cursor pagination has exhausted lower tiers.
-    fn form_or_update_bound(
-        &self,
-        bc_mutex: &parking_lot::Mutex<BoundCacheManager>,
-        filter_key: &CacheKey,
-        sort_clause: &SortClause,
-        result_ids: &[i64],
-        target_tier: u32,
-    ) {
-        let bound_key = BoundKey {
-            filter_key: filter_key.clone(),
-            sort_field: sort_clause.field.clone(),
-            direction: sort_clause.direction,
-            tier: target_tier,
-        };
-
-        let sort_field = match self.sorts.get_field(&sort_clause.field) {
-            Some(f) => f,
-            None => return,
-        };
-
-        let sorted_slots: Vec<u32> = result_ids.iter().map(|&id| id as u32).collect();
-
-        let mut bc = bc_mutex.lock();
-
-        if let Some(entry) = bc.get_mut(&bound_key) {
-            if entry.needs_rebuild() {
-                // Rebuild with fresh results
-                entry.rebuild(&sorted_slots, |slot| sort_field.reconstruct_value(slot));
-            }
-            // Otherwise, bound exists and doesn't need rebuild — leave it alone
-        } else {
-            // No bound exists — form one
-            bc.form_bound(bound_key, &sorted_slots, |slot| sort_field.reconstruct_value(slot));
-        }
     }
 
     /// Check if a single slot matches all the given filter clauses.
@@ -712,7 +486,7 @@ impl<'a> QueryExecutor<'a> {
                 narrowed.iter().rev().take(limit).map(|s| s as i64).collect()
             };
             let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
-                // Set sort_value = slot ID so apply_bound cursor-past-bound works for slot bounds
+                // Set sort_value = slot ID for cursor-based pagination
                 sort_value: last_id as u64,
                 slot_id: last_id as u32,
             });
@@ -729,7 +503,7 @@ impl<'a> QueryExecutor<'a> {
                 candidates.iter().rev().take(limit).map(|s| s as i64).collect()
             };
             let next_cursor = ids.last().map(|&last_id| crate::query::CursorPosition {
-                // Set sort_value = slot ID so apply_bound cursor-past-bound works for slot bounds
+                // Set sort_value = slot ID for cursor-based pagination
                 sort_value: last_id as u64,
                 slot_id: last_id as u32,
             });
@@ -830,7 +604,6 @@ impl<'a> QueryExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bound_cache::BoundCacheManager;
     use crate::config::{BucketConfig, Config, FilterFieldConfig, SortFieldConfig};
     use crate::filter::FilterFieldType;
     use crate::mutation::{Document, FieldValue, MutationEngine};
@@ -1392,135 +1165,6 @@ mod tests {
         let _ = executor.filter_index();
     }
 
-    // --- D5/D2/D8: Bound cache integration tests ---
-
-    #[test]
-    fn test_d5_bound_forms_on_first_sort_query() {
-        let mut h = TestHarness::new();
-
-        // Insert docs with varying reactionCount
-        for i in 1..=20u32 {
-            h.put(i, &make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                ("reactionCount", FieldValue::Single(Value::Integer((i * 100) as i64))),
-            ]));
-        }
-
-        let bc = parking_lot::Mutex::new(BoundCacheManager::new(10, 20));
-        let mut cache = TrieCache::new(h.config.cache.clone());
-
-        let executor = QueryExecutor::new(
-            &h.slots, &h.filters, &h.sorts, h.config.max_page_size,
-        ).with_bound_cache(&bc);
-
-        let sort = SortClause { field: "reactionCount".to_string(), direction: SortDirection::Desc };
-        let filters = vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))];
-
-        // First query — should form a bound
-        let result = executor.execute_with_cache(&filters, Some(&sort), 5, None, &mut cache).unwrap();
-        assert_eq!(result.ids.len(), 5);
-        assert_eq!(result.ids[0], 20); // highest reactionCount
-
-        // Bound should now exist
-        let bc_guard = bc.lock();
-        assert_eq!(bc_guard.len(), 1);
-    }
-
-    #[test]
-    fn test_d5_bound_used_on_second_query() {
-        let mut h = TestHarness::new();
-
-        for i in 1..=50u32 {
-            h.put(i, &make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                ("reactionCount", FieldValue::Single(Value::Integer((i * 10) as i64))),
-            ]));
-        }
-
-        let bc = parking_lot::Mutex::new(BoundCacheManager::new(10, 20));
-        let mut cache = TrieCache::new(h.config.cache.clone());
-
-        let executor = QueryExecutor::new(
-            &h.slots, &h.filters, &h.sorts, h.config.max_page_size,
-        ).with_bound_cache(&bc);
-
-        let sort = SortClause { field: "reactionCount".to_string(), direction: SortDirection::Desc };
-        let filters = vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))];
-
-        // First query forms the bound
-        let r1 = executor.execute_with_cache(&filters, Some(&sort), 5, None, &mut cache).unwrap();
-        assert_eq!(r1.ids, vec![50, 49, 48, 47, 46]);
-
-        // Second query should use the bound (same results expected)
-        let r2 = executor.execute_with_cache(&filters, Some(&sort), 5, None, &mut cache).unwrap();
-        assert_eq!(r2.ids, vec![50, 49, 48, 47, 46]);
-
-        // Bound should still be present
-        assert_eq!(bc.lock().len(), 1);
-    }
-
-    #[test]
-    fn test_d5_no_bound_without_sort() {
-        let mut h = TestHarness::new();
-
-        for i in 1..=10u32 {
-            h.put(i, &make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-            ]));
-        }
-
-        let bc = parking_lot::Mutex::new(BoundCacheManager::new(5, 10));
-        let mut cache = TrieCache::new(h.config.cache.clone());
-
-        let executor = QueryExecutor::new(
-            &h.slots, &h.filters, &h.sorts, h.config.max_page_size,
-        ).with_bound_cache(&bc);
-
-        // Query without sort — should NOT form a bound
-        let _ = executor.execute_with_cache(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-            None, 10, None, &mut cache,
-        ).unwrap();
-
-        assert_eq!(bc.lock().len(), 0);
-    }
-
-    #[test]
-    fn test_d5_different_filter_misses_bound() {
-        let mut h = TestHarness::new();
-
-        for i in 1..=20u32 {
-            let level = if i <= 10 { 1 } else { 2 };
-            h.put(i, &make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(level))),
-                ("reactionCount", FieldValue::Single(Value::Integer((i * 10) as i64))),
-            ]));
-        }
-
-        let bc = parking_lot::Mutex::new(BoundCacheManager::new(5, 10));
-        let mut cache = TrieCache::new(h.config.cache.clone());
-
-        let executor = QueryExecutor::new(
-            &h.slots, &h.filters, &h.sorts, h.config.max_page_size,
-        ).with_bound_cache(&bc);
-
-        let sort = SortClause { field: "reactionCount".to_string(), direction: SortDirection::Desc };
-
-        // Query with nsfwLevel=1 — forms a bound
-        let _ = executor.execute_with_cache(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-            Some(&sort), 5, None, &mut cache,
-        ).unwrap();
-
-        // Query with nsfwLevel=2 — different filter, should form a separate bound
-        let _ = executor.execute_with_cache(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(2))],
-            Some(&sort), 5, None, &mut cache,
-        ).unwrap();
-
-        // Should have 2 separate bounds
-        assert_eq!(bc.lock().len(), 2);
-    }
 
     // --- S4.5 / S4.6: Ascending slot-order and edge-case tests ---
 

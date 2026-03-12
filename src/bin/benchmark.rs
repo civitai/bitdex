@@ -620,10 +620,10 @@ fn load_records(path: &PathBuf, limit: usize, remap_ids: bool) -> Vec<(u32, Docu
 
 /// Print a detailed bitmap memory breakdown from the ConcurrentEngine.
 fn print_bitmap_memory(engine: &ConcurrentEngine) {
-    let (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details) =
+    let (slot_bytes, filter_bytes, sort_bytes, _cache_entries, cache_bytes, filter_details, sort_details) =
         engine.bitmap_memory_report();
-    let (bound_entries, bound_bytes, meta_entries, meta_bytes) = engine.bound_cache_stats();
-    let total = slot_bytes + filter_bytes + sort_bytes + cache_bytes + bound_bytes + meta_bytes;
+    let uc = engine.unified_cache_stats();
+    let total = slot_bytes + filter_bytes + sort_bytes + cache_bytes;
 
     println!("--- Bitmap Memory (pure Bitdex, excludes docstore/allocator) ---");
     println!("  Slots (alive+clean):  {:>10}", format_bytes(slot_bytes as u64));
@@ -635,9 +635,8 @@ fn print_bitmap_memory(engine: &ConcurrentEngine) {
     for (name, bytes) in &sort_details {
         println!("    {:<22}              {:>10}", name, format_bytes(*bytes as u64));
     }
-    println!("  Trie cache:           {:>10}  ({} entries)", format_bytes(cache_bytes as u64), cache_entries);
-    println!("  Bound cache:          {:>10}  ({} bounds)", format_bytes(bound_bytes as u64), bound_entries);
-    println!("  Meta-index:           {:>10}  ({} registered)", format_bytes(meta_bytes as u64), meta_entries);
+    println!("  Unified cache:        {:>10}  ({} entries, {} hits, {} misses)",
+        format_bytes(uc.memory_bytes as u64), uc.entries, uc.hits, uc.misses);
     println!("  ----------------------------------------");
     println!("  Total bitmap memory:  {:>10}", format_bytes(total as u64));
     println!();
@@ -1551,7 +1550,7 @@ fn main() {
             },
         ];
 
-        // Warm-up: run each query 10 times to populate trie cache
+        // Warm-up: run each query 10 times to populate unified cache
         let warmup_passes = 10;
         println!("  Warming up ({} passes x {} queries)...", warmup_passes, queries.len());
         for _ in 0..warmup_passes {
@@ -1597,20 +1596,20 @@ fn main() {
         }
         println!();
 
-        // Show bitmap memory after queries (trie cache + bound cache populated)
+        // Show bitmap memory after queries (unified cache populated)
         print_bitmap_memory(&engine);
 
         // -------------------------------------------------------------------
-        // Phase 5b: Bound Cache Effectiveness
+        // Phase 5b: Unified Cache Effectiveness (cold vs warm)
         //
-        // Measures the speedup from bound cache narrowing on sort queries.
-        // Clear the bound cache, run each sort query once (cold — trie cache
-        // warm but no bound), then run it again with the bound formed.
+        // Measures the speedup from unified cache on sort queries.
+        // Clear the cache, run each sort query once (cold), then run it
+        // again with the cache populated.
         // -------------------------------------------------------------------
-        println!("--- Phase 5b: Bound Cache Effectiveness (cold vs warm) ---");
+        println!("--- Phase 5b: Unified Cache Effectiveness (cold vs warm) ---");
         println!();
 
-        engine.clear_bound_cache();
+        engine.clear_unified_cache();
 
         struct BoundTestSpec {
             name: &'static str,
@@ -1666,7 +1665,7 @@ fn main() {
         println!("  {}", "-".repeat(72));
 
         for bt in &bound_tests {
-            // Cold: no bound exists (trie cache still warm)
+            // Cold: no cached results
             let cold_start = Instant::now();
             let _ = engine.query(&bt.filters, Some(&bt.sort), bt.limit).unwrap();
             let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
@@ -1687,11 +1686,11 @@ fn main() {
         }
         println!();
 
-        // Report bound cache stats after effectiveness test
+        // Report unified cache stats after effectiveness test
         {
-            let (be, bb, me, mb) = engine.bound_cache_stats();
-            println!("  Bound cache after effectiveness test: {} bounds, {}", be, format_bytes(bb as u64));
-            println!("  Meta-index: {} entries, {}", me, format_bytes(mb as u64));
+            let uc = engine.unified_cache_stats();
+            println!("  Unified cache after effectiveness test: {} entries, {} hits, {} misses",
+                uc.entries, uc.hits, uc.misses);
         }
         println!();
 
@@ -1761,12 +1760,12 @@ fn main() {
         }
         drop(snap);
 
-        // Report bound cache stats after pagination
+        // Report unified cache stats after pagination
         {
-            let (be, bb, me, mb) = engine.bound_cache_stats();
+            let uc = engine.unified_cache_stats();
             println!();
-            println!("  Bound cache after pagination: {} bounds, {}", be, format_bytes(bb as u64));
-            println!("  Meta-index: {} entries, {}", me, format_bytes(mb as u64));
+            println!("  Unified cache after pagination: {} entries, {} hits, {} misses",
+                uc.entries, uc.hits, uc.misses);
         }
         println!();
     }

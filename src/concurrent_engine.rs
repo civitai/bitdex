@@ -9,18 +9,19 @@ use arc_swap::{ArcSwap, Guard};
 use crossbeam_channel::{Receiver, Sender};
 use roaring::RoaringBitmap;
 
+use rayon::prelude::*;
+
 use crate::bitmap_fs::BitmapFs;
-use crate::bound_cache::{BoundCacheManager, BoundKey};
 use crate::filter::FilterFieldType;
-use crate::cache::{self, CacheLookup, CacheKey, TrieCache};
+use crate::cache;
 use crate::concurrency::InFlightTracker;
 use crate::config::Config;
 use crate::docstore::{DocStore, StoredDoc};
 use crate::error::Result;
-use crate::executor::{QueryExecutor, StringMaps};
-use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, Document, FieldRegistry, PatchPayload};
+use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
+use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, value_to_sort_u32, Document, FieldRegistry, PatchPayload};
 use crate::planner;
-use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
+use crate::query::{BitdexQuery, FilterClause, SortClause};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
 use crate::unified_cache::{UnifiedCache, UnifiedCacheConfig, UnifiedKey};
@@ -68,7 +69,6 @@ pub struct InnerEngine {
 /// no contention with writers or the flush thread.
 pub struct ConcurrentEngine {
     inner: Arc<ArcSwap<InnerEngine>>,
-    cache: Arc<parking_lot::Mutex<TrieCache>>,
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
     docstore: Arc<parking_lot::Mutex<DocStore>>,
@@ -79,7 +79,6 @@ pub struct ConcurrentEngine {
     flush_handle: Option<JoinHandle<()>>,
     merge_handle: Option<JoinHandle<()>>,
     bitmap_store: Option<Arc<BitmapFs>>,
-    bound_cache: Arc<parking_lot::Mutex<BoundCacheManager>>,
     loading_mode: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
     time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
@@ -93,7 +92,9 @@ pub struct ConcurrentEngine {
     lazy_tx: Sender<LazyLoad>,
     /// Reverse string maps for MappedString field query resolution.
     string_maps: Option<Arc<StringMaps>>,
-    /// Unified cache: replaces trie cache + bound cache (migration phase).
+    /// Fields where string matching is case-sensitive (default is case-insensitive).
+    case_sensitive_fields: Option<Arc<CaseSensitiveFields>>,
+    /// Unified cache: primary query result cache.
     unified_cache: Arc<parking_lot::Mutex<UnifiedCache>>,
     /// Flush loop stats: total snapshot publishes (monotonic counter).
     flush_publish_count: Arc<AtomicU64>,
@@ -131,7 +132,6 @@ impl ConcurrentEngine {
         }
 
         let field_registry = FieldRegistry::from_config(&config);
-        let cache = Arc::new(parking_lot::Mutex::new(TrieCache::new(config.cache.clone())));
 
         // Open filesystem bitmap store if configured
         let bitmap_store = if let Some(ref path) = config.storage.bitmap_path {
@@ -173,17 +173,31 @@ impl ConcurrentEngine {
                             pending_filter_loads.insert(fc.name.clone());
                         }
                     }
+                    // Time bucket sort field: load eagerly (needed for bucket rebuild)
+                    let tb_sort_field = config.time_buckets.as_ref()
+                        .map(|tb| tb.sort_field.clone());
+
                     for sc in &config.sort_fields {
+                        if tb_sort_field.as_deref() == Some(&sc.name) {
+                            // Eagerly load the sort field used by time buckets
+                            if let Some(ref store) = bitmap_store {
+                                if let Ok(Some(layers)) = store.load_sort_layers(&sc.name, sc.bits as usize) {
+                                    if !layers.is_empty() {
+                                        sorts.add_field(sc.clone());
+                                        if let Some(field) = sorts.get_field_mut(&sc.name) {
+                                            field.load_layers(layers);
+                                        }
+                                        eprintln!("Eagerly loaded sort field '{}' for time buckets", sc.name);
+                                        continue; // Don't add to pending
+                                    }
+                                }
+                            }
+                        }
                         pending_sort_loads.insert(sc.name.clone());
                     }
                 }
             }
         }
-        let bound_cache = Arc::new(parking_lot::Mutex::new(BoundCacheManager::with_max_count(
-            config.cache.bound_target_size,
-            config.cache.bound_max_size,
-            config.cache.bound_max_count,
-        )));
         let unified_cache = Arc::new(parking_lot::Mutex::new(UnifiedCache::new(
             UnifiedCacheConfig::default(),
         )));
@@ -191,11 +205,30 @@ impl ConcurrentEngine {
 
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
         let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
-            Arc::new(parking_lot::Mutex::new(TimeBucketManager::new_with_sort_field(
+            let mut tb = TimeBucketManager::new_with_sort_field(
                 tb_config.filter_field.clone(),
                 tb_config.sort_field.clone(),
                 tb_config.range_buckets.clone(),
-            )))
+            );
+
+            // Restore persisted time bucket bitmaps from disk
+            if let Some(ref store) = bitmap_store {
+                match store.load_time_buckets() {
+                    Ok(persisted) if !persisted.is_empty() => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let count = persisted.len();
+                        tb.load_persisted(&persisted, now);
+                        eprintln!("Restored {count} time bucket bitmaps from disk");
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Warning: failed to load time buckets: {e}"),
+                }
+            }
+
+            Arc::new(parking_lot::Mutex::new(tb))
         });
 
         let inner_engine = InnerEngine {
@@ -218,13 +251,6 @@ impl ConcurrentEngine {
 
         let docstore = Arc::new(parking_lot::Mutex::new(docstore));
 
-        // Collect filter field names for cache invalidation
-        let filter_field_names: Vec<String> = config
-            .filter_fields
-            .iter()
-            .map(|f| f.name.clone())
-            .collect();
-
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
         let dirty_flag = Arc::new(AtomicBool::new(false));
@@ -243,12 +269,9 @@ impl ConcurrentEngine {
 
         let flush_handle = {
             let inner = Arc::clone(&inner);
-            let cache = Arc::clone(&cache);
             let shutdown = Arc::clone(&shutdown);
             let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
-            let field_names = filter_field_names;
-            let flush_bound_cache = Arc::clone(&bound_cache);
             let flush_unified_cache = Arc::clone(&unified_cache);
             let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
@@ -338,72 +361,6 @@ impl ConcurrentEngine {
                         // This avoids the expensive staging.clone() → Arc::make_mut clone
                         // cascade that dominates write cost at scale.
                         if !flush_loading_mode.load(Ordering::Relaxed) {
-                            // D3/E3: Live maintenance of bound caches on sort field mutations.
-                            // Uses meta-index for O(1) lookup of relevant bounds instead of
-                            // linear scan. For each mutated slot, check if its new sort value
-                            // qualifies for any matching bound. Bits are only added, never
-                            // removed — bloat control (D4) handles cleanup.
-                            {
-                                let sort_mutations = coalescer.mutated_sort_slots();
-                                if !sort_mutations.is_empty() {
-                                    let mut bc = flush_bound_cache.lock();
-                                    if !bc.is_empty() {
-                                        for (sort_field, slots) in &sort_mutations {
-                                            // E3: Use meta-index to find matching bounds (O(1) vs linear)
-                                            let matching_keys = bc.bounds_for_sort_field(sort_field);
-
-                                            if matching_keys.is_empty() {
-                                                continue;
-                                            }
-
-                                            for &slot in slots {
-                                                let value = staging.sorts
-                                                    .get_field(sort_field)
-                                                    .map(|f| f.reconstruct_value(slot))
-                                                    .unwrap_or(0);
-
-                                                for bound_key in &matching_keys {
-                                                    if let Some(entry) = bc.get_mut(bound_key) {
-                                                        if entry.needs_rebuild() {
-                                                            continue;
-                                                        }
-                                                        let qualifies = match bound_key.direction {
-                                                            SortDirection::Desc => value > entry.min_tracked_value(),
-                                                            SortDirection::Asc => value < entry.min_tracked_value(),
-                                                        };
-                                                        if qualifies {
-                                                            entry.add_slot(slot);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Live maintenance for slot-based bounds: newly-alive slots
-                            // are monotonically increasing and always qualify for Desc bounds.
-                            {
-                                let alive_inserts = coalescer.alive_inserts();
-                                if !alive_inserts.is_empty() {
-                                    let mut bc = flush_bound_cache.lock();
-                                    let slot_bound_keys = bc.bounds_for_sort_field("__slot__");
-                                    for bound_key in &slot_bound_keys {
-                                        if let Some(entry) = bc.get_mut(bound_key) {
-                                            if !entry.needs_rebuild() {
-                                                for &slot in alive_inserts {
-                                                    // New slots are always > min_tracked for Desc
-                                                    if slot > entry.min_tracked_value() {
-                                                        entry.add_slot(slot);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
                             // Live maintenance for time buckets: add newly-alive slots to
                             // qualifying buckets, remove deleted slots from all buckets.
                             if let Some(ref tb_arc) = flush_time_buckets {
@@ -430,115 +387,33 @@ impl ConcurrentEngine {
                                 }
                             }
 
-                            // Cache maintenance: live updates for Eq entries, invalidation for the rest.
-                            if coalescer.has_alive_mutations() {
-                                // Alive changed — invalidate all filter fields because NotEq/Not
-                                // bake alive into cached results. Live update can't fix this.
-                                let mut c = cache.lock();
-                                for name in &field_names {
-                                    c.invalidate_field(name);
-                                }
-                            } else {
-                                // Live update: insert/remove mutated slots into matching Eq cache entries.
-                                // Non-Eq entries (NotEq, In) are not registered in the meta-index and
-                                // fall back to field-level generation-counter invalidation.
-                                let changed = coalescer.mutated_filter_fields();
-                                if !changed.is_empty() {
-                                    let mut c = cache.lock();
-
-                                    // Collect all live-updated (entry_id, field) pairs for generation refresh
-                                    let mut live_updated: Vec<(u32, String)> = Vec::new();
-
-                                    // Live-update Eq cache entries with inserted slots
-                                    for (filter_key, inserted_slots) in coalescer.filter_insert_entries() {
-                                        let value_repr = filter_key.value.to_string();
-                                        let ids: Vec<u32> = c.meta().entries_for_clause(&filter_key.field, "eq", &value_repr)
-                                            .map(|bm| bm.iter().collect())
-                                            .unwrap_or_default();
-                                        for id in &ids {
-                                            for &slot in inserted_slots {
-                                                c.update_entry_by_id(*id, slot, true);
-                                            }
-                                            live_updated.push((*id, filter_key.field.to_string()));
-                                        }
-                                    }
-
-                                    // Live-update Eq cache entries with removed slots
-                                    for (filter_key, removed_slots) in coalescer.filter_remove_entries() {
-                                        let value_repr = filter_key.value.to_string();
-                                        let ids: Vec<u32> = c.meta().entries_for_clause(&filter_key.field, "eq", &value_repr)
-                                            .map(|bm| bm.iter().collect())
-                                            .unwrap_or_default();
-                                        for id in &ids {
-                                            for &slot in removed_slots {
-                                                c.update_entry_by_id(*id, slot, false);
-                                            }
-                                            live_updated.push((*id, filter_key.field.to_string()));
-                                        }
-                                    }
-
-                                    // Invalidate all changed fields (bumps generation counter).
-                                    // This invalidates non-Eq entries (NotEq, In, range).
-                                    for name in &changed {
-                                        c.invalidate_field(name);
-                                    }
-
-                                    // Refresh generations on live-updated Eq entries so the
-                                    // generation bump doesn't falsely invalidate them.
-                                    for (id, field) in &live_updated {
-                                        c.refresh_entry_generation(*id, field);
-                                    }
-                                }
-                            }
-
-                            // D3: Invalidate bounds whose filter fields changed.
-                            // Alive mutations affect all bounds (alive is implicit in filter results).
-                            {
-                                let changed_filters = coalescer.mutated_filter_fields();
-                                let has_alive = coalescer.has_alive_mutations();
-                                if has_alive || !changed_filters.is_empty() {
-                                    let mut bc = flush_bound_cache.lock();
-                                    if !bc.is_empty() {
-                                        if has_alive {
-                                            // Alive changed — mark ALL bounds for rebuild
-                                            for (_, entry) in bc.iter_mut() {
-                                                entry.mark_for_rebuild();
-                                            }
-                                        } else {
-                                            for field_name in &changed_filters {
-                                                bc.invalidate_filter_field(field_name);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
                             // Unified cache live maintenance.
                             // Runs after bitmap mutations are applied to staging.
                             {
                                 let mut uc = flush_unified_cache.lock();
                                 if !uc.is_empty() {
-                                    if coalescer.has_alive_mutations() {
-                                        uc.maintain_alive_changes();
-                                    } else {
-                                        // Filter maintenance
-                                        if !coalescer.mutated_filter_fields().is_empty() {
-                                            uc.maintain_filter_changes(
-                                                coalescer.filter_insert_entries(),
-                                                coalescer.filter_remove_entries(),
-                                                &staging.filters,
-                                                &staging.sorts,
-                                            );
-                                        }
-                                        // Sort maintenance
-                                        let sort_mutations = coalescer.mutated_sort_slots();
-                                        if !sort_mutations.is_empty() {
-                                            uc.maintain_sort_changes(
-                                                &sort_mutations,
-                                                &staging.filters,
-                                                &staging.sorts,
-                                            );
-                                        }
+                                    // Targeted alive removal: remove deleted slots from
+                                    // all cache entries without blanket rebuild.
+                                    for &slot in coalescer.alive_removes() {
+                                        uc.remove_slot_from_all(slot);
+                                    }
+                                    // Filter maintenance
+                                    if !coalescer.mutated_filter_fields().is_empty() {
+                                        uc.maintain_filter_changes(
+                                            coalescer.filter_insert_entries(),
+                                            coalescer.filter_remove_entries(),
+                                            &staging.filters,
+                                            &staging.sorts,
+                                        );
+                                    }
+                                    // Sort maintenance
+                                    let sort_mutations = coalescer.mutated_sort_slots();
+                                    if !sort_mutations.is_empty() {
+                                        uc.maintain_sort_changes(
+                                            &sort_mutations,
+                                            &staging.filters,
+                                            &staging.sorts,
+                                        );
                                     }
                                 }
                             }
@@ -572,12 +447,7 @@ impl ConcurrentEngine {
                         for (_name, field) in staging.filters.fields_mut() {
                             field.merge_dirty();
                         }
-                        // Invalidate all caches — they may be stale from the loading period
-                        let mut c = cache.lock();
-                        for name in &field_names {
-                            c.invalidate_field(name);
-                        }
-                        drop(c);
+                        // Invalidate unified cache — may be stale from the loading period
                         flush_unified_cache.lock().clear();
                         inner.store(Arc::new(staging.clone()));
                         staging_dirty = false;
@@ -648,7 +518,7 @@ impl ConcurrentEngine {
                                         }
                                     }
 
-                                    let elapsed = start.elapsed();
+                                    let _tb_elapsed = start.elapsed();
 
                                     // Brief lock: capture old bitmaps, swap in new ones
                                     let mut bucket_diffs: Vec<(String, RoaringBitmap, RoaringBitmap)> = Vec::new();
@@ -672,7 +542,8 @@ impl ConcurrentEngine {
                                             );
                                         }
                                     }
-                                    cache.lock().invalidate_field(&field_name);
+                                    // Mark dirty so merge thread persists time buckets
+                                    flush_dirty_flag.store(true, Ordering::Release);
 
                                     // Push bucket diffs to unified cache
                                     if !bucket_diffs.is_empty() {
@@ -690,6 +561,8 @@ impl ConcurrentEngine {
                                             }
                                         }
                                     }
+                                } else {
+                                    eprintln!("Time bucket: sort field '{}' not found in staging", sort_field_name);
                                 }
                             }
                         }
@@ -729,11 +602,6 @@ impl ConcurrentEngine {
                         field.merge_dirty();
                     }
 
-                    // Shutdown: invalidate all fields for safety
-                    let mut c = cache.lock();
-                    for name in &field_names {
-                        c.invalidate_field(name);
-                    }
                     inner.store(Arc::new(staging.clone()));
                 }
 
@@ -758,6 +626,10 @@ impl ConcurrentEngine {
             let merge_dirty_flag = Arc::clone(&dirty_flag);
             let sort_field_configs: Vec<crate::config::SortFieldConfig> =
                 config.sort_fields.clone();
+            let merge_pending_sorts = Arc::clone(&pending_sort_loads);
+            let merge_pending_filters = Arc::clone(&pending_filter_loads);
+            let merge_lazy_values = Arc::clone(&lazy_value_fields);
+            let merge_time_buckets = time_buckets.as_ref().map(Arc::clone);
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
@@ -771,13 +643,26 @@ impl ConcurrentEngine {
                     if let Some(ref store) = merge_bitmap_store {
                         let snap = merge_inner.load_full();
                         let mut compacted = (*snap).clone();
-                        for (_name, field) in compacted.filters.fields_mut() {
-                            field.merge_dirty();
-                        }
 
-                        // Collect filter bitmap entries for persistence
+                        // Only persist fields that are (a) loaded and (b) dirty.
+                        // Pending lazy-load fields are empty placeholders — writing
+                        // them would overwrite real data on disk. Clean fields don't
+                        // need rewriting.
+                        let pending_s = merge_pending_sorts.lock().clone();
+                        let pending_f = merge_pending_filters.lock().clone();
+                        let lazy_v = merge_lazy_values.lock().clone();
+
+                        // Collect filter bitmap entries — all loaded fields.
+                        // Note: we don't check has_dirty() per-field because the flush
+                        // thread's periodic compaction (merge_dirty) clears per-field
+                        // dirty flags before the merge thread runs, creating a race.
+                        // The dirty_flag AtomicBool gates the write at the top level.
                         let mut filter_entries: Vec<(String, u64, RoaringBitmap)> = Vec::new();
-                        for (name, field) in compacted.filters.fields() {
+                        for (name, field) in compacted.filters.fields_mut() {
+                            if pending_f.contains(name) || lazy_v.contains(name) {
+                                continue;
+                            }
+                            field.merge_dirty();
                             for (&value, vb) in field.iter_versioned() {
                                 filter_entries.push((
                                     name.clone(),
@@ -787,10 +672,14 @@ impl ConcurrentEngine {
                             }
                         }
 
-                        // Collect sort layer bases
+                        // Collect sort layer bases — all loaded fields
                         let mut sort_data: Vec<(String, Vec<RoaringBitmap>)> = Vec::new();
                         for sc in &sort_field_configs {
-                            if let Some(sf) = compacted.sorts.get_field(&sc.name) {
+                            if pending_s.contains(&sc.name) {
+                                continue;
+                            }
+                            if let Some(sf) = compacted.sorts.get_field_mut(&sc.name) {
+                                sf.merge_dirty();
                                 let bases: Vec<RoaringBitmap> = sf
                                     .layer_bases()
                                     .iter()
@@ -826,6 +715,18 @@ impl ConcurrentEngine {
                         ) {
                             eprintln!("merge thread: bitmap snapshot write failed: {e}");
                         }
+
+                        // Persist time bucket bitmaps alongside filter/sort data
+                        if let Some(ref tb_arc) = merge_time_buckets {
+                            let tb = tb_arc.lock();
+                            for (name, bitmap) in tb.all_buckets() {
+                                if !bitmap.is_empty() {
+                                    if let Err(e) = store.write_time_bucket(name, bitmap) {
+                                        eprintln!("merge thread: time bucket write failed: {e}");
+                                    }
+                                }
+                            }
+                        }
                     }
                     } // needs_write
                 }
@@ -834,7 +735,6 @@ impl ConcurrentEngine {
 
         Ok(Self {
             inner,
-            cache,
             sender,
             doc_tx,
             docstore,
@@ -845,7 +745,6 @@ impl ConcurrentEngine {
             flush_handle: Some(flush_handle),
             merge_handle: Some(merge_handle),
             bitmap_store,
-            bound_cache,
             loading_mode,
             dirty_since_snapshot: Arc::clone(&dirty_flag),
             time_buckets,
@@ -854,6 +753,7 @@ impl ConcurrentEngine {
             lazy_value_fields,
             lazy_tx,
             string_maps: None,
+            case_sensitive_fields: None,
             unified_cache,
             flush_publish_count,
             flush_duration_nanos,
@@ -865,6 +765,11 @@ impl ConcurrentEngine {
     /// Call after creating the engine with schema data that includes string_map entries.
     pub fn set_string_maps(&mut self, maps: StringMaps) {
         self.string_maps = Some(Arc::new(maps));
+    }
+
+    /// Set the case-sensitive fields for string matching control.
+    pub fn set_case_sensitive_fields(&mut self, fields: CaseSensitiveFields) {
+        self.case_sensitive_fields = Some(Arc::new(fields));
     }
 
     /// Load the current snapshot (lock-free, zero refcount ops).
@@ -1036,10 +941,12 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            )
-            .with_bound_target_size(self.config.cache.bound_target_size);
+            );
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
+            }
+            if let Some(ref cs) = self.case_sensitive_fields {
+                base = base.with_case_sensitive_fields(cs);
             }
             if let Some(ref tb) = tb_guard {
                 base.with_time_buckets(tb, now_unix)
@@ -1051,41 +958,8 @@ impl ConcurrentEngine {
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, filters, tb_guard.as_deref(), now_unix)?;
 
-        // Compute total_matched from the FULL filter bitmap before bound narrowing.
-        // Filter bitmaps are kept clean (no stale bits from deleted docs),
-        // so no alive AND is needed.
-        let full_total_matched = filter_arc.len();
-
-        // D5: Narrow filter bitmap with bound cache.
-        // Synthesize implicit "__slot__" sort for filter-only queries so they
-        // benefit from slot-based bounds (newest-first = sort by slot desc).
-        let implicit_sort;
-        let bound_sort = match sort {
-            Some(s) => Some(s),
-            None => {
-                implicit_sort = SortClause {
-                    field: "__slot__".to_string(),
-                    direction: SortDirection::Desc,
-                };
-                Some(&implicit_sort)
-            }
-        };
-        let (effective_bitmap, use_simple, cache_key) =
-            self.apply_bound(&executor, &filter_arc, use_simple_sort, bound_sort, filters, None);
-
-        // Execute with ORIGINAL sort (None for filter-only) — bound narrows candidates,
-        // but slot-order pagination is used for filter-only queries.
         let mut result =
-            executor.execute_from_bitmap(&effective_bitmap, sort, limit, None, use_simple)?;
-
-        // Override total_matched with the accurate count from the full filter bitmap.
-        result.total_matched = full_total_matched;
-
-        // D2: Form or update bound from results (slot-based for filter-only)
-        self.update_bound_from_results(
-            &snap, bound_sort, &cache_key, &result.ids, None,
-            &filter_arc, &executor,
-        );
+            executor.execute_from_bitmap(&filter_arc, sort, limit, None, use_simple_sort)?;
 
         // Post-validation against in-flight writes
         self.post_validate(&mut result, filters, &executor)?;
@@ -1368,10 +1242,12 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            )
-            .with_bound_target_size(self.config.cache.bound_target_size);
+            );
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
+            }
+            if let Some(ref cs) = self.case_sensitive_fields {
+                base = base.with_case_sensitive_fields(cs);
             }
             if let Some(ref tb) = tb_guard {
                 base.with_time_buckets(tb, now_unix)
@@ -1383,13 +1259,12 @@ impl ConcurrentEngine {
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, &query.filters, tb_guard.as_deref(), now_unix)?;
 
-        // Compute total_matched from the FULL filter bitmap before bound narrowing.
         // Filter bitmaps are kept clean (no stale bits from deleted docs),
         // so no alive AND is needed.
         let full_total_matched = filter_arc.len();
 
         // Unified cache lookup: check for a cached bounded bitmap that combines
-        // filter + sort. On hit, skip the separate bound cache narrowing step.
+        // filter + sort. On hit, narrow the filter bitmap for sort acceleration.
         // Only for sorted queries above min_filter_size threshold.
         let (unified_key, unified_hit) = if let Some(sort_clause) = query.sort.as_ref() {
             let mut uc = self.unified_cache.lock();
@@ -1403,7 +1278,10 @@ impl ConcurrentEngine {
                     };
                     let hit = uc.lookup(&ukey).map(|entry| {
                         let bm = entry.bitmap().as_ref().clone();
-                        (bm, entry.has_more())
+                        let has_more = entry.has_more();
+                        let min_val = entry.min_tracked_value();
+                        let cap = entry.capacity();
+                        (bm, has_more, min_val, cap)
                     });
                     (Some(ukey), hit)
                 } else {
@@ -1416,34 +1294,83 @@ impl ConcurrentEngine {
             (None, None)
         };
 
-        // D5: Narrow filter bitmap with bound cache (skipped on unified cache hit).
-        // Synthesize implicit "__slot__" sort for filter-only queries.
-        let implicit_sort;
-        let bound_sort = match query.sort.as_ref() {
-            Some(s) => Some(s),
-            None => {
-                implicit_sort = SortClause {
-                    field: "__slot__".to_string(),
-                    direction: SortDirection::Desc,
-                };
-                Some(&implicit_sort)
+        // Check if cursor is past the cache boundary — trigger expansion if so.
+        // On cache hit with a cursor whose sort_value is strictly past min_tracked_value,
+        // do a full traversal for the next chunk and expand the cache entry.
+        // When sort_value equals min_tracked_value (common with ties like reactionCount=0),
+        // check if the cursor slot is still within the cached bitmap to avoid
+        // redundant expansion on every page.
+        let needs_expansion = if let (Some((ref unified_bm, _, min_val, _)), Some(cursor), Some(sort_clause))
+            = (&unified_hit, query.cursor.as_ref(), query.sort.as_ref())
+        {
+            let strictly_past = match sort_clause.direction {
+                crate::query::SortDirection::Desc => cursor.sort_value < *min_val as u64,
+                crate::query::SortDirection::Asc => cursor.sort_value > *min_val as u64,
+            };
+            let at_boundary = cursor.sort_value == *min_val as u64;
+            if strictly_past {
+                true
+            } else if at_boundary {
+                // At the boundary value: only expand if cursor slot is NOT in the bitmap
+                // (if it's in the bitmap, we're still within bounds)
+                !unified_bm.contains(cursor.slot_id)
+            } else {
+                false
             }
+        } else {
+            false
         };
 
-        let (effective_bitmap, use_simple, cache_key) = if let Some((ref unified_bm, _)) = unified_hit {
-            // Unified cache hit — use bounded bitmap directly, AND with filter for freshness
-            let narrowed = &filter_arc.as_ref().clone() & unified_bm;
-            (narrowed, false, cache::canonicalize(&query.filters))
+        let (effective_bitmap, use_simple) = if needs_expansion {
+            if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
+                if *has_more {
+                    // Expand: do a full traversal to get the next capacity-sized chunk,
+                    // then feed results into the cache entry.
+                    let expand_limit = *capacity; // get capacity more results
+                    let expand_result = executor.execute_from_bitmap_unclamped(
+                        &filter_arc,
+                        query.sort.as_ref(),
+                        expand_limit,
+                        query.cursor.as_ref(),
+                        use_simple_sort,
+                    )?;
+
+                    if !expand_result.ids.is_empty() {
+                        let sorted_slots: Vec<u32> = expand_result.ids.iter()
+                            .map(|&id| id as u32).collect();
+                        let sort_field = snap.sorts.get_field(&ukey.sort_field);
+                        let value_fn = |slot: u32| -> u32 {
+                            sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                        };
+                        let mut uc = self.unified_cache.lock();
+                        if let Some(entry) = uc.lookup(ukey) {
+                            entry.expand(&sorted_slots, value_fn);
+                        }
+                    }
+
+                    // Re-read the expanded bitmap
+                    let mut uc = self.unified_cache.lock();
+                    if let Some(entry) = uc.lookup(ukey) {
+                        (entry.bitmap().as_ref().clone(), false)
+                    } else {
+                        (filter_arc.as_ref().clone(), use_simple_sort)
+                    }
+                } else {
+                    // has_more is false — cache covers everything
+                    if let Some((ref unified_bm, ..)) = unified_hit {
+                        (unified_bm.clone(), false)
+                    } else {
+                        (filter_arc.as_ref().clone(), use_simple_sort)
+                    }
+                }
+            } else {
+                (filter_arc.as_ref().clone(), use_simple_sort)
+            }
+        } else if let Some((ref unified_bm, ..)) = unified_hit {
+            // Unified cache hit, cursor within boundary — use cached bitmap directly.
+            (unified_bm.clone(), false)
         } else {
-            // Unified cache miss — fall through to existing bound cache path
-            self.apply_bound(
-                &executor,
-                &filter_arc,
-                use_simple_sort,
-                bound_sort,
-                &query.filters,
-                query.cursor.as_ref(),
-            )
+            (filter_arc.as_ref().clone(), use_simple_sort)
         };
 
         // Offset pagination: if offset is set and no cursor, request offset+limit results
@@ -1455,7 +1382,6 @@ impl ConcurrentEngine {
         };
         let fetch_limit = query.limit.saturating_add(offset);
 
-        // Execute with ORIGINAL sort — bound narrows candidates only.
         let bound_was_applied = effective_bitmap.len() < filter_arc.len();
         let mut result = executor.execute_from_bitmap(
             &effective_bitmap,
@@ -1465,23 +1391,54 @@ impl ConcurrentEngine {
             use_simple,
         )?;
 
-        // Bound exhaustion retry: if the bound-narrowed bitmap returned 0 results
-        // but we have a cursor (meaning there should be more), retry with the full
-        // filter bitmap. This happens when the bound (global top-K) has a small
-        // intersection with a restrictive filter (e.g. 30-day time bucket).
-        if result.ids.is_empty() && query.cursor.is_some() && bound_was_applied {
+        // Bound exhaustion: if the bounded bitmap returned fewer results than requested,
+        // expand the cache and re-query from the expanded bitmap.
+        if result.ids.len() < fetch_limit && query.cursor.is_some() && bound_was_applied {
+            let did_expand = if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
+                if *has_more {
+                    let expand_limit = *capacity;
+                    let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
+                    let expand_result = executor.execute_from_bitmap_unclamped(
+                        &filter_arc,
+                        query.sort.as_ref(),
+                        expand_limit,
+                        expand_cursor,
+                        use_simple_sort,
+                    )?;
+                    if !expand_result.ids.is_empty() {
+                        let sorted_slots: Vec<u32> = expand_result.ids.iter()
+                            .map(|&id| id as u32).collect();
+                        let sort_field = snap.sorts.get_field(&ukey.sort_field);
+                        let value_fn = |slot: u32| -> u32 {
+                            sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                        };
+                        let mut uc = self.unified_cache.lock();
+                        if let Some(entry) = uc.lookup(ukey) {
+                            entry.expand(&sorted_slots, value_fn);
+                        }
+                    }
+                    true
+                } else { false }
+            } else { false };
+
+            // Re-query from expanded cache bitmap (small) or fall back to full filter
+            let re_bm = if did_expand {
+                if let Some(ref ukey) = unified_key {
+                    let mut uc = self.unified_cache.lock();
+                    uc.lookup(ukey).map(|e| e.bitmap().as_ref().clone())
+                } else { None }
+            } else { None };
+            let re_bm_ref = re_bm.as_ref().unwrap_or(filter_arc.as_ref());
             result = executor.execute_from_bitmap(
-                &filter_arc,
+                re_bm_ref,
                 query.sort.as_ref(),
                 fetch_limit,
                 query.cursor.as_ref(),
-                use_simple_sort,
+                false,
             )?;
         }
 
         // Override total_matched with the accurate count from the full filter bitmap.
-        // execute_from_bitmap computes total_matched from the possibly-narrowed bitmap,
-        // but users need the true count for pagination UI.
         result.total_matched = full_total_matched;
 
         // Apply offset: drop the first N results
@@ -1506,36 +1463,35 @@ impl ConcurrentEngine {
             }
         }
 
-        // D2/D6: Form or update bound from results (with cursor for tiered bounds).
-        // Passes filter bitmap + executor so bounds can be seeded with target_size
-        // entries via a full traversal, not just the page-limited result set.
-        self.update_bound_from_results(
-            &snap,
-            bound_sort,
-            &cache_key,
-            &result.ids,
-            query.cursor.as_ref(),
-            &filter_arc,
-            &executor,
-        );
-
-        // Unified cache formation: on miss with sort results, store the bounded
-        // bitmap for future queries with the same filter + sort combination.
+        // Unified cache formation: on miss with sort results, do a separate traversal
+        // for initial_capacity slots (default 1000) to properly seed the cache entry.
+        // The query result (with the user's limit, e.g. 20) is returned as-is.
         if unified_hit.is_none() {
             if let Some(ukey) = unified_key {
                 if !result.ids.is_empty() {
-                    let sort_field = snap.sorts.get_field(&ukey.sort_field);
-                    let sorted_slots: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
-                    let has_more = full_total_matched > sorted_slots.len() as u64;
-                    let value_fn = |slot: u32| -> u32 {
-                        sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                    };
-                    self.unified_cache.lock().form_and_store(
-                        ukey,
-                        &sorted_slots,
-                        has_more,
-                        value_fn,
-                    );
+                    let initial_cap = self.unified_cache.lock().config().initial_capacity;
+                    // Traverse for initial_capacity slots to seed the cache properly
+                    let seed_result = executor.execute_from_bitmap_unclamped(
+                        &filter_arc,
+                        query.sort.as_ref(),
+                        initial_cap,
+                        None, // no cursor — start from the top
+                        use_simple_sort,
+                    )?;
+                    if !seed_result.ids.is_empty() {
+                        let sort_field = snap.sorts.get_field(&ukey.sort_field);
+                        let sorted_slots: Vec<u32> = seed_result.ids.iter().map(|&id| id as u32).collect();
+                        let has_more = full_total_matched > sorted_slots.len() as u64;
+                        let value_fn = |slot: u32| -> u32 {
+                            sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                        };
+                        self.unified_cache.lock().form_and_store(
+                            ukey,
+                            &sorted_slots,
+                            has_more,
+                            value_fn,
+                        );
+                    }
                 }
             }
         }
@@ -1545,10 +1501,10 @@ impl ConcurrentEngine {
         Ok(result)
     }
 
-    /// Resolve filter clauses to a bitmap, using the trie cache with brief locks.
+    /// Resolve filter clauses to a bitmap.
     ///
-    /// Cache Mutex is held ONLY during lookup (~μs) and store (~μs),
-    /// never during filter computation or sort traversal.
+    /// Snaps range filters to time bucket bitmaps, plans clause ordering,
+    /// and computes the filter intersection.
     fn resolve_filters(
         &self,
         executor: &QueryExecutor,
@@ -1575,56 +1531,7 @@ impl ConcurrentEngine {
         };
 
         let plan = planner::plan_query(effective_filters, executor.filter_index(), executor.slot_allocator());
-        let cache_key = cache::canonicalize(&plan.ordered_clauses);
-
-        let filter_bitmap = if let Some(ref key) = cache_key {
-            // Brief lock: cache lookup only
-            let lookup = { self.cache.lock().lookup(key) };
-            // Lock released — CacheLookup owns its Arc bitmaps
-
-            match lookup {
-                CacheLookup::ExactHit(arc) => arc,
-                CacheLookup::PrefixHit { bitmap: prefix_arc, matched_prefix_len } => {
-                    // Sort clauses into canonical order (by field name) to match
-                    // the cache key ordering. The planner orders by cardinality,
-                    // but the cache key is alphabetical — using matched_prefix_len
-                    // as an index requires the same ordering.
-                    let mut canonical_clauses = plan.ordered_clauses.clone();
-                    canonical_clauses.sort_by(|a, b| {
-                        let ka = cache::CanonicalClause::from_filter(a);
-                        let kb = cache::CanonicalClause::from_filter(b);
-                        match (ka, kb) {
-                            (Some(a), Some(b)) => a.cmp(&b),
-                            (Some(_), None) => std::cmp::Ordering::Less,
-                            (None, Some(_)) => std::cmp::Ordering::Greater,
-                            (None, None) => std::cmp::Ordering::Equal,
-                        }
-                    });
-
-                    // Start from prefix bitmap, compute remaining clauses (no lock held)
-                    let mut bitmap = (*prefix_arc).clone();
-                    for clause in &canonical_clauses[matched_prefix_len..] {
-                        let clause_bm = executor.evaluate_clause(clause)?;
-                        bitmap &= &clause_bm;
-                    }
-                    // Brief lock: store result
-                    let arc = Arc::new(bitmap);
-                    self.cache.lock().store(key, arc.clone());
-                    arc
-                }
-                CacheLookup::Miss => {
-                    // Full computation (no lock held)
-                    let bitmap = executor.compute_filters(&plan.ordered_clauses)?;
-                    // Brief lock: store result
-                    let arc = Arc::new(bitmap);
-                    self.cache.lock().store(key, arc.clone());
-                    arc
-                }
-            }
-        } else {
-            // Uncacheable query — compute without cache
-            Arc::new(executor.compute_filters(&plan.ordered_clauses)?)
-        };
+        let filter_bitmap = Arc::new(executor.compute_filters(&plan.ordered_clauses)?);
 
         Ok((filter_bitmap, plan.use_simple_sort))
     }
@@ -1662,264 +1569,6 @@ impl ConcurrentEngine {
         }
 
         Ok(())
-    }
-
-    /// D5: Apply bound cache narrowing for sort queries.
-    ///
-    /// If a matching bound exists and is usable, ANDs the filter bitmap with the
-    /// bound bitmap to reduce the sort working set. Returns the effective bitmap,
-    /// whether to use simple sort, and the cache key for bound formation.
-    fn apply_bound(
-        &self,
-        _executor: &QueryExecutor,
-        filter_bitmap: &roaring::RoaringBitmap,
-        use_simple_sort: bool,
-        sort: Option<&SortClause>,
-        filters: &[FilterClause],
-        cursor: Option<&crate::query::CursorPosition>,
-    ) -> (roaring::RoaringBitmap, bool, Option<CacheKey>) {
-        let Some(sort_clause) = sort else {
-            return (filter_bitmap.clone(), use_simple_sort, None);
-        };
-
-        let cache_key = cache::canonicalize(filters);
-        let Some(ref filter_key) = cache_key else {
-            return (filter_bitmap.clone(), use_simple_sort, None);
-        };
-
-        let bound_key = BoundKey {
-            filter_key: filter_key.clone(),
-            sort_field: sort_clause.field.clone(),
-            direction: sort_clause.direction,
-            tier: 0,
-        };
-
-        let mut bc = self.bound_cache.lock();
-
-        // D6: Try tier 0 first, then escalate to higher tiers if cursor is past bound.
-        // When cursor is provided and all tiers are exhausted, skip bound entirely —
-        // bound cache is a first-page acceleration, not a correctness requirement.
-        let max_tiers = 4u32; // cap to avoid unbounded tier growth
-        let mut try_key = bound_key;
-        let mut skip_all_bounds = false;
-        for _tier in 0..max_tiers {
-            if let Some(entry) = bc.lookup_mut(&try_key) {
-                if !entry.needs_rebuild() {
-                    // Check if cursor is past this tier's range
-                    let cursor_past = if let Some(c) = cursor {
-                        let cursor_val = c.sort_value as u32;
-                        match sort_clause.direction {
-                            SortDirection::Desc => cursor_val <= entry.min_tracked_value(),
-                            SortDirection::Asc => cursor_val >= entry.min_tracked_value(),
-                        }
-                    } else {
-                        false
-                    };
-
-                    if cursor_past {
-                        // Try next tier
-                        try_key = BoundKey {
-                            filter_key: try_key.filter_key,
-                            sort_field: try_key.sort_field,
-                            direction: try_key.direction,
-                            tier: try_key.tier + 1,
-                        };
-                        continue;
-                    }
-
-                    entry.touch();
-                    let narrowed = filter_bitmap & entry.bitmap();
-                    return (narrowed, false, cache_key);
-                }
-            }
-            // No bound at this tier — if we got here because cursor was past
-            // previous tiers, skip all bounds to avoid 0-result pages.
-            if cursor.is_some() && try_key.tier > 0 {
-                skip_all_bounds = true;
-            }
-            break;
-        }
-        // If cursor exhausted all available tiers, it's past all bounds.
-        if cursor.is_some() && try_key.tier >= max_tiers {
-            skip_all_bounds = true;
-        }
-
-        // E4/S4.2: Superset matching — find a bound whose filter clauses are a
-        // subset of this query's. A bound for {nsfwLevel=1} can narrow a query
-        // for {nsfwLevel=1, onSite=true}. The bound bitmap is still ANDed with
-        // the full filter result, so correctness is preserved.
-        // Skip when cursor exhausted all available tiers.
-        if !skip_all_bounds {
-            if let Some(entry) = bc.find_superset_bound(
-                filter_key,
-                &sort_clause.field,
-                sort_clause.direction,
-            ) {
-                entry.touch();
-                let narrowed = filter_bitmap & entry.bitmap();
-                return (narrowed, false, cache_key);
-            }
-        }
-
-        drop(bc);
-
-        (filter_bitmap.clone(), use_simple_sort, cache_key)
-    }
-
-    /// D2/D6: Form or update a bound from sort query results.
-    /// With cursor awareness: if a cursor was past tier 0's range, form a tiered bound.
-    /// Supports "__slot__" pseudo-sort where sort value = slot ID.
-    ///
-    /// When forming or rebuilding a bound, if the query result set is smaller
-    /// than target_size, does a full sort traversal to seed the bound with
-    /// target_size entries. This ensures the bound covers many pages of
-    /// pagination, not just the first page's results.
-    fn update_bound_from_results(
-        &self,
-        snap: &Guard<Arc<InnerEngine>>,
-        sort: Option<&SortClause>,
-        cache_key: &Option<CacheKey>,
-        result_ids: &[i64],
-        cursor: Option<&crate::query::CursorPosition>,
-        filter_bitmap: &roaring::RoaringBitmap,
-        executor: &QueryExecutor,
-    ) {
-        let Some(sort_clause) = sort else { return };
-        let Some(ref filter_key) = cache_key else { return };
-        if result_ids.is_empty() { return; }
-
-        // Determine value function: slot-based or sort-field-based
-        let is_slot_sort = sort_clause.field == "__slot__";
-        let sort_field = if is_slot_sort {
-            None
-        } else {
-            match snap.sorts.get_field(&sort_clause.field) {
-                Some(f) => Some(f),
-                None => return,
-            }
-        };
-
-        // D6: Determine which tier to form/update.
-        let tier = if let Some(c) = cursor {
-            let cursor_val = c.sort_value as u32;
-            let mut t = 0u32;
-            let bc = self.bound_cache.lock();
-            loop {
-                let key = BoundKey {
-                    filter_key: filter_key.clone(),
-                    sort_field: sort_clause.field.clone(),
-                    direction: sort_clause.direction,
-                    tier: t,
-                };
-                if let Some(entry) = bc.lookup(&key) {
-                    let past = match sort_clause.direction {
-                        SortDirection::Desc => cursor_val < entry.min_tracked_value(),
-                        SortDirection::Asc => cursor_val > entry.min_tracked_value(),
-                    };
-                    if past {
-                        t += 1;
-                        if t >= 4 { break; }
-                        continue;
-                    }
-                }
-                break;
-            }
-            drop(bc);
-            t
-        } else {
-            0
-        };
-
-        let bound_key = BoundKey {
-            filter_key: filter_key.clone(),
-            sort_field: sort_clause.field.clone(),
-            direction: sort_clause.direction,
-            tier,
-        };
-
-        let target_size = self.bound_cache.lock().target_size();
-
-        // Check if we actually need to seed/rebuild the bound before doing
-        // the expensive full traversal. A bound needs seeding if it doesn't exist,
-        // needs rebuild, or was formed from too few results (e.g., just one page
-        // of 20 items instead of the target 10K).
-        let needs_seed = {
-            let bc = self.bound_cache.lock();
-            match bc.lookup(&bound_key) {
-                Some(entry) => entry.needs_rebuild() || (entry.bitmap().len() as usize) < target_size / 2,
-                None => true, // bound doesn't exist yet
-            }
-        };
-
-        if !needs_seed {
-            return;
-        }
-
-        // If the query result set is smaller than target_size, do a full
-        // traversal to seed the bound properly. This ensures the bound covers
-        // thousands of entries for pagination, not just a single page.
-        //
-        // For tier > 0, we need to start the seed traversal AFTER the previous
-        // tier's range. Find the previous tier's min_tracked_value and use it
-        // as the cursor for the seed traversal.
-        let seed_cursor = if tier > 0 {
-            let bc = self.bound_cache.lock();
-            let prev_key = BoundKey {
-                filter_key: filter_key.clone(),
-                sort_field: sort_clause.field.clone(),
-                direction: sort_clause.direction,
-                tier: tier - 1,
-            };
-            bc.lookup(&prev_key).map(|entry| {
-                let min_val = entry.min_tracked_value();
-                // Find the slot with min_tracked_value to build a cursor.
-                // Use slot_id=0 for Desc (any slot past min_val) or u32::MAX for Asc.
-                let slot_id = match sort_clause.direction {
-                    SortDirection::Desc => 0,
-                    SortDirection::Asc => u32::MAX,
-                };
-                crate::query::CursorPosition {
-                    sort_value: min_val as u64,
-                    slot_id,
-                }
-            })
-        } else {
-            None
-        };
-
-        let seed_slots: Vec<u32> = if result_ids.len() < target_size {
-            if let Ok(full_result) = executor.execute_from_bitmap_unclamped(
-                filter_bitmap,
-                Some(sort_clause),
-                target_size,
-                seed_cursor.as_ref(), // start after previous tier for tier > 0
-                false, // full sort, not simple
-            ) {
-                full_result.ids.iter().map(|&id| id as u32).collect()
-            } else {
-                result_ids.iter().map(|&id| id as u32).collect()
-            }
-        } else {
-            result_ids.iter().map(|&id| id as u32).collect()
-        };
-
-        // Value function: for __slot__ sort, value = slot ID itself
-        let value_fn = |slot: u32| -> u32 {
-            if is_slot_sort {
-                slot
-            } else {
-                sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-            }
-        };
-
-        let mut bc = self.bound_cache.lock();
-        if let Some(entry) = bc.get_mut(&bound_key) {
-            if entry.needs_rebuild() || (entry.bitmap().len() as usize) < target_size / 2 {
-                entry.rebuild(&seed_slots, &value_fn);
-            }
-        } else {
-            bc.form_bound(bound_key, &seed_slots, &value_fn);
-        }
     }
 
     /// Load the current snapshot (lock-free). Public API for advanced use.
@@ -2000,10 +1649,10 @@ impl ConcurrentEngine {
         let slot_bytes = snap.slots.bitmap_bytes();
         let filter_bytes = snap.filters.bitmap_bytes();
         let sort_bytes = snap.sorts.bitmap_bytes();
-        let cache = self.cache.lock();
-        let cache_entries = cache.len();
-        let cache_bytes = cache.bitmap_bytes();
-        drop(cache);
+        let uc = self.unified_cache.lock();
+        let cache_entries = uc.stats().entries;
+        let cache_bytes = uc.stats().memory_bytes;
+        drop(uc);
         let filter_details: Vec<(String, usize, usize)> = snap
             .filters
             .per_field_bytes()
@@ -2019,32 +1668,18 @@ impl ConcurrentEngine {
         (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details)
     }
 
-    /// Report bound cache statistics.
-    ///
-    /// Returns (bound_entries, bound_bitmap_bytes, meta_index_entries, meta_index_bytes).
-    pub fn bound_cache_stats(&self) -> (usize, usize, usize, usize) {
-        let bc = self.bound_cache.lock();
-        let bound_entries = bc.len();
-        let bound_bytes = bc.total_memory_bytes();
-        let meta = bc.meta_index();
-        let meta_entries = meta.entry_count();
-        let meta_bytes = meta.memory_bytes();
-        (bound_entries, bound_bytes, meta_entries, meta_bytes)
-    }
-
     /// Return unified cache stats (entries, hits, misses, memory).
     pub fn unified_cache_stats(&self) -> crate::unified_cache::UnifiedCacheStats {
         self.unified_cache.lock().stats()
     }
 
-    /// Clear unified cache entries and reset counters.
-    pub fn clear_unified_cache(&self) {
-        self.unified_cache.lock().clear();
+    /// Return per-entry cache details for diagnostics.
+    pub fn unified_cache_entry_details(&self) -> Vec<crate::unified_cache::UnifiedEntryDetail> {
+        self.unified_cache.lock().entry_details()
     }
 
-    /// Clear all bound cache entries (for benchmarking cold vs warm).
-    pub fn clear_bound_cache(&self) {
-        self.bound_cache.lock().clear();
+    /// Clear unified cache entries and reset counters.
+    pub fn clear_unified_cache(&self) {
         self.unified_cache.lock().clear();
     }
 
@@ -2091,7 +1726,10 @@ impl ConcurrentEngine {
                 "no bitmap_path configured; cannot save snapshot".to_string(),
             )
         })?;
-        Self::write_snapshot_to_store(store, &self.inner, &self.config)
+        let skip_sorts = self.pending_sort_loads.lock().clone();
+        let skip_filters = self.pending_filter_loads.lock().clone();
+        let skip_lazy = self.lazy_value_fields.lock().clone();
+        Self::write_snapshot_to_store(store, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)
     }
 
     /// Save a full snapshot of the current published state to a BitmapFs at a custom path.
@@ -2101,32 +1739,37 @@ impl ConcurrentEngine {
     /// or for creating point-in-time backups separate from the live store.
     pub fn save_snapshot_to(&self, path: &Path) -> Result<()> {
         let store = BitmapFs::new(path)?;
-        Self::write_snapshot_to_store(&store, &self.inner, &self.config)
+        let skip_sorts = self.pending_sort_loads.lock().clone();
+        let skip_filters = self.pending_filter_loads.lock().clone();
+        let skip_lazy = self.lazy_value_fields.lock().clone();
+        Self::write_snapshot_to_store(&store, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)
     }
 
-    /// Internal: extract all state from the current published snapshot and write it
-    /// to the given BitmapFs.
+    /// Internal: extract loaded state from the current published snapshot and write it
+    /// to the given BitmapFs. Skips fields that haven't been loaded yet (still pending
+    /// lazy-load) to avoid overwriting real persisted data with empty placeholders.
     fn write_snapshot_to_store(
         store: &BitmapFs,
         inner: &ArcSwap<InnerEngine>,
         config: &Config,
+        skip_sorts: &HashSet<String>,
+        skip_filters: &HashSet<String>,
+        skip_lazy_values: &HashSet<String>,
     ) -> Result<()> {
         // Load the current published snapshot (lock-free).
-        // load_full() returns Arc<InnerEngine>; we need an owned mutable copy
-        // to compact diffs before persisting.
         let snap: Arc<InnerEngine> = inner.load_full();
         let mut compacted: InnerEngine = (*snap).clone();
 
-        // Compact filter diffs so we persist clean bases
-        for (_name, field) in compacted.filters.fields_mut() {
-            field.merge_dirty();
-        }
         // Merge alive diffs
         compacted.slots.merge_alive();
 
-        // Collect filter bitmap entries
+        // Collect filter bitmap entries — skip unloaded fields
         let mut filter_entries: Vec<(String, u64, RoaringBitmap)> = Vec::new();
-        for (name, field) in compacted.filters.fields() {
+        for (name, field) in compacted.filters.fields_mut() {
+            if skip_filters.contains(name) || skip_lazy_values.contains(name) {
+                continue;
+            }
+            field.merge_dirty();
             for (&value, vb) in field.iter_versioned() {
                 filter_entries.push((
                     name.clone(),
@@ -2136,10 +1779,14 @@ impl ConcurrentEngine {
             }
         }
 
-        // Collect sort layer bases
+        // Collect sort layer bases — skip unloaded fields
         let mut sort_data: Vec<(String, Vec<RoaringBitmap>)> = Vec::new();
         for sc in &config.sort_fields {
-            if let Some(sf) = compacted.sorts.get_field(&sc.name) {
+            if skip_sorts.contains(&sc.name) {
+                continue;
+            }
+            if let Some(sf) = compacted.sorts.get_field_mut(&sc.name) {
+                sf.merge_dirty();
                 let bases: Vec<RoaringBitmap> = sf
                     .layer_bases()
                     .iter()
@@ -2338,18 +1985,7 @@ impl ConcurrentEngine {
     }
 
     fn invalidate_all_caches(&self) {
-        {
-            let mut c = self.cache.lock();
-            for fc in &self.config.filter_fields {
-                c.invalidate_field(&fc.name);
-            }
-        }
-        {
-            let mut bc = self.bound_cache.lock();
-            for (_, entry) in bc.iter_mut() {
-                entry.mark_for_rebuild();
-            }
-        }
+        self.unified_cache.lock().clear();
     }
 
     /// Persist documents to the docstore on a background thread.
@@ -2579,6 +2215,249 @@ impl ConcurrentEngine {
             t3.as_secs_f64());
 
         total_count
+    }
+
+    /// Rebuild sort and/or filter bitmaps from the docstore.
+    ///
+    /// Iterates all alive slots, reads each document from the docstore, and
+    /// reconstructs the requested bitmap fields from scratch. This is used to
+    /// repair corrupt or empty bitmap snapshots when the docstore is intact.
+    ///
+    /// The rebuilt bitmaps completely replace the existing ones for the specified
+    /// fields — existing data is cleared before the new bitmaps are applied.
+    ///
+    /// Returns (slots_processed, fields_rebuilt) on success.
+    pub fn rebuild_fields_from_docstore(
+        &self,
+        sort_fields: Option<Vec<String>>,
+        filter_fields: Option<Vec<String>>,
+        progress: Arc<AtomicU64>,
+    ) -> Result<(u64, Vec<String>)> {
+        let t0 = Instant::now();
+
+        // Determine which fields to rebuild
+        let rebuild_all = sort_fields.is_none() && filter_fields.is_none();
+        let sort_configs: Vec<_> = match &sort_fields {
+            Some(names) => self.config.sort_fields.iter()
+                .filter(|sc| names.contains(&sc.name))
+                .cloned()
+                .collect(),
+            None if rebuild_all => self.config.sort_fields.clone(),
+            None => vec![],
+        };
+        let filter_configs: Vec<_> = match &filter_fields {
+            Some(names) => self.config.filter_fields.iter()
+                .filter(|fc| names.contains(&fc.name))
+                .cloned()
+                .collect(),
+            None if rebuild_all => self.config.filter_fields.clone(),
+            None => vec![],
+        };
+
+        let rebuilt_names: Vec<String> = sort_configs.iter().map(|c| c.name.clone())
+            .chain(filter_configs.iter().map(|c| c.name.clone()))
+            .collect();
+
+        if sort_configs.is_empty() && filter_configs.is_empty() {
+            return Ok((0, rebuilt_names));
+        }
+
+        eprintln!("rebuild: sort fields={:?}, filter fields={:?}",
+            sort_configs.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            filter_configs.iter().map(|c| &c.name).collect::<Vec<_>>());
+
+        // Get alive bitmap from current snapshot
+        let snap = self.inner.load_full();
+        let alive = {
+            let mut tmp = (*snap).clone();
+            tmp.slots.merge_alive();
+            tmp.slots.alive_bitmap().clone()
+        };
+        let total_alive = alive.len();
+        eprintln!("rebuild: {} alive slots to process", total_alive);
+
+        // Parallel shard-based iteration using rayon fold+reduce.
+        // Open a second read-only DocStore (no mutex) for parallel reads.
+        let ds_path = self.docstore.lock().path().to_path_buf();
+        let reader = DocStore::open(&ds_path)
+            .map_err(|e| crate::error::BitdexError::DocStore(
+                format!("open reader docstore: {e}")))?;
+
+        let max_slot = alive.max().unwrap_or(0);
+        let max_shard = max_slot >> 9; // SHARD_SHIFT = 9
+        let num_shards = max_shard + 1;
+        eprintln!("rebuild: {} shards to scan with rayon", num_shards);
+
+        // Pre-build field name lists for efficient lookup in inner loop
+        let sort_names: Vec<&str> = sort_configs.iter().map(|c| c.name.as_str()).collect();
+        let sort_bits: Vec<usize> = sort_configs.iter().map(|c| c.bits as usize).collect();
+        let filter_names: Vec<&str> = filter_configs.iter().map(|c| c.name.as_str()).collect();
+
+        // Accumulator: per-sort-field pre-allocated layer bitmaps + filter map
+        type FilterMap = HashMap<(usize, u64), RoaringBitmap>; // (field_idx, value) -> bm
+        struct Accum {
+            // sort_layers[field_idx][bit] = bitmap
+            sort_layers: Vec<Vec<RoaringBitmap>>,
+            filter_map: FilterMap,
+            count: u64,
+        }
+
+        let make_accum = || Accum {
+            sort_layers: sort_bits.iter().map(|&b| {
+                (0..b).map(|_| RoaringBitmap::new()).collect()
+            }).collect(),
+            filter_map: FilterMap::new(),
+            count: 0,
+        };
+
+        // Chunk shards into batches of 500 for rayon — reduces task overhead
+        // while still getting good parallelism (239K/500 = ~479 tasks)
+        let chunk_size = 500u32;
+        let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
+
+        let merged = (0..num_chunks)
+            .into_par_iter()
+            .fold(make_accum, |mut acc, chunk_idx| {
+                let shard_start = chunk_idx * chunk_size;
+                let shard_end = std::cmp::min(shard_start + chunk_size, num_shards);
+
+                for shard_id in shard_start..shard_end {
+                    let docs = match reader.get_shard(shard_id) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+
+                    for (slot_id, doc) in &docs {
+                        if !alive.contains(*slot_id) {
+                            continue;
+                        }
+                        // Filter bitmap extraction (indexed by position)
+                        for (fi, &fname) in filter_names.iter().enumerate() {
+                            if let Some(fv) = doc.fields.get(fname) {
+                                match fv {
+                                    crate::mutation::FieldValue::Single(v) => {
+                                        if let Some(key) = value_to_bitmap_key(v) {
+                                            acc.filter_map
+                                                .entry((fi, key))
+                                                .or_insert_with(RoaringBitmap::new)
+                                                .insert(*slot_id);
+                                        }
+                                    }
+                                    crate::mutation::FieldValue::Multi(vals) => {
+                                        for v in vals {
+                                            if let Some(key) = value_to_bitmap_key(v) {
+                                                acc.filter_map
+                                                    .entry((fi, key))
+                                                    .or_insert_with(RoaringBitmap::new)
+                                                    .insert(*slot_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Sort bitmap extraction (direct layer access, no HashMap)
+                        for (si, &sname) in sort_names.iter().enumerate() {
+                            if let Some(fv) = doc.fields.get(sname) {
+                                if let crate::mutation::FieldValue::Single(ref v) = fv {
+                                    if let Some(value) = value_to_sort_u32(v) {
+                                        let num_bits = sort_bits[si];
+                                        for bit in 0..num_bits {
+                                            if (value >> bit) & 1 == 1 {
+                                                acc.sort_layers[si][bit].insert(*slot_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        acc.count += 1;
+                    }
+                }
+
+                // Update progress (approximate — each thread reports its own count)
+                progress.fetch_add(acc.count, Ordering::Relaxed);
+                acc.count = 0; // Reset so we don't double-count on next chunk
+
+                acc
+            })
+            .reduce(make_accum, |mut a, b| {
+                // Merge sort layers via OR
+                for (si, b_layers) in b.sort_layers.into_iter().enumerate() {
+                    for (bit, bm) in b_layers.into_iter().enumerate() {
+                        a.sort_layers[si][bit] |= bm;
+                    }
+                }
+                // Merge filter maps
+                for (key, bm) in b.filter_map {
+                    a.filter_map.entry(key)
+                        .and_modify(|existing| *existing |= &bm)
+                        .or_insert(bm);
+                }
+                a.count += b.count;
+                a
+            });
+
+        let slots_processed = progress.load(Ordering::Relaxed);
+
+        let read_elapsed = t0.elapsed();
+        eprintln!("rebuild: read phase complete in {:.1}s ({} slots, {:.0} slots/s)",
+            read_elapsed.as_secs_f64(), slots_processed,
+            slots_processed as f64 / read_elapsed.as_secs_f64());
+
+        // Apply to staging: clone current snapshot, clear target fields, OR in rebuilt data
+        let mut staging = self.clone_staging();
+
+        // Clear and replace sort fields
+        for sc in &sort_configs {
+            staging.sorts.add_field(sc.clone()); // replaces with fresh empty field
+        }
+        // Clear and replace filter fields
+        for fc in &filter_configs {
+            staging.filters.add_field(fc.clone()); // replaces with fresh empty field
+        }
+
+        // Apply rebuilt filter bitmaps (keyed by field index)
+        for ((fi, value), bitmap) in merged.filter_map {
+            let fname = &filter_configs[fi].name;
+            if let Some(field) = staging.filters.get_field_mut(fname) {
+                field.or_bitmap(value, &bitmap);
+            }
+        }
+        // Apply rebuilt sort layer bitmaps
+        for (si, layers) in merged.sort_layers.into_iter().enumerate() {
+            let sname = &sort_configs[si].name;
+            if let Some(field) = staging.sorts.get_field_mut(sname) {
+                for (bit, bitmap) in layers.into_iter().enumerate() {
+                    if !bitmap.is_empty() {
+                        field.or_layer(bit, &bitmap);
+                    }
+                }
+            }
+        }
+
+        // Publish the rebuilt staging
+        self.publish_staging(staging);
+
+        // Remove rebuilt fields from pending lazy-load sets (they're now loaded)
+        {
+            let mut pending = self.pending_filter_loads.lock();
+            for fc in &filter_configs {
+                pending.remove(&fc.name);
+            }
+        }
+        {
+            let mut pending = self.pending_sort_loads.lock();
+            for sc in &sort_configs {
+                pending.remove(&sc.name);
+            }
+        }
+
+        let total_elapsed = t0.elapsed();
+        eprintln!("rebuild: complete in {:.1}s — {} slots, {} fields rebuilt",
+            total_elapsed.as_secs_f64(), slots_processed, rebuilt_names.len());
+
+        Ok((slots_processed, rebuilt_names))
     }
 
     /// Shutdown the flush and merge threads gracefully.
@@ -4152,162 +4031,4 @@ mod tests {
         }
     }
 
-    // === Slot-based bound tests ===
-
-    #[test]
-    fn test_filter_only_query_forms_slot_bound() {
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-
-        // Insert documents
-        for i in 1..=20u32 {
-            engine.put(
-                i,
-                &make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 10))),
-                ]),
-            ).unwrap();
-        }
-        wait_for_flush(&engine, 20, 500);
-
-        // Run a filter-only query — should form a __slot__ bound
-        let result = engine.query(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-            None,
-            10,
-        ).unwrap();
-
-        // Results should be in descending slot order (newest first)
-        assert_eq!(result.ids.len(), 10);
-        assert_eq!(result.ids[0], 20);
-        assert_eq!(result.ids[9], 11);
-
-        // Second query should benefit from the bound (correctness check)
-        let result2 = engine.query(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-            None,
-            10,
-        ).unwrap();
-        assert_eq!(result.ids, result2.ids);
-    }
-
-    #[test]
-    fn test_filter_only_cursor_has_sort_value() {
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-
-        for i in 1..=30u32 {
-            engine.put(
-                i,
-                &make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
-                ]),
-            ).unwrap();
-        }
-        wait_for_flush(&engine, 30, 500);
-
-        // First page
-        let result = engine.query(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-            None,
-            10,
-        ).unwrap();
-        assert_eq!(result.ids.len(), 10);
-        assert_eq!(result.ids[0], 30);
-
-        // Cursor should have sort_value = last slot ID
-        let cursor = result.cursor.as_ref().expect("should have cursor");
-        assert_eq!(cursor.slot_id as i64, result.ids[9]);
-        assert_eq!(cursor.sort_value, result.ids[9] as u64, "sort_value should equal slot ID");
-    }
-
-    #[test]
-    fn test_slot_bound_live_maintenance_on_insert() {
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-
-        // Insert initial docs
-        for i in 1..=10u32 {
-            engine.put(
-                i,
-                &make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
-                ]),
-            ).unwrap();
-        }
-        wait_for_flush(&engine, 10, 500);
-
-        // Form a slot bound via filter-only query
-        let result = engine.query(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-            None,
-            10,
-        ).unwrap();
-        assert_eq!(result.ids[0], 10);
-
-        // Insert a new doc — slot 11 should be live-maintained into the bound
-        engine.put(
-            11,
-            &make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                ("reactionCount", FieldValue::Single(Value::Integer(110))),
-            ]),
-        ).unwrap();
-        wait_for_flush(&engine, 11, 500);
-
-        // Next query should see the new doc at the top
-        let result2 = engine.query(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-            None,
-            10,
-        ).unwrap();
-        assert_eq!(result2.ids[0], 11, "Newly inserted doc should be first (highest slot)");
-        assert_eq!(result2.ids.len(), 10);
-    }
-
-    // === Trie cache live update tests ===
-
-    #[test]
-    fn test_cache_live_update_on_insert() {
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-
-        // Insert docs so cache has data
-        for i in 1..=5u32 {
-            engine.put(
-                i,
-                &make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 100))),
-                ]),
-            ).unwrap();
-        }
-        wait_for_flush(&engine, 5, 500);
-
-        // Warm the cache with a query
-        let r1 = engine.query(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-            None,
-            100,
-        ).unwrap();
-        assert_eq!(r1.total_matched, 5);
-
-        // Insert another nsfwLevel=1 doc
-        engine.put(
-            6,
-            &make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                ("reactionCount", FieldValue::Single(Value::Integer(600))),
-            ]),
-        ).unwrap();
-        wait_for_flush(&engine, 6, 500);
-
-        // Query again — cache should be live-updated, not cold
-        let r2 = engine.query(
-            &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-            None,
-            100,
-        ).unwrap();
-        assert_eq!(r2.total_matched, 6, "live-updated cache should include new doc");
-        assert!(r2.ids.contains(&6), "new doc should be in results");
-    }
 }

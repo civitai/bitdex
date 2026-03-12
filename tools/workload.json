@@ -1,0 +1,122 @@
+{
+  "_comment": "Mixed workload config for BitDex unified cache stress testing. Weights are relative (don't need to sum to 100).",
+
+  "total_requests": 5000,
+  "warmup_requests": 200,
+  "concurrency": 4,
+  "limit": 20,
+
+  "write_mix": {
+    "upsert_pct": 3,
+    "delete_pct": 1,
+    "id_range": [1, 122580072]
+  },
+
+  "sorts": [
+    { "field": "reactionCount", "direction": "Desc", "weight": 45 },
+    { "field": "sortAt",        "direction": "Desc", "weight": 35 },
+    { "field": "sortAt",        "direction": "Asc",  "weight": 5 },
+    { "field": "commentCount",  "direction": "Desc", "weight": 5 },
+    { "field": "collectedCount","direction": "Desc", "weight": 5 },
+    { "field": "reactionCount", "direction": "Asc",  "weight": 3 },
+    { "field": "id",            "direction": "Desc", "weight": 2 }
+  ],
+
+  "filters": {
+    "nsfwLevel": {
+      "weight": 95,
+      "type": "eq",
+      "values": [
+        { "v": 1,  "weight": 40 },
+        { "v": 2,  "weight": 15 },
+        { "v": 4,  "weight": 15 },
+        { "v": 8,  "weight": 10 },
+        { "v": 16, "weight": 15 },
+        { "v": 32, "weight": 5 }
+      ]
+    },
+    "type": {
+      "weight": 30,
+      "type": "eq",
+      "values": [
+        { "v": 1, "weight": 80, "_comment": "image" },
+        { "v": 2, "weight": 18, "_comment": "video" },
+        { "v": 3, "weight": 2,  "_comment": "audio" }
+      ]
+    },
+    "postedToId": {
+      "weight": 15,
+      "type": "eq",
+      "range": [1, 100000]
+    },
+    "userId": {
+      "weight": 15,
+      "type": "eq",
+      "range": [1, 1000000]
+    },
+    "tagIds": {
+      "weight": 20,
+      "type": "in",
+      "range": [1, 31000],
+      "count": [1, 5]
+    },
+    "baseModel": {
+      "weight": 8,
+      "type": "eq",
+      "values": [
+        { "v": 2,  "weight": 30, "_comment": "SD 1.5" },
+        { "v": 16, "weight": 25, "_comment": "SDXL 1.0" },
+        { "v": 22, "weight": 15, "_comment": "Pony" },
+        { "v": 23, "weight": 10, "_comment": "Flux.1 D" },
+        { "v": 39, "weight": 8,  "_comment": "Illustrious" },
+        { "v": 40, "weight": 5,  "_comment": "NoobAI" },
+        { "v": 11, "weight": 4,  "_comment": "SD 3.5" },
+        { "v": 99, "weight": 3,  "_comment": "Other" }
+      ]
+    },
+    "hasMeta": {
+      "weight": 5,
+      "type": "eq_bool",
+      "value": true
+    },
+    "onSite": {
+      "weight": 3,
+      "type": "eq_bool",
+      "value": true
+    },
+    "availability": {
+      "weight": 10,
+      "type": "eq",
+      "values": [
+        { "v": 1, "weight": 90, "_comment": "Public" },
+        { "v": 2, "weight": 10, "_comment": "Unsearchable" }
+      ]
+    }
+  },
+
+  "pagination": {
+    "_comment": "% of queries that continue paginating (send cursor from previous result)",
+    "continuation_pct": 30,
+    "max_pages": 3
+  },
+
+  "hot_pool": {
+    "_comment": "hot_pct of queries re-use one of these fixed common patterns. Matches real traffic where ~60% of requests are the same gallery browse combos.",
+    "hot_pct": 60,
+    "queries": [
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":1}]}],                                                                    "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 20, "_comment": "PG gallery default" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":1}]},{"Eq":["type",{"Integer":1}]}],                                      "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 15, "_comment": "PG images only" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":1}]}],                                                                    "sort": {"field":"sortAt","direction":"Desc"},         "weight": 12, "_comment": "PG newest" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":1}]},{"Eq":["type",{"Integer":1}]}],                                      "sort": {"field":"sortAt","direction":"Desc"},         "weight": 10, "_comment": "PG images newest" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":4}]}],                                                                    "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 8,  "_comment": "R-rated gallery" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":16}]}],                                                                   "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 8,  "_comment": "XXX gallery" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":1}]},{"Eq":["type",{"Integer":2}]}],                                      "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 5,  "_comment": "PG videos" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":2}]}],                                                                    "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 5,  "_comment": "PG13 gallery" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":1}]},{"Eq":["availability",{"Integer":1}]}],                              "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 5,  "_comment": "PG public" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":8}]}],                                                                    "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 4,  "_comment": "X-rated gallery" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":1}]},{"Eq":["baseModel",{"Integer":2}]}],                                 "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 3,  "_comment": "PG SD1.5" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":1}]},{"Eq":["baseModel",{"Integer":16}]}],                                "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 3,  "_comment": "PG SDXL" },
+      { "filters": [{"Eq":["nsfwLevel",{"Integer":1}]},{"Eq":["baseModel",{"Integer":23}]}],                                "sort": {"field":"reactionCount","direction":"Desc"}, "weight": 2,  "_comment": "PG Flux" }
+    ]
+  }
+}
