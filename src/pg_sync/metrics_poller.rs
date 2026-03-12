@@ -1,7 +1,7 @@
 //! ClickHouse metrics poller: polls for recent metric events, fetches aggregate
 //! counts, rebuilds full docs from PG, and pushes to Bitdex.
 //!
-//! ClickHouse is queried via its HTTP interface (simple GET/POST with SQL).
+//! ClickHouse is queried via its HTTP interface (POST with SQL).
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,10 +14,17 @@ use super::bitdex_client::BitdexClient;
 use super::queries;
 use super::row_assembler::{assemble_batch, EnrichmentData, MetricInfo};
 
+/// ClickHouse connection config.
+pub struct ClickHouseConfig {
+    pub url: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
 /// Run the ClickHouse metrics poller loop. Runs forever until cancelled.
 pub async fn run_metrics_poller(
     pool: &PgPool,
-    clickhouse_url: &str,
+    ch_config: &ClickHouseConfig,
     bitdex_client: &BitdexClient,
     poll_interval_secs: u64,
 ) -> Result<(), String> {
@@ -26,16 +33,15 @@ pub async fn run_metrics_poller(
     let mut last_poll_ts = current_epoch_secs() - poll_interval_secs as i64;
 
     eprintln!(
-        "Metrics poller started (ClickHouse={clickhouse_url}, interval={poll_interval_secs}s)"
+        "Metrics poller started (ClickHouse={}, interval={poll_interval_secs}s)",
+        ch_config.url
     );
 
     loop {
         ticker.tick().await;
         let now = current_epoch_secs();
 
-        match poll_metrics_and_push(pool, &http, clickhouse_url, bitdex_client, last_poll_ts)
-            .await
-        {
+        match poll_metrics_and_push(pool, &http, ch_config, bitdex_client, last_poll_ts).await {
             Ok(count) => {
                 if count > 0 {
                     eprintln!("Metrics: updated {count} documents");
@@ -61,12 +67,12 @@ fn current_epoch_secs() -> i64 {
 async fn poll_metrics_and_push(
     pool: &PgPool,
     http: &Client,
-    clickhouse_url: &str,
+    ch_config: &ClickHouseConfig,
     bitdex_client: &BitdexClient,
     since_ts: i64,
 ) -> Result<usize, String> {
     // Query ClickHouse for image IDs with recent metric events
-    let metrics = fetch_metrics_from_clickhouse(http, clickhouse_url, since_ts).await?;
+    let metrics = fetch_metrics_from_clickhouse(http, ch_config, since_ts).await?;
 
     if metrics.is_empty() {
         return Ok(0);
@@ -108,13 +114,21 @@ async fn poll_metrics_and_push(
     Ok(count)
 }
 
-/// Query ClickHouse HTTP interface for aggregate metrics since a timestamp.
-/// Returns a map of image_id → MetricInfo.
+/// Query ClickHouse HTTP interface for aggregate metrics.
+///
+/// Finds entities with recent activity (day >= since_ts), then fetches their
+/// ALL-TIME totals so the search index has cumulative counts.
+///
+/// Table schema: entityType (String), entityId (Int32), metricType (String),
+///               day (Date), total (Int64)
+/// Metric types for Image: ReactionLike, ReactionHeart, ReactionLaugh,
+///                          ReactionCry, Comment, Collection, Buzz
 async fn fetch_metrics_from_clickhouse(
     http: &Client,
-    clickhouse_url: &str,
+    ch_config: &ClickHouseConfig,
     since_ts: i64,
 ) -> Result<HashMap<i64, MetricInfo>, String> {
+    // Find entities with recent activity, then get their all-time totals
     let query = format!(
         r#"SELECT
             entityId as id,
@@ -123,15 +137,25 @@ async fn fetch_metrics_from_clickhouse(
             sumIf(total, metricType = 'Collection') as collectedCount
         FROM entityMetricDailyAgg
         WHERE entityType = 'Image'
-          AND date >= toDate(fromUnixTimestamp({since_ts}))
+          AND entityId IN (
+            SELECT DISTINCT entityId
+            FROM entityMetricDailyAgg
+            WHERE entityType = 'Image'
+              AND day >= toDate(fromUnixTimestamp({since_ts}))
+          )
         GROUP BY entityId
-        HAVING max(updated) >= fromUnixTimestamp({since_ts})
         FORMAT JSONEachRow"#,
     );
 
-    let resp = http
-        .post(clickhouse_url)
-        .body(query)
+    let mut req = http.post(&ch_config.url).body(query);
+
+    // Add Basic auth if credentials provided
+    if let Some(ref username) = ch_config.username {
+        let password = ch_config.password.as_deref().unwrap_or("");
+        req = req.basic_auth(username, Some(password));
+    }
+
+    let resp = req
         .send()
         .await
         .map_err(|e| format!("ClickHouse request failed: {e}"))?;

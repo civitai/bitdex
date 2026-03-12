@@ -151,9 +151,14 @@ async fn main() {
             );
 
             if let Some(ref ch_url) = sync_config.clickhouse_url {
+                let ch_config = metrics_poller::ClickHouseConfig {
+                    url: ch_url.clone(),
+                    username: sync_config.clickhouse_username.clone(),
+                    password: sync_config.clickhouse_password.clone(),
+                };
                 let metrics_fut = metrics_poller::run_metrics_poller(
                     &pool,
-                    ch_url,
+                    &ch_config,
                     &bitdex_client,
                     sync_config.metrics_poll_interval_secs,
                 );

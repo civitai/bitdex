@@ -9,6 +9,10 @@ pub struct PgSyncConfig {
     pub postgres_url: String,
     /// ClickHouse HTTP URL for metrics queries.
     pub clickhouse_url: Option<String>,
+    /// ClickHouse username (default: "default").
+    pub clickhouse_username: Option<String>,
+    /// ClickHouse password.
+    pub clickhouse_password: Option<String>,
     /// Bitdex HTTP server URL (for sync mode, e.g. "http://localhost:3000").
     pub bitdex_url: Option<String>,
     /// Path to the index definition directory (contains config.json).
@@ -71,6 +75,12 @@ impl PgSyncConfig {
         }
         if let Ok(url) = std::env::var("BITDEX_URL") {
             config.bitdex_url = Some(url);
+        }
+        if let Ok(user) = std::env::var("CLICKHOUSE_USERNAME") {
+            config.clickhouse_username = Some(user);
+        }
+        if let Ok(pass) = std::env::var("CLICKHOUSE_PASSWORD") {
+            config.clickhouse_password = Some(pass);
         }
 
         Ok(config)
