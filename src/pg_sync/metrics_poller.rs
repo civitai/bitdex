@@ -1,0 +1,173 @@
+//! ClickHouse metrics poller: polls for recent metric events, fetches aggregate
+//! counts, rebuilds full docs from PG, and pushes to Bitdex.
+//!
+//! ClickHouse is queried via its HTTP interface (simple GET/POST with SQL).
+
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use reqwest::Client;
+use sqlx::PgPool;
+use tokio::time::{Duration, interval};
+
+use super::bitdex_client::BitdexClient;
+use super::queries;
+use super::row_assembler::{assemble_batch, EnrichmentData, MetricInfo};
+
+/// Run the ClickHouse metrics poller loop. Runs forever until cancelled.
+pub async fn run_metrics_poller(
+    pool: &PgPool,
+    clickhouse_url: &str,
+    bitdex_client: &BitdexClient,
+    poll_interval_secs: u64,
+) -> Result<(), String> {
+    let mut ticker = interval(Duration::from_secs(poll_interval_secs));
+    let http = Client::new();
+    let mut last_poll_ts = current_epoch_secs() - poll_interval_secs as i64;
+
+    eprintln!(
+        "Metrics poller started (ClickHouse={clickhouse_url}, interval={poll_interval_secs}s)"
+    );
+
+    loop {
+        ticker.tick().await;
+        let now = current_epoch_secs();
+
+        match poll_metrics_and_push(pool, &http, clickhouse_url, bitdex_client, last_poll_ts)
+            .await
+        {
+            Ok(count) => {
+                if count > 0 {
+                    eprintln!("Metrics: updated {count} documents");
+                }
+                last_poll_ts = now;
+            }
+            Err(e) => {
+                eprintln!("Metrics poll error: {e}");
+                // Don't advance last_poll_ts — retry same window
+            }
+        }
+    }
+}
+
+fn current_epoch_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Single poll + push cycle.
+async fn poll_metrics_and_push(
+    pool: &PgPool,
+    http: &Client,
+    clickhouse_url: &str,
+    bitdex_client: &BitdexClient,
+    since_ts: i64,
+) -> Result<usize, String> {
+    // Query ClickHouse for image IDs with recent metric events
+    let metrics = fetch_metrics_from_clickhouse(http, clickhouse_url, since_ts).await?;
+
+    if metrics.is_empty() {
+        return Ok(0);
+    }
+
+    let image_ids: Vec<i64> = metrics.keys().copied().collect();
+
+    // Fetch full documents from PG (same enrichment pipeline as outbox)
+    let images = queries::fetch_images_by_ids(pool, &image_ids)
+        .await
+        .map_err(|e| format!("fetch_images_by_ids: {e}"))?;
+
+    if images.is_empty() {
+        return Ok(0);
+    }
+
+    let fetched_ids: Vec<i64> = images.iter().map(|r| r.id).collect();
+
+    let (tags, tools, techniques, resources) = tokio::try_join!(
+        queries::fetch_tags(pool, &fetched_ids),
+        queries::fetch_tools(pool, &fetched_ids),
+        queries::fetch_techniques(pool, &fetched_ids),
+        queries::fetch_resources(pool, &fetched_ids),
+    )
+    .map_err(|e| format!("enrichment queries: {e}"))?;
+
+    let mut enrichment = EnrichmentData::from_rows(tags, tools, techniques, resources);
+
+    // Merge ClickHouse metrics into enrichment
+    enrichment.metrics = metrics;
+
+    let docs = assemble_batch(&images, &enrichment);
+    let count = docs.len();
+
+    if !docs.is_empty() {
+        bitdex_client.upsert_batch(&docs).await?;
+    }
+
+    Ok(count)
+}
+
+/// Query ClickHouse HTTP interface for aggregate metrics since a timestamp.
+/// Returns a map of image_id → MetricInfo.
+async fn fetch_metrics_from_clickhouse(
+    http: &Client,
+    clickhouse_url: &str,
+    since_ts: i64,
+) -> Result<HashMap<i64, MetricInfo>, String> {
+    let query = format!(
+        r#"SELECT
+            entityId as id,
+            sumIf(total, metricType IN ('ReactionLike','ReactionHeart','ReactionLaugh','ReactionCry')) as reactionCount,
+            sumIf(total, metricType = 'Comment') as commentCount,
+            sumIf(total, metricType = 'Collection') as collectedCount
+        FROM entityMetricDailyAgg
+        WHERE entityType = 'Image'
+          AND date >= toDate(fromUnixTimestamp({since_ts}))
+        GROUP BY entityId
+        HAVING max(updated) >= fromUnixTimestamp({since_ts})
+        FORMAT JSONEachRow"#,
+    );
+
+    let resp = http
+        .post(clickhouse_url)
+        .body(query)
+        .send()
+        .await
+        .map_err(|e| format!("ClickHouse request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("ClickHouse returned {status}: {body}"));
+    }
+
+    let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
+    let mut metrics = HashMap::new();
+
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("parse CH row: {e}"))?;
+
+        let id = row["id"]
+            .as_i64()
+            .ok_or_else(|| "missing id in CH response".to_string())?;
+        let reaction_count = row["reactionCount"].as_i64().unwrap_or(0);
+        let comment_count = row["commentCount"].as_i64().unwrap_or(0);
+        let collected_count = row["collectedCount"].as_i64().unwrap_or(0);
+
+        metrics.insert(
+            id,
+            MetricInfo {
+                reaction_count,
+                comment_count,
+                collected_count,
+            },
+        );
+    }
+
+    Ok(metrics)
+}

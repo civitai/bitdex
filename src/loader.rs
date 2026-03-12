@@ -39,19 +39,19 @@ pub struct LoadStats {
 
 /// Bitmap accumulator for rayon fold+reduce.
 /// Each rayon task builds its own instance; reduce merges them with bitmap OR.
-struct BitmapAccum {
-    filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
-    sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
-    alive: RoaringBitmap,
+pub(crate) struct BitmapAccum {
+    pub(crate) filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
+    pub(crate) sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
+    pub(crate) alive: RoaringBitmap,
     /// Pre-encoded msgpack bytes — encoding happens in the rayon fold so
     /// BulkWriter does pure I/O with no rayon contention.
-    encoded_docs: Vec<(u32, Vec<u8>)>,
-    count: usize,
-    errors: u64,
+    pub(crate) encoded_docs: Vec<(u32, Vec<u8>)>,
+    pub(crate) count: usize,
+    pub(crate) errors: u64,
 }
 
 impl BitmapAccum {
-    fn new(filter_names: &[String], sort_configs: &[(String, u8)]) -> Self {
+    pub(crate) fn new(filter_names: &[String], sort_configs: &[(String, u8)]) -> Self {
         let mut filter_maps = HashMap::with_capacity(filter_names.len());
         for name in filter_names {
             filter_maps.insert(name.clone(), HashMap::new());
@@ -70,7 +70,7 @@ impl BitmapAccum {
         }
     }
 
-    fn merge(mut self, other: Self) -> Self {
+    pub(crate) fn merge(mut self, other: Self) -> Self {
         self.alive |= &other.alive;
         for (field, value_map) in other.filter_maps {
             let target = self.filter_maps.entry(field).or_default();
@@ -356,7 +356,7 @@ pub fn load_ndjson(
 
 /// Extract bitmap entries directly from JSON into accumulator maps.
 /// Skips intermediate Document creation for indexed fields.
-fn extract_bitmaps(
+pub(crate) fn extract_bitmaps(
     json: &serde_json::Value,
     schema: &DataSchema,
     filter_set: &HashSet<String>,
@@ -411,7 +411,7 @@ fn extract_bitmaps(
 }
 
 /// Extract a single filter value from JSON and insert into the field's bitmap map.
-fn extract_filter_value(
+pub(crate) fn extract_filter_value(
     raw: &serde_json::Value,
     mapping: &FieldMapping,
     slot: u32,
@@ -470,7 +470,7 @@ fn extract_filter_value(
 }
 
 /// Extract sort value from JSON and insert into bit-layer bitmap maps.
-fn extract_sort_value(
+pub(crate) fn extract_sort_value(
     raw: &serde_json::Value,
     mapping: &FieldMapping,
     slot: u32,
@@ -498,7 +498,7 @@ fn extract_sort_value(
 }
 
 /// Extract an integer from a JSON value, optionally truncating to u32.
-fn extract_integer(raw: &serde_json::Value, truncate_u32: bool) -> Option<i64> {
+pub(crate) fn extract_integer(raw: &serde_json::Value, truncate_u32: bool) -> Option<i64> {
     let n = raw
         .as_i64()
         .or_else(|| raw.as_u64().map(|n| n as i64))

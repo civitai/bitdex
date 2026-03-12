@@ -8,8 +8,9 @@ keywords = ["bitmap", "index", "database", "search", "roaring"]
 
 [features]
 default = []
-server = ["axum", "tower-http", "tokio"]
+server = ["dep:axum", "dep:tower-http", "dep:tokio"]
 loadtest = ["ureq"]
+pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio"]
 
 [dependencies]
 # Bitmap indexes
@@ -46,6 +47,12 @@ tower-http = { version = "0.6", features = ["cors"], optional = true }
 
 # HTTP client (optional — only needed for loadtest binary)
 ureq = { version = "2", optional = true }
+
+# PG sync dependencies (optional — only needed for pg-sync binary)
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls", "chrono"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
+chrono = { version = "0.4", optional = true }
 
 # RNG (used by benchmark binary)
 rand = "0.8"
@@ -90,3 +97,8 @@ required-features = ["server"]
 name = "loadtest"
 path = "src/bin/loadtest.rs"
 required-features = ["loadtest"]
+
+[[bin]]
+name = "pg-sync"
+path = "src/bin/pg_sync.rs"
+required-features = ["pg-sync"]

@@ -1,0 +1,32 @@
+# Bitdex PG Sync Configuration
+# Copy to sync.toml and adjust for your environment.
+
+# Postgres connection string (read-write logical replica)
+postgres_url = "postgres://user:pass@localhost:5432/civitai"
+
+# ClickHouse HTTP URL for metrics (optional — omit to skip metrics polling)
+clickhouse_url = "http://localhost:8123"
+
+# Bitdex server URL (used by sync mode to push upserts/deletes)
+bitdex_url = "http://localhost:3000"
+
+# Path to the index definition directory (must contain config.json)
+index_dir = "data/indexes/civitai"
+
+# Data directory for engine storage (bitmaps + docstore)
+data_dir = "data/civitai"
+
+# Number of PG connections in the pool (default: 10)
+pg_pool_size = 10
+
+# Number of image IDs per batch during bulk loading (default: 100000)
+batch_size = 100000
+
+# Outbox poll interval in seconds (default: 2)
+poll_interval_secs = 2
+
+# Max outbox rows per poll cycle (default: 5000)
+outbox_batch_limit = 5000
+
+# ClickHouse metrics poll interval in seconds (default: 60)
+metrics_poll_interval_secs = 60
