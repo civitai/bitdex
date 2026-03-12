@@ -21,16 +21,25 @@
  *     cargo run --release --features server --bin server -- --port 3000 --data-dir ./test-write-data
  */
 
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 const BASE_URL = process.argv.includes('--url')
   ? process.argv[process.argv.indexOf('--url') + 1]
   : 'http://localhost:3000';
 const VERBOSE = process.argv.includes('--verbose');
 const KEEP = process.argv.includes('--keep');
+const RESULTS_DIR = process.argv.includes('--results-dir')
+  ? process.argv[process.argv.indexOf('--results-dir') + 1]
+  : null;
 
 const INDEX = 'write-test';
 
 let passed = 0;
 let failed = 0;
+
+// Per-group results tracking for JSON output
+const groupResults = [];
 
 function log(...args) { console.log(...args); }
 function vlog(...args) { if (VERBOSE) console.log('  [verbose]', ...args); }
@@ -463,16 +472,33 @@ async function main() {
     process.exit(1);
   }
 
+  const suiteStart = Date.now();
+
   for (const [id, name, fn] of groups) {
+    const groupStart = Date.now();
     try {
       await fn();
       passed++;
       log(`  PASS: ${id}. ${name}`);
+      groupResults.push({
+        id,
+        name,
+        status: 'pass',
+        duration_ms: Date.now() - groupStart,
+        assertions: [],
+      });
     } catch (e) {
       failed++;
       log(`  FAIL: ${id}. ${name}`);
       log(`    ${e.message}`);
       if (VERBOSE) console.error(e.stack);
+      groupResults.push({
+        id,
+        name,
+        status: 'fail',
+        duration_ms: Date.now() - groupStart,
+        assertions: [{ check: e.message, passed: false }],
+      });
     }
   }
 
@@ -481,6 +507,26 @@ async function main() {
   log(`\n${'='.repeat(50)}`);
   log(`Results: ${passed} passed, ${failed} failed out of ${groups.length}`);
   log(`${'='.repeat(50)}`);
+
+  // Write JSON results if --results-dir provided
+  if (RESULTS_DIR) {
+    mkdirSync(RESULTS_DIR, { recursive: true });
+    const resultsJson = {
+      suite: 'write-handling',
+      timestamp: new Date().toISOString(),
+      server_url: BASE_URL,
+      groups: groupResults,
+      summary: {
+        passed,
+        failed,
+        total: groups.length,
+        duration_ms: Date.now() - suiteStart,
+      },
+    };
+    const resultsPath = resolve(RESULTS_DIR, 'write-handling.json');
+    writeFileSync(resultsPath, JSON.stringify(resultsJson, null, 2));
+    log(`JSON results written to: ${resultsPath}`);
+  }
 
   process.exit(failed > 0 ? 1 : 0);
 }
