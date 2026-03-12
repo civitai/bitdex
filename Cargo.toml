@@ -8,7 +8,7 @@ keywords = ["bitmap", "index", "database", "search", "roaring"]
 
 [features]
 default = []
-server = ["dep:axum", "dep:tower-http", "dep:tokio"]
+server = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:prometheus"]
 loadtest = ["ureq"]
 pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio"]
 
@@ -44,6 +44,7 @@ rpmalloc = "0.2"
 # HTTP server (optional — only needed for HTTP server)
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
+prometheus = { version = "0.13", features = ["process"], optional = true }
 
 # HTTP client (optional — only needed for loadtest binary)
 ureq = { version = "2", optional = true }

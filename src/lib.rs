@@ -16,6 +16,8 @@ pub mod parser;
 pub mod planner;
 pub mod query;
 #[cfg(feature = "server")]
+pub mod metrics;
+#[cfg(feature = "server")]
 pub mod server;
 pub mod slot;
 pub mod sort;

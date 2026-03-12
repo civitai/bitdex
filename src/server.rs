@@ -22,6 +22,7 @@ use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{Config, DataSchema, FieldValueType};
 use crate::executor::StringMaps;
 use crate::loader;
+use crate::metrics::Metrics;
 use crate::query::BitdexQuery;
 
 // ---------------------------------------------------------------------------
@@ -74,6 +75,7 @@ struct IndexState {
 struct AppState {
     data_dir: PathBuf,
     index: Mutex<Option<IndexState>>,
+    metrics: Metrics,
 }
 
 type SharedState = Arc<AppState>;
@@ -161,6 +163,7 @@ impl BitdexServer {
         let state = Arc::new(AppState {
             data_dir: self.data_dir.clone(),
             index: Mutex::new(None),
+            metrics: Metrics::new(),
         });
 
         // Try to restore an existing index from disk
@@ -186,6 +189,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             // Utility
             .route("/api/health", get(handle_health))
+            .route("/metrics", get(handle_metrics))
             // Serve static UI
             .route("/", get(handle_ui))
             .layer(CorsLayer::permissive())
@@ -636,9 +640,15 @@ async fn handle_query(
     };
 
     let start = Instant::now();
+    let m = &state.metrics;
     match engine.execute_query(&req.query) {
         Ok(result) => {
-            let elapsed_us = start.elapsed().as_micros() as u64;
+            let elapsed = start.elapsed();
+            let elapsed_us = elapsed.as_micros() as u64;
+            m.query_total.with_label_values(&[&name]).inc();
+            m.query_duration_seconds
+                .with_label_values(&[&name])
+                .observe(elapsed.as_secs_f64());
             let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
 
             let documents = if req.include_docs {
@@ -674,6 +684,10 @@ async fn handle_query(
             Json(response).into_response()
         }
         Err(e) => {
+            m.query_total.with_label_values(&[&name]).inc();
+            m.query_duration_seconds
+                .with_label_values(&[&name])
+                .observe(start.elapsed().as_secs_f64());
             (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": e.to_string()})),
@@ -775,6 +789,12 @@ async fn handle_upsert(
         }
     }
 
+    state
+        .metrics
+        .upsert_total
+        .with_label_values(&[&name])
+        .inc_by(upserted);
+
     if errors.is_empty() {
         Json(serde_json::json!({"upserted": upserted})).into_response()
     } else {
@@ -812,6 +832,12 @@ async fn handle_delete_docs(
             Err(e) => errors.push(format!("id={}: {}", id, e)),
         }
     }
+
+    state
+        .metrics
+        .delete_total
+        .with_label_values(&[&name])
+        .inc_by(deleted);
 
     if errors.is_empty() {
         Json(serde_json::json!({"deleted": deleted})).into_response()
@@ -883,6 +909,101 @@ async fn handle_clear_cache(
 
 async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
+    let m = &state.metrics;
+
+    // Collect-on-scrape: refresh all gauges from current engine state.
+    {
+        let guard = state.index.lock();
+        if let Some(idx) = guard.as_ref() {
+            let name = &idx.definition.name;
+            let engine = &idx.engine;
+
+            // Document lifecycle gauges
+            m.alive_documents
+                .with_label_values(&[name])
+                .set(engine.alive_count() as i64);
+            m.slot_high_water
+                .with_label_values(&[name])
+                .set(engine.slot_counter() as i64);
+
+            // Cache gauges
+            let uc = engine.unified_cache_stats();
+            m.cache_entries
+                .with_label_values(&[name])
+                .set(uc.entries as i64);
+            m.cache_bytes
+                .with_label_values(&[name])
+                .set(uc.memory_bytes as i64);
+            m.cache_hits_total
+                .with_label_values(&[name])
+                .set(uc.hits as i64);
+            m.cache_misses_total
+                .with_label_values(&[name])
+                .set(uc.misses as i64);
+
+            // Bound cache + meta-index gauges
+            let (bound_entries, bound_bytes, meta_entries, meta_bytes) =
+                engine.bound_cache_stats();
+            m.bound_cache_entries
+                .with_label_values(&[name])
+                .set(bound_entries as i64);
+            m.bound_cache_bytes
+                .with_label_values(&[name])
+                .set(bound_bytes as i64);
+            m.meta_index_entries
+                .with_label_values(&[name])
+                .set(meta_entries as i64);
+            m.meta_index_bytes
+                .with_label_values(&[name])
+                .set(meta_bytes as i64);
+
+            // Per-field bitmap memory gauges
+            let (slot_bytes, _filter_bytes, _sort_bytes, _ce, _cb, filter_details, sort_details) =
+                engine.bitmap_memory_report();
+            m.slot_bitmap_bytes
+                .with_label_values(&[name])
+                .set(slot_bytes as i64);
+            for (field, count, bytes) in &filter_details {
+                m.filter_bitmap_bytes
+                    .with_label_values(&[name, field])
+                    .set(*bytes as i64);
+                m.filter_bitmap_count
+                    .with_label_values(&[name, field])
+                    .set(*count as i64);
+            }
+            for (field, bytes) in &sort_details {
+                m.sort_bitmap_bytes
+                    .with_label_values(&[name, field])
+                    .set(*bytes as i64);
+            }
+
+            // Flush pipeline stats
+            let (pub_count, _cumulative_nanos, last_nanos) = engine.flush_stats();
+            m.snapshot_publish_total
+                .with_label_values(&[name])
+                .set(pub_count as i64);
+            m.flush_last_duration_seconds
+                .with_label_values(&[name])
+                .set(last_nanos as i64);
+
+            // Pending fields (lazy loading)
+            let pending = engine.pending_field_count();
+            m.pending_fields
+                .with_label_values(&[name])
+                .set(pending as i64);
+        }
+    }
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        m.gather(),
+    )
 }
 
 async fn handle_ui() -> impl IntoResponse {

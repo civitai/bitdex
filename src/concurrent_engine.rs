@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, Guard};
 use crossbeam_channel::{Receiver, Sender};
@@ -95,6 +95,12 @@ pub struct ConcurrentEngine {
     string_maps: Option<Arc<StringMaps>>,
     /// Unified cache: replaces trie cache + bound cache (migration phase).
     unified_cache: Arc<parking_lot::Mutex<UnifiedCache>>,
+    /// Flush loop stats: total snapshot publishes (monotonic counter).
+    flush_publish_count: Arc<AtomicU64>,
+    /// Flush loop stats: cumulative flush duration in nanoseconds.
+    flush_duration_nanos: Arc<AtomicU64>,
+    /// Flush loop stats: most recent flush duration in nanoseconds.
+    flush_last_duration_nanos: Arc<AtomicU64>,
 }
 
 impl ConcurrentEngine {
@@ -231,6 +237,10 @@ impl ConcurrentEngine {
         let pending_sort_loads = Arc::new(parking_lot::Mutex::new(pending_sort_loads));
         let lazy_value_fields = Arc::new(parking_lot::Mutex::new(lazy_value_fields));
 
+        let flush_publish_count = Arc::new(AtomicU64::new(0));
+        let flush_duration_nanos = Arc::new(AtomicU64::new(0));
+        let flush_last_duration_nanos = Arc::new(AtomicU64::new(0));
+
         let flush_handle = {
             let inner = Arc::clone(&inner);
             let cache = Arc::clone(&cache);
@@ -243,6 +253,9 @@ impl ConcurrentEngine {
             let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
             let flush_time_buckets = time_buckets.as_ref().map(Arc::clone);
+            let flush_pub_count = Arc::clone(&flush_publish_count);
+            let flush_dur_nanos = Arc::clone(&flush_duration_nanos);
+            let flush_last_dur_nanos = Arc::clone(&flush_last_duration_nanos);
 
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
@@ -297,6 +310,7 @@ impl ConcurrentEngine {
                     }
 
                     // Phase 2: Apply mutations to staging (private, no lock needed)
+                    let flush_start = Instant::now();
                     if bitmap_count > 0 {
                         staging_dirty = true;
                         flush_dirty_flag.store(true, Ordering::Release);
@@ -543,6 +557,12 @@ impl ConcurrentEngine {
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
                             inner.store(Arc::new(staging.clone()));
                             staging_dirty = false;
+
+                            // Record flush stats for Prometheus
+                            let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
+                            flush_pub_count.fetch_add(1, Ordering::Relaxed);
+                            flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
+                            flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
                         }
                     }
 
@@ -835,6 +855,9 @@ impl ConcurrentEngine {
             lazy_tx,
             string_maps: None,
             unified_cache,
+            flush_publish_count,
+            flush_duration_nanos,
+            flush_last_duration_nanos,
         })
     }
 
@@ -1907,6 +1930,20 @@ impl ConcurrentEngine {
     /// Get the number of alive documents (lock-free snapshot).
     pub fn alive_count(&self) -> u64 {
         self.snapshot().slots.alive_count()
+    }
+
+    /// Flush loop stats: (publish_count, cumulative_duration_nanos, last_duration_nanos).
+    pub fn flush_stats(&self) -> (u64, u64, u64) {
+        (
+            self.flush_publish_count.load(Ordering::Relaxed),
+            self.flush_duration_nanos.load(Ordering::Relaxed),
+            self.flush_last_duration_nanos.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Number of filter + sort fields still pending lazy load.
+    pub fn pending_field_count(&self) -> usize {
+        self.pending_filter_loads.lock().len() + self.pending_sort_loads.lock().len()
     }
 
     /// Get the high-water mark slot counter (lock-free snapshot).
