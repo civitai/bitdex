@@ -110,6 +110,10 @@ struct LoadRequest {
     chunk_size: usize,
     #[serde(default = "default_docstore_batch_size")]
     docstore_batch_size: usize,
+    #[serde(default = "default_max_writer_threads")]
+    max_writer_threads: usize,
+    #[serde(default)]
+    save_snapshot: bool,
 }
 
 fn default_threads() -> usize {
@@ -127,6 +131,10 @@ fn default_chunk_size() -> usize {
 
 fn default_docstore_batch_size() -> usize {
     100_000
+}
+
+fn default_max_writer_threads() -> usize {
+    4
 }
 
 #[derive(Deserialize)]
@@ -758,6 +766,8 @@ async fn handle_load(
     let threads = req.threads;
     let chunk_size = req.chunk_size;
     let docstore_batch_size = req.docstore_batch_size;
+    let max_writer_threads = req.max_writer_threads;
+    let save_snapshot = req.save_snapshot;
     let progress = Arc::clone(&load_progress);
     let status = Arc::clone(&load_status);
 
@@ -766,7 +776,7 @@ async fn handle_load(
         // Enter loading mode
         engine.enter_loading_mode();
 
-        match loader::load_ndjson(&engine, &schema, &path, limit, threads, chunk_size, docstore_batch_size, progress.clone()) {
+        match loader::load_ndjson(&engine, &schema, &path, limit, threads, chunk_size, docstore_batch_size, max_writer_threads, progress.clone()) {
             Ok(stats) => {
                 // Exit loading mode (publishes staging and restarts maintenance)
                 engine.exit_loading_mode();
@@ -774,21 +784,21 @@ async fn handle_load(
                 let alive = engine.alive_count();
                 eprintln!("Load complete: {} records alive", alive);
 
-                // Transition to Saving — bitmap snapshot save can be slow
-                *status.lock() = LoadStatus::Saving {
-                    records_loaded: stats.records_loaded,
-                    elapsed_secs: stats.elapsed.as_secs_f64(),
-                };
+                if save_snapshot {
+                    // Transition to Saving — bitmap snapshot save can be slow
+                    *status.lock() = LoadStatus::Saving {
+                        records_loaded: stats.records_loaded,
+                        elapsed_secs: stats.elapsed.as_secs_f64(),
+                    };
 
-                // Save bitmap snapshot for fast restart (may take a while on NTFS)
-                let snap_start = Instant::now();
-                if let Err(e) = engine.save_snapshot() {
-                    eprintln!("Warning: failed to save bitmap snapshot: {e}");
-                } else {
-                    eprintln!("Bitmap snapshot saved in {:.1}s", snap_start.elapsed().as_secs_f64());
+                    let snap_start = Instant::now();
+                    if let Err(e) = engine.save_snapshot() {
+                        eprintln!("Warning: failed to save bitmap snapshot: {e}");
+                    } else {
+                        eprintln!("Bitmap snapshot saved in {:.1}s", snap_start.elapsed().as_secs_f64());
+                    }
                 }
 
-                // Only report complete after snapshot is fully saved
                 *status.lock() = LoadStatus::Complete {
                     records_loaded: stats.records_loaded,
                     elapsed_secs: stats.elapsed.as_secs_f64(),

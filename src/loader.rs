@@ -106,6 +106,7 @@ impl BitmapAccum {
 /// - `threads`: number of threads (unused — rayon manages parallelism)
 /// - `chunk_size`: number of full docs to accumulate before flushing docstore
 /// - `docstore_batch_size`: unused
+/// - `max_writer_threads`: max concurrent docstore writer threads (0 = unbounded)
 /// - `progress`: atomic counter updated as records are loaded (for progress polling)
 pub fn load_ndjson(
     engine: &ConcurrentEngine,
@@ -115,6 +116,7 @@ pub fn load_ndjson(
     _threads: usize,
     chunk_size: usize,
     _docstore_batch_size: usize,
+    max_writer_threads: usize,
     progress: Arc<AtomicU64>,
 ) -> Result<LoadStats, String> {
     let record_limit = limit.unwrap_or(usize::MAX);
@@ -292,6 +294,7 @@ pub fn load_ndjson(
     let wall_start = Instant::now();
 
     let mut ds_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    let writer_cap = if max_writer_threads == 0 { usize::MAX } else { max_writer_threads };
 
     while let Ok(chunk) = chunk_rx.recv() {
         total_errors += chunk.errors;
@@ -318,6 +321,13 @@ pub fn load_ndjson(
             chunks_processed, total_inserted, rate, apply_ms
         );
 
+        // Backpressure: wait for a writer to finish before spawning another
+        if ds_handles.len() >= writer_cap {
+            if let Some(h) = ds_handles.drain(..1).next() {
+                h.join().unwrap();
+            }
+        }
+
         // Spawn docstore writer with pre-encoded bytes — pure I/O, no rayon contention.
         if !chunk.encoded_docs.is_empty() {
             let writer = Arc::clone(&bulk_writer);
@@ -327,7 +337,7 @@ pub fn load_ndjson(
         }
     }
 
-    // Wait for threads
+    // Wait for remaining threads
     parse_handle.join().unwrap();
     reader_handle.join().unwrap();
     for h in ds_handles {

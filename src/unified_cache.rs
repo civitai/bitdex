@@ -20,29 +20,33 @@ use crate::cache::CanonicalClause;
 use crate::filter::FilterIndex;
 use crate::meta_index::{CacheEntryId, MetaIndex};
 use crate::query::SortDirection;
+use crate::radix_sort::RadixSortIndex;
 use crate::sort::SortIndex;
 use crate::write_coalescer::FilterGroupKey;
 
 /// Configuration for the unified cache.
 #[derive(Debug, Clone)]
 pub struct UnifiedCacheConfig {
-    /// Maximum number of cache entries before LRU eviction (default 5000).
+    /// Maximum number of cache entries (safety cap, default 100_000).
     pub max_entries: usize,
+    /// Maximum total cache memory in bytes (default 512 MB). Primary eviction trigger.
+    pub max_bytes: usize,
     /// Initial bound capacity per entry (default 4000).
     pub initial_capacity: usize,
     /// Maximum bound capacity per entry after expansion (default 64000).
     pub max_capacity: usize,
-    /// Skip caching if filter result has fewer docs than this (default 1000).
+    /// Skip caching if filter result has fewer docs than this (default 0 = cache everything).
     pub min_filter_size: usize,
 }
 
 impl Default for UnifiedCacheConfig {
     fn default() -> Self {
         Self {
-            max_entries: 5000,
+            max_entries: 100_000,
+            max_bytes: 512 * 1024 * 1024, // 512 MB
             initial_capacity: 4_000,
             max_capacity: 64_000,
-            min_filter_size: 1000,
+            min_filter_size: 0,
         }
     }
 }
@@ -56,6 +60,10 @@ pub struct UnifiedKey {
 }
 
 /// Cache entry: dynamically-sized bounded bitmap.
+///
+/// At initial capacity (≤4K), pagination uses bitmap sort traversal.
+/// After expansion (>4K → 64K), a `RadixSortIndex` is built for O(1) bucket-based
+/// pagination and O(1) maintenance (vs O(n) memmove for sorted vecs).
 pub struct UnifiedEntry {
     /// Bounded top-K bitmap within the filter result.
     bitmap: Arc<RoaringBitmap>,
@@ -77,6 +85,16 @@ pub struct UnifiedEntry {
     last_used: Instant,
     /// Meta-index entry ID for this cache entry.
     meta_id: CacheEntryId,
+    /// Pre-sorted packed keys for O(1) pagination via binary search at initial capacity.
+    /// Each key is `(sort_value as u64) << 32 | slot_id`. Sorted in traversal order.
+    /// Cleared on expand() when radix takes over.
+    sorted_keys: Option<Vec<u64>>,
+    /// Radix sort index for expanded entries (>4K items).
+    /// Built during expand(), enables O(1) bucket-based pagination and maintenance.
+    /// None at initial capacity — sorted vec binary search is faster for ≤4K items.
+    radix: Option<Arc<RadixSortIndex>>,
+    /// Sort direction for this entry (needed for radix iteration order).
+    direction: SortDirection,
 }
 
 impl UnifiedEntry {
@@ -84,6 +102,7 @@ impl UnifiedEntry {
     ///
     /// `sorted_slots` should be the top-N slots from the sort traversal, in sort order.
     /// `value_fn` returns the sort value for a given slot.
+    /// At formation, capacity is initial_capacity (4K) — no radix needed.
     pub fn new(
         sorted_slots: &[u32],
         capacity: usize,
@@ -91,6 +110,7 @@ impl UnifiedEntry {
         has_more: bool,
         total_matched: u64,
         meta_id: CacheEntryId,
+        direction: SortDirection,
         value_fn: impl Fn(u32) -> u32,
     ) -> Self {
         let mut bitmap = RoaringBitmap::new();
@@ -105,8 +125,18 @@ impl UnifiedEntry {
             0
         };
 
+        let bitmap = Arc::new(bitmap);
+
+        // Build sorted keys for fast binary search pagination at initial capacity.
+        // Each key is (sort_value << 32) | slot_id, sorted in traversal order.
+        let sorted_keys = if take_count > 0 {
+            Some(Self::build_sorted_keys(&sorted_slots[..take_count], direction, &value_fn))
+        } else {
+            None
+        };
+
         Self {
-            bitmap: Arc::new(bitmap),
+            bitmap,
             min_tracked_value,
             capacity,
             max_capacity,
@@ -116,6 +146,9 @@ impl UnifiedEntry {
             rebuilding: AtomicBool::new(false),
             last_used: Instant::now(),
             meta_id,
+            sorted_keys,
+            radix: None, // No radix at initial capacity — sorted vec is faster
+            direction,
         }
     }
 
@@ -172,8 +205,15 @@ impl UnifiedEntry {
     }
 
     /// Add a slot to the bounded bitmap. Returns true if bloat threshold was exceeded.
-    pub fn add_slot(&mut self, slot: u32) -> bool {
+    /// `sort_value` is needed to maintain the radix index when present.
+    pub fn add_slot(&mut self, slot: u32, sort_value: u32) -> bool {
         Arc::make_mut(&mut self.bitmap).insert(slot);
+
+        // Maintain radix if present (expanded entry)
+        if let Some(ref mut radix) = self.radix {
+            Arc::make_mut(radix).insert(slot, sort_value);
+        }
+
         let bloat_threshold = self.capacity * 2;
         if self.bitmap.len() as usize > bloat_threshold {
             self.needs_rebuild = true;
@@ -184,8 +224,23 @@ impl UnifiedEntry {
     }
 
     /// Remove a slot from the bounded bitmap.
-    pub fn remove_slot(&mut self, slot: u32) {
+    /// `sort_value` is needed to maintain the radix index when present.
+    pub fn remove_slot(&mut self, slot: u32, sort_value: u32) {
         Arc::make_mut(&mut self.bitmap).remove(slot);
+
+        // Maintain radix if present (expanded entry)
+        if let Some(ref mut radix) = self.radix {
+            Arc::make_mut(radix).remove(slot, sort_value);
+        }
+    }
+
+    /// Remove a slot without knowing its sort value. Uses blind scan for radix.
+    pub fn remove_slot_blind(&mut self, slot: u32) {
+        Arc::make_mut(&mut self.bitmap).remove(slot);
+
+        if let Some(ref mut radix) = self.radix {
+            Arc::make_mut(radix).remove_blind(slot);
+        }
     }
 
     /// Check if a sort value qualifies for this bound.
@@ -198,6 +253,9 @@ impl UnifiedEntry {
 
     /// Expand the entry by appending new slots from a deeper sort traversal.
     /// Returns the new capacity after expansion.
+    ///
+    /// Builds a RadixSortIndex from the full bitmap for O(1) bucket-based pagination
+    /// and O(1) maintenance at the expanded capacity.
     pub fn expand(
         &mut self,
         new_slots: &[u32],
@@ -217,6 +275,13 @@ impl UnifiedEntry {
         // entry at 64K) and this eliminates repeated expansion events at boundaries.
         let old_capacity = self.capacity;
         self.capacity = self.max_capacity;
+
+        // Clear sorted keys — radix takes over for expanded entries
+        self.sorted_keys = None;
+
+        // Build radix index from the full bitmap (old + new slots).
+        // ~1ms at 64K items (benchmarked). Enables O(1) pagination and maintenance.
+        self.radix = Some(Arc::new(RadixSortIndex::from_bitmap(&self.bitmap, &value_fn)));
 
         // If expansion returned fewer than expected, no more results
         let expected_chunk = self.max_capacity - old_capacity;
@@ -246,6 +311,20 @@ impl UnifiedEntry {
         };
 
         self.bitmap = Arc::new(bitmap);
+
+        // Rebuild radix if at expanded capacity, sorted keys if at initial capacity
+        if self.capacity >= self.max_capacity {
+            self.sorted_keys = None;
+            self.radix = Some(Arc::new(RadixSortIndex::from_bitmap(&self.bitmap, &value_fn)));
+        } else {
+            self.sorted_keys = if take_count > 0 {
+                Some(Self::build_sorted_keys(&sorted_slots[..take_count], self.direction, &value_fn))
+            } else {
+                None
+            };
+            self.radix = None;
+        }
+
         self.needs_rebuild = false;
         self.rebuilding.store(false, Ordering::Release);
     }
@@ -257,9 +336,43 @@ impl UnifiedEntry {
             .is_ok()
     }
 
-    /// Memory usage of this entry's bitmap.
+    /// Get the radix sort index (present for expanded entries).
+    pub fn radix(&self) -> Option<&Arc<RadixSortIndex>> {
+        self.radix.as_ref()
+    }
+
+    /// Get the sort direction for this entry.
+    pub fn direction(&self) -> SortDirection {
+        self.direction
+    }
+
+    /// Get the pre-sorted keys for binary search pagination (initial capacity only).
+    /// Returns None after expand() when radix takes over.
+    pub fn sorted_keys(&self) -> Option<&[u64]> {
+        self.sorted_keys.as_deref()
+    }
+
+    /// Memory usage of this entry's bitmap + sorted keys + radix index.
     pub fn memory_bytes(&self) -> usize {
-        self.bitmap.serialized_size()
+        let bitmap_bytes = self.bitmap.serialized_size();
+        let keys_bytes = self.sorted_keys.as_ref()
+            .map(|k| k.capacity() * 8)
+            .unwrap_or(0);
+        let radix_bytes = self.radix.as_ref().map(|r| r.memory_bytes()).unwrap_or(0);
+        bitmap_bytes + keys_bytes + radix_bytes
+    }
+
+    /// Build packed sorted keys from slots + values.
+    fn build_sorted_keys(slots: &[u32], direction: SortDirection, value_fn: &impl Fn(u32) -> u32) -> Vec<u64> {
+        let mut keys: Vec<u64> = slots.iter().map(|&slot| {
+            let val = value_fn(slot) as u64;
+            (val << 32) | (slot as u64)
+        }).collect();
+        match direction {
+            SortDirection::Desc => keys.sort_unstable_by(|a, b| b.cmp(a)),
+            SortDirection::Asc => keys.sort_unstable(),
+        }
+        keys
     }
 }
 
@@ -292,6 +405,8 @@ pub struct UnifiedCache {
     config: UnifiedCacheConfig,
     hits: u64,
     misses: u64,
+    /// Running total of entry memory (bitmap + sorted_keys + radix bytes).
+    total_bytes: usize,
 }
 
 impl UnifiedCache {
@@ -302,6 +417,7 @@ impl UnifiedCache {
             config,
             hits: 0,
             misses: 0,
+            total_bytes: 0,
         }
     }
 
@@ -329,20 +445,26 @@ impl UnifiedCache {
         self.entries.get(key)
     }
 
-    /// Store a new entry, evicting LRU if at capacity. Returns the meta_id assigned.
+    /// Store a new entry, evicting LRU if over budget. Returns the meta_id assigned.
     pub fn store(&mut self, key: UnifiedKey, entry: UnifiedEntry) -> CacheEntryId {
         let meta_id = entry.meta_id;
+        let new_bytes = entry.memory_bytes();
 
-        // Evict LRU if at capacity
-        if self.entries.len() >= self.config.max_entries && !self.entries.contains_key(&key) {
-            self.evict_lru();
-        }
-
-        // If replacing an existing entry, deregister the old one
+        // If replacing an existing entry, deregister the old one and subtract its bytes
         if let Some(old) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.memory_bytes());
             self.meta.deregister(old.meta_id);
         }
 
+        // Evict LRU entries while over byte budget or entry count cap
+        while (self.total_bytes + new_bytes > self.config.max_bytes
+            || self.entries.len() >= self.config.max_entries)
+            && !self.entries.is_empty()
+        {
+            self.evict_lru();
+        }
+
+        self.total_bytes += new_bytes;
         self.entries.insert(key, entry);
         meta_id
     }
@@ -364,6 +486,7 @@ impl UnifiedCache {
             Some(key.direction),
         );
 
+        let direction = key.direction;
         let entry = UnifiedEntry::new(
             sorted_slots,
             self.config.initial_capacity,
@@ -371,6 +494,7 @@ impl UnifiedCache {
             has_more,
             total_matched,
             meta_id,
+            direction,
             value_fn,
         );
 
@@ -386,6 +510,7 @@ impl UnifiedCache {
             .map(|(key, _)| key.clone())?;
 
         if let Some(evicted) = self.entries.remove(&lru_key) {
+            self.total_bytes = self.total_bytes.saturating_sub(evicted.memory_bytes());
             self.meta.deregister(evicted.meta_id);
         }
 
@@ -418,7 +543,14 @@ impl UnifiedCache {
 
     /// Total memory of all bounded bitmaps.
     pub fn total_memory_bytes(&self) -> usize {
-        self.entries.values().map(|e| e.memory_bytes()).sum()
+        self.total_bytes
+    }
+
+    /// Reconcile the tracked total_bytes with actual entry sizes.
+    /// Call after bulk maintenance operations (expand/rebuild/add_slot/remove_slot)
+    /// which mutate entries in-place without updating the running total.
+    pub fn reconcile_bytes(&mut self) {
+        self.total_bytes = self.entries.values().map(|e| e.memory_bytes()).sum();
     }
 
     /// Clear all entries, reset the meta-index, and reset counters.
@@ -427,6 +559,7 @@ impl UnifiedCache {
         self.meta = MetaIndex::new();
         self.hits = 0;
         self.misses = 0;
+        self.total_bytes = 0;
     }
 
     /// Return a stats snapshot.
@@ -534,19 +667,18 @@ impl UnifiedCache {
             }
 
             for &slot in &slots_to_check {
+                let sort_value = sorts
+                    .get_field(&key.sort_field)
+                    .map(|f| f.reconstruct_value(slot))
+                    .unwrap_or(0);
                 let matches = slot_matches_filter(slot, &key.filter_clauses, filters, sorts);
                 if matches {
-                    // Check sort qualification before adding
-                    let sort_value = sorts
-                        .get_field(&key.sort_field)
-                        .map(|f| f.reconstruct_value(slot))
-                        .unwrap_or(0);
                     if entry.sort_qualifies(sort_value, key.direction) {
-                        entry.add_slot(slot);
+                        entry.add_slot(slot, sort_value);
                     }
                 } else {
                     // Slot no longer matches filter — remove it
-                    entry.remove_slot(slot);
+                    entry.remove_slot(slot, sort_value);
                 }
             }
         }
@@ -590,7 +722,7 @@ impl UnifiedCache {
 
                 // Sort qualifies — check filter match
                 if slot_matches_filter(slot, &key.filter_clauses, filters, sorts) {
-                    entry.add_slot(slot);
+                    entry.add_slot(slot, sort_value);
                 }
             }
         }
@@ -602,7 +734,7 @@ impl UnifiedCache {
     /// avoids marking all entries for rebuild, preserving cache effectiveness.
     pub fn remove_slot_from_all(&mut self, slot: u32) {
         for (_, entry) in self.entries.iter_mut() {
-            entry.remove_slot(slot);
+            entry.remove_slot_blind(slot);
         }
     }
 
@@ -669,6 +801,13 @@ impl UnifiedCache {
             if !dropped_slots.is_empty() {
                 let bm = Arc::make_mut(&mut entry.bitmap);
                 *bm -= dropped_slots;
+                // Also remove from radix (blind — no sort values for bulk drop)
+                if let Some(ref mut radix) = entry.radix {
+                    let r = Arc::make_mut(radix);
+                    for slot in dropped_slots.iter() {
+                        r.remove_blind(slot);
+                    }
+                }
             }
 
             // Add qualifying new slots
@@ -693,7 +832,7 @@ impl UnifiedCache {
                         .unwrap_or(0);
 
                     if entry.sort_qualifies(sort_value, key.direction) {
-                        entry.add_slot(slot);
+                        entry.add_slot(slot, sort_value);
                     }
                 }
             }
@@ -846,6 +985,7 @@ mod tests {
     fn make_config() -> UnifiedCacheConfig {
         UnifiedCacheConfig {
             max_entries: 5,
+            max_bytes: 1024 * 1024, // 1 MB — generous for tests
             initial_capacity: 100,
             max_capacity: 1600,
             min_filter_size: 100,
@@ -1046,8 +1186,8 @@ mod tests {
         assert!(!entry.needs_rebuild());
 
         // Add slots until bloat threshold (2 * capacity = 20)
-        for i in 10..21 {
-            entry.add_slot(i);
+        for i in 10..21u32 {
+            entry.add_slot(i, 1000 - i);
         }
         assert!(entry.needs_rebuild());
     }
@@ -1262,11 +1402,11 @@ mod tests {
         let entry = cache.get_mut(&key).unwrap();
         assert_eq!(entry.cardinality(), 10);
 
-        entry.add_slot(100);
+        entry.add_slot(100, 900);
         assert_eq!(entry.cardinality(), 11);
         assert!(entry.bitmap().contains(100));
 
-        entry.remove_slot(100);
+        entry.remove_slot(100, 900);
         assert_eq!(entry.cardinality(), 10);
         assert!(!entry.bitmap().contains(100));
     }
@@ -1381,6 +1521,90 @@ mod tests {
         entry.expand(&new_slots, |s| 1000 - s);
 
         assert_eq!(entry.min_tracked_value(), 991); // 1000 - 9
+    }
+
+    #[test]
+    fn test_radix_built_on_expand() {
+        let config = UnifiedCacheConfig {
+            initial_capacity: 5,
+            max_capacity: 100,
+            ..make_config()
+        };
+        let mut cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        let entry = cache.get(&key).unwrap();
+        assert!(entry.radix().is_none(), "no radix at initial capacity");
+
+        // Expand
+        let entry = cache.get_mut(&key).unwrap();
+        let new_slots: Vec<u32> = (5..100).collect();
+        entry.expand(&new_slots, |s| 1000 - s);
+        assert!(entry.radix().is_some(), "radix should be built on expand");
+
+        // Verify radix has all slots
+        let radix = entry.radix().unwrap();
+        assert_eq!(radix.total_slots(), 100);
+    }
+
+    #[test]
+    fn test_radix_maintained_on_add_remove() {
+        let config = UnifiedCacheConfig {
+            initial_capacity: 5,
+            max_capacity: 20,
+            ..make_config()
+        };
+        let mut cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        // Expand to build radix
+        let entry = cache.get_mut(&key).unwrap();
+        let new_slots: Vec<u32> = (5..20).collect();
+        entry.expand(&new_slots, |s| 1000 - s);
+        assert_eq!(entry.radix().unwrap().total_slots(), 20);
+
+        // Add a slot — should appear in both bitmap and radix
+        entry.add_slot(100, 500);
+        assert!(entry.bitmap().contains(100));
+        // Radix total should increase (after rebuild_counts)
+        let radix = entry.radix().unwrap();
+        assert!(radix.is_dirty()); // dirty from insert
+
+        // Remove a slot
+        entry.remove_slot(100, 500);
+        assert!(!entry.bitmap().contains(100));
+    }
+
+    #[test]
+    fn test_radix_rebuilt_on_rebuild() {
+        let config = UnifiedCacheConfig {
+            initial_capacity: 5,
+            max_capacity: 10,
+            ..make_config()
+        };
+        let mut cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        // Expand to max capacity
+        let entry = cache.get_mut(&key).unwrap();
+        let new_slots: Vec<u32> = (5..10).collect();
+        entry.expand(&new_slots, |s| 1000 - s);
+        assert!(entry.radix().is_some());
+
+        // Rebuild — should rebuild radix at expanded capacity
+        let new_slots: Vec<u32> = (0..8).collect();
+        entry.rebuild(&new_slots, |s| 1000 - s);
+        assert!(entry.radix().is_some(), "radix should be rebuilt at expanded capacity");
+        assert_eq!(entry.radix().unwrap().total_slots(), 8);
     }
 
     // ── Maintenance Tests ──────────────────────────────────────────────────

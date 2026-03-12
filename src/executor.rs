@@ -542,6 +542,146 @@ impl<'a> QueryExecutor<'a> {
         Ok((ids, next_cursor))
     }
 
+    /// Paginate using pre-sorted packed keys (binary search fast path for initial-capacity entries).
+    ///
+    /// Each key is `(sort_value << 32) | slot_id`, pre-sorted in traversal order.
+    /// Binary search for cursor position, then take N items. ~55ns at 4K entries.
+    pub fn execute_from_sorted_keys(
+        &self,
+        sorted_keys: &[u64],
+        _sort_field_name: &str,
+        direction: SortDirection,
+        limit: usize,
+        cursor: Option<&crate::query::CursorPosition>,
+        total_matched: u64,
+    ) -> Result<QueryResult> {
+        let limit = limit.min(self.max_page_size);
+
+        let start_idx = if let Some(cursor) = cursor {
+            let cursor_key = (cursor.sort_value << 32) | (cursor.slot_id as u64);
+            // Find position past the cursor
+            match direction {
+                SortDirection::Desc => {
+                    // Keys sorted descending — find first key strictly less than cursor_key
+                    sorted_keys.partition_point(|&k| k >= cursor_key)
+                }
+                SortDirection::Asc => {
+                    // Keys sorted ascending — find first key strictly greater than cursor_key
+                    sorted_keys.partition_point(|&k| k <= cursor_key)
+                }
+            }
+        } else {
+            0
+        };
+
+        let end_idx = (start_idx + limit).min(sorted_keys.len());
+        let ids: Vec<i64> = sorted_keys[start_idx..end_idx]
+            .iter()
+            .map(|&key| (key & 0xFFFF_FFFF) as i64)
+            .collect();
+
+        let cursor = if end_idx < sorted_keys.len() {
+            let last_key = sorted_keys[end_idx - 1];
+            Some(crate::query::CursorPosition {
+                sort_value: last_key >> 32,
+                slot_id: (last_key & 0xFFFF_FFFF) as u32,
+            })
+        } else {
+            None
+        };
+
+        Ok(QueryResult {
+            ids,
+            total_matched,
+            cursor,
+        })
+    }
+
+    /// Paginate using a RadixSortIndex (bucket-based fast path for expanded entries).
+    ///
+    /// Instead of traversing 32 bit layers on the full bitmap, this:
+    /// 1. Uses cumulative rank arrays to skip directly to the target bucket (O(1) for offset)
+    /// 2. Calls top_n on a small bucket bitmap (~250 items at 64K uniform) instead of 64K
+    /// 3. Collects results across buckets until limit is reached
+    pub fn execute_from_radix(
+        &self,
+        radix: &crate::radix_sort::RadixSortIndex,
+        sort_clause: &SortClause,
+        limit: usize,
+        cursor: Option<&crate::query::CursorPosition>,
+        total_matched: u64,
+    ) -> Result<QueryResult> {
+        let sort_field = self
+            .sorts
+            .get_field(&sort_clause.field)
+            .ok_or_else(|| BitdexError::FieldNotFound(sort_clause.field.clone()))?;
+
+        let descending = sort_clause.direction == SortDirection::Desc;
+        let limit = limit.min(self.max_page_size);
+
+        let cursor_prefix = cursor.map(|c| (c.sort_value >> 24) as u8);
+        let cursor_param = cursor.map(|c| (c.sort_value, c.slot_id));
+
+        let mut result_ids: Vec<i64> = Vec::with_capacity(limit);
+        let mut remaining = limit;
+        let mut last_slot: Option<u32> = None;
+
+        for (prefix, bucket_bm) in radix.iter_buckets(sort_clause.direction) {
+            if remaining == 0 {
+                break;
+            }
+
+            // Skip buckets that are entirely before the cursor
+            if let Some(cp) = cursor_prefix {
+                match sort_clause.direction {
+                    SortDirection::Desc => {
+                        if prefix > cp {
+                            // This bucket has higher prefix than cursor — all slots are before cursor
+                            continue;
+                        }
+                    }
+                    SortDirection::Asc => {
+                        if prefix < cp {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // For the cursor bucket, pass the cursor. For subsequent buckets, no cursor needed.
+            let bucket_cursor = if cursor_prefix == Some(prefix) {
+                cursor_param
+            } else {
+                None
+            };
+
+            let sorted_slots = sort_field.top_n(bucket_bm, remaining, descending, bucket_cursor);
+
+            for &slot in &sorted_slots {
+                result_ids.push(slot as i64);
+                last_slot = Some(slot);
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+
+        let next_cursor = last_slot.map(|slot| {
+            let sort_value = sort_field.reconstruct_value(slot) as u64;
+            crate::query::CursorPosition {
+                sort_value,
+                slot_id: slot,
+            }
+        });
+
+        Ok(QueryResult {
+            ids: result_ids,
+            cursor: next_cursor,
+            total_matched,
+        })
+    }
+
     /// Simple in-memory sort for small result sets.
     /// When the planner estimates the result set is small, this avoids walking 32 bit layers.
     fn simple_sort_and_paginate(

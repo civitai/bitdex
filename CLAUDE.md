@@ -157,6 +157,15 @@ Postgres WAL consumer, backfill pipeline, shadow mode, end-to-end tests. NOT yet
 
 ---
 
+## Running Locally
+
+```bash
+# Run the server for testing (port 3001 to avoid conflicts with other dev servers)
+cargo run --release --features server --bin server -- --port 3001 --data-dir ./data
+```
+
+---
+
 ## Coding Standards
 
 - **Language**: Rust

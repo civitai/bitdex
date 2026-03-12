@@ -116,11 +116,12 @@ async fn poll_metrics_and_push(
 
 /// Query ClickHouse HTTP interface for aggregate metrics.
 ///
-/// Finds entities with recent activity (day >= since_ts), then fetches their
-/// ALL-TIME totals so the search index has cumulative counts.
+/// Two-phase approach:
+/// 1. Discovery: `entityMetricEvents` — find image IDs with recent activity
+///    (has `createdAt` for precise recency, unlike daily aggregates)
+/// 2. Totals: `entityMetricDailyAgg` — fetch ALL-TIME cumulative counts
+///    for those IDs so the search index stays correct.
 ///
-/// Table schema: entityType (String), entityId (Int32), metricType (String),
-///               day (Date), total (Int64)
 /// Metric types for Image: ReactionLike, ReactionHeart, ReactionLaugh,
 ///                          ReactionCry, Comment, Collection, Buzz
 async fn fetch_metrics_from_clickhouse(
@@ -128,7 +129,8 @@ async fn fetch_metrics_from_clickhouse(
     ch_config: &ClickHouseConfig,
     since_ts: i64,
 ) -> Result<HashMap<i64, MetricInfo>, String> {
-    // Find entities with recent activity, then get their all-time totals
+    // Phase 1: discover IDs with recent metric events
+    // Phase 2: get their all-time totals from the daily aggregate table
     let query = format!(
         r#"SELECT
             entityId as id,
@@ -139,9 +141,10 @@ async fn fetch_metrics_from_clickhouse(
         WHERE entityType = 'Image'
           AND entityId IN (
             SELECT DISTINCT entityId
-            FROM entityMetricDailyAgg
+            FROM entityMetricEvents
             WHERE entityType = 'Image'
-              AND day >= toDate(fromUnixTimestamp({since_ts}))
+              AND entityId IS NOT NULL
+              AND createdAt > fromUnixTimestamp({since_ts})
           )
         GROUP BY entityId
         FORMAT JSONEachRow"#,
