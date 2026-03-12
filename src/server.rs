@@ -65,10 +65,15 @@ pub struct IndexDefinition {
     pub data_schema: DataSchema,
 }
 
+/// Reverse string maps for MappedString fields: field_name → (int → original_string).
+/// Built from the original string_map before case normalization so original casing is preserved.
+type ReverseStringMaps = HashMap<String, HashMap<i64, String>>;
+
 /// Live state for a single index.
 struct IndexState {
     engine: Arc<ConcurrentEngine>,
     definition: IndexDefinition,
+    reverse_maps: Arc<ReverseStringMaps>,
     load_progress: Arc<AtomicU64>,
     load_status: Arc<Mutex<LoadStatus>>,
     load_started_at: Arc<Mutex<Option<Instant>>>,
@@ -217,9 +222,11 @@ impl IncludeDocs {
 ///
 /// Schema fields that were elided at write time (absent from StoredDoc) are
 /// filled with their type's default value so callers always see the full shape.
+/// MappedString fields are reverse-mapped from integer back to the original string.
 fn format_document(
     doc: &StoredDoc,
     schema: &DataSchema,
+    reverse_maps: &ReverseStringMaps,
     selection: &IncludeDocs,
 ) -> serde_json::Value {
     let mut fields = serde_json::Map::new();
@@ -242,7 +249,16 @@ fn format_document(
         }
 
         let value = if let Some(fv) = doc.fields.get(&mapping.target) {
-            field_value_to_json(fv)
+            // Reverse-map MappedString fields from integer back to string
+            if mapping.value_type == FieldValueType::MappedString {
+                if let Some(rev) = reverse_maps.get(&mapping.target) {
+                    reverse_map_value(fv, rev)
+                } else {
+                    field_value_to_json(fv)
+                }
+            } else {
+                field_value_to_json(fv)
+            }
         } else {
             // Fuse schema default for elided fields
             default_json_for_type(&mapping.value_type)
@@ -251,6 +267,23 @@ fn format_document(
     }
 
     serde_json::Value::Object(fields)
+}
+
+/// Reverse-map a MappedString field value from its stored integer back to
+/// the original string using a precomputed int→string map.
+fn reverse_map_value(fv: &FieldValue, rev: &HashMap<i64, String>) -> serde_json::Value {
+    match fv {
+        FieldValue::Single(Value::Integer(i)) => {
+            if let Some(s) = rev.get(i) {
+                serde_json::json!(s)
+            } else {
+                // Unknown mapping — return null rather than a meaningless integer
+                serde_json::Value::Null
+            }
+        }
+        // Non-integer values pass through (shouldn't happen for MappedString, but be safe)
+        other => field_value_to_json(other),
+    }
 }
 
 fn field_value_to_json(fv: &FieldValue) -> serde_json::Value {
@@ -271,7 +304,8 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 
 fn default_json_for_type(vt: &FieldValueType) -> serde_json::Value {
     match vt {
-        FieldValueType::Integer | FieldValueType::MappedString => serde_json::json!(0),
+        FieldValueType::Integer => serde_json::json!(0),
+        FieldValueType::MappedString => serde_json::Value::Null,
         FieldValueType::Boolean | FieldValueType::ExistsBoolean => serde_json::json!(false),
         FieldValueType::String => serde_json::json!(""),
         FieldValueType::IntegerArray => serde_json::json!([]),
@@ -391,6 +425,8 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 
         let json = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
         let mut def: IndexDefinition = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        // Build reverse maps BEFORE normalization to preserve original casing
+        let reverse_maps = build_reverse_string_maps(&def.data_schema);
         def.data_schema.normalize_string_maps();
 
         // Create engine from persisted config
@@ -430,6 +466,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         *state.index.lock() = Some(IndexState {
             engine: Arc::new(engine),
             definition: def,
+            reverse_maps: Arc::new(reverse_maps),
             load_progress: Arc::new(AtomicU64::new(alive)),
             load_status: Arc::new(Mutex::new(load_status)),
             load_started_at: Arc::new(Mutex::new(None)),
@@ -468,6 +505,24 @@ fn build_string_maps(schema: &DataSchema) -> (StringMaps, CaseSensitiveFields) {
         }
     }
     (maps, cs_fields)
+}
+
+/// Build reverse string maps (int → original string) for MappedString fields.
+/// Must be called BEFORE `normalize_string_maps()` to preserve original casing.
+fn build_reverse_string_maps(schema: &DataSchema) -> ReverseStringMaps {
+    let mut reverse = ReverseStringMaps::new();
+    for mapping in &schema.fields {
+        if mapping.value_type == FieldValueType::MappedString {
+            if let Some(ref string_map) = mapping.string_map {
+                let rev: HashMap<i64, String> = string_map
+                    .iter()
+                    .map(|(k, v)| (*v, k.clone()))
+                    .collect();
+                reverse.insert(mapping.target.clone(), rev);
+            }
+        }
+    }
+    reverse
 }
 
 async fn handle_create_index(
@@ -509,6 +564,9 @@ async fn handle_create_index(
             Json(serde_json::json!({"error": format!("Failed to create index directory: {e}")})),
         ).into_response();
     }
+
+    // Build reverse maps BEFORE normalization to preserve original casing
+    let reverse_maps = build_reverse_string_maps(&req.data_schema);
 
     // Persist config
     let mut data_schema = req.data_schema;
@@ -554,6 +612,7 @@ async fn handle_create_index(
     *state.index.lock() = Some(IndexState {
         engine: Arc::new(engine),
         definition,
+        reverse_maps: Arc::new(reverse_maps),
         load_progress: Arc::new(AtomicU64::new(0)),
         load_status: Arc::new(Mutex::new(LoadStatus::Idle)),
         load_started_at: Arc::new(Mutex::new(None)),
@@ -809,12 +868,13 @@ async fn handle_query(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema) = {
+    let (engine, schema, reverse_maps) = {
         let guard = state.index.lock();
         match guard.as_ref() {
             Some(idx) if idx.definition.name == name => (
                 Arc::clone(&idx.engine),
                 idx.definition.data_schema.clone(),
+                Arc::clone(&idx.reverse_maps),
             ),
             _ => {
                 return (
@@ -843,7 +903,7 @@ async fn handle_query(
                     let doc = engine.get_document(id as u32);
                     docs.push(match doc {
                         Ok(Some(stored)) => {
-                            format_document(&stored, &schema, &req.include_docs)
+                            format_document(&stored, &schema, &reverse_maps, &req.include_docs)
                         }
                         _ => serde_json::json!({ "id": id }),
                     });
@@ -883,12 +943,13 @@ async fn handle_document(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<DocumentRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema) = {
+    let (engine, schema, reverse_maps) = {
         let guard = state.index.lock();
         match guard.as_ref() {
             Some(idx) if idx.definition.name == name => (
                 Arc::clone(&idx.engine),
                 idx.definition.data_schema.clone(),
+                Arc::clone(&idx.reverse_maps),
             ),
             _ => {
                 return (
@@ -900,7 +961,7 @@ async fn handle_document(
     };
 
     match engine.get_document(req.slot_id) {
-        Ok(Some(doc)) => Json(format_document(&doc, &schema, &req.fields)).into_response(),
+        Ok(Some(doc)) => Json(format_document(&doc, &schema, &reverse_maps, &req.fields)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
@@ -911,12 +972,13 @@ async fn handle_documents_batch(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<DocumentBatchRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema) = {
+    let (engine, schema, reverse_maps) = {
         let guard = state.index.lock();
         match guard.as_ref() {
             Some(idx) if idx.definition.name == name => (
                 Arc::clone(&idx.engine),
                 idx.definition.data_schema.clone(),
+                Arc::clone(&idx.reverse_maps),
             ),
             _ => {
                 return (
@@ -930,7 +992,7 @@ async fn handle_documents_batch(
     let mut docs = Vec::with_capacity(req.slot_ids.len());
     for slot_id in &req.slot_ids {
         match engine.get_document(*slot_id) {
-            Ok(Some(doc)) => docs.push(format_document(&doc, &schema, &req.fields)),
+            Ok(Some(doc)) => docs.push(format_document(&doc, &schema, &reverse_maps, &req.fields)),
             Ok(None) => docs.push(serde_json::json!({"id": slot_id})),
             Err(_) => docs.push(serde_json::json!({"id": slot_id})),
         }
