@@ -7,6 +7,10 @@ postgres_url = "postgres://user:pass@localhost:5432/civitai"
 # ClickHouse HTTP URL for metrics (optional — omit to skip metrics polling)
 clickhouse_url = "http://localhost:8123"
 
+# ClickHouse auth (optional — can also use CLICKHOUSE_USERNAME/CLICKHOUSE_PASSWORD env vars)
+# clickhouse_username = "default"
+# clickhouse_password = "secret"
+
 # Bitdex server URL (used by sync mode to push upserts/deletes)
 bitdex_url = "http://localhost:3000"
 
