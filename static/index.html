@@ -476,7 +476,7 @@ function buildQuery(cursor) {
   const sortDir = document.getElementById('sort-dir').value;
   const limit = parseInt(document.getElementById('limit').value) || 40;
 
-  const query = { filters, limit };
+  const query = { filters, limit, include_docs: true };
   if (sortField) query.sort = { field: sortField, direction: sortDir };
   if (cursor) query.cursor = cursor;
   return query;
@@ -543,7 +543,7 @@ async function executeQuery(query, append = false) {
     hasMore = !!d.cursor && d.ids.length > 0;
 
     if (d.ids.length > 0) {
-      await renderCards(d.ids, append);
+      renderCards(d.ids, d.documents || [], append);
       totalShown += d.ids.length;
     }
 
@@ -561,29 +561,14 @@ async function executeQuery(query, append = false) {
   document.getElementById('load-indicator').style.display = 'none';
 }
 
-// Render Image Cards
-async function renderCards(slotIds, append) {
+// Render Image Cards — documents come inline from the query response (parallel to slotIds)
+function renderCards(slotIds, documents, append) {
   const grid = document.getElementById('grid');
-
-  let docs = {};
-  try {
-    const r = await fetch(apiPath('/documents'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ slot_ids: slotIds }),
-    });
-    const d = await r.json();
-    if (d.documents) {
-      for (const doc of d.documents) {
-        docs[doc.slot_id] = doc.fields;
-      }
-    }
-  } catch(e) {}
-
   const frag = document.createDocumentFragment();
 
-  for (const slotId of slotIds) {
-    const fields = docs[slotId];
+  for (let i = 0; i < slotIds.length; i++) {
+    const slotId = slotIds[i];
+    const fields = documents[i] || null;
     const card = document.createElement('div');
     card.className = 'card';
     card.onclick = () => openModal(slotId, fields);

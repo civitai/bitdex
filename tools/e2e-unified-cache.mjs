@@ -210,9 +210,9 @@ async function testC_DeepPagination() {
 
   let cursor = null;
   const pageSize = 20;
-  // Page through past the first expansion boundary (1000 slots / 20 per page = page 50)
-  // and past the second boundary (2000 / 20 = page 100) to verify expansion works
-  const targetPages = 110;
+  // Page through past the expansion boundary (~page 200 with initial_capacity=4000)
+  // to verify single jump-to-max expansion works correctly
+  const targetPages = 250;
   const allIds = [];
 
   const pageTimes = [];
@@ -237,7 +237,7 @@ async function testC_DeepPagination() {
   }
 
   // Show expansion boundary pages
-  const boundaryPages = [1, 2, 49, 50, 51, 52, 99, 100, 101, 102, 110];
+  const boundaryPages = [1, 2, 3, 100, 195, 196, 197, 198, 199, 200, 201, 202, 203, 250];
   log('  Page latencies at boundaries:');
   for (const p of boundaryPages) {
     if (p <= pageTimes.length) {
@@ -260,14 +260,13 @@ async function testC_DeepPagination() {
   const entry = details.find(e => e.sort_field === 'reactionCount' && e.direction === 'Desc');
   if (entry) {
     log(`  [3] Cache entry: capacity=${entry.capacity}, cardinality=${entry.cardinality}, has_more=${entry.has_more}`);
-    // After paging through 110 pages (2200 results), capacity should be at least 4000
-    // Initial 1000 → expand to 2000 at ~page 50 → expand to 4000 at ~page 100
-    assert(entry.capacity >= 4000,
-      `expected capacity >= 4000 after ${targetPages} pages, got ${entry.capacity}`);
-    log(`  [4] Cache capacity expanded correctly: ${entry.capacity} >= 4000`);
-    // Cardinality should be close to capacity (actual slots stored)
-    assert(entry.cardinality >= 2000,
-      `expected cardinality >= 2000, got ${entry.cardinality}`);
+    // After paging through 250 pages (5000 results), should have expanded to max (64000).
+    // Initial 4000 covers pages 1-~200, then one jump-to-max expansion at ~page 200.
+    assert(entry.capacity >= 64000,
+      `expected capacity >= 64000 (max) after ${targetPages} pages, got ${entry.capacity}`);
+    log(`  [4] Cache capacity at max: ${entry.capacity}`);
+    assert(entry.cardinality >= 5000,
+      `expected cardinality >= 5000, got ${entry.cardinality}`);
     log(`  [5] Cache cardinality: ${entry.cardinality}`);
   } else {
     log(`  [3] WARNING: Could not find cache entry details for reactionCount/Desc`);
@@ -277,9 +276,9 @@ async function testC_DeepPagination() {
   if (slowPages.length > 0) {
     log(`  [6] Expansion pages (>100ms): ${slowPages.map(p => `p${p.page}=${fmt_us(p.us)}`).join(', ')}`);
   }
-  assert(slowPages.length <= 3,
-    `too many slow pages (expected <=3 expansion boundaries): ${slowPages.length}`);
-  log(`  [7] Expansion boundaries within budget: ${slowPages.length} slow pages`);
+  assert(slowPages.length <= 1,
+    `too many slow pages (expected <=1 expansion event): ${slowPages.length}`);
+  log(`  [7] Expansion events within budget: ${slowPages.length} slow pages`);
 }
 
 async function testD_MutationMaintenance() {

@@ -2,8 +2,8 @@
 //!
 //! Each entry is keyed by (canonical filter clauses, sort field, sort direction) and stores
 //! a dynamically-sized bounded bitmap: the approximate top-K documents within the filter
-//! result, sorted by the specified field. Entries start small (initial_capacity, default 1K)
-//! and grow on demand as deeper pagination requires more results.
+//! result, sorted by the specified field. Entries start at initial_capacity (default 4K)
+//! and jump straight to max_capacity (default 64K) on first expansion.
 //!
 //! Live maintenance is performed by the flush thread: when documents are inserted, updated,
 //! or deleted, the meta-index identifies affected entries, and each entry's bitmap is updated
@@ -28,9 +28,9 @@ use crate::write_coalescer::FilterGroupKey;
 pub struct UnifiedCacheConfig {
     /// Maximum number of cache entries before LRU eviction (default 5000).
     pub max_entries: usize,
-    /// Initial bound capacity per entry (default 1000).
+    /// Initial bound capacity per entry (default 4000).
     pub initial_capacity: usize,
-    /// Maximum bound capacity per entry after expansion (default 16000).
+    /// Maximum bound capacity per entry after expansion (default 64000).
     pub max_capacity: usize,
     /// Skip caching if filter result has fewer docs than this (default 1000).
     pub min_filter_size: usize,
@@ -40,8 +40,8 @@ impl Default for UnifiedCacheConfig {
     fn default() -> Self {
         Self {
             max_entries: 5000,
-            initial_capacity: 1000,
-            max_capacity: 16_000,
+            initial_capacity: 4_000,
+            max_capacity: 64_000,
             min_filter_size: 1000,
         }
     }
@@ -61,12 +61,14 @@ pub struct UnifiedEntry {
     bitmap: Arc<RoaringBitmap>,
     /// Sort floor (Desc) or ceiling (Asc) of the current bound.
     min_tracked_value: u32,
-    /// Current capacity tier: 1K, 2K, 4K, 8K, 16K.
+    /// Current capacity: starts at initial_capacity (4K), jumps to max_capacity (64K) on expansion.
     capacity: usize,
     /// Ceiling from config.
     max_capacity: usize,
     /// Whether more results exist beyond the current bound.
     has_more: bool,
+    /// Total documents matching the filter (for returning total_matched without recomputing filters).
+    total_matched: u64,
     /// Bloat control: flagged when cardinality exceeds 2 * capacity.
     needs_rebuild: bool,
     /// Guard to prevent concurrent rebuilds.
@@ -87,6 +89,7 @@ impl UnifiedEntry {
         capacity: usize,
         max_capacity: usize,
         has_more: bool,
+        total_matched: u64,
         meta_id: CacheEntryId,
         value_fn: impl Fn(u32) -> u32,
     ) -> Self {
@@ -108,6 +111,7 @@ impl UnifiedEntry {
             capacity,
             max_capacity,
             has_more,
+            total_matched,
             needs_rebuild: false,
             rebuilding: AtomicBool::new(false),
             last_used: Instant::now(),
@@ -137,6 +141,10 @@ impl UnifiedEntry {
 
     pub fn has_more(&self) -> bool {
         self.has_more
+    }
+
+    pub fn total_matched(&self) -> u64 {
+        self.total_matched
     }
 
     pub fn needs_rebuild(&self) -> bool {
@@ -205,17 +213,18 @@ impl UnifiedEntry {
             self.min_tracked_value = value_fn(last);
         }
 
-        // Double capacity, capped at max
-        let new_capacity = (self.capacity * 2).min(self.max_capacity);
-        self.capacity = new_capacity;
+        // Jump straight to max capacity on expansion — memory is cheap (~8-16KB per
+        // entry at 64K) and this eliminates repeated expansion events at boundaries.
+        let old_capacity = self.capacity;
+        self.capacity = self.max_capacity;
 
         // If expansion returned fewer than expected, no more results
-        let expected_chunk = new_capacity / 2; // half of new capacity = the chunk we just added
+        let expected_chunk = self.max_capacity - old_capacity;
         if new_slots.len() < expected_chunk {
             self.has_more = false;
         }
 
-        new_capacity
+        self.max_capacity
     }
 
     /// Rebuild the entry from a fresh sort traversal.
@@ -345,6 +354,7 @@ impl UnifiedCache {
         key: UnifiedKey,
         sorted_slots: &[u32],
         has_more: bool,
+        total_matched: u64,
         value_fn: impl Fn(u32) -> u32,
     ) -> CacheEntryId {
         // Register with meta-index
@@ -359,6 +369,7 @@ impl UnifiedCache {
             self.config.initial_capacity,
             self.config.max_capacity,
             has_more,
+            total_matched,
             meta_id,
             value_fn,
         );
@@ -847,7 +858,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..50).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.lookup(&key).unwrap();
         assert_eq!(entry.cardinality(), 50);
@@ -868,8 +879,8 @@ mod tests {
         let key2 = make_key(&[("nsfwLevel", "eq", "1")], "sortAt", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..50).collect();
-        cache.form_and_store(key1.clone(), &slots, true, |s| 1000 - s);
-        cache.form_and_store(key2.clone(), &slots, true, |s| s);
+        cache.form_and_store(key1.clone(), &slots, true, 100_000, |s| 1000 - s);
+        cache.form_and_store(key2.clone(), &slots, true, 100_000, |s| s);
 
         assert!(cache.lookup(&key1).is_some());
         assert!(cache.lookup(&key2).is_some());
@@ -883,8 +894,8 @@ mod tests {
         let key_asc = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Asc);
 
         let slots: Vec<u32> = (0..50).collect();
-        cache.form_and_store(key_desc.clone(), &slots, true, |s| 1000 - s);
-        cache.form_and_store(key_asc.clone(), &slots, false, |s| s);
+        cache.form_and_store(key_desc.clone(), &slots, true, 100_000, |s| 1000 - s);
+        cache.form_and_store(key_asc.clone(), &slots, false, 100_000, |s| s);
 
         assert_eq!(cache.len(), 2);
     }
@@ -901,7 +912,7 @@ mod tests {
                 "sort",
                 SortDirection::Desc,
             );
-            cache.form_and_store(key, &slots, true, |s| s);
+            cache.form_and_store(key, &slots, true, 100_000, |s| s);
         }
         assert_eq!(cache.len(), 5);
 
@@ -917,7 +928,7 @@ mod tests {
 
         // Add one more — should evict entry 0 (LRU)
         let new_key = make_key(&[("field", "eq", "5")], "sort", SortDirection::Desc);
-        cache.form_and_store(new_key, &slots, true, |s| s);
+        cache.form_and_store(new_key, &slots, true, 100_000, |s| s);
 
         assert_eq!(cache.len(), 5);
         let evicted_key = make_key(&[("field", "eq", "0")], "sort", SortDirection::Desc);
@@ -936,7 +947,7 @@ mod tests {
 
         // Provide 50 slots but capacity is 10
         let slots: Vec<u32> = (0..50).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.lookup(&key).unwrap();
         assert_eq!(entry.cardinality(), 10); // only initial_capacity slots
@@ -956,23 +967,17 @@ mod tests {
 
         // Initial formation with 10 slots
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.get_mut(&key).unwrap();
         assert_eq!(entry.capacity(), 10);
 
-        // Expand with 10 more slots (simulating next chunk)
-        let new_slots: Vec<u32> = (10..20).collect();
+        // Expand — jumps straight to max_capacity (80)
+        let new_slots: Vec<u32> = (10..80).collect();
         let new_cap = entry.expand(&new_slots, |s| 1000 - s);
-        assert_eq!(new_cap, 20); // doubled
-        assert_eq!(entry.cardinality(), 20);
-        assert_eq!(entry.capacity(), 20);
-
-        // Expand again
-        let new_slots: Vec<u32> = (20..40).collect();
-        let new_cap = entry.expand(&new_slots, |s| 1000 - s);
-        assert_eq!(new_cap, 40);
-        assert_eq!(entry.cardinality(), 40);
+        assert_eq!(new_cap, 80); // jumped to max
+        assert_eq!(entry.cardinality(), 80);
+        assert_eq!(entry.capacity(), 80);
     }
 
     #[test]
@@ -986,19 +991,19 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.get_mut(&key).unwrap();
 
-        // First expansion: 10 -> 20 (hits max)
+        // First expansion: 10 -> 20 (jumps to max)
         let new_slots: Vec<u32> = (10..20).collect();
         let new_cap = entry.expand(&new_slots, |s| 1000 - s);
-        assert_eq!(new_cap, 20); // capped at max_capacity
+        assert_eq!(new_cap, 20); // jumped to max_capacity
 
-        // Another expansion attempt: stays at 20
+        // Another expansion attempt: stays at max
         let new_slots: Vec<u32> = (20..30).collect();
         let new_cap = entry.expand(&new_slots, |s| 1000 - s);
-        assert_eq!(new_cap, 20); // still capped
+        assert_eq!(new_cap, 20); // still at max
     }
 
     #[test]
@@ -1012,12 +1017,12 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..100).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.get_mut(&key).unwrap();
         assert!(entry.has_more());
 
-        // Expand with fewer slots than expected chunk size (capacity doubles to 200, chunk = 100)
+        // Expand with fewer slots than expected chunk size (jumps to max 1600, chunk = 1500)
         // But we only provide 30 — means we've exhausted the result set
         let partial_slots: Vec<u32> = (100..130).collect();
         entry.expand(&partial_slots, |s| 1000 - s);
@@ -1035,7 +1040,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.get_mut(&key).unwrap();
         assert!(!entry.needs_rebuild());
@@ -1055,7 +1060,7 @@ mod tests {
 
         // Slots with values: 0->1000, 1->999, ..., 49->951
         let slots: Vec<u32> = (0..50).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.get(&key).unwrap();
         // min_tracked_value = value of last slot = 1000 - 49 = 951
@@ -1075,7 +1080,7 @@ mod tests {
 
         // Slots with ascending values: 0->0, 1->1, ..., 49->49
         let slots: Vec<u32> = (0..50).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| s);
 
         let entry = cache.get(&key).unwrap();
         // min_tracked_value = value of last slot = 49
@@ -1098,7 +1103,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.get_mut(&key).unwrap();
         entry.mark_for_rebuild();
@@ -1116,7 +1121,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.get_mut(&key).unwrap();
         assert!(entry.try_start_rebuild()); // first caller gets it
@@ -1134,7 +1139,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key, &slots, true, |s| s);
+        cache.form_and_store(key, &slots, true, 100_000, |s| s);
 
         assert_eq!(cache.len(), 1);
         cache.clear();
@@ -1148,10 +1153,10 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots1: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key.clone(), &slots1, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots1, true, 100_000, |s| 1000 - s);
 
         let slots2: Vec<u32> = (100..120).collect();
-        cache.form_and_store(key.clone(), &slots2, false, |s| 2000 - s);
+        cache.form_and_store(key.clone(), &slots2, false, 100_000, |s| 2000 - s);
 
         assert_eq!(cache.len(), 1); // no duplicates
         let entry = cache.get(&key).unwrap();
@@ -1169,7 +1174,7 @@ mod tests {
         );
 
         let slots: Vec<u32> = (0..10).collect();
-        let meta_id = cache.form_and_store(key, &slots, true, |s| s);
+        let meta_id = cache.form_and_store(key, &slots, true, 100_000, |s| s);
 
         // Meta-index should have entries for both filter fields
         let nsfw_entries = cache.meta().entries_for_filter_field("nsfwLevel");
@@ -1196,17 +1201,17 @@ mod tests {
 
         // Add two entries
         let key1 = make_key(&[("field", "eq", "1")], "sort", SortDirection::Desc);
-        let meta_id_1 = cache.form_and_store(key1.clone(), &slots, true, |s| s);
+        let meta_id_1 = cache.form_and_store(key1.clone(), &slots, true, 100_000, |s| s);
 
         let key2 = make_key(&[("field", "eq", "2")], "sort", SortDirection::Desc);
-        cache.form_and_store(key2.clone(), &slots, true, |s| s);
+        cache.form_and_store(key2.clone(), &slots, true, 100_000, |s| s);
 
         // Touch key2 to make key1 the LRU
         cache.lookup(&key2);
 
         // Add third — evicts key1
         let key3 = make_key(&[("field", "eq", "3")], "sort", SortDirection::Desc);
-        cache.form_and_store(key3, &slots, true, |s| s);
+        cache.form_and_store(key3, &slots, true, 100_000, |s| s);
 
         // meta_id_1 should no longer be in the meta-index
         let entries = cache.meta().entries_for_clause("field", "eq", "1");
@@ -1225,7 +1230,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         // Without any expansion, capacity stays at initial
         let entry = cache.get(&key).unwrap();
@@ -1238,7 +1243,7 @@ mod tests {
         let mut cache = UnifiedCache::new(make_config());
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
-        cache.form_and_store(key.clone(), &[], false, |_| 0);
+        cache.form_and_store(key.clone(), &[], false, 0, |_| 0);
 
         let entry = cache.get(&key).unwrap();
         assert_eq!(entry.cardinality(), 0);
@@ -1252,7 +1257,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
 
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.get_mut(&key).unwrap();
         assert_eq!(entry.cardinality(), 10);
@@ -1294,7 +1299,7 @@ mod tests {
         };
 
         let slots: Vec<u32> = (0..10).collect();
-        let meta_id = cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        let meta_id = cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         // All three filter fields should be in field-level index
         assert!(cache.meta().entries_for_filter_field("nsfwLevel").unwrap().contains(meta_id));
@@ -1341,7 +1346,7 @@ mod tests {
         };
 
         let slots: Vec<u32> = (0..10).collect();
-        let meta_id = cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        let meta_id = cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         // Both range clauses should be registered
         assert!(cache.meta().entries_for_clause("sortAt", "gte", "1700000000").unwrap().contains(meta_id));
@@ -1365,7 +1370,7 @@ mod tests {
 
         // Values: slot 0 -> 1000, slot 1 -> 999, ..., slot 4 -> 996
         let slots: Vec<u32> = (0..5).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         let entry = cache.get(&key).unwrap();
         assert_eq!(entry.min_tracked_value(), 996); // 1000 - 4
@@ -1429,7 +1434,7 @@ mod tests {
         // Initial slots 0..5, sort values: 0->1000, 1->999, ...
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         assert_eq!(cache.get(&key).unwrap().cardinality(), 5);
 
         // Slot 10 now has nsfwLevel=1 (just inserted) and reactionCount=1500 (qualifies for Desc)
@@ -1455,7 +1460,7 @@ mod tests {
 
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         // Slot 2 removed from nsfwLevel=1 (no longer matches Eq(nsfwLevel, 1))
         let filters = make_filter_index(&[("nsfwLevel", &[(1, &[0, 1, 3, 4])])]);
@@ -1481,7 +1486,7 @@ mod tests {
         // Entry with min_tracked_value = 951 (Desc, slot 49 has value 951)
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         assert_eq!(cache.get(&key).unwrap().min_tracked_value(), 951);
 
         // Slot 100 matches filter but has reactionCount=500 (below 951 threshold)
@@ -1511,7 +1516,7 @@ mod tests {
             SortDirection::Desc,
         );
         let slots: Vec<u32> = (0..5).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         // Slot 10: has nsfwLevel=1 but NOT type=2
         let filters = make_filter_index(&[
@@ -1539,7 +1544,7 @@ mod tests {
         // Entry: NotEq(nsfwLevel, 5), sort by reactionCount Desc
         let key = make_key(&[("nsfwLevel", "neq", "5")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         // Slot 10 now has nsfwLevel=5 (should be excluded by NotEq)
         let filters = make_filter_index(&[("nsfwLevel", &[(5, &[10])])]);
@@ -1563,7 +1568,7 @@ mod tests {
 
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         // min_tracked_value = 951
 
         // Slot 100 already matches nsfwLevel=1, sort value now updated to 1500
@@ -1584,7 +1589,7 @@ mod tests {
 
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..50).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         // Slot 100 does NOT match nsfwLevel=1 but has good sort value
         let filters = make_filter_index(&[("nsfwLevel", &[(1, &[])])]); // slot 100 not in nsfwLevel=1
@@ -1605,8 +1610,8 @@ mod tests {
         let key1 = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let key2 = make_key(&[("type", "eq", "2")], "sortAt", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key1.clone(), &slots, true, |s| s);
-        cache.form_and_store(key2.clone(), &slots, true, |s| s);
+        cache.form_and_store(key1.clone(), &slots, true, 100_000, |s| s);
+        cache.form_and_store(key2.clone(), &slots, true, 100_000, |s| s);
 
         assert!(!cache.get(&key1).unwrap().needs_rebuild());
         assert!(!cache.get(&key2).unwrap().needs_rebuild());
@@ -1623,7 +1628,7 @@ mod tests {
 
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
 
         // Mark for rebuild
         cache.get_mut(&key).unwrap().mark_for_rebuild();
@@ -1666,7 +1671,7 @@ mod tests {
             direction: SortDirection::Desc,
         };
         let slots: Vec<u32> = (0..10).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         assert_eq!(cache.get(&key).unwrap().cardinality(), 10);
 
         // Bucket rebuild: slots 0, 1, 2 dropped out of the 7d window
@@ -1709,7 +1714,7 @@ mod tests {
             direction: SortDirection::Desc,
         };
         let slots: Vec<u32> = (0..5).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         // min_tracked_value = 996
 
         // Slot 100 enters the bucket and matches nsfwLevel=1 with reactionCount=1500
@@ -1731,7 +1736,7 @@ mod tests {
         // Entry on field "type", not "nsfwLevel"
         let key = make_key(&[("type", "eq", "2")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..5).collect();
-        cache.form_and_store(key.clone(), &slots, true, |s| 1000 - s);
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         let orig_cardinality = cache.get(&key).unwrap().cardinality();
 
         // Mutation only on "nsfwLevel" — should not affect "type" entry

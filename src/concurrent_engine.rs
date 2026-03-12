@@ -1256,17 +1256,170 @@ impl ConcurrentEngine {
             }
         };
 
-        let (filter_arc, use_simple_sort) =
-            self.resolve_filters(&executor, &query.filters, tb_guard.as_deref(), now_unix)?;
+        // ── Fast path: unified cache hit without expansion ──
+        // Try cache lookup BEFORE computing filters. If we hit, we can skip
+        // the expensive filter bitmap computation entirely (~2ms saved at 105M).
+        if let Some(sort_clause) = query.sort.as_ref() {
+            if let Some(clauses) = cache::canonicalize(&query.filters) {
+                let ukey = UnifiedKey {
+                    filter_clauses: clauses,
+                    sort_field: sort_clause.field.clone(),
+                    direction: sort_clause.direction,
+                };
 
-        // Filter bitmaps are kept clean (no stale bits from deleted docs),
-        // so no alive AND is needed.
+                let cache_data = {
+                    let mut uc = self.unified_cache.lock();
+                    uc.lookup(&ukey).map(|entry| {
+                        let bm = entry.bitmap().as_ref().clone();
+                        let has_more = entry.has_more();
+                        let min_val = entry.min_tracked_value();
+                        let cap = entry.capacity();
+                        let total = entry.total_matched();
+                        (bm, has_more, min_val, cap, total)
+                    })
+                };
+
+                if let Some((unified_bm, has_more, min_val, capacity, cached_total)) = cache_data {
+                    // Check if cursor is past the cache boundary
+                    let needs_expansion = if let Some(cursor) = query.cursor.as_ref() {
+                        let strictly_past = match sort_clause.direction {
+                            crate::query::SortDirection::Desc => cursor.sort_value < min_val as u64,
+                            crate::query::SortDirection::Asc => cursor.sort_value > min_val as u64,
+                        };
+                        if strictly_past {
+                            true
+                        } else if cursor.sort_value == min_val as u64 {
+                            !unified_bm.contains(cursor.slot_id)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !needs_expansion {
+                        // FAST PATH: cache hit, no expansion needed.
+                        // Skip filter computation entirely — use cached bitmap + total_matched.
+                        let offset = if query.cursor.is_none() {
+                            query.offset.unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let fetch_limit = query.limit.saturating_add(offset);
+                        let use_simple = unified_bm.len() < 10_000;
+
+                        let mut result = executor.execute_from_bitmap(
+                            &unified_bm,
+                            query.sort.as_ref(),
+                            fetch_limit,
+                            query.cursor.as_ref(),
+                            use_simple,
+                        )?;
+
+                        // Short page from cache = cursor at boundary, need expansion.
+                        // Compute filters (we skipped this) and expand.
+                        if result.ids.len() < fetch_limit && query.cursor.is_some() && has_more {
+                            let (filter_arc, use_simple_sort) = self.resolve_filters(
+                                &executor, &query.filters, tb_guard.as_deref(), now_unix,
+                            )?;
+                            let max_cap = self.unified_cache.lock().config().max_capacity;
+                            let expand_limit = max_cap.saturating_sub(capacity);
+                            let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
+                            let expand_result = executor.execute_from_bitmap_unclamped(
+                                &filter_arc, query.sort.as_ref(), expand_limit,
+                                expand_cursor, use_simple_sort,
+                            )?;
+                            if !expand_result.ids.is_empty() {
+                                let sorted_slots: Vec<u32> = expand_result.ids.iter()
+                                    .map(|&id| id as u32).collect();
+                                let sort_field = snap.sorts.get_field(&sort_clause.field);
+                                let value_fn = |slot: u32| -> u32 {
+                                    sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                                };
+                                let mut uc = self.unified_cache.lock();
+                                if let Some(entry) = uc.lookup(&ukey) {
+                                    entry.expand(&sorted_slots, value_fn);
+                                }
+                            }
+                            // Re-query from expanded bitmap
+                            let expanded_bm = {
+                                let mut uc = self.unified_cache.lock();
+                                uc.lookup(&ukey).map(|e| e.bitmap().as_ref().clone())
+                            };
+                            if let Some(ref bm) = expanded_bm {
+                                result = executor.execute_from_bitmap(
+                                    bm, query.sort.as_ref(), fetch_limit,
+                                    query.cursor.as_ref(), bm.len() < 10_000,
+                                )?;
+                            }
+                            result.total_matched = filter_arc.len();
+                            self.post_validate(&mut result, &query.filters, &executor)?;
+                            return Ok(result);
+                        }
+
+                        // Use cached total_matched (avoids recomputing 21M-entry filter bitmap)
+                        result.total_matched = cached_total;
+
+                        // Apply offset
+                        if offset > 0 && !result.ids.is_empty() {
+                            if offset >= result.ids.len() {
+                                result.ids.clear();
+                                result.cursor = None;
+                            } else {
+                                result.ids = result.ids.split_off(offset);
+                                if let Some(&last_id) = result.ids.last() {
+                                    let slot = last_id as u32;
+                                    if let Some(sort_field) = snap.sorts.get_field(&sort_clause.field) {
+                                        result.cursor = Some(crate::query::CursorPosition {
+                                            sort_value: sort_field.reconstruct_value(slot) as u64,
+                                            slot_id: slot,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        self.post_validate(&mut result, &query.filters, &executor)?;
+                        return Ok(result);
+                    }
+
+                    // Expansion needed — fall through to slow path with pre-fetched cache data.
+                    return self.execute_query_slow_path(
+                        query, &snap, &executor, tb_guard.as_deref(), now_unix,
+                        Some((ukey, unified_bm, has_more, min_val, capacity, cached_total)),
+                    );
+                }
+            }
+        }
+
+        // ── Slow path: cache miss or unsorted query ──
+        self.execute_query_slow_path(
+            query, &snap, &executor, tb_guard.as_deref(), now_unix, None,
+        )
+    }
+
+    /// Slow path for execute_query: computes full filter bitmap.
+    /// Used for cache misses, expansions, and unsorted queries.
+    fn execute_query_slow_path(
+        &self,
+        query: &BitdexQuery,
+        snap: &Arc<InnerEngine>,
+        executor: &QueryExecutor,
+        time_buckets: Option<&TimeBucketManager>,
+        now_unix: u64,
+        // Pre-fetched cache data from fast path that detected expansion needed
+        cached: Option<(UnifiedKey, RoaringBitmap, bool, u32, usize, u64)>,
+    ) -> Result<QueryResult> {
+        let (filter_arc, use_simple_sort) =
+            self.resolve_filters(executor, &query.filters, time_buckets, now_unix)?;
+
         let full_total_matched = filter_arc.len();
 
-        // Unified cache lookup: check for a cached bounded bitmap that combines
-        // filter + sort. On hit, narrow the filter bitmap for sort acceleration.
-        // Only for sorted queries above min_filter_size threshold.
-        let (unified_key, unified_hit) = if let Some(sort_clause) = query.sort.as_ref() {
+        // If we have pre-fetched cache data (expansion case), use it.
+        // Otherwise, do a fresh cache lookup (miss case).
+        let (unified_key, unified_hit) = if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
+            (Some(ukey), Some((bm, has_more, min_val, cap)))
+        } else if let Some(sort_clause) = query.sort.as_ref() {
             let mut uc = self.unified_cache.lock();
             let min_size = uc.config().min_filter_size as u64;
             if full_total_matched >= min_size {
@@ -1295,11 +1448,6 @@ impl ConcurrentEngine {
         };
 
         // Check if cursor is past the cache boundary — trigger expansion if so.
-        // On cache hit with a cursor whose sort_value is strictly past min_tracked_value,
-        // do a full traversal for the next chunk and expand the cache entry.
-        // When sort_value equals min_tracked_value (common with ties like reactionCount=0),
-        // check if the cursor slot is still within the cached bitmap to avoid
-        // redundant expansion on every page.
         let needs_expansion = if let (Some((ref unified_bm, _, min_val, _)), Some(cursor), Some(sort_clause))
             = (&unified_hit, query.cursor.as_ref(), query.sort.as_ref())
         {
@@ -1311,8 +1459,6 @@ impl ConcurrentEngine {
             if strictly_past {
                 true
             } else if at_boundary {
-                // At the boundary value: only expand if cursor slot is NOT in the bitmap
-                // (if it's in the bitmap, we're still within bounds)
                 !unified_bm.contains(cursor.slot_id)
             } else {
                 false
@@ -1324,9 +1470,8 @@ impl ConcurrentEngine {
         let (effective_bitmap, use_simple) = if needs_expansion {
             if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
                 if *has_more {
-                    // Expand: do a full traversal to get the next capacity-sized chunk,
-                    // then feed results into the cache entry.
-                    let expand_limit = *capacity; // get capacity more results
+                    let max_cap = self.unified_cache.lock().config().max_capacity;
+                    let expand_limit = max_cap.saturating_sub(*capacity);
                     let expand_result = executor.execute_from_bitmap_unclamped(
                         &filter_arc,
                         query.sort.as_ref(),
@@ -1348,17 +1493,18 @@ impl ConcurrentEngine {
                         }
                     }
 
-                    // Re-read the expanded bitmap
                     let mut uc = self.unified_cache.lock();
                     if let Some(entry) = uc.lookup(ukey) {
-                        (entry.bitmap().as_ref().clone(), false)
+                        let bm = entry.bitmap().as_ref().clone();
+                        let use_simple = bm.len() < 10_000;
+                        (bm, use_simple)
                     } else {
                         (filter_arc.as_ref().clone(), use_simple_sort)
                     }
                 } else {
-                    // has_more is false — cache covers everything
                     if let Some((ref unified_bm, ..)) = unified_hit {
-                        (unified_bm.clone(), false)
+                        let use_simple = unified_bm.len() < 10_000;
+                        (unified_bm.clone(), use_simple)
                     } else {
                         (filter_arc.as_ref().clone(), use_simple_sort)
                     }
@@ -1367,14 +1513,12 @@ impl ConcurrentEngine {
                 (filter_arc.as_ref().clone(), use_simple_sort)
             }
         } else if let Some((ref unified_bm, ..)) = unified_hit {
-            // Unified cache hit, cursor within boundary — use cached bitmap directly.
-            (unified_bm.clone(), false)
+            let use_simple = unified_bm.len() < 10_000;
+            (unified_bm.clone(), use_simple)
         } else {
             (filter_arc.as_ref().clone(), use_simple_sort)
         };
 
-        // Offset pagination: if offset is set and no cursor, request offset+limit results
-        // then drop the first `offset` items. Cursor takes precedence over offset.
         let offset = if query.cursor.is_none() {
             query.offset.unwrap_or(0)
         } else {
@@ -1396,7 +1540,8 @@ impl ConcurrentEngine {
         if result.ids.len() < fetch_limit && query.cursor.is_some() && bound_was_applied {
             let did_expand = if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
                 if *has_more {
-                    let expand_limit = *capacity;
+                    let max_cap = self.unified_cache.lock().config().max_capacity;
+                    let expand_limit = max_cap.saturating_sub(*capacity);
                     let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
                     let expand_result = executor.execute_from_bitmap_unclamped(
                         &filter_arc,
@@ -1421,7 +1566,6 @@ impl ConcurrentEngine {
                 } else { false }
             } else { false };
 
-            // Re-query from expanded cache bitmap (small) or fall back to full filter
             let re_bm = if did_expand {
                 if let Some(ref ukey) = unified_key {
                     let mut uc = self.unified_cache.lock();
@@ -1438,17 +1582,15 @@ impl ConcurrentEngine {
             )?;
         }
 
-        // Override total_matched with the accurate count from the full filter bitmap.
         result.total_matched = full_total_matched;
 
-        // Apply offset: drop the first N results
+        // Apply offset
         if offset > 0 && !result.ids.is_empty() {
             if offset >= result.ids.len() {
                 result.ids.clear();
                 result.cursor = None;
             } else {
                 result.ids = result.ids.split_off(offset);
-                // Recompute cursor from the new last element
                 if let Some(sort_clause) = query.sort.as_ref() {
                     if let Some(&last_id) = result.ids.last() {
                         let slot = last_id as u32;
@@ -1464,18 +1606,16 @@ impl ConcurrentEngine {
         }
 
         // Unified cache formation: on miss with sort results, do a separate traversal
-        // for initial_capacity slots (default 1000) to properly seed the cache entry.
-        // The query result (with the user's limit, e.g. 20) is returned as-is.
+        // for initial_capacity slots (default 4000) to properly seed the cache entry.
         if unified_hit.is_none() {
             if let Some(ukey) = unified_key {
                 if !result.ids.is_empty() {
                     let initial_cap = self.unified_cache.lock().config().initial_capacity;
-                    // Traverse for initial_capacity slots to seed the cache properly
                     let seed_result = executor.execute_from_bitmap_unclamped(
                         &filter_arc,
                         query.sort.as_ref(),
                         initial_cap,
-                        None, // no cursor — start from the top
+                        None,
                         use_simple_sort,
                     )?;
                     if !seed_result.ids.is_empty() {
@@ -1489,6 +1629,7 @@ impl ConcurrentEngine {
                             ukey,
                             &sorted_slots,
                             has_more,
+                            full_total_matched,
                             value_fn,
                         );
                     }
@@ -1496,8 +1637,7 @@ impl ConcurrentEngine {
             }
         }
 
-        self.post_validate(&mut result, &query.filters, &executor)?;
-
+        self.post_validate(&mut result, &query.filters, executor)?;
         Ok(result)
     }
 

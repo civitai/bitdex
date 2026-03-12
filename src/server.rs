@@ -127,14 +127,14 @@ fn default_docstore_batch_size() -> usize {
 #[derive(Deserialize)]
 struct DocumentRequest {
     slot_id: u32,
-    #[serde(default)]
+    #[serde(default = "IncludeDocs::all")]
     fields: IncludeDocs,
 }
 
 #[derive(Deserialize)]
 struct DocumentBatchRequest {
     slot_ids: Vec<u32>,
-    #[serde(default)]
+    #[serde(default = "IncludeDocs::all")]
     fields: IncludeDocs,
 }
 
@@ -144,9 +144,12 @@ struct DocumentBatchRequest {
 
 /// Controls which document fields to return.
 ///
-/// - `false` / omitted → no documents
+/// - `false` → no documents
 /// - `true` / `["*"]` → all fields
 /// - `["field1", "field2"]` → only those fields
+///
+/// Default is `None` (IDs only) for query endpoints.
+/// Document endpoints default to `All` since returning docs is their purpose.
 #[derive(Debug, Clone)]
 enum IncludeDocs {
     None,
@@ -203,6 +206,10 @@ impl<'de> Deserialize<'de> for IncludeDocs {
 impl IncludeDocs {
     fn is_none(&self) -> bool {
         matches!(self, IncludeDocs::None)
+    }
+
+    fn all() -> Self {
+        IncludeDocs::All
     }
 }
 
@@ -892,9 +899,8 @@ async fn handle_document(
         }
     };
 
-    let selection = if req.fields.is_none() { &IncludeDocs::All } else { &req.fields };
     match engine.get_document(req.slot_id) {
-        Ok(Some(doc)) => Json(format_document(&doc, &schema, selection)).into_response(),
+        Ok(Some(doc)) => Json(format_document(&doc, &schema, &req.fields)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
@@ -921,11 +927,10 @@ async fn handle_documents_batch(
         }
     };
 
-    let selection = if req.fields.is_none() { &IncludeDocs::All } else { &req.fields };
     let mut docs = Vec::with_capacity(req.slot_ids.len());
     for slot_id in &req.slot_ids {
         match engine.get_document(*slot_id) {
-            Ok(Some(doc)) => docs.push(format_document(&doc, &schema, selection)),
+            Ok(Some(doc)) => docs.push(format_document(&doc, &schema, &req.fields)),
             Ok(None) => docs.push(serde_json::json!({"id": slot_id})),
             Err(_) => docs.push(serde_json::json!({"id": slot_id})),
         }
