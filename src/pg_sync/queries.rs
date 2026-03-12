@@ -29,16 +29,23 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Triggers on direct image-ID tables
+-- ENABLE ALWAYS ensures triggers fire on CDC-replicated rows (Debezium sets
+-- session_replication_role = replica, which skips standard triggers).
 CREATE OR REPLACE TRIGGER bitdex_image_trg AFTER INSERT OR UPDATE OR DELETE ON "Image"
   FOR EACH ROW EXECUTE FUNCTION bitdex_image_notify();
+ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_trg;
 CREATE OR REPLACE TRIGGER bitdex_tags_trg AFTER INSERT OR DELETE ON "TagsOnImageNew"
   FOR EACH ROW EXECUTE FUNCTION bitdex_image_notify();
+ALTER TABLE "TagsOnImageNew" ENABLE ALWAYS TRIGGER bitdex_tags_trg;
 CREATE OR REPLACE TRIGGER bitdex_tool_trg AFTER INSERT OR DELETE ON "ImageTool"
   FOR EACH ROW EXECUTE FUNCTION bitdex_image_notify();
+ALTER TABLE "ImageTool" ENABLE ALWAYS TRIGGER bitdex_tool_trg;
 CREATE OR REPLACE TRIGGER bitdex_technique_trg AFTER INSERT OR DELETE ON "ImageTechnique"
   FOR EACH ROW EXECUTE FUNCTION bitdex_image_notify();
+ALTER TABLE "ImageTechnique" ENABLE ALWAYS TRIGGER bitdex_technique_trg;
 CREATE OR REPLACE TRIGGER bitdex_resource_trg AFTER INSERT OR DELETE ON "ImageResourceNew"
   FOR EACH ROW EXECUTE FUNCTION bitdex_image_notify();
+ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_resource_trg;
 
 -- Post changes
 CREATE OR REPLACE FUNCTION bitdex_post_notify() RETURNS trigger AS $$
@@ -50,6 +57,7 @@ END;
 $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER bitdex_post_trg AFTER UPDATE ON "Post"
   FOR EACH ROW EXECUTE FUNCTION bitdex_post_notify();
+ALTER TABLE "Post" ENABLE ALWAYS TRIGGER bitdex_post_trg;
 
 -- ModelVersion changes
 CREATE OR REPLACE FUNCTION bitdex_mv_notify() RETURNS trigger AS $$
@@ -61,6 +69,7 @@ END;
 $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER bitdex_mv_trg AFTER UPDATE ON "ModelVersion"
   FOR EACH ROW EXECUTE FUNCTION bitdex_mv_notify();
+ALTER TABLE "ModelVersion" ENABLE ALWAYS TRIGGER bitdex_mv_trg;
 
 -- Model changes
 CREATE OR REPLACE FUNCTION bitdex_model_notify() RETURNS trigger AS $$
@@ -75,6 +84,7 @@ END;
 $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER bitdex_model_trg AFTER UPDATE ON "Model"
   FOR EACH ROW EXECUTE FUNCTION bitdex_model_notify();
+ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_trg;
 "#;
 
 // ---------------------------------------------------------------------------
