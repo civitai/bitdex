@@ -15,11 +15,11 @@ Guide for running the right tests based on what you changed, and for developing 
 | Files Changed | Required Tests | Command |
 |--------------|----------------|---------|
 | `src/write_coalescer.rs` | Lib tests + E2E write handling | `cargo test --lib` then `node tools/e2e-write-handling.mjs --url <server>` |
-| `src/executor.rs` | Lib tests + E2E write handling | `cargo test --lib` then `node tools/e2e-write-handling.mjs --url <server>` |
+| `src/executor.rs` | Lib tests + E2E write handling + E2E query operators | `cargo test --lib` then `node tools/e2e-write-handling.mjs --url <server>` and `node tools/e2e-query-operators.mjs --url <server>` |
 | `src/filter.rs` or `src/sort.rs` | Lib tests + proptest + E2E write handling | `cargo test --lib && cargo test --test proptest_correctness` |
 | `src/planner.rs` | Lib tests (query planning) | `cargo test --lib` |
 | `src/query.rs` | Lib tests + proptest | `cargo test --lib && cargo test --test proptest_correctness` |
-| `src/cache.rs` or `src/unified_cache.rs` | Lib tests + E2E unified cache (if prod data available) | `cargo test --lib` |
+| `src/cache.rs` or `src/unified_cache.rs` | Lib tests + E2E pagination-overhead + E2E unified cache (if prod data) | `cargo test --lib` then `node tools/e2e-pagination-overhead.mjs --url <server>` |
 | `src/concurrent_engine.rs` | Lib tests + relevant E2E test (see below) | `cargo test --lib` + whichever E2E covers your change |
 | `src/mutation.rs` | Lib tests + proptest + E2E write handling | `cargo test --lib && cargo test --test proptest_correctness` |
 
@@ -41,7 +41,7 @@ Guide for running the right tests based on what you changed, and for developing 
 
 | Files Changed | Required Tests | Command |
 |--------------|----------------|---------|
-| `src/server.rs` | Build check + relevant E2E | `cargo build --features server` + test the endpoint you changed |
+| `src/server.rs` | Build check + E2E error handling + relevant E2E | `cargo build --features server` then `node tools/e2e-error-handling.mjs --url <server>` + test the endpoint you changed |
 | `src/config.rs` | Lib tests (config validation) | `cargo test --lib` |
 | `src/metrics.rs` | Build check | `cargo build --features server` |
 
@@ -206,6 +206,9 @@ Full descriptions of all test suites are in `docs/testing.md`.
 |-------|------|---------------|-------|
 | Write Handling | `tools/e2e-write-handling.mjs` | Yes | Insert, upsert filter/sort, delete, concurrent, multi-value |
 | Eviction | `tools/e2e-eviction.mjs` | Yes | Load, idle, evict, reload, existence set |
+| Query Operators | `tools/e2e-query-operators.mjs` | Yes | Range filters (Gt/Gte/Lt/Lte), NotEq, combined range+filter |
+| Error Handling | `tools/e2e-error-handling.mjs` | Yes | Invalid JSON, unknown index 404, empty index, slot recycling |
+| Pagination & Overhead | `tools/e2e-pagination-overhead.mjs` | Yes | Cursor pagination, cache acceleration, expansion, structural overhead |
 | Unified Cache | `tools/e2e-unified-cache.mjs` | No (prod data) | Cache population, pagination, mutation/delete maintenance |
 
 ### Integration (Rust, in-process)

@@ -129,6 +129,86 @@ node tools/e2e-unified-cache.mjs --url http://localhost:3000 --results-dir docs/
 
 ---
 
+### e2e-query-operators.mjs
+
+**File:** `tools/e2e-query-operators.mjs`
+
+**What it tests:** Query operators that had zero test coverage through the HTTP API path: range filters (Gt, Gte, Lt, Lte), NotEq, and combined range+filter queries with sorted output.
+
+**Why it exists:** Range operators (`range_scan()` in executor.rs) iterate all stored filter values and union matching bitmaps. This is a fundamentally different code path from Eq/In lookups. NotEq uses `alive - eq_bitmap` which depends on the alive bitmap being correct. Both paths had zero coverage at any level — no unit tests, no property tests, no integration tests.
+
+**Test groups:**
+| ID | Name | What it validates |
+|----|------|-------------------|
+| A | Range Filters | Gt/Gte/Lt/Lte on integer `score` field. 10 docs with scores 10-100. Verifies exact result counts and correct ID inclusion/exclusion at boundaries. |
+| B | NotEq Filter | NotEq on string `category` field. Verifies excluded category absent, non-existent value returns all docs. |
+| C | Range + Filter Combination | And(Gte, Lte) for range window. Verifies result set correctness and sort order (Desc top-3 and Asc bottom-3). |
+
+**Self-contained:** YES. Creates own index, inserts data, tests, cleans up.
+
+**How to run:**
+```bash
+node tools/e2e-query-operators.mjs --url http://localhost:3100
+node tools/e2e-query-operators.mjs --url http://localhost:3100 --results-dir docs/test-results
+```
+
+**Expected output:** 4 groups pass (Setup + A-C). Exit code 0.
+
+---
+
+### e2e-error-handling.mjs
+
+**File:** `tools/e2e-error-handling.mjs`
+
+**What it tests:** HTTP error handling and edge cases with zero server-level test coverage: malformed requests, unknown index 404s, empty index queries, and slot recycling (the "clean deletes" design principle end-to-end).
+
+**Why it exists:** The server (`src/server.rs`) has zero tests. A panic on bad input is a production incident. Slot recycling (delete → reinsert same ID) verifies that clean deletes fully clear all filter/sort bitmap bits — if stale bits leak, queries return ghost results from deleted documents.
+
+**Test groups:**
+| ID | Name | What it validates |
+|----|------|-------------------|
+| A | Invalid JSON / Malformed Requests | Garbage body, empty object, wrong-type filters field. Asserts non-500 responses. |
+| B | Unknown Index Name | GET stats, POST query, PUT docs to nonexistent index. All expect 404. |
+| C | Empty Index Queries | Create index with 0 docs. Query with no filters, with sort, with Eq filter. All expect 0 results, no crash. |
+| D | Slot Recycling | Insert doc → delete → verify clean (no stale bits) → reinsert same ID with new values → verify old values fully gone, new values present, sort reflects new score. |
+
+**Self-contained:** YES. Creates own index, inserts data, tests, cleans up.
+
+**How to run:**
+```bash
+node tools/e2e-error-handling.mjs --url http://localhost:3100
+node tools/e2e-error-handling.mjs --url http://localhost:3100 --results-dir docs/test-results
+```
+
+**Expected output:** 4 groups pass (A-D). Exit code 0.
+
+---
+
+### e2e-pagination-overhead.mjs
+
+**File:** `tools/e2e-pagination-overhead.mjs`
+
+**What it tests:** Cursor pagination correctness, unified cache acceleration, cache expansion on deep pagination, structural memory overhead, and filtered cursor pagination. Produces quantitative measurements (bytes per entry, bytes per doc, hit/miss latency, capacity progression) for regression tracking.
+
+| Group | Name | Key Assertions |
+|-------|------|---------------|
+| Setup | Create test index | 50 docs inserted (25 per category), flush confirmed |
+| A | Cursor pagination correctness | 5 pages of 10, no gaps/duplicates, correct DESC sort order |
+| B | Cache hit acceleration | Hit faster than miss, stats show entries/hits/misses |
+| C | Cache expansion on deep pagination | Cardinality reaches 50, has_more=false after full traversal |
+| D | Structural overhead | Bytes per doc < 1000, cache memory populated |
+| E | Filtered cursor pagination | category=1 only (25 docs), no category=2 leakage, correct sort order |
+
+**How to run:**
+```bash
+node tools/e2e-pagination-overhead.mjs --url http://localhost:3100
+node tools/e2e-pagination-overhead.mjs --url http://localhost:3100 --results-dir docs/test-results
+```
+
+**Expected output:** 6 groups pass (Setup, A-E). Exit code 0. Measurements logged for regression tracking.
+
+---
+
 ## Integration Tests (Rust, In-Process)
 
 Integration tests run inside the Rust test harness using `cargo test`. They exercise the engine API directly without HTTP or the server binary. All are self-contained.

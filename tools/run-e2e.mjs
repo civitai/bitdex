@@ -11,6 +11,9 @@
  * Suites run:
  *   - e2e-write-handling.mjs  (self-contained)
  *   - e2e-eviction.mjs        (self-contained)
+ *   - e2e-query-operators.mjs     (self-contained)
+ *   - e2e-error-handling.mjs       (self-contained)
+ *   - e2e-pagination-overhead.mjs  (self-contained)
  *
  * NOT run automatically (requires production data):
  *   - e2e-unified-cache.mjs   (use --data-dir with loaded data manually)
@@ -53,6 +56,21 @@ const SUITES = [
     name: 'eviction',
     file: 'tools/e2e-eviction.mjs',
     description: 'Idle eviction lifecycle (load, idle, evict, reload, existence set)',
+  },
+  {
+    name: 'query-operators',
+    file: 'tools/e2e-query-operators.mjs',
+    description: 'Query operators (Range Gt/Gte/Lt/Lte, NotEq, combined range+filter)',
+  },
+  {
+    name: 'error-handling',
+    file: 'tools/e2e-error-handling.mjs',
+    description: 'Error handling (invalid JSON, unknown index, empty index, slot recycling)',
+  },
+  {
+    name: 'pagination-overhead',
+    file: 'tools/e2e-pagination-overhead.mjs',
+    description: 'Pagination & overhead (cursor correctness, cache acceleration, expansion, structural overhead)',
   },
 ];
 

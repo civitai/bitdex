@@ -282,17 +282,23 @@ impl WriteBatch {
             }
         }
 
+        // Apply sort layer clears BEFORE sets.
+        // On slot recycling (delete → reinsert), diff_document emits SortClear
+        // for old value bits and SortSet for new value bits.  For bits that are 1
+        // in both old and new values, the same slot appears in both sort_clears
+        // and sort_sets.  Sets-first makes the set a no-op, then clear deletes
+        // the bit — losing the value.  Clears-first is safe: clear removes the
+        // old bit, then set re-establishes it.
+        for (key, slot_ids) in &self.sort_clears {
+            if let Some(field) = sorts.get_field_mut(&key.field) {
+                field.clear_layer_bulk(key.bit_layer, slot_ids);
+            }
+        }
+
         // Apply sort layer sets in bulk
         for (key, slot_ids) in &self.sort_sets {
             if let Some(field) = sorts.get_field_mut(&key.field) {
                 field.set_layer_bulk(key.bit_layer, slot_ids.iter().copied());
-            }
-        }
-
-        // Apply sort layer clears in bulk
-        for (key, slot_ids) in &self.sort_clears {
-            if let Some(field) = sorts.get_field_mut(&key.field) {
-                field.clear_layer_bulk(key.bit_layer, slot_ids);
             }
         }
 
