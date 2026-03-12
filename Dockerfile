@@ -7,6 +7,7 @@ FROM rust:1.87-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY benches/ benches/
 COPY static/ static/
 COPY data/ data/
 
