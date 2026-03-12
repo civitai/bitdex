@@ -1,5 +1,8 @@
 /target
 /.browser
 /data/
+!/data/indexes/
+!/data/indexes/civitai/
+!/data/indexes/civitai/config.json
 *.redb
 /benchmark_*.txt
