@@ -1,0 +1,35 @@
+{
+  "name": "test",
+  "config": {
+    "filter_fields": [
+      { "name": "nsfwLevel", "field_type": "single_value", "behaviors": null },
+      { "name": "userId", "field_type": "single_value", "behaviors": null },
+      { "name": "type", "field_type": "single_value", "behaviors": null }
+    ],
+    "sort_fields": [
+      { "name": "id", "source_type": "uint32", "encoding": "linear", "bits": 32 }
+    ],
+    "max_page_size": 200,
+    "cache": {
+      "max_entries": 100,
+      "decay_rate": 0.95,
+      "bound_target_size": 100,
+      "bound_max_size": 200,
+      "bound_max_count": 10
+    },
+    "autovac_interval_secs": 3600,
+    "merge_interval_ms": 1000,
+    "flush_interval_us": 100,
+    "channel_capacity": 10000,
+    "storage": { "bitmap_path": null }
+  },
+  "data_schema": {
+    "id_field": "id",
+    "fields": [
+      { "source": "nsfwLevel", "target": "nsfwLevel", "value_type": "integer", "fallback": null, "string_map": null, "doc_only": false, "truncate_u32": false, "case_sensitive": false },
+      { "source": "userId", "target": "userId", "value_type": "integer", "fallback": null, "string_map": null, "doc_only": false, "truncate_u32": false, "case_sensitive": false },
+      { "source": "type", "target": "type", "value_type": "mapped_string", "fallback": null, "string_map": { "image": 1, "video": 2 }, "doc_only": false, "truncate_u32": false, "case_sensitive": false },
+      { "source": "url", "target": "url", "value_type": "string", "fallback": null, "string_map": null, "doc_only": true, "truncate_u32": false, "case_sensitive": false }
+    ]
+  }
+}

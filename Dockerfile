@@ -19,7 +19,7 @@ RUN cargo build --release --features server --bin server && \
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

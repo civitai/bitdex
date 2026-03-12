@@ -1,0 +1,12 @@
+# pg-sync config for integration tests.
+# DATABASE_URL, BITDEX_URL, and BITDEX_REPLICA_ID are set via environment.
+
+postgres_url = "postgres://bitdex:bitdex@postgres:5432/bitdex_test"
+bitdex_url = "http://localhost:3000"
+index_dir = "/etc/bitdex"
+data_dir = "/data"
+pg_pool_size = 2
+batch_size = 1000
+poll_interval_secs = 1
+outbox_batch_limit = 100
+replica_id = "default"

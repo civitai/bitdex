@@ -1,0 +1,131 @@
+# Docker Compose for BitDex rolling-restart cursor integration test.
+#
+# Architecture:
+#   postgres         — Single PG instance with schema (no data — test inserts data)
+#   bitdex-0         — BitDex server replica 0 (port 3001)
+#   bitdex-1         — BitDex server replica 1 (port 3002)
+#   sidecar-0        — pg-sync for bitdex-0 (setup + sync)
+#   sidecar-1        — pg-sync for bitdex-1 (setup + sync)
+#
+# The sidecars run setup (creates outbox table + triggers) then sync (polls outbox).
+# The test script inserts data into PG AFTER triggers exist, so everything flows
+# through the outbox → sidecar → BitDex pipeline.
+#
+# Usage:
+#   bash run.sh           # build + start + test + teardown
+#   bash run.sh --keep    # leave containers running for debugging
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: bitdex_test
+      POSTGRES_USER: bitdex
+      POSTGRES_PASSWORD: bitdex
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bitdex -d bitdex_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  bitdex-0:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["bitdex-server", "--port", "3000", "--data-dir", "/data"]
+    ports:
+      - "3011:3000"
+    volumes:
+      - bitdex-data-0:/data
+      - ./config.json:/data/indexes/test/config.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  bitdex-1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["bitdex-server", "--port", "3000", "--data-dir", "/data"]
+    ports:
+      - "3012:3000"
+    volumes:
+      - bitdex-data-1:/data
+      - ./config.json:/data/indexes/test/config.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  # Sidecar for bitdex-0: setup triggers then poll outbox
+  sidecar-0:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for bitdex-0..."
+        until curl -sf http://bitdex-0:3000/api/health > /dev/null 2>&1; do sleep 1; done
+        echo "bitdex-0 is ready. Running setup..."
+        bitdex-pg-sync --config /etc/bitdex/sync.toml setup
+        echo "Setup complete. Starting sync..."
+        exec bitdex-pg-sync --config /etc/bitdex/sync.toml sync
+    environment:
+      DATABASE_URL: postgres://bitdex:bitdex@postgres:5432/bitdex_test
+      BITDEX_URL: http://bitdex-0:3000/api/indexes/test
+      BITDEX_REPLICA_ID: bitdex-0
+    volumes:
+      - ./sync.toml:/etc/bitdex/sync.toml:ro
+      - ./config.json:/etc/bitdex/config.json:ro
+    depends_on:
+      bitdex-0:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # Sidecar for bitdex-1: setup triggers then poll outbox
+  sidecar-1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for bitdex-1..."
+        until curl -sf http://bitdex-1:3000/api/health > /dev/null 2>&1; do sleep 1; done
+        echo "bitdex-1 is ready. Running setup..."
+        bitdex-pg-sync --config /etc/bitdex/sync.toml setup
+        echo "Setup complete. Starting sync..."
+        exec bitdex-pg-sync --config /etc/bitdex/sync.toml sync
+    environment:
+      DATABASE_URL: postgres://bitdex:bitdex@postgres:5432/bitdex_test
+      BITDEX_URL: http://bitdex-1:3000/api/indexes/test
+      BITDEX_REPLICA_ID: bitdex-1
+    volumes:
+      - ./sync.toml:/etc/bitdex/sync.toml:ro
+      - ./config.json:/etc/bitdex/config.json:ro
+    depends_on:
+      bitdex-1:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  bitdex-data-0:
+  bitdex-data-1:
