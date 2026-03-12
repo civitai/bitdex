@@ -20,7 +20,7 @@
 //!   meta/slot_counter.bin
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use roaring::RoaringBitmap;
@@ -311,6 +311,46 @@ impl BitmapFs {
             }
         }
         Ok(result)
+    }
+
+    /// List all existing value keys for a field without loading bitmap payloads.
+    /// Reads only the `.fpack` header index (value IDs) from each bucket file.
+    /// Used to build positive existence sets for zero-result query elimination.
+    pub fn list_field_keys(&self, field_name: &str) -> Result<HashSet<u64>> {
+        let dir = self.root.join("filter").join(field_name);
+        let mut keys = HashSet::new();
+        if !dir.exists() {
+            return Ok(keys);
+        }
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| BitdexError::DocStore(format!("read filter dir: {e}")))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().map_or(true, |ext| ext != "fpack") {
+                continue;
+            }
+            let data = std::fs::read(&path)
+                .map_err(|e| BitdexError::DocStore(format!("read pack file: {e}")))?;
+            if data.len() < 4 {
+                continue;
+            }
+            let num_entries =
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            let header_size = 4 + num_entries * 16;
+            if data.len() < header_size {
+                continue;
+            }
+            for i in 0..num_entries {
+                let idx = 4 + i * 16;
+                let value = u64::from_le_bytes([
+                    data[idx], data[idx + 1], data[idx + 2], data[idx + 3],
+                    data[idx + 4], data[idx + 5], data[idx + 6], data[idx + 7],
+                ]);
+                keys.insert(value);
+            }
+        }
+        Ok(keys)
     }
 
     /// Load multiple fields at once.

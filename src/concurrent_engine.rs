@@ -105,6 +105,11 @@ pub struct ConcurrentEngine {
     /// Named cursors: opaque key-value pairs persisted at checkpoint time.
     /// Callers (e.g. pg-sync sidecars) use these to track replication progress.
     cursors: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    /// Positive existence sets for per-value lazy loading fields.
+    /// Maps field_name → set of all value IDs that exist on disk.
+    /// Queries for values NOT in this set skip disk I/O entirely.
+    /// Updated by the flush thread when new distinct values appear.
+    existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>>,
 }
 
 impl ConcurrentEngine {
@@ -272,6 +277,40 @@ impl ConcurrentEngine {
 
         let pending_filter_loads = Arc::new(parking_lot::Mutex::new(pending_filter_loads));
         let pending_sort_loads = Arc::new(parking_lot::Mutex::new(pending_sort_loads));
+
+        // Build positive existence sets for per-value lazy loading fields.
+        // Reads only .fpack headers (no bitmap payloads) — fast even at 31K keys.
+        let mut existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> = HashMap::new();
+        if let Some(ref store) = bitmap_store {
+            for field_name in &lazy_value_fields {
+                match store.list_field_keys(field_name) {
+                    Ok(keys) => {
+                        let count = keys.len();
+                        if count > 0 {
+                            eprintln!(
+                                "Existence set for '{}': {} keys",
+                                field_name, count
+                            );
+                        }
+                        existing_keys.insert(
+                            field_name.clone(),
+                            Arc::new(ArcSwap::from_pointee(keys)),
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to build existence set for '{}': {}",
+                            field_name, e
+                        );
+                        existing_keys.insert(
+                            field_name.clone(),
+                            Arc::new(ArcSwap::from_pointee(HashSet::new())),
+                        );
+                    }
+                }
+            }
+        }
+
         let lazy_value_fields = Arc::new(parking_lot::Mutex::new(lazy_value_fields));
 
         let flush_publish_count = Arc::new(AtomicU64::new(0));
@@ -290,6 +329,8 @@ impl ConcurrentEngine {
             let flush_pub_count = Arc::clone(&flush_publish_count);
             let flush_dur_nanos = Arc::clone(&flush_duration_nanos);
             let flush_last_dur_nanos = Arc::clone(&flush_last_duration_nanos);
+            let flush_existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> =
+                existing_keys.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
 
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
@@ -365,6 +406,22 @@ impl ConcurrentEngine {
                             let activated = staging.slots.activate_due(now_unix);
                             if !activated.is_empty() {
                                 staging.slots.merge_alive();
+                            }
+                        }
+
+                        // Update positive existence sets with any new distinct values.
+                        // This is cheap (HashSet insert + Arc swap) and must be visible
+                        // to query threads immediately, even during loading mode.
+                        if !flush_existing_keys.is_empty() {
+                            for (fgk, _slots) in coalescer.filter_insert_entries() {
+                                if let Some(ek) = flush_existing_keys.get(fgk.field.as_ref()) {
+                                    let current = ek.load();
+                                    if !current.contains(&fgk.value) {
+                                        let mut updated = (**current).clone();
+                                        updated.insert(fgk.value);
+                                        ek.store(Arc::new(updated));
+                                    }
+                                }
                             }
                         }
 
@@ -783,6 +840,7 @@ impl ConcurrentEngine {
             flush_duration_nanos,
             flush_last_duration_nanos,
             cursors,
+            existing_keys,
         })
     }
 
@@ -1090,6 +1148,15 @@ impl ConcurrentEngine {
                     .collect()
             } else {
                 values.clone()
+            };
+
+            // Filter out values that don't exist on disk (positive existence set).
+            // This eliminates 30-50ms disk I/O per nonexistent value.
+            let missing: Vec<u64> = if let Some(ek) = self.existing_keys.get(field_name.as_str()) {
+                let keys = ek.load();
+                missing.into_iter().filter(|v| keys.contains(v)).collect()
+            } else {
+                missing
             };
 
             if missing.is_empty() {
