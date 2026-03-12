@@ -323,11 +323,21 @@ fn default_json_for_type(vt: &FieldValueType) -> serde_json::Value {
 #[derive(Deserialize)]
 struct UpsertRequest {
     documents: Vec<serde_json::Value>,
+    #[serde(default)]
+    cursor: Option<CursorInput>,
 }
 
 #[derive(Deserialize)]
 struct DeleteDocsRequest {
     ids: Vec<u32>,
+    #[serde(default)]
+    cursor: Option<CursorInput>,
+}
+
+#[derive(Deserialize)]
+struct CursorInput {
+    name: String,
+    value: String,
 }
 
 #[derive(Deserialize)]
@@ -391,6 +401,9 @@ impl BitdexServer {
             .route("/api/indexes/{name}/stats", get(handle_stats))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
+            // Cursors
+            .route("/api/indexes/{name}/cursors", get(handle_list_cursors))
+            .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
             // Utility
             .route("/api/health", get(handle_health))
             .route("/metrics", get(handle_metrics))
@@ -1049,6 +1062,11 @@ async fn handle_upsert(
         }
     }
 
+    // Set cursor if provided (after mutations are submitted to coalescer)
+    if let Some(cursor) = req.cursor {
+        engine.set_cursor(cursor.name, cursor.value);
+    }
+
     state
         .metrics
         .upsert_total
@@ -1091,6 +1109,11 @@ async fn handle_delete_docs(
             Ok(()) => deleted += 1,
             Err(e) => errors.push(format!("id={}: {}", id, e)),
         }
+    }
+
+    // Set cursor if provided (after mutations are submitted to coalescer)
+    if let Some(cursor) = req.cursor {
+        engine.set_cursor(cursor.name, cursor.value);
     }
 
     state
@@ -1296,6 +1319,64 @@ async fn handle_rebuild(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({"status": "rebuilding"})),
     ).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Cursors
+// ---------------------------------------------------------------------------
+
+async fn handle_get_cursor(
+    State(state): State<SharedState>,
+    AxumPath((name, cursor_name)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    match engine.get_cursor(&cursor_name) {
+        Some(value) => Json(serde_json::json!({
+            "name": cursor_name,
+            "value": value,
+        })).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Cursor '{}' not found", cursor_name)})),
+        ).into_response(),
+    }
+}
+
+async fn handle_list_cursors(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let cursors = engine.get_all_cursors();
+    let entries: Vec<serde_json::Value> = cursors
+        .into_iter()
+        .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+        .collect();
+    Json(serde_json::json!({"cursors": entries})).into_response()
 }
 
 // ---------------------------------------------------------------------------
