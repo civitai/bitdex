@@ -1,0 +1,13 @@
+target/
+data/
+.git/
+.github/
+.claude/
+docs/
+*.ndjson
+*.redb
+*.txt
+cache_test.js
+pagination_bench.js
+timing_test.js
+server_stderr.log
