@@ -41,6 +41,10 @@ pub struct Metrics {
     // -- Tier 2: Lazy loading --
     pub lazy_load_duration_seconds: HistogramVec,
     pub pending_fields: IntGaugeVec,
+
+    // -- Eviction --
+    pub eviction_total: IntGaugeVec,
+    pub eviction_resident_values: IntGaugeVec,
 }
 
 impl Metrics {
@@ -182,6 +186,24 @@ impl Metrics {
         )
         .unwrap();
 
+        let eviction_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_eviction_total",
+                "Total values evicted from filter fields since startup",
+            ),
+            &["index", "field"],
+        )
+        .unwrap();
+
+        let eviction_resident_values = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_eviction_resident_values",
+                "Currently resident value count for eviction-enabled fields",
+            ),
+            &["index", "field"],
+        )
+        .unwrap();
+
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
         registry.register(Box::new(slot_high_water.clone())).unwrap();
@@ -223,6 +245,12 @@ impl Metrics {
         registry
             .register(Box::new(pending_fields.clone()))
             .unwrap();
+        registry
+            .register(Box::new(eviction_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(eviction_resident_values.clone()))
+            .unwrap();
 
         Self {
             registry,
@@ -244,6 +272,8 @@ impl Metrics {
             snapshot_publish_total,
             lazy_load_duration_seconds,
             pending_fields,
+            eviction_total,
+            eviction_resident_values,
         }
     }
 

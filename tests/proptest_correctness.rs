@@ -20,20 +20,20 @@ fn test_config() -> Config {
             FilterFieldConfig {
                 name: "category".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
                 field_type: FilterFieldType::MultiValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "active".to_string(),
                 field_type: FilterFieldType::Boolean,
-
                 behaviors: None,
+                eviction: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {

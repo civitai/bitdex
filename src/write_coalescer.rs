@@ -511,14 +511,14 @@ mod tests {
         filters.add_field(FilterFieldConfig {
             name: "status".to_string(),
             field_type: FilterFieldType::SingleValue,
-
             behaviors: None,
+            eviction: None,
         });
         filters.add_field(FilterFieldConfig {
             name: "tagIds".to_string(),
             field_type: FilterFieldType::MultiValue,
-
             behaviors: None,
+            eviction: None,
         });
         filters
     }

@@ -30,44 +30,44 @@ fn civitai_config() -> Config {
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "tagIds".to_string(),
                 field_type: FilterFieldType::MultiValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "userId".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "modelVersionIds".to_string(),
                 field_type: FilterFieldType::MultiValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "onSite".to_string(),
                 field_type: FilterFieldType::Boolean,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "hasMeta".to_string(),
                 field_type: FilterFieldType::Boolean,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "type".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             },
         ],
         sort_fields: vec![
@@ -114,20 +114,20 @@ fn minimal_config() -> Config {
             FilterFieldConfig {
                 name: "status".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
                 field_type: FilterFieldType::MultiValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "active".to_string(),
                 field_type: FilterFieldType::Boolean,
-
                 behaviors: None,
+                eviction: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {

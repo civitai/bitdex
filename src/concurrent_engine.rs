@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, Guard};
 use crossbeam_channel::{Receiver, Sender};
+use dashmap::DashMap;
 use roaring::RoaringBitmap;
 
 use rayon::prelude::*;
@@ -110,6 +111,14 @@ pub struct ConcurrentEngine {
     /// Queries for values NOT in this set skip disk I/O entirely.
     /// Updated by the flush thread when new distinct values appear.
     existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>>,
+    /// Per-value last-accessed flush cycle for idle eviction.
+    /// Key: (field_name, value_id). Value: flush cycle when last touched.
+    /// Shared between query threads (stamp) and flush thread (sweep).
+    eviction_stamps: Arc<DashMap<(Arc<str>, u64), AtomicU64>>,
+    /// Global flush cycle counter, incremented by flush thread.
+    flush_cycle: Arc<AtomicU64>,
+    /// Cumulative eviction counts per field (for Prometheus metrics).
+    eviction_total: Arc<DashMap<String, AtomicU64>>,
 }
 
 impl ConcurrentEngine {
@@ -311,8 +320,25 @@ impl ConcurrentEngine {
             }
         }
 
+        // Eviction-enabled fields must always be in lazy_value_fields so that
+        // ensure_fields_loaded() can reload values after eviction, even when the
+        // engine wasn't restored from disk.
+        for fc in &config.filter_fields {
+            if fc.eviction.is_some() && fc.field_type == FilterFieldType::MultiValue {
+                lazy_value_fields.insert(fc.name.clone());
+                // Ensure existence set exists (empty if no bitmap store)
+                existing_keys.entry(fc.name.clone()).or_insert_with(|| {
+                    Arc::new(ArcSwap::from_pointee(HashSet::new()))
+                });
+            }
+        }
+
         let lazy_value_fields = Arc::new(parking_lot::Mutex::new(lazy_value_fields));
 
+        // Eviction state
+        let eviction_stamps: Arc<DashMap<(Arc<str>, u64), AtomicU64>> = Arc::new(DashMap::new());
+        let flush_cycle = Arc::new(AtomicU64::new(0));
+        let eviction_total: Arc<DashMap<String, AtomicU64>> = Arc::new(DashMap::new());
         let flush_publish_count = Arc::new(AtomicU64::new(0));
         let flush_duration_nanos = Arc::new(AtomicU64::new(0));
         let flush_last_duration_nanos = Arc::new(AtomicU64::new(0));
@@ -331,6 +357,14 @@ impl ConcurrentEngine {
             let flush_last_dur_nanos = Arc::clone(&flush_last_duration_nanos);
             let flush_existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> =
                 existing_keys.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
+            let flush_eviction_stamps = Arc::clone(&eviction_stamps);
+            let flush_eviction_total = Arc::clone(&eviction_total);
+            let flush_cycle_clone = Arc::clone(&flush_cycle);
+            let eviction_sweep_interval = config.eviction_sweep_interval;
+            // Build eviction config map: field_name → idle_seconds
+            let eviction_configs: HashMap<String, f64> = config.filter_fields.iter()
+                .filter_map(|fc| fc.eviction.as_ref().map(|e| (fc.name.clone(), e.idle_seconds)))
+                .collect();
 
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
@@ -343,6 +377,10 @@ impl ConcurrentEngine {
                 // Compact filter diffs every N flush cycles (~5s at 100μs interval).
                 // Keeps diff layers small so apply_diff/fused stay fast.
                 const COMPACTION_INTERVAL: u64 = 50;
+                // Track cycle timing for seconds→cycles conversion
+                let mut eviction_cycle_start = Instant::now();
+                let mut eviction_cycles_elapsed: u64 = 0;
+                let mut observed_cycles_per_second: f64 = 10_000.0; // initial estimate
 
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(current_sleep);
@@ -498,6 +536,8 @@ impl ConcurrentEngine {
                                 }
                             }
                             flush_cycle += 1;
+                            flush_cycle_clone.store(flush_cycle, Ordering::Relaxed);
+                            eviction_cycles_elapsed += 1;
 
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
                             inner.store(Arc::new(staging.clone()));
@@ -523,6 +563,83 @@ impl ConcurrentEngine {
                         staging_dirty = false;
                     }
                     was_loading = is_loading;
+
+                    // --- Idle eviction sweep ---
+                    if !is_loading && !eviction_configs.is_empty()
+                        && flush_cycle > 0 && flush_cycle % eviction_sweep_interval == 0
+                    {
+                        // Update observed cycle rate for seconds→cycles conversion
+                        let now = Instant::now();
+                        let elapsed_secs = eviction_cycle_start.elapsed().as_secs_f64();
+                        if elapsed_secs > 0.1 {
+                            observed_cycles_per_second =
+                                eviction_cycles_elapsed as f64 / elapsed_secs;
+                            eviction_cycle_start = now;
+                            eviction_cycles_elapsed = 0;
+                        }
+
+                        let mut any_evicted = false;
+                        for (field_name, idle_seconds) in &eviction_configs {
+                            let idle_cycles = (*idle_seconds * observed_cycles_per_second) as u64;
+                            if idle_cycles == 0 {
+                                continue;
+                            }
+                            let cutoff = flush_cycle.saturating_sub(idle_cycles);
+
+                            // Collect values to evict
+                            let field = match staging.filters.get_field(field_name) {
+                                Some(f) => f,
+                                None => continue,
+                            };
+                            let field_name_arc: Arc<str> = Arc::from(field_name.as_str());
+
+                            let to_evict: Vec<u64> = field.bitmap_keys()
+                                .filter(|&value| {
+                                    // Skip dirty bitmaps (unpersisted mutations)
+                                    if let Some(vb) = field.get_versioned(*value) {
+                                        if vb.is_dirty() {
+                                            return false;
+                                        }
+                                    }
+                                    // Check stamp
+                                    let key = (field_name_arc.clone(), *value);
+                                    flush_eviction_stamps
+                                        .get(&key)
+                                        .map(|entry| entry.value().load(Ordering::Relaxed) < cutoff)
+                                        .unwrap_or(true) // no stamp = never touched = evict
+                                })
+                                .copied()
+                                .collect();
+
+                            if !to_evict.is_empty() {
+                                let count = to_evict.len();
+                                if let Some(field_mut) = staging.filters.get_field_mut(field_name) {
+                                    for value in &to_evict {
+                                        field_mut.remove_value(*value);
+                                        flush_eviction_stamps.remove(
+                                            &(field_name_arc.clone(), *value),
+                                        );
+                                    }
+                                }
+                                // Update eviction counter
+                                flush_eviction_total
+                                    .entry(field_name.clone())
+                                    .or_insert_with(|| AtomicU64::new(0))
+                                    .fetch_add(count as u64, Ordering::Relaxed);
+
+                                eprintln!(
+                                    "Evicted {} idle values from filter '{}' (cycle={}, idle_cycles={}, rate={:.0} cyc/s)",
+                                    count, field_name, flush_cycle, idle_cycles, observed_cycles_per_second
+                                );
+                                any_evicted = true;
+                            }
+                        }
+
+                        if any_evicted {
+                            // Publish snapshot without evicted values
+                            inner.store(Arc::new(staging.clone()));
+                        }
+                    }
 
                     // Publish if lazy loads updated staging but no mutations triggered a publish.
                     // This ensures staging stays consistent with the snapshot published by
@@ -841,6 +958,9 @@ impl ConcurrentEngine {
             flush_last_duration_nanos,
             cursors,
             existing_keys,
+            eviction_stamps,
+            flush_cycle,
+            eviction_total,
         })
     }
 
@@ -1096,6 +1216,26 @@ impl ConcurrentEngine {
             let lvf = self.lazy_value_fields.lock();
             for clause in filters {
                 Self::collect_lazy_values(clause, &lvf, &mut needed_values);
+            }
+        }
+
+        // Stamp accessed values for idle eviction tracking.
+        // This runs for ALL queried values (already-loaded and new).
+        if !needed_values.is_empty() {
+            let cycle = self.flush_cycle.load(Ordering::Relaxed);
+            for (field_name, values) in &needed_values {
+                // Only stamp eviction-enabled fields
+                if self.config.filter_fields.iter()
+                    .any(|fc| fc.name == *field_name && fc.eviction.is_some())
+                {
+                    let field_arc: Arc<str> = Arc::from(field_name.as_str());
+                    for &value in values {
+                        self.eviction_stamps
+                            .entry((field_arc.clone(), value))
+                            .or_insert_with(|| AtomicU64::new(cycle))
+                            .store(cycle, Ordering::Relaxed);
+                    }
+                }
             }
         }
 
@@ -1881,6 +2021,34 @@ impl ConcurrentEngine {
         self.pending_filter_loads.lock().len() + self.pending_sort_loads.lock().len()
     }
 
+    /// Get eviction stats: (field_name, evicted_total, resident_count).
+    pub fn eviction_stats(&self) -> Vec<(String, u64, usize)> {
+        let snap = self.snapshot();
+        self.config
+            .filter_fields
+            .iter()
+            .filter(|fc| fc.eviction.is_some())
+            .map(|fc| {
+                let total = self
+                    .eviction_total
+                    .get(&fc.name)
+                    .map(|e| e.value().load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                let resident = snap
+                    .filters
+                    .get_field(&fc.name)
+                    .map(|f| f.loaded_value_count())
+                    .unwrap_or(0);
+                (fc.name.clone(), total, resident)
+            })
+            .collect()
+    }
+
+    /// Get the current flush cycle counter.
+    pub fn flush_cycle(&self) -> u64 {
+        self.flush_cycle.load(Ordering::Relaxed)
+    }
+
     /// Get the high-water mark slot counter (lock-free snapshot).
     pub fn slot_counter(&self) -> u32 {
         self.snapshot().slots.slot_counter()
@@ -2069,10 +2237,16 @@ impl ConcurrentEngine {
         // Merge alive diffs
         compacted.slots.merge_alive();
 
-        // Collect filter bitmap entries — skip unloaded fields
+        // Collect filter bitmap entries — skip unloaded fields.
+        // Lazy-value fields (multi_value with per-value loading) are only skipped
+        // if they have no loaded bitmaps. If they have data (from upserts or lazy loads),
+        // save whatever is currently in memory.
         let mut filter_entries: Vec<(String, u64, RoaringBitmap)> = Vec::new();
         for (name, field) in compacted.filters.fields_mut() {
-            if skip_filters.contains(name) || skip_lazy_values.contains(name) {
+            if skip_filters.contains(name) {
+                continue;
+            }
+            if skip_lazy_values.contains(name) && field.loaded_value_count() == 0 {
                 continue;
             }
             field.merge_dirty();
@@ -2800,20 +2974,20 @@ mod tests {
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
-
                     behaviors: None,
+                    eviction: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
-
                     behaviors: None,
+                    eviction: None,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
-
                     behaviors: None,
+                    eviction: None,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -3943,20 +4117,20 @@ mod tests {
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
                     field_type: FilterFieldType::SingleValue,
-
                     behaviors: None,
+                    eviction: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
-
                     behaviors: None,
+                    eviction: None,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
-
                     behaviors: None,
+                    eviction: None,
                 },
             ],
             sort_fields: vec![SortFieldConfig {

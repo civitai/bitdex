@@ -647,13 +647,9 @@ impl BulkWriter {
                 continue;
             };
 
-            let raw = json
-                .get(&mapping.source)
-                .or_else(|| mapping.fallback.as_ref().and_then(|fb| json.get(fb)));
-
-            let raw = match raw {
-                Some(v) if !v.is_null() => v,
-                _ => {
+            let (raw, apply_ms) = match mapping.resolve_raw(json) {
+                Some(pair) => pair,
+                None => {
                     if matches!(mapping.value_type, FieldValueType::ExistsBoolean) {
                         pairs.push((idx, PackedValue::B(false)));
                     }
@@ -661,7 +657,7 @@ impl BulkWriter {
                 }
             };
 
-            if let Some(pv) = json_to_packed(raw, mapping) {
+            if let Some(pv) = json_to_packed(raw, mapping, apply_ms) {
                 pairs.push((idx, pv));
             }
         }
@@ -715,15 +711,15 @@ fn pack_value(v: &Value) -> PackedValue {
 
 /// Convert a raw JSON value directly to PackedValue based on field mapping type.
 /// Skips FieldValue intermediate — JSON → PackedValue in one step.
-fn json_to_packed(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<PackedValue> {
+fn json_to_packed(raw: &serde_json::Value, mapping: &FieldMapping, ms_to_seconds: bool) -> Option<PackedValue> {
     match mapping.value_type {
         FieldValueType::Integer => {
             let n = raw
                 .as_i64()
                 .or_else(|| raw.as_u64().map(|u| u as i64))
                 .or_else(|| raw.as_f64().map(|f| f as i64))?;
-            let n = if mapping.truncate_u32 {
-                (n as u32) as i64
+            let n = if ms_to_seconds {
+                ((n / 1000) as u32) as i64
             } else {
                 n
             };

@@ -40,18 +40,18 @@ fn test_deferred_alive_far_future_invisible() {
             FilterFieldConfig {
                 name: "publishedAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: Some(bitdex_v2::config::FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
                     sort_field: None,
                 }),
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {
@@ -112,18 +112,18 @@ fn test_deferred_alive_past_timestamp_visible() {
             FilterFieldConfig {
                 name: "publishedAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: Some(bitdex_v2::config::FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
                     sort_field: None,
                 }),
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {
@@ -171,12 +171,12 @@ fn test_mixed_deferred_and_immediate() {
             FilterFieldConfig {
                 name: "publishedAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: Some(bitdex_v2::config::FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
                     sort_field: None,
                 }),
+                eviction: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {
@@ -266,11 +266,13 @@ fn make_bucket_engine() -> (ConcurrentEngine, u64) {
                 name: "sortAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "category".to_string(),
                 field_type: FilterFieldType::SingleValue,
                 behaviors: None,
+                eviction: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {

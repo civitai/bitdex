@@ -1617,6 +1617,7 @@ mod tests {
                 name: name.to_string(),
                 field_type: FilterFieldType::SingleValue,
                 behaviors: None,
+                eviction: None,
             });
             let field = fi.get_field_mut(name).unwrap();
             for (value, slots) in *values {

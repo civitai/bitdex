@@ -58,6 +58,12 @@ pub struct Config {
     /// Bitmap persistence and caching settings.
     #[serde(default)]
     pub storage: StorageConfig,
+
+    /// Eviction sweep interval: check for idle values every N flush cycles.
+    /// Default 1000 (~0.1s at 100μs flush). Lower values make eviction more
+    /// responsive (useful for testing).
+    #[serde(default = "default_eviction_sweep_interval")]
+    pub eviction_sweep_interval: u64,
 }
 
 fn default_max_page_size() -> usize {
@@ -74,6 +80,9 @@ fn default_prometheus_port() -> u16 {
 }
 fn default_flush_interval_us() -> u64 {
     100
+}
+fn default_eviction_sweep_interval() -> u64 {
+    1000
 }
 fn default_channel_capacity() -> usize {
     100_000
@@ -93,6 +102,7 @@ impl Default for Config {
             flush_interval_us: default_flush_interval_us(),
             channel_capacity: default_channel_capacity(),
             storage: StorageConfig::default(),
+            eviction_sweep_interval: default_eviction_sweep_interval(),
         }
     }
 }
@@ -171,6 +181,21 @@ impl Config {
                     "duplicate filter field: {}",
                     f.name
                 )));
+            }
+            // Validate eviction: only on multi_value fields
+            if let Some(ref eviction) = f.eviction {
+                if f.field_type != FilterFieldType::MultiValue {
+                    return Err(BitdexError::Config(format!(
+                        "filter field '{}': eviction is only supported on multi_value fields",
+                        f.name
+                    )));
+                }
+                if eviction.idle_seconds <= 0.0 {
+                    return Err(BitdexError::Config(format!(
+                        "filter field '{}': eviction.idle_seconds must be > 0",
+                        f.name
+                    )));
+                }
             }
             if let Some(behaviors) = &f.behaviors {
                 // Warn (as error) if deferred_alive is set on a boolean field
@@ -357,6 +382,19 @@ pub struct FilterFieldConfig {
     /// Optional time-related behaviors (only valid for timestamp fields).
     #[serde(default)]
     pub behaviors: Option<FieldBehaviors>,
+    /// Idle eviction config. Only meaningful on `multi_value` fields.
+    /// Values untouched for `idle_seconds` are evicted from memory and
+    /// re-loaded from BitmapFs on the next query.
+    #[serde(default)]
+    pub eviction: Option<EvictionConfig>,
+}
+
+/// Per-value idle eviction configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvictionConfig {
+    /// Evict values untouched for this many seconds.
+    /// The flush thread converts this to flush cycles using observed cycle timing.
+    pub idle_seconds: f64,
 }
 
 /// Time-related behaviors for timestamp fields.
@@ -463,13 +501,46 @@ pub struct FieldMapping {
     /// If true, this field is stored in docstore only (not bitmap-indexed).
     #[serde(default)]
     pub doc_only: bool,
-    /// If true, cast the value to u32 before storing (for unix timestamps that exceed u32::MAX).
+    /// If true, divide millisecond timestamp by 1000 to get seconds, then store as u32.
+    /// Use for fields like sortAtUnix/publishedAtUnix that are in milliseconds.
+    #[serde(default)]
+    pub ms_to_seconds: bool,
+    /// Legacy alias for ms_to_seconds. Deprecated — use ms_to_seconds instead.
     #[serde(default)]
     pub truncate_u32: bool,
     /// If true, string matching is case-sensitive. Default false (case-insensitive).
     /// Applies to MappedString fields: both ingest (string_map lookup) and query resolution.
     #[serde(default)]
     pub case_sensitive: bool,
+}
+
+impl FieldMapping {
+    /// Whether this field should convert ms timestamps to seconds.
+    /// Accepts either the new `ms_to_seconds` or legacy `truncate_u32` flag.
+    pub fn should_convert_ms(&self) -> bool {
+        self.ms_to_seconds || self.truncate_u32
+    }
+
+    /// Resolve the raw JSON value for this field, trying source then fallback.
+    /// Returns (value, apply_ms_to_seconds). When the fallback is used, ms_to_seconds
+    /// is NOT applied since the fallback is assumed to already be in the target unit.
+    pub fn resolve_raw<'a>(
+        &self,
+        json: &'a serde_json::Value,
+    ) -> Option<(&'a serde_json::Value, bool)> {
+        if let Some(v) = json.get(&self.source).filter(|v| !v.is_null()) {
+            Some((v, self.should_convert_ms()))
+        } else if let Some(v) = self
+            .fallback
+            .as_ref()
+            .and_then(|fb| json.get(fb))
+            .filter(|v| !v.is_null())
+        {
+            Some((v, false))
+        } else {
+            None
+        }
+    }
 }
 
 impl DataSchema {
@@ -705,14 +776,14 @@ cache:
                 FilterFieldConfig {
                     name: "status".to_string(),
                     field_type: FilterFieldType::SingleValue,
-    
                     behaviors: None,
+                    eviction: None,
                 },
                 FilterFieldConfig {
                     name: "status".to_string(),
                     field_type: FilterFieldType::SingleValue,
-    
                     behaviors: None,
+                    eviction: None,
                 },
             ],
             ..Default::default()
@@ -748,8 +819,8 @@ cache:
             filter_fields: vec![FilterFieldConfig {
                 name: "".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             }],
             ..Default::default()
         };
@@ -932,8 +1003,8 @@ sort_fields:
             filter_fields: vec![FilterFieldConfig {
                 name: "status".into(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             }],
             ..Config::default()
         };
@@ -1060,12 +1131,12 @@ field_type = "single_value"
             filter_fields: vec![FilterFieldConfig {
                 name: "onSite".into(),
                 field_type: FilterFieldType::Boolean,
-
                 behaviors: Some(FieldBehaviors {
                     deferred_alive: true,
                     range_buckets: vec![],
                     sort_field: None,
                 }),
+                eviction: None,
             }],
             ..Config::default()
         };
@@ -1095,6 +1166,7 @@ field_type = "single_value"
                     ],
                     sort_field: None,
                 }),
+                eviction: None,
             }],
             ..Config::default()
         };
@@ -1117,6 +1189,7 @@ field_type = "single_value"
                     }],
                     sort_field: None,
                 }),
+                eviction: None,
             }],
             ..Config::default()
         };
@@ -1139,6 +1212,7 @@ field_type = "single_value"
                     }],
                     sort_field: None,
                 }),
+                eviction: None,
             }],
             ..Config::default()
         };
@@ -1161,6 +1235,7 @@ field_type = "single_value"
                     }],
                     sort_field: None,
                 }),
+                eviction: None,
             }],
             ..Config::default()
         };

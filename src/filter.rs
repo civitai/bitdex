@@ -117,6 +117,22 @@ impl FilterField {
         self.bitmaps.get(&value)
     }
 
+    /// Iterator over all value keys in this field's bitmap HashMap.
+    pub fn bitmap_keys(&self) -> impl Iterator<Item = &u64> {
+        self.bitmaps.keys()
+    }
+
+    /// Remove a value's bitmap from the field (used by idle eviction).
+    /// The bitmap can be re-loaded from disk on the next query.
+    pub fn remove_value(&mut self, value: u64) {
+        self.bitmaps.remove(&value);
+    }
+
+    /// Number of distinct values currently loaded in memory.
+    pub fn loaded_value_count(&self) -> usize {
+        self.bitmaps.len()
+    }
+
     /// Get the fused bitmap for a single value against a candidate set.
     /// Applies the diff (sets/clears) to the intersection of base and candidates.
     /// This is the primary diff-aware read path for Eq/NotEq queries.
@@ -328,8 +344,8 @@ mod tests {
         FilterFieldConfig {
             name: name.to_string(),
             field_type: FilterFieldType::SingleValue,
-
             behaviors: None,
+            eviction: None,
         }
     }
 
@@ -337,8 +353,8 @@ mod tests {
         FilterFieldConfig {
             name: name.to_string(),
             field_type: FilterFieldType::MultiValue,
-
             behaviors: None,
+            eviction: None,
         }
     }
 
@@ -346,8 +362,8 @@ mod tests {
         FilterFieldConfig {
             name: name.to_string(),
             field_type: FilterFieldType::Boolean,
-
             behaviors: None,
+            eviction: None,
         }
     }
 

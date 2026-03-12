@@ -177,17 +177,17 @@ fn memrchr_newline(data: &[u8]) -> Option<usize> {
 fn civitai_config() -> Config {
     Config {
         filter_fields: vec![
-            FilterFieldConfig { name: "nsfwLevel".into(), field_type: FilterFieldType::SingleValue, behaviors: None },
-            FilterFieldConfig { name: "userId".into(), field_type: FilterFieldType::SingleValue, behaviors: None },
-            FilterFieldConfig { name: "type".into(), field_type: FilterFieldType::SingleValue, behaviors: None },
-            FilterFieldConfig { name: "hasMeta".into(), field_type: FilterFieldType::Boolean, behaviors: None },
-            FilterFieldConfig { name: "onSite".into(), field_type: FilterFieldType::Boolean, behaviors: None },
-            FilterFieldConfig { name: "poi".into(), field_type: FilterFieldType::Boolean, behaviors: None },
-            FilterFieldConfig { name: "minor".into(), field_type: FilterFieldType::Boolean, behaviors: None },
-            FilterFieldConfig { name: "tagIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None },
-            FilterFieldConfig { name: "modelVersionIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None },
-            FilterFieldConfig { name: "toolIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None },
-            FilterFieldConfig { name: "techniqueIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None },
+            FilterFieldConfig { name: "nsfwLevel".into(), field_type: FilterFieldType::SingleValue, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "userId".into(), field_type: FilterFieldType::SingleValue, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "type".into(), field_type: FilterFieldType::SingleValue, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "hasMeta".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "onSite".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "poi".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "minor".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "tagIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "modelVersionIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "toolIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None },
+            FilterFieldConfig { name: "techniqueIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None },
         ],
         sort_fields: vec![
             SortFieldConfig { name: "reactionCount".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32 },

@@ -21,20 +21,20 @@ fn restart_config(bitmap_path: &std::path::Path) -> Config {
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "tagIds".to_string(),
                 field_type: FilterFieldType::MultiValue,
-
                 behaviors: None,
+                eviction: None,
             },
             FilterFieldConfig {
                 name: "onSite".to_string(),
                 field_type: FilterFieldType::Boolean,
-
                 behaviors: None,
+                eviction: None,
             },
         ],
         sort_fields: vec![SortFieldConfig {

@@ -387,13 +387,9 @@ pub(crate) fn extract_bitmaps(
             continue;
         }
 
-        let raw = json
-            .get(&mapping.source)
-            .or_else(|| mapping.fallback.as_ref().and_then(|fb| json.get(fb)));
-
-        let raw = match raw {
-            Some(v) if !v.is_null() => v,
-            _ => {
+        let (raw, apply_ms) = match mapping.resolve_raw(json) {
+            Some(pair) => pair,
+            None => {
                 // ExistsBoolean: field absent → false
                 if is_filter && matches!(mapping.value_type, FieldValueType::ExistsBoolean) {
                     if let Some(fm) = filter_maps.get_mut(&mapping.target) {
@@ -408,13 +404,13 @@ pub(crate) fn extract_bitmaps(
 
         if is_filter {
             if let Some(fm) = filter_maps.get_mut(&mapping.target) {
-                extract_filter_value(raw, mapping, slot, fm);
+                extract_filter_value(raw, mapping, slot, fm, apply_ms);
             }
         }
 
         if let Some(bits) = s_bits {
             if let Some(sm) = sort_maps.get_mut(&mapping.target) {
-                extract_sort_value(raw, mapping, slot, bits, sm);
+                extract_sort_value(raw, mapping, slot, bits, sm, apply_ms);
             }
         }
     }
@@ -426,10 +422,11 @@ pub(crate) fn extract_filter_value(
     mapping: &FieldMapping,
     slot: u32,
     field_map: &mut HashMap<u64, RoaringBitmap>,
+    ms_to_seconds: bool,
 ) {
     match mapping.value_type {
         FieldValueType::Integer => {
-            if let Some(n) = extract_integer(raw, mapping.truncate_u32) {
+            if let Some(n) = extract_integer(raw, ms_to_seconds) {
                 field_map
                     .entry(n as u64)
                     .or_insert_with(RoaringBitmap::new)
@@ -491,12 +488,13 @@ pub(crate) fn extract_sort_value(
     slot: u32,
     bits: u8,
     bit_map: &mut HashMap<usize, RoaringBitmap>,
+    ms_to_seconds: bool,
 ) {
     let value = match mapping.value_type {
         // Sort fields are stored as u32 — clamp negative values to 0 so they don't
         // wrap around to u32::MAX and sort incorrectly.
         FieldValueType::Integer => {
-            extract_integer(raw, mapping.truncate_u32).map(|n| n.max(0) as u32)
+            extract_integer(raw, ms_to_seconds).map(|n| n.max(0) as u32)
         }
         _ => None,
     };
@@ -512,14 +510,14 @@ pub(crate) fn extract_sort_value(
     }
 }
 
-/// Extract an integer from a JSON value, optionally truncating to u32.
-pub(crate) fn extract_integer(raw: &serde_json::Value, truncate_u32: bool) -> Option<i64> {
+/// Extract an integer from a JSON value, optionally converting ms→seconds.
+pub(crate) fn extract_integer(raw: &serde_json::Value, ms_to_seconds: bool) -> Option<i64> {
     let n = raw
         .as_i64()
         .or_else(|| raw.as_u64().map(|n| n as i64))
         .or_else(|| raw.as_f64().map(|n| n as i64))?;
-    Some(if truncate_u32 {
-        (n as u32) as i64
+    Some(if ms_to_seconds {
+        ((n / 1000) as u32) as i64
     } else {
         n
     })
@@ -543,13 +541,9 @@ fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDo
     }
 
     for mapping in &schema.fields {
-        let raw = json
-            .get(&mapping.source)
-            .or_else(|| mapping.fallback.as_ref().and_then(|fb| json.get(fb)));
-
-        let raw = match raw {
-            Some(v) if !v.is_null() => v,
-            _ => {
+        let (raw, apply_ms) = match mapping.resolve_raw(json) {
+            Some(pair) => pair,
+            None => {
                 match mapping.value_type {
                     FieldValueType::ExistsBoolean => {
                         fields.insert(
@@ -563,7 +557,7 @@ fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDo
             }
         };
 
-        if let Some(fv) = convert_field(raw, mapping) {
+        if let Some(fv) = convert_field(raw, mapping, apply_ms) {
             fields.insert(mapping.target.clone(), fv);
         }
     }
@@ -599,13 +593,9 @@ pub fn json_to_document(
     );
 
     for mapping in &schema.fields {
-        let raw = json
-            .get(&mapping.source)
-            .or_else(|| mapping.fallback.as_ref().and_then(|fb| json.get(fb)));
-
-        let raw = match raw {
-            Some(v) if !v.is_null() => v,
-            _ => {
+        let (raw, apply_ms) = match mapping.resolve_raw(json) {
+            Some(pair) => pair,
+            None => {
                 if matches!(mapping.value_type, FieldValueType::ExistsBoolean) {
                     fields.insert(
                         mapping.target.clone(),
@@ -616,7 +606,7 @@ pub fn json_to_document(
             }
         };
 
-        if let Some(fv) = convert_field(raw, mapping) {
+        if let Some(fv) = convert_field(raw, mapping, apply_ms) {
             fields.insert(mapping.target.clone(), fv);
         }
     }
@@ -625,7 +615,7 @@ pub fn json_to_document(
 }
 
 /// Convert a raw serde_json Value field to a FieldValue.
-fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<FieldValue> {
+fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping, ms_to_seconds: bool) -> Option<FieldValue> {
     match mapping.value_type {
         FieldValueType::Integer => {
             let n = if let Some(n) = raw.as_i64() {
@@ -637,8 +627,8 @@ fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping) -> Option<Fiel
             } else {
                 return None;
             };
-            let n = if mapping.truncate_u32 {
-                (n as u32) as i64
+            let n = if ms_to_seconds {
+                ((n / 1000) as u32) as i64
             } else {
                 n
             };
@@ -705,6 +695,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
             }],
@@ -732,6 +723,7 @@ mod tests {
                 fallback: Some("secondary".into()),
                 string_map: None,
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
             }],
@@ -759,6 +751,7 @@ mod tests {
                 fallback: None,
                 string_map: Some(map),
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
             }],
@@ -786,6 +779,7 @@ mod tests {
                 fallback: None,
                 string_map: Some(map),
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false, // default
             }],
@@ -824,6 +818,7 @@ mod tests {
                 fallback: None,
                 string_map: Some(map),
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: true,
             }],
@@ -858,6 +853,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
             }],
@@ -881,6 +877,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
             }],
@@ -908,18 +905,128 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
-                truncate_u32: true,
+                ms_to_seconds: true,
+                truncate_u32: false,
                 case_sensitive: false,
             }],
         };
-        let big_val: i64 = 5_000_000_000;
-        let json: serde_json::Value = serde_json::json!({"id": 1, "ts": big_val});
+        // Millisecond timestamp → divide by 1000, then cast to u32
+        let ms_val: i64 = 1_710_000_000_000; // March 2024 in ms
+        let json: serde_json::Value = serde_json::json!({"id": 1, "ts": ms_val});
         let doc = json_to_stored_doc(&json, &schema);
-        let expected = (big_val as u32) as i64;
+        let expected = (ms_val / 1000) as i64; // 1_710_000_000 — valid seconds
         assert_eq!(
             doc.fields.get("ts"),
             Some(&FieldValue::Single(Value::Integer(expected)))
         );
+
+    }
+
+    #[test]
+    fn test_ms_to_seconds_with_fallback() {
+        // Mirrors the real civitai config: source=sortAtUnix (ms), fallback=sortAt (seconds)
+        let schema = DataSchema {
+            id_field: "id".into(),
+            fields: vec![FieldMapping {
+                source: "sortAtUnix".into(),
+                target: "sortAt".into(),
+                value_type: FieldValueType::Integer,
+                fallback: Some("sortAt".into()),
+                string_map: None,
+                doc_only: false,
+                ms_to_seconds: true,
+                truncate_u32: false,
+                case_sensitive: false,
+            }],
+        };
+
+        // Case 1: sortAtUnix present (milliseconds) → divide by 1000
+        let json1: serde_json::Value =
+            serde_json::json!({"id": 1, "sortAtUnix": 1_684_867_905_000_i64});
+        let doc1 = json_to_stored_doc(&json1, &schema);
+        assert_eq!(
+            doc1.fields.get("sortAt"),
+            Some(&FieldValue::Single(Value::Integer(1_684_867_905))),
+            "ms timestamp should be divided by 1000"
+        );
+
+        // Case 2: sortAtUnix missing, falls back to sortAt (seconds) → NO division
+        let json2: serde_json::Value =
+            serde_json::json!({"id": 2, "sortAt": 1_684_867_905_i64});
+        let doc2 = json_to_stored_doc(&json2, &schema);
+        assert_eq!(
+            doc2.fields.get("sortAt"),
+            Some(&FieldValue::Single(Value::Integer(1_684_867_905))),
+            "fallback (seconds) should NOT be divided by 1000"
+        );
+
+        // Case 3: sortAtUnix present but null, falls back to sortAt (seconds)
+        let json3: serde_json::Value =
+            serde_json::json!({"id": 3, "sortAtUnix": null, "sortAt": 1_684_867_905_i64});
+        let doc3 = json_to_stored_doc(&json3, &schema);
+        assert_eq!(
+            doc3.fields.get("sortAt"),
+            Some(&FieldValue::Single(Value::Integer(1_684_867_905))),
+            "null primary should fall back to seconds without division"
+        );
+
+        // Case 4: Both missing → field absent
+        let json4: serde_json::Value = serde_json::json!({"id": 4});
+        let doc4 = json_to_stored_doc(&json4, &schema);
+        assert_eq!(
+            doc4.fields.get("sortAt"),
+            None,
+            "both missing → field should be absent"
+        );
+    }
+
+    #[test]
+    fn test_ms_to_seconds_json_to_document() {
+        // Same test through json_to_document (the production path for upserts)
+        let schema = DataSchema {
+            id_field: "id".into(),
+            fields: vec![FieldMapping {
+                source: "sortAtUnix".into(),
+                target: "sortAt".into(),
+                value_type: FieldValueType::Integer,
+                fallback: Some("sortAt".into()),
+                string_map: None,
+                doc_only: false,
+                ms_to_seconds: true,
+                truncate_u32: false,
+                case_sensitive: false,
+            }],
+        };
+
+        // Primary (ms) → divided
+        let json1 = serde_json::json!({"id": 100, "sortAtUnix": 1_684_867_905_000_i64});
+        let (slot, doc1) = json_to_document(&json1, &schema).unwrap();
+        assert_eq!(slot, 100);
+        assert_eq!(
+            doc1.fields.get("sortAt"),
+            Some(&FieldValue::Single(Value::Integer(1_684_867_905)))
+        );
+
+        // Fallback (seconds) → not divided
+        let json2 = serde_json::json!({"id": 200, "sortAt": 1_684_867_905_i64});
+        let (slot2, doc2) = json_to_document(&json2, &schema).unwrap();
+        assert_eq!(slot2, 200);
+        assert_eq!(
+            doc2.fields.get("sortAt"),
+            Some(&FieldValue::Single(Value::Integer(1_684_867_905)))
+        );
+    }
+
+    #[test]
+    fn test_ms_to_seconds_extract_integer() {
+        // Direct test of the extraction function
+        let ms = serde_json::json!(1_684_867_905_000_i64);
+        assert_eq!(extract_integer(&ms, true), Some(1_684_867_905));
+        assert_eq!(extract_integer(&ms, false), Some(1_684_867_905_000));
+
+        let sec = serde_json::json!(1_684_867_905_i64);
+        assert_eq!(extract_integer(&sec, true), Some(1_684_867));
+        assert_eq!(extract_integer(&sec, false), Some(1_684_867_905));
     }
 
     #[test]
@@ -933,6 +1040,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: true,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
             }],
@@ -958,6 +1066,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
             }],
@@ -978,6 +1087,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
             }],
@@ -998,6 +1108,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
             }],

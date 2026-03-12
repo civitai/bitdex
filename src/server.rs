@@ -401,6 +401,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/stats", get(handle_stats))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
+            .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             // Cursors
             .route("/api/indexes/{name}/cursors", get(handle_list_cursors))
             .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
@@ -1162,9 +1163,17 @@ async fn handle_stats(
             "min_tracked_value": e.min_tracked_value,
         })
     }).collect();
+    let eviction: Vec<serde_json::Value> = engine.eviction_stats().into_iter().map(|(name, total, resident)| {
+        serde_json::json!({
+            "field": name,
+            "evicted_total": total,
+            "resident_values": resident,
+        })
+    }).collect();
     Json(serde_json::json!({
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
+        "flush_cycle": engine.flush_cycle(),
         "unified_cache_entries": uc.entries,
         "unified_cache_hits": uc.hits,
         "unified_cache_misses": uc.misses,
@@ -1172,6 +1181,7 @@ async fn handle_stats(
         "unified_cache_meta_entries": uc.meta_index_entries,
         "unified_cache_meta_bytes": uc.meta_index_bytes,
         "unified_cache_entry_details": entries,
+        "eviction": eviction,
     })).into_response()
 }
 
@@ -1322,6 +1332,45 @@ async fn handle_rebuild(
 }
 
 // ---------------------------------------------------------------------------
+// Handlers: Snapshot
+// ---------------------------------------------------------------------------
+
+async fn handle_save_snapshot(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    match engine.save_snapshot() {
+        Ok(()) => {
+            let elapsed = t0.elapsed().as_secs_f64();
+            Json(serde_json::json!({
+                "status": "saved",
+                "elapsed_secs": elapsed,
+            })).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Snapshot save failed: {e}")})),
+            ).into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handlers: Cursors
 // ---------------------------------------------------------------------------
 
@@ -1454,6 +1503,16 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.pending_fields
                 .with_label_values(&[name])
                 .set(pending as i64);
+
+            // Eviction stats
+            for (field, total, resident) in engine.eviction_stats() {
+                m.eviction_total
+                    .with_label_values(&[name, &field])
+                    .set(total as i64);
+                m.eviction_resident_values
+                    .with_label_values(&[name, &field])
+                    .set(resident as i64);
+            }
         }
     }
 
