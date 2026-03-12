@@ -97,18 +97,33 @@ async fn main() {
         Commands::Load => {
             eprintln!("Starting bulk load...");
 
-            // Build engine with storage path for snapshot saving
+            // Build engine with storage paths matching the server's layout:
+            //   {data_dir}/indexes/{name}/bitmaps/
+            //   {data_dir}/indexes/{name}/docs/
+            let index_storage_dir = sync_config.data_dir.join("indexes").join(&index_def.name);
+            std::fs::create_dir_all(&index_storage_dir).ok();
+
             let mut engine_config = index_def.config.clone();
-            engine_config.storage.bitmap_path = Some(sync_config.data_dir.join("bitmaps"));
+            engine_config.storage.bitmap_path = Some(index_storage_dir.join("bitmaps"));
 
             let engine = ConcurrentEngine::new_with_path(
                 engine_config,
-                &sync_config.data_dir.join("docstore"),
+                &index_storage_dir.join("docs"),
             )
             .unwrap_or_else(|e| {
                 eprintln!("Failed to create engine: {e}");
                 std::process::exit(1);
             });
+
+            // Copy config.json into the index storage dir so the server finds it
+            let config_dest = index_storage_dir.join("config.json");
+            if !config_dest.exists() {
+                let config_src = sync_config.index_dir.join("config.json");
+                if config_src.exists() {
+                    std::fs::copy(&config_src, &config_dest).ok();
+                    eprintln!("Copied config.json to {}", config_dest.display());
+                }
+            }
 
             engine.enter_loading_mode();
 
