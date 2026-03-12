@@ -51,11 +51,29 @@ fn default_metrics_poll_interval_secs() -> u64 {
 
 impl PgSyncConfig {
     /// Load a `PgSyncConfig` from a TOML file on disk.
+    ///
+    /// After loading, environment variables override config values:
+    /// - `DATABASE_URL` overrides `postgres_url`
+    /// - `CLICKHOUSE_URL` overrides `clickhouse_url`
+    /// - `BITDEX_URL` overrides `bitdex_url`
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-        toml::from_str(&contents)
-            .map_err(|e| format!("failed to parse {}: {}", path.display(), e))
+        let mut config: Self = toml::from_str(&contents)
+            .map_err(|e| format!("failed to parse {}: {}", path.display(), e))?;
+
+        // Environment variable overrides
+        if let Ok(url) = std::env::var("DATABASE_URL") {
+            config.postgres_url = url;
+        }
+        if let Ok(url) = std::env::var("CLICKHOUSE_URL") {
+            config.clickhouse_url = Some(url);
+        }
+        if let Ok(url) = std::env::var("BITDEX_URL") {
+            config.bitdex_url = Some(url);
+        }
+
+        Ok(config)
     }
 }
 
