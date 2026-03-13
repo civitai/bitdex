@@ -15,14 +15,14 @@ Tested against 105M records (Civitai image dataset) on a single machine (Windows
 
 | Concurrency | QPS | p50 | p95 | p99 | max |
 |--:|--:|--:|--:|--:|--:|
-| 1 | 6,349 | 0.14ms | 0.21ms | 0.26ms | 0.61ms |
-| 4 | 21,994 | 0.17ms | 0.26ms | 0.33ms | 1.65ms |
-| 8 | 33,815 | 0.21ms | 0.37ms | 0.47ms | 15.29ms |
-| 16 | 34,899 | 0.43ms | 0.91ms | 1.27ms | 7.58ms |
-| 32 | 34,217 | 0.89ms | 2.20ms | 3.18ms | 8.37ms |
-| 64 | 34,052 | 1.77ms | 3.49ms | 4.60ms | 10.81ms |
+| 1 | 8,619 | 0.10ms | 0.17ms | 0.22ms | 4.96ms |
+| 4 | 22,673 | 0.16ms | 0.26ms | 0.33ms | 5.93ms |
+| 8 | 34,451 | 0.20ms | 0.39ms | 0.58ms | 9.19ms |
+| 16 | 35,520 | 0.41ms | 0.93ms | 1.33ms | 6.14ms |
+| 32 | 35,111 | 0.85ms | 2.18ms | 3.22ms | 15.94ms |
+| 64 | 39,015 | 1.53ms | 3.12ms | 4.18ms | 10.98ms |
 
-Production workload mix (filter + sort queries). Unified cache at 99.98% hit rate.
+Production workload mix (2,516 real Civitai traffic queries from `tests/loadtest/workload.json`). Unified cache at 99.98% hit rate. The loadtest auto-detects this workload file when run from the repo root.
 
 ### Query Latency (single-threaded benchmark harness, cache warm)
 
@@ -85,6 +85,36 @@ cargo build --release --features loadtest --bin loadtest
 # Benchmark harness
 cargo build --release --bin benchmark
 ```
+
+#### SIMD build (nightly)
+
+The `simd` feature enables vectorized bitmap operations via Rust's `portable_simd`. This accelerates bitwise AND/OR/XOR and popcount across roaring bitmap containers (processing 4-8 u64 words per instruction with AVX2/AVX-512 instead of one at a time).
+
+Requires Rust nightly. The `portable_simd` API broke in nightly 1.95+ (January 2026); use `nightly-2025-12-15` until the `roaring` crate updates.
+
+```bash
+rustup install nightly-2025-12-15
+
+# Build with SIMD
+cargo +nightly-2025-12-15 build --release --features server,simd --bin server
+```
+
+#### Docker
+
+Production and SIMD Docker images are in the `docker/` directory.
+
+```bash
+# Production image (stable Rust, fat LTO, target-cpu=znver3)
+docker build -t bitdex:latest -f docker/Dockerfile .
+
+# SIMD image (pinned nightly, roaring portable_simd)
+docker build -t bitdex:simd -f docker/Dockerfile.simd .
+
+# Run
+docker run -p 3000:3000 -v bitdex-data:/data bitdex:latest
+```
+
+The production image sets `MALLOC_CONF` for jemalloc memory return tuning (important in K8s to avoid OOMKill). Both images compile with `-C target-cpu=znver3` for AMD EPYC (AVX2, BMI2, POPCNT). Change to `znver4` for Genoa/Bergamo or `native` for auto-detection.
 
 ### Run the Server
 

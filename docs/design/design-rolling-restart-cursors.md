@@ -367,7 +367,7 @@ The sidecar does NOT poll during bulk load. The `load` and `sync` commands are s
 | **Normal rolling restart** | Pod loads from PVC, sidecar catches up from cursor, ready in seconds |
 | **PVC lost** | Cursor file gone → sidecar starts from 0 → replays full outbox. If outbox has been cleaned past 0, needs bulk load first |
 | **Sidecar crashes, BitDex stays up** | K8s restarts sidecar container. Reads cursor from BitDex, resumes. BitDex serves stale but doesn't go down |
-| **BitDex crashes, sidecar stays up** | Sidecar's pushes fail. It retries on next poll cycle. BitDex restarts from checkpoint, cursor on disk is authoritative |
+| **BitDex crashes, sidecar stays up** | Health gate detects BitDex is down, pauses PG polling (no wasted work). When BitDex restarts from checkpoint, health returns 200, sidecar resumes from its in-memory cursor. Cursor on disk is authoritative |
 | **Both pods restart** | PDB prevents this in normal operation. If it happens (node failure), both catch up independently from their PVC cursors |
 | **Replica decommissioned** | Operator deletes cursor row from `bitdex_cursors`. Cleanup trigger resumes |
 | **Outbox grows during long restart** | Bounded by write volume. At typical rates, minutes of outbox accumulation is negligible. Alert if `bitdex_cursors.updated_at` is stale |
@@ -642,7 +642,7 @@ containers:
             key: DATABASE_URL
 ```
 
-The sidecar needs to wait for BitDex to be healthy before polling. The outbox poller already reads the cursor from BitDex on boot (`GET /cursors/{name}`) — if BitDex isn't up yet, this will fail and the sidecar should retry. Consider adding a startup loop in the poller that waits for `/api/health` to return 200.
+The sidecar waits for BitDex to be healthy before polling. On boot, the outbox poller loops on `GET /api/health` until it returns 200, then reads the cursor. During steady-state, every poll cycle checks health first — if BitDex is unreachable, the PG fetch is skipped entirely to avoid wasted work. The metrics poller has the same health gate.
 
 On K8s 1.28+, native sidecars (`restartPolicy: Always` in `initContainers`) guarantee ordering. Check cluster K8s version — the current cluster runs v1.33-1.35 so this is available.
 
