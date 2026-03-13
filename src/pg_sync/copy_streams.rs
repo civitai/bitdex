@@ -12,15 +12,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::TryStreamExt;
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use sqlx::PgPool;
 
 use crate::config::DataSchema;
-use crate::loader::{extract_bitmaps, BitmapAccum};
+use crate::loader::BitmapAccum;
 
 use super::copy_queries::{
     self, parse_image_row, parse_resource_row, parse_tag_row, parse_technique_row, parse_tool_row,
-    CopyParser, CopyResourceRow,
+    CopyParser, CopyImageRow, CopyResourceRow,
 };
 use super::progress::LoadProgress;
 use super::slot_arena::{self, SlotArena};
@@ -36,7 +37,9 @@ const LOG_INTERVAL: u64 = 1_000_000;
 // ---------------------------------------------------------------------------
 
 /// Stream the Image+Post table via COPY: writes scalars to arena, builds
-/// filter/sort bitmaps via `extract_bitmaps`.
+/// filter/sort bitmaps directly from parsed CSV fields (no JSON allocation).
+///
+/// Uses Rayon fold+reduce for parallel bitmap construction across chunks.
 pub(crate) async fn stream_images_copy(
     pool: &PgPool,
     arena: &SlotArena,
@@ -48,9 +51,39 @@ pub(crate) async fn stream_images_copy(
     progress: &Arc<LoadProgress>,
 ) -> Result<(BitmapAccum, StreamStats), String> {
     let start = Instant::now();
-    let mut accum = BitmapAccum::new(filter_names, sort_configs);
     let mut total = 0u64;
     let mut last_log = 0u64;
+    let mut accum = BitmapAccum::new(filter_names, sort_configs);
+
+    // Pre-resolve string_maps for MappedString filter fields (type, availability, blockedFor).
+    // These are looked up once instead of per-row.
+    let type_map = resolve_string_map(schema, "type");
+    let availability_map = resolve_string_map(schema, "availability");
+    let blocked_for_map = resolve_string_map(schema, "blockedFor");
+
+    // Pre-resolve which sort fields exist and their bit counts
+    let sort_at_bits = sort_bits.get("sortAt").copied();
+    let published_at_bits = sort_bits.get("publishedAt").copied();
+    let reaction_count_bits = sort_bits.get("reactionCount").copied();
+    let comment_count_bits = sort_bits.get("commentCount").copied();
+    let collected_count_bits = sort_bits.get("collectedCount").copied();
+    let id_sort_bits = sort_bits.get("id").copied();
+
+    // Pre-check which filter fields are active
+    let has_nsfw = filter_set.contains("nsfwLevel");
+    let has_user = filter_set.contains("userId");
+    let has_type = filter_set.contains("type");
+    let has_avail = filter_set.contains("availability");
+    let has_blocked = filter_set.contains("blockedFor");
+    let has_post = filter_set.contains("postId");
+    let has_posted_to = filter_set.contains("postedToId");
+    let has_remix_of = filter_set.contains("remixOfId");
+    let has_has_meta = filter_set.contains("hasMeta");
+    let has_on_site = filter_set.contains("onSite");
+    let has_poi = filter_set.contains("poi");
+    let has_minor = filter_set.contains("minor");
+    let has_is_published = filter_set.contains("isPublished");
+    let has_is_remix = filter_set.contains("isRemix");
 
     let mut stream = copy_queries::copy_images(pool)
         .await
@@ -63,22 +96,22 @@ pub(crate) async fn stream_images_copy(
         .map_err(|e| format!("copy_images stream: {e}"))?
     {
         let lines = parser.feed(&chunk);
-        for line in lines {
-            let row = match parse_image_row(&line) {
-                Some(r) => r,
-                None => continue,
-            };
+        let chunk_len = lines.len() as u64;
+        if chunk_len == 0 {
+            continue;
+        }
+
+        // Parse all lines in this chunk (fast, mostly integer parsing)
+        let rows: Vec<CopyImageRow> = lines
+            .into_iter()
+            .filter_map(|line| parse_image_row(&line))
+            .collect();
+
+        // Write scalars to arena sequentially (mmap writes, fast)
+        for row in &rows {
             let slot = row.id as u32;
-
-            // Compute derived fields
             let sort_at = row.sort_at_secs();
-            let has_meta = row.has_meta();
-            let on_site = row.on_site();
-            let poi = row.poi();
-            let minor = row.minor();
             let published_at_ms = (row.published_at_secs.unwrap_or(0) * 1000) as u64;
-
-            // Write scalar fields to arena
             arena.write_scalars(
                 slot,
                 row.id as u64,
@@ -86,80 +119,131 @@ pub(crate) async fn stream_images_copy(
                 row.user_id as u64,
                 slot_arena::encode_image_type(Some(&row.image_type)),
                 sort_at,
-                poi,
-                minor,
+                row.poi(),
+                row.minor(),
                 row.url.as_deref().map(|s| s.as_bytes()),
                 row.hash.as_deref().map(|s| s.as_bytes()),
-                has_meta,
-                on_site,
+                row.has_meta(),
+                row.on_site(),
                 row.post_id.unwrap_or(0) as u64,
                 row.posted_to_id.unwrap_or(0) as u64,
                 slot_arena::encode_availability(Some(row.availability.as_str())),
                 slot_arena::encode_blocked_for(row.blocked_for.as_deref()),
                 published_at_ms,
             );
+        }
 
-            // Build a minimal JSON doc for bitmap extraction.
-            // extract_bitmaps handles all schema-aware filter/sort field logic
-            // including string_map lookups, exists-booleans, bit decomposition, etc.
-            let mut doc = serde_json::json!({
-                "id": row.id,
-                "nsfwLevel": row.nsfw_level,
-                "userId": row.user_id,
-                "postId": row.post_id.unwrap_or(0),
-                "postedToId": row.posted_to_id.unwrap_or(0),
-                "type": &row.image_type,
-                "availability": &row.availability,
-                "blockedFor": row.blocked_for.as_deref(),
-                "reactionCount": 0,
-                "commentCount": 0,
-                "collectedCount": 0,
-                "sortAt": sort_at,
-                "publishedAtUnix": published_at_ms as i64,
-            });
+        // Build bitmaps in parallel via Rayon fold+reduce
+        let chunk_accum = rows
+            .par_iter()
+            .fold(
+                || BitmapAccum::new(filter_names, sort_configs),
+                |mut acc, row| {
+                    let slot = row.id as u32;
+                    let sort_at = row.sort_at_secs();
+                    let has_meta = row.has_meta();
+                    let on_site = row.on_site();
+                    let poi = row.poi();
+                    let minor = row.minor();
+                    let published_at_secs = row.published_at_secs.unwrap_or(0);
 
-            // Exists-boolean fields: only set when true (matching extract_bitmaps behavior)
-            if let Some(obj) = doc.as_object_mut() {
-                if has_meta {
-                    obj.insert("hasMeta".into(), serde_json::json!(true));
-                }
-                if on_site {
-                    obj.insert("onSite".into(), serde_json::json!(true));
-                }
-                if poi {
-                    obj.insert("poi".into(), serde_json::json!(true));
-                }
-                if minor {
-                    obj.insert("minor".into(), serde_json::json!(true));
-                }
-            }
+                    acc.alive.insert(slot);
 
-            accum.alive.insert(slot);
-            extract_bitmaps(
-                &doc,
-                schema,
-                filter_set,
-                sort_bits,
-                slot,
-                &mut accum.filter_maps,
-                &mut accum.sort_maps,
+                    // --- Filter bitmaps (direct, no JSON) ---
+                    if has_nsfw {
+                        insert_filter(&mut acc.filter_maps, "nsfwLevel", row.nsfw_level as u64, slot);
+                    }
+                    if has_user {
+                        insert_filter(&mut acc.filter_maps, "userId", row.user_id as u64, slot);
+                    }
+                    if has_type {
+                        let key = lookup_string_map(&type_map, &row.image_type);
+                        insert_filter(&mut acc.filter_maps, "type", key, slot);
+                    }
+                    if has_avail {
+                        let key = lookup_string_map(&availability_map, &row.availability);
+                        insert_filter(&mut acc.filter_maps, "availability", key, slot);
+                    }
+                    if has_blocked {
+                        if let Some(ref bf) = row.blocked_for {
+                            let key = lookup_string_map(&blocked_for_map, bf);
+                            insert_filter(&mut acc.filter_maps, "blockedFor", key, slot);
+                        }
+                    }
+                    if has_post {
+                        insert_filter(&mut acc.filter_maps, "postId", row.post_id.unwrap_or(0) as u64, slot);
+                    }
+                    if has_posted_to {
+                        insert_filter(&mut acc.filter_maps, "postedToId", row.posted_to_id.unwrap_or(0) as u64, slot);
+                    }
+                    if has_remix_of {
+                        // remixOfId not in images COPY — skip (enriched from resources)
+                    }
+                    // Boolean filters
+                    if has_has_meta {
+                        insert_filter(&mut acc.filter_maps, "hasMeta", if has_meta { 1 } else { 0 }, slot);
+                    }
+                    if has_on_site {
+                        insert_filter(&mut acc.filter_maps, "onSite", if on_site { 1 } else { 0 }, slot);
+                    }
+                    if has_poi {
+                        insert_filter(&mut acc.filter_maps, "poi", if poi { 1 } else { 0 }, slot);
+                    }
+                    if has_minor {
+                        insert_filter(&mut acc.filter_maps, "minor", if minor { 1 } else { 0 }, slot);
+                    }
+                    // Exists-boolean filters
+                    if has_is_published {
+                        insert_filter(&mut acc.filter_maps, "isPublished", if published_at_secs != 0 { 1 } else { 0 }, slot);
+                    }
+                    if has_is_remix {
+                        // isRemix derived from remixOfId — not in images COPY
+                        insert_filter(&mut acc.filter_maps, "isRemix", 0, slot);
+                    }
+
+                    // --- Sort bitmaps (bit decomposition, no JSON) ---
+                    if let Some(bits) = sort_at_bits {
+                        insert_sort_bits(&mut acc.sort_maps, "sortAt", sort_at as u32, bits, slot);
+                    }
+                    if let Some(bits) = published_at_bits {
+                        insert_sort_bits(&mut acc.sort_maps, "publishedAt", published_at_secs.max(0) as u32, bits, slot);
+                    }
+                    if let Some(bits) = reaction_count_bits {
+                        insert_sort_bits(&mut acc.sort_maps, "reactionCount", 0, bits, slot);
+                    }
+                    if let Some(bits) = comment_count_bits {
+                        insert_sort_bits(&mut acc.sort_maps, "commentCount", 0, bits, slot);
+                    }
+                    if let Some(bits) = collected_count_bits {
+                        insert_sort_bits(&mut acc.sort_maps, "collectedCount", 0, bits, slot);
+                    }
+                    if let Some(bits) = id_sort_bits {
+                        insert_sort_bits(&mut acc.sort_maps, "id", slot, bits, slot);
+                    }
+
+                    acc
+                },
+            )
+            .reduce(
+                || BitmapAccum::new(filter_names, sort_configs),
+                |a, b| a.merge(b),
             );
 
-            total += 1;
+        accum = accum.merge(chunk_accum);
+        total += rows.len() as u64;
 
-            // Progress updates
-            if total % PROGRESS_INTERVAL == 0 {
-                progress.image_rows.store(total, Ordering::Release);
-            }
-            if total % LOG_INTERVAL == 0 && total > last_log {
-                last_log = total;
-                let elapsed = start.elapsed().as_secs_f64();
-                let rate = total as f64 / elapsed;
-                eprintln!(
-                    "  stream_images_copy: {} rows ({:.0}/s, {:.1}s)",
-                    total, rate, elapsed
-                );
-            }
+        // Progress + logging
+        if total / PROGRESS_INTERVAL != (total - rows.len() as u64) / PROGRESS_INTERVAL {
+            progress.image_rows.store(total, Ordering::Release);
+        }
+        if total / LOG_INTERVAL != last_log / LOG_INTERVAL {
+            last_log = total;
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = total as f64 / elapsed;
+            eprintln!(
+                "  stream_images_copy: {} rows ({:.0}/s, {:.1}s)",
+                total, rate, elapsed
+            );
         }
     }
 
@@ -178,6 +262,71 @@ pub(crate) async fn stream_images_copy(
     );
 
     Ok((accum, StreamStats { rows_processed: total, elapsed }))
+}
+
+// ---------------------------------------------------------------------------
+// Direct bitmap helpers (no JSON allocation)
+// ---------------------------------------------------------------------------
+
+/// Insert a value into a filter bitmap map.
+#[inline]
+fn insert_filter(
+    filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
+    field: &str,
+    value: u64,
+    slot: u32,
+) {
+    if let Some(fm) = filter_maps.get_mut(field) {
+        fm.entry(value)
+            .or_insert_with(RoaringBitmap::new)
+            .insert(slot);
+    }
+}
+
+/// Decompose a u32 value into bit-layer sort bitmaps.
+#[inline]
+fn insert_sort_bits(
+    sort_maps: &mut HashMap<String, HashMap<usize, RoaringBitmap>>,
+    field: &str,
+    value: u32,
+    bits: u8,
+    slot: u32,
+) {
+    if let Some(sm) = sort_maps.get_mut(field) {
+        for bit in 0..(bits as usize) {
+            if (value >> bit) & 1 == 1 {
+                sm.entry(bit)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(slot);
+            }
+        }
+    }
+}
+
+/// Pre-resolve a string_map from schema for a given field target name.
+/// Returns a Vec of (lowercase_key, mapped_value) pairs for fast lookup.
+fn resolve_string_map(schema: &DataSchema, target: &str) -> Vec<(String, u64)> {
+    schema
+        .fields
+        .iter()
+        .find(|f| f.target == target)
+        .and_then(|f| f.string_map.as_ref())
+        .map(|map| {
+            map.iter()
+                .map(|(k, &v)| (k.to_lowercase(), v as u64))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Look up a string value in a pre-resolved string_map. Returns 0 if not found.
+#[inline]
+fn lookup_string_map(map: &[(String, u64)], value: &str) -> u64 {
+    let lower = value.to_lowercase();
+    map.iter()
+        .find(|(k, _)| k == &lower)
+        .map(|(_, v)| *v)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

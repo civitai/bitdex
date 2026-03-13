@@ -17,14 +17,30 @@ CREATE TABLE IF NOT EXISTS "BitdexOutbox" (
 CREATE INDEX IF NOT EXISTS idx_bitdex_outbox_id ON "BitdexOutbox" (id);
 
 -- Image trigger function
+-- Image table has "id"; join tables (TagsOnImageNew, ImageTool, ImageTechnique,
+-- ImageResourceNew) have "imageId" instead.
 CREATE OR REPLACE FUNCTION bitdex_image_notify() RETURNS trigger AS $$
+DECLARE
+  _image_id BIGINT;
 BEGIN
-  IF TG_OP = 'DELETE' AND TG_TABLE_NAME = 'Image' THEN
-    INSERT INTO "BitdexOutbox" (entity_type, entity_id, event) VALUES ('Image', OLD.id, 'DELETE');
+  IF TG_TABLE_NAME = 'Image' THEN
+    IF TG_OP = 'DELETE' THEN
+      INSERT INTO "BitdexOutbox" (entity_type, entity_id, event) VALUES ('Image', OLD.id, 'DELETE');
+      RETURN OLD;
+    ELSE
+      INSERT INTO "BitdexOutbox" (entity_type, entity_id, event) VALUES ('Image', NEW.id, 'UPSERT');
+      RETURN NEW;
+    END IF;
   ELSE
-    INSERT INTO "BitdexOutbox" (entity_type, entity_id, event) VALUES ('Image', NEW.id, 'UPSERT');
+    -- Join tables: use "imageId" column
+    IF TG_OP = 'DELETE' THEN
+      _image_id := OLD."imageId";
+    ELSE
+      _image_id := NEW."imageId";
+    END IF;
+    INSERT INTO "BitdexOutbox" (entity_type, entity_id, event) VALUES ('Image', _image_id, 'UPSERT');
+    RETURN COALESCE(NEW, OLD);
   END IF;
-  RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
