@@ -284,6 +284,100 @@ async function testE_UpsertAfterUnload() {
 }
 
 // ---------------------------------------------------------------------------
+// F. Combined exit_loading + save + unload (load endpoint path)
+// ---------------------------------------------------------------------------
+
+async function testF_CombinedLoadPathNoSpike() {
+  log('\n--- F. Combined Load Path: No Memory Spike ---');
+
+  // This tests the optimized path where exit_loading_mode + save + unload
+  // happen in one flush command, avoiding the staging.clone() memory spike.
+  //
+  // Write NDJSON file, load via the load endpoint (which uses the combined path),
+  // then verify bitmap memory is near-zero after load completes.
+
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const os = await import('node:os');
+
+  // Write a small NDJSON file
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bitdex-e2e-'));
+  const ndjsonPath = path.join(tmpDir, 'test-data.ndjson');
+  const lines = [];
+  for (let i = 2001; i <= 3000; i++) {
+    lines.push(JSON.stringify({
+      id: i,
+      category: i % 10,
+      tags: [i % 50, i % 30 + 100],
+      active: i % 2 === 0,
+      score: i * 3,
+    }));
+  }
+  fs.writeFileSync(ndjsonPath, lines.join('\n') + '\n');
+  log(`  [1] wrote ${lines.length} records to ${ndjsonPath}`);
+
+  // Trigger load with save_snapshot=true (uses combined exit+save+unload path)
+  const loadRes = await fetch(api('/load'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      path: ndjsonPath,
+      save_snapshot: true,
+    }),
+  });
+  assert(loadRes.ok, `load request failed: ${loadRes.status}`);
+  log(`  [2] load started`);
+
+  // Wait for load to complete — poll load-status until complete/error
+  const deadline = Date.now() + 60000;
+  let loadStatus;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(api('/load/status'));
+      const text = await res.text();
+      if (!text) { await new Promise(r => setTimeout(r, 200)); continue; }
+      loadStatus = JSON.parse(text);
+      vlog(`load-status: ${JSON.stringify(loadStatus)}`);
+      if (loadStatus.status === 'complete' || loadStatus.status === 'error') break;
+    } catch (_) { /* may not be ready yet */ }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  assert(loadStatus, 'load-status never returned');
+  assert(loadStatus.status === 'complete', `load did not complete: ${JSON.stringify(loadStatus)}`);
+  log(`  [3] load complete: ${loadStatus.records_loaded} records`);
+
+  // Check bitmap memory is near-zero (all unloaded)
+  const s = await stats();
+  const totalBytes = s.filter_bitmap_bytes + s.sort_bitmap_bytes;
+  log(`  [4] bitmap memory after combined load+save+unload: ${totalBytes} bytes`);
+
+  // After combined save+unload, filter and sort bitmaps should be mostly unloaded.
+  // Some residual bytes remain from field metadata and any in-flight diffs,
+  // but the vast majority of bitmap data should be freed.
+  // At scale (105M), this is the difference between 6.5GB and ~10KB.
+  // For 1000 records the numbers are small, so we check < 50KB as a sanity bound.
+  assert(
+    totalBytes < 50000,
+    `bitmap memory should be very low after combined load (got ${totalBytes}). ` +
+    `If high, the combined exit+save+unload path may not be unloading correctly.`
+  );
+  log(`  [5] bitmap memory ${totalBytes} bytes (< 50KB) -- combined path working correctly`);
+
+  // Verify queries still work via lazy reload
+  const r = await post('/query', {
+    filters: [{ Eq: ['category', { Integer: 5 }] }],
+    sort: { field: 'score', direction: 'Desc' },
+    limit: 5,
+  });
+  assert(r.status === 200, `query after combined load failed: ${r.status}`);
+  assert(r.data.ids.length > 0, 'expected results after combined load');
+  log(`  [6] queries work via lazy reload after combined load -- [${r.data.ids.slice(0, 3)}...]`);
+
+  // Cleanup temp file
+  try { fs.rmSync(tmpDir, { recursive: true }); } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
 // Cleanup + Runner
 // ---------------------------------------------------------------------------
 
@@ -307,6 +401,7 @@ const groups = [
   ['C', 'Memory Stays Low (No Re-inflation)', testC_MemoryStaysLow],
   ['D', 'Queries Work Via Lazy Reload', testD_QueryAfterUnload],
   ['E', 'Upsert After Unload Works', testE_UpsertAfterUnload],
+  ['F', 'Combined Load Path No Memory Spike', testF_CombinedLoadPathNoSpike],
 ];
 
 async function main() {

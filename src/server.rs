@@ -895,27 +895,32 @@ async fn handle_load(
 
         match loader::load_ndjson(&engine, &schema, &path, limit, threads, chunk_size, docstore_batch_size, max_writer_threads, progress.clone()) {
             Ok(stats) => {
-                // Exit loading mode (publishes staging and restarts maintenance)
-                engine.exit_loading_mode();
-
-                let alive = engine.alive_count();
-                eprintln!("Load complete: {} records alive", alive);
+                let alive;
 
                 if save_snapshot {
-                    // Transition to Saving — bitmap snapshot save can be slow
+                    // Combined exit-loading + save + unload: saves directly from
+                    // staging without an intermediate full publish, eliminating the
+                    // memory spike from staging.clone() at scale.
                     *status.lock() = LoadStatus::Saving {
                         records_loaded: stats.records_loaded,
                         elapsed_secs: stats.elapsed.as_secs_f64(),
                     };
 
-                    // Save bitmap snapshot and unload to free memory (lazy reload on demand)
                     let snap_start = Instant::now();
-                    if let Err(e) = engine.save_and_unload() {
-                        eprintln!("Warning: failed to save_and_unload: {e}");
+                    if let Err(e) = engine.exit_loading_mode_and_save_unload() {
+                        eprintln!("Warning: failed to exit_loading_mode_and_save_unload: {e}");
                     } else {
-                        eprintln!("save_and_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
+                        eprintln!("exit_loading_mode_and_save_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
                     }
+                    // Alive bitmap is always preserved during unload
+                    alive = engine.alive_count();
+                } else {
+                    // Just exit loading mode — no save needed
+                    engine.exit_loading_mode();
+                    alive = engine.alive_count();
                 }
+
+                eprintln!("Load complete: {} records alive", alive);
 
                 *status.lock() = LoadStatus::Complete {
                     records_loaded: stats.records_loaded,

@@ -48,6 +48,27 @@ enum FlushCommand {
         /// Oneshot sender — caller blocks until staging is replaced and published.
         done: crossbeam_channel::Sender<()>,
     },
+    /// Combined exit-loading + save + unload in one atomic operation.
+    /// Saves bitmaps directly from staging (the single in-memory copy)
+    /// without publishing a full intermediate snapshot. This eliminates
+    /// the memory spike from `staging.clone()` that doubles bitmap memory
+    /// at scale (e.g., 22GB → 38GB at 105M records).
+    ///
+    /// Flow: drain mutations → merge diffs → save staging to disk →
+    /// build unloaded staging → publish unloaded → signal done.
+    ExitLoadingSaveUnload {
+        /// Sets to skip (already pending lazy loads — not in memory).
+        skip_sorts: HashSet<String>,
+        skip_filters: HashSet<String>,
+        skip_lazy: HashSet<String>,
+        /// Cursors to persist alongside bitmaps.
+        cursors: HashMap<String, String>,
+        /// Dictionaries to persist alongside bitmaps.
+        dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
+        /// Oneshot sender — caller blocks until save+unload is complete.
+        /// Returns Ok(()) on success or error message on failure.
+        done: crossbeam_channel::Sender<std::result::Result<(), String>>,
+    },
 }
 
 /// Lazy-load request sent from query threads to the flush thread.
@@ -714,6 +735,103 @@ impl ConcurrentEngine {
                                 inner.store(Arc::new(staging.clone()));
                                 staging_dirty = false;
                                 let _ = done.send(());
+                            }
+                            FlushCommand::ExitLoadingSaveUnload {
+                                skip_sorts, skip_filters, skip_lazy,
+                                cursors, dictionaries, done,
+                            } => {
+                                // Combined exit-loading + save + unload. Saves directly
+                                // from staging (the single copy) without publishing an
+                                // intermediate full snapshot — eliminates the clone spike.
+                                eprintln!("  flush: ExitLoadingSaveUnload starting");
+
+                                // 1. Drain all remaining mutations into staging
+                                let extra = coalescer.flush(
+                                    &mut staging.slots,
+                                    &mut staging.filters,
+                                    &mut staging.sorts,
+                                );
+                                if extra > 0 {
+                                    staging_dirty = true;
+                                }
+
+                                // 2. Compact filter diffs before saving
+                                for (_name, field) in staging.filters.fields_mut() {
+                                    field.merge_dirty();
+                                }
+
+                                // 3. Save directly from staging — no clone, no Arc refcount bump
+                                if let Some(ref store) = flush_bitmap_store {
+                                    let save_result = ConcurrentEngine::write_inner_to_store(
+                                        store,
+                                        &staging,
+                                        &flush_config,
+                                        &skip_sorts,
+                                        &skip_filters,
+                                        &skip_lazy,
+                                    );
+                                    if let Err(e) = save_result {
+                                        let _ = done.send(Err(format!("save failed: {e}")));
+                                        continue;
+                                    }
+
+                                    // Persist cursors
+                                    for (name, value) in &cursors {
+                                        if let Err(e) = store.write_cursor(name, value) {
+                                            eprintln!("Warning: failed to persist cursor '{}': {}", name, e);
+                                        }
+                                    }
+
+                                    // Persist dictionaries
+                                    if !dictionaries.is_empty() {
+                                        let dict_dir = store.root_path().join("dictionaries");
+                                        for (name, dict) in dictionaries.iter() {
+                                            let snap = dict.snapshot();
+                                            let path = dict_dir.join(format!("{}.dict", name));
+                                            if let Err(e) = crate::dictionary::save_dictionary(&snap, &path) {
+                                                eprintln!("Warning: failed to persist dictionary '{}': {}", name, e);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 4. Build unloaded staging — reuse field configs, clear bitmaps
+                                let slots = staging.slots.clone();
+                                let mut new_filters = crate::filter::FilterIndex::new();
+                                for fc in &flush_config.filter_fields {
+                                    new_filters.add_field(fc.clone());
+                                }
+                                for fc in &flush_config.filter_fields {
+                                    if skip_filters.contains(&fc.name) {
+                                        new_filters.copy_field_arc_from(&staging.filters, &fc.name);
+                                    } else {
+                                        new_filters.unload_from(&staging.filters, &fc.name);
+                                    }
+                                }
+                                let mut new_sorts = crate::sort::SortIndex::new();
+                                for sc in &flush_config.sort_fields {
+                                    new_sorts.add_field(sc.clone());
+                                }
+                                for sc in &flush_config.sort_fields {
+                                    if skip_sorts.contains(&sc.name) {
+                                        new_sorts.copy_field_arc_from(&staging.sorts, &sc.name);
+                                    } else {
+                                        new_sorts.unload_from(&staging.sorts, &sc.name);
+                                    }
+                                }
+
+                                // 5. Replace staging and publish the unloaded version
+                                staging = InnerEngine {
+                                    slots,
+                                    filters: new_filters,
+                                    sorts: new_sorts,
+                                };
+                                flush_unified_cache.lock().clear();
+                                inner.store(Arc::new(staging.clone()));
+                                staging_dirty = false;
+
+                                eprintln!("  flush: ExitLoadingSaveUnload complete");
+                                let _ = done.send(Ok(()));
                             }
                         }
                     }
@@ -2470,6 +2588,89 @@ impl ConcurrentEngine {
         }
     }
 
+    /// Combined exit-loading + save + unload that avoids the memory spike.
+    ///
+    /// Instead of:
+    ///   1. exit_loading_mode() → publishes staging.clone() (doubles refcounts)
+    ///   2. save_and_unload() → reads published snapshot, saves to disk
+    ///
+    /// This does:
+    ///   1. Sends ExitLoadingSaveUnload to flush thread
+    ///   2. Flush thread saves directly from staging (the single copy)
+    ///   3. Builds unloaded staging, publishes only the unloaded version
+    ///
+    /// At 105M records this eliminates the 22GB→38GB RSS spike from the
+    /// intermediate staging.clone() that bumps Arc refcounts.
+    pub fn exit_loading_mode_and_save_unload(&self) -> Result<()> {
+        self.loading_mode.store(false, Ordering::Release);
+
+        let store = self.bitmap_store.as_ref().ok_or_else(|| {
+            crate::error::BitdexError::Config(
+                "no bitmap_path configured; cannot save_and_unload".to_string(),
+            )
+        })?;
+        let _ = store; // Just validating it exists; flush thread has its own Arc
+
+        let skip_sorts = self.pending_sort_loads.lock().clone();
+        let skip_filters = self.pending_filter_loads.lock().clone();
+        let skip_lazy = self.lazy_value_fields.lock().clone();
+        let cursors = self.cursors.lock().clone();
+        let dictionaries = Arc::clone(&self.dictionaries);
+
+        // Mark all loaded fields as pending for lazy reload after unload.
+        for fc in &self.config.filter_fields {
+            if !skip_filters.contains(&fc.name) && !skip_lazy.contains(&fc.name) {
+                self.pending_filter_loads.lock().insert(fc.name.clone());
+            }
+        }
+        for sc in &self.config.sort_fields {
+            if !skip_sorts.contains(&sc.name) {
+                self.pending_sort_loads.lock().insert(sc.name.clone());
+            }
+        }
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        match self.cmd_tx.send(FlushCommand::ExitLoadingSaveUnload {
+            skip_sorts: skip_sorts.clone(),
+            skip_filters: skip_filters.clone(),
+            skip_lazy: skip_lazy.clone(),
+            cursors,
+            dictionaries,
+            done: done_tx,
+        }) {
+            Ok(()) => {
+                // Save can take minutes at 105M — use generous timeout
+                match done_rx.recv_timeout(Duration::from_secs(600)) {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(msg)) => Err(crate::error::BitdexError::Config(msg)),
+                    Err(_) => {
+                        eprintln!("Warning: exit_loading_mode_and_save_unload timed out");
+                        Err(crate::error::BitdexError::Config(
+                            "timed out waiting for flush thread save".to_string(),
+                        ))
+                    }
+                }
+            }
+            Err(_) => {
+                // Flush thread is gone — fall back to separate exit + save_and_unload
+                eprintln!("Warning: flush thread gone, falling back to separate exit+save");
+                // Re-clear the pending loads we just set (save_and_unload will re-set them)
+                for fc in &self.config.filter_fields {
+                    if !skip_filters.contains(&fc.name) && !skip_lazy.contains(&fc.name) {
+                        self.pending_filter_loads.lock().remove(&fc.name);
+                    }
+                }
+                for sc in &self.config.sort_fields {
+                    if !skip_sorts.contains(&sc.name) {
+                        self.pending_sort_loads.lock().remove(&sc.name);
+                    }
+                }
+                self.exit_loading_mode();
+                self.save_and_unload()
+            }
+        }
+    }
+
     /// Save a full snapshot of the current published state to the configured BitmapStore.
     ///
     /// Captures the current ArcSwap snapshot (what readers see) and writes all
@@ -2546,14 +2747,24 @@ impl ConcurrentEngine {
         skip_filters: &HashSet<String>,
         skip_lazy_values: &HashSet<String>,
     ) -> Result<()> {
+        let snap: Arc<InnerEngine> = inner.load_full();
+        Self::write_inner_to_store(store, &snap, config, skip_sorts, skip_filters, skip_lazy_values)
+    }
+
+    /// Write bitmaps from an InnerEngine directly to the store.
+    /// This is used by both the ArcSwap-based path and the flush thread's
+    /// direct-from-staging path (which avoids the intermediate clone).
+    fn write_inner_to_store(
+        store: &BitmapFs,
+        snap: &InnerEngine,
+        config: &Config,
+        skip_sorts: &HashSet<String>,
+        skip_filters: &HashSet<String>,
+        skip_lazy_values: &HashSet<String>,
+    ) -> Result<()> {
         use std::borrow::Cow;
 
         let save_start = std::time::Instant::now();
-
-        // Load the current published snapshot (lock-free Arc clone, no data copy).
-        let snap: Arc<InnerEngine> = inner.load_full();
-        eprintln!("  save: snapshot loaded ({:.1}ms)",
-            save_start.elapsed().as_secs_f64() * 1000.0);
 
         // Write alive bitmap + slot counter + deferred map first (critical metadata).
         let alive_cow = snap.slots.alive_fused_cow();
