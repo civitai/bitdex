@@ -1080,6 +1080,12 @@ fn slot_matches_clause(
         op if op.starts_with("not(") => {
             // Compound not: "not(eq)" → evaluate inner and negate
             let inner_op = &op[4..op.len() - 1]; // strip "not(" and ")"
+            // If inner is a compound clause (and/or), we can't evaluate it precisely.
+            // The inner returns true conservatively, negating gives false — wrong.
+            // Return true (conservative) for compound negations.
+            if inner_op == "and" || inner_op == "or" {
+                return true;
+            }
             let inner_clause = CanonicalClause {
                 field: clause.field.clone(),
                 op: inner_op.to_string(),
@@ -2114,5 +2120,131 @@ mod tests {
         cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
 
         assert_eq!(cache.get(&key).unwrap().cardinality(), orig_cardinality);
+    }
+
+    // --- Compound clause live maintenance tests ---
+
+    #[test]
+    fn test_slot_matches_clause_or_returns_true_conservatively() {
+        // Or(...) should return true (conservative) since we can't evaluate sub-clauses
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let clause = CanonicalClause {
+            field: "nsfwLevel".to_string(),
+            op: "or".to_string(),
+            value_repr: "".to_string(),
+        };
+        assert!(
+            slot_matches_clause(42, &clause, &filters, &sorts),
+            "Or clause should conservatively return true"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_clause_and_returns_true_conservatively() {
+        // And(...) should return true (conservative)
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let clause = CanonicalClause {
+            field: "nsfwLevel".to_string(),
+            op: "and".to_string(),
+            value_repr: "".to_string(),
+        };
+        assert!(
+            slot_matches_clause(42, &clause, &filters, &sorts),
+            "And clause should conservatively return true"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_clause_not_and_returns_true_conservatively() {
+        // not(and) should return true (conservative).
+        // Bug: inner "and" returns true, negation gives false — incorrectly rejects slots.
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let clause = CanonicalClause {
+            field: "nsfwLevel".to_string(),
+            op: "not(and)".to_string(),
+            value_repr: "".to_string(),
+        };
+        assert!(
+            slot_matches_clause(42, &clause, &filters, &sorts),
+            "Not(And(...)) should conservatively return true, not negate the inner conservative true"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_clause_not_or_returns_true_conservatively() {
+        // not(or) should return true (conservative).
+        // Bug: inner "or" returns true, negation gives false — incorrectly rejects slots.
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let clause = CanonicalClause {
+            field: "nsfwLevel".to_string(),
+            op: "not(or)".to_string(),
+            value_repr: "".to_string(),
+        };
+        assert!(
+            slot_matches_clause(42, &clause, &filters, &sorts),
+            "Not(Or(...)) should conservatively return true, not negate the inner conservative true"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_filter_with_not_and_clause() {
+        // A filter with a Not(And(...)) clause should not reject slots
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[42])])]);
+        let sorts = make_sort_index(&[]);
+        let clauses = vec![
+            CanonicalClause {
+                field: "nsfwLevel".to_string(),
+                op: "eq".to_string(),
+                value_repr: "1".to_string(),
+            },
+            CanonicalClause {
+                field: "type".to_string(),
+                op: "not(and)".to_string(),
+                value_repr: "".to_string(),
+            },
+        ];
+        assert!(
+            slot_matches_filter(42, &clauses, &filters, &sorts),
+            "Filter with Not(And(...)) clause should not reject slot that matches other clauses"
+        );
+    }
+
+    #[test]
+    fn test_maintain_not_and_clause_does_not_reject_slot() {
+        // E2E: cache entry with Not(And(...)) clause should keep slots during maintenance
+        let mut cache = UnifiedCache::new(make_config());
+
+        // Entry with a Not(And(...)) clause
+        let key = make_key(
+            &[("nsfwLevel", "eq", "1"), ("type", "not(and)", "")],
+            "reactionCount",
+            SortDirection::Desc,
+        );
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        assert_eq!(cache.get(&key).unwrap().cardinality(), 5);
+
+        // Insert slot 10 with nsfwLevel=1
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[0, 1, 2, 3, 4, 10])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 1500)])]);
+
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![10],
+        );
+
+        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+
+        // Slot 10 should be added — the Not(And(...)) clause should not reject it
+        let entry = cache.get(&key).unwrap();
+        assert!(
+            entry.bitmap().contains(10),
+            "Slot 10 should be added to cache entry with Not(And(...)) clause"
+        );
     }
 }
