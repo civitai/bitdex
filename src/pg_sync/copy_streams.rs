@@ -566,7 +566,7 @@ pub(crate) async fn stream_techniques_copy(
 // Resource COPY stream
 // ---------------------------------------------------------------------------
 
-/// Stream ImageResourceNew + ModelVersion + Model via COPY, ordered by imageId.
+/// Stream ImageResourceNew via COPY (no JOINs), enriched with MV/Model lookup maps.
 ///
 /// Accumulates all resource rows per image, then flushes:
 /// - Detected MVs to `arena.write_model_version_ids`
@@ -574,6 +574,9 @@ pub(crate) async fn stream_techniques_copy(
 /// - Base model (first Checkpoint-type model) to `arena.write_base_model`
 /// - Resource POI (any model.poi=true) to `arena.set_resource_poi`
 /// - Filter bitmaps for modelVersionIds and baseModel
+///
+/// `mv_lookup`: MV.id → (baseModel, modelId)
+/// `model_lookup`: Model.id → (poi, model_type)
 pub(crate) async fn stream_resources_copy(
     pool: &PgPool,
     arena: &SlotArena,
@@ -581,6 +584,8 @@ pub(crate) async fn stream_resources_copy(
     filter_names: &[String],
     sort_configs: &[(String, u8)],
     progress: &Arc<LoadProgress>,
+    mv_lookup: &HashMap<i64, (Option<String>, i64)>,
+    model_lookup: &HashMap<i64, (bool, String)>,
 ) -> Result<(BitmapAccum, StreamStats), String> {
     let start = Instant::now();
     let mut accum = BitmapAccum::new(filter_names, sort_configs);
@@ -617,6 +622,8 @@ pub(crate) async fn stream_resources_copy(
                         arena,
                         schema,
                         &mut accum.filter_maps,
+                        mv_lookup,
+                        model_lookup,
                     );
                 }
                 current_image_id = Some(row.image_id);
@@ -650,6 +657,8 @@ pub(crate) async fn stream_resources_copy(
             arena,
             schema,
             &mut accum.filter_maps,
+            mv_lookup,
+            model_lookup,
         );
     }
 
@@ -679,12 +688,14 @@ fn flush_resources(
     arena: &SlotArena,
     schema: &DataSchema,
     filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
+    mv_lookup: &HashMap<i64, (Option<String>, i64)>,
+    model_lookup: &HashMap<i64, (bool, String)>,
 ) {
     let slot = image_id as u32;
 
     let mut detected_mvs: Vec<u32> = Vec::new();
     let mut manual_mvs: Vec<u32> = Vec::new();
-    let mut base_model_str: Option<&str> = None;
+    let mut base_model_str: Option<String> = None;
     let mut has_resource_poi = false;
 
     for res in resources {
@@ -696,14 +707,18 @@ fn flush_resources(
             manual_mvs.push(mv_id);
         }
 
-        // Base model: first Checkpoint-type model wins
-        if base_model_str.is_none() && res.model_type == "Checkpoint" {
-            base_model_str = res.base_model.as_deref();
-        }
-
-        // Resource POI: any model with poi=true
-        if res.model_poi {
-            has_resource_poi = true;
+        // Look up MV → Model enrichment data
+        if let Some((mv_base_model, model_id)) = mv_lookup.get(&res.model_version_id) {
+            if let Some((poi, model_type)) = model_lookup.get(model_id) {
+                // Base model: first Checkpoint-type model wins
+                if base_model_str.is_none() && model_type == "Checkpoint" {
+                    base_model_str = mv_base_model.clone();
+                }
+                // Resource POI: any model with poi=true
+                if *poi {
+                    has_resource_poi = true;
+                }
+            }
         }
     }
 
@@ -714,7 +729,7 @@ fn flush_resources(
     if !manual_mvs.is_empty() {
         arena.write_model_version_ids_manual(slot, &manual_mvs);
     }
-    if let Some(bm) = base_model_str {
+    if let Some(ref bm) = base_model_str {
         arena.write_base_model(slot, slot_arena::encode_base_model(Some(bm)));
     }
     if has_resource_poi {
@@ -733,7 +748,7 @@ fn flush_resources(
     }
 
     // baseModel filter bitmap via schema string_map
-    if let Some(bm_str) = base_model_str {
+    if let Some(ref bm_str) = base_model_str {
         if !bm_str.is_empty() {
             let key = schema
                 .fields

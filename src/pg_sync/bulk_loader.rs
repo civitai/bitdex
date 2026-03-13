@@ -22,6 +22,7 @@ use crate::concurrent_engine::ConcurrentEngine;
 use crate::loader::BitmapAccum;
 
 use super::config::IndexDefinition;
+use super::copy_queries;
 use super::copy_streams;
 use super::progress::LoadProgress;
 use super::queries;
@@ -300,6 +301,71 @@ pub async fn run_bulk_load_copy(
     let (arena_mb, _) = arena.memory_usage();
     eprintln!("SlotArena: {} MB allocated", arena_mb / (1024 * 1024));
 
+    // Step 2b: Load enrichment lookup tables (Post, ModelVersion, Model).
+    // These are small tables streamed via COPY into HashMaps for in-memory JOINs.
+    eprintln!("\n=== Loading enrichment tables ===");
+    let enrich_start = Instant::now();
+
+    let (post_map, mv_map, model_map) = {
+        use futures_util::TryStreamExt;
+        use super::copy_queries::{
+            CopyParser, parse_post_row, parse_model_version_row, parse_model_row,
+        };
+
+        // Post → HashMap<post_id, (published_at_secs, availability, model_version_id)>
+        let mut post_map: HashMap<i64, (Option<i64>, String, Option<i64>)> = HashMap::new();
+        let mut post_stream = copy_queries::copy_posts(pool)
+            .await.map_err(|e| format!("copy_posts: {e}"))?;
+        let mut post_parser = CopyParser::new();
+        let mut post_count = 0u64;
+        while let Some(chunk) = post_stream.try_next().await.map_err(|e| format!("copy_posts stream: {e}"))? {
+            for line in post_parser.feed(&chunk) {
+                if let Some(row) = parse_post_row(&line) {
+                    post_map.insert(row.id, (row.published_at_secs, row.availability, row.model_version_id));
+                    post_count += 1;
+                }
+            }
+        }
+        eprintln!("  Posts: {} rows in {:.1}s", post_count, enrich_start.elapsed().as_secs_f64());
+
+        // ModelVersion → HashMap<mv_id, (base_model, model_id)>
+        let mv_start = Instant::now();
+        let mut mv_map: HashMap<i64, (Option<String>, i64)> = HashMap::new();
+        let mut mv_stream = copy_queries::copy_model_versions(pool)
+            .await.map_err(|e| format!("copy_model_versions: {e}"))?;
+        let mut mv_parser = CopyParser::new();
+        let mut mv_count = 0u64;
+        while let Some(chunk) = mv_stream.try_next().await.map_err(|e| format!("copy_model_versions stream: {e}"))? {
+            for line in mv_parser.feed(&chunk) {
+                if let Some(row) = parse_model_version_row(&line) {
+                    mv_map.insert(row.id, (row.base_model, row.model_id));
+                    mv_count += 1;
+                }
+            }
+        }
+        eprintln!("  ModelVersions: {} rows in {:.1}s", mv_count, mv_start.elapsed().as_secs_f64());
+
+        // Model → HashMap<model_id, (poi, model_type)>
+        let model_start = Instant::now();
+        let mut model_map: HashMap<i64, (bool, String)> = HashMap::new();
+        let mut model_stream = copy_queries::copy_models(pool)
+            .await.map_err(|e| format!("copy_models: {e}"))?;
+        let mut model_parser = CopyParser::new();
+        let mut model_count = 0u64;
+        while let Some(chunk) = model_stream.try_next().await.map_err(|e| format!("copy_models stream: {e}"))? {
+            for line in model_parser.feed(&chunk) {
+                if let Some(row) = parse_model_row(&line) {
+                    model_map.insert(row.id, (row.poi, row.model_type));
+                    model_count += 1;
+                }
+            }
+        }
+        eprintln!("  Models: {} rows in {:.1}s", model_count, model_start.elapsed().as_secs_f64());
+
+        eprintln!("Enrichment tables loaded in {:.1}s", enrich_start.elapsed().as_secs_f64());
+        (post_map, mv_map, model_map)
+    };
+
     // Step 3: Stream all tables via COPY with checkpoint recovery.
     // Each stream saves a checkpoint on completion. On restart, completed
     // streams are loaded from disk instead of re-streamed from Postgres.
@@ -399,6 +465,7 @@ pub async fn run_bulk_load_copy(
             "resources", &ckpt_resources, &filter_names, &sort_configs, 3,
             || copy_streams::stream_resources_copy(
                 pool, &arena, schema, &filter_names, &sort_configs, &progress,
+                &mv_map, &model_map,
             ),
         ),
     );
