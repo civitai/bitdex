@@ -347,7 +347,7 @@ Create `benches/radix_sort_bench.rs` (add `[[bench]]` entry to Cargo.toml).
 
 3. **Phase 1 integration** — Wire into UnifiedEntry (transition in `expand()`), executor, concurrent_engine. Small entries keep sorted_keys, expanded entries use radix.
 
-4. **Phase 1 validation** — `cargo test --release` (all existing + new tests pass), E2E tests pass (`node tools/e2e-unified-cache.mjs`), loadtest comparison on 105M dataset.
+4. **Phase 1 validation** — `cargo test --release` (all existing + new tests pass), E2E tests pass (`node tests/e2e/e2e-unified-cache.mjs`), loadtest comparison on 105M dataset.
 
 5. **Phase 2** — Adaptive splitting (only if Group 4 benchmarks confirm value for clustered data). Critical for sortAt field.
 
@@ -359,8 +359,8 @@ Create `benches/radix_sort_bench.rs` (add `[[bench]]` entry to Cargo.toml).
 
 1. `cargo test --release` — All existing + new unit tests pass
 2. `cargo bench --bench radix_sort_bench` — All 5 groups meet go/no-go thresholds
-3. Start server, load data, run `node tools/e2e-unified-cache.mjs` — All test groups pass
-4. Loadtest comparison: `target/release/loadtest.exe --mode http --url http://localhost:3001 --workload tools/workload.json --concurrency 1,4,8,16,32,64 --duration 10`
+3. Start server, load data, run `node tests/e2e/e2e-unified-cache.mjs` — All test groups pass
+4. Loadtest comparison: `target/release/loadtest.exe --mode http --url http://localhost:3001 --workload tests/loadtest/workload.json --concurrency 1,4,8,16,32,64 --duration 10`
 5. Compare cache-hit latency: before vs after (target: measurable improvement at high concurrency)
 6. Memory: radix entries at 64K should use < 130 KB each (vs 500 KB for sorted vec)
 7. Flush thread mutation cost: radix insert/remove should be faster than sorted vec memmove at 64K

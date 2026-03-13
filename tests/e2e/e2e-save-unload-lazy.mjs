@@ -8,7 +8,7 @@
  * consistent throughout.
  *
  * Usage:
- *   node tools/e2e-save-unload-lazy.mjs [--url http://localhost:3000] [--verbose] [--keep] [--results-dir ./results]
+ *   node tests/e2e/e2e-save-unload-lazy.mjs [--url http://localhost:3000] [--verbose] [--keep] [--results-dir ./results]
  */
 
 import { writeFileSync, mkdirSync } from 'node:fs';

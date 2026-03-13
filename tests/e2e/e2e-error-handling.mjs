@@ -11,7 +11,7 @@
  *   D. Slot Recycling (Delete → Reinsert Same ID)
  *
  * Usage:
- *   node tools/e2e-error-handling.mjs [--url http://localhost:3000] [--verbose] [--keep] [--results-dir ./results]
+ *   node tests/e2e/e2e-error-handling.mjs [--url http://localhost:3000] [--verbose] [--keep] [--results-dir ./results]
  *
  * Prerequisites:
  *   Server running:

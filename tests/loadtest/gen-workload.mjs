@@ -80,7 +80,7 @@ for (const t of tags) {
 
 const output = { queries };
 writeFileSync(join(__dirname, 'workload.json'), JSON.stringify(output, null, 2));
-console.log(`Generated ${queries.length} queries → tools/workload.json`);
+console.log(`Generated ${queries.length} queries → tests/loadtest/workload.json`);
 console.log(`  Feed variants: 16`);
 console.log(`  User queries: ${users.length * 2}`);
 console.log(`  MV queries: ${mvs.length}`);

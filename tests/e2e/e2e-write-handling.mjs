@@ -14,7 +14,7 @@
  *   F. Multi-value field upsert (add/remove tags)
  *
  * Usage:
- *   node tools/e2e-write-handling.mjs [--url http://localhost:3000] [--verbose] [--keep]
+ *   node tests/e2e/e2e-write-handling.mjs [--url http://localhost:3000] [--verbose] [--keep]
  *
  * Prerequisites:
  *   Server running with NO existing index (or use --keep to skip cleanup):

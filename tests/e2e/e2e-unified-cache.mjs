@@ -7,8 +7,8 @@
  * min_filter_size threshold, and multiple filter combinations.
  *
  * Usage:
- *   node tools/e2e-unified-cache.mjs [--url http://localhost:3000] [--index models] [--verbose]
- *   node tools/e2e-unified-cache.mjs --bench [--iterations 200] [--warmup 10]
+ *   node tests/e2e/e2e-unified-cache.mjs [--url http://localhost:3000] [--index models] [--verbose]
+ *   node tests/e2e/e2e-unified-cache.mjs --bench [--iterations 200] [--warmup 10]
  */
 
 import { writeFileSync, mkdirSync } from 'node:fs';

@@ -30,7 +30,7 @@
 | 3 | **Hardcoded `SHARD_SHIFT = 9`** | `rebuild_fields_from_docstore` uses magic number `>> 9` instead of `DocStore::SHARD_SHIFT`. Will silently break if constant changes. | Trivial |
 | 4 | **Silent shard errors in rebuild** | `get_shard()` errors in the rebuild rayon fold are silently `continue`d. Should at minimum `eprintln!` a warning and track error count. | Small |
 | 5 | **Missing unified cache Prometheus metrics** | `/metrics` endpoint dropped 4 bound_cache gauge families but added nothing for unified cache. Stats endpoint has the data — just needs gauge registration. | Small |
-| 6 | **`.gitignore` + scratch files** | Add `*.log`, `cache_test.js`, `timing_test.js`, `pagination_bench.js`, `RESUME.md` to `.gitignore`. Commit `tools/workload.json` and `tools/mixed-workload.mjs`. | Trivial |
+| 6 | **`.gitignore` + scratch files** | Add `*.log`, `cache_test.js`, `timing_test.js`, `pagination_bench.js`, `RESUME.md` to `.gitignore`. Commit `tests/loadtest/workload.json`. | Trivial |
 
 ### Low Priority / Monitor
 

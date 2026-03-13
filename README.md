@@ -348,10 +348,10 @@ src/
 cargo test --release
 
 # All self-contained E2E tests (builds server, runs 6 suites, 31 tests)
-node tools/run-e2e.mjs
+node tests/e2e/run-e2e.mjs
 
 # Skip rebuild if binary is current
-node tools/run-e2e.mjs --skip-build
+node tests/e2e/run-e2e.mjs --skip-build
 ```
 
 E2E test suites:

@@ -14,12 +14,12 @@ Guide for running the right tests based on what you changed, and for developing 
 
 | Files Changed | Required Tests | Command |
 |--------------|----------------|---------|
-| `src/write_coalescer.rs` | Lib tests + E2E write handling | `cargo test --lib` then `node tools/e2e-write-handling.mjs --url <server>` |
-| `src/executor.rs` | Lib tests + E2E write handling + E2E query operators | `cargo test --lib` then `node tools/e2e-write-handling.mjs --url <server>` and `node tools/e2e-query-operators.mjs --url <server>` |
+| `src/write_coalescer.rs` | Lib tests + E2E write handling | `cargo test --lib` then `node tests/e2e/e2e-write-handling.mjs --url <server>` |
+| `src/executor.rs` | Lib tests + E2E write handling + E2E query operators | `cargo test --lib` then `node tests/e2e/e2e-write-handling.mjs --url <server>` and `node tests/e2e/e2e-query-operators.mjs --url <server>` |
 | `src/filter.rs` or `src/sort.rs` | Lib tests + proptest + E2E write handling | `cargo test --lib && cargo test --test proptest_correctness` |
 | `src/planner.rs` | Lib tests (query planning) | `cargo test --lib` |
 | `src/query.rs` | Lib tests + proptest | `cargo test --lib && cargo test --test proptest_correctness` |
-| `src/cache.rs` or `src/unified_cache.rs` | Lib tests + E2E pagination-overhead + E2E unified cache (if prod data) | `cargo test --lib` then `node tools/e2e-pagination-overhead.mjs --url <server>` |
+| `src/cache.rs` or `src/unified_cache.rs` | Lib tests + E2E pagination-overhead + E2E unified cache (if prod data) | `cargo test --lib` then `node tests/e2e/e2e-pagination-overhead.mjs --url <server>` |
 | `src/concurrent_engine.rs` | Lib tests + relevant E2E test (see below) | `cargo test --lib` + whichever E2E covers your change |
 | `src/mutation.rs` | Lib tests + proptest + E2E write handling | `cargo test --lib && cargo test --test proptest_correctness` |
 
@@ -29,19 +29,19 @@ Guide for running the right tests based on what you changed, and for developing 
 |--------------|----------------|---------|
 | `src/bitmap_fs.rs` | Lib tests + restart test | `cargo test --lib && cargo test --test restart_test` |
 | `src/docstore.rs` | Lib tests + restart test | `cargo test --lib && cargo test --test restart_test` |
-| Snapshot save/restore logic | Restart test + E2E eviction + E2E save-unload | `cargo test --test restart_test` then `node tools/e2e-eviction.mjs --url <server>` and `node tools/e2e-save-unload-lazy.mjs --url <server>` |
+| Snapshot save/restore logic | Restart test + E2E eviction + E2E save-unload | `cargo test --test restart_test` then `node tests/e2e/e2e-eviction.mjs --url <server>` and `node tests/e2e/e2e-save-unload-lazy.mjs --url <server>` |
 
 ### Eviction Changes
 
 | Files Changed | Required Tests | Command |
 |--------------|----------------|---------|
-| Eviction stamps/sweep in `concurrent_engine.rs` | Eviction tests + E2E eviction | `cargo test --test eviction_stamp_gap_test && cargo test --test eviction_atomics_test` then `node tools/e2e-eviction.mjs --url <server>` |
+| Eviction stamps/sweep in `concurrent_engine.rs` | Eviction tests + E2E eviction | `cargo test --test eviction_stamp_gap_test && cargo test --test eviction_atomics_test` then `node tests/e2e/e2e-eviction.mjs --url <server>` |
 
 ### Server / API Changes
 
 | Files Changed | Required Tests | Command |
 |--------------|----------------|---------|
-| `src/server.rs` | Build check + E2E error handling + relevant E2E | `cargo build --features server` then `node tools/e2e-error-handling.mjs --url <server>` + test the endpoint you changed |
+| `src/server.rs` | Build check + E2E error handling + relevant E2E | `cargo build --features server` then `node tests/e2e/e2e-error-handling.mjs --url <server>` + test the endpoint you changed |
 | `src/config.rs` | Lib tests (config validation) | `cargo test --lib` |
 | `src/metrics.rs` | Build check | `cargo build --features server` |
 
@@ -59,7 +59,7 @@ Run everything:
 cargo test --lib --features server          # 409 unit tests (~10s)
 cargo test --test proptest_correctness      # Property-based tests (~1s)
 cargo test --test restart_test              # Persistence round-trip
-node tools/run-e2e.mjs --skip-build         # All self-contained E2E tests (~10s)
+node tests/e2e/run-e2e.mjs --skip-build         # All self-contained E2E tests (~10s)
 ```
 
 ## Running E2E Tests
@@ -68,9 +68,9 @@ E2E tests run against a live HTTP server. Two modes:
 
 ### Automated (all self-contained suites)
 ```bash
-node tools/run-e2e.mjs                      # Build + start server + run all + cleanup
-node tools/run-e2e.mjs --skip-build          # Skip cargo build (use existing binary)
-node tools/run-e2e.mjs --keep                # Keep test data dir for debugging
+node tests/e2e/run-e2e.mjs                      # Build + start server + run all + cleanup
+node tests/e2e/run-e2e.mjs --skip-build          # Skip cargo build (use existing binary)
+node tests/e2e/run-e2e.mjs --keep                # Keep test data dir for debugging
 ```
 
 ### Manual (single suite against running server)
@@ -79,12 +79,12 @@ node tools/run-e2e.mjs --keep                # Keep test data dir for debugging
 cargo run --release --features server --bin server -- --port 3100 --data-dir ./test-data
 
 # Run one suite
-node tools/e2e-write-handling.mjs --url http://localhost:3100
-node tools/e2e-eviction.mjs --url http://localhost:3100
-node tools/e2e-unified-cache.mjs --url http://localhost:3100   # needs production data
+node tests/e2e/e2e-write-handling.mjs --url http://localhost:3100
+node tests/e2e/e2e-eviction.mjs --url http://localhost:3100
+node tests/e2e/e2e-unified-cache.mjs --url http://localhost:3100   # needs production data
 
 # With structured JSON results
-node tools/e2e-write-handling.mjs --url http://localhost:3100 --results-dir docs/test-results
+node tests/e2e/e2e-write-handling.mjs --url http://localhost:3100 --results-dir docs/test-results
 ```
 
 ### Flags (all E2E tests)
@@ -104,7 +104,7 @@ BitDex uses a blend of Rust and Node tests. Choose based on what you're testing:
 - **Concurrency correctness** — Thread barriers, atomic ordering, ArcSwap behavior
 - **Persistence round-trips** — Engine-level save/restore without server lifecycle
 
-### Use Node (`node tools/e2e-*.mjs`) when:
+### Use Node (`node tests/e2e/e2e-*.mjs`) when:
 - **Testing the HTTP API contract** — Request/response format, status codes, error messages
 - **Testing the full write pipeline** — HTTP → mutation → coalescer → flush → snapshot → query
 - **Testing server lifecycle** — Index create/delete, loading, snapshot endpoints
@@ -120,7 +120,7 @@ BitDex uses a blend of Rust and Node tests. Choose based on what you're testing:
 
 ### Structure
 
-Follow the existing pattern in `tools/e2e-*.mjs`:
+Follow the existing pattern in `tests/e2e/e2e-*.mjs`:
 
 1. **Self-contained**: Create own index, insert data, test, clean up
 2. **Groups**: Each test has named groups (Setup, A, B, C...) with clear assertions
@@ -149,12 +149,12 @@ let passed = 0, failed = 0;
 const groupResults = [];
 
 // ... helper functions (apiPost, apiGet, apiDelete, query, upsert, etc.)
-// Copy from tools/e2e-write-handling.mjs
+// Copy from tests/e2e/e2e-write-handling.mjs
 
 // ... test groups (setup, testA, testB, etc.)
 
 // ... runner with JSON output
-// Copy the main() pattern from tools/e2e-write-handling.mjs
+// Copy the main() pattern from tests/e2e/e2e-write-handling.mjs
 ```
 
 ### Filter clause syntax
@@ -204,13 +204,13 @@ Full descriptions of all test suites are in `docs/testing.md`.
 ### E2E (Node, against live server)
 | Suite | File | Self-contained | Tests |
 |-------|------|---------------|-------|
-| Write Handling | `tools/e2e-write-handling.mjs` | Yes | Insert, upsert filter/sort, delete, concurrent, multi-value |
-| Eviction | `tools/e2e-eviction.mjs` | Yes | Load, idle, evict, reload, existence set |
-| Query Operators | `tools/e2e-query-operators.mjs` | Yes | Range filters (Gt/Gte/Lt/Lte), NotEq, combined range+filter |
-| Error Handling | `tools/e2e-error-handling.mjs` | Yes | Invalid JSON, unknown index 404, empty index, slot recycling |
-| Pagination & Overhead | `tools/e2e-pagination-overhead.mjs` | Yes | Cursor pagination, cache acceleration, expansion, structural overhead |
-| Save/Unload/Lazy | `tools/e2e-save-unload-lazy.mjs` | Yes | Snapshot save, query after save, mutation survival, stats integrity |
-| Unified Cache | `tools/e2e-unified-cache.mjs` | No (prod data) | Cache population, pagination, mutation/delete maintenance |
+| Write Handling | `tests/e2e/e2e-write-handling.mjs` | Yes | Insert, upsert filter/sort, delete, concurrent, multi-value |
+| Eviction | `tests/e2e/e2e-eviction.mjs` | Yes | Load, idle, evict, reload, existence set |
+| Query Operators | `tests/e2e/e2e-query-operators.mjs` | Yes | Range filters (Gt/Gte/Lt/Lte), NotEq, combined range+filter |
+| Error Handling | `tests/e2e/e2e-error-handling.mjs` | Yes | Invalid JSON, unknown index 404, empty index, slot recycling |
+| Pagination & Overhead | `tests/e2e/e2e-pagination-overhead.mjs` | Yes | Cursor pagination, cache acceleration, expansion, structural overhead |
+| Save/Unload/Lazy | `tests/e2e/e2e-save-unload-lazy.mjs` | Yes | Snapshot save, query after save, mutation survival, stats integrity |
+| Unified Cache | `tests/e2e/e2e-unified-cache.mjs` | No (prod data) | Cache population, pagination, mutation/delete maintenance |
 
 ### Integration (Rust, in-process)
 | Suite | File | Tests |

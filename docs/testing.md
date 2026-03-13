@@ -13,7 +13,7 @@ All E2E tests support `--url <url>` to override the server address (default: `ht
 ### Automated Runner
 
 ```bash
-node tools/run-e2e.mjs
+node tests/e2e/run-e2e.mjs
 ```
 
 Starts a fresh server on port 3100, runs all self-contained E2E suites, produces JSON results in `docs/test-results/`, prints a summary, and cleans up. Exit code 1 if any suite fails.
@@ -28,7 +28,7 @@ Options:
 
 ### e2e-write-handling.mjs
 
-**File:** `tools/e2e-write-handling.mjs`
+**File:** `tests/e2e/e2e-write-handling.mjs`
 
 **What it tests:** Write correctness — that inserts, upserts, and deletes correctly update filter and sort bitmaps, and that queries reflect the changes after flush cycles complete. Also validates concurrent read/write safety and multi-value field update correctness (old values cleared, new values set).
 
@@ -50,10 +50,10 @@ Options:
 **How to run:**
 ```bash
 # Standalone (server must be running)
-node tools/e2e-write-handling.mjs --url http://localhost:3000
+node tests/e2e/e2e-write-handling.mjs --url http://localhost:3000
 
 # With JSON results output
-node tools/e2e-write-handling.mjs --url http://localhost:3000 --results-dir docs/test-results
+node tests/e2e/e2e-write-handling.mjs --url http://localhost:3000 --results-dir docs/test-results
 ```
 
 **Expected output:** 7 groups pass (Setup + A-F). Exit code 0.
@@ -62,7 +62,7 @@ node tools/e2e-write-handling.mjs --url http://localhost:3000 --results-dir docs
 
 ### e2e-eviction.mjs
 
-**File:** `tools/e2e-eviction.mjs`
+**File:** `tests/e2e/e2e-eviction.mjs`
 
 **What it tests:** The idle eviction lifecycle for multi-value filter fields. Verifies that lazily-loaded bitmap values become resident, go idle after no queries, get evicted by the sweep thread, and reload from disk on the next query. Also tests the existence set (nonexistent values skip disk lookup).
 
@@ -82,10 +82,10 @@ node tools/e2e-write-handling.mjs --url http://localhost:3000 --results-dir docs
 **How to run:**
 ```bash
 # Standalone
-node tools/e2e-eviction.mjs --url http://localhost:3000
+node tests/e2e/e2e-eviction.mjs --url http://localhost:3000
 
 # With JSON results output
-node tools/e2e-eviction.mjs --url http://localhost:3000 --results-dir docs/test-results
+node tests/e2e/e2e-eviction.mjs --url http://localhost:3000 --results-dir docs/test-results
 ```
 
 **Expected output:** 5 groups pass (Setup + A-D). Exit code 0.
@@ -94,7 +94,7 @@ node tools/e2e-eviction.mjs --url http://localhost:3000 --results-dir docs/test-
 
 ### e2e-unified-cache.mjs
 
-**File:** `tools/e2e-unified-cache.mjs`
+**File:** `tests/e2e/e2e-unified-cache.mjs`
 
 **What it tests:** The unified cache system: population on miss, hit speedup, pagination correctness (no duplicates, correct sort order), deep pagination with cache expansion, mutation maintenance (upsert updates cached entries), delete maintenance (deleted docs removed from cache), min_filter_size threshold (narrow queries bypass cache), and multiple filter combinations.
 
@@ -116,13 +116,13 @@ node tools/e2e-eviction.mjs --url http://localhost:3000 --results-dir docs/test-
 **How to run:**
 ```bash
 # Requires server with production data loaded
-node tools/e2e-unified-cache.mjs --url http://localhost:3000
+node tests/e2e/e2e-unified-cache.mjs --url http://localhost:3000
 
 # Bench mode (latency percentiles)
-node tools/e2e-unified-cache.mjs --url http://localhost:3000 --bench --iterations 200
+node tests/e2e/e2e-unified-cache.mjs --url http://localhost:3000 --bench --iterations 200
 
 # With JSON results output
-node tools/e2e-unified-cache.mjs --url http://localhost:3000 --results-dir docs/test-results
+node tests/e2e/e2e-unified-cache.mjs --url http://localhost:3000 --results-dir docs/test-results
 ```
 
 **Expected output:** 7 groups pass (A-G). Exit code 0.
@@ -131,7 +131,7 @@ node tools/e2e-unified-cache.mjs --url http://localhost:3000 --results-dir docs/
 
 ### e2e-query-operators.mjs
 
-**File:** `tools/e2e-query-operators.mjs`
+**File:** `tests/e2e/e2e-query-operators.mjs`
 
 **What it tests:** Query operators that had zero test coverage through the HTTP API path: range filters (Gt, Gte, Lt, Lte), NotEq, and combined range+filter queries with sorted output.
 
@@ -148,8 +148,8 @@ node tools/e2e-unified-cache.mjs --url http://localhost:3000 --results-dir docs/
 
 **How to run:**
 ```bash
-node tools/e2e-query-operators.mjs --url http://localhost:3100
-node tools/e2e-query-operators.mjs --url http://localhost:3100 --results-dir docs/test-results
+node tests/e2e/e2e-query-operators.mjs --url http://localhost:3100
+node tests/e2e/e2e-query-operators.mjs --url http://localhost:3100 --results-dir docs/test-results
 ```
 
 **Expected output:** 4 groups pass (Setup + A-C). Exit code 0.
@@ -158,7 +158,7 @@ node tools/e2e-query-operators.mjs --url http://localhost:3100 --results-dir doc
 
 ### e2e-error-handling.mjs
 
-**File:** `tools/e2e-error-handling.mjs`
+**File:** `tests/e2e/e2e-error-handling.mjs`
 
 **What it tests:** HTTP error handling and edge cases with zero server-level test coverage: malformed requests, unknown index 404s, empty index queries, and slot recycling (the "clean deletes" design principle end-to-end).
 
@@ -176,8 +176,8 @@ node tools/e2e-query-operators.mjs --url http://localhost:3100 --results-dir doc
 
 **How to run:**
 ```bash
-node tools/e2e-error-handling.mjs --url http://localhost:3100
-node tools/e2e-error-handling.mjs --url http://localhost:3100 --results-dir docs/test-results
+node tests/e2e/e2e-error-handling.mjs --url http://localhost:3100
+node tests/e2e/e2e-error-handling.mjs --url http://localhost:3100 --results-dir docs/test-results
 ```
 
 **Expected output:** 4 groups pass (A-D). Exit code 0.
@@ -186,7 +186,7 @@ node tools/e2e-error-handling.mjs --url http://localhost:3100 --results-dir docs
 
 ### e2e-pagination-overhead.mjs
 
-**File:** `tools/e2e-pagination-overhead.mjs`
+**File:** `tests/e2e/e2e-pagination-overhead.mjs`
 
 **What it tests:** Cursor pagination correctness, unified cache acceleration, cache expansion on deep pagination, structural memory overhead, and filtered cursor pagination. Produces quantitative measurements (bytes per entry, bytes per doc, hit/miss latency, capacity progression) for regression tracking.
 
@@ -201,8 +201,8 @@ node tools/e2e-error-handling.mjs --url http://localhost:3100 --results-dir docs
 
 **How to run:**
 ```bash
-node tools/e2e-pagination-overhead.mjs --url http://localhost:3100
-node tools/e2e-pagination-overhead.mjs --url http://localhost:3100 --results-dir docs/test-results
+node tests/e2e/e2e-pagination-overhead.mjs --url http://localhost:3100
+node tests/e2e/e2e-pagination-overhead.mjs --url http://localhost:3100 --results-dir docs/test-results
 ```
 
 **Expected output:** 6 groups pass (Setup, A-E). Exit code 0. Measurements logged for regression tracking.
@@ -211,7 +211,7 @@ node tools/e2e-pagination-overhead.mjs --url http://localhost:3100 --results-dir
 
 ### e2e-save-unload-lazy.mjs
 
-**File:** `tools/e2e-save-unload-lazy.mjs`
+**File:** `tests/e2e/e2e-save-unload-lazy.mjs`
 
 **What it tests:** The save-snapshot lifecycle end-to-end: bitmap snapshot save via the `/api/indexes/{name}/save` endpoint, query correctness before and after snapshot, mutation survival after snapshot, and stats integrity throughout. Validates that save_and_unload() preserves query behavior and that the lazy reload path works correctly after unloading.
 
@@ -230,8 +230,8 @@ node tools/e2e-pagination-overhead.mjs --url http://localhost:3100 --results-dir
 
 **How to run:**
 ```bash
-node tools/e2e-save-unload-lazy.mjs --url http://localhost:3100
-node tools/e2e-save-unload-lazy.mjs --url http://localhost:3100 --results-dir docs/test-results
+node tests/e2e/e2e-save-unload-lazy.mjs --url http://localhost:3100
+node tests/e2e/e2e-save-unload-lazy.mjs --url http://localhost:3100 --results-dir docs/test-results
 ```
 
 **Expected output:** 5 groups pass (Setup + A-D). Exit code 0.
@@ -407,7 +407,7 @@ cargo test --release --test bench_hashmap_keys -- --nocapture
 
 ```bash
 # Automated: starts server, runs tests, cleans up
-node tools/run-e2e.mjs
+node tests/e2e/run-e2e.mjs
 ```
 
 ### All Rust Tests
@@ -437,11 +437,11 @@ cargo test --release --test bench_hashmap_keys -- --nocapture
 cargo run --release --features server --bin server -- --port 3000
 
 # 2. Wait for data to load, then run unified cache tests
-node tools/e2e-unified-cache.mjs --url http://localhost:3000
+node tests/e2e/e2e-unified-cache.mjs --url http://localhost:3000
 
 # 3. Run self-contained E2E tests against the same server
-node tools/e2e-write-handling.mjs --url http://localhost:3000
-node tools/e2e-eviction.mjs --url http://localhost:3000
+node tests/e2e/e2e-write-handling.mjs --url http://localhost:3000
+node tests/e2e/e2e-eviction.mjs --url http://localhost:3000
 ```
 
 ### JSON Results
@@ -449,12 +449,12 @@ node tools/e2e-eviction.mjs --url http://localhost:3000
 All E2E tests support `--results-dir <dir>`. When provided, each test writes a structured JSON file:
 
 ```bash
-node tools/e2e-write-handling.mjs --results-dir docs/test-results
-node tools/e2e-eviction.mjs --results-dir docs/test-results
-node tools/e2e-unified-cache.mjs --results-dir docs/test-results
+node tests/e2e/e2e-write-handling.mjs --results-dir docs/test-results
+node tests/e2e/e2e-eviction.mjs --results-dir docs/test-results
+node tests/e2e/e2e-unified-cache.mjs --results-dir docs/test-results
 ```
 
-The automated runner (`tools/run-e2e.mjs`) writes a combined results file to `docs/test-results/e2e-{timestamp}.json`.
+The automated runner (`tests/e2e/run-e2e.mjs`) writes a combined results file to `docs/test-results/e2e-{timestamp}.json`.
 
 ---
 
@@ -527,7 +527,7 @@ Prioritized list of missing E2E test scenarios identified via codebase analysis 
 
 Based on the gaps above, the following new test files would close the most critical gaps:
 
-1. **`tools/e2e-query-operators.mjs`** — Gaps 1-7: All filter operators (NotEq, NotIn, Not, Or, Range), offset pagination, sort direction + offset interaction
-2. **`tools/e2e-persistence.mjs`** — Gaps 8-12: Full restart cycle, cursor persistence, include_docs after restore, index lifecycle, loading mode
-3. **`tools/e2e-error-handling.mjs`** — Gaps 13-20: Invalid input, unknown index, empty index, single doc, max page size, slot recycling, type mismatches
-4. **`tools/e2e-metrics.mjs`** — Gaps 23, 27: Prometheus counter accuracy, lazy loading metrics
+1. **`tests/e2e/e2e-query-operators.mjs`** — Gaps 1-7: All filter operators (NotEq, NotIn, Not, Or, Range), offset pagination, sort direction + offset interaction
+2. **`tests/e2e/e2e-persistence.mjs`** — Gaps 8-12: Full restart cycle, cursor persistence, include_docs after restore, index lifecycle, loading mode
+3. **`tests/e2e/e2e-error-handling.mjs`** — Gaps 13-20: Invalid input, unknown index, empty index, single doc, max page size, slot recycling, type mismatches
+4. **`tests/e2e/e2e-metrics.mjs`** — Gaps 23, 27: Prometheus counter accuracy, lazy loading metrics

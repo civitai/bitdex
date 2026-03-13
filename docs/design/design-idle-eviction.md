@@ -182,7 +182,7 @@ Already works. When a query references `tagIds=42` and value 42 has been evicted
 
 No changes needed to the lazy loading path. Eviction makes the value "pending" again naturally.
 
-> **Measured reload latency (2026-03-12, 105M Civitai dataset):** Tags that exist in the index: **4.7ms cold → 21μs warm** (subsequent queries). Popular tags: **11μs** steady state. Eviction + reload is viable for all existing tag values. See `tools/measure-reload.mjs`.
+> **Measured reload latency (2026-03-12, 105M Civitai dataset):** Tags that exist in the index: **4.7ms cold → 21μs warm** (subsequent queries). Popular tags: **11μs** steady state. Eviction + reload is viable for all existing tag values. See `measure-reload.mjs` (removed).
 >
 > **Finding:** Zero-result tag queries (nonexistent tag IDs) are consistently 30-50ms and never speed up, even warm. Root cause: no negative cache in per-value lazy loading — `ensure_fields_loaded()` opens `.fpack` from disk every time for nonexistent values. **Solution: Positive Existence Set** — see dedicated section below.
 
@@ -343,8 +343,8 @@ Three assumptions were tested before implementation. Test files are checked in.
 | Clone cost at 31K entries (tagIds) | `tests/eviction_clone_bench.rs` | 963μs p50 | **BORDERLINE** — must move stamps outside FilterField |
 | Clone cost at 553K entries (userId) | `tests/eviction_clone_bench.rs` | 38ms p50 | **FAIL** — rules out stamps inside FilterField |
 | Eviction sweep cost at 31K | `tests/eviction_clone_bench.rs` | 44-73μs | **PASS** |
-| Single-value reload latency | `tools/measure-reload.mjs` | 4.7ms cold → 21μs warm | **PASS** — eviction+reload viable |
-| Zero-result tag queries | `tools/measure-reload.mjs` | 30-50ms, never caches | **FINDING** — separate optimization needed |
+| Single-value reload latency | `measure-reload.mjs` (removed) | 4.7ms cold → 21μs warm | **PASS** — eviction+reload viable |
+| Zero-result tag queries | `measure-reload.mjs` (removed) | 30-50ms, never caches | **FINDING** — separate optimization needed |
 
 **Key design change driven by benchmarks:** `last_touched` stamps moved from `FilterField` (cloned every snapshot publish) to a shared `DashMap` on `ConcurrentEngine` (never cloned). See revised "Access tracking" section.
 
@@ -441,7 +441,7 @@ The concern raised in "AtomicU64 stamp gap after eviction + reload" was tested w
 
 ### Problem
 
-The `tools/measure-reload.mjs` investigation found that queries for **nonexistent** tag IDs cost 30-50ms each and never improve — `ensure_fields_loaded()` opens the `.fpack` file from disk, finds nothing, and remembers nothing. The workload has 379 such queries (15% of all tag queries). This is orthogonal to eviction but compounds with it: evicted values reload in 4.7ms, but nonexistent values waste 30-50ms every time.
+The `measure-reload.mjs` (removed) investigation found that queries for **nonexistent** tag IDs cost 30-50ms each and never improve — `ensure_fields_loaded()` opens the `.fpack` file from disk, finds nothing, and remembers nothing. The workload has 379 such queries (15% of all tag queries). This is orthogonal to eviction but compounds with it: evicted values reload in 4.7ms, but nonexistent values waste 30-50ms every time.
 
 ### Recommendation: In-Memory Key Dictionary (not a negative cache)
 

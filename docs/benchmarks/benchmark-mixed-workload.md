@@ -7,7 +7,7 @@
 
 ## Configuration
 
-- **Workload config**: `tools/workload.json`
+- **Workload config**: `tests/loadtest/workload.json`
 - **Requests**: 5,000 (+ 200 warmup)
 - **Concurrency**: 8 workers
 - **Write mix**: 3% upsert, 1% delete

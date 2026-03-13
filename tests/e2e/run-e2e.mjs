@@ -6,7 +6,7 @@
  * structured JSON results, and cleans up.
  *
  * Usage:
- *   node tools/run-e2e.mjs [--port 3100] [--skip-build] [--keep] [--verbose]
+ *   node tests/e2e/run-e2e.mjs [--port 3100] [--skip-build] [--keep] [--verbose]
  *
  * Suites run:
  *   - e2e-write-handling.mjs  (self-contained)
@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const PROJECT_ROOT = resolve(__dirname, '..');
+const PROJECT_ROOT = resolve(__dirname, '..', '..');
 
 // --- CLI args ---
 
@@ -50,32 +50,32 @@ const SERVER_URL = `http://localhost:${PORT}`;
 const SUITES = [
   {
     name: 'write-handling',
-    file: 'tools/e2e-write-handling.mjs',
+    file: 'tests/e2e/e2e-write-handling.mjs',
     description: 'Write correctness (insert, upsert, delete, concurrent, multi-value)',
   },
   {
     name: 'eviction',
-    file: 'tools/e2e-eviction.mjs',
+    file: 'tests/e2e/e2e-eviction.mjs',
     description: 'Idle eviction lifecycle (load, idle, evict, reload, existence set)',
   },
   {
     name: 'query-operators',
-    file: 'tools/e2e-query-operators.mjs',
+    file: 'tests/e2e/e2e-query-operators.mjs',
     description: 'Query operators (Range Gt/Gte/Lt/Lte, NotEq, combined range+filter)',
   },
   {
     name: 'error-handling',
-    file: 'tools/e2e-error-handling.mjs',
+    file: 'tests/e2e/e2e-error-handling.mjs',
     description: 'Error handling (invalid JSON, unknown index, empty index, slot recycling)',
   },
   {
     name: 'pagination-overhead',
-    file: 'tools/e2e-pagination-overhead.mjs',
+    file: 'tests/e2e/e2e-pagination-overhead.mjs',
     description: 'Pagination & overhead (cursor correctness, cache acceleration, expansion, structural overhead)',
   },
   {
     name: 'save-unload-lazy',
-    file: 'tools/e2e-save-unload-lazy.mjs',
+    file: 'tests/e2e/e2e-save-unload-lazy.mjs',
     description: 'Save-snapshot lifecycle (snapshot save, query correctness, mutation survival, stats)',
   },
 ];
@@ -84,7 +84,7 @@ const SUITES = [
 const MANUAL_SUITES = [
   {
     name: 'unified-cache',
-    file: 'tools/e2e-unified-cache.mjs',
+    file: 'tests/e2e/e2e-unified-cache.mjs',
     description: 'Unified cache: population, pagination, mutation/delete maintenance, min_filter_size',
     note: 'Requires --data-dir with loaded production data',
   },

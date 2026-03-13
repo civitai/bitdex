@@ -14,7 +14,7 @@
  *   9. Clean up (delete test index)
  *
  * Usage:
- *   node tools/e2e-eviction.mjs [--url http://localhost:3000] [--verbose] [--keep]
+ *   node tests/e2e/e2e-eviction.mjs [--url http://localhost:3000] [--verbose] [--keep]
  *
  * Prerequisites:
  *   Server running with NO existing index (or use --keep to skip cleanup):

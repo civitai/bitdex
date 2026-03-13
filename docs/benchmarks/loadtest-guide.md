@@ -9,7 +9,7 @@ cargo run --release --features server --bin server -- --port 3001
 # 2. Run the Rust loadtest against it
 cargo run --release --bin loadtest --features loadtest -- \
   --mode http --url http://localhost:3001 \
-  --workload tools/workload.json \
+  --workload tests/loadtest/workload.json \
   --concurrency 1,4,16,64 --duration 10
 ```
 
@@ -27,7 +27,7 @@ Tests the full stack: HTTP parsing, query execution, serialization, cache.
 cargo run --release --bin loadtest --features loadtest -- \
   --mode http \
   --url http://localhost:3001 \
-  --workload tools/workload.json \
+  --workload tests/loadtest/workload.json \
   --concurrency 1,4,16,64 \
   --duration 10 \
   --warmup 3
@@ -43,7 +43,7 @@ Embeds the engine in-process. Bypasses HTTP entirely — tests pure bitmap query
 cargo run --release --bin loadtest --features loadtest -- \
   --mode direct \
   --data-dir ./data \
-  --workload tools/workload.json \
+  --workload tests/loadtest/workload.json \
   --concurrency 1,4,16,64
 ```
 
@@ -85,7 +85,7 @@ Note: Direct mode creates a fresh engine each run, so the first run includes col
 
 Without `--workload`, the loadtest uses 13 hard-coded Civitai queries (homepage sorts, user lookups, mixed filters). Good for quick regression testing, but too small for realistic cache pressure testing.
 
-### Real-Traffic Workload (`tools/workload.json`)
+### Real-Traffic Workload (`tests/loadtest/workload.json`)
 
 2,516 queries generated from real Civitai traffic data. Format:
 
@@ -117,17 +117,17 @@ Query mix:
 The workload is generated from CSV files containing real Civitai traffic data (24h view counts):
 
 ```bash
-node tools/gen-workload.mjs
-# Output: Generated 2516 queries → tools/workload.json
+node tests/loadtest/gen-workload.mjs
+# Output: Generated 2516 queries → tests/loadtest/workload.json
 ```
 
-Source CSVs in `tools/`:
+Source CSVs (place in `tests/loadtest/` alongside `gen-workload.mjs`):
 - `user_profile_views_24h.csv` — userId, views
 - `model_version_views_24h.csv` — modelVersionId, views
 - `tag_views_24h.csv` — tagId, name, views
 - `model_views_24h.csv` — modelId, views (not currently used in workload)
 
-To update with fresh traffic data, export new CSVs from ClickHouse/analytics and re-run `gen-workload.mjs`.
+To update with fresh traffic data, export new CSVs from ClickHouse/analytics, place in `tests/loadtest/`, and re-run `gen-workload.mjs`.
 
 ## Interpreting Results
 

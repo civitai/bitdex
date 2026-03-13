@@ -195,8 +195,8 @@ Run `/testing` for the full guide. Key points:
 
 - **Before committing**, check which tests cover your changed files. The `/testing` command has a change→test mapping table.
 - **Rust tests** (`cargo test`) for bitmap correctness, property-based testing, and high-throughput benchmarks. Node can't match Rust's throughput for load tests.
-- **Node E2E tests** (`node tools/e2e-*.mjs`) for HTTP API behavior, full write pipeline, and observable client behavior.
-- **Automated runner**: `node tools/run-e2e.mjs` starts a fresh server, runs all self-contained E2E suites, and produces JSON results.
+- **Node E2E tests** (`node tests/e2e/e2e-*.mjs`) for HTTP API behavior, full write pipeline, and observable client behavior.
+- **Automated runner**: `node tests/e2e/run-e2e.mjs` starts a fresh server, runs all self-contained E2E suites, and produces JSON results.
 - **Full docs**: `docs/testing.md` — master reference for all test suites, run commands, and coverage gap analysis.
 
 ---

@@ -11,7 +11,7 @@
  *   C. Range + filter combination with sorted output
  *
  * Usage:
- *   node tools/e2e-query-operators.mjs [--url http://localhost:3000] [--verbose] [--keep]
+ *   node tests/e2e/e2e-query-operators.mjs [--url http://localhost:3000] [--verbose] [--keep]
  *
  * Prerequisites:
  *   Server running with NO existing index (or use --keep to skip cleanup):
