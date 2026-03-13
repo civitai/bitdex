@@ -9,4 +9,5 @@ server_*_stderr.log
 server_*_stdout.log
 server_stderr.log
 server_stdout.log
-.claude/worktrees/**/data/
+.claude/worktrees/
+test-bench-data/
