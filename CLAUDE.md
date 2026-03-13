@@ -29,7 +29,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 7. **Full precision sort layers first.** Do not implement log encoding or reduced bit depths until benchmarks prove it's necessary.
 
-8. **JSON query parser only for V2.** OpenSearch and Meilisearch syntax plugins are future work.
+8. **JSON transport, pluggable query formats.** Three formats: `bitdex` (default, typed JSON), `compact` (MongoDB-style), `meilisearch` (string DSL). All parse to the same `BitdexQuery` via the `QueryParser` trait. Select per-request with `?format=` or set a server default. See `docs/guide/query-formats.md`.
 
 9. **Single process, single node.** No clustering, no replication, no distributed consensus. A Postgres fallback in the API layer handles the (rare) downtime during restarts.
 
@@ -87,7 +87,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 Run `/architecture` for the full guide — design docs, learnings, known gaps, and expectations for updating docs when changing architecture.
 
-Key guides: `docs/guide/api.md` (HTTP API), `docs/guide/config-schema.md` (config), `docs/guide/testing.md` (tests), `docs/guide/bitdex-civitai-schema.md` (Civitai fields).
+Key guides: `docs/guide/api.md` (HTTP API), `docs/guide/query-formats.md` (query syntax), `docs/guide/config-schema.md` (config), `docs/guide/testing.md` (tests), `docs/guide/bitdex-civitai-schema.md` (Civitai fields).
 
 ---
 

@@ -19,11 +19,14 @@ Each design doc has front matter with a status field:
 | `design-unified-cache-persistence.md` | Cache warm-start from disk | APPROVED |
 | `design-rolling-restart-cursors.md` | Named cursors for zero-downtime restarts | IMPLEMENTED (Ph 1-3) |
 | `design-radix-sort-trie.md` | 8-bit radix bucketing for large cache entries | IMPLEMENTED (Ph 1) |
+| `meilisearch-syntax-reference.md` | Meilisearch filter/sort syntax mapping to BitDex | IMPLEMENTED |
+| `query-language-proposals.md` | Query language design proposals and evaluation | IMPLEMENTED (compact) |
 
 ### `guide/` — How to Use Bitdex
 Reference documentation for operators and integrators.
 
 - `api.md` — HTTP API reference (all endpoints, request/response examples)
+- `query-formats.md` — Query format guide (bitdex, compact, meilisearch — syntax, examples, when to use)
 - `config-schema.md` — Configuration schema reference
 - `bitdex-civitai-schema.md` — Civitai dataset field mapping
 - `testing.md` — Test suite guide (Rust tests, E2E tests, benchmarks)

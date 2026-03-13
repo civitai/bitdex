@@ -17,6 +17,8 @@ cargo run --release --features server --bin server -- [OPTIONS]
 | `--port <N>` | `3000` | HTTP listen port |
 | `--data-dir <PATH>` | `./data` | Root directory for index storage (config, docstore, bitmaps) |
 | `--rebuild` | off | Rebuild all bitmap indexes from docstore before serving (see below) |
+| `--default-format <FMT>` | `bitdex` | Default query format: `bitdex`, `compact`, or `meilisearch` |
+| `--log-level <LEVEL>` | `warn` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 
 ### `--rebuild` — Full Bitmap Rebuild on Boot
 
@@ -217,12 +219,14 @@ Loads documents from a newline-delimited JSON file on disk. Runs asynchronously 
 ### Query
 
 ```
-POST /api/indexes/{name}/query
+POST /api/indexes/{name}/query[?format=bitdex|compact|meilisearch]
 ```
 
 Execute a filter + sort query and return ordered document IDs.
 
-**Request body:**
+Three query formats are available — select with the `?format=` query parameter. If omitted, uses the server's default (configurable via `--default-format` or TOML `default_query_format`). See [Query Formats](query-formats.md) for full syntax of all three formats.
+
+**Request body (BitDex format):**
 
 ```json
 {
@@ -876,6 +880,25 @@ GET /api/health
 ```
 
 **Response:** `200 OK` — `"ok"`
+
+---
+
+### List Query Formats
+
+```
+GET /api/formats
+```
+
+Returns the available query formats and the current default.
+
+**Response:** `200 OK`
+
+```json
+{
+  "formats": ["bitdex", "compact", "meilisearch"],
+  "default": "bitdex"
+}
+```
 
 ---
 
