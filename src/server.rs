@@ -404,11 +404,20 @@ fn default_save_snapshot() -> bool {
 /// The BitDex HTTP server. Starts blank and creates indexes via API.
 pub struct BitdexServer {
     data_dir: PathBuf,
+    rebuild: bool,
 }
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+        Self { data_dir, rebuild: false }
+    }
+
+    /// Enable rebuild mode: on startup, delete existing bitmap indexes and
+    /// rebuild all bitmaps from the docstore using the current config.
+    /// Useful for config changes, corruption recovery, or fresh deployments.
+    pub fn with_rebuild(mut self, rebuild: bool) -> Self {
+        self.rebuild = rebuild;
+        self
     }
 
     /// Start the HTTP server. Blocks until the server shuts down.
@@ -425,6 +434,14 @@ impl BitdexServer {
         // Try to restore an existing index from disk
         if let Err(e) = restore_index(&state) {
             eprintln!("Warning: failed to restore index from disk: {e}");
+        }
+
+        // Rebuild mode: delete existing bitmaps and rebuild from docstore
+        if self.rebuild {
+            if let Err(e) = rebuild_on_boot(&state) {
+                eprintln!("FATAL: rebuild failed: {e}");
+                std::process::exit(1);
+            }
         }
 
         let app = Router::new()
@@ -556,6 +573,91 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 
         // Only restore the first index (single-index for now)
         break;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild on boot
+// ---------------------------------------------------------------------------
+
+/// Delete existing bitmap indexes and rebuild all bitmaps from the docstore.
+///
+/// Requires an index to already be restored (config.json + docstore must exist).
+/// Deletes the bitmaps directory, runs `build_all_from_docstore`, then
+/// `save_and_unload` to persist and free memory.
+fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
+    use crate::concurrent_engine::get_rss_bytes;
+
+    let guard = state.index.lock();
+    let idx = guard.as_ref().ok_or("No index found — cannot rebuild without config.json")?;
+
+    let engine = Arc::clone(&idx.engine);
+    let index_name = idx.definition.name.clone();
+    let bitmap_path = state.data_dir.join("indexes").join(&index_name).join("bitmaps");
+    drop(guard);
+
+    eprintln!("\n=== REBUILD MODE ===");
+    eprintln!("Index: {}", index_name);
+
+    // Step 1: Delete existing bitmaps
+    if bitmap_path.exists() {
+        eprintln!("Deleting existing bitmaps at {} ...", bitmap_path.display());
+        std::fs::remove_dir_all(&bitmap_path).map_err(|e| format!("delete bitmaps: {e}"))?;
+        std::fs::create_dir_all(&bitmap_path).map_err(|e| format!("recreate bitmaps dir: {e}"))?;
+        eprintln!("  done");
+    }
+
+    // Step 2: Build all bitmap indexes from docstore
+    let rss_start = get_rss_bytes();
+    eprintln!("Building bitmap indexes from docstore...");
+    eprintln!("  RSS before build: {:.2} GB", rss_start as f64 / 1e9);
+
+    let progress = Arc::new(AtomicU64::new(0));
+    let progress_clone = progress.clone();
+
+    let memory_cb: Box<dyn Fn(u64, f64, u64) + Send + Sync> = Box::new(move |docs, elapsed, rss| {
+        if elapsed > 0.0 {
+            eprintln!("  [{:>6.1}s] {:>10} docs ({:>7.0} docs/s)  RSS={:.2} GB",
+                elapsed, docs, docs as f64 / elapsed, rss as f64 / 1e9);
+        }
+    });
+
+    let (total_docs, build_elapsed) = engine
+        .build_all_from_docstore(progress_clone, Some(memory_cb))
+        .map_err(|e| format!("build_all_from_docstore: {e}"))?;
+
+    let rss_after_build = get_rss_bytes();
+    eprintln!("Build complete: {} docs in {:.1}s ({:.0} docs/s), RSS={:.2} GB",
+        total_docs, build_elapsed, total_docs as f64 / build_elapsed, rss_after_build as f64 / 1e9);
+
+    // Step 3: Persist bitmaps to disk and unload from memory
+    eprintln!("Persisting bitmaps to disk...");
+    let persist_start = std::time::Instant::now();
+
+    engine.save_and_unload().map_err(|e| format!("save_and_unload: {e}"))?;
+
+    let persist_elapsed = persist_start.elapsed().as_secs_f64();
+    let rss_final = get_rss_bytes();
+    let total_elapsed = build_elapsed + persist_elapsed;
+
+    eprintln!("\n=== REBUILD COMPLETE ===");
+    eprintln!("  Docs:          {}", total_docs);
+    eprintln!("  Build:         {:.1}s", build_elapsed);
+    eprintln!("  Persist:       {:.1}s", persist_elapsed);
+    eprintln!("  Total:         {:.1}s ({:.1} min)", total_elapsed, total_elapsed / 60.0);
+    eprintln!("  RSS final:     {:.2} GB", rss_final as f64 / 1e9);
+    eprintln!("Server will now start with lazy bitmap loading.\n");
+
+    // Update load status so the API reflects the rebuild
+    let guard = state.index.lock();
+    if let Some(idx) = guard.as_ref() {
+        idx.load_progress.store(total_docs, Ordering::Release);
+        *idx.load_status.lock() = LoadStatus::Complete {
+            records_loaded: total_docs,
+            elapsed_secs: total_elapsed,
+        };
     }
 
     Ok(())

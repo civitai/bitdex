@@ -150,6 +150,28 @@ Source: `docs/benchmarks/benchmark-mixed-workload.md`.
 | Upsert | 43ms | 134ms | Includes HTTP round-trip. p95=492ms |
 | Delete | 27ms | 50ms | Includes HTTP round-trip. p95=162ms |
 
+### Rebuild from Docstore (105.3M, channel-based merge)
+
+Source: `rebuild_bench --full` runs on Justin's dev machine (Mar 13, 2026).
+
+Rebuilds all bitmap indexes (18 filter + 5 sort fields) from the on-disk docstore using packed decode + channel-based merge (rayon workers → bounded channel → single merge thread).
+
+| Phase | Time | Rate | Peak RSS | Notes |
+|---|---|---|---|---|
+| Build (read + merge) | 98-120s | 876K-1.1M docs/s | 20-21 GB | Varies with system load |
+| Persist (save_and_unload) | 37-49s | — | +0-2 GB during write | Zero-copy via fused_cow() |
+| **Total (build + persist)** | **149-159s (~2.5 min)** | **662K-706K docs/s e2e** | **20-22 GB peak** | |
+| Disk footprint | — | — | 8 GB | 7.2 GB filter + 866 MB sort + 15 MB system |
+
+Usage:
+```bash
+# Benchmark binary (measures each phase separately)
+cargo run --release --bin rebuild_bench -- --data-dir ./data --index civitai --full
+
+# Server with --rebuild flag (same pipeline, starts serving after)
+cargo run --release --features server --bin server -- --rebuild --port 3001 --data-dir ./data
+```
+
 ---
 
 ## 4. Cache Performance
@@ -244,6 +266,8 @@ These are guidelines, not hard gates. Hardware, OS, background load, and session
 | **Fused pipeline rate** | 320-365K/s sustained | <225K/s (-30%) | Full pipeline including docstore |
 | **Upsert under load p50** | 43ms | >100ms (>2x) | 8 concurrent workers |
 | **Delete under load p50** | 27ms | >60ms (>2x) | 8 concurrent workers |
+| **Rebuild from docstore (105M)** | 149-159s total | >240s (+60%) | Build + persist; system-load-sensitive |
+| **Rebuild peak RSS (105M)** | 20-22 GB | >30 GB (+40%) | Channel merge bounds memory |
 
 ### How to Use These Thresholds
 

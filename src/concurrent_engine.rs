@@ -71,6 +71,60 @@ enum FlushCommand {
     },
 }
 
+// ---------------------------------------------------------------------------
+// RSS memory tracking (cross-platform)
+// ---------------------------------------------------------------------------
+
+pub fn get_rss_bytes() -> u64 {
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::MaybeUninit;
+        #[repr(C)]
+        #[allow(non_snake_case)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+        }
+        #[link(name = "psapi")]
+        extern "system" {
+            fn GetProcessMemoryInfo(process: isize, ppsmemCounters: *mut ProcessMemoryCounters, cb: u32) -> i32;
+        }
+        unsafe {
+            let process = GetCurrentProcess();
+            let mut pmc: MaybeUninit<ProcessMemoryCounters> = MaybeUninit::zeroed();
+            if GetProcessMemoryInfo(process, pmc.as_mut_ptr(), std::mem::size_of::<ProcessMemoryCounters>() as u32) != 0 {
+                (*pmc.as_ptr()).working_set_size as u64
+            } else {
+                0
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(rss_pages) = statm.split_whitespace().nth(1) {
+                if let Ok(pages) = rss_pages.parse::<u64>() {
+                    return pages * 4096;
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    { 0 }
+}
+
 /// Lazy-load request sent from query threads to the flush thread.
 /// Used during startup restore to load bitmaps on demand per field.
 enum LazyLoad {
@@ -3340,6 +3394,285 @@ impl ConcurrentEngine {
             t3.as_secs_f64());
 
         total_count
+    }
+
+    /// Build all bitmap indexes from the docstore.
+    ///
+    /// Designed for "build index" boot mode: starts from bare docs on disk,
+    /// constructs alive bitmap + all filter + all sort bitmaps from scratch.
+    /// Uses the packed decode path (skips StoredDoc allocation) for speed.
+    ///
+    /// Progress callback receives (docs_processed, elapsed_secs, rss_bytes)
+    /// at regular intervals for monitoring.
+    ///
+    /// Returns (docs_processed, elapsed_secs) on success.
+    pub fn build_all_from_docstore(
+        &self,
+        progress: Arc<AtomicU64>,
+        memory_cb: Option<Box<dyn Fn(u64, f64, u64) + Send + Sync>>,
+    ) -> Result<(u64, f64)> {
+        use crate::docstore::PackedValue;
+
+        let t0 = Instant::now();
+
+        let sort_configs = self.config.sort_fields.clone();
+        let filter_configs = self.config.filter_fields.clone();
+
+        let sort_names: Vec<&str> = sort_configs.iter().map(|c| c.name.as_str()).collect();
+        let sort_bits: Vec<usize> = sort_configs.iter().map(|c| c.bits as usize).collect();
+        let filter_names: Vec<&str> = filter_configs.iter().map(|c| c.name.as_str()).collect();
+
+        eprintln!("build_all: {} filter fields, {} sort fields",
+            filter_names.len(), sort_names.len());
+
+        // Open a read-only DocStore for parallel reads
+        let ds_path = self.docstore.lock().path().to_path_buf();
+        let reader = DocStore::open(&ds_path)
+            .map_err(|e| crate::error::BitdexError::DocStore(
+                format!("open reader docstore: {e}")))?;
+
+        // Build u16 field dictionary → field position lookup tables
+        let field_dict = reader.field_to_idx();
+        let mut filter_idx_map: HashMap<u16, usize> = HashMap::new();
+        let mut sort_idx_map: HashMap<u16, (usize, usize)> = HashMap::new();
+
+        for (fi, &fname) in filter_names.iter().enumerate() {
+            if let Some(&idx) = field_dict.get(fname) {
+                filter_idx_map.insert(idx, fi);
+            }
+        }
+        for (si, &sname) in sort_names.iter().enumerate() {
+            if let Some(&idx) = field_dict.get(sname) {
+                sort_idx_map.insert(idx, (si, sort_bits[si]));
+            }
+        }
+
+        eprintln!("build_all: filter fields mapped: {}/{}, sort fields mapped: {}/{}",
+            filter_idx_map.len(), filter_names.len(),
+            sort_idx_map.len(), sort_names.len());
+
+        // Discover max shard by scanning docstore directory
+        let shards_dir = ds_path.join("shards");
+        let mut max_shard_id = 0u32;
+        if let Ok(entries) = std::fs::read_dir(&shards_dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
+                        for sub in sub_entries.flatten() {
+                            if let Some(stem) = sub.path().file_stem() {
+                                if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
+                                    max_shard_id = max_shard_id.max(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let num_shards = max_shard_id + 1;
+        eprintln!("build_all: {} shards to scan", num_shards);
+
+        // Start memory monitoring thread
+        let monitor_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let monitor_progress = progress.clone();
+        let monitor_active_clone = monitor_active.clone();
+        let monitor_handle = if memory_cb.is_some() {
+            let cb = memory_cb.unwrap();
+            let t0_clone = t0;
+            Some(std::thread::spawn(move || {
+                while monitor_active_clone.load(Ordering::Relaxed) {
+                    let docs = monitor_progress.load(Ordering::Relaxed);
+                    let elapsed = t0_clone.elapsed().as_secs_f64();
+                    let rss = get_rss_bytes();
+                    cb(docs, elapsed, rss);
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Channel-based merge: rayon workers send chunk results to a single
+        // merge thread. This bounds peak memory to ~1 final accumulator + 1
+        // in-flight chunk, instead of 32 thread accumulators during tree reduce.
+        type FilterMap = HashMap<(usize, u64), RoaringBitmap>;
+        struct ChunkResult {
+            sort_layers: Vec<Vec<RoaringBitmap>>,
+            filter_map: FilterMap,
+            alive: RoaringBitmap,
+            count: u64,
+        }
+
+        let chunk_size = 500u32;
+        let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
+
+        // Bounded channel — backpressure if merge thread falls behind
+        let (tx, rx) = crossbeam_channel::bounded::<ChunkResult>(4);
+
+        // Merge thread: accumulates into staging directly
+        let sort_bits_clone = sort_bits.clone();
+        let filter_configs_clone = filter_configs.clone();
+        let sort_configs_clone = sort_configs.clone();
+        let inner_clone = self.inner.clone();
+        let progress_merge = progress.clone();
+
+        let merge_handle = thread::spawn(move || {
+            let mut staging = {
+                let snap = inner_clone.load_full();
+                (*snap).clone()
+            };
+
+            // Pre-clear all fields for fresh build
+            for fc in &filter_configs_clone {
+                staging.filters.add_field(fc.clone());
+            }
+            for sc in &sort_configs_clone {
+                staging.sorts.add_field(sc.clone());
+            }
+
+            let mut total_merged = 0u64;
+
+            while let Ok(chunk) = rx.recv() {
+                // Merge alive
+                staging.slots.alive_or_bitmap(&chunk.alive);
+
+                // Merge filter bitmaps directly into staging fields
+                for ((fi, value), bitmap) in chunk.filter_map {
+                    let fname = &filter_configs_clone[fi].name;
+                    if let Some(field) = staging.filters.get_field_mut(fname) {
+                        field.or_bitmap(value, &bitmap);
+                    }
+                }
+
+                // Merge sort layers directly into staging fields
+                for (si, layers) in chunk.sort_layers.into_iter().enumerate() {
+                    let sname = &sort_configs_clone[si].name;
+                    if let Some(field) = staging.sorts.get_field_mut(sname) {
+                        for (bit, bitmap) in layers.into_iter().enumerate() {
+                            if !bitmap.is_empty() {
+                                field.or_layer(bit, &bitmap);
+                            }
+                        }
+                    }
+                }
+
+                total_merged += chunk.count;
+            }
+
+            (staging, total_merged)
+        });
+
+        // Rayon workers: process chunks, send results over channel
+        (0..num_chunks)
+            .into_par_iter()
+            .for_each_with(tx, |tx, chunk_idx| {
+                let shard_start = chunk_idx * chunk_size;
+                let shard_end = std::cmp::min(shard_start + chunk_size, num_shards);
+
+                let mut sort_layers: Vec<Vec<RoaringBitmap>> = sort_bits.iter().map(|&b| {
+                    (0..b).map(|_| RoaringBitmap::new()).collect()
+                }).collect();
+                let mut filter_map: FilterMap = FilterMap::new();
+                let mut alive = RoaringBitmap::new();
+                let mut count = 0u64;
+
+                for shard_id in shard_start..shard_end {
+                    let packed_docs = match reader.get_shard_packed(shard_id) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+
+                    for (slot_id, pairs) in &packed_docs {
+                        alive.insert(*slot_id);
+
+                        for (field_idx, pv) in pairs {
+                            if let Some(&fi) = filter_idx_map.get(field_idx) {
+                                match pv {
+                                    PackedValue::I(v) => {
+                                        filter_map
+                                            .entry((fi, *v as u64))
+                                            .or_insert_with(RoaringBitmap::new)
+                                            .insert(*slot_id);
+                                    }
+                                    PackedValue::B(b) => {
+                                        filter_map
+                                            .entry((fi, if *b { 1 } else { 0 }))
+                                            .or_insert_with(RoaringBitmap::new)
+                                            .insert(*slot_id);
+                                    }
+                                    PackedValue::Mi(vals) => {
+                                        for v in vals {
+                                            filter_map
+                                                .entry((fi, *v as u64))
+                                                .or_insert_with(RoaringBitmap::new)
+                                                .insert(*slot_id);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            if let Some(&(si, bits)) = sort_idx_map.get(field_idx) {
+                                if let PackedValue::I(v) = pv {
+                                    let value = (*v).max(0) as u32;
+                                    for bit in 0..bits {
+                                        if (value >> bit) & 1 == 1 {
+                                            sort_layers[si][bit].insert(*slot_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        count += 1;
+                    }
+                }
+
+                progress.fetch_add(count, Ordering::Relaxed);
+
+                // Send chunk to merge thread (blocks if channel full = backpressure)
+                let _ = tx.send(ChunkResult {
+                    sort_layers,
+                    filter_map,
+                    alive,
+                    count,
+                });
+            });
+
+        // Wait for merge thread to finish
+        let (staging, total_merged) = merge_handle.join()
+            .expect("merge thread panicked");
+
+        let read_elapsed = t0.elapsed().as_secs_f64();
+        let total_docs = progress.load(Ordering::Relaxed);
+        eprintln!("build_all: read+merge phase complete in {:.1}s ({} docs, {:.0} docs/s)",
+            read_elapsed, total_docs, total_docs as f64 / read_elapsed);
+
+        // Publish the fully built staging
+        self.publish_staging(staging);
+
+        // Clear all pending loads (everything is now loaded)
+        {
+            let mut pending = self.pending_filter_loads.lock();
+            pending.clear();
+        }
+        {
+            let mut pending = self.pending_sort_loads.lock();
+            pending.clear();
+        }
+
+        // Stop memory monitor
+        monitor_active.store(false, Ordering::Relaxed);
+        if let Some(handle) = monitor_handle {
+            handle.join().ok();
+        }
+
+        let total_elapsed = t0.elapsed().as_secs_f64();
+        let rss = get_rss_bytes();
+        eprintln!("build_all: complete in {:.1}s — {} docs, RSS={:.2} GB",
+            total_elapsed, total_docs, rss as f64 / 1e9);
+
+        Ok((total_docs, total_elapsed))
     }
 
     /// Rebuild sort and/or filter bitmaps from the docstore.

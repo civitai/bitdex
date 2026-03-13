@@ -160,6 +160,7 @@ Custom filesystem storage: BitmapFs for bitmap persistence (hex-bucketed pack fi
 - HTTP server with index management, query, upsert, delete endpoints — COMPLETE
 - Web UI with infinite scroll image grid — COMPLETE
 - Grafana dashboard — COMPLETE
+- Rebuild from docstore (`--rebuild` flag) — COMPLETE: deletes existing bitmaps, rebuilds all indexes from docstore using current config, persists via `save_and_unload()`, then starts serving. Benchmark binary: `rebuild_bench --full`
 - Autovac, admin API, graceful shutdown — NOT yet started
 
 ### Phase 5: Integration — IN PROGRESS

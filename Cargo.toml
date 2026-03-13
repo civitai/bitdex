@@ -134,3 +134,7 @@ required-features = ["loadtest"]
 name = "bitdex-pg-sync"
 path = "src/bin/pg_sync.rs"
 required-features = ["pg-sync"]
+
+[[bin]]
+name = "rebuild_bench"
+path = "src/bin/rebuild_bench.rs"

@@ -401,6 +401,37 @@ cargo test --release --test bench_hashmap_keys -- --nocapture
 
 ---
 
+### rebuild_bench (Full-Scale Rebuild)
+
+**File:** `src/bin/rebuild_bench.rs`
+
+**What it measures:** End-to-end rebuild of all bitmap indexes from the on-disk docstore. Includes 7 microbenchmark stages (raw I/O, decode, per-field rebuild, CPU vs I/O split, packed vs StoredDoc) plus a `--full` mode that exercises the production `build_all_from_docstore()` + `save_and_unload()` pipeline.
+
+**Requires:** Production data in `data/indexes/<name>/docs/` (docstore shards).
+
+**How to run:**
+```bash
+# Microbenchmark stages (first N shards for quick iteration)
+cargo run --release --bin rebuild_bench -- --data-dir ./data --index civitai --shards 1000
+
+# Full-scale build + persist (105M records, ~2.5 min)
+cargo run --release --bin rebuild_bench -- --data-dir ./data --index civitai --full
+```
+
+**Stages:**
+| Stage | What it measures |
+|-------|-----------------|
+| 1. Raw I/O | Disk read + zstd decompression throughput |
+| 2. Decode | StoredDoc (HashMap) decode cost |
+| 3. Full rebuild | All filter + sort fields via StoredDoc path |
+| 4. Single field | Per-field rebuild cost in isolation |
+| 5. Split-phase | CPU vs I/O split (pre-read into memory, then bitmap ops) |
+| 6. Selective decode | HashMap::get cost for target fields only |
+| 7. Packed rebuild | All fields via packed decode (skip StoredDoc) |
+| --full | Engine-level build_all_from_docstore + save_and_unload |
+
+---
+
 ## Running Everything
 
 ### Quick: Self-Contained E2E Tests (No Production Data)

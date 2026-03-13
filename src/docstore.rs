@@ -601,6 +601,54 @@ impl DocStore {
         Ok(out)
     }
 
+    /// Read a shard and return raw (slot_id, packed_pairs) without full StoredDoc decode.
+    /// Each entry is the raw `Vec<(u16, PackedValue)>` — caller uses field dictionary
+    /// indices directly, avoiding HashMap + String allocations.
+    pub fn get_shard_packed(&self, shard_id: u32) -> Result<Vec<(u32, Vec<(u16, PackedValue)>)>> {
+        if self.in_memory {
+            let start = shard_id << SHARD_SHIFT;
+            let end = start + (1 << SHARD_SHIFT);
+            let mut out = Vec::new();
+            for slot in start..end {
+                if let Some(data) = self.memory_store.get(&slot) {
+                    let pairs: Vec<(u16, PackedValue)> = rmp_serde::from_slice(data)
+                        .map_err(|e| BitdexError::DocStore(format!("msgpack decode: {e}")))?;
+                    out.push((slot, pairs));
+                }
+            }
+            return Ok(out);
+        }
+        let path = Self::shard_path(&self.root, shard_id);
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
+        };
+        let (entries, decompressed) = Self::read_shard_file(&data)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (slot_id, offset, length) in &entries {
+            let start = *offset as usize;
+            let end = start + *length as usize;
+            if end > decompressed.len() {
+                continue;
+            }
+            let pairs: Vec<(u16, PackedValue)> = rmp_serde::from_slice(&decompressed[start..end])
+                .map_err(|e| BitdexError::DocStore(format!("msgpack decode: {e}")))?;
+            out.push((*slot_id, pairs));
+        }
+        Ok(out)
+    }
+
+    /// Get the field name → u16 dictionary index mapping.
+    pub fn field_to_idx(&self) -> &HashMap<String, u16> {
+        &self.field_to_idx
+    }
+
+    /// Get the u16 → field name mapping.
+    pub fn idx_to_field(&self) -> &[String] {
+        &self.idx_to_field
+    }
+
     /// Store a single document. Reads the existing shard, merges, and rewrites.
     pub fn put(&mut self, id: u32, doc: &StoredDoc) -> Result<()> {
         let raw_bytes = self.encode_doc(doc)?;
@@ -953,7 +1001,7 @@ impl BulkWriter {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-enum PackedValue {
+pub enum PackedValue {
     I(i64),
     F(f64),
     B(bool),

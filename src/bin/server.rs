@@ -20,12 +20,14 @@ use bitdex_v2::server::BitdexServer;
 struct Args {
     port: u16,
     data_dir: PathBuf,
+    rebuild: bool,
 }
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     let mut port: u16 = 3000;
     let mut data_dir = PathBuf::from("./data");
+    let mut rebuild = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -38,6 +40,9 @@ fn parse_args() -> Args {
                 i += 1;
                 data_dir = PathBuf::from(&args[i]);
             }
+            "--rebuild" => {
+                rebuild = true;
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -46,7 +51,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    Args { port, data_dir }
+    Args { port, data_dir, rebuild }
 }
 
 #[tokio::main]
@@ -57,7 +62,13 @@ async fn main() {
     eprintln!("BitDex V2 Server");
     eprintln!("  port: {}", args.port);
     eprintln!("  data-dir: {}", args.data_dir.display());
+    if args.rebuild {
+        eprintln!("  mode: REBUILD (will rebuild all bitmap indexes from docstore)");
+    }
 
-    let server = BitdexServer::new(args.data_dir);
+    let mut server = BitdexServer::new(args.data_dir);
+    if args.rebuild {
+        server = server.with_rebuild(true);
+    }
     server.serve(addr).await.expect("Server failed");
 }
