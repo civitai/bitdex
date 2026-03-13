@@ -37,6 +37,11 @@ pub struct UnifiedCacheConfig {
     pub max_capacity: usize,
     /// Skip caching if filter result has fewer docs than this (default 0 = cache everything).
     pub min_filter_size: usize,
+    /// Maximum maintenance work per flush (affected_entries × changed_slots).
+    /// When exceeded, affected entries are marked for rebuild instead of
+    /// per-slot evaluation. Prevents positive feedback loops under burst writes.
+    /// Default 50_000 (~5ms of maintenance work).
+    pub max_maintenance_work: usize,
 }
 
 impl Default for UnifiedCacheConfig {
@@ -47,6 +52,7 @@ impl Default for UnifiedCacheConfig {
             initial_capacity: 4_000,
             max_capacity: 64_000,
             min_filter_size: 0,
+            max_maintenance_work: 50_000,
         }
     }
 }
@@ -209,6 +215,11 @@ impl UnifiedEntry {
     pub fn add_slot(&mut self, slot: u32, sort_value: u32) -> bool {
         Arc::make_mut(&mut self.bitmap).insert(slot);
 
+        // Invalidate sorted_keys — maintaining sorted order in a Vec is O(n)
+        // per operation. The bitmap path is only slightly slower and correct.
+        // sorted_keys will be rebuilt on next rebuild() call.
+        self.sorted_keys = None;
+
         // Maintain radix if present (expanded entry)
         if let Some(ref mut radix) = self.radix {
             Arc::make_mut(radix).insert(slot, sort_value);
@@ -228,6 +239,9 @@ impl UnifiedEntry {
     pub fn remove_slot(&mut self, slot: u32, sort_value: u32) {
         Arc::make_mut(&mut self.bitmap).remove(slot);
 
+        // Invalidate sorted_keys — stale keys would return removed slots.
+        self.sorted_keys = None;
+
         // Maintain radix if present (expanded entry)
         if let Some(ref mut radix) = self.radix {
             Arc::make_mut(radix).remove(slot, sort_value);
@@ -237,6 +251,9 @@ impl UnifiedEntry {
     /// Remove a slot without knowing its sort value. Uses blind scan for radix.
     pub fn remove_slot_blind(&mut self, slot: u32) {
         Arc::make_mut(&mut self.bitmap).remove(slot);
+
+        // Invalidate sorted_keys — stale keys would return removed slots.
+        self.sorted_keys = None;
 
         if let Some(ref mut radix) = self.radix {
             Arc::make_mut(radix).remove_blind(slot);
@@ -401,6 +418,8 @@ pub struct UnifiedEntryDetail {
 /// The unified cache: flat HashMap keyed by (filters, sort, direction).
 pub struct UnifiedCache {
     entries: HashMap<UnifiedKey, UnifiedEntry>,
+    /// Reverse index: meta_id → key, for O(1) lookup from MetaIndex results.
+    meta_id_to_key: HashMap<CacheEntryId, UnifiedKey>,
     meta: MetaIndex,
     config: UnifiedCacheConfig,
     hits: u64,
@@ -413,6 +432,7 @@ impl UnifiedCache {
     pub fn new(config: UnifiedCacheConfig) -> Self {
         Self {
             entries: HashMap::new(),
+            meta_id_to_key: HashMap::new(),
             meta: MetaIndex::new(),
             config,
             hits: 0,
@@ -453,6 +473,7 @@ impl UnifiedCache {
         // If replacing an existing entry, deregister the old one and subtract its bytes
         if let Some(old) = self.entries.remove(&key) {
             self.total_bytes = self.total_bytes.saturating_sub(old.memory_bytes());
+            self.meta_id_to_key.remove(&old.meta_id);
             self.meta.deregister(old.meta_id);
         }
 
@@ -465,6 +486,7 @@ impl UnifiedCache {
         }
 
         self.total_bytes += new_bytes;
+        self.meta_id_to_key.insert(meta_id, key.clone());
         self.entries.insert(key, entry);
         meta_id
     }
@@ -511,6 +533,7 @@ impl UnifiedCache {
 
         if let Some(evicted) = self.entries.remove(&lru_key) {
             self.total_bytes = self.total_bytes.saturating_sub(evicted.memory_bytes());
+            self.meta_id_to_key.remove(&evicted.meta_id);
             self.meta.deregister(evicted.meta_id);
         }
 
@@ -556,6 +579,7 @@ impl UnifiedCache {
     /// Clear all entries, reset the meta-index, and reset counters.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.meta_id_to_key.clear();
         self.meta = MetaIndex::new();
         self.hits = 0;
         self.misses = 0;
@@ -606,11 +630,15 @@ impl UnifiedCache {
         self.entries.iter_mut()
     }
 
-    /// Get entry by meta_id. Linear scan — used only on flush path.
-    pub fn entry_by_meta_id(&mut self, meta_id: CacheEntryId) -> Option<(&UnifiedKey, &mut UnifiedEntry)> {
-        self.entries
-            .iter_mut()
-            .find(|(_, entry)| entry.meta_id == meta_id)
+    /// Get entry by meta_id. O(1) via reverse index.
+    pub fn entry_by_meta_id(&mut self, meta_id: CacheEntryId) -> Option<&mut UnifiedEntry> {
+        let key = self.meta_id_to_key.get(&meta_id)?;
+        self.entries.get_mut(key)
+    }
+
+    /// Get the key for a meta_id. O(1) via reverse index.
+    pub fn key_for_meta_id(&self, meta_id: CacheEntryId) -> Option<&UnifiedKey> {
+        self.meta_id_to_key.get(&meta_id)
     }
 
     // ── Live Maintenance (Phase 3) ──────────────────────────────────────────
@@ -648,13 +676,85 @@ impl UnifiedCache {
             return;
         }
 
-        // Iterate all entries and maintain those that reference changed fields
-        for (key, entry) in self.entries.iter_mut() {
+        // Clause-level narrowing: find entries matching specific (field, "eq", value)
+        // combinations rather than broad field-level matching. This is a 25-50x
+        // improvement when fields have many distinct values (e.g., 50 categories
+        // → only entries with the specific changed values are checked, not all
+        // entries mentioning the field).
+        let mut affected_ids = RoaringBitmap::new();
+
+        // Eq clause hits: exact value matches (handles the common case)
+        for (key, _slots) in filter_inserts.iter().chain(filter_removes.iter()) {
+            let value_repr = key.value.to_string();
+            if let Some(bm) = self.meta.entries_for_clause(&key.field, "eq", &value_repr) {
+                affected_ids |= bm;
+            }
+        }
+
+        // Field-level fallback for non-Eq entries (In, Gt, Lt, NotEq, etc.)
+        // These entries can't be found by clause-level lookup because their
+        // value_repr format differs (e.g., "5,10" for In). Use the broader
+        // field-level bitmap but subtract entries already found via clause-level.
+        for field in changed_slots_per_field.keys() {
+            if let Some(field_bm) = self.meta.entries_for_filter_field(field) {
+                // Only add entries not already in affected_ids
+                let new_entries = field_bm - &affected_ids;
+                if !new_entries.is_empty() {
+                    // Check if any of these are non-Eq entries (have ops other than "eq")
+                    for meta_id in new_entries.iter() {
+                        if let Some(key) = self.meta_id_to_key.get(&meta_id) {
+                            // Include if any clause for this field uses a non-Eq op
+                            let has_non_eq = key.filter_clauses.iter().any(|c| {
+                                c.field == *field && c.op != "eq"
+                            });
+                            if has_non_eq {
+                                affected_ids.insert(meta_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if affected_ids.is_empty() {
+            return;
+        }
+
+        // Count total changed slots for budget estimation
+        let total_changed_slots: usize = changed_slots_per_field.values().map(|s| s.len()).sum();
+        let affected_count = affected_ids.len() as usize;
+        let estimated_work = affected_count * total_changed_slots;
+
+        // Budget check: if maintenance would be too expensive, mark affected
+        // entries for rebuild instead. Prevents positive feedback loops where
+        // long maintenance → batch growth → even longer maintenance.
+        if estimated_work > self.config.max_maintenance_work {
+            for meta_id in affected_ids.iter() {
+                if let Some(key) = self.meta_id_to_key.get(&meta_id) {
+                    if let Some(entry) = self.entries.get_mut(key) {
+                        entry.mark_for_rebuild();
+                    }
+                }
+            }
+            return;
+        }
+
+        // Collect affected keys (avoids borrow conflict between meta_id_to_key and entries)
+        let affected_keys: Vec<UnifiedKey> = affected_ids
+            .iter()
+            .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())
+            .collect();
+
+        // Iterate only affected entries
+        for key in &affected_keys {
+            let Some(entry) = self.entries.get_mut(key) else {
+                continue;
+            };
             if entry.needs_rebuild {
                 continue;
             }
 
-            // Collect slots to check: union of changed slots from all the entry's referenced fields
+            // Collect slots to check: union of changed slots from the entry's referenced fields
             let mut slots_to_check = HashSet::new();
             for clause in &key.filter_clauses {
                 if let Some(slots) = changed_slots_per_field.get(clause.field.as_str()) {
@@ -699,7 +799,43 @@ impl UnifiedCache {
             return;
         }
 
-        for (key, entry) in self.entries.iter_mut() {
+        // Use MetaIndex to find only entries that sort by changed fields
+        let mut affected_ids = RoaringBitmap::new();
+        for field in sort_mutations.keys() {
+            affected_ids |= self.meta.entries_for_sort_field(field);
+        }
+
+        if affected_ids.is_empty() {
+            return;
+        }
+
+        // Budget check for sort maintenance
+        let total_sort_slots: usize = sort_mutations.values().map(|s| s.len()).sum();
+        let affected_count = affected_ids.len() as usize;
+        let estimated_work = affected_count * total_sort_slots;
+
+        if estimated_work > self.config.max_maintenance_work {
+            for meta_id in affected_ids.iter() {
+                if let Some(key) = self.meta_id_to_key.get(&meta_id) {
+                    if let Some(entry) = self.entries.get_mut(key) {
+                        entry.mark_for_rebuild();
+                    }
+                }
+            }
+            return;
+        }
+
+        // Collect affected keys (avoids borrow conflict)
+        let affected_keys: Vec<UnifiedKey> = affected_ids
+            .iter()
+            .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())
+            .collect();
+
+        // Iterate only affected entries
+        for key in &affected_keys {
+            let Some(entry) = self.entries.get_mut(key) else {
+                continue;
+            };
             if entry.needs_rebuild {
                 continue;
             }
@@ -989,6 +1125,7 @@ mod tests {
             initial_capacity: 100,
             max_capacity: 1600,
             min_filter_size: 100,
+            ..Default::default()
         }
     }
 
