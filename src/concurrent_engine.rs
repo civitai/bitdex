@@ -740,31 +740,29 @@ impl ConcurrentEngine {
                                 skip_sorts, skip_filters, skip_lazy,
                                 cursors, dictionaries, done,
                             } => {
-                                // Combined exit-loading + save + unload. Saves directly
-                                // from staging (the single copy) without publishing an
-                                // intermediate full snapshot — eliminates the clone spike.
+                                // Combined exit-loading + save + unload.
+                                //
+                                // The NDJSON loader builds bitmaps in its own staging and
+                                // publishes directly to ArcSwap via publish_staging(). The
+                                // flush thread's private staging is therefore empty. We load
+                                // the published snapshot from ArcSwap (just an Arc clone —
+                                // no deep copy) and save from that. Then we build a tiny
+                                // unloaded snapshot and publish it, releasing the full data.
+                                //
+                                // Memory profile: at no point do two full copies exist.
+                                // The Arc<InnerEngine> from load_full() shares bitmaps with
+                                // the published snapshot. After we publish the unloaded
+                                // version, readers drop the old Arc and memory is freed.
                                 eprintln!("  flush: ExitLoadingSaveUnload starting");
 
-                                // 1. Drain all remaining mutations into staging
-                                let extra = coalescer.flush(
-                                    &mut staging.slots,
-                                    &mut staging.filters,
-                                    &mut staging.sorts,
-                                );
-                                if extra > 0 {
-                                    staging_dirty = true;
-                                }
+                                // 1. Load the published snapshot (loader already published here)
+                                let published = inner.load_full();
 
-                                // 2. Compact filter diffs before saving
-                                for (_name, field) in staging.filters.fields_mut() {
-                                    field.merge_dirty();
-                                }
-
-                                // 3. Save directly from staging — no clone, no Arc refcount bump
+                                // 2. Save from the published snapshot — no clone, just a borrow
                                 if let Some(ref store) = flush_bitmap_store {
                                     let save_result = ConcurrentEngine::write_inner_to_store(
                                         store,
-                                        &staging,
+                                        &published,
                                         &flush_config,
                                         &skip_sorts,
                                         &skip_filters,
@@ -795,17 +793,17 @@ impl ConcurrentEngine {
                                     }
                                 }
 
-                                // 4. Build unloaded staging — reuse field configs, clear bitmaps
-                                let slots = staging.slots.clone();
+                                // 3. Build unloaded staging — reuse field configs, clear bitmaps
+                                let slots = published.slots.clone();
                                 let mut new_filters = crate::filter::FilterIndex::new();
                                 for fc in &flush_config.filter_fields {
                                     new_filters.add_field(fc.clone());
                                 }
                                 for fc in &flush_config.filter_fields {
                                     if skip_filters.contains(&fc.name) {
-                                        new_filters.copy_field_arc_from(&staging.filters, &fc.name);
+                                        new_filters.copy_field_arc_from(&published.filters, &fc.name);
                                     } else {
-                                        new_filters.unload_from(&staging.filters, &fc.name);
+                                        new_filters.unload_from(&published.filters, &fc.name);
                                     }
                                 }
                                 let mut new_sorts = crate::sort::SortIndex::new();
@@ -814,11 +812,16 @@ impl ConcurrentEngine {
                                 }
                                 for sc in &flush_config.sort_fields {
                                     if skip_sorts.contains(&sc.name) {
-                                        new_sorts.copy_field_arc_from(&staging.sorts, &sc.name);
+                                        new_sorts.copy_field_arc_from(&published.sorts, &sc.name);
                                     } else {
-                                        new_sorts.unload_from(&staging.sorts, &sc.name);
+                                        new_sorts.unload_from(&published.sorts, &sc.name);
                                     }
                                 }
+
+                                // 4. Drop the published snapshot reference before publishing
+                                //    the unloaded version. This ensures only one full copy
+                                //    exists when readers switch to the unloaded snapshot.
+                                drop(published);
 
                                 // 5. Replace staging and publish the unloaded version
                                 staging = InnerEngine {
