@@ -696,11 +696,14 @@ async function main() {
 
   // Write JSON results
   const resultsDir = resolve(PROJECT_ROOT, 'docs', 'benchmarks', 'results');
-  mkdirSync(resultsDir, { recursive: true });
+  const historyDir = resolve(resultsDir, 'history');
+  mkdirSync(historyDir, { recursive: true });
+  const payload = JSON.stringify({ timestamp: new Date().toISOString(), doc_count: DOC_COUNT, results }, null, 2);
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  const outFile = resolve(resultsDir, `bench-write-path-${ts}.json`);
-  writeFileSync(outFile, JSON.stringify({ timestamp: new Date().toISOString(), doc_count: DOC_COUNT, results }, null, 2));
-  log(`\nResults written to: ${outFile}`);
+  writeFileSync(resolve(historyDir, `bench-write-path-${ts}.json`), payload);
+  const latestFile = resolve(resultsDir, `bench-write-path.json`);
+  writeFileSync(latestFile, payload);
+  log(`\nResults written to: ${latestFile} (+ history)`);
 
   // Cleanup
   await apiDelete(`/api/indexes/${INDEX}`);

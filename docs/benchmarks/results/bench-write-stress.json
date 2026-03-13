@@ -1,0 +1,457 @@
+{
+  "timestamp": "2026-03-13T16:37:48.411Z",
+  "doc_count": 5000,
+  "max_caches": 50000,
+  "results": [
+    {
+      "target_cache_entries": 0,
+      "actual_cache_entries": 0,
+      "cache_bytes": 0,
+      "meta_entries": 0,
+      "meta_bytes": 0,
+      "single_writer": {
+        "ops_per_sec": 305,
+        "latency": {
+          "count": 916,
+          "mean": 3.27,
+          "p50": 2.42,
+          "p95": 8.21,
+          "p99": 10.2,
+          "min": 0.61,
+          "max": 13.54
+        }
+      },
+      "concurrent_writers": {
+        "1": {
+          "ops_per_sec": 327,
+          "latency": {
+            "count": 984,
+            "mean": 3.05,
+            "p50": 2.3,
+            "p95": 7.62,
+            "p99": 9.7,
+            "min": 0.55,
+            "max": 12.24
+          }
+        },
+        "2": {
+          "ops_per_sec": 364,
+          "latency": {
+            "count": 1094,
+            "mean": 5.49,
+            "p50": 4.96,
+            "p95": 10.76,
+            "p99": 14.71,
+            "min": 0.66,
+            "max": 39.57
+          }
+        },
+        "4": {
+          "ops_per_sec": 432,
+          "latency": {
+            "count": 1295,
+            "mean": 9.27,
+            "p50": 9.05,
+            "p95": 16.79,
+            "p99": 23.34,
+            "min": 0.88,
+            "max": 31.35
+          }
+        },
+        "8": {
+          "ops_per_sec": 538,
+          "latency": {
+            "count": 1622,
+            "mean": 14.81,
+            "p50": 13.54,
+            "p95": 25.33,
+            "p99": 44.89,
+            "min": 0.61,
+            "max": 85.46
+          }
+        }
+      },
+      "correctness": "PASS",
+      "memory_after": {
+        "cache_bytes": 936,
+        "meta_bytes": 54,
+        "cache_entries": 1
+      }
+    },
+    {
+      "target_cache_entries": 100,
+      "actual_cache_entries": 101,
+      "cache_bytes": 152988,
+      "meta_entries": 101,
+      "meta_bytes": 2198,
+      "single_writer": {
+        "ops_per_sec": 354,
+        "latency": {
+          "count": 1062,
+          "mean": 2.82,
+          "p50": 2.12,
+          "p95": 7.63,
+          "p99": 9.38,
+          "min": 0.47,
+          "max": 13.21
+        }
+      },
+      "concurrent_writers": {
+        "1": {
+          "ops_per_sec": 346,
+          "latency": {
+            "count": 1043,
+            "mean": 2.89,
+            "p50": 2.17,
+            "p95": 8.08,
+            "p99": 10.15,
+            "min": 0.44,
+            "max": 20.3
+          }
+        },
+        "2": {
+          "ops_per_sec": 344,
+          "latency": {
+            "count": 1037,
+            "mean": 5.81,
+            "p50": 5.26,
+            "p95": 12.37,
+            "p99": 15.41,
+            "min": 0.49,
+            "max": 20.67
+          }
+        },
+        "4": {
+          "ops_per_sec": 431,
+          "latency": {
+            "count": 1297,
+            "mean": 9.27,
+            "p50": 9.18,
+            "p95": 17.42,
+            "p99": 21.91,
+            "min": 0.95,
+            "max": 38.34
+          }
+        },
+        "8": {
+          "ops_per_sec": 529,
+          "latency": {
+            "count": 1707,
+            "mean": 15.11,
+            "p50": 14,
+            "p95": 25.15,
+            "p99": 32.47,
+            "min": 0.87,
+            "max": 276.19
+          }
+        }
+      },
+      "correctness": "PASS",
+      "memory_after": {
+        "cache_bytes": 1236,
+        "meta_bytes": 54,
+        "cache_entries": 1
+      }
+    },
+    {
+      "target_cache_entries": 1000,
+      "actual_cache_entries": 1001,
+      "cache_bytes": 212648,
+      "meta_entries": 1001,
+      "meta_bytes": 11198,
+      "single_writer": {
+        "ops_per_sec": 373,
+        "latency": {
+          "count": 1120,
+          "mean": 2.68,
+          "p50": 0.93,
+          "p95": 8.89,
+          "p99": 12.78,
+          "min": 0.41,
+          "max": 33.01
+        }
+      },
+      "concurrent_writers": {
+        "1": {
+          "ops_per_sec": 347,
+          "latency": {
+            "count": 1043,
+            "mean": 2.88,
+            "p50": 1.54,
+            "p95": 8.67,
+            "p99": 11.61,
+            "min": 0.45,
+            "max": 15.15
+          }
+        },
+        "2": {
+          "ops_per_sec": 413,
+          "latency": {
+            "count": 1238,
+            "mean": 4.85,
+            "p50": 3.99,
+            "p95": 12.34,
+            "p99": 16.17,
+            "min": 0.48,
+            "max": 22.74
+          }
+        },
+        "4": {
+          "ops_per_sec": 463,
+          "latency": {
+            "count": 1392,
+            "mean": 8.64,
+            "p50": 8.65,
+            "p95": 17.54,
+            "p99": 22.86,
+            "min": 0.95,
+            "max": 29.96
+          }
+        },
+        "8": {
+          "ops_per_sec": 585,
+          "latency": {
+            "count": 1759,
+            "mean": 13.67,
+            "p50": 13.84,
+            "p95": 25.1,
+            "p99": 30.96,
+            "min": 0.97,
+            "max": 46.59
+          }
+        }
+      },
+      "correctness": "PASS",
+      "memory_after": {
+        "cache_bytes": 1096,
+        "meta_bytes": 54,
+        "cache_entries": 1
+      }
+    },
+    {
+      "target_cache_entries": 5000,
+      "actual_cache_entries": 5001,
+      "cache_bytes": 365338,
+      "meta_entries": 5001,
+      "meta_bytes": 60308,
+      "single_writer": {
+        "ops_per_sec": 528,
+        "latency": {
+          "count": 1584,
+          "mean": 1.89,
+          "p50": 0.6,
+          "p95": 11.44,
+          "p99": 16.04,
+          "min": 0.42,
+          "max": 25.85
+        }
+      },
+      "concurrent_writers": {
+        "1": {
+          "ops_per_sec": 486,
+          "latency": {
+            "count": 1461,
+            "mean": 2.05,
+            "p50": 0.63,
+            "p95": 11.58,
+            "p99": 16.01,
+            "min": 0.42,
+            "max": 22.23
+          }
+        },
+        "2": {
+          "ops_per_sec": 657,
+          "latency": {
+            "count": 1972,
+            "mean": 3.04,
+            "p50": 0.74,
+            "p95": 16.11,
+            "p99": 20.06,
+            "min": 0.46,
+            "max": 32.32
+          }
+        },
+        "4": {
+          "ops_per_sec": 748,
+          "latency": {
+            "count": 2244,
+            "mean": 5.35,
+            "p50": 1.46,
+            "p95": 18.58,
+            "p99": 22.13,
+            "min": 0.63,
+            "max": 24.98
+          }
+        },
+        "8": {
+          "ops_per_sec": 851,
+          "latency": {
+            "count": 2558,
+            "mean": 9.4,
+            "p50": 4.07,
+            "p95": 22.51,
+            "p99": 26.37,
+            "min": 0.97,
+            "max": 35.96
+          }
+        }
+      },
+      "correctness": "PASS",
+      "memory_after": {
+        "cache_bytes": 916,
+        "meta_bytes": 54,
+        "cache_entries": 1
+      }
+    },
+    {
+      "target_cache_entries": 10000,
+      "actual_cache_entries": 10001,
+      "cache_bytes": 420254,
+      "meta_entries": 10001,
+      "meta_bytes": 100972,
+      "single_writer": {
+        "ops_per_sec": 699,
+        "latency": {
+          "count": 2102,
+          "mean": 1.43,
+          "p50": 0.54,
+          "p95": 4.37,
+          "p99": 19.36,
+          "min": 0.41,
+          "max": 34.36
+        }
+      },
+      "concurrent_writers": {
+        "1": {
+          "ops_per_sec": 714,
+          "latency": {
+            "count": 2145,
+            "mean": 1.4,
+            "p50": 0.53,
+            "p95": 4.15,
+            "p99": 19.67,
+            "min": 0.4,
+            "max": 31.55
+          }
+        },
+        "2": {
+          "ops_per_sec": 1205,
+          "latency": {
+            "count": 3616,
+            "mean": 1.66,
+            "p50": 0.65,
+            "p95": 8.16,
+            "p99": 20.72,
+            "min": 0.43,
+            "max": 26.52
+          }
+        },
+        "4": {
+          "ops_per_sec": 1310,
+          "latency": {
+            "count": 3930,
+            "mean": 3.05,
+            "p50": 1.3,
+            "p95": 18.49,
+            "p99": 24.28,
+            "min": 0.68,
+            "max": 29.37
+          }
+        },
+        "8": {
+          "ops_per_sec": 1388,
+          "latency": {
+            "count": 4169,
+            "mean": 5.76,
+            "p50": 2.69,
+            "p95": 21.82,
+            "p99": 25.21,
+            "min": 1.04,
+            "max": 29.2
+          }
+        }
+      },
+      "correctness": "PASS",
+      "memory_after": {
+        "cache_bytes": 906,
+        "meta_bytes": 54,
+        "cache_entries": 1
+      }
+    },
+    {
+      "target_cache_entries": 50000,
+      "actual_cache_entries": 50000,
+      "cache_bytes": 842448,
+      "meta_entries": 50000,
+      "meta_bytes": 392764,
+      "single_writer": {
+        "ops_per_sec": 1451,
+        "latency": {
+          "count": 4355,
+          "mean": 0.69,
+          "p50": 0.51,
+          "p95": 0.79,
+          "p99": 3.15,
+          "min": 0.39,
+          "max": 28.18
+        }
+      },
+      "concurrent_writers": {
+        "1": {
+          "ops_per_sec": 1482,
+          "latency": {
+            "count": 4445,
+            "mean": 0.67,
+            "p50": 0.5,
+            "p95": 0.78,
+            "p99": 3.16,
+            "min": 0.38,
+            "max": 26.96
+          }
+        },
+        "2": {
+          "ops_per_sec": 2378,
+          "latency": {
+            "count": 7134,
+            "mean": 0.84,
+            "p50": 0.63,
+            "p95": 1,
+            "p99": 4.11,
+            "min": 0.42,
+            "max": 26.34
+          }
+        },
+        "4": {
+          "ops_per_sec": 2527,
+          "latency": {
+            "count": 7626,
+            "mean": 1.58,
+            "p50": 1.19,
+            "p95": 2.6,
+            "p99": 18.4,
+            "min": 0.64,
+            "max": 28.15
+          }
+        },
+        "8": {
+          "ops_per_sec": 2609,
+          "latency": {
+            "count": 7831,
+            "mean": 3.06,
+            "p50": 2.31,
+            "p95": 5.46,
+            "p99": 21.61,
+            "min": 1.07,
+            "max": 27.94
+          }
+        }
+      },
+      "correctness": "PASS",
+      "memory_after": {
+        "cache_bytes": 1096,
+        "meta_bytes": 54,
+        "cache_entries": 1
+      }
+    }
+  ]
+}

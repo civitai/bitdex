@@ -586,16 +586,19 @@ async function main() {
 
   // Write JSON results
   const resultsDir = resolve(PROJECT_ROOT, 'docs', 'benchmarks', 'results');
-  mkdirSync(resultsDir, { recursive: true });
-  const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  const outFile = resolve(resultsDir, `bench-write-stress-${ts}.json`);
-  writeFileSync(outFile, JSON.stringify({
+  const historyDir = resolve(resultsDir, 'history');
+  mkdirSync(historyDir, { recursive: true });
+  const payload = JSON.stringify({
     timestamp: new Date().toISOString(),
     doc_count: DOC_COUNT,
     max_caches: MAX_CACHES,
     results: allResults,
-  }, null, 2));
-  log(`\nResults: ${outFile}`);
+  }, null, 2);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  writeFileSync(resolve(historyDir, `bench-write-stress-${ts}.json`), payload);
+  const latestFile = resolve(resultsDir, `bench-write-stress.json`);
+  writeFileSync(latestFile, payload);
+  log(`\nResults: ${latestFile} (+ history)`);
 
   // Cleanup
   await apiDelete(`/api/indexes/${INDEX}`);
