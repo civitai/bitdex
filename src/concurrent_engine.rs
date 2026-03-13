@@ -16,7 +16,7 @@ use crate::bitmap_fs::BitmapFs;
 use crate::filter::FilterFieldType;
 use crate::cache;
 use crate::concurrency::InFlightTracker;
-use crate::config::Config;
+use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
 use crate::docstore::{DocStore, StoredDoc};
 use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
@@ -3916,6 +3916,257 @@ impl ConcurrentEngine {
             total_elapsed.as_secs_f64(), slots_processed, rebuilt_names.len());
 
         Ok((slots_processed, rebuilt_names))
+    }
+
+    /// Add new filter and/or sort fields, building their bitmaps from the docstore.
+    ///
+    /// Unlike `rebuild_fields_from_docstore` (which rebuilds fields already in the config),
+    /// this method adds entirely new fields that didn't exist before. It:
+    /// 1. Validates the requested fields don't already exist
+    /// 2. Adds empty field structures to the staging snapshot
+    /// 3. Scans all alive documents to build bitmaps for the new fields
+    /// 4. Publishes the updated snapshot
+    ///
+    /// The caller (server) is responsible for updating the persisted config.json.
+    /// Returns (slots_processed, field_names_added).
+    pub fn add_fields_from_docstore(
+        &self,
+        new_filters: Vec<FilterFieldConfig>,
+        new_sorts: Vec<SortFieldConfig>,
+        progress: Arc<AtomicU64>,
+    ) -> Result<(u64, Vec<String>)> {
+        let t0 = Instant::now();
+
+        if new_filters.is_empty() && new_sorts.is_empty() {
+            return Ok((0, vec![]));
+        }
+
+        // Validate no duplicates with existing fields
+        {
+            let snap = self.inner.load_full();
+            for fc in &new_filters {
+                if snap.filters.get_field(&fc.name).is_some() {
+                    return Err(crate::error::BitdexError::Config(
+                        format!("Filter field '{}' already exists", fc.name)));
+                }
+            }
+            for sc in &new_sorts {
+                if snap.sorts.get_field(&sc.name).is_some() {
+                    return Err(crate::error::BitdexError::Config(
+                        format!("Sort field '{}' already exists", sc.name)));
+                }
+            }
+        }
+
+        let added_names: Vec<String> = new_filters.iter().map(|c| c.name.clone())
+            .chain(new_sorts.iter().map(|c| c.name.clone()))
+            .collect();
+
+        eprintln!("add_fields: filter={:?}, sort={:?}",
+            new_filters.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            new_sorts.iter().map(|c| &c.name).collect::<Vec<_>>());
+
+        // Get alive bitmap
+        let snap = self.inner.load_full();
+        let alive = {
+            let mut tmp = (*snap).clone();
+            tmp.slots.merge_alive();
+            tmp.slots.alive_bitmap().clone()
+        };
+        let total_alive = alive.len();
+        eprintln!("add_fields: {} alive slots to scan", total_alive);
+
+        // Open read-only docstore for parallel reads
+        let ds_path = self.docstore.lock().path().to_path_buf();
+        let reader = DocStore::open(&ds_path)
+            .map_err(|e| crate::error::BitdexError::DocStore(
+                format!("open reader docstore: {e}")))?;
+
+        let max_slot = alive.max().unwrap_or(0);
+        let max_shard = max_slot >> 9;
+        let num_shards = max_shard + 1;
+
+        // Build field name/config lists for the inner loop
+        let sort_names: Vec<&str> = new_sorts.iter().map(|c| c.name.as_str()).collect();
+        let sort_bits: Vec<usize> = new_sorts.iter().map(|c| c.bits as usize).collect();
+        let filter_names: Vec<&str> = new_filters.iter().map(|c| c.name.as_str()).collect();
+
+        // Parallel shard scan — same pattern as rebuild_fields_from_docstore
+        type FilterMap = HashMap<(usize, u64), RoaringBitmap>;
+        struct Accum {
+            sort_layers: Vec<Vec<RoaringBitmap>>,
+            filter_map: FilterMap,
+            count: u64,
+        }
+
+        let make_accum = || Accum {
+            sort_layers: sort_bits.iter().map(|&b| {
+                (0..b).map(|_| RoaringBitmap::new()).collect()
+            }).collect(),
+            filter_map: FilterMap::new(),
+            count: 0,
+        };
+
+        let chunk_size = 500u32;
+        let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
+
+        let merged = (0..num_chunks)
+            .into_par_iter()
+            .fold(make_accum, |mut acc, chunk_idx| {
+                let shard_start = chunk_idx * chunk_size;
+                let shard_end = std::cmp::min(shard_start + chunk_size, num_shards);
+
+                for shard_id in shard_start..shard_end {
+                    let docs = match reader.get_shard(shard_id) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+
+                    for (slot_id, doc) in &docs {
+                        if !alive.contains(*slot_id) {
+                            continue;
+                        }
+                        for (fi, &fname) in filter_names.iter().enumerate() {
+                            if let Some(fv) = doc.fields.get(fname) {
+                                match fv {
+                                    crate::mutation::FieldValue::Single(v) => {
+                                        if let Some(key) = value_to_bitmap_key(v) {
+                                            acc.filter_map
+                                                .entry((fi, key))
+                                                .or_insert_with(RoaringBitmap::new)
+                                                .insert(*slot_id);
+                                        }
+                                    }
+                                    crate::mutation::FieldValue::Multi(vals) => {
+                                        for v in vals {
+                                            if let Some(key) = value_to_bitmap_key(v) {
+                                                acc.filter_map
+                                                    .entry((fi, key))
+                                                    .or_insert_with(RoaringBitmap::new)
+                                                    .insert(*slot_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for (si, &sname) in sort_names.iter().enumerate() {
+                            if let Some(fv) = doc.fields.get(sname) {
+                                if let crate::mutation::FieldValue::Single(ref v) = fv {
+                                    if let Some(value) = value_to_sort_u32(v) {
+                                        let num_bits = sort_bits[si];
+                                        for bit in 0..num_bits {
+                                            if (value >> bit) & 1 == 1 {
+                                                acc.sort_layers[si][bit].insert(*slot_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        acc.count += 1;
+                    }
+                }
+
+                progress.fetch_add(acc.count, Ordering::Relaxed);
+                acc.count = 0;
+                acc
+            })
+            .reduce(make_accum, |mut a, b| {
+                for (si, b_layers) in b.sort_layers.into_iter().enumerate() {
+                    for (bit, bm) in b_layers.into_iter().enumerate() {
+                        a.sort_layers[si][bit] |= bm;
+                    }
+                }
+                for (key, bm) in b.filter_map {
+                    a.filter_map.entry(key)
+                        .and_modify(|existing| *existing |= &bm)
+                        .or_insert(bm);
+                }
+                a.count += b.count;
+                a
+            });
+
+        let slots_processed = progress.load(Ordering::Relaxed);
+        let scan_elapsed = t0.elapsed();
+        eprintln!("add_fields: scan complete in {:.1}s ({} slots, {:.0} slots/s)",
+            scan_elapsed.as_secs_f64(), slots_processed,
+            slots_processed as f64 / scan_elapsed.as_secs_f64());
+
+        // Apply: clone staging, add new empty fields, then OR in rebuilt bitmaps
+        let mut staging = self.clone_staging();
+
+        for fc in &new_filters {
+            staging.filters.add_field(fc.clone());
+        }
+        for sc in &new_sorts {
+            staging.sorts.add_field(sc.clone());
+        }
+
+        // Apply rebuilt filter bitmaps
+        for ((fi, value), bitmap) in merged.filter_map {
+            let fname = &new_filters[fi].name;
+            if let Some(field) = staging.filters.get_field_mut(fname) {
+                field.or_bitmap(value, &bitmap);
+            }
+        }
+        // Apply rebuilt sort layer bitmaps
+        for (si, layers) in merged.sort_layers.into_iter().enumerate() {
+            let sname = &new_sorts[si].name;
+            if let Some(field) = staging.sorts.get_field_mut(sname) {
+                for (bit, bitmap) in layers.into_iter().enumerate() {
+                    if !bitmap.is_empty() {
+                        field.or_layer(bit, &bitmap);
+                    }
+                }
+            }
+        }
+
+        self.publish_staging(staging);
+
+        let total_elapsed = t0.elapsed();
+        eprintln!("add_fields: complete in {:.1}s — {} slots, {} fields added",
+            total_elapsed.as_secs_f64(), slots_processed, added_names.len());
+
+        Ok((slots_processed, added_names))
+    }
+
+    /// Validate that field names exist in the docstore by checking one shard.
+    /// Returns Ok(()) if all fields are found, or Err with the missing field names.
+    pub fn validate_fields_in_docstore(&self, field_names: &[&str]) -> Result<Vec<String>> {
+        let ds_path = self.docstore.lock().path().to_path_buf();
+        let reader = DocStore::open(&ds_path)
+            .map_err(|e| crate::error::BitdexError::DocStore(
+                format!("open reader docstore: {e}")))?;
+
+        // Find a non-empty shard to sample
+        let snap = self.inner.load_full();
+        let alive = snap.slots.alive_bitmap();
+        let sample_slot = alive.min()
+            .ok_or_else(|| crate::error::BitdexError::Config(
+                "No alive documents to validate fields against".to_string()))?;
+        let sample_shard = sample_slot >> 9;
+
+        let docs = reader.get_shard(sample_shard)
+            .map_err(|e| crate::error::BitdexError::DocStore(
+                format!("read sample shard {}: {e}", sample_shard)))?;
+
+        if docs.is_empty() {
+            return Err(crate::error::BitdexError::Config(
+                "Sample shard is empty — cannot validate fields".to_string()));
+        }
+
+        let (_, sample_doc) = &docs[0];
+        let available_fields: HashSet<&str> = sample_doc.fields.keys()
+            .map(|k| k.as_str())
+            .collect();
+
+        let missing: Vec<String> = field_names.iter()
+            .filter(|&&name| !available_fields.contains(name))
+            .map(|&name| name.to_string())
+            .collect();
+
+        Ok(missing)
     }
 
     /// Shutdown the flush and merge threads gracefully.

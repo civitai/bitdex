@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
 use crate::concurrent_engine::ConcurrentEngine;
-use crate::config::{Config, DataSchema, FieldValueType};
+use crate::config::{Config, DataSchema, FieldValueType, FilterFieldConfig, SortFieldConfig};
 use crate::docstore::StoredDoc;
 use crate::executor::{CaseSensitiveFields, StringMaps};
 use crate::loader;
@@ -397,6 +397,19 @@ fn default_save_snapshot() -> bool {
     true
 }
 
+#[derive(Deserialize)]
+struct AddFieldsRequest {
+    #[serde(default)]
+    filter_fields: Vec<FilterFieldConfig>,
+    #[serde(default)]
+    sort_fields: Vec<SortFieldConfig>,
+    #[serde(default = "default_save_snapshot")]
+    save_snapshot: bool,
+    /// If true, skip validation that fields exist in docstore documents.
+    #[serde(default)]
+    skip_validation: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Public server entry point
 // ---------------------------------------------------------------------------
@@ -461,6 +474,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/stats", get(handle_stats))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
+            .route("/api/indexes/{name}/fields", post(handle_add_fields))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             // Cursors
             .route("/api/indexes/{name}/cursors", get(handle_list_cursors))
@@ -1573,6 +1587,180 @@ async fn handle_rebuild(
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({"status": "rebuilding"})),
+    ).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Add Fields
+// ---------------------------------------------------------------------------
+
+async fn handle_add_fields(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<AddFieldsRequest>,
+) -> impl IntoResponse {
+    if req.filter_fields.is_empty() && req.sort_fields.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "No fields specified"})),
+        ).into_response();
+    }
+
+    let (engine, load_progress, load_status, load_started_at) = {
+        let mut guard = state.index.lock();
+        match guard.as_mut() {
+            Some(idx) if idx.definition.name == name => {
+                // Check if busy
+                {
+                    let status = idx.load_status.lock();
+                    if matches!(*status, LoadStatus::Loading { .. } | LoadStatus::Saving { .. }) {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": "Already loading, saving, or rebuilding"})),
+                        ).into_response();
+                    }
+                }
+
+                // Validate no duplicate field names with existing config
+                for fc in &req.filter_fields {
+                    if idx.definition.config.filter_fields.iter().any(|f| f.name == fc.name) {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": format!("Filter field '{}' already exists", fc.name)})),
+                        ).into_response();
+                    }
+                }
+                for sc in &req.sort_fields {
+                    if idx.definition.config.sort_fields.iter().any(|f| f.name == sc.name) {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({"error": format!("Sort field '{}' already exists", sc.name)})),
+                        ).into_response();
+                    }
+                }
+
+                // Update the persisted config with the new fields
+                idx.definition.config.filter_fields.extend(req.filter_fields.clone());
+                idx.definition.config.sort_fields.extend(req.sort_fields.clone());
+
+                // Save updated config.json
+                let index_dir = state.data_dir.join("indexes").join(&name);
+                let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
+                if let Err(e) = std::fs::write(index_dir.join("config.json"), &config_json) {
+                    // Rollback config changes
+                    for fc in &req.filter_fields {
+                        idx.definition.config.filter_fields.retain(|f| f.name != fc.name);
+                    }
+                    for sc in &req.sort_fields {
+                        idx.definition.config.sort_fields.retain(|f| f.name != sc.name);
+                    }
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Failed to persist config: {e}")})),
+                    ).into_response();
+                }
+
+                (
+                    Arc::clone(&idx.engine),
+                    Arc::clone(&idx.load_progress),
+                    Arc::clone(&idx.load_status),
+                    Arc::clone(&idx.load_started_at),
+                )
+            }
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    // Validate fields exist in docstore (unless skipped)
+    if !req.skip_validation {
+        let all_names: Vec<&str> = req.filter_fields.iter().map(|f| f.name.as_str())
+            .chain(req.sort_fields.iter().map(|f| f.name.as_str()))
+            .collect();
+
+        match engine.validate_fields_in_docstore(&all_names) {
+            Ok(missing) if !missing.is_empty() => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Fields not found in docstore: {:?}", missing),
+                        "hint": "Set skip_validation=true to add fields that may not exist in all documents"
+                    })),
+                ).into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Validation failed: {e}")})),
+                ).into_response();
+            }
+            _ => {}
+        }
+    }
+
+    // Reset progress
+    load_progress.store(0, Ordering::Release);
+    *load_started_at.lock() = Some(Instant::now());
+    *load_status.lock() = LoadStatus::Loading {
+        records_loaded: 0,
+        elapsed_secs: 0.0,
+    };
+
+    let filter_fields = req.filter_fields;
+    let sort_fields = req.sort_fields;
+    let save = req.save_snapshot;
+    let progress = Arc::clone(&load_progress);
+    let status = Arc::clone(&load_status);
+
+    tokio::task::spawn_blocking(move || {
+        match engine.add_fields_from_docstore(filter_fields, sort_fields, progress) {
+            Ok((slots, fields)) => {
+                let elapsed = {
+                    let started = load_started_at.lock();
+                    started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
+                };
+
+                if save {
+                    *status.lock() = LoadStatus::Saving {
+                        records_loaded: slots,
+                        elapsed_secs: elapsed,
+                    };
+
+                    let snap_start = Instant::now();
+                    if let Err(e) = engine.save_and_unload() {
+                        eprintln!("add_fields: save_and_unload failed: {e}");
+                    } else {
+                        eprintln!("add_fields: save_and_unload in {:.1}s", snap_start.elapsed().as_secs_f64());
+                    }
+                }
+
+                let final_elapsed = {
+                    let started = load_started_at.lock();
+                    started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
+                };
+                *status.lock() = LoadStatus::Complete {
+                    records_loaded: slots,
+                    elapsed_secs: final_elapsed,
+                };
+
+                eprintln!("add_fields: done — {} slots, {} fields in {:.1}s",
+                    slots, fields.len(), final_elapsed);
+            }
+            Err(e) => {
+                *status.lock() = LoadStatus::Error {
+                    message: format!("Add fields failed: {}", e),
+                };
+            }
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"status": "adding_fields"})),
     ).into_response()
 }
 

@@ -29,6 +29,7 @@ struct BenchConfig {
     index_name: String,
     max_shards: Option<u32>,
     full_build: bool,
+    add_field: Option<String>,
 }
 
 fn parse_args() -> BenchConfig {
@@ -37,6 +38,7 @@ fn parse_args() -> BenchConfig {
     let mut index_name = "civitai".to_string();
     let mut max_shards: Option<u32> = None;
     let mut full_build = false;
+    let mut add_field: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -45,11 +47,12 @@ fn parse_args() -> BenchConfig {
             "--index" => { index_name = args[i + 1].clone(); i += 2; }
             "--shards" => { max_shards = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--full" => { full_build = true; i += 1; }
+            "--add-field" => { add_field = Some(args[i + 1].clone()); i += 2; }
             _ => { i += 1; }
         }
     }
 
-    BenchConfig { data_dir, index_name, max_shards, full_build }
+    BenchConfig { data_dir, index_name, max_shards, full_build, add_field }
 }
 
 /// Count total shards by scanning the shard directory.
@@ -860,10 +863,128 @@ fn run_full_build(data_dir: &Path, index_name: &str) {
     eprintln!("  Bytes/doc (build): {:.0}", bitmap_rss as f64 / total_docs as f64);
 }
 
+/// --add-field mode: build a full engine from docstore, then hot-add a single field.
+/// This benchmarks the add_fields_from_docstore() path that will back the HTTP endpoint.
+///
+/// Strategy: load the config, remove the target field, build the engine without it,
+/// then add it back via add_fields_from_docstore and measure the cost.
+fn run_add_field(data_dir: &Path, index_name: &str, field_name: &str) {
+    use bitdex_v2::concurrent_engine::{ConcurrentEngine, get_rss_bytes};
+    use bitdex_v2::config::{FilterFieldConfig, SortFieldConfig};
+
+    let index_dir = data_dir.join("indexes").join(index_name);
+    let config_path = index_dir.join("config.json");
+    let docs_path = index_dir.join("docs");
+
+    eprintln!("\n=== ADD-FIELD BENCHMARK: '{}' ===", field_name);
+    eprintln!("Index: {}", index_name);
+
+    #[derive(serde::Deserialize)]
+    struct IndexDef {
+        config: bitdex_v2::config::Config,
+    }
+    let config_json = std::fs::read_to_string(&config_path).expect("read config.json");
+    let index_def: IndexDef = serde_json::from_str(&config_json).expect("parse config.json");
+    let mut config = index_def.config;
+
+    // Find and remove the target field from config (so we can add it back)
+    let removed_filter: Option<FilterFieldConfig> = {
+        let pos = config.filter_fields.iter().position(|f| f.name == field_name);
+        pos.map(|i| config.filter_fields.remove(i))
+    };
+    let removed_sort: Option<SortFieldConfig> = {
+        let pos = config.sort_fields.iter().position(|f| f.name == field_name);
+        pos.map(|i| config.sort_fields.remove(i))
+    };
+
+    if removed_filter.is_none() && removed_sort.is_none() {
+        eprintln!("ERROR: Field '{}' not found in config (neither filter nor sort)", field_name);
+        std::process::exit(1);
+    }
+
+    eprintln!("  Removed from config: filter={}, sort={}",
+        removed_filter.is_some(), removed_sort.is_some());
+    eprintln!("  Will build engine without '{}', then hot-add it", field_name);
+
+    // Build engine without the target field
+    let bitmap_path = index_dir.join("bitmaps");
+    config.storage.bitmap_path = Some(bitmap_path.clone());
+
+    let rss_before = get_rss_bytes();
+
+    let engine = ConcurrentEngine::new_with_path(config, &docs_path)
+        .expect("create engine");
+
+    // Full build without the target field
+    eprintln!("\n--- Phase 1: Full build (without '{}') ---", field_name);
+    let progress = std::sync::Arc::new(AtomicU64::new(0));
+    let t_build = Instant::now();
+    let (total_docs, build_elapsed) = engine.build_all_from_docstore(
+        progress.clone(),
+        None,
+    ).expect("build_all_from_docstore");
+
+    let rss_after_build = get_rss_bytes();
+    eprintln!("  Build: {} docs in {:.1}s ({:.0} docs/s)",
+        total_docs, build_elapsed, total_docs as f64 / build_elapsed);
+    eprintln!("  RSS after build: {:.2} GB", rss_after_build as f64 / 1e9);
+
+    // Now hot-add the field
+    eprintln!("\n--- Phase 2: Hot-add '{}' ---", field_name);
+    let rss_before_add = get_rss_bytes();
+    progress.store(0, Ordering::Relaxed);
+    let t_add = Instant::now();
+
+    let new_filters = removed_filter.map(|f| vec![f]).unwrap_or_default();
+    let new_sorts = removed_sort.map(|f| vec![f]).unwrap_or_default();
+
+    let (slots, fields) = engine.add_fields_from_docstore(
+        new_filters,
+        new_sorts,
+        progress,
+    ).expect("add_fields_from_docstore");
+
+    let add_elapsed = t_add.elapsed().as_secs_f64();
+    let rss_after_add = get_rss_bytes();
+    let rss_delta = rss_after_add.saturating_sub(rss_before_add);
+
+    eprintln!("  Slots scanned:     {}", slots);
+    eprintln!("  Fields added:      {:?}", fields);
+    eprintln!("  Time:              {:.1}s", add_elapsed);
+    eprintln!("  Throughput:        {:.0} docs/s", slots as f64 / add_elapsed);
+    eprintln!("  RSS delta:         {:.2} MB", rss_delta as f64 / 1e6);
+    eprintln!("  RSS total:         {:.2} GB", rss_after_add as f64 / 1e9);
+
+    // Optional: persist
+    eprintln!("\n--- Phase 3: Persist ---");
+    let t_persist = Instant::now();
+    engine.save_and_unload().expect("save_and_unload");
+    let persist_elapsed = t_persist.elapsed().as_secs_f64();
+    let rss_after_persist = get_rss_bytes();
+    eprintln!("  Persist time:      {:.1}s", persist_elapsed);
+    eprintln!("  RSS after unload:  {:.2} GB", rss_after_persist as f64 / 1e9);
+
+    eprintln!("\n========================================");
+    eprintln!("  ADD-FIELD BENCHMARK COMPLETE");
+    eprintln!("========================================");
+    eprintln!("  Field:             {}", field_name);
+    eprintln!("  Full build:        {:.1}s (without field)", build_elapsed);
+    eprintln!("  Hot-add:           {:.1}s ({:.0} docs/s)", add_elapsed, slots as f64 / add_elapsed);
+    eprintln!("  Persist:           {:.1}s", persist_elapsed);
+    eprintln!("  Add + persist:     {:.1}s", add_elapsed + persist_elapsed);
+    eprintln!("  Add overhead:      {:.1}% of full build", add_elapsed / build_elapsed * 100.0);
+}
+
 fn main() {
     let config = parse_args();
     let index_dir = config.data_dir.join("indexes").join(&config.index_name);
     let docs_path = index_dir.join("docs");
+
+    // --add-field mode: benchmark hot-adding a single field
+    if let Some(ref field_name) = config.add_field {
+        run_add_field(&config.data_dir, &config.index_name, field_name);
+        return;
+    }
 
     // --full mode: run the engine-level build_all_from_docstore
     if config.full_build {
