@@ -9,7 +9,6 @@
 static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -21,6 +20,7 @@ use bitdex_v2::pg_sync::bulk_loader;
 use bitdex_v2::pg_sync::config::{IndexDefinition, PgSyncConfig};
 use bitdex_v2::pg_sync::metrics_poller;
 use bitdex_v2::pg_sync::outbox_poller;
+use bitdex_v2::pg_sync::progress::{self, LoadProgress};
 use bitdex_v2::pg_sync::queries;
 
 #[derive(Parser)]
@@ -161,19 +161,31 @@ async fn main() {
 
             engine.enter_loading_mode();
 
-            let progress = Arc::new(AtomicU64::new(0));
-            let stats = bulk_loader::run_bulk_load(
+            // Set up progress tracking + HTTP endpoint
+            let load_progress = Arc::new(LoadProgress::new());
+            let progress_shutdown = if let Some(port) = sync_config.progress_port {
+                let tx = progress::spawn_progress_server(port, Arc::clone(&load_progress));
+                Some(tx)
+            } else {
+                None
+            };
+
+            let stats = bulk_loader::run_bulk_load_copy(
                 &pool,
                 &engine,
                 &index_def,
-                sync_config.batch_size,
-                progress,
+                Arc::clone(&load_progress),
             )
             .await
             .unwrap_or_else(|e| {
                 eprintln!("Bulk load failed: {e}");
                 std::process::exit(1);
             });
+
+            // Shut down progress server
+            if let Some(tx) = progress_shutdown {
+                let _ = tx.send(());
+            }
 
             engine.exit_loading_mode();
 

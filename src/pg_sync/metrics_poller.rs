@@ -31,6 +31,7 @@ pub async fn run_metrics_poller(
     let mut ticker = interval(Duration::from_secs(poll_interval_secs));
     let http = Client::new();
     let mut last_poll_ts = current_epoch_secs() - poll_interval_secs as i64;
+    let mut bitdex_was_down = false;
 
     eprintln!(
         "Metrics poller started (ClickHouse={}, interval={poll_interval_secs}s)",
@@ -39,6 +40,20 @@ pub async fn run_metrics_poller(
 
     loop {
         ticker.tick().await;
+
+        // Health gate: skip ClickHouse + PG fetch if BitDex is unreachable.
+        if !bitdex_client.is_healthy().await {
+            if !bitdex_was_down {
+                eprintln!("Metrics: BitDex is unreachable, pausing until healthy");
+                bitdex_was_down = true;
+            }
+            continue;
+        }
+        if bitdex_was_down {
+            eprintln!("Metrics: BitDex is back, resuming");
+            bitdex_was_down = false;
+        }
+
         let now = current_epoch_secs();
 
         match poll_metrics_and_push(pool, &http, ch_config, bitdex_client, last_poll_ts).await {

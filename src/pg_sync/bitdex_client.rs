@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -6,6 +8,8 @@ use serde_json::Value;
 pub struct BitdexClient {
     client: Client,
     base_url: String,
+    /// Server root URL (e.g. "http://localhost:3000") for health checks.
+    server_root: String,
 }
 
 #[derive(Deserialize)]
@@ -17,9 +21,33 @@ struct CursorResponse {
 
 impl BitdexClient {
     pub fn new(base_url: &str) -> Self {
+        let base = base_url.trim_end_matches('/').to_string();
+        // Derive server root from base_url by stripping /api/indexes/{name}.
+        // e.g. "http://host:3000/api/indexes/test" → "http://host:3000"
+        let server_root = base
+            .find("/api/indexes/")
+            .map(|pos| base[..pos].to_string())
+            .unwrap_or_else(|| base.clone());
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            client: Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            client,
+            base_url: base,
+            server_root,
+        }
+    }
+
+    /// Check if the BitDex server is reachable and healthy.
+    /// Returns true if GET /api/health returns 200, false otherwise.
+    /// Uses a short timeout so the health gate reacts quickly to failures.
+    pub async fn is_healthy(&self) -> bool {
+        let url = format!("{}/api/health", self.server_root);
+        match self.client.get(&url).timeout(Duration::from_secs(3)).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
         }
     }
 

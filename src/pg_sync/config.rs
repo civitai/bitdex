@@ -49,6 +49,10 @@ pub struct PgSyncConfig {
     /// Defaults to "default". Override via BITDEX_REPLICA_ID env var (e.g. from StatefulSet pod name).
     #[serde(default = "default_replica_id")]
     pub replica_id: String,
+    /// Port for the progress HTTP endpoint during bulk load.
+    /// Set to None to disable. Default: 9091.
+    #[serde(default = "default_progress_port")]
+    pub progress_port: Option<u16>,
 }
 
 fn default_index_subdir() -> String {
@@ -77,6 +81,9 @@ fn default_metrics_poll_interval_secs() -> u64 {
 }
 fn default_replica_id() -> String {
     "default".to_string()
+}
+fn default_progress_port() -> Option<u16> {
+    Some(9091)
 }
 
 impl PgSyncConfig {

@@ -25,6 +25,17 @@ pub async fn run_outbox_poller(
     batch_limit: i64,
     cursor_name: &str,
 ) -> Result<(), String> {
+    // Wait for BitDex to be healthy before reading the cursor.
+    // On K8s, the sidecar may start before the main container is ready.
+    eprintln!("Outbox poller waiting for BitDex to be healthy...");
+    loop {
+        if client.is_healthy().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    eprintln!("BitDex is healthy.");
+
     // Read initial cursor from BitDex (persisted on disk from last checkpoint)
     let mut cursor: i64 = match client.get_cursor(cursor_name).await? {
         Some(value) => value.parse::<i64>().unwrap_or(0),
@@ -36,9 +47,24 @@ pub async fn run_outbox_poller(
     );
 
     let mut ticker = interval(Duration::from_secs(poll_interval_secs));
+    let mut bitdex_was_down = false;
 
     loop {
         ticker.tick().await;
+
+        // Health gate: skip the PG fetch if BitDex is unreachable.
+        // This avoids wasted work (enrichment JOINs) when the server can't accept data.
+        if !client.is_healthy().await {
+            if !bitdex_was_down {
+                eprintln!("Outbox: BitDex is unreachable, pausing PG polling until healthy");
+                bitdex_was_down = true;
+            }
+            continue;
+        }
+        if bitdex_was_down {
+            eprintln!("Outbox: BitDex is back, resuming PG polling");
+            bitdex_was_down = false;
+        }
 
         match poll_and_process(pool, client, batch_limit, cursor_name, &mut cursor).await {
             Ok(processed) => {
