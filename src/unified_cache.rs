@@ -88,7 +88,7 @@ pub struct UnifiedEntry {
     /// Pre-sorted packed keys for O(1) pagination via binary search at initial capacity.
     /// Each key is `(sort_value as u64) << 32 | slot_id`. Sorted in traversal order.
     /// Cleared on expand() when radix takes over.
-    sorted_keys: Option<Vec<u64>>,
+    sorted_keys: Option<Arc<Vec<u64>>>,
     /// Radix sort index for expanded entries (>4K items).
     /// Built during expand(), enables O(1) bucket-based pagination and maintenance.
     /// None at initial capacity — sorted vec binary search is faster for ≤4K items.
@@ -130,7 +130,7 @@ impl UnifiedEntry {
         // Build sorted keys for fast binary search pagination at initial capacity.
         // Each key is (sort_value << 32) | slot_id, sorted in traversal order.
         let sorted_keys = if take_count > 0 {
-            Some(Self::build_sorted_keys(&sorted_slots[..take_count], direction, &value_fn))
+            Some(Arc::new(Self::build_sorted_keys(&sorted_slots[..take_count], direction, &value_fn)))
         } else {
             None
         };
@@ -318,7 +318,7 @@ impl UnifiedEntry {
             self.radix = Some(Arc::new(RadixSortIndex::from_bitmap(&self.bitmap, &value_fn)));
         } else {
             self.sorted_keys = if take_count > 0 {
-                Some(Self::build_sorted_keys(&sorted_slots[..take_count], self.direction, &value_fn))
+                Some(Arc::new(Self::build_sorted_keys(&sorted_slots[..take_count], self.direction, &value_fn)))
             } else {
                 None
             };
@@ -348,8 +348,8 @@ impl UnifiedEntry {
 
     /// Get the pre-sorted keys for binary search pagination (initial capacity only).
     /// Returns None after expand() when radix takes over.
-    pub fn sorted_keys(&self) -> Option<&[u64]> {
-        self.sorted_keys.as_deref()
+    pub fn sorted_keys(&self) -> Option<&Arc<Vec<u64>>> {
+        self.sorted_keys.as_ref()
     }
 
     /// Memory usage of this entry's bitmap + sorted keys + radix index.

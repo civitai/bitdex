@@ -15,12 +15,12 @@ Tested against 105M records (Civitai image dataset) on a single machine (Windows
 
 | Concurrency | QPS | p50 | p95 | p99 | max |
 |--:|--:|--:|--:|--:|--:|
-| 1 | 8,619 | 0.10ms | 0.17ms | 0.22ms | 4.96ms |
-| 4 | 22,673 | 0.16ms | 0.26ms | 0.33ms | 5.93ms |
-| 8 | 34,451 | 0.20ms | 0.39ms | 0.58ms | 9.19ms |
-| 16 | 35,520 | 0.41ms | 0.93ms | 1.33ms | 6.14ms |
-| 32 | 35,111 | 0.85ms | 2.18ms | 3.22ms | 15.94ms |
-| 64 | 39,015 | 1.53ms | 3.12ms | 4.18ms | 10.98ms |
+| 1 | 8,530 | 0.10ms | 0.17ms | 0.20ms | 1.22ms |
+| 4 | 25,343 | 0.14ms | 0.23ms | 0.34ms | 24.06ms |
+| 8 | 46,915 | 0.16ms | 0.23ms | 0.29ms | 12.61ms |
+| 16 | 63,562 | 0.23ms | 0.36ms | 0.47ms | 15.96ms |
+| 32 | 71,415 | 0.42ms | 0.69ms | 0.89ms | 22.27ms |
+| 64 | 82,104 | 0.73ms | 1.30ms | 1.63ms | 6.80ms |
 
 Production workload mix (2,516 real Civitai traffic queries from `tests/loadtest/workload.json`). Unified cache at 99.98% hit rate. The loadtest auto-detects this workload file when run from the repo root.
 

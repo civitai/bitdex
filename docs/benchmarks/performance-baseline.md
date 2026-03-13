@@ -1,6 +1,6 @@
 # BitDex V2 — Performance Baselines
 
-**Last Updated**: 2026-03-12
+**Last Updated**: 2026-03-13
 **Platform**: Windows 11 Pro, Desktop (NVMe SSD), 4 threads (benchmark), 8 threads (mixed workload)
 **Allocator**: rpmalloc (release builds)
 
@@ -39,6 +39,22 @@ Source: `docs/benchmarks/benchmark-mixed-workload.md` (Mar 11, 2026). Unified ca
 | nsfwLevel=1, reactionCount asc | 152ms | 3.90ms | 7.11ms | Reverse sort direction |
 | nsfwLevel=1, sortAt desc | 15ms | 5.16ms | 6.89ms | Time-based sort |
 | nsfwLevel=1 + type=image, sortAt desc | 24ms | 12.51ms | 16.04ms | Two-clause filter + time sort |
+
+### HTTP Loadtest — Real Traffic Workload (105M, 2026-03-13)
+
+Source: `tests/loadtest/workload.json` (2,516 real Civitai traffic queries). Stable build: fat LTO, codegen-units=1. Unified cache warm.
+
+| Concurrency | QPS | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| 1 | 8,530 | 0.10ms | 0.17ms | 0.20ms | 1.22ms |
+| 4 | 25,343 | 0.14ms | 0.23ms | 0.34ms | 24.06ms |
+| 8 | 46,915 | 0.16ms | 0.23ms | 0.29ms | 12.61ms |
+| 16 | 63,562 | 0.23ms | 0.36ms | 0.47ms | 15.96ms |
+| 32 | 71,415 | 0.42ms | 0.69ms | 0.89ms | 22.27ms |
+| 64 | 82,104 | 0.73ms | 1.30ms | 1.63ms | 6.80ms |
+| 128 | 77,430 | 1.58ms | 2.78ms | 3.46ms | 9.21ms |
+
+Saturates at c=64 (~82K QPS). c=128 adds no throughput, only latency. Near-linear scaling from c=1 to c=32.
 
 ### E2E HTTP — 8 Concurrent Workers (105.3M)
 
@@ -247,3 +263,4 @@ These are guidelines, not hard gates. Hardware, OS, background load, and session
 | `docs/benchmarks/benchmark-comparison-loading-mode.md` | 104.6M bound cache before/after, write perf | Feb 21, 2026 |
 | `docs/benchmarks/benchmark-mixed-workload.md` | 105.3M mixed workload, unified cache, 8 workers | Mar 11, 2026 |
 | `CLAUDE.md` | Memory tables, loading pipeline throughput | Ongoing |
+| Loadtest (real traffic workload) | 105M HTTP throughput, c=1 to c=128, stable build | Mar 13, 2026 |

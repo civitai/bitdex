@@ -1683,14 +1683,14 @@ impl ConcurrentEngine {
                 let cache_data = {
                     let mut uc = self.unified_cache.lock();
                     uc.lookup(&ukey).map(|entry| {
-                        let bm = entry.bitmap().as_ref().clone();
+                        let bm = Arc::clone(entry.bitmap());
                         let has_more = entry.has_more();
                         let min_val = entry.min_tracked_value();
                         let cap = entry.capacity();
                         let total = entry.total_matched();
                         let radix = entry.radix().cloned();
                         let direction = entry.direction();
-                        let sorted_keys = entry.sorted_keys().map(|k| k.to_vec());
+                        let sorted_keys = entry.sorted_keys().map(Arc::clone);
                         (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
                     })
                 };
@@ -1777,7 +1777,7 @@ impl ConcurrentEngine {
                                 let mut uc = self.unified_cache.lock();
                                 uc.lookup(&ukey).map(|e| {
                                     let radix = e.radix().cloned();
-                                    let bm = e.bitmap().as_ref().clone();
+                                    let bm = Arc::clone(e.bitmap());
                                     (radix, bm)
                                 })
                             };
@@ -1850,7 +1850,7 @@ impl ConcurrentEngine {
         time_buckets: Option<&TimeBucketManager>,
         now_unix: u64,
         // Pre-fetched cache data from fast path that detected expansion needed
-        cached: Option<(UnifiedKey, RoaringBitmap, bool, u32, usize, u64)>,
+        cached: Option<(UnifiedKey, Arc<RoaringBitmap>, bool, u32, usize, u64)>,
     ) -> Result<QueryResult> {
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(executor, &query.filters, time_buckets, now_unix)?;
@@ -1872,7 +1872,7 @@ impl ConcurrentEngine {
                         direction: sort_clause.direction,
                     };
                     let hit = uc.lookup(&ukey).map(|entry| {
-                        let bm = entry.bitmap().as_ref().clone();
+                        let bm = Arc::clone(entry.bitmap());
                         let has_more = entry.has_more();
                         let min_val = entry.min_tracked_value();
                         let cap = entry.capacity();
@@ -1937,28 +1937,28 @@ impl ConcurrentEngine {
 
                     let mut uc = self.unified_cache.lock();
                     if let Some(entry) = uc.lookup(ukey) {
-                        let bm = entry.bitmap().as_ref().clone();
+                        let bm = Arc::clone(entry.bitmap());
                         let use_simple = bm.len() < 10_000;
                         (bm, use_simple)
                     } else {
-                        (filter_arc.as_ref().clone(), use_simple_sort)
+                        (Arc::clone(&filter_arc), use_simple_sort)
                     }
                 } else {
                     if let Some((ref unified_bm, ..)) = unified_hit {
                         let use_simple = unified_bm.len() < 10_000;
-                        (unified_bm.clone(), use_simple)
+                        (Arc::clone(unified_bm), use_simple)
                     } else {
-                        (filter_arc.as_ref().clone(), use_simple_sort)
+                        (Arc::clone(&filter_arc), use_simple_sort)
                     }
                 }
             } else {
-                (filter_arc.as_ref().clone(), use_simple_sort)
+                (Arc::clone(&filter_arc), use_simple_sort)
             }
         } else if let Some((ref unified_bm, ..)) = unified_hit {
             let use_simple = unified_bm.len() < 10_000;
-            (unified_bm.clone(), use_simple)
+            (Arc::clone(unified_bm), use_simple)
         } else {
-            (filter_arc.as_ref().clone(), use_simple_sort)
+            (Arc::clone(&filter_arc), use_simple_sort)
         };
 
         let offset = if query.cursor.is_none() {
@@ -2014,7 +2014,7 @@ impl ConcurrentEngine {
                     let mut uc = self.unified_cache.lock();
                     uc.lookup(ukey).map(|e| {
                         let radix = e.radix().cloned();
-                        let bm = e.bitmap().as_ref().clone();
+                        let bm = Arc::clone(e.bitmap());
                         (radix, bm)
                     })
                 } else { None }
