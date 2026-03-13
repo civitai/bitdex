@@ -2095,7 +2095,7 @@ fn main() {
                     let mut filters: Vec<FilterClause> = Vec::new();
 
                     for _ in 0..num_clauses {
-                        let clause_type = rng.gen_range(0..6);
+                        let clause_type = rng.gen_range(0..9);
                         let clause = match clause_type {
                             0 => {
                                 // nsfwLevel eq
@@ -2129,10 +2129,44 @@ fn main() {
                                     .collect();
                                 FilterClause::In("nsfwLevel".into(), vals)
                             }
-                            _ => {
+                            5 => {
                                 // NOT eq on nsfwLevel
                                 let v = nsfw[rng.gen_range(0..nsfw.len())];
                                 FilterClause::NotEq("nsfwLevel".into(), Value::Integer(v))
+                            }
+                            6 => {
+                                // Or: nsfwLevel IN or userId eq (mirrors Civitai shadow queries)
+                                let count = rng.gen_range(2..=4);
+                                let nsfw_vals: Vec<Value> = (0..count)
+                                    .map(|_| Value::Integer(nsfw[rng.gen_range(0..nsfw.len())]))
+                                    .collect();
+                                let uid = users[rng.gen_range(0..users.len())];
+                                FilterClause::Or(vec![
+                                    FilterClause::In("nsfwLevel".into(), nsfw_vals),
+                                    FilterClause::Eq("userId".into(), Value::Integer(uid)),
+                                ])
+                            }
+                            7 => {
+                                // Not(And(nsfwLevel IN, boolean)) — the pattern that was buggy
+                                let count = rng.gen_range(2..=3);
+                                let nsfw_vals: Vec<Value> = (0..count)
+                                    .map(|_| Value::Integer(nsfw[rng.gen_range(0..nsfw.len())]))
+                                    .collect();
+                                let field = match rng.gen_range(0..2) {
+                                    0 => "onSite",
+                                    _ => "hasMeta",
+                                };
+                                FilterClause::Not(Box::new(FilterClause::And(vec![
+                                    FilterClause::In("nsfwLevel".into(), nsfw_vals),
+                                    FilterClause::Eq(field.into(), Value::Bool(rng.gen_bool(0.5))),
+                                ])))
+                            }
+                            _ => {
+                                // And(boolean, boolean) — simple compound
+                                FilterClause::And(vec![
+                                    FilterClause::Eq("onSite".into(), Value::Bool(rng.gen_bool(0.7))),
+                                    FilterClause::Eq("hasMeta".into(), Value::Bool(rng.gen_bool(0.5))),
+                                ])
                             }
                         };
                         filters.push(clause);
