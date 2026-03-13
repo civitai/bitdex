@@ -92,7 +92,10 @@ pub async fn run_bulk_load(
         .map(|p| p.parent().unwrap_or(p).to_path_buf())
         .unwrap_or_else(|| std::env::temp_dir());
     let arena_path = storage_dir.join("slot_arena.bin");
-    let arena = SlotArena::new(max_id as u32, &arena_path)
+    // Add safety margin for new inserts that arrive during the load.
+    // Production inserts ~1K images/min; 100K headroom covers ~100 min of loading.
+    let arena_max = (max_id as u32).saturating_add(100_000);
+    let arena = SlotArena::new(arena_max, &arena_path)
         .map_err(|e| format!("SlotArena::new failed: {e}"))?;
 
     let (arena_mb, _) = arena.memory_usage();
@@ -288,36 +291,124 @@ pub async fn run_bulk_load_copy(
         .map(|p| p.parent().unwrap_or(p).to_path_buf())
         .unwrap_or_else(|| std::env::temp_dir());
     let arena_path = storage_dir.join("slot_arena.bin");
-    let arena = SlotArena::new(max_id as u32, &arena_path)
+    // Add safety margin for new inserts that arrive during the load.
+    // Production inserts ~1K images/min; 100K headroom covers ~100 min of loading.
+    let arena_max = (max_id as u32).saturating_add(100_000);
+    let arena = SlotArena::new(arena_max, &arena_path)
         .map_err(|e| format!("SlotArena::new failed: {e}"))?;
 
     let (arena_mb, _) = arena.memory_usage();
     eprintln!("SlotArena: {} MB allocated", arena_mb / (1024 * 1024));
 
-    // Step 3: All 5 COPY streams in parallel
+    // Step 3: Stream all tables via COPY with checkpoint recovery.
+    // Each stream saves a checkpoint on completion. On restart, completed
+    // streams are loaded from disk instead of re-streamed from Postgres.
     progress.set_phase(1); // streaming
-    eprintln!("\n=== Streaming all tables via COPY (parallel) ===");
+    let checkpoint_dir = storage_dir.join("load_checkpoint");
+    std::fs::create_dir_all(&checkpoint_dir)
+        .map_err(|e| format!("create checkpoint dir: {e}"))?;
+
+    eprintln!("\n=== Streaming tables via COPY (with checkpoints) ===");
     let stream_start = Instant::now();
 
-    let (image_result, tag_result, tool_result, tech_result, res_result) = tokio::try_join!(
-        copy_streams::stream_images_copy(
-            pool, &arena, schema,
-            &filter_names, &sort_configs, &filter_set, &sort_bits,
-            &progress,
+    // Helper: run a stream with retry, save checkpoint on success
+    async fn run_stream_with_retry<F, Fut>(
+        name: &str,
+        checkpoint_path: &std::path::Path,
+        _filter_names: &[String],
+        _sort_configs: &[(String, u8)],
+        max_retries: usize,
+        mut make_future: F,
+    ) -> Result<(BitmapAccum, table_streams::StreamStats), String>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<(BitmapAccum, table_streams::StreamStats), String>>,
+    {
+        // Check for existing checkpoint
+        if checkpoint_path.exists() {
+            eprintln!("{name}: loading from checkpoint");
+            let accum = BitmapAccum::load_checkpoint(checkpoint_path)
+                .map_err(|e| format!("{name} checkpoint load: {e}"))?;
+            let stats = table_streams::StreamStats {
+                rows_processed: 0, // unknown from checkpoint
+                elapsed: std::time::Duration::ZERO,
+            };
+            return Ok((accum, stats));
+        }
+
+        let mut last_err = String::new();
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let delay = std::time::Duration::from_secs(2u64.pow(attempt as u32).min(30));
+                eprintln!("{name}: retry {attempt}/{max_retries} after {delay:?}");
+                tokio::time::sleep(delay).await;
+            }
+
+            match make_future().await {
+                Ok((accum, stats)) => {
+                    // Save checkpoint
+                    if let Err(e) = accum.save_checkpoint(checkpoint_path) {
+                        eprintln!("{name}: WARNING: checkpoint save failed: {e}");
+                    }
+                    return Ok((accum, stats));
+                }
+                Err(e) => {
+                    eprintln!("{name}: stream failed (attempt {attempt}): {e}");
+                    last_err = e;
+                }
+            }
+        }
+        Err(format!("{name}: all {max_retries} retries exhausted: {last_err}"))
+    }
+
+    // Run all 5 streams concurrently with independent retry
+    let ckpt_images = checkpoint_dir.join("images.ckpt");
+    let ckpt_tags = checkpoint_dir.join("tags.ckpt");
+    let ckpt_tools = checkpoint_dir.join("tools.ckpt");
+    let ckpt_techniques = checkpoint_dir.join("techniques.ckpt");
+    let ckpt_resources = checkpoint_dir.join("resources.ckpt");
+
+    let (image_result, tag_result, tool_result, tech_result, res_result) = tokio::join!(
+        run_stream_with_retry(
+            "images", &ckpt_images, &filter_names, &sort_configs, 3,
+            || copy_streams::stream_images_copy(
+                pool, &arena, schema,
+                &filter_names, &sort_configs, &filter_set, &sort_bits,
+                &progress,
+            ),
         ),
-        copy_streams::stream_tags_copy(
-            pool, &arena, &filter_names, &sort_configs, &progress,
+        run_stream_with_retry(
+            "tags", &ckpt_tags, &filter_names, &sort_configs, 3,
+            || copy_streams::stream_tags_copy(
+                pool, &arena, &filter_names, &sort_configs, &progress,
+            ),
         ),
-        copy_streams::stream_tools_copy(
-            pool, &arena, &filter_names, &sort_configs, &progress,
+        run_stream_with_retry(
+            "tools", &ckpt_tools, &filter_names, &sort_configs, 3,
+            || copy_streams::stream_tools_copy(
+                pool, &arena, &filter_names, &sort_configs, &progress,
+            ),
         ),
-        copy_streams::stream_techniques_copy(
-            pool, &arena, &filter_names, &sort_configs, &progress,
+        run_stream_with_retry(
+            "techniques", &ckpt_techniques, &filter_names, &sort_configs, 3,
+            || copy_streams::stream_techniques_copy(
+                pool, &arena, &filter_names, &sort_configs, &progress,
+            ),
         ),
-        copy_streams::stream_resources_copy(
-            pool, &arena, schema, &filter_names, &sort_configs, &progress,
+        run_stream_with_retry(
+            "resources", &ckpt_resources, &filter_names, &sort_configs, 3,
+            || copy_streams::stream_resources_copy(
+                pool, &arena, schema, &filter_names, &sort_configs, &progress,
+            ),
         ),
-    )?;
+    );
+
+    // Collect results — report all errors, don't fail on first
+    let image_result = image_result?;
+    let tag_result = tag_result?;
+    let tool_result = tool_result?;
+    let tech_result = tech_result?;
+    let res_result = res_result?;
 
     let (image_accum, image_stats) = image_result;
     let (mut tag_accum, tag_stats) = tag_result;
@@ -423,9 +514,12 @@ pub async fn run_bulk_load_copy(
         .map_err(|e| format!("save_snapshot failed: {e}"))?;
     eprintln!("Snapshot saved.");
 
-    // Cleanup arena
+    // Cleanup arena + checkpoints (load succeeded, no longer needed)
     if let Err(e) = arena.cleanup() {
         eprintln!("Warning: failed to cleanup arena file: {e}");
+    }
+    if let Err(e) = std::fs::remove_dir_all(&checkpoint_dir) {
+        eprintln!("Warning: failed to cleanup checkpoints: {e}");
     }
 
     progress.set_phase(6); // done
