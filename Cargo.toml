@@ -10,7 +10,8 @@ keywords = ["bitmap", "index", "database", "search", "roaring"]
 default = []
 server = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:prometheus"]
 loadtest = ["ureq"]
-pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio"]
+pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes"]
+simd = ["roaring/simd"]
 
 [dependencies]
 # Bitmap indexes
@@ -54,6 +55,9 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "tls-rustls",
 clap = { version = "4", features = ["derive"], optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 chrono = { version = "0.4", optional = true }
+futures-core = { version = "0.3", optional = true }
+futures-util = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
 
 # Memory-mapped files (slot arena for bulk loading)
 memmap2 = "0.9"
@@ -80,6 +84,13 @@ rand = "0.8"
 tempfile = "3"
 memmap2 = "0.9"
 
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
 
 [[bench]]
 name = "engine_bench"
@@ -108,10 +119,6 @@ harness = false
 [[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
-
-# [[bin]]
-# name = "throughput_experiment"
-# path = "src/bin/throughput_experiment.rs"
 
 [[bin]]
 name = "server"
