@@ -24,6 +24,7 @@ COPY --from=builder /build/target/release/bitdex-server /usr/local/bin/bitdex-se
 COPY --from=builder /build/target/release/bitdex-pg-sync /usr/local/bin/bitdex-pg-sync
 COPY --from=builder /build/static /opt/bitdex/static
 
+VOLUME /data
 EXPOSE 3000
 ENTRYPOINT ["bitdex-server"]
 CMD ["--data-dir", "/data"]

@@ -1,9 +1,11 @@
 # Bitdex V2 — justfile
 # Run `just` or `just --list` to see all available recipes.
 
-# Defaults (override on CLI: just server PORT=3002)
+set shell := ["powershell", "-NoProfile", "-Command"]
+
+# Defaults (override on CLI: just dev PORT=3002)
 PORT           := "3001"
-DATA_DIR       := "./data"
+DATA_DIR       := justfile_directory() / "data"
 E2E_PORT       := "3100"
 BENCH_STAGES   := "query"
 NDJSON         := 'C:/Dev/Repos/open-source/bitdex/data/images-full-v2.ndjson'
@@ -135,13 +137,13 @@ benchmark-persist:
 
 # ─── Server ────────────────────────────────────────────────────────
 
-# Run server (fast profile — good perf, quick rebuilds)
-server:
-    cargo run --profile fast --features server --bin bitdex-server -- --port {{PORT}} --data-dir {{DATA_DIR}}
+# Build + run server (fast profile)
+dev: build-server
+    {{justfile_directory() / "target" / "fast" / "bitdex-server"}} --port {{PORT}} --data-dir {{DATA_DIR}}
 
-# Run server (debug build, fastest compile)
-server-dev:
-    cargo run --features server --bin bitdex-server -- --port {{PORT}} --data-dir {{DATA_DIR}}
+# Run server without rebuilding (instant start)
+run:
+    {{justfile_directory() / "target" / "fast" / "bitdex-server"}} --port {{PORT}} --data-dir {{DATA_DIR}}
 
 # ─── Load Testing ──────────────────────────────────────────────────
 
