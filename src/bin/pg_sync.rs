@@ -73,6 +73,16 @@ async fn main() {
     // Create PG connection pool
     let pool = PgPoolOptions::new()
         .max_connections(sync_config.pg_pool_size)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Disable statement_timeout for bulk COPY streams that can run for minutes.
+                // The default 2min timeout kills long-running COPY TO STDOUT queries.
+                sqlx::query("SET statement_timeout = 0")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(&sync_config.postgres_url)
         .await
         .unwrap_or_else(|e| {
