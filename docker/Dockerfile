@@ -1,0 +1,31 @@
+# Bitdex V2 — Production Image (stable Rust, fat LTO)
+# Build: docker build -t bitdex:latest -f docker/Dockerfile .
+# Run:   docker run -p 3000:3000 -v bitdex-data:/data bitdex:latest
+
+FROM rust:1.85-bookworm AS builder
+
+WORKDIR /build
+COPY . .
+
+# EPYC-optimized: unlock AVX2, BMI2, POPCNT
+ENV RUSTFLAGS="-C target-cpu=znver3"
+
+RUN cargo build --release --features server --bin server && \
+    cargo build --release --features pg-sync --bin pg-sync
+
+# --- Runtime ---
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/server /usr/local/bin/bitdex-server
+COPY --from=builder /build/target/release/pg-sync /usr/local/bin/bitdex-pg-sync
+COPY --from=builder /build/static /opt/bitdex/static
+
+ENV MALLOC_CONF="background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:3000"
+
+EXPOSE 3000
+ENTRYPOINT ["bitdex-server"]
+CMD ["--data-dir", "/data"]

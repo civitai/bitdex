@@ -1,0 +1,45 @@
+# Bitdex V2 — Nightly SIMD Image (roaring portable_simd)
+# Build: docker build -t bitdex:simd -f docker/Dockerfile.simd .
+# Run:   docker run -p 3000:3000 -v bitdex-data:/data bitdex:simd
+#
+# This image uses Rust nightly for the roaring crate's `simd` feature,
+# which enables portable_simd for vectorized bitmap operations (AVX2/AVX-512).
+# Pin to a known-good nightly date for reproducible builds.
+# NOTE: nightly >= 1.95 (Jan 2026) broke portable_simd API (LaneCount removed).
+# Use nightly-2025-12-15 (rustc 1.94.0) until roaring crate updates.
+
+FROM rust:1.94.0-nightly-bookworm AS builder
+
+# If the above tag doesn't exist, use manual install:
+# FROM debian:bookworm AS builder
+# RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+#     --default-toolchain nightly-2025-12-15
+# ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+COPY . .
+
+# EPYC-optimized: unlock AVX2, BMI2, POPCNT (use znver4 for Genoa/AVX-512)
+ENV RUSTFLAGS="-C target-cpu=znver3"
+
+# Enable the roaring simd feature for this build
+RUN sed -i 's/^roaring = "0.10"/roaring = { version = "0.11", features = ["simd"] }/' Cargo.toml && \
+    cargo build --release --features server --bin server && \
+    cargo build --release --features pg-sync --bin pg-sync
+
+# --- Runtime ---
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/server /usr/local/bin/bitdex-server
+COPY --from=builder /build/target/release/pg-sync /usr/local/bin/bitdex-pg-sync
+COPY --from=builder /build/static /opt/bitdex/static
+
+ENV MALLOC_CONF="background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:3000"
+
+EXPOSE 3000
+ENTRYPOINT ["bitdex-server"]
+CMD ["--data-dir", "/data"]
