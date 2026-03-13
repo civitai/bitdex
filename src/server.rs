@@ -648,6 +648,8 @@ impl BitdexServer {
             }
         }
 
+        let shutdown_state = Arc::clone(&state);
+
         let app = Router::new()
             // Index management
             .route("/api/indexes", post(handle_create_index))
@@ -682,8 +684,37 @@ impl BitdexServer {
 
         eprintln!("BitDex server listening on http://{}", addr);
 
+        let shutdown_signal = async {
+            #[cfg(unix)]
+            {
+                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = term.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            tokio::signal::ctrl_c().await.ok();
+
+            eprintln!("Shutdown signal received, draining...");
+        };
+
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal)
+            .await?;
+
+        // After graceful shutdown: save snapshot and shut down the engine
+        eprintln!("Server stopped, saving final snapshot...");
+        let guard = shutdown_state.index.lock();
+        if let Some(ref index_state) = *guard {
+            if let Err(e) = index_state.engine.save_snapshot() {
+                eprintln!("Warning: failed to save final snapshot: {e}");
+            }
+        }
+        drop(guard);
+        eprintln!("Shutdown complete.");
+
         Ok(())
     }
 }

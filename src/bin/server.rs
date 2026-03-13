@@ -56,6 +56,11 @@ fn parse_args() -> Args {
 
 #[tokio::main]
 async fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("FATAL PANIC: {info}");
+        eprintln!("Backtrace: {:?}", std::backtrace::Backtrace::force_capture());
+    }));
+
     let args = parse_args();
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port));
 

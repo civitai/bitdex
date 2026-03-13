@@ -166,6 +166,10 @@ impl DocStore {
         let tmp = path.with_extension("bin.tmp");
         std::fs::write(&tmp, &bytes)
             .map_err(|e| BitdexError::DocStore(format!("write field dict: {e}")))?;
+        std::fs::OpenOptions::new().write(true).open(&tmp)
+            .map_err(|e| BitdexError::DocStore(format!("open field dict for fsync: {e}")))?
+            .sync_all()
+            .map_err(|e| BitdexError::DocStore(format!("fsync field dict: {e}")))?;
         std::fs::rename(&tmp, &path)
             .map_err(|e| BitdexError::DocStore(format!("rename field dict: {e}")))?;
         Ok(())
@@ -435,6 +439,10 @@ impl DocStore {
         let tmp = path.with_extension("bin.tmp");
         std::fs::write(&tmp, &buf)
             .map_err(|e| BitdexError::DocStore(format!("write shard: {e}")))?;
+        std::fs::OpenOptions::new().write(true).open(&tmp)
+            .map_err(|e| BitdexError::DocStore(format!("open shard for fsync: {e}")))?
+            .sync_all()
+            .map_err(|e| BitdexError::DocStore(format!("fsync shard: {e}")))?;
         std::fs::rename(&tmp, path)
             .map_err(|e| BitdexError::DocStore(format!("rename shard: {e}")))?;
         Ok(())

@@ -74,6 +74,10 @@ impl BitmapFs {
             .map_err(|e| BitdexError::DocStore(format!("bitmap serialize: {e}")))?;
         std::fs::write(&tmp_path, &buf)
             .map_err(|e| BitdexError::DocStore(format!("write tmp: {e}")))?;
+        std::fs::OpenOptions::new().write(true).open(&tmp_path)
+            .map_err(|e| BitdexError::DocStore(format!("open tmp for fsync: {e}")))?
+            .sync_all()
+            .map_err(|e| BitdexError::DocStore(format!("fsync tmp: {e}")))?;
         std::fs::rename(&tmp_path, path)
             .map_err(|e| BitdexError::DocStore(format!("rename: {e}")))?;
         Ok(())
@@ -99,6 +103,10 @@ impl BitmapFs {
         }
         std::fs::write(&tmp_path, data)
             .map_err(|e| BitdexError::DocStore(format!("write tmp: {e}")))?;
+        std::fs::OpenOptions::new().write(true).open(&tmp_path)
+            .map_err(|e| BitdexError::DocStore(format!("open tmp for fsync: {e}")))?
+            .sync_all()
+            .map_err(|e| BitdexError::DocStore(format!("fsync tmp: {e}")))?;
         std::fs::rename(&tmp_path, path)
             .map_err(|e| BitdexError::DocStore(format!("rename: {e}")))?;
         Ok(())

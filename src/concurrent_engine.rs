@@ -1090,7 +1090,7 @@ impl ConcurrentEngine {
                     let doc_count = doc_batch.len();
                     if doc_count > 0 {
                         if let Err(e) = docstore.lock().put_batch(&doc_batch) {
-                            eprintln!("docstore batch write failed: {e}");
+                            panic!("docstore batch write failed: {e}");
                         }
                     }
 
@@ -1126,7 +1126,7 @@ impl ConcurrentEngine {
                 }
                 if !doc_batch.is_empty() {
                     if let Err(e) = docstore.lock().put_batch(&doc_batch) {
-                        eprintln!("docstore final batch write failed: {e}");
+                        panic!("docstore final batch write failed: {e}");
                     }
                 }
             })
@@ -1497,49 +1497,56 @@ impl ConcurrentEngine {
     /// bitmaps need clearing. This makes filter bitmaps always clean (no stale bits),
     /// eliminating the alive AND from the query hot path.
     pub fn delete(&self, id: u32) -> Result<()> {
-        // Read the doc to know which bitmaps to clear
-        let old_doc = self.docstore.lock().get(id)?;
+        self.in_flight.mark_in_flight(id);
 
-        let mut ops = Vec::new();
+        let result = (|| -> Result<()> {
+            // Read the doc to know which bitmaps to clear
+            let old_doc = self.docstore.lock().get(id)?;
 
-        // Generate filter/sort cleanup ops from the stored doc
-        if let Some(doc) = &old_doc {
-            for fc in &self.config.filter_fields {
-                if let Some(val) = doc.fields.get(&fc.name) {
-                    let arc_name = self.field_registry.get(&fc.name);
-                    crate::mutation::collect_filter_remove_ops(&mut ops, &arc_name, id, val);
+            let mut ops = Vec::new();
+
+            // Generate filter/sort cleanup ops from the stored doc
+            if let Some(doc) = &old_doc {
+                for fc in &self.config.filter_fields {
+                    if let Some(val) = doc.fields.get(&fc.name) {
+                        let arc_name = self.field_registry.get(&fc.name);
+                        crate::mutation::collect_filter_remove_ops(&mut ops, &arc_name, id, val);
+                    }
                 }
-            }
-            for sc in &self.config.sort_fields {
-                if let Some(val) = doc.fields.get(&sc.name) {
-                    if let crate::mutation::FieldValue::Single(v) = val {
-                        if let Some(sort_val) = crate::mutation::value_to_sort_u32(v) {
-                            let arc_name = self.field_registry.get(&sc.name);
-                            let num_bits = sc.bits as usize;
-                            for bit in 0..num_bits {
-                                if (sort_val >> bit) & 1 == 1 {
-                                    ops.push(MutationOp::SortClear {
-                                        field: arc_name.clone(),
-                                        bit_layer: bit,
-                                        slots: vec![id],
-                                    });
+                for sc in &self.config.sort_fields {
+                    if let Some(val) = doc.fields.get(&sc.name) {
+                        if let crate::mutation::FieldValue::Single(v) = val {
+                            if let Some(sort_val) = crate::mutation::value_to_sort_u32(v) {
+                                let arc_name = self.field_registry.get(&sc.name);
+                                let num_bits = sc.bits as usize;
+                                for bit in 0..num_bits {
+                                    if (sort_val >> bit) & 1 == 1 {
+                                        ops.push(MutationOp::SortClear {
+                                            field: arc_name.clone(),
+                                            bit_layer: bit,
+                                            slots: vec![id],
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Clear the alive bit last
-        ops.push(MutationOp::AliveRemove { slots: vec![id] });
+            // Clear the alive bit last
+            ops.push(MutationOp::AliveRemove { slots: vec![id] });
 
-        self.sender.send_batch(ops).map_err(|_| {
-            crate::error::BitdexError::CapacityExceeded(
-                "coalescer channel disconnected".to_string(),
-            )
-        })?;
-        Ok(())
+            self.sender.send_batch(ops).map_err(|_| {
+                crate::error::BitdexError::CapacityExceeded(
+                    "coalescer channel disconnected".to_string(),
+                )
+            })?;
+            Ok(())
+        })();
+
+        self.in_flight.clear_in_flight(id);
+        result
     }
 
     /// Execute a query from individual filter/sort/limit components.
@@ -1676,19 +1683,16 @@ impl ConcurrentEngine {
             None => return Ok(()), // no store, nothing to load
         };
 
-        // Clone current snapshot, apply loaded fields, publish immediately
-        let current: Arc<InnerEngine> = self.inner.load_full();
-        let mut updated = (*current).clone();
-        let mut any_loaded = false;
+        // Do all expensive disk I/O outside the rcu closure, collecting loaded data.
+        let mut loaded_filters: Vec<(String, HashMap<u64, RoaringBitmap>)> = Vec::new();
+        let mut loaded_values: Vec<(String, HashMap<u64, RoaringBitmap>, Vec<u64>)> = Vec::new();
+        let mut loaded_sort: Option<(String, Vec<RoaringBitmap>)> = None;
 
         // Full-field loads (low-cardinality)
         for name in &needed_filters {
             let t0 = std::time::Instant::now();
             let bitmaps = store.load_field(name)?;
             let count = bitmaps.len();
-            if let Some(field) = updated.filters.get_field_mut(name) {
-                field.load_field_complete(bitmaps.clone());
-            }
             eprintln!(
                 "Lazy-loaded filter '{}': {} values in {:.1}ms",
                 name,
@@ -1698,66 +1702,66 @@ impl ConcurrentEngine {
 
             let _ = self.lazy_tx.send(LazyLoad::FilterField {
                 name: name.clone(),
-                bitmaps,
+                bitmaps: bitmaps.clone(),
             });
             self.pending_filter_loads.lock().remove(name);
-            any_loaded = true;
+            loaded_filters.push((name.clone(), bitmaps));
         }
 
         // Per-value loads (high-cardinality multi_value)
-        for (field_name, values) in &needed_values {
-            // Filter out values already present in the snapshot
-            let missing: Vec<u64> = if let Some(field) = updated.filters.get_field(field_name) {
-                values
-                    .iter()
-                    .copied()
-                    .filter(|v| {
-                        // Load if the value doesn't exist OR if it exists but is unloaded
-                        match field.get_versioned(*v) {
-                            None => true,
-                            Some(vb) => !vb.is_loaded(),
-                        }
-                    })
-                    .collect()
-            } else {
-                values.clone()
-            };
+        // We need the current snapshot to determine which values are missing.
+        {
+            let current: Arc<InnerEngine> = self.inner.load_full();
+            for (field_name, values) in &needed_values {
+                // Filter out values already present in the snapshot
+                let missing: Vec<u64> = if let Some(field) = current.filters.get_field(field_name) {
+                    values
+                        .iter()
+                        .copied()
+                        .filter(|v| {
+                            // Load if the value doesn't exist OR if it exists but is unloaded
+                            match field.get_versioned(*v) {
+                                None => true,
+                                Some(vb) => !vb.is_loaded(),
+                            }
+                        })
+                        .collect()
+                } else {
+                    values.clone()
+                };
 
-            // Filter out values that don't exist on disk (positive existence set).
-            // This eliminates 30-50ms disk I/O per nonexistent value.
-            let missing: Vec<u64> = if let Some(ek) = self.existing_keys.get(field_name.as_str()) {
-                let keys = ek.load();
-                missing.into_iter().filter(|v| keys.contains(v)).collect()
-            } else {
-                missing
-            };
+                // Filter out values that don't exist on disk (positive existence set).
+                // This eliminates 30-50ms disk I/O per nonexistent value.
+                let missing: Vec<u64> = if let Some(ek) = self.existing_keys.get(field_name.as_str()) {
+                    let keys = ek.load();
+                    missing.into_iter().filter(|v| keys.contains(v)).collect()
+                } else {
+                    missing
+                };
 
-            if missing.is_empty() {
-                continue;
+                if missing.is_empty() {
+                    continue;
+                }
+
+                let t0 = std::time::Instant::now();
+                let loaded = store.load_field_values(field_name, &missing)?;
+                if loaded.is_empty() {
+                    continue;
+                }
+                let count = loaded.len();
+                eprintln!(
+                    "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
+                    field_name,
+                    count,
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+
+                let _ = self.lazy_tx.send(LazyLoad::FilterValues {
+                    field: field_name.clone(),
+                    values: loaded.clone(),
+                });
+                loaded_values.push((field_name.clone(), loaded, missing));
             }
-
-            let t0 = std::time::Instant::now();
-            let loaded = store.load_field_values(field_name, &missing)?;
-            if loaded.is_empty() {
-                continue;
-            }
-            let count = loaded.len();
-            if let Some(field) = updated.filters.get_field_mut(field_name) {
-                let requested_keys: Vec<u64> = missing.clone();
-                field.load_values(loaded.clone(), &requested_keys);
-            }
-            eprintln!(
-                "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
-                field_name,
-                count,
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
-
-            let _ = self.lazy_tx.send(LazyLoad::FilterValues {
-                field: field_name.clone(),
-                values: loaded,
-            });
-            any_loaded = true;
         }
 
         // Sort field loads
@@ -1772,9 +1776,6 @@ impl ConcurrentEngine {
                 .unwrap_or(32);
             if let Some(layers) = store.load_sort_layers(sort_name, bits)? {
                 let layer_count = layers.len();
-                if let Some(sf) = updated.sorts.get_field_mut(sort_name) {
-                    sf.load_layers(layers.clone());
-                }
                 eprintln!(
                     "Lazy-loaded sort '{}': {} layers in {:.1}ms",
                     sort_name,
@@ -1784,17 +1785,43 @@ impl ConcurrentEngine {
 
                 let _ = self.lazy_tx.send(LazyLoad::SortField {
                     name: sort_name.clone(),
-                    layers,
+                    layers: layers.clone(),
                 });
-                any_loaded = true;
+                loaded_sort = Some((sort_name.clone(), layers));
             }
 
             self.pending_sort_loads.lock().remove(sort_name);
         }
 
+        let any_loaded = !loaded_filters.is_empty() || !loaded_values.is_empty() || loaded_sort.is_some();
         if any_loaded {
-            // Publish updated snapshot immediately (queries can proceed)
-            self.inner.store(Arc::new(updated));
+            // Use rcu() to atomically apply loaded data without racing with
+            // the flush thread's store(). The closure may be called multiple
+            // times if the snapshot changes underneath, but it only does
+            // cheap in-memory modifications (no disk I/O).
+            self.inner.rcu(|current| {
+                let mut updated = (**current).clone();
+
+                for (name, bitmaps) in &loaded_filters {
+                    if let Some(field) = updated.filters.get_field_mut(name) {
+                        field.load_field_complete(bitmaps.clone());
+                    }
+                }
+
+                for (field_name, loaded, requested_keys) in &loaded_values {
+                    if let Some(field) = updated.filters.get_field_mut(field_name) {
+                        field.load_values(loaded.clone(), requested_keys);
+                    }
+                }
+
+                if let Some((ref sort_name, ref layers)) = loaded_sort {
+                    if let Some(sf) = updated.sorts.get_field_mut(sort_name) {
+                        sf.load_layers(layers.clone());
+                    }
+                }
+
+                updated
+            });
         }
 
         Ok(())
@@ -6105,5 +6132,212 @@ mod tests {
             100,
             "query should return all 100 records immediately after exit_loading_mode"
         );
+    }
+
+    // ---- Regression tests for reliability fixes ----
+
+    /// Regression test: delete() marks slots in-flight (just like put()),
+    /// preventing concurrent readers from seeing partially-applied delete
+    /// mutations.
+    #[test]
+    fn test_concurrent_put_delete_in_flight_race() {
+        let engine = Arc::new(ConcurrentEngine::new(test_config()).unwrap());
+
+        let num_docs = 20u32;
+        for id in 1..=num_docs {
+            engine
+                .put(
+                    id,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer((id % 3 + 1) as i64))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(id as i64 * 10))),
+                    ]),
+                )
+                .unwrap();
+        }
+        wait_for_flush(&engine, num_docs as u64, 1000);
+
+        let iterations = 100;
+        let query_error_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let put_handles: Vec<_> = (0..4)
+            .map(|t| {
+                let engine = Arc::clone(&engine);
+                thread::spawn(move || {
+                    let base = 100 + t * iterations;
+                    for i in 0..iterations {
+                        let id = (base + i) as u32;
+                        let val = (i % 5 + 1) as i64;
+                        engine
+                            .put(
+                                id,
+                                &make_doc(vec![
+                                    ("nsfwLevel", FieldValue::Single(Value::Integer(val))),
+                                    ("reactionCount", FieldValue::Single(Value::Integer(val * 10))),
+                                ]),
+                            )
+                            .ok();
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        let delete_handles: Vec<_> = (0..4)
+            .map(|t| {
+                let engine = Arc::clone(&engine);
+                thread::spawn(move || {
+                    let start = t * 5 + 1;
+                    for id in start..start + 5 {
+                        engine.delete(id as u32).ok();
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        let reader_handles: Vec<_> = (0..4)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let errors = Arc::clone(&query_error_count);
+                thread::spawn(move || {
+                    for _ in 0..200 {
+                        for val in 1..=5i64 {
+                            match engine.query(
+                                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(val))],
+                                None,
+                                1000,
+                            ) {
+                                Ok(_) => {}
+                                Err(_) => { errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                            }
+                        }
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        for h in put_handles { h.join().unwrap(); }
+        for h in delete_handles { h.join().unwrap(); }
+        for h in reader_handles { h.join().unwrap(); }
+
+        assert_eq!(query_error_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let mut engine = Arc::try_unwrap(engine).ok().expect("refcount 1");
+        engine.shutdown();
+
+        let expected_alive = 400u64;
+        assert_eq!(engine.alive_count(), expected_alive);
+
+        let mut all_found: Vec<i64> = Vec::new();
+        for val in 1..=5i64 {
+            let result = engine
+                .query(&[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(val))], None, 1000)
+                .unwrap();
+            all_found.extend_from_slice(&result.ids);
+        }
+        all_found.sort();
+        all_found.dedup();
+        assert_eq!(all_found.len(), expected_alive as usize);
+
+        for id in 1..=num_docs as i64 {
+            assert!(!all_found.contains(&id), "deleted slot {} found in filter query", id);
+        }
+    }
+
+    /// Regression test: lazy field loading via rcu() must not clobber
+    /// concurrent flush thread mutations.
+    #[test]
+    fn test_lazy_load_under_flush_pressure_rcu() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        // Phase 1: Create engine, insert seed data, save snapshot
+        {
+            let mut engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+            for i in 1..=10u32 {
+                engine
+                    .put(
+                        i,
+                        &make_doc(vec![
+                            ("nsfwLevel", FieldValue::Single(Value::Integer((i % 3 + 1) as i64))),
+                            ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 100))),
+                        ]),
+                    )
+                    .unwrap();
+            }
+            engine.shutdown();
+            assert_eq!(engine.alive_count(), 10);
+            engine.save_snapshot().unwrap();
+        }
+
+        // Phase 2: Restore into new engine, concurrent lazy loads + mutations
+        {
+            let engine = Arc::new(
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap(),
+            );
+            assert_eq!(engine.alive_count(), 10);
+
+            let mutation_ids: Vec<u32> = (20..30).collect();
+            let query_engine = Arc::clone(&engine);
+            let mutate_engine = Arc::clone(&engine);
+
+            let query_handle = thread::spawn(move || {
+                for _ in 0..50 {
+                    let _ = query_engine.query(
+                        &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                        Some(&SortClause { field: "reactionCount".to_string(), direction: SortDirection::Desc }),
+                        100,
+                    );
+                    thread::yield_now();
+                }
+            });
+
+            let mutate_handle = thread::spawn(move || {
+                for &id in &mutation_ids {
+                    mutate_engine
+                        .put(
+                            id,
+                            &make_doc(vec![
+                                ("nsfwLevel", FieldValue::Single(Value::Integer(5))),
+                                ("reactionCount", FieldValue::Single(Value::Integer(id as i64 * 10))),
+                            ]),
+                        )
+                        .unwrap();
+                    thread::yield_now();
+                }
+            });
+
+            query_handle.join().unwrap();
+            mutate_handle.join().unwrap();
+            wait_for_flush(&engine, 20, 2000);
+
+            let result = engine
+                .query(&[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(5))], None, 100)
+                .unwrap();
+            let mut found_ids: Vec<i64> = result.ids.clone();
+            found_ids.sort();
+            let expected_ids: Vec<i64> = (20..30).map(|x| x as i64).collect();
+            assert_eq!(found_ids, expected_ids, "all 10 mutations must survive lazy load");
+
+            let result = engine
+                .query(&[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))], None, 100)
+                .unwrap();
+            assert!(!result.ids.is_empty(), "seed data should be queryable after lazy load");
+
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(5))],
+                    Some(&SortClause { field: "reactionCount".to_string(), direction: SortDirection::Desc }),
+                    100,
+                )
+                .unwrap();
+            assert_eq!(result.ids.len(), 10);
+            assert_eq!(result.ids[0], 29, "slot 29 should be first in desc sort");
+        }
     }
 }
