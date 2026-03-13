@@ -341,6 +341,11 @@ impl FilterIndex {
         self.fields.insert(name, Arc::new(FilterField::new(config)));
     }
 
+    /// Remove a filter field by name. Returns true if the field existed.
+    pub fn remove_field(&mut self, name: &str) -> bool {
+        self.fields.remove(name).is_some()
+    }
+
     /// Get a reference to a filter field by name.
     pub fn get_field(&self, name: &str) -> Option<&FilterField> {
         self.fields.get(name).map(|f| f.as_ref())

@@ -3,7 +3,7 @@
 //! Feature-gated behind `server`. Provides `BitdexServer` which starts blank
 //! and creates indexes via API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,29 +32,212 @@ use crate::query::{BitdexQuery, Value};
 // Server state
 // ---------------------------------------------------------------------------
 
-/// Load status for an index.
+// ---------------------------------------------------------------------------
+// Task Registry — replaces the old LoadStatus enum
+// ---------------------------------------------------------------------------
+
+type TaskId = u64;
+
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "status")]
-pub enum LoadStatus {
-    #[serde(rename = "idle")]
-    Idle,
-    #[serde(rename = "loading")]
-    Loading {
-        records_loaded: u64,
-        elapsed_secs: f64,
-    },
-    #[serde(rename = "saving")]
-    Saving {
-        records_loaded: u64,
-        elapsed_secs: f64,
-    },
-    #[serde(rename = "complete")]
-    Complete {
-        records_loaded: u64,
-        elapsed_secs: f64,
-    },
-    #[serde(rename = "error")]
-    Error { message: String },
+#[serde(rename_all = "snake_case")]
+pub enum TaskType {
+    Load,
+    Rebuild,
+    AddFields,
+    RemoveFields,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Running,
+    Saving,
+    Complete,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskProgress {
+    pub records_processed: u64,
+    pub total_estimate: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskInfo {
+    pub task_id: TaskId,
+    pub task_type: TaskType,
+    pub status: TaskStatus,
+    pub progress: TaskProgress,
+    pub elapsed_secs: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskSnapshot {
+    pub active: Option<TaskInfo>,
+    pub history: Vec<TaskInfo>,
+}
+
+struct ActiveTask {
+    id: TaskId,
+    task_type: TaskType,
+    status: TaskStatus,
+    started_at: Instant,
+}
+
+struct RegistryState {
+    active: Option<ActiveTask>,
+    history: VecDeque<TaskInfo>,
+}
+
+pub struct TaskRegistry {
+    next_id: AtomicU64,
+    active_progress: Arc<AtomicU64>,
+    state: Mutex<RegistryState>,
+}
+
+fn build_task_info(active: &ActiveTask, progress: u64) -> TaskInfo {
+    TaskInfo {
+        task_id: active.id,
+        task_type: active.task_type.clone(),
+        status: active.status.clone(),
+        progress: TaskProgress {
+            records_processed: progress,
+            total_estimate: None,
+        },
+        elapsed_secs: active.started_at.elapsed().as_secs_f64(),
+        result: None,
+        error: if active.status == TaskStatus::Error {
+            Some("Task in error state".to_string())
+        } else {
+            None
+        },
+    }
+}
+
+impl TaskRegistry {
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            active_progress: Arc::new(AtomicU64::new(0)),
+            state: Mutex::new(RegistryState {
+                active: None,
+                history: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// Try to start a new task. Returns (task_id, progress_counter) on success,
+    /// or the active TaskInfo on conflict.
+    pub fn try_start(&self, task_type: TaskType) -> Result<(TaskId, Arc<AtomicU64>), TaskInfo> {
+        let mut state = self.state.lock();
+        if let Some(ref active) = state.active {
+            let progress = self.active_progress.load(Ordering::Acquire);
+            return Err(build_task_info(active, progress));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.active_progress.store(0, Ordering::Release);
+        state.active = Some(ActiveTask {
+            id,
+            task_type,
+            status: TaskStatus::Running,
+            started_at: Instant::now(),
+        });
+        Ok((id, Arc::clone(&self.active_progress)))
+    }
+
+    pub fn set_saving(&self, task_id: TaskId) {
+        let mut state = self.state.lock();
+        if let Some(ref mut active) = state.active {
+            if active.id == task_id {
+                active.status = TaskStatus::Saving;
+            }
+        }
+    }
+
+    pub fn set_complete(&self, task_id: TaskId, result: Option<serde_json::Value>) {
+        let mut state = self.state.lock();
+        if let Some(active) = state.active.take() {
+            if active.id == task_id {
+                let progress = self.active_progress.load(Ordering::Acquire);
+                let mut info = build_task_info(&active, progress);
+                info.status = TaskStatus::Complete;
+                info.result = result;
+                state.history.push_front(info);
+                if state.history.len() > 20 {
+                    state.history.pop_back();
+                }
+            } else {
+                // Put it back — wrong task_id
+                state.active = Some(active);
+            }
+        }
+    }
+
+    pub fn set_error(&self, task_id: TaskId, message: String) {
+        let mut state = self.state.lock();
+        if let Some(active) = state.active.take() {
+            if active.id == task_id {
+                let progress = self.active_progress.load(Ordering::Acquire);
+                let mut info = build_task_info(&active, progress);
+                info.status = TaskStatus::Error;
+                info.error = Some(message);
+                state.history.push_front(info);
+                if state.history.len() > 20 {
+                    state.history.pop_back();
+                }
+            } else {
+                state.active = Some(active);
+            }
+        }
+    }
+
+    pub fn get(&self, task_id: TaskId) -> Option<TaskInfo> {
+        let state = self.state.lock();
+        // Check active first
+        if let Some(ref active) = state.active {
+            if active.id == task_id {
+                let progress = self.active_progress.load(Ordering::Acquire);
+                return Some(build_task_info(active, progress));
+            }
+        }
+        // Check history
+        state.history.iter().find(|t| t.task_id == task_id).cloned()
+    }
+
+    pub fn snapshot(&self) -> TaskSnapshot {
+        let state = self.state.lock();
+        let active = state.active.as_ref().map(|a| {
+            let progress = self.active_progress.load(Ordering::Acquire);
+            build_task_info(a, progress)
+        });
+        TaskSnapshot {
+            active,
+            history: state.history.iter().cloned().collect(),
+        }
+    }
+}
+
+struct TaskGuard {
+    tasks: Arc<TaskRegistry>,
+    task_id: Option<TaskId>,
+}
+
+impl TaskGuard {
+    fn defuse(&mut self) {
+        self.task_id.take();
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.task_id {
+            self.tasks.set_error(id, "Task panicked".to_string());
+        }
+    }
 }
 
 /// Persisted index definition (saved as config.json in the index directory).
@@ -79,9 +262,7 @@ struct IndexState {
     definition: IndexDefinition,
     reverse_maps: Arc<ReverseStringMaps>,
     schema_registry: Arc<SchemaRegistry>,
-    load_progress: Arc<AtomicU64>,
-    load_status: Arc<Mutex<LoadStatus>>,
-    load_started_at: Arc<Mutex<Option<Instant>>>,
+    tasks: Arc<TaskRegistry>,
 }
 
 /// Shared application state.
@@ -410,6 +591,16 @@ struct AddFieldsRequest {
     skip_validation: bool,
 }
 
+#[derive(Deserialize)]
+struct RemoveFieldsRequest {
+    #[serde(default)]
+    filter_fields: Vec<String>,
+    #[serde(default)]
+    sort_fields: Vec<String>,
+    #[serde(default = "default_save_snapshot")]
+    save_snapshot: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Public server entry point
 // ---------------------------------------------------------------------------
@@ -474,8 +665,10 @@ impl BitdexServer {
             .route("/api/indexes/{name}/stats", get(handle_stats))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
-            .route("/api/indexes/{name}/fields", post(handle_add_fields))
+            .route("/api/indexes/{name}/fields", post(handle_add_fields).delete(handle_remove_fields))
+            .route("/api/indexes/{name}/tasks", get(handle_list_tasks))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
+            .route("/api/tasks/{task_id}", get(handle_get_task))
             // Cursors
             .route("/api/indexes/{name}/cursors", get(handle_list_cursors))
             .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
@@ -564,14 +757,17 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             def.name, alive
         );
 
-        let load_status = if alive > 0 {
-            LoadStatus::Complete {
-                records_loaded: alive,
-                elapsed_secs: 0.0,
+        let tasks = Arc::new(TaskRegistry::new());
+        // If there are existing records, add a synthetic "complete" entry to history
+        if alive > 0 {
+            // Use try_start + set_complete to put a history entry
+            if let Ok((tid, progress)) = tasks.try_start(TaskType::Load) {
+                progress.store(alive, Ordering::Release);
+                tasks.set_complete(tid, Some(serde_json::json!({
+                    "records_loaded": alive,
+                })));
             }
-        } else {
-            LoadStatus::Idle
-        };
+        }
 
         let schema_registry = engine.build_schema_registry();
 
@@ -580,9 +776,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             definition: def,
             reverse_maps: Arc::new(reverse_maps),
             schema_registry: Arc::new(schema_registry),
-            load_progress: Arc::new(AtomicU64::new(alive)),
-            load_status: Arc::new(Mutex::new(load_status)),
-            load_started_at: Arc::new(Mutex::new(None)),
+            tasks,
         });
 
         // Only restore the first index (single-index for now)
@@ -664,14 +858,16 @@ fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
     eprintln!("  RSS final:     {:.2} GB", rss_final as f64 / 1e9);
     eprintln!("Server will now start with lazy bitmap loading.\n");
 
-    // Update load status so the API reflects the rebuild
+    // Update task registry so the API reflects the rebuild
     let guard = state.index.lock();
     if let Some(idx) = guard.as_ref() {
-        idx.load_progress.store(total_docs, Ordering::Release);
-        *idx.load_status.lock() = LoadStatus::Complete {
-            records_loaded: total_docs,
-            elapsed_secs: total_elapsed,
-        };
+        if let Ok((tid, progress)) = idx.tasks.try_start(TaskType::Rebuild) {
+            progress.store(total_docs, Ordering::Release);
+            idx.tasks.set_complete(tid, Some(serde_json::json!({
+                "records_loaded": total_docs,
+                "elapsed_secs": total_elapsed,
+            })));
+        }
     }
 
     Ok(())
@@ -854,9 +1050,7 @@ async fn handle_create_index(
         definition,
         reverse_maps: Arc::new(reverse_maps),
         schema_registry: Arc::new(schema_registry),
-        load_progress: Arc::new(AtomicU64::new(0)),
-        load_status: Arc::new(Mutex::new(LoadStatus::Idle)),
-        load_started_at: Arc::new(Mutex::new(None)),
+        tasks: Arc::new(TaskRegistry::new()),
     });
 
     (
@@ -914,13 +1108,13 @@ async fn handle_delete_index(
         ).into_response();
     }
 
-    // Check if loading or saving
+    // Check if a task is active
     if let Some(idx) = guard.as_ref() {
-        let status = idx.load_status.lock();
-        if matches!(*status, LoadStatus::Loading { .. } | LoadStatus::Saving { .. }) {
+        let snap = idx.tasks.snapshot();
+        if snap.active.is_some() {
             return (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "Cannot delete index while loading or saving"})),
+                Json(serde_json::json!({"error": "Cannot delete index while a task is running"})),
             ).into_response();
         }
     }
@@ -948,28 +1142,14 @@ async fn handle_load(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<LoadRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema, load_progress, load_status, load_started_at) = {
+    let (engine, schema, tasks) = {
         let guard = state.index.lock();
         match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => {
-                // Check if already loading or saving
-                {
-                    let status = idx.load_status.lock();
-                    if matches!(*status, LoadStatus::Loading { .. } | LoadStatus::Saving { .. }) {
-                        return (
-                            StatusCode::CONFLICT,
-                            Json(serde_json::json!({"error": "Already loading or saving"})),
-                        ).into_response();
-                    }
-                }
-                (
-                    Arc::clone(&idx.engine),
-                    idx.definition.data_schema.clone(),
-                    Arc::clone(&idx.load_progress),
-                    Arc::clone(&idx.load_status),
-                    Arc::clone(&idx.load_started_at),
-                )
-            }
+            Some(idx) if idx.definition.name == name => (
+                Arc::clone(&idx.engine),
+                idx.definition.data_schema.clone(),
+                Arc::clone(&idx.tasks),
+            ),
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -987,12 +1167,17 @@ async fn handle_load(
         ).into_response();
     }
 
-    // Reset progress and record start time
-    load_progress.store(0, Ordering::Release);
-    *load_started_at.lock() = Some(Instant::now());
-    *load_status.lock() = LoadStatus::Loading {
-        records_loaded: 0,
-        elapsed_secs: 0.0,
+    let (task_id, progress) = match tasks.try_start(TaskType::Load) {
+        Ok(v) => v,
+        Err(active_info) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "A task is already running",
+                    "active_task": serde_json::to_value(&active_info).unwrap(),
+                })),
+            ).into_response();
+        }
     };
 
     let limit = req.limit;
@@ -1001,11 +1186,12 @@ async fn handle_load(
     let docstore_batch_size = req.docstore_batch_size;
     let max_writer_threads = req.max_writer_threads;
     let save_snapshot = req.save_snapshot;
-    let progress = Arc::clone(&load_progress);
-    let status = Arc::clone(&load_status);
 
-    // Spawn blocking loading task
+    // Spawn blocking loading task with TaskGuard for panic safety
+    let tasks_clone = Arc::clone(&tasks);
     tokio::task::spawn_blocking(move || {
+        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
+
         // Enter loading mode
         engine.enter_loading_mode();
 
@@ -1017,10 +1203,7 @@ async fn handle_load(
                     // Combined exit-loading + save + unload: saves directly from
                     // staging without an intermediate full publish, eliminating the
                     // memory spike from staging.clone() at scale.
-                    *status.lock() = LoadStatus::Saving {
-                        records_loaded: stats.records_loaded,
-                        elapsed_secs: stats.elapsed.as_secs_f64(),
-                    };
+                    guard.tasks.set_saving(task_id);
 
                     let snap_start = Instant::now();
                     if let Err(e) = engine.exit_loading_mode_and_save_unload() {
@@ -1038,23 +1221,23 @@ async fn handle_load(
 
                 eprintln!("Load complete: {} records alive", alive);
 
-                *status.lock() = LoadStatus::Complete {
-                    records_loaded: stats.records_loaded,
-                    elapsed_secs: stats.elapsed.as_secs_f64(),
-                };
+                guard.tasks.set_complete(task_id, Some(serde_json::json!({
+                    "records_loaded": stats.records_loaded,
+                    "elapsed_secs": stats.elapsed.as_secs_f64(),
+                })));
+                guard.defuse();
             }
             Err(e) => {
                 engine.exit_loading_mode();
-                *status.lock() = LoadStatus::Error {
-                    message: e.to_string(),
-                };
+                guard.tasks.set_error(task_id, e.to_string());
+                guard.defuse();
             }
         }
     });
 
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({"status": "loading"})),
+        Json(serde_json::json!({"task_id": task_id})),
     ).into_response()
 }
 
@@ -1065,31 +1248,45 @@ async fn handle_load_status(
     let guard = state.index.lock();
     match guard.as_ref() {
         Some(idx) if idx.definition.name == name => {
-            let status = idx.load_status.lock().clone();
-            // If loading or saving, update elapsed from live timer
-            let status = match status {
-                LoadStatus::Loading { .. } => {
-                    let loaded = idx.load_progress.load(Ordering::Acquire);
-                    let elapsed = idx.load_started_at.lock()
-                        .map(|t| t.elapsed().as_secs_f64())
-                        .unwrap_or(0.0);
-                    LoadStatus::Loading {
-                        records_loaded: loaded,
-                        elapsed_secs: elapsed,
-                    }
+            let snap = idx.tasks.snapshot();
+            // Map task registry state to old LoadStatus JSON shape for backward compat
+            let status_json = if let Some(ref active) = snap.active {
+                match active.status {
+                    TaskStatus::Running => serde_json::json!({
+                        "status": "loading",
+                        "records_loaded": active.progress.records_processed,
+                        "elapsed_secs": active.elapsed_secs,
+                    }),
+                    TaskStatus::Saving => serde_json::json!({
+                        "status": "saving",
+                        "records_loaded": active.progress.records_processed,
+                        "elapsed_secs": active.elapsed_secs,
+                    }),
+                    _ => serde_json::json!({"status": "idle"}),
                 }
-                LoadStatus::Saving { records_loaded, .. } => {
-                    let elapsed = idx.load_started_at.lock()
-                        .map(|t| t.elapsed().as_secs_f64())
-                        .unwrap_or(0.0);
-                    LoadStatus::Saving {
-                        records_loaded,
-                        elapsed_secs: elapsed,
+            } else if let Some(recent) = snap.history.first() {
+                match recent.status {
+                    TaskStatus::Complete => {
+                        let records = recent.result.as_ref()
+                            .and_then(|r| r.get("records_loaded"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(recent.progress.records_processed);
+                        serde_json::json!({
+                            "status": "complete",
+                            "records_loaded": records,
+                            "elapsed_secs": recent.elapsed_secs,
+                        })
                     }
+                    TaskStatus::Error => serde_json::json!({
+                        "status": "error",
+                        "message": recent.error.as_deref().unwrap_or("Unknown error"),
+                    }),
+                    _ => serde_json::json!({"status": "idle"}),
                 }
-                other => other,
+            } else {
+                serde_json::json!({"status": "idle"})
             };
-            Json(serde_json::to_value(&status).unwrap()).into_response()
+            Json(status_json).into_response()
         }
         _ => (
             StatusCode::NOT_FOUND,
@@ -1474,28 +1671,14 @@ async fn handle_rebuild(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<RebuildRequest>,
 ) -> impl IntoResponse {
-    let (engine, config, load_progress, load_status, load_started_at) = {
+    let (engine, config, tasks) = {
         let guard = state.index.lock();
         match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => {
-                // Check if already loading, saving, or rebuilding
-                {
-                    let status = idx.load_status.lock();
-                    if matches!(*status, LoadStatus::Loading { .. } | LoadStatus::Saving { .. }) {
-                        return (
-                            StatusCode::CONFLICT,
-                            Json(serde_json::json!({"error": "Already loading, saving, or rebuilding"})),
-                        ).into_response();
-                    }
-                }
-                (
-                    Arc::clone(&idx.engine),
-                    idx.definition.config.clone(),
-                    Arc::clone(&idx.load_progress),
-                    Arc::clone(&idx.load_status),
-                    Arc::clone(&idx.load_started_at),
-                )
-            }
+            Some(idx) if idx.definition.name == name => (
+                Arc::clone(&idx.engine),
+                idx.definition.config.clone(),
+                Arc::clone(&idx.tasks),
+            ),
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -1527,34 +1710,31 @@ async fn handle_rebuild(
         }
     }
 
-    // Reset progress and record start time
-    load_progress.store(0, Ordering::Release);
-    *load_started_at.lock() = Some(Instant::now());
-    *load_status.lock() = LoadStatus::Loading {
-        records_loaded: 0,
-        elapsed_secs: 0.0,
+    let (task_id, progress) = match tasks.try_start(TaskType::Rebuild) {
+        Ok(v) => v,
+        Err(active_info) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "A task is already running",
+                    "active_task": serde_json::to_value(&active_info).unwrap(),
+                })),
+            ).into_response();
+        }
     };
 
     let sort_fields = req.sort_fields;
     let filter_fields = req.filter_fields;
     let save = req.save_snapshot;
-    let progress = Arc::clone(&load_progress);
-    let status = Arc::clone(&load_status);
 
-    // Spawn blocking rebuild task
+    let tasks_clone = Arc::clone(&tasks);
     tokio::task::spawn_blocking(move || {
+        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
+
         match engine.rebuild_fields_from_docstore(sort_fields, filter_fields, progress.clone()) {
             Ok((slots, fields)) => {
-                let elapsed = {
-                    let started = load_started_at.lock();
-                    started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
-                };
-
                 if save {
-                    *status.lock() = LoadStatus::Saving {
-                        records_loaded: slots,
-                        elapsed_secs: elapsed,
-                    };
+                    guard.tasks.set_saving(task_id);
 
                     let snap_start = Instant::now();
                     if let Err(e) = engine.save_and_unload() {
@@ -1564,29 +1744,24 @@ async fn handle_rebuild(
                     }
                 }
 
-                let final_elapsed = {
-                    let started = load_started_at.lock();
-                    started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
-                };
-                *status.lock() = LoadStatus::Complete {
-                    records_loaded: slots,
-                    elapsed_secs: final_elapsed,
-                };
+                guard.tasks.set_complete(task_id, Some(serde_json::json!({
+                    "records_loaded": slots,
+                    "fields": fields,
+                })));
+                guard.defuse();
 
-                eprintln!("rebuild: done — {} slots, {} fields in {:.1}s",
-                    slots, fields.len(), final_elapsed);
+                eprintln!("rebuild: done — {} slots, {} fields", slots, fields.len());
             }
             Err(e) => {
-                *status.lock() = LoadStatus::Error {
-                    message: format!("Rebuild failed: {}", e),
-                };
+                guard.tasks.set_error(task_id, format!("Rebuild failed: {}", e));
+                guard.defuse();
             }
         }
     });
 
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({"status": "rebuilding"})),
+        Json(serde_json::json!({"task_id": task_id})),
     ).into_response()
 }
 
@@ -1606,21 +1781,10 @@ async fn handle_add_fields(
         ).into_response();
     }
 
-    let (engine, load_progress, load_status, load_started_at) = {
+    let (engine, tasks) = {
         let mut guard = state.index.lock();
         match guard.as_mut() {
             Some(idx) if idx.definition.name == name => {
-                // Check if busy
-                {
-                    let status = idx.load_status.lock();
-                    if matches!(*status, LoadStatus::Loading { .. } | LoadStatus::Saving { .. }) {
-                        return (
-                            StatusCode::CONFLICT,
-                            Json(serde_json::json!({"error": "Already loading, saving, or rebuilding"})),
-                        ).into_response();
-                    }
-                }
-
                 // Validate no duplicate field names with existing config
                 for fc in &req.filter_fields {
                     if idx.definition.config.filter_fields.iter().any(|f| f.name == fc.name) {
@@ -1662,9 +1826,7 @@ async fn handle_add_fields(
 
                 (
                     Arc::clone(&idx.engine),
-                    Arc::clone(&idx.load_progress),
-                    Arc::clone(&idx.load_status),
-                    Arc::clone(&idx.load_started_at),
+                    Arc::clone(&idx.tasks),
                 )
             }
             _ => {
@@ -1702,33 +1864,31 @@ async fn handle_add_fields(
         }
     }
 
-    // Reset progress
-    load_progress.store(0, Ordering::Release);
-    *load_started_at.lock() = Some(Instant::now());
-    *load_status.lock() = LoadStatus::Loading {
-        records_loaded: 0,
-        elapsed_secs: 0.0,
+    let (task_id, progress) = match tasks.try_start(TaskType::AddFields) {
+        Ok(v) => v,
+        Err(active_info) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "A task is already running",
+                    "active_task": serde_json::to_value(&active_info).unwrap(),
+                })),
+            ).into_response();
+        }
     };
 
     let filter_fields = req.filter_fields;
     let sort_fields = req.sort_fields;
     let save = req.save_snapshot;
-    let progress = Arc::clone(&load_progress);
-    let status = Arc::clone(&load_status);
 
+    let tasks_clone = Arc::clone(&tasks);
     tokio::task::spawn_blocking(move || {
+        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
+
         match engine.add_fields_from_docstore(filter_fields, sort_fields, progress) {
             Ok((slots, fields)) => {
-                let elapsed = {
-                    let started = load_started_at.lock();
-                    started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
-                };
-
                 if save {
-                    *status.lock() = LoadStatus::Saving {
-                        records_loaded: slots,
-                        elapsed_secs: elapsed,
-                    };
+                    guard.tasks.set_saving(task_id);
 
                     let snap_start = Instant::now();
                     if let Err(e) = engine.save_and_unload() {
@@ -1738,29 +1898,185 @@ async fn handle_add_fields(
                     }
                 }
 
-                let final_elapsed = {
-                    let started = load_started_at.lock();
-                    started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
-                };
-                *status.lock() = LoadStatus::Complete {
-                    records_loaded: slots,
-                    elapsed_secs: final_elapsed,
-                };
+                guard.tasks.set_complete(task_id, Some(serde_json::json!({
+                    "records_loaded": slots,
+                    "fields": fields,
+                })));
+                guard.defuse();
 
-                eprintln!("add_fields: done — {} slots, {} fields in {:.1}s",
-                    slots, fields.len(), final_elapsed);
+                eprintln!("add_fields: done — {} slots, {} fields", slots, fields.len());
             }
             Err(e) => {
-                *status.lock() = LoadStatus::Error {
-                    message: format!("Add fields failed: {}", e),
-                };
+                guard.tasks.set_error(task_id, format!("Add fields failed: {}", e));
+                guard.defuse();
             }
         }
     });
 
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({"status": "adding_fields"})),
+        Json(serde_json::json!({"task_id": task_id})),
+    ).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Remove Fields
+// ---------------------------------------------------------------------------
+
+async fn handle_remove_fields(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<RemoveFieldsRequest>,
+) -> impl IntoResponse {
+    if req.filter_fields.is_empty() && req.sort_fields.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "No fields specified"})),
+        ).into_response();
+    }
+
+    let (engine, tasks) = {
+        let mut guard = state.index.lock();
+        match guard.as_mut() {
+            Some(idx) if idx.definition.name == name => {
+                // Validate fields exist in current config
+                for fname in &req.filter_fields {
+                    if !idx.definition.config.filter_fields.iter().any(|f| &f.name == fname) {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": format!("Filter field '{}' not found in config", fname)})),
+                        ).into_response();
+                    }
+                }
+                for sname in &req.sort_fields {
+                    if !idx.definition.config.sort_fields.iter().any(|f| &f.name == sname) {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": format!("Sort field '{}' not found in config", sname)})),
+                        ).into_response();
+                    }
+                }
+
+                // Update config: remove fields
+                for fname in &req.filter_fields {
+                    idx.definition.config.filter_fields.retain(|f| &f.name != fname);
+                }
+                for sname in &req.sort_fields {
+                    idx.definition.config.sort_fields.retain(|f| &f.name != sname);
+                }
+
+                // Save updated config.json
+                let index_dir = state.data_dir.join("indexes").join(&name);
+                let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
+                if let Err(e) = std::fs::write(index_dir.join("config.json"), &config_json) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Failed to persist config: {e}")})),
+                    ).into_response();
+                }
+
+                (
+                    Arc::clone(&idx.engine),
+                    Arc::clone(&idx.tasks),
+                )
+            }
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let (task_id, _progress) = match tasks.try_start(TaskType::RemoveFields) {
+        Ok(v) => v,
+        Err(active_info) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "A task is already running",
+                    "active_task": serde_json::to_value(&active_info).unwrap(),
+                })),
+            ).into_response();
+        }
+    };
+
+    let filter_fields = req.filter_fields;
+    let sort_fields = req.sort_fields;
+    let save = req.save_snapshot;
+
+    let tasks_clone = Arc::clone(&tasks);
+    tokio::task::spawn_blocking(move || {
+        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
+
+        match engine.remove_fields(&filter_fields, &sort_fields) {
+            Ok(removed) => {
+                if save {
+                    guard.tasks.set_saving(task_id);
+
+                    let snap_start = Instant::now();
+                    if let Err(e) = engine.save_and_unload() {
+                        eprintln!("remove_fields: save_and_unload failed: {e}");
+                    } else {
+                        eprintln!("remove_fields: save_and_unload in {:.1}s", snap_start.elapsed().as_secs_f64());
+                    }
+                }
+
+                guard.tasks.set_complete(task_id, Some(serde_json::json!({
+                    "removed": removed,
+                })));
+                guard.defuse();
+
+                eprintln!("remove_fields: done — removed {:?}", removed);
+            }
+            Err(e) => {
+                guard.tasks.set_error(task_id, format!("Remove fields failed: {}", e));
+                guard.defuse();
+            }
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"task_id": task_id})),
+    ).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Task status
+// ---------------------------------------------------------------------------
+
+async fn handle_list_tasks(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let guard = state.index.lock();
+    match guard.as_ref() {
+        Some(idx) if idx.definition.name == name => {
+            let snap = idx.tasks.snapshot();
+            Json(serde_json::to_value(&snap).unwrap()).into_response()
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+        ).into_response(),
+    }
+}
+
+async fn handle_get_task(
+    State(state): State<SharedState>,
+    AxumPath(task_id): AxumPath<u64>,
+) -> impl IntoResponse {
+    let guard = state.index.lock();
+    if let Some(idx) = guard.as_ref() {
+        if let Some(info) = idx.tasks.get(task_id) {
+            return Json(serde_json::to_value(&info).unwrap()).into_response();
+        }
+    }
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": format!("Task {} not found", task_id)})),
     ).into_response()
 }
 

@@ -4169,6 +4169,39 @@ impl ConcurrentEngine {
         Ok(missing)
     }
 
+    /// Remove filter and/or sort fields from the engine.
+    ///
+    /// Removes the fields from the in-memory staging snapshot and publishes.
+    /// Does NOT delete bitmap files on disk — orphaned files are overwritten
+    /// on next `save_snapshot` or ignored on boot (field not in config = not loaded).
+    /// The caller (server) is responsible for updating the persisted config.json.
+    pub fn remove_fields(
+        &self,
+        filter_names: &[String],
+        sort_names: &[String],
+    ) -> Result<Vec<String>> {
+        let mut staging = self.clone_staging();
+        let mut removed = Vec::new();
+
+        for name in filter_names {
+            if staging.filters.remove_field(name) {
+                removed.push(name.clone());
+            }
+        }
+        for name in sort_names {
+            if staging.sorts.remove_field(name) {
+                removed.push(name.clone());
+            }
+        }
+
+        if !removed.is_empty() {
+            self.publish_staging(staging);
+            eprintln!("remove_fields: removed {:?}", removed);
+        }
+
+        Ok(removed)
+    }
+
     /// Shutdown the flush and merge threads gracefully.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);

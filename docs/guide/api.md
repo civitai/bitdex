@@ -165,7 +165,7 @@ Deletes the index and removes its directory from disk.
 
 **Errors:**
 - `404` — Index not found
-- `409` — Cannot delete while loading or saving
+- `409` — Cannot delete while a task is running
 
 ---
 
@@ -177,7 +177,7 @@ Deletes the index and removes its directory from disk.
 POST /api/indexes/{name}/load
 ```
 
-Loads documents from a newline-delimited JSON file on disk. Runs asynchronously — returns immediately with `202 Accepted`. Poll `/load/status` for progress.
+Loads documents from a newline-delimited JSON file on disk. Runs asynchronously — returns immediately with `202 Accepted` and a task ID. Poll the task system for progress.
 
 **Request body:**
 
@@ -202,23 +202,23 @@ Loads documents from a newline-delimited JSON file on disk. Runs asynchronously 
 **Response:** `202 Accepted`
 
 ```json
-{ "status": "loading" }
+{ "task_id": 1 }
 ```
 
 **Errors:**
 - `400` — File not found
 - `404` — Index not found
-- `409` — Already loading or saving
+- `409` — Another task is already running (returns the active task info)
 
 ---
 
-### Load Status
+### Load Status (backward compat)
 
 ```
 GET /api/indexes/{name}/load/status
 ```
 
-Returns the current state of the loading pipeline.
+Returns the current state of the index in the legacy format. Proxies to the task registry internally — any active task type maps to the equivalent legacy status.
 
 **Response:** `200 OK`
 
@@ -630,7 +630,7 @@ Clears all unified cache entries. Cache will rebuild on subsequent queries.
 POST /api/indexes/{name}/rebuild
 ```
 
-Reconstructs sort and/or filter bitmaps from the on-disk document store. Runs asynchronously. Poll `/load/status` for progress. Uses the same `build_all_from_docstore()` pipeline as the `--rebuild` CLI flag, but supports selective field rebuilds.
+Reconstructs sort and/or filter bitmaps from the on-disk document store. Runs asynchronously — returns a task ID. Uses the same `build_all_from_docstore()` pipeline as the `--rebuild` CLI flag, but supports selective field rebuilds.
 
 **Request body:**
 
@@ -653,13 +653,177 @@ If both `sort_fields` and `filter_fields` are null/omitted, ALL fields are rebui
 **Response:** `202 Accepted`
 
 ```json
-{ "status": "rebuilding" }
+{ "task_id": 2 }
 ```
 
 **Errors:**
 - `400` — Unknown field name
 - `404` — Index not found
-- `409` — Already loading, saving, or rebuilding
+- `409` — Another task is already running (returns the active task info)
+
+---
+
+### Add Fields
+
+```
+POST /api/indexes/{name}/fields
+```
+
+Hot-add new filter or sort fields to a running index by scanning the docstore. The index remains queryable during the operation. Returns a task ID immediately.
+
+**Request body:**
+
+```json
+{
+  "filter_fields": [
+    { "name": "type", "field_type": "single_value" }
+  ],
+  "sort_fields": [
+    { "name": "commentCount", "source_type": "u32", "bits": 32, "encoding": "identity" }
+  ],
+  "save_snapshot": true
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `filter_fields` | object[] | `[]` | New filter field configs to add |
+| `sort_fields` | object[] | `[]` | New sort field configs to add |
+| `save_snapshot` | boolean | `true` | Persist bitmaps to disk after building |
+
+Field names must exist in the data schema and must not already be indexed. The operation scans all alive docstore shards via rayon fold+reduce, building bitmaps for only the new fields.
+
+**Performance at 105M:** ~48s for a filter field, ~55s for a sort field. I/O-dominated — adding multiple fields in one request costs roughly the same as adding one.
+
+**Response:** `202 Accepted`
+
+```json
+{ "task_id": 3 }
+```
+
+**Errors:**
+- `400` — Field already exists, not in schema, or no fields specified
+- `404` — Index not found
+- `409` — Another task is already running
+
+---
+
+### Remove Fields
+
+```
+DELETE /api/indexes/{name}/fields
+```
+
+Remove filter or sort fields from a running index. Removes the in-memory bitmaps immediately. Orphaned bitmap files on disk are left in place (overwritten on next `save_snapshot` or ignored on boot).
+
+**Request body:**
+
+```json
+{
+  "filter_fields": ["type"],
+  "sort_fields": ["commentCount"],
+  "save_snapshot": true
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `filter_fields` | string[] | `[]` | Filter fields to remove |
+| `sort_fields` | string[] | `[]` | Sort fields to remove |
+| `save_snapshot` | boolean | `true` | Persist bitmaps to disk after removal |
+
+Field names must currently exist in the index config. The data schema is NOT modified — raw data remains in the docstore and can be re-indexed later via Add Fields.
+
+**Response:** `202 Accepted`
+
+```json
+{ "task_id": 4 }
+```
+
+**Errors:**
+- `400` — Field not found in config, or no fields specified
+- `404` — Index not found
+- `409` — Another task is already running
+
+---
+
+## Task System
+
+All long-running operations (load, rebuild, add_fields, remove_fields) return a task ID immediately. At most one task runs at a time per index. Completed and failed tasks are kept in a history ring (max 20 entries).
+
+### List Tasks
+
+```
+GET /api/indexes/{name}/tasks
+```
+
+Returns the active task (if any) and recent task history for the index.
+
+**Response:** `200 OK`
+
+```json
+{
+  "active": {
+    "id": 3,
+    "task_type": "add_fields",
+    "status": "running",
+    "progress": { "records_processed": 52000000 },
+    "elapsed_secs": 24.5,
+    "result": null,
+    "error": null
+  },
+  "history": [
+    {
+      "id": 2,
+      "task_type": "rebuild",
+      "status": "complete",
+      "progress": { "records_processed": 105300000 },
+      "elapsed_secs": 98.2,
+      "result": "Rebuilt 3 filter fields, 2 sort fields",
+      "error": null
+    },
+    {
+      "id": 1,
+      "task_type": "load",
+      "status": "complete",
+      "progress": { "records_processed": 105300000 },
+      "elapsed_secs": 320.1,
+      "result": "Loaded 105300000 records",
+      "error": null
+    }
+  ]
+}
+```
+
+---
+
+### Get Task
+
+```
+GET /api/tasks/{task_id}
+```
+
+Look up a specific task by ID. Checks the active task first, then searches history.
+
+**Response:** `200 OK`
+
+```json
+{
+  "id": 3,
+  "task_type": "add_fields",
+  "status": "running",
+  "progress": { "records_processed": 52000000 },
+  "elapsed_secs": 24.5,
+  "result": null,
+  "error": null
+}
+```
+
+**Task types:** `load`, `rebuild`, `add_fields`, `remove_fields`
+
+**Task statuses:** `running`, `saving`, `complete`, `error`
+
+**Errors:** `404` — Task not found
 
 ---
 
