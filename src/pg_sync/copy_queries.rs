@@ -48,7 +48,7 @@ pub async fn copy_tags(
     pool: &PgPool,
 ) -> Result<BoxStream<'static, Result<Bytes, sqlx::Error>>, sqlx::Error> {
     pool.copy_out_raw(
-        r#"COPY (SELECT "tagId", "imageId" FROM "TagsOnImageDetails" WHERE disabled = false ORDER BY "tagId", "imageId") TO STDOUT WITH (FORMAT csv)"#,
+        r#"COPY (SELECT "tagId", "imageId" FROM "TagsOnImageDetails" WHERE disabled = false) TO STDOUT WITH (FORMAT csv)"#,
     )
     .await
 }
@@ -60,7 +60,7 @@ pub async fn copy_tools(
     pool: &PgPool,
 ) -> Result<BoxStream<'static, Result<Bytes, sqlx::Error>>, sqlx::Error> {
     pool.copy_out_raw(
-        r#"COPY (SELECT "toolId", "imageId" FROM "ImageTool" ORDER BY "toolId", "imageId") TO STDOUT WITH (FORMAT csv)"#,
+        r#"COPY (SELECT "toolId", "imageId" FROM "ImageTool") TO STDOUT WITH (FORMAT csv)"#,
     )
     .await
 }
@@ -72,7 +72,7 @@ pub async fn copy_techniques(
     pool: &PgPool,
 ) -> Result<BoxStream<'static, Result<Bytes, sqlx::Error>>, sqlx::Error> {
     pool.copy_out_raw(
-        r#"COPY (SELECT "techniqueId", "imageId" FROM "ImageTechnique" ORDER BY "techniqueId", "imageId") TO STDOUT WITH (FORMAT csv)"#,
+        r#"COPY (SELECT "techniqueId", "imageId" FROM "ImageTechnique") TO STDOUT WITH (FORMAT csv)"#,
     )
     .await
 }

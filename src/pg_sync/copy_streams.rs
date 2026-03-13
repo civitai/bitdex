@@ -333,10 +333,9 @@ fn lookup_string_map(map: &[(String, u64)], value: &str) -> u64 {
 // Tag COPY stream
 // ---------------------------------------------------------------------------
 
-/// Stream TagsOnImageDetails via COPY, ordered by tagId.
+/// Stream TagsOnImageDetails via COPY (unordered).
 ///
-/// Groups rows by tagId and flushes batches of image IDs to the arena
-/// and filter bitmaps — same pattern as `table_streams::stream_tags`.
+/// Inserts directly into bitmaps per-row — no sorting or grouping needed.
 pub(crate) async fn stream_tags_copy(
     pool: &PgPool,
     arena: &SlotArena,
@@ -354,10 +353,6 @@ pub(crate) async fn stream_tags_copy(
         .map_err(|e| format!("copy_tags: {e}"))?;
     let mut parser = CopyParser::new();
 
-    // Group-by-tagId state
-    let mut current_tag: Option<i64> = None;
-    let mut current_images: Vec<u32> = Vec::with_capacity(4096);
-
     while let Some(chunk) = stream
         .try_next()
         .await
@@ -370,16 +365,16 @@ pub(crate) async fn stream_tags_copy(
                 None => continue,
             };
 
-            if current_tag != Some(tag_id) {
-                // Flush previous tag batch
-                if let Some(prev_tag_id) = current_tag {
-                    flush_tag_batch(prev_tag_id as u64, &current_images, arena, &mut accum.filter_maps);
-                }
-                current_tag = Some(tag_id);
-                current_images.clear();
+            let slot = image_id as u32;
+            arena.write_tags(slot, &[tag_id as u32]);
+
+            // Direct bitmap insert (no grouping needed)
+            if let Some(fm) = accum.filter_maps.get_mut("tagIds") {
+                fm.entry(tag_id as u64)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(slot);
             }
 
-            current_images.push(image_id as u32);
             total += 1;
 
             if total % PROGRESS_INTERVAL == 0 {
@@ -395,11 +390,6 @@ pub(crate) async fn stream_tags_copy(
                 );
             }
         }
-    }
-
-    // Flush final tag batch
-    if let Some(tag_id) = current_tag {
-        flush_tag_batch(tag_id as u64, &current_images, arena, &mut accum.filter_maps);
     }
 
     progress.tag_rows.store(total, Ordering::Release);
@@ -422,7 +412,7 @@ pub(crate) async fn stream_tags_copy(
 // Tool COPY stream
 // ---------------------------------------------------------------------------
 
-/// Stream ImageTool via COPY, ordered by toolId.
+/// Stream ImageTool via COPY (unordered). Direct per-row bitmap inserts.
 pub(crate) async fn stream_tools_copy(
     pool: &PgPool,
     arena: &SlotArena,
@@ -440,9 +430,6 @@ pub(crate) async fn stream_tools_copy(
         .map_err(|e| format!("copy_tools: {e}"))?;
     let mut parser = CopyParser::new();
 
-    let mut current_tool: Option<i64> = None;
-    let mut current_images: Vec<u32> = Vec::with_capacity(256);
-
     while let Some(chunk) = stream
         .try_next()
         .await
@@ -455,21 +442,15 @@ pub(crate) async fn stream_tools_copy(
                 None => continue,
             };
 
-            if current_tool != Some(tool_id) {
-                if let Some(prev_tool_id) = current_tool {
-                    flush_id_batch(
-                        "toolIds",
-                        prev_tool_id as u64,
-                        &current_images,
-                        |img_id| arena.write_tools(img_id, &[prev_tool_id as u32]),
-                        &mut accum.filter_maps,
-                    );
-                }
-                current_tool = Some(tool_id);
-                current_images.clear();
+            let slot = image_id as u32;
+            arena.write_tools(slot, &[tool_id as u32]);
+
+            if let Some(fm) = accum.filter_maps.get_mut("toolIds") {
+                fm.entry(tool_id as u64)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(slot);
             }
 
-            current_images.push(image_id as u32);
             total += 1;
 
             if total % PROGRESS_INTERVAL == 0 {
@@ -486,17 +467,6 @@ pub(crate) async fn stream_tools_copy(
                 );
             }
         }
-    }
-
-    // Flush final batch
-    if let Some(tool_id) = current_tool {
-        flush_id_batch(
-            "toolIds",
-            tool_id as u64,
-            &current_images,
-            |img_id| arena.write_tools(img_id, &[tool_id as u32]),
-            &mut accum.filter_maps,
-        );
     }
 
     progress.tool_rows.store(total, Ordering::Release);
@@ -519,7 +489,7 @@ pub(crate) async fn stream_tools_copy(
 // Technique COPY stream
 // ---------------------------------------------------------------------------
 
-/// Stream ImageTechnique via COPY, ordered by techniqueId.
+/// Stream ImageTechnique via COPY (unordered). Direct per-row bitmap inserts.
 pub(crate) async fn stream_techniques_copy(
     pool: &PgPool,
     arena: &SlotArena,
@@ -537,9 +507,6 @@ pub(crate) async fn stream_techniques_copy(
         .map_err(|e| format!("copy_techniques: {e}"))?;
     let mut parser = CopyParser::new();
 
-    let mut current_tech: Option<i64> = None;
-    let mut current_images: Vec<u32> = Vec::with_capacity(256);
-
     while let Some(chunk) = stream
         .try_next()
         .await
@@ -552,21 +519,15 @@ pub(crate) async fn stream_techniques_copy(
                 None => continue,
             };
 
-            if current_tech != Some(technique_id) {
-                if let Some(tech_id) = current_tech {
-                    flush_id_batch(
-                        "techniqueIds",
-                        tech_id as u64,
-                        &current_images,
-                        |img_id| arena.write_techniques(img_id, &[tech_id as u32]),
-                        &mut accum.filter_maps,
-                    );
-                }
-                current_tech = Some(technique_id);
-                current_images.clear();
+            let slot = image_id as u32;
+            arena.write_techniques(slot, &[technique_id as u32]);
+
+            if let Some(fm) = accum.filter_maps.get_mut("techniqueIds") {
+                fm.entry(technique_id as u64)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(slot);
             }
 
-            current_images.push(image_id as u32);
             total += 1;
 
             if total % PROGRESS_INTERVAL == 0 {
@@ -583,17 +544,6 @@ pub(crate) async fn stream_techniques_copy(
                 );
             }
         }
-    }
-
-    // Flush final batch
-    if let Some(tech_id) = current_tech {
-        flush_id_batch(
-            "techniqueIds",
-            tech_id as u64,
-            &current_images,
-            |img_id| arena.write_techniques(img_id, &[tech_id as u32]),
-            &mut accum.filter_maps,
-        );
     }
 
     progress.technique_rows.store(total, Ordering::Release);
@@ -806,50 +756,3 @@ fn flush_resources(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-/// Flush a batch of images for a single tagId: write to arena + build bitmap.
-fn flush_tag_batch(
-    tag_id: u64,
-    image_ids: &[u32],
-    arena: &SlotArena,
-    filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
-) {
-    let tag_u32 = tag_id as u32;
-    for &image_id in image_ids {
-        arena.write_tags(image_id, &[tag_u32]);
-    }
-
-    let bm = filter_maps
-        .entry("tagIds".to_string())
-        .or_default()
-        .entry(tag_id)
-        .or_insert_with(RoaringBitmap::new);
-    for &image_id in image_ids {
-        bm.insert(image_id);
-    }
-}
-
-/// Generic flush for ID-based streams (tools, techniques).
-fn flush_id_batch(
-    field_name: &str,
-    id_value: u64,
-    image_ids: &[u32],
-    mut arena_write: impl FnMut(u32),
-    filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
-) {
-    for &image_id in image_ids {
-        arena_write(image_id);
-    }
-
-    let bm = filter_maps
-        .entry(field_name.to_string())
-        .or_default()
-        .entry(id_value)
-        .or_insert_with(RoaringBitmap::new);
-    for &image_id in image_ids {
-        bm.insert(image_id);
-    }
-}
