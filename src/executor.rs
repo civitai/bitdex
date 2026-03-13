@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use roaring::RoaringBitmap;
 
+use crate::dictionary::FieldDictionary;
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
 use crate::planner;
@@ -40,6 +41,9 @@ pub struct QueryExecutor<'a> {
     now_unix: u64,
     string_maps: Option<&'a StringMaps>,
     case_sensitive_fields: Option<&'a CaseSensitiveFields>,
+    /// Live dictionaries for LowCardinalityString fields — used as fallback
+    /// when string_maps snapshot doesn't have a recently-added value.
+    dictionaries: Option<&'a HashMap<String, FieldDictionary>>,
 }
 
 impl<'a> QueryExecutor<'a> {
@@ -58,6 +62,7 @@ impl<'a> QueryExecutor<'a> {
             now_unix: 0,
             string_maps: None,
             case_sensitive_fields: None,
+            dictionaries: None,
         }
     }
 
@@ -71,6 +76,13 @@ impl<'a> QueryExecutor<'a> {
     /// Attach case-sensitive field set for string matching control.
     pub fn with_case_sensitive_fields(mut self, fields: &'a CaseSensitiveFields) -> Self {
         self.case_sensitive_fields = Some(fields);
+        self
+    }
+
+    /// Attach live dictionaries for LowCardinalityString field query resolution.
+    /// Used as fallback when the string_maps snapshot doesn't have a recently-added value.
+    pub fn with_dictionaries(mut self, dicts: &'a HashMap<String, FieldDictionary>) -> Self {
+        self.dictionaries = Some(dicts);
         self
     }
 
@@ -92,7 +104,8 @@ impl<'a> QueryExecutor<'a> {
         self.slots
     }
 
-    /// Resolve a Value to a bitmap key, consulting string_maps for MappedString fields.
+    /// Resolve a Value to a bitmap key, consulting string_maps for MappedString fields
+    /// and live dictionaries for LowCardinalityString fields.
     /// Applies case-insensitive normalization (lowercase) unless the field is in case_sensitive_fields.
     fn resolve_value_key(&self, field: &str, val: &Value) -> Option<u64> {
         // Try direct conversion first (Integer, Bool)
@@ -110,7 +123,20 @@ impl<'a> QueryExecutor<'a> {
                     } else {
                         std::borrow::Cow::Owned(s.to_lowercase())
                     };
-                    return field_map.get(lookup.as_ref()).map(|&v| v as u64);
+                    if let Some(&v) = field_map.get(lookup.as_ref()) {
+                        return Some(v as u64);
+                    }
+                    // Don't return None — fall through to dictionary check.
+                    // LowCardinalityString fields may have values added after the
+                    // string_maps snapshot was built (or the snapshot may be empty
+                    // for a freshly-created index).
+                }
+            }
+            // Fallback: check live dictionaries for LowCardinalityString fields.
+            // This catches values added via upsert after the string_maps snapshot was built.
+            if let Some(dicts) = self.dictionaries {
+                if let Some(dict) = dicts.get(field) {
+                    return dict.get(s).map(|v| v as u64);
                 }
             }
         }
@@ -290,11 +316,12 @@ impl<'a> QueryExecutor<'a> {
                 }
                 // Try Tier 1 (snapshot FilterIndex) first — diff-aware read
                 if let Some(filter_field) = self.filters.get_field(field) {
-                    let key = self.resolve_value_key(field, value)
-                        .ok_or_else(|| BitdexError::InvalidValue {
-                            field: field.clone(),
-                            reason: "cannot convert to bitmap key".to_string(),
-                        })?;
+                    let key = match self.resolve_value_key(field, value) {
+                        Some(k) => k,
+                        // Unknown string value (e.g. LCS value never inserted).
+                        // Return empty bitmap — the value simply doesn't match anything.
+                        None => return Ok(RoaringBitmap::new()),
+                    };
                     return Ok(filter_field
                         .get_versioned(key)
                         .map(|vb| vb.fused())

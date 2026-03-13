@@ -40,10 +40,19 @@ pub const SHARD_SHIFT_PUB: u32 = SHARD_SHIFT;
 /// Shard file version. Bump if format changes.
 const SHARD_VERSION: u32 = 1;
 
+/// Marker byte indicating the document has a version prefix.
+/// Chosen as 0x00 because msgpack arrays (our doc format) always start at 0x90+.
+const DOC_VERSION_MARKER: u8 = 0x00;
+
 /// A stored document containing all field values.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredDoc {
     pub fields: HashMap<String, FieldValue>,
+    /// Schema version this document was encoded with.
+    /// Used to select correct defaults when reading elided fields.
+    /// 0 = legacy (pre-versioning), 1+ = versioned.
+    #[serde(skip, default)]
+    pub schema_version: u8,
 }
 
 /// Filesystem-based document store with packed shard files.
@@ -53,6 +62,14 @@ pub struct DocStore {
     idx_to_field: Vec<String>,
     in_memory: bool,
     memory_store: HashMap<u32, Vec<u8>>,
+    /// Per-field default values keyed by field dict index.
+    /// Fields matching their default are elided on write to save space.
+    field_defaults: HashMap<u16, PackedValue>,
+    /// Current schema version. Prepended to every encoded document.
+    schema_version: u8,
+    /// Historical defaults keyed by schema version.
+    /// Used to reconstruct elided fields from documents encoded with older schemas.
+    historical_defaults: HashMap<u8, HashMap<u16, PackedValue>>,
 }
 
 impl DocStore {
@@ -65,12 +82,17 @@ impl DocStore {
 
         let (field_to_idx, idx_to_field) = Self::load_field_dict_from_dir(path)?;
 
+        let historical_defaults = Self::load_schema_history(path);
+
         Ok(Self {
             root: path.to_path_buf(),
             field_to_idx,
             idx_to_field,
             in_memory: false,
             memory_store: HashMap::new(),
+            field_defaults: HashMap::new(),
+            schema_version: 1,
+            historical_defaults,
         })
     }
 
@@ -82,6 +104,9 @@ impl DocStore {
             idx_to_field: Vec::new(),
             in_memory: true,
             memory_store: HashMap::new(),
+            field_defaults: HashMap::new(),
+            schema_version: 1,
+            historical_defaults: HashMap::new(),
         })
     }
 
@@ -154,6 +179,160 @@ impl DocStore {
         self.idx_to_field.push(name.to_string());
         self.field_to_idx.insert(name.to_string(), idx);
         idx
+    }
+
+    /// Build the field_defaults map from a DataSchema.
+    /// Must be called after field dictionary is populated (i.e., after prepare_bulk_load
+    /// or after fields have been ensured). For null defaults, we treat them as
+    /// "elide when the field is absent from the source" — no PackedValue stored.
+    ///
+    /// Also sets the schema version and saves the current schema history to disk.
+    pub fn set_field_defaults(&mut self, schema: &DataSchema) {
+        self.schema_version = schema.schema_version;
+        self.field_defaults.clear();
+        for mapping in &schema.fields {
+            if let Some(ref default_val) = mapping.default_value {
+                if let Some(&idx) = self.field_to_idx.get(&mapping.target) {
+                    if let Some(pv) = json_to_packed_default(default_val) {
+                        self.field_defaults.insert(idx, pv);
+                    }
+                }
+            }
+        }
+        // Store current version's defaults for future historical lookups
+        self.historical_defaults
+            .insert(self.schema_version, self.field_defaults.clone());
+        // Persist schema history to disk
+        self.save_schema_history();
+    }
+
+    /// Get the current schema version.
+    pub fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
+
+    /// Build a schema registry mapping version → (field_name → default_json_value).
+    /// Used by the server layer for version-aware default reconstruction in format_document.
+    pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {
+        let mut registry = HashMap::new();
+        // Current version — prefer live field_defaults, fall back to historical
+        let current_defaults = if !self.field_defaults.is_empty() {
+            self.idx_defaults_to_named(&self.field_defaults)
+        } else if let Some(hist) = self.historical_defaults.get(&self.schema_version) {
+            self.idx_defaults_to_named(hist)
+        } else {
+            HashMap::new()
+        };
+        registry.insert(self.schema_version, current_defaults);
+        // Historical versions
+        for (&version, defaults) in &self.historical_defaults {
+            if version != self.schema_version {
+                registry.insert(version, self.idx_defaults_to_named(defaults));
+            }
+        }
+        registry
+    }
+
+    fn idx_defaults_to_named(
+        &self,
+        defaults: &HashMap<u16, PackedValue>,
+    ) -> HashMap<String, serde_json::Value> {
+        defaults
+            .iter()
+            .filter_map(|(&idx, pv)| {
+                self.idx_to_field
+                    .get(idx as usize)
+                    .map(|name| (name.clone(), packed_value_to_json(pv)))
+            })
+            .collect()
+    }
+
+    // ---- Schema history persistence ----
+
+    fn schema_dir(root: &Path) -> PathBuf {
+        root.join("meta").join("schema")
+    }
+
+    fn save_schema_history(&self) {
+        if self.in_memory {
+            return;
+        }
+        let dir = Self::schema_dir(&self.root);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("DocStore: failed to create schema dir: {e}");
+            return;
+        }
+        // Save current version's defaults as field_name → JSON default pairs
+        let defaults_map: HashMap<String, Option<serde_json::Value>> = self
+            .field_defaults
+            .iter()
+            .filter_map(|(&idx, pv)| {
+                self.idx_to_field
+                    .get(idx as usize)
+                    .map(|name| (name.clone(), Some(packed_value_to_json(pv))))
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "schema_version": self.schema_version,
+            "field_defaults": defaults_map,
+        });
+        let path = dir.join(format!("v{}.json", self.schema_version));
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(json) = serde_json::to_string_pretty(&payload) {
+            if let Err(e) = std::fs::write(&tmp, &json) {
+                eprintln!("DocStore: failed to write schema v{}: {e}", self.schema_version);
+                return;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                eprintln!("DocStore: failed to rename schema v{}: {e}", self.schema_version);
+            }
+        }
+    }
+
+    fn load_schema_history(root: &Path) -> HashMap<u8, HashMap<u16, PackedValue>> {
+        let dir = Self::schema_dir(root);
+        let mut history = HashMap::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return history,
+        };
+        // Load field dictionary for name→idx mapping
+        let (field_to_idx, _) = match Self::load_field_dict_from_dir(root) {
+            Ok(pair) => pair,
+            Err(_) => return history,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if !name.starts_with('v') || path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let version: u8 = match name[1..].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let data = match std::fs::read_to_string(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let json: serde_json::Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(defaults_obj) = json.get("field_defaults").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let mut defaults = HashMap::new();
+            for (field_name, val) in defaults_obj {
+                if let Some(&idx) = field_to_idx.get(field_name) {
+                    if let Some(pv) = json_to_packed_default(val) {
+                        defaults.insert(idx, pv);
+                    }
+                }
+            }
+            history.insert(version, defaults);
+        }
+        history
     }
 
     // ---- Shard file I/O ----
@@ -284,6 +463,26 @@ impl DocStore {
 
     // ---- Encoding ----
 
+    /// Prepend the version marker + version byte to encoded msgpack bytes.
+    fn prepend_version(version: u8, msgpack: Vec<u8>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + msgpack.len());
+        out.push(DOC_VERSION_MARKER);
+        out.push(version);
+        out.extend_from_slice(&msgpack);
+        out
+    }
+
+    /// Strip the version prefix from raw bytes, returning (version, msgpack_data).
+    /// Legacy docs (pre-versioning) have no prefix and return version 0.
+    fn strip_version(raw: &[u8]) -> (u8, &[u8]) {
+        if raw.len() >= 2 && raw[0] == DOC_VERSION_MARKER {
+            (raw[1], &raw[2..])
+        } else {
+            // Legacy unversioned doc
+            (0, raw)
+        }
+    }
+
     fn encode_doc(&mut self, doc: &StoredDoc) -> Result<Vec<u8>> {
         let mut dict_changed = false;
         let mut pairs: Vec<(u16, PackedValue)> = Vec::with_capacity(doc.fields.len());
@@ -293,28 +492,45 @@ impl DocStore {
             if self.idx_to_field.len() > old_len {
                 dict_changed = true;
             }
-            pairs.push((idx, pack_field_value(fv)));
+            let pv = pack_field_value(fv);
+            // Elide fields matching their schema default
+            if let Some(default_pv) = self.field_defaults.get(&idx) {
+                if &pv == default_pv {
+                    continue;
+                }
+            }
+            pairs.push((idx, pv));
         }
         if dict_changed {
             self.save_field_dict()?;
         }
-        rmp_serde::to_vec(&pairs)
-            .map_err(|e| BitdexError::DocStore(format!("msgpack encode: {e}")))
+        let msgpack = rmp_serde::to_vec(&pairs)
+            .map_err(|e| BitdexError::DocStore(format!("msgpack encode: {e}")))?;
+        Ok(Self::prepend_version(self.schema_version, msgpack))
     }
 
     fn encode_doc_readonly(&self, doc: &StoredDoc) -> Result<Vec<u8>> {
         let mut pairs: Vec<(u16, PackedValue)> = Vec::with_capacity(doc.fields.len());
         for (name, fv) in &doc.fields {
             if let Some(&idx) = self.field_to_idx.get(name.as_str()) {
-                pairs.push((idx, pack_field_value(fv)));
+                let pv = pack_field_value(fv);
+                // Elide fields matching their schema default
+                if let Some(default_pv) = self.field_defaults.get(&idx) {
+                    if &pv == default_pv {
+                        continue;
+                    }
+                }
+                pairs.push((idx, pv));
             }
         }
-        rmp_serde::to_vec(&pairs)
-            .map_err(|e| BitdexError::DocStore(format!("msgpack encode: {e}")))
+        let msgpack = rmp_serde::to_vec(&pairs)
+            .map_err(|e| BitdexError::DocStore(format!("msgpack encode: {e}")))?;
+        Ok(Self::prepend_version(self.schema_version, msgpack))
     }
 
     fn decode_doc(&self, raw: &[u8]) -> Result<StoredDoc> {
-        let pairs: Vec<(u16, PackedValue)> = rmp_serde::from_slice(raw)
+        let (version, msgpack) = Self::strip_version(raw);
+        let pairs: Vec<(u16, PackedValue)> = rmp_serde::from_slice(msgpack)
             .map_err(|e| BitdexError::DocStore(format!("msgpack decode: {e}")))?;
         let mut fields = HashMap::with_capacity(pairs.len());
         for (idx, pv) in pairs {
@@ -322,7 +538,10 @@ impl DocStore {
                 fields.insert(name.clone(), unpack_field_value(pv));
             }
         }
-        Ok(StoredDoc { fields })
+        Ok(StoredDoc {
+            fields,
+            schema_version: version,
+        })
     }
 
     // ---- Public API ----
@@ -549,6 +768,8 @@ impl DocStore {
             field_to_idx: self.field_to_idx.clone(),
             root: self.root.clone(),
             shard_locks: Arc::new(DashMap::new()),
+            field_defaults: self.field_defaults.clone(),
+            schema_version: self.schema_version,
         })
     }
 }
@@ -569,6 +790,11 @@ pub struct BulkWriter {
     /// Per-shard locks: only contended at block boundaries (~1 shard per block).
     /// Most shards are written by exactly one thread → zero contention.
     shard_locks: Arc<DashMap<u32, parking_lot::Mutex<()>>>,
+    /// Per-field default values keyed by field dict index.
+    /// Fields matching their default are elided on write.
+    field_defaults: HashMap<u16, PackedValue>,
+    /// Schema version to prepend to each encoded document.
+    schema_version: u8,
 }
 
 impl BulkWriter {
@@ -639,16 +865,34 @@ impl BulkWriter {
         let mut pairs: Vec<(u16, PackedValue)> = Vec::with_capacity(doc.fields.len());
         for (name, fv) in &doc.fields {
             if let Some(&idx) = self.field_to_idx.get(name.as_str()) {
-                pairs.push((idx, pack_field_value(fv)));
+                let pv = pack_field_value(fv);
+                // Elide fields matching their schema default
+                if let Some(default_pv) = self.field_defaults.get(&idx) {
+                    if &pv == default_pv {
+                        continue;
+                    }
+                }
+                pairs.push((idx, pv));
             }
         }
-        rmp_serde::to_vec(&pairs).unwrap_or_default()
+        let msgpack = rmp_serde::to_vec(&pairs).unwrap_or_default();
+        DocStore::prepend_version(self.schema_version, msgpack)
     }
 
     /// Encode a JSON value directly to msgpack bytes using the DataSchema.
     /// Skips the intermediate StoredDoc/HashMap allocation entirely —
     /// walks schema fields once, converts JSON → PackedValue → msgpack.
     pub fn encode_json(&self, json: &serde_json::Value, schema: &DataSchema) -> Vec<u8> {
+        self.encode_json_with_dicts(json, schema, None)
+    }
+
+    /// Encode a JSON document to msgpack bytes, with optional dictionaries for LowCardinalityString.
+    pub fn encode_json_with_dicts(
+        &self,
+        json: &serde_json::Value,
+        schema: &DataSchema,
+        dictionaries: Option<&std::collections::HashMap<String, crate::dictionary::FieldDictionary>>,
+    ) -> Vec<u8> {
         let mut pairs: Vec<(u16, PackedValue)> =
             Vec::with_capacity(schema.fields.len() + 1);
 
@@ -674,18 +918,33 @@ impl BulkWriter {
                 Some(pair) => pair,
                 None => {
                     if matches!(mapping.value_type, FieldValueType::ExistsBoolean) {
-                        pairs.push((idx, PackedValue::B(false)));
+                        // ExistsBoolean false — check if it matches the default before storing
+                        let pv = PackedValue::B(false);
+                        if let Some(default_pv) = self.field_defaults.get(&idx) {
+                            if &pv == default_pv {
+                                continue;
+                            }
+                        }
+                        pairs.push((idx, pv));
                     }
                     continue;
                 }
             };
 
-            if let Some(pv) = json_to_packed(raw, mapping, apply_ms) {
+            let dict = dictionaries.and_then(|d| d.get(&mapping.target));
+            if let Some(pv) = json_to_packed_with_dict(raw, mapping, apply_ms, dict) {
+                // Elide fields matching their schema default
+                if let Some(default_pv) = self.field_defaults.get(&idx) {
+                    if &pv == default_pv {
+                        continue;
+                    }
+                }
                 pairs.push((idx, pv));
             }
         }
 
-        rmp_serde::to_vec(&pairs).unwrap_or_default()
+        let msgpack = rmp_serde::to_vec(&pairs).unwrap_or_default();
+        DocStore::prepend_version(self.schema_version, msgpack)
     }
 }
 
@@ -693,7 +952,7 @@ impl BulkWriter {
 // Compact value encoding
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 enum PackedValue {
     I(i64),
     F(f64),
@@ -701,6 +960,54 @@ enum PackedValue {
     S(String),
     Mi(Vec<i64>),
     Mm(Vec<PackedValue>),
+}
+
+/// Convert a serde_json::Value to a PackedValue for default comparison.
+/// Returns None for types that can't be represented (objects, etc.) or
+/// for null (which means "elide if field is missing").
+fn json_to_packed_default(val: &serde_json::Value) -> Option<PackedValue> {
+    match val {
+        serde_json::Value::Null => None, // null default = elide when field is absent
+        serde_json::Value::Bool(b) => Some(PackedValue::B(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(PackedValue::I(i))
+            } else if let Some(f) = n.as_f64() {
+                Some(PackedValue::F(f))
+            } else {
+                None
+            }
+        }
+        serde_json::Value::String(s) => Some(PackedValue::S(s.clone())),
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                Some(PackedValue::Mi(Vec::new()))
+            } else if arr.iter().all(|v| v.is_i64() || v.is_u64()) {
+                let ints: Vec<i64> = arr
+                    .iter()
+                    .filter_map(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+                    .collect();
+                Some(PackedValue::Mi(ints))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Convert a PackedValue back to a serde_json::Value (for schema history persistence).
+fn packed_value_to_json(pv: &PackedValue) -> serde_json::Value {
+    match pv {
+        PackedValue::I(i) => serde_json::json!(i),
+        PackedValue::F(f) => serde_json::json!(f),
+        PackedValue::B(b) => serde_json::json!(b),
+        PackedValue::S(s) => serde_json::json!(s),
+        PackedValue::Mi(arr) => serde_json::json!(arr),
+        PackedValue::Mm(arr) => {
+            serde_json::Value::Array(arr.iter().map(packed_value_to_json).collect())
+        }
+    }
 }
 
 fn pack_field_value(fv: &FieldValue) -> PackedValue {
@@ -732,9 +1039,13 @@ fn pack_value(v: &Value) -> PackedValue {
     }
 }
 
-/// Convert a raw JSON value directly to PackedValue based on field mapping type.
-/// Skips FieldValue intermediate — JSON → PackedValue in one step.
-fn json_to_packed(raw: &serde_json::Value, mapping: &FieldMapping, ms_to_seconds: bool) -> Option<PackedValue> {
+/// Convert a raw JSON value to PackedValue, with optional dictionary for LowCardinalityString.
+fn json_to_packed_with_dict(
+    raw: &serde_json::Value,
+    mapping: &FieldMapping,
+    ms_to_seconds: bool,
+    dictionary: Option<&crate::dictionary::FieldDictionary>,
+) -> Option<PackedValue> {
     match mapping.value_type {
         FieldValueType::Integer => {
             let n = raw
@@ -763,6 +1074,16 @@ fn json_to_packed(raw: &serde_json::Value, mapping: &FieldMapping, ms_to_seconds
                 .and_then(|m| m.get(lookup.as_ref()).copied())
                 .unwrap_or(0);
             Some(PackedValue::I(n))
+        }
+        FieldValueType::LowCardinalityString => {
+            let s = raw.as_str()?;
+            if let Some(dict) = dictionary {
+                let n = dict.get_or_insert(s);
+                Some(PackedValue::I(n))
+            } else {
+                // Without dictionary, store 0 (will be resolved later if needed)
+                Some(PackedValue::I(0))
+            }
         }
         FieldValueType::IntegerArray => {
             let arr = raw.as_array()?;
@@ -818,6 +1139,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            schema_version: 0,
         };
         store.put(42, &doc).unwrap();
         let got = store.get(42).unwrap().unwrap();
@@ -846,6 +1168,7 @@ mod tests {
                     ]
                     .into_iter()
                     .collect(),
+                    schema_version: 0,
                 };
                 (i, doc)
             })
@@ -868,6 +1191,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+                schema_version: 0,
             };
             store.put(100, &doc).unwrap();
         }
@@ -896,6 +1220,7 @@ mod tests {
                         fields: vec![("val".to_string(), FieldValue::Single(Value::Integer(i as i64)))]
                             .into_iter()
                             .collect(),
+                        schema_version: 0,
                     };
                     (i, doc)
                 })
@@ -920,6 +1245,7 @@ mod tests {
         let mut store = DocStore::open(&docs_dir).unwrap();
         let doc = StoredDoc {
             fields: vec![("x".to_string(), FieldValue::Single(Value::Integer(1)))].into_iter().collect(),
+            schema_version: 0,
         };
         store.put(5, &doc).unwrap();
         assert!(store.get(5).unwrap().is_some());
@@ -941,6 +1267,7 @@ mod tests {
                     fields: vec![("id".to_string(), FieldValue::Single(Value::Integer(i as i64)))]
                         .into_iter()
                         .collect(),
+                    schema_version: 0,
                 };
                 (i, doc)
             })
@@ -954,5 +1281,470 @@ mod tests {
                 other => panic!("unexpected for {}: {:?}", id, other),
             }
         }
+    }
+
+    // ---- Default value elision tests ----
+
+    fn make_schema_with_defaults() -> DataSchema {
+        DataSchema {
+            id_field: "id".to_string(),
+            schema_version: 1,
+            fields: vec![
+                FieldMapping {
+                    source: "commentCount".into(),
+                    target: "commentCount".into(),
+                    value_type: FieldValueType::Integer,
+                    fallback: None,
+                    string_map: None,
+                    doc_only: false,
+                    ms_to_seconds: false,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: Some(serde_json::json!(0)),
+                },
+                FieldMapping {
+                    source: "poi".into(),
+                    target: "poi".into(),
+                    value_type: FieldValueType::Boolean,
+                    fallback: None,
+                    string_map: None,
+                    doc_only: false,
+                    ms_to_seconds: false,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: Some(serde_json::json!(false)),
+                },
+                FieldMapping {
+                    source: "toolIds".into(),
+                    target: "toolIds".into(),
+                    value_type: FieldValueType::IntegerArray,
+                    fallback: None,
+                    string_map: None,
+                    doc_only: false,
+                    ms_to_seconds: false,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: Some(serde_json::json!([])),
+                },
+                FieldMapping {
+                    source: "blockedFor".into(),
+                    target: "blockedFor".into(),
+                    value_type: FieldValueType::MappedString,
+                    fallback: None,
+                    string_map: Some([("tos".to_string(), 1i64)].into_iter().collect()),
+                    doc_only: false,
+                    ms_to_seconds: false,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: Some(serde_json::Value::Null),
+                },
+                FieldMapping {
+                    source: "userId".into(),
+                    target: "userId".into(),
+                    value_type: FieldValueType::Integer,
+                    fallback: None,
+                    string_map: None,
+                    doc_only: false,
+                    ms_to_seconds: false,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: None, // no default — always stored
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_elision_default_fields_not_stored() {
+        // Fields matching their default should be elided from encoded bytes
+        let mut store = DocStore::open_temp().unwrap();
+        let schema = make_schema_with_defaults();
+
+        // Ensure field dictionary is populated
+        for f in &schema.fields {
+            store.ensure_field_idx(&f.target);
+        }
+        store.ensure_field_idx("id");
+        store.set_field_defaults(&schema);
+
+        // Doc with all-default values: commentCount=0, poi=false, toolIds=[], userId=42
+        let doc = StoredDoc {
+            fields: vec![
+                ("id".to_string(), FieldValue::Single(Value::Integer(1))),
+                ("commentCount".to_string(), FieldValue::Single(Value::Integer(0))),
+                ("poi".to_string(), FieldValue::Single(Value::Bool(false))),
+                ("toolIds".to_string(), FieldValue::Multi(vec![])),
+                ("userId".to_string(), FieldValue::Single(Value::Integer(42))),
+            ]
+            .into_iter()
+            .collect(),
+            schema_version: 0,
+        };
+
+        store.put(1, &doc).unwrap();
+        let got = store.get(1).unwrap().unwrap();
+
+        // Default fields should NOT be in the decoded doc (they were elided)
+        assert!(got.fields.get("commentCount").is_none(), "commentCount=0 should be elided");
+        assert!(got.fields.get("poi").is_none(), "poi=false should be elided");
+        assert!(got.fields.get("toolIds").is_none(), "toolIds=[] should be elided");
+
+        // Non-default field should be preserved
+        match &got.fields["userId"] {
+            FieldValue::Single(Value::Integer(42)) => {}
+            other => panic!("userId should be 42, got: {:?}", other),
+        }
+        // ID should be preserved
+        match &got.fields["id"] {
+            FieldValue::Single(Value::Integer(1)) => {}
+            other => panic!("id should be 1, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_elision_non_default_preserved() {
+        let mut store = DocStore::open_temp().unwrap();
+        let schema = make_schema_with_defaults();
+        for f in &schema.fields {
+            store.ensure_field_idx(&f.target);
+        }
+        store.ensure_field_idx("id");
+        store.set_field_defaults(&schema);
+
+        // Doc with non-default values
+        let doc = StoredDoc {
+            fields: vec![
+                ("id".to_string(), FieldValue::Single(Value::Integer(2))),
+                ("commentCount".to_string(), FieldValue::Single(Value::Integer(5))),
+                ("poi".to_string(), FieldValue::Single(Value::Bool(true))),
+                ("toolIds".to_string(), FieldValue::Multi(vec![Value::Integer(10), Value::Integer(20)])),
+                ("userId".to_string(), FieldValue::Single(Value::Integer(99))),
+            ]
+            .into_iter()
+            .collect(),
+            schema_version: 0,
+        };
+
+        store.put(2, &doc).unwrap();
+        let got = store.get(2).unwrap().unwrap();
+
+        match &got.fields["commentCount"] {
+            FieldValue::Single(Value::Integer(5)) => {}
+            other => panic!("expected commentCount=5, got: {:?}", other),
+        }
+        match &got.fields["poi"] {
+            FieldValue::Single(Value::Bool(true)) => {}
+            other => panic!("expected poi=true, got: {:?}", other),
+        }
+        match &got.fields["toolIds"] {
+            FieldValue::Multi(vs) => {
+                assert_eq!(vs.len(), 2);
+            }
+            other => panic!("expected toolIds with 2 elements, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_elision_round_trip_mixed() {
+        let mut store = DocStore::open_temp().unwrap();
+        let schema = make_schema_with_defaults();
+        for f in &schema.fields {
+            store.ensure_field_idx(&f.target);
+        }
+        store.ensure_field_idx("id");
+        store.set_field_defaults(&schema);
+
+        // Mix of default and non-default
+        let doc1 = StoredDoc {
+            fields: vec![
+                ("id".to_string(), FieldValue::Single(Value::Integer(10))),
+                ("commentCount".to_string(), FieldValue::Single(Value::Integer(0))), // default
+                ("poi".to_string(), FieldValue::Single(Value::Bool(true))),          // non-default
+                ("userId".to_string(), FieldValue::Single(Value::Integer(7))),
+            ]
+            .into_iter()
+            .collect(),
+            schema_version: 0,
+        };
+        let doc2 = StoredDoc {
+            fields: vec![
+                ("id".to_string(), FieldValue::Single(Value::Integer(11))),
+                ("commentCount".to_string(), FieldValue::Single(Value::Integer(3))), // non-default
+                ("poi".to_string(), FieldValue::Single(Value::Bool(false))),         // default
+                ("userId".to_string(), FieldValue::Single(Value::Integer(8))),
+            ]
+            .into_iter()
+            .collect(),
+            schema_version: 0,
+        };
+
+        store.put(10, &doc1).unwrap();
+        store.put(11, &doc2).unwrap();
+
+        let got1 = store.get(10).unwrap().unwrap();
+        assert!(got1.fields.get("commentCount").is_none()); // elided
+        match &got1.fields["poi"] {
+            FieldValue::Single(Value::Bool(true)) => {}
+            other => panic!("doc1 poi: {:?}", other),
+        }
+
+        let got2 = store.get(11).unwrap().unwrap();
+        match &got2.fields["commentCount"] {
+            FieldValue::Single(Value::Integer(3)) => {}
+            other => panic!("doc2 commentCount: {:?}", other),
+        }
+        assert!(got2.fields.get("poi").is_none()); // elided
+    }
+
+    #[test]
+    fn test_elision_backward_compatibility() {
+        // Docs stored WITHOUT elision (no field_defaults) should still decode correctly
+        let mut store = DocStore::open_temp().unwrap();
+        // Don't set field_defaults — simulates old data
+
+        let doc = StoredDoc {
+            fields: vec![
+                ("id".to_string(), FieldValue::Single(Value::Integer(1))),
+                ("commentCount".to_string(), FieldValue::Single(Value::Integer(0))),
+                ("poi".to_string(), FieldValue::Single(Value::Bool(false))),
+            ]
+            .into_iter()
+            .collect(),
+            schema_version: 0,
+        };
+        store.put(1, &doc).unwrap();
+
+        // Without defaults, all fields are stored
+        let got = store.get(1).unwrap().unwrap();
+        assert_eq!(got.fields.len(), 3);
+        match &got.fields["commentCount"] {
+            FieldValue::Single(Value::Integer(0)) => {}
+            other => panic!("expected commentCount=0, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_elision_null_default() {
+        // blockedFor has null default — when field is absent from source,
+        // it's simply not stored (natural behavior). When field IS present
+        // as a mapped string value, it should be stored.
+        let mut store = DocStore::open_temp().unwrap();
+        let schema = make_schema_with_defaults();
+        for f in &schema.fields {
+            store.ensure_field_idx(&f.target);
+        }
+        store.ensure_field_idx("id");
+        store.set_field_defaults(&schema);
+
+        // blockedFor = "tos" → mapped to 1 → should be stored
+        let doc = StoredDoc {
+            fields: vec![
+                ("id".to_string(), FieldValue::Single(Value::Integer(1))),
+                ("blockedFor".to_string(), FieldValue::Single(Value::Integer(1))),
+            ]
+            .into_iter()
+            .collect(),
+            schema_version: 0,
+        };
+        store.put(1, &doc).unwrap();
+        let got = store.get(1).unwrap().unwrap();
+        match &got.fields["blockedFor"] {
+            FieldValue::Single(Value::Integer(1)) => {}
+            other => panic!("expected blockedFor=1, got: {:?}", other),
+        }
+
+        // Doc without blockedFor field — nothing stored (null default = natural absence)
+        let doc2 = StoredDoc {
+            fields: vec![
+                ("id".to_string(), FieldValue::Single(Value::Integer(2))),
+            ]
+            .into_iter()
+            .collect(),
+            schema_version: 0,
+        };
+        store.put(2, &doc2).unwrap();
+        let got2 = store.get(2).unwrap().unwrap();
+        assert!(got2.fields.get("blockedFor").is_none());
+    }
+
+    #[test]
+    fn test_elision_bulk_writer_encode_doc() {
+        let mut store = DocStore::open_temp().unwrap();
+        let schema = make_schema_with_defaults();
+        let field_names: Vec<String> = schema.fields.iter().map(|f| f.target.clone())
+            .chain(std::iter::once("id".to_string()))
+            .collect();
+        for name in &field_names {
+            store.ensure_field_idx(name);
+        }
+        store.set_field_defaults(&schema);
+        let writer = store.prepare_bulk_load(&field_names).unwrap();
+
+        // Encode a doc with default values via BulkWriter
+        let doc = StoredDoc {
+            fields: vec![
+                ("id".to_string(), FieldValue::Single(Value::Integer(1))),
+                ("commentCount".to_string(), FieldValue::Single(Value::Integer(0))),
+                ("poi".to_string(), FieldValue::Single(Value::Bool(false))),
+                ("userId".to_string(), FieldValue::Single(Value::Integer(42))),
+            ]
+            .into_iter()
+            .collect(),
+            schema_version: 0,
+        };
+
+        let bytes = writer.encode_doc(&doc);
+        // Decode and verify defaults were elided
+        let decoded = store.decode_doc(&bytes).unwrap();
+        assert!(decoded.fields.get("commentCount").is_none(), "commentCount=0 should be elided in BulkWriter");
+        assert!(decoded.fields.get("poi").is_none(), "poi=false should be elided in BulkWriter");
+        assert!(decoded.fields.get("userId").is_some(), "userId should be preserved");
+    }
+
+    #[test]
+    fn test_elision_bulk_writer_encode_json() {
+        let mut store = DocStore::open_temp().unwrap();
+        let schema = make_schema_with_defaults();
+        let field_names: Vec<String> = schema.fields.iter().map(|f| f.target.clone())
+            .chain(std::iter::once("id".to_string()))
+            .collect();
+        for name in &field_names {
+            store.ensure_field_idx(name);
+        }
+        store.set_field_defaults(&schema);
+        let writer = store.prepare_bulk_load(&field_names).unwrap();
+
+        // Encode JSON directly with default values
+        let json = serde_json::json!({
+            "id": 1,
+            "commentCount": 0,
+            "poi": false,
+            "toolIds": [],
+            "userId": 42
+        });
+        let bytes = writer.encode_json(&json, &schema);
+        let decoded = store.decode_doc(&bytes).unwrap();
+        assert!(decoded.fields.get("commentCount").is_none(), "commentCount=0 should be elided in encode_json");
+        assert!(decoded.fields.get("poi").is_none(), "poi=false should be elided in encode_json");
+        // toolIds=[] returns None from json_to_packed (empty array), so it's always absent
+        assert!(decoded.fields.get("toolIds").is_none());
+        assert!(decoded.fields.get("userId").is_some());
+    }
+
+    // ---- Schema versioning tests ----
+
+    #[test]
+    fn test_version_byte_roundtrip() {
+        let mut store = DocStore::open_temp().unwrap();
+        store.schema_version = 3;
+
+        let doc = StoredDoc {
+            fields: vec![("x".to_string(), FieldValue::Single(Value::Integer(42)))]
+                .into_iter()
+                .collect(),
+            schema_version: 0,
+        };
+        store.put(1, &doc).unwrap();
+
+        let got = store.get(1).unwrap().unwrap();
+        assert_eq!(got.schema_version, 3, "decoded doc should carry the schema version it was encoded with");
+        assert_eq!(
+            got.fields["x"],
+            FieldValue::Single(Value::Integer(42))
+        );
+    }
+
+    #[test]
+    fn test_legacy_doc_decodes_as_version_0() {
+        // Simulate a legacy doc encoded without version prefix (raw msgpack)
+        let store = DocStore::open_temp().unwrap();
+        let pairs: Vec<(u16, PackedValue)> = vec![(0, PackedValue::I(99))];
+        let raw = rmp_serde::to_vec(&pairs).unwrap();
+
+        // Legacy: first byte should be >= 0x90 (msgpack fixarray)
+        assert!(raw[0] >= 0x90, "msgpack array should start >= 0x90");
+
+        let decoded = store.decode_doc(&raw).unwrap();
+        assert_eq!(decoded.schema_version, 0, "legacy doc should decode as version 0");
+    }
+
+    #[test]
+    fn test_versioned_doc_first_bytes() {
+        let mut store = DocStore::open_temp().unwrap();
+        store.schema_version = 5;
+
+        let doc = StoredDoc {
+            fields: vec![("x".to_string(), FieldValue::Single(Value::Integer(1)))]
+                .into_iter()
+                .collect(),
+            schema_version: 0,
+        };
+        let encoded = store.encode_doc(&doc).unwrap();
+
+        // First two bytes should be [0x00, 5]
+        assert_eq!(encoded[0], 0x00, "version marker byte");
+        assert_eq!(encoded[1], 5, "schema version byte");
+    }
+
+    #[test]
+    fn test_schema_history_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+
+        // Create store, set defaults for version 1
+        {
+            let mut store = DocStore::open(&docs_dir).unwrap();
+            let schema = make_schema_with_defaults();
+            store.ensure_field_idx("commentCount");
+            store.ensure_field_idx("poi");
+            store.ensure_field_idx("toolIds");
+            store.ensure_field_idx("userId");
+            store.ensure_field_idx("blockedFor");
+            store.save_field_dict().unwrap(); // persist so reload can map names→indices
+            store.set_field_defaults(&schema);
+        }
+
+        // Verify schema file was created
+        let schema_path = docs_dir.join("meta").join("schema").join("v1.json");
+        assert!(schema_path.exists(), "v1.json schema history should exist");
+
+        // Reopen and verify historical defaults loaded
+        let store2 = DocStore::open(&docs_dir).unwrap();
+        let registry = store2.build_schema_registry();
+        assert!(registry.contains_key(&1), "registry should contain version 1");
+        let v1_defaults = &registry[&1];
+        assert_eq!(v1_defaults["commentCount"], serde_json::json!(0));
+        assert_eq!(v1_defaults["poi"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_bulk_writer_encodes_with_version() {
+        let mut store = DocStore::open_temp().unwrap();
+        let schema = make_schema_with_defaults();
+        let field_names: Vec<String> = schema.fields.iter().map(|f| f.target.clone())
+            .chain(std::iter::once("id".to_string()))
+            .collect();
+        for name in &field_names {
+            store.ensure_field_idx(name);
+        }
+        store.set_field_defaults(&schema);
+        let writer = store.prepare_bulk_load(&field_names).unwrap();
+
+        let doc = StoredDoc {
+            fields: vec![("userId".to_string(), FieldValue::Single(Value::Integer(42)))]
+                .into_iter()
+                .collect(),
+            schema_version: 0,
+        };
+        let encoded = writer.encode_doc(&doc);
+
+        // Should have version prefix
+        assert_eq!(encoded[0], 0x00, "BulkWriter should prepend version marker");
+        assert_eq!(encoded[1], 1, "BulkWriter should use schema_version 1");
+
+        // Should decode correctly
+        let decoded = store.decode_doc(&encoded).unwrap();
+        assert_eq!(decoded.schema_version, 1);
+        assert!(decoded.fields.get("userId").is_some());
     }
 }

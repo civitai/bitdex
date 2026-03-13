@@ -48,6 +48,11 @@ impl BitmapFs {
         Ok(Self { root })
     }
 
+    /// Get the root directory path.
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
+
     /// Create a temporary in-memory bitmap store for testing.
     /// Uses a tempdir that is cleaned up when the BitmapFs is dropped
     /// (caller should hold the tempdir handle).
@@ -525,6 +530,64 @@ impl BitmapFs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(BitdexError::DocStore(format!("read slot counter: {e}"))),
         }
+    }
+
+    // ---- Deferred alive map ----
+    //
+    // Layout: system/deferred_alive.bin
+    // Format: [u32 entry_count][entries...] where each entry is [u64 timestamp][u32 slot_count][u32... slots]
+    // All values little-endian.
+
+    /// Write the deferred alive map to disk.
+    pub fn write_deferred_alive(&self, deferred: &std::collections::BTreeMap<u64, Vec<u32>>) -> Result<()> {
+        let path = self.root.join("system").join("deferred_alive.bin");
+        let mut buf = Vec::new();
+        let entry_count = deferred.len() as u32;
+        buf.extend_from_slice(&entry_count.to_le_bytes());
+        for (ts, slots) in deferred {
+            buf.extend_from_slice(&ts.to_le_bytes());
+            buf.extend_from_slice(&(slots.len() as u32).to_le_bytes());
+            for &slot in slots {
+                buf.extend_from_slice(&slot.to_le_bytes());
+            }
+        }
+        Self::write_bytes_atomic(&path, &buf)
+    }
+
+    /// Load the deferred alive map from disk.
+    pub fn load_deferred_alive(&self) -> Result<Option<std::collections::BTreeMap<u64, Vec<u32>>>> {
+        let path = self.root.join("system").join("deferred_alive.bin");
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(BitdexError::DocStore(format!("read deferred alive: {e}"))),
+        };
+        if data.len() < 4 {
+            return Err(BitdexError::DocStore("deferred alive file too short".into()));
+        }
+        let entry_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let mut offset = 4;
+        let mut map = std::collections::BTreeMap::new();
+        for _ in 0..entry_count {
+            if offset + 12 > data.len() {
+                return Err(BitdexError::DocStore("deferred alive truncated".into()));
+            }
+            let ts = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            let slot_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + slot_count * 4 > data.len() {
+                return Err(BitdexError::DocStore("deferred alive slots truncated".into()));
+            }
+            let mut slots = Vec::with_capacity(slot_count);
+            for _ in 0..slot_count {
+                let slot = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                offset += 4;
+                slots.push(slot);
+            }
+            map.insert(ts, slots);
+        }
+        Ok(Some(map))
     }
 
     // ---- Time bucket bitmaps ----

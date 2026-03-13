@@ -90,6 +90,68 @@ pub fn diff_document(
     is_upsert: bool,
     registry: &FieldRegistry,
 ) -> Vec<MutationOp> {
+    // Deferred alive check FIRST: if the document should be deferred, return
+    // only the DeferredAlive op (plus cleanup ops if upsert) with NO new bitmap
+    // mutations. The document remains completely invisible (no filter/sort bits)
+    // until activation, at which point the full mutation pipeline is replayed
+    // from the stored doc.
+    if let Some(ref da_config) = config.deferred_alive {
+        if let Some(fv) = new_doc.fields.get(&da_config.source_field) {
+            if let FieldValue::Single(Value::Integer(ts)) = fv {
+                let mut activate_at = *ts as u64;
+                if da_config.ms_to_seconds {
+                    activate_at /= 1000;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if activate_at > now {
+                    let mut ops = Vec::new();
+
+                    // If this is an upsert (old doc exists with live bitmaps),
+                    // we must clear all old filter/sort bits and the alive bit.
+                    // Otherwise the document stays visible with stale data until
+                    // activation replays the full mutation pipeline.
+                    if let Some(old) = old_doc {
+                        for filter_config in &config.filter_fields {
+                            if let Some(old_val) = old.fields.get(&filter_config.name) {
+                                let arc_name = registry.get(&filter_config.name);
+                                collect_filter_remove_ops(&mut ops, &arc_name, slot, old_val);
+                            }
+                        }
+                        for sort_config in &config.sort_fields {
+                            if let Some(old_val) = old.fields.get(&sort_config.name) {
+                                if let FieldValue::Single(val) = old_val {
+                                    if let Some(old_s) = value_to_sort_u32(val) {
+                                        let arc_name = registry.get(&sort_config.name);
+                                        let num_bits = sort_config.bits as usize;
+                                        for bit in 0..num_bits {
+                                            if (old_s >> bit) & 1 == 1 {
+                                                ops.push(MutationOp::SortClear {
+                                                    field: arc_name.clone(),
+                                                    bit_layer: bit,
+                                                    slots: vec![slot],
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ops.push(MutationOp::AliveRemove { slots: vec![slot] });
+                    }
+
+                    ops.push(MutationOp::DeferredAlive {
+                        slot,
+                        activate_at,
+                    });
+                    return ops;
+                }
+            }
+        }
+    }
+
     let mut ops = Vec::new();
 
     if is_upsert {
@@ -242,34 +304,8 @@ pub fn diff_document(
     }
 
     // Alive insert (for both fresh insert and upsert -- idempotent).
-    // If a field has deferred_alive behavior and its value is in the future,
-    // schedule a deferred activation instead of immediate alive insert.
-    let mut deferred = false;
-    for fc in &config.filter_fields {
-        if let Some(ref behaviors) = fc.behaviors {
-            if behaviors.deferred_alive {
-                if let Some(fv) = new_doc.fields.get(&fc.name) {
-                    if let FieldValue::Single(Value::Integer(ts)) = fv {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        if (*ts as u64) > now {
-                            ops.push(MutationOp::DeferredAlive {
-                                slot,
-                                activate_at: *ts as u64,
-                            });
-                            deferred = true;
-                        }
-                    }
-                }
-                break; // Only one field can be deferred_alive
-            }
-        }
-    }
-    if !deferred {
-        ops.push(MutationOp::AliveInsert { slots: vec![slot] });
-    }
+    // If we reach here, the document is not deferred (checked at top of function).
+    ops.push(MutationOp::AliveInsert { slots: vec![slot] });
 
     ops
 }
@@ -493,6 +529,7 @@ impl<'a> MutationEngine<'a> {
         // Write new doc to docstore
         let stored = StoredDoc {
             fields: doc.fields.clone(),
+            schema_version: 0,
         };
         self.docstore.put(id, &stored)?;
 

@@ -281,6 +281,16 @@ impl SlotAllocator {
         activated
     }
 
+    /// Get a reference to the deferred map (for persistence).
+    pub fn deferred_map(&self) -> &BTreeMap<u64, Vec<u32>> {
+        &self.deferred
+    }
+
+    /// Replace the deferred map (for restore from disk).
+    pub fn set_deferred(&mut self, deferred: BTreeMap<u64, Vec<u32>>) {
+        self.deferred = deferred;
+    }
+
     /// Total number of slots waiting for deferred activation.
     pub fn deferred_count(&self) -> usize {
         self.deferred.values().map(|v| v.len()).sum()

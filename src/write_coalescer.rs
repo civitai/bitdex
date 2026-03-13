@@ -90,6 +90,11 @@ impl WriteBatch {
         }
     }
 
+    /// Push a list of ops directly (used by deferred alive activation in the flush thread).
+    pub fn push_ops(&mut self, ops: Vec<MutationOp>) {
+        self.ops.extend(ops);
+    }
+
     /// Drain all pending ops from the channel receiver.
     pub fn drain_channel(&mut self, receiver: &Receiver<MutationOp>) {
         while let Ok(op) = receiver.try_recv() {
@@ -185,6 +190,11 @@ impl WriteBatch {
     /// When alive changes, all cached NotEq/Not results are stale (they bake in alive).
     pub fn has_alive_mutations(&self) -> bool {
         !self.alive_inserts.is_empty() || !self.alive_removes.is_empty()
+    }
+
+    /// Returns true if this batch contains deferred alive entries.
+    pub fn has_deferred_alive(&self) -> bool {
+        !self.deferred_alive.is_empty()
     }
 
     /// Extract filter mutations for Tier 2 fields before apply.
@@ -470,6 +480,11 @@ impl WriteCoalescer {
     /// When alive changes, cached NotEq/Not results (which bake in alive) are stale.
     pub fn has_alive_mutations(&self) -> bool {
         self.batch.has_alive_mutations()
+    }
+
+    /// Returns true if the prepared batch contains deferred alive entries.
+    pub fn has_deferred_alive(&self) -> bool {
+        self.batch.has_deferred_alive()
     }
 
     /// Returns the set of filter field names mutated in the prepared batch.

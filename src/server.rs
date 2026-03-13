@@ -69,11 +69,16 @@ pub struct IndexDefinition {
 /// Built from the original string_map before case normalization so original casing is preserved.
 type ReverseStringMaps = HashMap<String, HashMap<i64, String>>;
 
+/// Historical schema defaults: version → (field_target_name → default_json_value).
+/// Used by format_document to reconstruct elided fields from docs encoded with older schemas.
+type SchemaRegistry = HashMap<u8, HashMap<String, serde_json::Value>>;
+
 /// Live state for a single index.
 struct IndexState {
     engine: Arc<ConcurrentEngine>,
     definition: IndexDefinition,
     reverse_maps: Arc<ReverseStringMaps>,
+    schema_registry: Arc<SchemaRegistry>,
     load_progress: Arc<AtomicU64>,
     load_status: Arc<Mutex<LoadStatus>>,
     load_started_at: Arc<Mutex<Option<Instant>>>,
@@ -231,11 +236,15 @@ impl IncludeDocs {
 /// Schema fields that were elided at write time (absent from StoredDoc) are
 /// filled with their type's default value so callers always see the full shape.
 /// MappedString fields are reverse-mapped from integer back to the original string.
+///
+/// When a document was encoded with a different schema version, uses historical
+/// defaults from the schema registry instead of the current schema's defaults.
 fn format_document(
     doc: &StoredDoc,
     schema: &DataSchema,
     reverse_maps: &ReverseStringMaps,
     selection: &IncludeDocs,
+    schema_registry: &SchemaRegistry,
 ) -> serde_json::Value {
     let mut fields = serde_json::Map::new();
 
@@ -243,6 +252,16 @@ fn format_document(
     if let Some(id_val) = doc.fields.get("id") {
         fields.insert("id".to_string(), field_value_to_json(id_val));
     }
+
+    // Determine which defaults to use based on the doc's schema version.
+    // Version 0 = legacy (pre-versioning), use current defaults.
+    let historical_defaults = if doc.schema_version != 0
+        && doc.schema_version != schema.schema_version
+    {
+        schema_registry.get(&doc.schema_version)
+    } else {
+        None
+    };
 
     for mapping in &schema.fields {
         // Apply field selection filter
@@ -257,8 +276,10 @@ fn format_document(
         }
 
         let value = if let Some(fv) = doc.fields.get(&mapping.target) {
-            // Reverse-map MappedString fields from integer back to string
-            if mapping.value_type == FieldValueType::MappedString {
+            // Reverse-map MappedString / LowCardinalityString fields from integer back to string
+            if mapping.value_type == FieldValueType::MappedString
+                || mapping.value_type == FieldValueType::LowCardinalityString
+            {
                 if let Some(rev) = reverse_maps.get(&mapping.target) {
                     reverse_map_value(fv, rev)
                 } else {
@@ -267,9 +288,14 @@ fn format_document(
             } else {
                 field_value_to_json(fv)
             }
+        } else if let Some(hist) = historical_defaults {
+            // Doc encoded with an older schema — use that version's defaults
+            hist.get(&mapping.target)
+                .cloned()
+                .unwrap_or_else(|| default_json_for_field(mapping))
         } else {
-            // Fuse schema default for elided fields
-            default_json_for_type(&mapping.value_type)
+            // Current schema version or legacy — use current defaults
+            default_json_for_field(mapping)
         };
         fields.insert(mapping.target.clone(), value);
     }
@@ -313,10 +339,20 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 fn default_json_for_type(vt: &FieldValueType) -> serde_json::Value {
     match vt {
         FieldValueType::Integer => serde_json::json!(0),
-        FieldValueType::MappedString => serde_json::Value::Null,
+        FieldValueType::MappedString | FieldValueType::LowCardinalityString => serde_json::Value::Null,
         FieldValueType::Boolean | FieldValueType::ExistsBoolean => serde_json::json!(false),
         FieldValueType::String => serde_json::json!(""),
         FieldValueType::IntegerArray => serde_json::json!([]),
+    }
+}
+
+/// Return the default JSON value for a field, preferring the per-field schema default
+/// over the generic type-based fallback.
+fn default_json_for_field(mapping: &crate::config::FieldMapping) -> serde_json::Value {
+    if let Some(ref default) = mapping.default_value {
+        default.clone()
+    } else {
+        default_json_for_type(&mapping.value_type)
     }
 }
 
@@ -447,22 +483,36 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 
         let json = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
         let mut def: IndexDefinition = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+
+        // Load LowCardinalityString dictionaries from disk
+        let bitmap_path = path.join("bitmaps");
+        let lcs_dicts = ConcurrentEngine::load_dictionaries(&def.data_schema, &bitmap_path)
+            .map_err(|e| e.to_string())?;
+
         // Build reverse maps BEFORE normalization to preserve original casing
-        let reverse_maps = build_reverse_string_maps(&def.data_schema);
+        let reverse_maps = build_reverse_string_maps_with_dicts(&def.data_schema, Some(&lcs_dicts));
         def.data_schema.normalize_string_maps();
 
         // Create engine from persisted config
         let docstore_path = path.join("docs");
         let mut config = def.config.clone();
-        config.storage.bitmap_path = Some(path.join("bitmaps"));
+        config.storage.bitmap_path = Some(bitmap_path);
 
         // Always use new_with_path so bitmaps restore from bitmap_path even if
         // docstore doesn't exist yet (it will be created fresh).
         let mut engine = ConcurrentEngine::new_with_path(config, &docstore_path)
             .map_err(|e| e.to_string())?;
 
-        // Build string_maps from DataSchema for MappedString field reverse lookup
-        let (string_maps, cs_fields) = build_string_maps(&def.data_schema);
+        // Set docstore field defaults for write-side elision
+        engine.set_docstore_defaults(&def.data_schema);
+
+        // Set LowCardinalityString dictionaries
+        if !lcs_dicts.is_empty() {
+            engine.set_dictionaries(lcs_dicts);
+        }
+
+        // Build string_maps from DataSchema for MappedString + LowCardinalityString field reverse lookup
+        let (string_maps, cs_fields) = build_string_maps_with_dicts(&def.data_schema, Some(engine.dictionaries()));
         if !string_maps.is_empty() {
             engine.set_string_maps(string_maps);
         }
@@ -485,10 +535,13 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             LoadStatus::Idle
         };
 
+        let schema_registry = engine.build_schema_registry();
+
         *state.index.lock() = Some(IndexState {
             engine: Arc::new(engine),
             definition: def,
             reverse_maps: Arc::new(reverse_maps),
+            schema_registry: Arc::new(schema_registry),
             load_progress: Arc::new(AtomicU64::new(alive)),
             load_status: Arc::new(Mutex::new(load_status)),
             load_started_at: Arc::new(Mutex::new(None)),
@@ -505,8 +558,11 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 // Handlers: Index management
 // ---------------------------------------------------------------------------
 
-/// Build reverse string maps from DataSchema for MappedString field query resolution.
-fn build_string_maps(schema: &DataSchema) -> (StringMaps, CaseSensitiveFields) {
+/// Build string maps with optional dictionaries for LowCardinalityString fields.
+fn build_string_maps_with_dicts(
+    schema: &DataSchema,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+) -> (StringMaps, CaseSensitiveFields) {
     let mut maps = StringMaps::new();
     let mut cs_fields = CaseSensitiveFields::new();
     for mapping in &schema.fields {
@@ -524,14 +580,25 @@ fn build_string_maps(schema: &DataSchema) -> (StringMaps, CaseSensitiveFields) {
                     maps.insert(mapping.target.clone(), normalized);
                 }
             }
+        } else if mapping.value_type == FieldValueType::LowCardinalityString {
+            // LowCardinalityString: build string map from dictionary
+            if let Some(dicts) = dictionaries {
+                if let Some(dict) = dicts.get(&mapping.target) {
+                    let snap = dict.snapshot();
+                    maps.insert(mapping.target.clone(), snap.to_string_map());
+                    // LowCardinalityString is always case-insensitive (keys are already lowercase)
+                }
+            }
         }
     }
     (maps, cs_fields)
 }
 
-/// Build reverse string maps (int → original string) for MappedString fields.
-/// Must be called BEFORE `normalize_string_maps()` to preserve original casing.
-fn build_reverse_string_maps(schema: &DataSchema) -> ReverseStringMaps {
+/// Build reverse string maps with optional dictionaries for LowCardinalityString fields.
+fn build_reverse_string_maps_with_dicts(
+    schema: &DataSchema,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+) -> ReverseStringMaps {
     let mut reverse = ReverseStringMaps::new();
     for mapping in &schema.fields {
         if mapping.value_type == FieldValueType::MappedString {
@@ -541,6 +608,13 @@ fn build_reverse_string_maps(schema: &DataSchema) -> ReverseStringMaps {
                     .map(|(k, v)| (*v, k.clone()))
                     .collect();
                 reverse.insert(mapping.target.clone(), rev);
+            }
+        } else if mapping.value_type == FieldValueType::LowCardinalityString {
+            if let Some(dicts) = dictionaries {
+                if let Some(dict) = dicts.get(&mapping.target) {
+                    let snap = dict.snapshot();
+                    reverse.insert(mapping.target.clone(), snap.to_reverse_map());
+                }
             }
         }
     }
@@ -587,8 +661,19 @@ async fn handle_create_index(
         ).into_response();
     }
 
+    // Initialize empty dictionaries for LowCardinalityString fields
+    let mut lcs_dicts = HashMap::new();
+    for mapping in &req.data_schema.fields {
+        if mapping.value_type == FieldValueType::LowCardinalityString {
+            lcs_dicts.insert(
+                mapping.target.clone(),
+                crate::dictionary::FieldDictionary::new(),
+            );
+        }
+    }
+
     // Build reverse maps BEFORE normalization to preserve original casing
-    let reverse_maps = build_reverse_string_maps(&req.data_schema);
+    let reverse_maps = build_reverse_string_maps_with_dicts(&req.data_schema, Some(&lcs_dicts));
 
     // Persist config
     let mut data_schema = req.data_schema;
@@ -622,8 +707,16 @@ async fn handle_create_index(
         }
     };
 
-    // Build string_maps from DataSchema for MappedString field reverse lookup
-    let (string_maps, cs_fields) = build_string_maps(&definition.data_schema);
+    // Set docstore field defaults for write-side elision
+    engine.set_docstore_defaults(&definition.data_schema);
+
+    // Set LowCardinalityString dictionaries
+    if !lcs_dicts.is_empty() {
+        engine.set_dictionaries(lcs_dicts);
+    }
+
+    // Build string_maps from DataSchema for MappedString + LowCardinalityString field reverse lookup
+    let (string_maps, cs_fields) = build_string_maps_with_dicts(&definition.data_schema, Some(engine.dictionaries()));
     if !string_maps.is_empty() {
         engine.set_string_maps(string_maps);
     }
@@ -631,10 +724,13 @@ async fn handle_create_index(
         engine.set_case_sensitive_fields(cs_fields);
     }
 
+    let schema_registry = engine.build_schema_registry();
+
     *state.index.lock() = Some(IndexState {
         engine: Arc::new(engine),
         definition,
         reverse_maps: Arc::new(reverse_maps),
+        schema_registry: Arc::new(schema_registry),
         load_progress: Arc::new(AtomicU64::new(0)),
         load_status: Arc::new(Mutex::new(LoadStatus::Idle)),
         load_started_at: Arc::new(Mutex::new(None)),
@@ -893,13 +989,14 @@ async fn handle_query(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema, reverse_maps) = {
+    let (engine, schema, reverse_maps, schema_registry) = {
         let guard = state.index.lock();
         match guard.as_ref() {
             Some(idx) if idx.definition.name == name => (
                 Arc::clone(&idx.engine),
                 idx.definition.data_schema.clone(),
                 Arc::clone(&idx.reverse_maps),
+                Arc::clone(&idx.schema_registry),
             ),
             _ => {
                 return (
@@ -928,7 +1025,7 @@ async fn handle_query(
                     let doc = engine.get_document(id as u32);
                     docs.push(match doc {
                         Ok(Some(stored)) => {
-                            format_document(&stored, &schema, &reverse_maps, &req.include_docs)
+                            format_document(&stored, &schema, &reverse_maps, &req.include_docs, &schema_registry)
                         }
                         _ => serde_json::json!({ "id": id }),
                     });
@@ -968,13 +1065,14 @@ async fn handle_document(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<DocumentRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema, reverse_maps) = {
+    let (engine, schema, reverse_maps, schema_registry) = {
         let guard = state.index.lock();
         match guard.as_ref() {
             Some(idx) if idx.definition.name == name => (
                 Arc::clone(&idx.engine),
                 idx.definition.data_schema.clone(),
                 Arc::clone(&idx.reverse_maps),
+                Arc::clone(&idx.schema_registry),
             ),
             _ => {
                 return (
@@ -986,7 +1084,7 @@ async fn handle_document(
     };
 
     match engine.get_document(req.slot_id) {
-        Ok(Some(doc)) => Json(format_document(&doc, &schema, &reverse_maps, &req.fields)).into_response(),
+        Ok(Some(doc)) => Json(format_document(&doc, &schema, &reverse_maps, &req.fields, &schema_registry)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
@@ -997,13 +1095,14 @@ async fn handle_documents_batch(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<DocumentBatchRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema, reverse_maps) = {
+    let (engine, schema, reverse_maps, schema_registry) = {
         let guard = state.index.lock();
         match guard.as_ref() {
             Some(idx) if idx.definition.name == name => (
                 Arc::clone(&idx.engine),
                 idx.definition.data_schema.clone(),
                 Arc::clone(&idx.reverse_maps),
+                Arc::clone(&idx.schema_registry),
             ),
             _ => {
                 return (
@@ -1017,7 +1116,7 @@ async fn handle_documents_batch(
     let mut docs = Vec::with_capacity(req.slot_ids.len());
     for slot_id in &req.slot_ids {
         match engine.get_document(*slot_id) {
-            Ok(Some(doc)) => docs.push(format_document(&doc, &schema, &reverse_maps, &req.fields)),
+            Ok(Some(doc)) => docs.push(format_document(&doc, &schema, &reverse_maps, &req.fields, &schema_registry)),
             Ok(None) => docs.push(serde_json::json!({"id": slot_id})),
             Err(_) => docs.push(serde_json::json!({"id": slot_id})),
         }
@@ -1030,13 +1129,12 @@ async fn handle_upsert(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<UpsertRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema) = {
+    let engine = {
         let guard = state.index.lock();
         match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => (
-                Arc::clone(&idx.engine),
-                idx.definition.data_schema.clone(),
-            ),
+            Some(idx) if idx.definition.name == name => {
+                Arc::clone(&idx.engine)
+            }
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -1046,11 +1144,20 @@ async fn handle_upsert(
         }
     };
 
+    // Get schema and dictionaries for the upsert
+    let (schema, has_lcs) = {
+        let guard = state.index.lock();
+        let idx = guard.as_ref().unwrap();
+        let has_lcs = idx.definition.data_schema.fields.iter().any(|f| f.value_type == FieldValueType::LowCardinalityString);
+        (idx.definition.data_schema.clone(), has_lcs)
+    };
+
     let mut upserted = 0u64;
     let mut errors: Vec<String> = Vec::new();
 
     for (i, doc_json) in req.documents.iter().enumerate() {
-        match loader::json_to_document(doc_json, &schema) {
+        let dicts = if has_lcs { Some(engine.dictionaries()) } else { None };
+        match loader::json_to_document_with_dicts(doc_json, &schema, dicts) {
             Ok((slot, doc)) => {
                 if let Err(e) = engine.put(slot, &doc) {
                     errors.push(format!("doc[{}] id={}: {}", i, slot, e));
@@ -1067,6 +1174,25 @@ async fn handle_upsert(
     // Set cursor if provided (after mutations are submitted to coalescer)
     if let Some(cursor) = req.cursor {
         engine.set_cursor(cursor.name, cursor.value);
+    }
+
+    // Rebuild reverse maps if LCS dictionaries gained new values.
+    // Ensures newly-upserted string values are reverse-mappable when serving documents.
+    // Query-time resolution already falls through to live dictionaries (no rebuild needed).
+    if has_lcs && upserted > 0 {
+        // Persist dirty dictionaries before updating reverse maps.
+        // This ensures dictionary mappings survive crashes — a doc on disk
+        // always has its integer keys resolvable via the persisted dictionary.
+        if let Err(e) = engine.persist_dirty_dictionaries() {
+            eprintln!("warning: failed to persist LCS dictionaries: {}", e);
+        }
+
+        let mut guard = state.index.lock();
+        if let Some(ref mut idx) = *guard {
+            let dicts = engine.dictionaries();
+            let reverse_maps = build_reverse_string_maps_with_dicts(&idx.definition.data_schema, Some(dicts));
+            idx.reverse_maps = Arc::new(reverse_maps);
+        }
     }
 
     state

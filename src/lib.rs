@@ -3,6 +3,7 @@ pub mod cache;
 pub mod concurrency;
 pub mod concurrent_engine;
 pub mod config;
+pub mod dictionary;
 pub mod docstore;
 pub mod engine;
 pub mod error;

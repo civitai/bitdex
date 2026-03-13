@@ -24,6 +24,7 @@ use roaring::RoaringBitmap;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{DataSchema, FieldMapping, FieldValueType};
+use crate::dictionary::FieldDictionary;
 use crate::mutation::{Document, FieldValue};
 use crate::query::Value;
 #[cfg(test)]
@@ -181,6 +182,8 @@ pub fn load_ndjson(
         .map(|f| f.target.clone())
         .chain(std::iter::once("id".to_string()))
         .collect();
+    // Set up field defaults for write-side elision before creating the BulkWriter
+    engine.set_docstore_defaults(schema);
     let bulk_writer = Arc::new(
         engine
             .prepare_bulk_writer(&all_field_names)
@@ -198,7 +201,16 @@ pub fn load_ndjson(
     let parse_writer = Arc::clone(&bulk_writer);
     let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<BitmapAccum>(2);
 
+    // Check if there are LowCardinalityString fields; if so, get dictionaries from engine
+    let has_lcs = schema.fields.iter().any(|f| f.value_type == FieldValueType::LowCardinalityString);
+    let dicts_arc: Option<Arc<HashMap<String, FieldDictionary>>> = if has_lcs {
+        Some(engine.dictionaries_arc())
+    } else {
+        None
+    };
+
     let id_field = schema_ref.id_field.clone();
+    let dicts_clone = dicts_arc;
     let parse_handle = thread::spawn(move || {
         let mut total_parsed: usize = 0;
 
@@ -231,6 +243,7 @@ pub fn load_ndjson(
             let s_bits = &sort_bits_clone;
             let writer = &parse_writer;
             let id_field_ref = &id_field;
+            let dicts = dicts_clone.as_deref();
 
             // Rayon fold+reduce: each worker builds thread-local bitmap maps
             // AND encodes docs to msgpack bytes — all CPU work in one pass.
@@ -252,12 +265,12 @@ pub fn load_ndjson(
                                 };
 
                                 // Encode doc directly from JSON — no StoredDoc allocation
-                                let bytes = writer.encode_json(&json, schema);
+                                let bytes = writer.encode_json_with_dicts(&json, schema, dicts);
                                 acc.encoded_docs.push((slot, bytes));
 
                                 // Build bitmaps directly from JSON
                                 acc.alive.insert(slot);
-                                extract_bitmaps(
+                                extract_bitmaps_with_dicts(
                                     &json,
                                     schema,
                                     f_set,
@@ -265,6 +278,7 @@ pub fn load_ndjson(
                                     slot,
                                     &mut acc.filter_maps,
                                     &mut acc.sort_maps,
+                                    dicts,
                                 );
                                 acc.count += 1;
                             }
@@ -366,6 +380,7 @@ pub fn load_ndjson(
 
 /// Extract bitmap entries directly from JSON into accumulator maps.
 /// Skips intermediate Document creation for indexed fields.
+#[allow(dead_code)] // Used by pg_sync (feature-gated)
 pub(crate) fn extract_bitmaps(
     json: &serde_json::Value,
     schema: &DataSchema,
@@ -374,6 +389,20 @@ pub(crate) fn extract_bitmaps(
     slot: u32,
     filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
     sort_maps: &mut HashMap<String, HashMap<usize, RoaringBitmap>>,
+) {
+    extract_bitmaps_with_dicts(json, schema, filter_set, sort_bits, slot, filter_maps, sort_maps, None);
+}
+
+/// Extract bitmap entries directly from JSON into accumulator maps, with optional dictionaries.
+pub(crate) fn extract_bitmaps_with_dicts(
+    json: &serde_json::Value,
+    schema: &DataSchema,
+    filter_set: &HashSet<String>,
+    sort_bits: &HashMap<String, u8>,
+    slot: u32,
+    filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
+    sort_maps: &mut HashMap<String, HashMap<usize, RoaringBitmap>>,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
 ) {
     for mapping in &schema.fields {
         if mapping.doc_only {
@@ -404,7 +433,8 @@ pub(crate) fn extract_bitmaps(
 
         if is_filter {
             if let Some(fm) = filter_maps.get_mut(&mapping.target) {
-                extract_filter_value(raw, mapping, slot, fm, apply_ms);
+                let dict = dictionaries.and_then(|d| d.get(&mapping.target));
+                extract_filter_value_with_dict(raw, mapping, slot, fm, apply_ms, dict);
             }
         }
 
@@ -416,13 +446,14 @@ pub(crate) fn extract_bitmaps(
     }
 }
 
-/// Extract a single filter value from JSON and insert into the field's bitmap map.
-pub(crate) fn extract_filter_value(
+/// Extract a single filter value, with optional dictionary for LowCardinalityString.
+pub(crate) fn extract_filter_value_with_dict(
     raw: &serde_json::Value,
     mapping: &FieldMapping,
     slot: u32,
     field_map: &mut HashMap<u64, RoaringBitmap>,
     ms_to_seconds: bool,
+    dictionary: Option<&FieldDictionary>,
 ) {
     match mapping.value_type {
         FieldValueType::Integer => {
@@ -457,6 +488,18 @@ pub(crate) fn extract_filter_value(
                     .entry(n as u64)
                     .or_insert_with(RoaringBitmap::new)
                     .insert(slot);
+            }
+        }
+        FieldValueType::LowCardinalityString => {
+            if let Some(s) = raw.as_str() {
+                if let Some(dict) = dictionary {
+                    let n = dict.get_or_insert(s);
+                    field_map
+                        .entry(n as u64)
+                        .or_insert_with(RoaringBitmap::new)
+                        .insert(slot);
+                }
+                // If no dictionary provided, skip silently (shouldn't happen in practice)
             }
         }
         FieldValueType::IntegerArray => {
@@ -562,7 +605,7 @@ fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDo
         }
     }
 
-    StoredDoc { fields }
+    StoredDoc { fields, schema_version: 0 }
 }
 
 /// Convert a raw JSON object to a `Document` using the given `DataSchema`.
@@ -573,6 +616,15 @@ fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDo
 pub fn json_to_document(
     json: &serde_json::Value,
     schema: &DataSchema,
+) -> Result<(u32, Document), String> {
+    json_to_document_with_dicts(json, schema, None)
+}
+
+/// Convert a raw JSON object to a `Document`, with optional dictionaries for LowCardinalityString fields.
+pub fn json_to_document_with_dicts(
+    json: &serde_json::Value,
+    schema: &DataSchema,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
 ) -> Result<(u32, Document), String> {
     // Extract ID
     let id_val = json
@@ -606,7 +658,8 @@ pub fn json_to_document(
             }
         };
 
-        if let Some(fv) = convert_field(raw, mapping, apply_ms) {
+        let dict = dictionaries.and_then(|d| d.get(&mapping.target));
+        if let Some(fv) = convert_field_with_dict(raw, mapping, apply_ms, dict) {
             fields.insert(mapping.target.clone(), fv);
         }
     }
@@ -615,7 +668,18 @@ pub fn json_to_document(
 }
 
 /// Convert a raw serde_json Value field to a FieldValue.
+#[allow(dead_code)] // Used by test helpers
 fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping, ms_to_seconds: bool) -> Option<FieldValue> {
+    convert_field_with_dict(raw, mapping, ms_to_seconds, None)
+}
+
+/// Convert a raw serde_json Value field to a FieldValue, with optional dictionary.
+pub fn convert_field_with_dict(
+    raw: &serde_json::Value,
+    mapping: &FieldMapping,
+    ms_to_seconds: bool,
+    dictionary: Option<&FieldDictionary>,
+) -> Option<FieldValue> {
     match mapping.value_type {
         FieldValueType::Integer => {
             let n = if let Some(n) = raw.as_i64() {
@@ -653,6 +717,16 @@ fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping, ms_to_seconds:
             let n = map.get(lookup.as_ref()).copied().unwrap_or(0);
             Some(FieldValue::Single(Value::Integer(n)))
         }
+        FieldValueType::LowCardinalityString => {
+            let s = raw.as_str()?;
+            if let Some(dict) = dictionary {
+                let n = dict.get_or_insert(s);
+                Some(FieldValue::Single(Value::Integer(n)))
+            } else {
+                // Without a dictionary, store as 0 (unknown)
+                Some(FieldValue::Single(Value::Integer(0)))
+            }
+        }
         FieldValueType::IntegerArray => {
             let arr = raw.as_array()?;
             if arr.is_empty() {
@@ -688,6 +762,7 @@ mod tests {
     fn test_json_to_stored_doc_integer() {
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "count".into(),
                 target: "count".into(),
@@ -698,6 +773,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 42, "count": 100});
@@ -716,6 +792,7 @@ mod tests {
     fn test_json_to_stored_doc_fallback() {
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "primary".into(),
                 target: "val".into(),
@@ -726,6 +803,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "secondary": 99});
@@ -744,6 +822,7 @@ mod tests {
 
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "type".into(),
                 target: "type".into(),
@@ -754,6 +833,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "type": "image"});
@@ -772,6 +852,7 @@ mod tests {
 
         let mut schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "type".into(),
                 target: "type".into(),
@@ -782,6 +863,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false, // default
+                default_value: None,
             }],
         };
         schema.normalize_string_maps();
@@ -811,6 +893,7 @@ mod tests {
 
         let mut schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "type".into(),
                 target: "type".into(),
@@ -821,6 +904,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: true,
+                default_value: None,
             }],
         };
         schema.normalize_string_maps();
@@ -846,6 +930,7 @@ mod tests {
     fn test_json_to_stored_doc_boolean() {
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "hasMeta".into(),
                 target: "hasMeta".into(),
@@ -856,6 +941,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "hasMeta": true});
@@ -870,6 +956,7 @@ mod tests {
     fn test_json_to_stored_doc_integer_array() {
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "tagIds".into(),
                 target: "tagIds".into(),
@@ -880,6 +967,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "tagIds": [10, 20, 30]});
@@ -898,6 +986,7 @@ mod tests {
     fn test_json_to_stored_doc_truncate_u32() {
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "ts".into(),
                 target: "ts".into(),
@@ -908,6 +997,7 @@ mod tests {
                 ms_to_seconds: true,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         // Millisecond timestamp → divide by 1000, then cast to u32
@@ -927,6 +1017,7 @@ mod tests {
         // Mirrors the real civitai config: source=sortAtUnix (ms), fallback=sortAt (seconds)
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "sortAtUnix".into(),
                 target: "sortAt".into(),
@@ -937,6 +1028,7 @@ mod tests {
                 ms_to_seconds: true,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
 
@@ -985,6 +1077,7 @@ mod tests {
         // Same test through json_to_document (the production path for upserts)
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "sortAtUnix".into(),
                 target: "sortAt".into(),
@@ -995,6 +1088,7 @@ mod tests {
                 ms_to_seconds: true,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
 
@@ -1033,6 +1127,7 @@ mod tests {
     fn test_json_to_stored_doc_string() {
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "url".into(),
                 target: "url".into(),
@@ -1043,6 +1138,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "url": "http://example.com"});
@@ -1059,6 +1155,7 @@ mod tests {
     fn test_json_to_stored_doc_missing_field_skipped() {
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "missing".into(),
                 target: "val".into(),
@@ -1069,6 +1166,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1});
@@ -1080,6 +1178,7 @@ mod tests {
     fn test_json_to_stored_doc_null_field_skipped() {
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "val".into(),
                 target: "val".into(),
@@ -1090,6 +1189,7 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "val": null});
@@ -1101,6 +1201,7 @@ mod tests {
     fn test_json_to_stored_doc_empty_array_skipped() {
         let schema = DataSchema {
             id_field: "id".into(),
+            schema_version: 1,
             fields: vec![FieldMapping {
                 source: "tags".into(),
                 target: "tags".into(),
@@ -1111,10 +1212,187 @@ mod tests {
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
+                default_value: None,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "tags": []});
         let doc = json_to_stored_doc(&json, &schema);
         assert!(doc.fields.get("tags").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // LowCardinalityString tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_low_cardinality_string_auto_assignment() {
+        use crate::dictionary::FieldDictionary;
+
+        let dict = FieldDictionary::new();
+        let mut dicts = HashMap::new();
+        dicts.insert("baseModel".to_string(), dict);
+
+        let schema = DataSchema {
+            id_field: "id".into(),
+            schema_version: 1,
+            fields: vec![FieldMapping {
+                source: "baseModel".into(),
+                target: "baseModel".into(),
+                value_type: FieldValueType::LowCardinalityString,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+            }],
+        };
+
+        // First document — "SD 1.5" gets assigned a key
+        let json1 = serde_json::json!({"id": 1, "baseModel": "SD 1.5"});
+        let (slot1, doc1) = json_to_document_with_dicts(&json1, &schema, Some(&dicts)).unwrap();
+        assert_eq!(slot1, 1);
+        let k1 = match doc1.fields.get("baseModel") {
+            Some(FieldValue::Single(Value::Integer(n))) => *n,
+            _ => panic!("expected integer"),
+        };
+        assert!(k1 >= 1, "auto-assigned key should be >= 1");
+
+        // Second document — same string gets same key
+        let json2 = serde_json::json!({"id": 2, "baseModel": "SD 1.5"});
+        let (_, doc2) = json_to_document_with_dicts(&json2, &schema, Some(&dicts)).unwrap();
+        let k2 = match doc2.fields.get("baseModel") {
+            Some(FieldValue::Single(Value::Integer(n))) => *n,
+            _ => panic!("expected integer"),
+        };
+        assert_eq!(k1, k2, "same string should get same key");
+
+        // Third document — different string gets different key
+        let json3 = serde_json::json!({"id": 3, "baseModel": "SDXL 1.0"});
+        let (_, doc3) = json_to_document_with_dicts(&json3, &schema, Some(&dicts)).unwrap();
+        let k3 = match doc3.fields.get("baseModel") {
+            Some(FieldValue::Single(Value::Integer(n))) => *n,
+            _ => panic!("expected integer"),
+        };
+        assert_ne!(k1, k3, "different string should get different key");
+    }
+
+    #[test]
+    fn test_low_cardinality_string_case_insensitive() {
+        use crate::dictionary::FieldDictionary;
+
+        let dict = FieldDictionary::new();
+        let mut dicts = HashMap::new();
+        dicts.insert("type".to_string(), dict);
+
+        let schema = DataSchema {
+            id_field: "id".into(),
+            schema_version: 1,
+            fields: vec![FieldMapping {
+                source: "type".into(),
+                target: "type".into(),
+                value_type: FieldValueType::LowCardinalityString,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+            }],
+        };
+
+        let json1 = serde_json::json!({"id": 1, "type": "Image"});
+        let (_, doc1) = json_to_document_with_dicts(&json1, &schema, Some(&dicts)).unwrap();
+        let k1 = match doc1.fields.get("type") {
+            Some(FieldValue::Single(Value::Integer(n))) => *n,
+            _ => panic!("expected integer"),
+        };
+
+        // Different casing should get same key
+        let json2 = serde_json::json!({"id": 2, "type": "IMAGE"});
+        let (_, doc2) = json_to_document_with_dicts(&json2, &schema, Some(&dicts)).unwrap();
+        let k2 = match doc2.fields.get("type") {
+            Some(FieldValue::Single(Value::Integer(n))) => *n,
+            _ => panic!("expected integer"),
+        };
+        assert_eq!(k1, k2, "case-insensitive: same key for different casing");
+
+        // Original casing preserved in dictionary
+        let dict = dicts.get("type").unwrap();
+        let snap = dict.snapshot();
+        assert_eq!(snap.originals.get("image"), Some(&"Image".to_string()));
+    }
+
+    #[test]
+    fn test_low_cardinality_string_extract_filter_value() {
+        use crate::dictionary::FieldDictionary;
+
+        let dict = FieldDictionary::new();
+        let mapping = FieldMapping {
+            source: "color".into(),
+            target: "color".into(),
+            value_type: FieldValueType::LowCardinalityString,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: None,
+        };
+
+        let mut field_map: HashMap<u64, RoaringBitmap> = HashMap::new();
+
+        let raw1 = serde_json::json!("Red");
+        extract_filter_value_with_dict(&raw1, &mapping, 100, &mut field_map, false, Some(&dict));
+
+        let raw2 = serde_json::json!("Blue");
+        extract_filter_value_with_dict(&raw2, &mapping, 200, &mut field_map, false, Some(&dict));
+
+        let raw3 = serde_json::json!("red"); // same as "Red" (case insensitive)
+        extract_filter_value_with_dict(&raw3, &mapping, 300, &mut field_map, false, Some(&dict));
+
+        // "Red" and "red" should have the same key
+        let red_key = dict.get("Red").unwrap() as u64;
+        let blue_key = dict.get("Blue").unwrap() as u64;
+        assert_ne!(red_key, blue_key);
+
+        let red_bm = field_map.get(&red_key).unwrap();
+        assert!(red_bm.contains(100));
+        assert!(red_bm.contains(300)); // "red" maps to same key as "Red"
+        assert!(!red_bm.contains(200));
+
+        let blue_bm = field_map.get(&blue_key).unwrap();
+        assert!(blue_bm.contains(200));
+        assert!(!blue_bm.contains(100));
+    }
+
+    #[test]
+    fn test_low_cardinality_string_dictionary_persistence() {
+        use crate::dictionary::{FieldDictionary, save_dictionary, load_dictionary};
+
+        let dict = FieldDictionary::new();
+        dict.get_or_insert("Alpha");
+        dict.get_or_insert("Beta");
+        dict.get_or_insert("Gamma");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_field.dict");
+
+        let snap = dict.snapshot();
+        save_dictionary(&snap, &path).unwrap();
+
+        let loaded_snap = load_dictionary(&path).unwrap().unwrap();
+        let dict2 = FieldDictionary::from_snapshot(&loaded_snap);
+
+        // Same mappings after reload
+        assert_eq!(dict2.get("alpha"), dict.get("alpha"));
+        assert_eq!(dict2.get("beta"), dict.get("beta"));
+        assert_eq!(dict2.get("gamma"), dict.get("gamma"));
+
+        // Original casing preserved
+        assert_eq!(loaded_snap.originals.get("alpha"), Some(&"Alpha".to_string()));
     }
 }

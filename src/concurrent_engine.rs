@@ -95,6 +95,8 @@ pub struct ConcurrentEngine {
     string_maps: Option<Arc<StringMaps>>,
     /// Fields where string matching is case-sensitive (default is case-insensitive).
     case_sensitive_fields: Option<Arc<CaseSensitiveFields>>,
+    /// Per-field dictionaries for LowCardinalityString fields.
+    dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
     /// Unified cache: primary query result cache.
     unified_cache: Arc<parking_lot::Mutex<UnifiedCache>>,
     /// Flush loop stats: total snapshot publishes (monotonic counter).
@@ -177,6 +179,15 @@ impl ConcurrentEngine {
                     alive_bm,
                     RoaringBitmap::new(),
                 );
+
+                // Restore deferred alive map if persisted.
+                if let Some(deferred) = store.load_deferred_alive()? {
+                    if !deferred.is_empty() {
+                        let total: usize = deferred.values().map(|v| v.len()).sum();
+                        eprintln!("Restored {} deferred alive slots ({} timestamps)", total, deferred.len());
+                        slots.set_deferred(deferred);
+                    }
+                }
 
                 // Only register pending loads if there are actual records to restore.
                 // Fields with no saved bitmaps don't need lazy loading.
@@ -360,6 +371,9 @@ impl ConcurrentEngine {
             let flush_eviction_stamps = Arc::clone(&eviction_stamps);
             let flush_eviction_total = Arc::clone(&eviction_total);
             let flush_cycle_clone = Arc::clone(&flush_cycle);
+            let flush_bitmap_store = bitmap_store.clone();
+            let flush_config = Arc::clone(&config);
+            let flush_field_registry = field_registry.clone();
             let eviction_sweep_interval = config.eviction_sweep_interval;
             // Build eviction config map: field_name → idle_seconds
             let eviction_configs: HashMap<String, f64> = config.filter_fields.iter()
@@ -433,17 +447,12 @@ impl ConcurrentEngine {
                             &mut staging.sorts,
                         );
 
-                        // Activate deferred alive slots whose time has come.
-                        // O(pending count) — typically small; runs every flush cycle for
-                        // sub-second activation precision.
-                        {
-                            let now_unix = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            let activated = staging.slots.activate_due(now_unix);
-                            if !activated.is_empty() {
-                                staging.slots.merge_alive();
+                        // Persist deferred map when new deferred entries are added.
+                        if coalescer.has_deferred_alive() {
+                            if let Some(ref store) = flush_bitmap_store {
+                                if let Err(e) = store.write_deferred_alive(staging.slots.deferred_map()) {
+                                    eprintln!("Warning: failed to persist deferred alive map: {e}");
+                                }
                             }
                         }
 
@@ -547,6 +556,74 @@ impl ConcurrentEngine {
                             flush_pub_count.fetch_add(1, Ordering::Relaxed);
                             flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
                             flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
+                        }
+                    }
+
+                    // Activate deferred alive slots whose time has come.
+                    // Runs every flush cycle regardless of write activity for sub-second
+                    // activation precision. On activation: read stored doc from docstore,
+                    // replay the full mutation pipeline (filter/sort/alive ops) as if the
+                    // document was just PUT for the first time. This ensures the document
+                    // only becomes visible in bitmaps at activation time.
+                    if staging.slots.deferred_count() > 0 {
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let activated = staging.slots.activate_due(now_unix);
+                        if !activated.is_empty() {
+                            // Collect all mutation ops for activated slots into a WriteBatch,
+                            // then apply in bulk (same path as normal mutations).
+                            let mut activation_batch = crate::write_coalescer::WriteBatch::new();
+                            {
+                                let ds = docstore.lock();
+                                for &slot in &activated {
+                                    match ds.get(slot) {
+                                        Ok(Some(stored_doc)) => {
+                                            let doc = crate::mutation::Document {
+                                                fields: stored_doc.fields.clone(),
+                                            };
+                                            let ops = crate::mutation::diff_document(
+                                                slot,
+                                                None, // fresh insert — no old doc
+                                                &doc,
+                                                &flush_config,
+                                                false, // not upsert
+                                                &flush_field_registry,
+                                            );
+                                            activation_batch.push_ops(ops);
+                                        }
+                                        Ok(None) => {
+                                            eprintln!("Warning: deferred slot {} has no stored doc, setting alive only", slot);
+                                            activation_batch.push_ops(vec![
+                                                MutationOp::AliveInsert { slots: vec![slot] },
+                                            ]);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Warning: failed to read deferred slot {}: {e}, setting alive only", slot);
+                                            activation_batch.push_ops(vec![
+                                                MutationOp::AliveInsert { slots: vec![slot] },
+                                            ]);
+                                        }
+                                    }
+                                }
+                            } // docstore lock released
+                            activation_batch.group_and_sort();
+                            activation_batch.apply(
+                                &mut staging.slots,
+                                &mut staging.filters,
+                                &mut staging.sorts,
+                            );
+                            staging_dirty = true;
+
+                            // Persist the deferred map AFTER activation so the activated
+                            // entries are already removed. On crash before persist, the
+                            // old map is re-read and those slots get re-activated (idempotent).
+                            if let Some(ref store) = flush_bitmap_store {
+                                if let Err(e) = store.write_deferred_alive(staging.slots.deferred_map()) {
+                                    eprintln!("Warning: failed to persist deferred alive map: {e}");
+                                }
+                            }
                         }
                     }
 
@@ -947,6 +1024,7 @@ impl ConcurrentEngine {
             lazy_tx,
             string_maps: None,
             case_sensitive_fields: None,
+            dictionaries: Arc::new(HashMap::new()),
             unified_cache,
             flush_publish_count,
             flush_duration_nanos,
@@ -968,6 +1046,96 @@ impl ConcurrentEngine {
     /// Set the case-sensitive fields for string matching control.
     pub fn set_case_sensitive_fields(&mut self, fields: CaseSensitiveFields) {
         self.case_sensitive_fields = Some(Arc::new(fields));
+    }
+
+    /// Set the per-field dictionaries for LowCardinalityString fields.
+    pub fn set_dictionaries(&mut self, dicts: HashMap<String, crate::dictionary::FieldDictionary>) {
+        self.dictionaries = Arc::new(dicts);
+    }
+
+    /// Get a reference to the dictionaries (for loader and upsert paths).
+    pub fn dictionaries(&self) -> &HashMap<String, crate::dictionary::FieldDictionary> {
+        &self.dictionaries
+    }
+
+    /// Get a cloneable Arc to the dictionaries (for passing into threads).
+    pub fn dictionaries_arc(&self) -> Arc<HashMap<String, crate::dictionary::FieldDictionary>> {
+        Arc::clone(&self.dictionaries)
+    }
+
+    /// Save all dictionaries to disk in the given directory.
+    pub fn save_dictionaries(&self, dir: &std::path::Path) -> Result<()> {
+        let dict_dir = dir.join("dictionaries");
+        for (name, dict) in self.dictionaries.iter() {
+            let snap = dict.snapshot();
+            let path = dict_dir.join(format!("{}.dict", name));
+            crate::dictionary::save_dictionary(&snap, &path)
+                .map_err(|e| crate::error::BitdexError::Config(e))?;
+        }
+        Ok(())
+    }
+
+    /// Persist dirty dictionaries to disk. Call after upserts that may have
+    /// created new LowCardinalityString values. Only writes dictionaries that
+    /// have new entries since the last persist, and clears their dirty flags.
+    ///
+    /// This ensures dictionary mappings survive crashes even before the next
+    /// full `save_snapshot()`. Dictionaries are small (typically < 1 KB), so
+    /// the I/O cost is negligible.
+    pub fn persist_dirty_dictionaries(&self) -> Result<()> {
+        if self.dictionaries.is_empty() {
+            return Ok(());
+        }
+        let store = match self.bitmap_store.as_ref() {
+            Some(s) => s,
+            None => return Ok(()), // no persistence configured
+        };
+        let dict_dir = store.root_path().join("dictionaries");
+        for (name, dict) in self.dictionaries.iter() {
+            if dict.is_dirty() {
+                let snap = dict.snapshot();
+                let path = dict_dir.join(format!("{}.dict", name));
+                crate::dictionary::save_dictionary(&snap, &path)
+                    .map_err(|e| crate::error::BitdexError::Config(e))?;
+                dict.clear_dirty();
+            }
+        }
+        Ok(())
+    }
+
+    /// Load dictionaries from disk for all LowCardinalityString fields in the schema.
+    pub fn load_dictionaries(
+        schema: &crate::config::DataSchema,
+        dir: &std::path::Path,
+    ) -> Result<HashMap<String, crate::dictionary::FieldDictionary>> {
+        let dict_dir = dir.join("dictionaries");
+        let mut dicts = HashMap::new();
+        for mapping in &schema.fields {
+            if mapping.value_type == crate::config::FieldValueType::LowCardinalityString {
+                let path = dict_dir.join(format!("{}.dict", mapping.target));
+                match crate::dictionary::load_dictionary(&path) {
+                    Ok(Some(snap)) => {
+                        dicts.insert(
+                            mapping.target.clone(),
+                            crate::dictionary::FieldDictionary::from_snapshot(&snap),
+                        );
+                    }
+                    Ok(None) => {
+                        // No persisted dictionary — create empty
+                        dicts.insert(
+                            mapping.target.clone(),
+                            crate::dictionary::FieldDictionary::new(),
+                        );
+                    }
+                    Err(e) => {
+                        return Err(crate::error::BitdexError::Config(
+                            format!("Failed to load dictionary for '{}': {}", mapping.target, e),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(dicts)
     }
 
     /// Load the current snapshot (lock-free, zero refcount ops).
@@ -1024,6 +1192,7 @@ impl ConcurrentEngine {
             // Enqueue doc write — flush thread will batch these
             let stored = StoredDoc {
                 fields: doc.fields.clone(),
+                schema_version: 0,
             };
             self.doc_tx.send((id, stored)).map_err(|_| {
                 crate::error::BitdexError::CapacityExceeded(
@@ -1145,6 +1314,9 @@ impl ConcurrentEngine {
             }
             if let Some(ref cs) = self.case_sensitive_fields {
                 base = base.with_case_sensitive_fields(cs);
+            }
+            if !self.dictionaries.is_empty() {
+                base = base.with_dictionaries(&self.dictionaries);
             }
             if let Some(ref tb) = tb_guard {
                 base.with_time_buckets(tb, now_unix)
@@ -1486,6 +1658,9 @@ impl ConcurrentEngine {
             }
             if let Some(ref cs) = self.case_sensitive_fields {
                 base = base.with_case_sensitive_fields(cs);
+            }
+            if !self.dictionaries.is_empty() {
+                base = base.with_dictionaries(&self.dictionaries);
             }
             if let Some(ref tb) = tb_guard {
                 base.with_time_buckets(tb, now_unix)
@@ -2090,6 +2265,22 @@ impl ConcurrentEngine {
         self.docstore.lock().compact()
     }
 
+    /// Configure docstore field defaults from a DataSchema.
+    /// Must be called before `prepare_bulk_writer()` so the BulkWriter inherits the defaults.
+    pub fn set_docstore_defaults(&self, schema: &crate::config::DataSchema) {
+        self.docstore.lock().set_field_defaults(schema);
+    }
+
+    /// Get the current schema version from the docstore.
+    pub fn docstore_schema_version(&self) -> u8 {
+        self.docstore.lock().schema_version()
+    }
+
+    /// Build the schema registry for version-aware default reconstruction.
+    pub fn build_schema_registry(&self) -> std::collections::HashMap<u8, std::collections::HashMap<String, serde_json::Value>> {
+        self.docstore.lock().build_schema_registry()
+    }
+
     /// Prepare a BulkWriter for lock-free parallel docstore writes during bulk loading.
     /// The BulkWriter holds a snapshot of the field dictionary and can encode/write
     /// docs without acquiring the DocStore Mutex.
@@ -2219,6 +2410,12 @@ impl ConcurrentEngine {
             store.write_cursor(name, value)?;
         }
 
+        // Save LowCardinalityString dictionaries alongside bitmaps.
+        if !self.dictionaries.is_empty() {
+            let bitmap_path = store.root_path();
+            self.save_dictionaries(bitmap_path)?;
+        }
+
         Ok(())
     }
 
@@ -2232,7 +2429,14 @@ impl ConcurrentEngine {
         let skip_sorts = self.pending_sort_loads.lock().clone();
         let skip_filters = self.pending_filter_loads.lock().clone();
         let skip_lazy = self.lazy_value_fields.lock().clone();
-        Self::write_snapshot_to_store(&store, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)
+        Self::write_snapshot_to_store(&store, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)?;
+
+        // Save LowCardinalityString dictionaries alongside bitmaps.
+        if !self.dictionaries.is_empty() {
+            self.save_dictionaries(path)?;
+        }
+
+        Ok(())
     }
 
     /// Internal: zero-copy snapshot serialization.
@@ -2261,10 +2465,13 @@ impl ConcurrentEngine {
         eprintln!("  save: snapshot loaded ({:.1}ms)",
             save_start.elapsed().as_secs_f64() * 1000.0);
 
-        // Write alive bitmap + slot counter first (critical metadata).
+        // Write alive bitmap + slot counter + deferred map first (critical metadata).
         let alive_cow = snap.slots.alive_fused_cow();
         store.write_alive(&alive_cow)?;
         store.write_slot_counter(snap.slots.slot_counter())?;
+        if snap.slots.deferred_count() > 0 {
+            store.write_deferred_alive(snap.slots.deferred_map())?;
+        }
 
         // Sort fields — one at a time, zero-copy via fused_cow.
         for sc in &config.sort_fields {
@@ -2467,6 +2674,7 @@ impl ConcurrentEngine {
                     id,
                     crate::docstore::StoredDoc {
                         fields: doc.fields.clone(),
+                        schema_version: 0,
                     },
                 ));
             }
@@ -2575,7 +2783,7 @@ impl ConcurrentEngine {
             let batch_size = 100_000;
             let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
             for (slot, doc) in docs {
-                batch.push((slot, StoredDoc { fields: doc.fields }));
+                batch.push((slot, StoredDoc { fields: doc.fields, schema_version: 0 }));
                 if batch.len() >= batch_size {
                     if let Err(e) = docstore.lock().put_batch(&batch) {
                         eprintln!("put_bulk: docstore batch write failed: {e}");
@@ -2598,7 +2806,7 @@ impl ConcurrentEngine {
         let batch_size = 10_000;
         let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
         for (slot, doc) in docs {
-            batch.push((*slot, StoredDoc { fields: doc.fields.clone() }));
+            batch.push((*slot, StoredDoc { fields: doc.fields.clone(), schema_version: 0 }));
             if batch.len() >= batch_size {
                 if let Err(e) = self.docstore.lock().put_batch(&batch) {
                     eprintln!("write_docs_to_docstore: batch write failed: {e}");

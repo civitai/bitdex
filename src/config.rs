@@ -64,6 +64,11 @@ pub struct Config {
     /// responsive (useful for testing).
     #[serde(default = "default_eviction_sweep_interval")]
     pub eviction_sweep_interval: u64,
+
+    /// Deferred alive: documents with a future timestamp in the specified field
+    /// won't be marked alive until that time arrives. Only one field per document.
+    #[serde(default)]
+    pub deferred_alive: Option<DeferredAliveConfig>,
 }
 
 fn default_max_page_size() -> usize {
@@ -87,6 +92,23 @@ fn default_eviction_sweep_interval() -> u64 {
 fn default_channel_capacity() -> usize {
     100_000
 }
+fn default_schema_version() -> u8 {
+    1
+}
+
+/// Deferred alive configuration: defer a document's alive bit until a future timestamp.
+///
+/// The source field is read from the incoming document. If its value is in the future,
+/// the slot's filter/sort bitmaps are set immediately but the alive bit is deferred
+/// until the timestamp arrives. The flush thread activates due slots every cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredAliveConfig {
+    /// The document field containing the activation timestamp (unix seconds).
+    pub source_field: String,
+    /// If true, the source value is in milliseconds and will be divided by 1000.
+    #[serde(default)]
+    pub ms_to_seconds: bool,
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -103,6 +125,7 @@ impl Default for Config {
             channel_capacity: default_channel_capacity(),
             storage: StorageConfig::default(),
             eviction_sweep_interval: default_eviction_sweep_interval(),
+            deferred_alive: None,
         }
     }
 }
@@ -198,13 +221,6 @@ impl Config {
                 }
             }
             if let Some(behaviors) = &f.behaviors {
-                // Warn (as error) if deferred_alive is set on a boolean field
-                if behaviors.deferred_alive && f.field_type == FilterFieldType::Boolean {
-                    return Err(BitdexError::Config(format!(
-                        "filter field '{}': deferred_alive is not meaningful on boolean fields",
-                        f.name
-                    )));
-                }
                 // Validate range_buckets: unique names, non-zero durations
                 let mut bucket_names = std::collections::HashSet::new();
                 for bucket in &behaviors.range_buckets {
@@ -273,6 +289,15 @@ impl Config {
                         bucket.name
                     )));
                 }
+            }
+        }
+
+        // Validate deferred_alive config
+        if let Some(ref da) = self.deferred_alive {
+            if da.source_field.is_empty() {
+                return Err(BitdexError::Config(
+                    "deferred_alive.source_field must not be empty".to_string(),
+                ));
             }
         }
 
@@ -400,10 +425,6 @@ pub struct EvictionConfig {
 /// Time-related behaviors for timestamp fields.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FieldBehaviors {
-    /// If true, documents with future values in this field won't be marked alive
-    /// until the scheduled time arrives.
-    #[serde(default)]
-    pub deferred_alive: bool,
     /// Pre-computed range buckets for this field (e.g., "24h", "7d", "30d").
     #[serde(default)]
     pub range_buckets: Vec<BucketConfig>,
@@ -474,13 +495,29 @@ fn default_bits() -> u8 {
 
 /// Schema describing how raw NDJSON records map to engine documents.
 /// Used by the generic loader to convert arbitrary JSON into Documents.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataSchema {
     /// Name of the JSON field containing the document ID.
     pub id_field: String,
+    /// Current schema version. Increment when changing field defaults.
+    /// Old documents encoded with previous schema versions are decoded using
+    /// historical defaults stored in `meta/schema/v{n}.json`. Docs are lazily
+    /// migrated to the current schema version on next write.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u8,
     /// Field mapping rules: source JSON → target engine field.
     #[serde(default)]
     pub fields: Vec<FieldMapping>,
+}
+
+impl Default for DataSchema {
+    fn default() -> Self {
+        Self {
+            id_field: String::new(),
+            schema_version: default_schema_version(),
+            fields: Vec::new(),
+        }
+    }
 }
 
 /// Maps a single source JSON field to a target engine field.
@@ -512,6 +549,10 @@ pub struct FieldMapping {
     /// Applies to MappedString fields: both ingest (string_map lookup) and query resolution.
     #[serde(default)]
     pub case_sensitive: bool,
+    /// Default value for this field. Documents with this value will have the field
+    /// elided on write. On read, missing fields are reconstructed from this default.
+    #[serde(default, rename = "default")]
+    pub default_value: Option<serde_json::Value>,
 }
 
 impl FieldMapping {
@@ -544,6 +585,16 @@ impl FieldMapping {
 }
 
 impl DataSchema {
+    /// Validate the schema.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version < 1 {
+            return Err(BitdexError::Config(
+                "data_schema.schema_version must be >= 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Normalize string_map keys to lowercase for case-insensitive MappedString fields.
     /// Call once after deserialization, before use in loader/docstore/server.
     pub fn normalize_string_maps(&mut self) {
@@ -569,6 +620,10 @@ pub enum FieldValueType {
     String,
     /// String mapped to integer via string_map → Value::Integer
     MappedString,
+    /// Low-cardinality string: auto-builds dictionary as new values are encountered.
+    /// No hardcoded string_map needed — the dictionary assigns integer keys automatically.
+    /// Case-insensitive matching by default.
+    LowCardinalityString,
     /// Array of integers → FieldValue::Multi
     IntegerArray,
     /// Computed boolean: true if the source field exists and is non-null, false otherwise.
@@ -1064,9 +1119,6 @@ max_page_size = 50
 name = "scheduledAt"
 field_type = "single_value"
 
-[filter_fields.behaviors]
-deferred_alive = true
-
 [[filter_fields.behaviors.range_buckets]]
 name = "24h"
 duration_secs = 86400
@@ -1076,11 +1128,13 @@ refresh_interval_secs = 60
 name = "7d"
 duration_secs = 604800
 refresh_interval_secs = 300
+
+[deferred_alive]
+source_field = "scheduledAt"
 "#;
         let config = Config::from_toml(toml_str).unwrap();
         assert_eq!(config.filter_fields.len(), 1);
         let behaviors = config.filter_fields[0].behaviors.as_ref().unwrap();
-        assert!(behaviors.deferred_alive);
         assert_eq!(behaviors.range_buckets.len(), 2);
         assert_eq!(behaviors.range_buckets[0].name, "24h");
         assert_eq!(behaviors.range_buckets[0].duration_secs, 86400);
@@ -1088,6 +1142,9 @@ refresh_interval_secs = 300
         assert_eq!(behaviors.range_buckets[1].name, "7d");
         assert_eq!(behaviors.range_buckets[1].duration_secs, 604800);
         assert_eq!(behaviors.range_buckets[1].refresh_interval_secs, 300);
+        let da = config.deferred_alive.as_ref().unwrap();
+        assert_eq!(da.source_field, "scheduledAt");
+        assert!(!da.ms_to_seconds);
     }
 
     #[test]
@@ -1097,7 +1154,6 @@ filter_fields:
   - name: scheduledAt
     field_type: single_value
     behaviors:
-      deferred_alive: true
       range_buckets:
         - name: "24h"
           duration_secs: 86400
@@ -1105,13 +1161,18 @@ filter_fields:
         - name: "30d"
           duration_secs: 2592000
           refresh_interval_secs: 3600
+deferred_alive:
+  source_field: scheduledAt
+  ms_to_seconds: true
 "#;
         let config = Config::from_yaml(yaml).unwrap();
         let behaviors = config.filter_fields[0].behaviors.as_ref().unwrap();
-        assert!(behaviors.deferred_alive);
         assert_eq!(behaviors.range_buckets.len(), 2);
         assert_eq!(behaviors.range_buckets[1].name, "30d");
         assert_eq!(behaviors.range_buckets[1].duration_secs, 2592000);
+        let da = config.deferred_alive.as_ref().unwrap();
+        assert_eq!(da.source_field, "scheduledAt");
+        assert!(da.ms_to_seconds);
     }
 
     #[test]
@@ -1126,21 +1187,28 @@ field_type = "single_value"
     }
 
     #[test]
-    fn test_validation_rejects_deferred_alive_on_boolean() {
+    fn test_validation_rejects_empty_deferred_alive_source_field() {
         let config = Config {
-            filter_fields: vec![FilterFieldConfig {
-                name: "onSite".into(),
-                field_type: FilterFieldType::Boolean,
-                behaviors: Some(FieldBehaviors {
-                    deferred_alive: true,
-                    range_buckets: vec![],
-                    sort_field: None,
-                }),
-                eviction: None,
-            }],
+            deferred_alive: Some(DeferredAliveConfig {
+                source_field: "".into(),
+                ms_to_seconds: false,
+            }),
             ..Config::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_deferred_alive_config_parsing() {
+        let toml_str = r#"
+[deferred_alive]
+source_field = "publishedAtUnix"
+ms_to_seconds = true
+"#;
+        let config = Config::from_toml(toml_str).unwrap();
+        let da = config.deferred_alive.as_ref().unwrap();
+        assert_eq!(da.source_field, "publishedAtUnix");
+        assert!(da.ms_to_seconds);
     }
 
     #[test]
@@ -1151,7 +1219,6 @@ field_type = "single_value"
                 field_type: FilterFieldType::SingleValue,
 
                 behaviors: Some(FieldBehaviors {
-                    deferred_alive: false,
                     range_buckets: vec![
                         BucketConfig {
                             name: "24h".into(),
@@ -1181,7 +1248,6 @@ field_type = "single_value"
                 field_type: FilterFieldType::SingleValue,
 
                 behaviors: Some(FieldBehaviors {
-                    deferred_alive: false,
                     range_buckets: vec![BucketConfig {
                         name: "bad".into(),
                         duration_secs: 0,
@@ -1204,7 +1270,6 @@ field_type = "single_value"
                 field_type: FilterFieldType::SingleValue,
 
                 behaviors: Some(FieldBehaviors {
-                    deferred_alive: false,
                     range_buckets: vec![BucketConfig {
                         name: "bad".into(),
                         duration_secs: 86400,
@@ -1227,7 +1292,6 @@ field_type = "single_value"
                 field_type: FilterFieldType::SingleValue,
 
                 behaviors: Some(FieldBehaviors {
-                    deferred_alive: true,
                     range_buckets: vec![BucketConfig {
                         name: "7d".into(),
                         duration_secs: 604800,
@@ -1237,13 +1301,53 @@ field_type = "single_value"
                 }),
                 eviction: None,
             }],
+            deferred_alive: Some(DeferredAliveConfig {
+                source_field: "scheduledAt".into(),
+                ms_to_seconds: false,
+            }),
             ..Config::default()
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let roundtrip = Config::from_toml(&toml_str).unwrap();
         let behaviors = roundtrip.filter_fields[0].behaviors.as_ref().unwrap();
-        assert!(behaviors.deferred_alive);
         assert_eq!(behaviors.range_buckets[0].name, "7d");
         assert_eq!(behaviors.range_buckets[0].duration_secs, 604800);
+        let da = roundtrip.deferred_alive.as_ref().unwrap();
+        assert_eq!(da.source_field, "scheduledAt");
+    }
+
+    #[test]
+    fn test_data_schema_default_version() {
+        let schema = DataSchema::default();
+        assert_eq!(schema.schema_version, 1);
+    }
+
+    #[test]
+    fn test_data_schema_version_from_json() {
+        let json = r#"{"id_field": "id", "schema_version": 3, "fields": []}"#;
+        let schema: DataSchema = serde_json::from_str(json).unwrap();
+        assert_eq!(schema.schema_version, 3);
+    }
+
+    #[test]
+    fn test_data_schema_version_defaults_to_1_in_json() {
+        let json = r#"{"id_field": "id", "fields": []}"#;
+        let schema: DataSchema = serde_json::from_str(json).unwrap();
+        assert_eq!(schema.schema_version, 1);
+    }
+
+    #[test]
+    fn test_data_schema_validates_version_zero() {
+        let schema = DataSchema {
+            schema_version: 0,
+            ..DataSchema::default()
+        };
+        assert!(schema.validate().is_err());
+    }
+
+    #[test]
+    fn test_data_schema_validates_version_one() {
+        let schema = DataSchema::default();
+        assert!(schema.validate().is_ok());
     }
 }
