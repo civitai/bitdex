@@ -320,16 +320,16 @@ impl SortField {
         }
 
         // After all bits: `equal` contains slots with the exact same sort value as cursor.
-        // Apply slot ID tiebreaker.
-        for slot in equal.iter() {
-            let dominated = if descending {
-                slot < cursor_slot_id
+        // Apply slot ID tiebreaker using bitmap range ops (O(containers) not O(slots)).
+        if !equal.is_empty() {
+            if descending {
+                // Descending: slots with lower slot_id come after cursor
+                equal.remove_range(cursor_slot_id..=u32::MAX);
             } else {
-                slot > cursor_slot_id
-            };
-            if dominated {
-                confirmed.insert(slot);
+                // Ascending: slots with higher slot_id come after cursor
+                equal.remove_range(0..=cursor_slot_id);
             }
+            confirmed |= equal;
         }
 
         confirmed
