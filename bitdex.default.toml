@@ -1,0 +1,23 @@
+# BitDex Server Configuration
+#
+# This file is the default configuration shipped with BitDex.
+# On first run (with no CLI arguments), a copy is written as bitdex.toml
+# next to the executable so you can customize it.
+#
+# All relative paths are resolved from the directory containing this file
+# (i.e., next to the executable).
+#
+# CLI flags always override these values:
+#   --port <N>         Override port
+#   --data-dir <PATH>  Override data_dir
+#   --rebuild          Force rebuild on startup
+#   --config <PATH>    Use a different config file
+
+# HTTP port to listen on
+port = 3000
+
+# Directory for index data storage
+data_dir = "data"
+
+# Set to true to rebuild all bitmap indexes from docstore on startup
+# rebuild = false
