@@ -431,7 +431,7 @@ fn main() {
                 eprintln!("  --duration <SECS>            Seconds per level (default: 10)");
                 eprintln!("  --warmup <SECS>              Warmup before measuring (default: 3)");
                 eprintln!("  --no-warmup                  Skip warmup phase");
-                eprintln!("  --workload <PATH>            JSON workload file (default: built-in Civitai)");
+                eprintln!("  --workload <PATH>            JSON workload file (default: tests/loadtest/workload.json)");
                 std::process::exit(0);
             }
             _ => {
@@ -444,7 +444,7 @@ fn main() {
 
     eprintln!("BitDex Load Test");
     eprintln!("  mode: {}", mode);
-    eprintln!("  workload: {}", workload_path.as_deref().unwrap_or("built-in civitai"));
+    eprintln!("  workload: {}", workload_path.as_deref().unwrap_or("auto-detect"));
     eprintln!("  concurrency: {:?}", concurrency_levels);
     eprintln!("  duration: {}s per level ({}s warmup)", duration_secs, warmup_secs);
 
@@ -487,7 +487,15 @@ fn main() {
     let workload = if let Some(ref path) = workload_path {
         QueryWorkload::from_file(path)
     } else {
-        QueryWorkload::civitai_default()
+        // Default to real traffic workload if available, fall back to built-in
+        let default_workload = std::path::Path::new("tests/loadtest/workload.json");
+        if default_workload.exists() {
+            eprintln!("  workload file: tests/loadtest/workload.json (2,516 real traffic queries)");
+            QueryWorkload::from_file(default_workload.to_str().unwrap())
+        } else {
+            eprintln!("  workload: built-in (13 stress-test queries — use --workload for baselines)");
+            QueryWorkload::civitai_default()
+        }
     };
 
     // Warmup: trigger lazy loads and seed bound cache
