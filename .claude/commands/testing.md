@@ -29,7 +29,7 @@ Guide for running the right tests based on what you changed, and for developing 
 |--------------|----------------|---------|
 | `src/bitmap_fs.rs` | Lib tests + restart test | `cargo test --lib && cargo test --test restart_test` |
 | `src/docstore.rs` | Lib tests + restart test | `cargo test --lib && cargo test --test restart_test` |
-| Snapshot save/restore logic | Restart test + E2E eviction (tests reload) | `cargo test --test restart_test` then `node tools/e2e-eviction.mjs --url <server>` |
+| Snapshot save/restore logic | Restart test + E2E eviction + E2E save-unload | `cargo test --test restart_test` then `node tools/e2e-eviction.mjs --url <server>` and `node tools/e2e-save-unload-lazy.mjs --url <server>` |
 
 ### Eviction Changes
 
@@ -209,6 +209,7 @@ Full descriptions of all test suites are in `docs/testing.md`.
 | Query Operators | `tools/e2e-query-operators.mjs` | Yes | Range filters (Gt/Gte/Lt/Lte), NotEq, combined range+filter |
 | Error Handling | `tools/e2e-error-handling.mjs` | Yes | Invalid JSON, unknown index 404, empty index, slot recycling |
 | Pagination & Overhead | `tools/e2e-pagination-overhead.mjs` | Yes | Cursor pagination, cache acceleration, expansion, structural overhead |
+| Save/Unload/Lazy | `tools/e2e-save-unload-lazy.mjs` | Yes | Snapshot save, query after save, mutation survival, stats integrity |
 | Unified Cache | `tools/e2e-unified-cache.mjs` | No (prod data) | Cache population, pagination, mutation/delete maintenance |
 
 ### Integration (Rust, in-process)

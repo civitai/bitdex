@@ -209,6 +209,35 @@ node tools/e2e-pagination-overhead.mjs --url http://localhost:3100 --results-dir
 
 ---
 
+### e2e-save-unload-lazy.mjs
+
+**File:** `tools/e2e-save-unload-lazy.mjs`
+
+**What it tests:** The save-snapshot lifecycle end-to-end: bitmap snapshot save via the `/api/indexes/{name}/save` endpoint, query correctness before and after snapshot, mutation survival after snapshot, and stats integrity throughout. Validates that save_and_unload() preserves query behavior and that the lazy reload path works correctly after unloading.
+
+**Why it exists:** The save-and-unload path (`save_and_unload()` in concurrent_engine.rs) is complex — it saves bitmaps zero-copy via `fused_cow()`, then builds a new InnerEngine with empty field shells and marks fields pending for lazy reload. A bug in the lazy-value field skip condition (unconditionally skipping multi-value fields during save) was caught by E2E eviction tests. This suite directly validates the save lifecycle to prevent similar regressions.
+
+**Test groups:**
+| ID | Name | What it validates |
+|----|------|-------------------|
+| Setup | Create test index + insert data | 100 docs with category, tags, score fields; flush confirmed |
+| A | Snapshot save + stats verification | Warmup query, save endpoint returns 200, alive_count unchanged |
+| B | Query correctness after snapshot | Category filter + multi-value tag filter produce exact expected IDs and sort order |
+| C | Mutation survival after snapshot | Upsert changes score, sort order reflects change, original value restored |
+| D | Stats integrity | alive_count, flush_cycle, slot_count, cache stats all valid |
+
+**Self-contained:** Yes. Creates its own `save-unload-test` index and cleans up after (unless `--keep`).
+
+**How to run:**
+```bash
+node tools/e2e-save-unload-lazy.mjs --url http://localhost:3100
+node tools/e2e-save-unload-lazy.mjs --url http://localhost:3100 --results-dir docs/test-results
+```
+
+**Expected output:** 5 groups pass (Setup + A-D). Exit code 0.
+
+---
+
 ## Integration Tests (Rust, In-Process)
 
 Integration tests run inside the Rust test harness using `cargo test`. They exercise the engine API directly without HTTP or the server binary. All are self-contained.

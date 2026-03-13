@@ -14,6 +14,7 @@
  *   - e2e-query-operators.mjs     (self-contained)
  *   - e2e-error-handling.mjs       (self-contained)
  *   - e2e-pagination-overhead.mjs  (self-contained)
+ *   - e2e-save-unload-lazy.mjs    (self-contained)
  *
  * NOT run automatically (requires production data):
  *   - e2e-unified-cache.mjs   (use --data-dir with loaded data manually)
@@ -71,6 +72,11 @@ const SUITES = [
     name: 'pagination-overhead',
     file: 'tools/e2e-pagination-overhead.mjs',
     description: 'Pagination & overhead (cursor correctness, cache acceleration, expansion, structural overhead)',
+  },
+  {
+    name: 'save-unload-lazy',
+    file: 'tools/e2e-save-unload-lazy.mjs',
+    description: 'Save-snapshot lifecycle (snapshot save, query correctness, mutation survival, stats)',
   },
 ];
 
