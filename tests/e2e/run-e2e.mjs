@@ -18,6 +18,7 @@
  *   - e2e-low-cardinality-string.mjs (self-contained)
  *   - e2e-delisting.mjs              (self-contained)
  *   - e2e-schema-versioning.mjs      (self-contained)
+ *   - e2e-unload-memory.mjs          (self-contained)
  *
  * NOT run automatically (requires production data):
  *   - e2e-unified-cache.mjs   (use --data-dir with loaded data manually)
@@ -95,6 +96,11 @@ const SUITES = [
     name: 'schema-versioning',
     file: 'tests/e2e/e2e-schema-versioning.mjs',
     description: 'Schema versioning & field elision (defaults, reconstruction, null handling, round-trip)',
+  },
+  {
+    name: 'unload-memory',
+    file: 'tests/e2e/e2e-unload-memory.mjs',
+    description: 'Bitmap memory drops after save_and_unload, stays low, queries work via lazy reload',
   },
 ];
 

@@ -28,6 +28,18 @@ use crate::types::QueryResult;
 use crate::unified_cache::{UnifiedCache, UnifiedCacheConfig, UnifiedKey};
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 
+/// Commands sent to the flush thread for state transitions that must
+/// go through the single writer. Keeps flush thread as sole ArcSwap writer.
+enum FlushCommand {
+    /// Force the flush thread to publish its current staging immediately.
+    /// Used by `exit_loading_mode()` to guarantee readers see fresh data
+    /// before the caller continues (e.g., before save_and_unload).
+    ForcePublish {
+        /// Oneshot sender — caller blocks on the receiver until publish completes.
+        done: crossbeam_channel::Sender<()>,
+    },
+}
+
 /// Lazy-load request sent from query threads to the flush thread.
 /// Used during startup restore to load bitmaps on demand per field.
 enum LazyLoad {
@@ -91,6 +103,8 @@ pub struct ConcurrentEngine {
     lazy_value_fields: Arc<parking_lot::Mutex<HashSet<String>>>,
     /// Channel for sending lazy-loaded field data to the flush thread.
     lazy_tx: Sender<LazyLoad>,
+    /// Command channel for state transitions (force publish, unload, etc.).
+    cmd_tx: Sender<FlushCommand>,
     /// Reverse string maps for MappedString field query resolution.
     string_maps: Option<Arc<StringMaps>>,
     /// Fields where string matching is case-sensitive (default is case-insensitive).
@@ -293,6 +307,10 @@ impl ConcurrentEngine {
 
         // Lazy load channel: query threads send loaded field data here for staging sync.
         let (lazy_tx, lazy_rx): (Sender<LazyLoad>, Receiver<LazyLoad>) =
+            crossbeam_channel::unbounded();
+
+        // Command channel: external threads send state transition commands to flush thread.
+        let (cmd_tx, cmd_rx): (Sender<FlushCommand>, Receiver<FlushCommand>) =
             crossbeam_channel::unbounded();
 
         let pending_filter_loads = Arc::new(parking_lot::Mutex::new(pending_filter_loads));
@@ -640,6 +658,34 @@ impl ConcurrentEngine {
                     }
                     was_loading = is_loading;
 
+                    // Process flush commands (force publish, unload, etc.)
+                    while let Ok(cmd) = cmd_rx.try_recv() {
+                        match cmd {
+                            FlushCommand::ForcePublish { done } => {
+                                // Drain any remaining mutations from the channel
+                                // before publishing — they may not have been picked
+                                // up by the regular prepare() at the top of the loop.
+                                let extra = coalescer.flush(
+                                    &mut staging.slots,
+                                    &mut staging.filters,
+                                    &mut staging.sorts,
+                                );
+                                if extra > 0 {
+                                    staging_dirty = true;
+                                }
+                                // Compact diffs before publishing
+                                for (_name, field) in staging.filters.fields_mut() {
+                                    field.merge_dirty();
+                                }
+                                flush_unified_cache.lock().clear();
+                                inner.store(Arc::new(staging.clone()));
+                                staging_dirty = false;
+                                // Signal caller that publish is complete
+                                let _ = done.send(());
+                            }
+                        }
+                    }
+
                     // --- Idle eviction sweep (wall-clock based) ---
                     // Runs every eviction_sweep_interval flush cycles. Stamps are
                     // wall-clock millis set by query threads on read, so values stay
@@ -715,7 +761,9 @@ impl ConcurrentEngine {
 
                     // Publish if lazy loads updated staging but no mutations triggered a publish.
                     // This ensures staging stays consistent with the snapshot published by
-                    // ensure_loaded() on the query thread.
+                    // ensure_loaded() on the query thread. Skipped during loading mode:
+                    // staging.clone() triggers Arc refcount cascade that kills write throughput.
+                    // Queries during loading are expected to see stale data anyway.
                     if lazy_loaded && bitmap_count == 0 && !is_loading {
                         inner.store(Arc::new(staging.clone()));
                     }
@@ -1022,6 +1070,7 @@ impl ConcurrentEngine {
             pending_sort_loads,
             lazy_value_fields,
             lazy_tx,
+            cmd_tx,
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
@@ -2373,11 +2422,20 @@ impl ConcurrentEngine {
     /// on the next flush cycle by briefly pausing to let the flush thread catch up.
     pub fn exit_loading_mode(&self) {
         self.loading_mode.store(false, Ordering::Release);
-        // Give the flush thread time to see the flag and do a final publish.
-        // The next flush cycle with bitmap_count > 0 will publish normally.
-        // If no mutations are pending, we need to ensure at least one flush
-        // cycle runs — the existing adaptive sleep ensures this happens within
-        // max_sleep (flush_interval * 10).
+
+        // Send ForcePublish command and block until the flush thread confirms.
+        // This guarantees readers see the fully-loaded data before the caller
+        // continues (e.g., before save_and_unload).
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let _ = self.cmd_tx.send(FlushCommand::ForcePublish { done: done_tx });
+        // Block until flush thread processes the command. Timeout after 30s
+        // to avoid deadlock if flush thread is stuck.
+        match done_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(()) => {}
+            Err(_) => {
+                eprintln!("Warning: exit_loading_mode timed out waiting for flush thread publish");
+            }
+        }
     }
 
     /// Save a full snapshot of the current published state to the configured BitmapStore.
@@ -5023,5 +5081,132 @@ mod tests {
         let field = snap.filters.get_field("nsfwLevel").unwrap();
         let vb = field.get_versioned(1).unwrap();
         assert!(vb.contains(10), "mutation during unloaded state should be visible");
+    }
+
+    #[test]
+    fn test_save_and_unload_memory_drops_with_flush_thread_running() {
+        // Regression test: save_and_unload must drop bitmap memory even when
+        // the flush thread is still running. Previously, the flush thread's
+        // private staging held the old data and re-inflated on next publish.
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        let engine = Arc::new(
+            ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap(),
+        );
+
+        // Bulk insert via loading mode (the real-world path)
+        engine.enter_loading_mode();
+        for i in 1u32..=500 {
+            engine
+                .put(
+                    i,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer((i % 5) as i64))),
+                        ("tagIds", FieldValue::Multi(vec![
+                            Value::Integer((i % 100) as i64),
+                            Value::Integer((i % 50 + 200) as i64),
+                        ])),
+                        ("onSite", FieldValue::Single(Value::Bool(i % 2 == 0))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
+                    ]),
+                )
+                .unwrap();
+        }
+        engine.exit_loading_mode();
+        // Flush thread is still running — this is the key difference from
+        // test_save_and_unload_then_query which calls shutdown() first.
+
+        // Capture pre-unload memory from the published snapshot
+        let (_, filter_before, sort_before, _, _, _, _) = engine.bitmap_memory_report();
+        let total_before = filter_before + sort_before;
+        assert!(total_before > 0, "should have bitmap data before unload");
+
+        // Save and unload (flush thread still alive)
+        engine.save_and_unload().unwrap();
+
+        // Give the flush thread a few cycles to potentially re-inflate
+        thread::sleep(Duration::from_millis(50));
+
+        // Verify memory dropped in the published snapshot
+        let (_, filter_after, sort_after, _, _, _, _) = engine.bitmap_memory_report();
+        let total_after = filter_after + sort_after;
+        assert!(
+            total_after < total_before / 2,
+            "bitmap memory should drop significantly after save_and_unload \
+             (before={total_before}, after={total_after}). \
+             If this fails, the flush thread's staging is re-inflating the snapshot."
+        );
+
+        // Verify queries still work via lazy reload
+        let result = engine
+            .query(
+                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(0))],
+                Some(&SortClause {
+                    field: "reactionCount".to_string(),
+                    direction: crate::query::SortDirection::Desc,
+                }),
+                10,
+            )
+            .unwrap();
+        assert!(!result.ids.is_empty(), "query should work after unload via lazy reload");
+
+        // After lazy reload, memory comes back for queried fields only
+        let (_, filter_reloaded, sort_reloaded, _, _, _, _) = engine.bitmap_memory_report();
+        assert!(
+            filter_reloaded + sort_reloaded > 0,
+            "queried fields should be back in memory after lazy reload"
+        );
+    }
+
+    #[test]
+    fn test_exit_loading_mode_publishes_before_returning() {
+        // Regression test: exit_loading_mode must guarantee the published
+        // snapshot contains all mutations before returning. Previously it
+        // just set an atomic flag and hoped the flush thread would catch up.
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        let engine =
+            ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+        engine.enter_loading_mode();
+        for i in 1u32..=100 {
+            engine
+                .put(
+                    i,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
+                    ]),
+                )
+                .unwrap();
+        }
+        engine.exit_loading_mode();
+
+        // Immediately after exit_loading_mode, the published snapshot must
+        // contain all 100 records — no timing gap.
+        assert_eq!(
+            engine.alive_count(),
+            100,
+            "all records should be visible immediately after exit_loading_mode"
+        );
+
+        let result = engine
+            .query(
+                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                None,
+                200,
+            )
+            .unwrap();
+        assert_eq!(
+            result.ids.len(),
+            100,
+            "query should return all 100 records immediately after exit_loading_mode"
+        );
     }
 }

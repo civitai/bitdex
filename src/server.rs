@@ -371,6 +371,13 @@ struct DeleteDocsRequest {
 }
 
 #[derive(Deserialize)]
+struct SnapshotParams {
+    /// If true, save bitmaps to disk then unload from memory (lazy reload on demand).
+    #[serde(default)]
+    unload: bool,
+}
+
+#[derive(Deserialize)]
 struct CursorInput {
     name: String,
     value: String,
@@ -1277,6 +1284,7 @@ async fn handle_stats(
         }
     };
 
+    let (slot_bytes, filter_bytes, sort_bytes, _, _, _, _) = engine.bitmap_memory_report();
     let uc = engine.unified_cache_stats();
     let entries: Vec<serde_json::Value> = engine.unified_cache_entry_details().into_iter().map(|e| {
         serde_json::json!({
@@ -1301,6 +1309,9 @@ async fn handle_stats(
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
         "flush_cycle": engine.flush_cycle(),
+        "slot_bitmap_bytes": slot_bytes,
+        "filter_bitmap_bytes": filter_bytes,
+        "sort_bitmap_bytes": sort_bytes,
         "unified_cache_entries": uc.entries,
         "unified_cache_hits": uc.hits,
         "unified_cache_misses": uc.misses,
@@ -1465,6 +1476,7 @@ async fn handle_rebuild(
 async fn handle_save_snapshot(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
+    query: axum::extract::Query<SnapshotParams>,
 ) -> impl IntoResponse {
     let engine = {
         let guard = state.index.lock();
@@ -1480,11 +1492,16 @@ async fn handle_save_snapshot(
     };
 
     let t0 = std::time::Instant::now();
-    match engine.save_snapshot() {
+    let result = if query.unload {
+        engine.save_and_unload()
+    } else {
+        engine.save_snapshot()
+    };
+    match result {
         Ok(()) => {
             let elapsed = t0.elapsed().as_secs_f64();
             Json(serde_json::json!({
-                "status": "saved",
+                "status": if query.unload { "saved_and_unloaded" } else { "saved" },
                 "elapsed_secs": elapsed,
             })).into_response()
         }
