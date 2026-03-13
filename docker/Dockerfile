@@ -7,6 +7,9 @@ FROM rust:1.88-bookworm AS builder
 WORKDIR /build
 COPY . .
 
+# Remove dev-only scratch workspace member (not included via .dockerignore)
+RUN sed -i 's/members = \[".", "scratch"\]/members = ["."]/' Cargo.toml
+
 # EPYC 4585PX (Zen 5): unlocks AVX-512, AVX2, BMI2, POPCNT
 ENV RUSTFLAGS="-C target-cpu=znver5"
 

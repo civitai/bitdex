@@ -22,8 +22,10 @@ COPY . .
 # EPYC 4585PX (Zen 5): unlocks AVX-512, AVX2, BMI2, POPCNT (use znver4 for Genoa, znver3 for Milan)
 ENV RUSTFLAGS="-C target-cpu=znver5"
 
+# Remove dev-only scratch workspace member (not included via .dockerignore)
 # Enable the roaring simd feature for this build
-RUN sed -i 's/^roaring = "0.10"/roaring = { version = "0.11", features = ["simd"] }/' Cargo.toml && \
+RUN sed -i 's/members = \[".", "scratch"\]/members = ["."]/' Cargo.toml && \
+    sed -i 's/^roaring = "0.10"/roaring = { version = "0.11", features = ["simd"] }/' Cargo.toml && \
     cargo build --release --features server --bin bitdex-server && \
     cargo build --release --features pg-sync --bin bitdex-pg-sync
 
