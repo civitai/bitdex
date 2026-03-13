@@ -1,9 +1,6 @@
 /target
 /.browser
 /data/
-!/data/indexes/
-!/data/indexes/civitai/
-!/data/indexes/civitai/config.json
 /data-*/
 *.redb
 /benchmark_*.txt
@@ -12,3 +9,4 @@ server_*_stderr.log
 server_*_stdout.log
 server_stderr.log
 server_stdout.log
+.claude/worktrees/**/data/
