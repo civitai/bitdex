@@ -21,6 +21,7 @@
  *   - e2e-schema-versioning.mjs      (self-contained)
  *   - e2e-unload-memory.mjs          (self-contained)
  *   - e2e-cache-maintenance.mjs     (self-contained)
+ *   - e2e-load-save-snapshot.mjs   (self-contained)
  *
  * NOT run automatically (requires production data):
  *   - e2e-unified-cache.mjs   (use --data-dir with loaded data manually)
@@ -47,7 +48,7 @@ const PORT = Number(getArg('--port', '3100'));
 const SKIP_BUILD = process.argv.includes('--skip-build');
 const KEEP = process.argv.includes('--keep');
 const VERBOSE = process.argv.includes('--verbose');
-const DATA_DIR = resolve(PROJECT_ROOT, 'test-e2e-data');
+const DATA_DIR = resolve(PROJECT_ROOT, '.test-data', 'e2e');
 const RESULTS_DIR = resolve(PROJECT_ROOT, 'docs', 'test-results');
 const SERVER_URL = `http://localhost:${PORT}`;
 
@@ -113,6 +114,11 @@ const SUITES = [
     name: 'cache-maintenance',
     file: 'tests/e2e/e2e-cache-maintenance.mjs',
     description: 'Cache maintenance after mutations (filter, sort, delete, multi-value, fan-out, burst)',
+  },
+  {
+    name: 'load-save-snapshot',
+    file: 'tests/e2e/e2e-load-save-snapshot.mjs',
+    description: 'NDJSON load with save_snapshot=true (race condition regression: alive_count, queries, lazy reload)',
   },
 ];
 

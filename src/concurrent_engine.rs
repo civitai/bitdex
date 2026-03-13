@@ -65,6 +65,10 @@ enum FlushCommand {
         cursors: HashMap<String, String>,
         /// Dictionaries to persist alongside bitmaps.
         dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
+        /// Loading mode flag — handler clears this AFTER reading the published snapshot,
+        /// preventing the flush thread's loading-exit force-publish from overwriting
+        /// the loader's data before we save it.
+        loading_mode: Arc<AtomicBool>,
         /// Oneshot sender — caller blocks until save+unload is complete.
         /// Returns Ok(()) on success or error message on failure.
         done: crossbeam_channel::Sender<std::result::Result<(), String>>,
@@ -747,6 +751,28 @@ impl ConcurrentEngine {
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
                             FlushCommand::ForcePublish { done } => {
+                                // Drain lazy load channel — query threads may have
+                                // loaded data from disk and need it published.
+                                while let Ok(load) = lazy_rx.try_recv() {
+                                    match load {
+                                        LazyLoad::FilterField { name, bitmaps } => {
+                                            if let Some(field) = staging.filters.get_field_mut(&name) {
+                                                field.load_field_complete(bitmaps);
+                                            }
+                                        }
+                                        LazyLoad::FilterValues { field, values } => {
+                                            if let Some(f) = staging.filters.get_field_mut(&field) {
+                                                let requested: Vec<u64> = values.keys().copied().collect();
+                                                f.load_values(values, &requested);
+                                            }
+                                        }
+                                        LazyLoad::SortField { name, layers } => {
+                                            if let Some(sf) = staging.sorts.get_field_mut(&name) {
+                                                sf.load_layers(layers);
+                                            }
+                                        }
+                                    }
+                                }
                                 // Drain any remaining mutations from the channel
                                 // before publishing — they may not have been picked
                                 // up by the regular prepare() at the top of the loop.
@@ -792,7 +818,7 @@ impl ConcurrentEngine {
                             }
                             FlushCommand::ExitLoadingSaveUnload {
                                 skip_sorts, skip_filters, skip_lazy,
-                                cursors, dictionaries, done,
+                                cursors, dictionaries, loading_mode, done,
                             } => {
                                 // Combined exit-loading + save + unload.
                                 //
@@ -811,6 +837,12 @@ impl ConcurrentEngine {
 
                                 // 1. Load the published snapshot (loader already published here)
                                 let published = inner.load_full();
+
+                                // 1b. NOW clear loading_mode — after we've captured the
+                                // snapshot but before the next loop iteration. This prevents
+                                // the was_loading→!is_loading force-publish from overwriting
+                                // the loader's data.
+                                loading_mode.store(false, Ordering::Release);
 
                                 // 2. Save from the published snapshot — no clone, just a borrow
                                 if let Some(ref store) = flush_bitmap_store {
@@ -1795,33 +1827,37 @@ impl ConcurrentEngine {
 
         let any_loaded = !loaded_filters.is_empty() || !loaded_values.is_empty() || loaded_sort.is_some();
         if any_loaded {
-            // Use rcu() to atomically apply loaded data without racing with
-            // the flush thread's store(). The closure may be called multiple
-            // times if the snapshot changes underneath, but it only does
-            // cheap in-memory modifications (no disk I/O).
-            self.inner.rcu(|current| {
-                let mut updated = (**current).clone();
-
+            // Single-writer publish: data was already sent to the flush thread
+            // via lazy_tx. Ask the flush thread to drain it and publish a new
+            // snapshot. This avoids the old rcu() CAS loop which could race
+            // with the flush thread's own store() calls.
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            let flush_alive = self.cmd_tx.send(FlushCommand::ForcePublish { done: done_tx }).is_ok();
+            if flush_alive {
+                // Block until flush thread publishes (typically <1ms).
+                let _ = done_rx.recv_timeout(Duration::from_secs(5));
+            } else {
+                // Flush thread is dead (shutdown called). Publish directly —
+                // no concurrent publisher to race with.
+                let current = self.inner.load_full();
+                let mut updated = (*current).clone();
                 for (name, bitmaps) in &loaded_filters {
                     if let Some(field) = updated.filters.get_field_mut(name) {
                         field.load_field_complete(bitmaps.clone());
                     }
                 }
-
-                for (field_name, loaded, requested_keys) in &loaded_values {
+                for (field_name, loaded_vals, requested_keys) in &loaded_values {
                     if let Some(field) = updated.filters.get_field_mut(field_name) {
-                        field.load_values(loaded.clone(), requested_keys);
+                        field.load_values(loaded_vals.clone(), requested_keys);
                     }
                 }
-
                 if let Some((ref sort_name, ref layers)) = loaded_sort {
                     if let Some(sf) = updated.sorts.get_field_mut(sort_name) {
                         sf.load_layers(layers.clone());
                     }
                 }
-
-                updated
-            });
+                self.inner.store(Arc::new(updated));
+            }
         }
 
         Ok(())
@@ -2686,7 +2722,11 @@ impl ConcurrentEngine {
     /// At 105M records this eliminates the 22GB→38GB RSS spike from the
     /// intermediate staging.clone() that bumps Arc refcounts.
     pub fn exit_loading_mode_and_save_unload(&self) -> Result<()> {
-        self.loading_mode.store(false, Ordering::Release);
+        // NOTE: Do NOT set loading_mode = false here. The ExitLoadingSaveUnload
+        // handler in the flush thread will clear it AFTER reading the published
+        // snapshot. Setting it here causes a race: the flush thread's loading-exit
+        // force-publish (was_loading && !is_loading) overwrites the loader's
+        // published data before the save command reads it.
 
         let store = self.bitmap_store.as_ref().ok_or_else(|| {
             crate::error::BitdexError::Config(
@@ -2720,6 +2760,7 @@ impl ConcurrentEngine {
             skip_lazy: skip_lazy.clone(),
             cursors,
             dictionaries,
+            loading_mode: Arc::clone(&self.loading_mode),
             done: done_tx,
         }) {
             Ok(()) => {
