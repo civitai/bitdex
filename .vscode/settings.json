@@ -1,0 +1,8 @@
+{
+  "files.associations": {
+    "**/configs/civitai-index.json": "jsonc"
+  },
+  "[jsonc]": {
+    "editor.formatOnSave": false
+  }
+}
