@@ -13,7 +13,7 @@
 
 ### Benchmark Harness — Single-Threaded, Cache-Warm (104.6M, commit 6fb2b78)
 
-Source: `docs/benchmark-comparison-loading-mode.md` (Feb 21, 2026). Bound cache enabled.
+Source: `docs/benchmarks/benchmark-comparison-loading-mode.md` (Feb 21, 2026). Bound cache enabled.
 
 | Query Type | p50 | p95 | Cache State | Notes |
 |---|---|---|---|---|
@@ -30,7 +30,7 @@ Source: `docs/benchmark-comparison-loading-mode.md` (Feb 21, 2026). Bound cache 
 
 ### E2E HTTP — Single-Worker, Cache-Warm (105.3M, commit ~769c87f)
 
-Source: `docs/benchmark-mixed-workload.md` (Mar 11, 2026). Unified cache enabled.
+Source: `docs/benchmarks/benchmark-mixed-workload.md` (Mar 11, 2026). Unified cache enabled.
 
 | Query Type | Cold Miss | p50 Hit | p95 Hit | Notes |
 |---|---|---|---|---|
@@ -54,7 +54,7 @@ Under concurrent load, memory bandwidth is the bottleneck. These numbers include
 
 ### Pre-Bound-Cache Baselines (104.6M, commit 763a008)
 
-Source: `docs/benchmark-report.md` (Feb 19, 2026). No bound cache. Useful for regression comparison of filter-only queries since there was no session variance concern.
+Source: `docs/benchmarks/benchmark-report.md` (Feb 19, 2026). No bound cache. Useful for regression comparison of filter-only queries since there was no session variance concern.
 
 | Query Type | p50 | p95 | p99 |
 |---|---|---|---|
@@ -70,7 +70,7 @@ Source: `docs/benchmark-report.md` (Feb 19, 2026). No bound cache. Useful for re
 
 ## 2. Memory Baselines
 
-Source: `docs/benchmark-report.md` and `docs/benchmark-comparison-loading-mode.md`.
+Source: `docs/benchmarks/benchmark-report.md` and `docs/benchmarks/benchmark-comparison-loading-mode.md`.
 
 | Scale | Bitmap Memory | RSS | Key Commit | Date |
 |---|---|---|---|---|
@@ -102,7 +102,7 @@ Scaling is linear: ~62 bytes/record bitmap memory. RSS overhead stabilizes at ~4
 
 ### Bulk Loading (put_bulk_loading, single-threaded bitmap path)
 
-Source: `docs/benchmark-report.md`, `docs/benchmark-comparison-loading-mode.md`, CLAUDE.md MEMORY.
+Source: `docs/benchmarks/benchmark-report.md`, `docs/benchmarks/benchmark-comparison-loading-mode.md`, CLAUDE.md MEMORY.
 
 | Scale | Rate | Wall Time | Commit | Notes |
 |---|---|---|---|---|
@@ -127,7 +127,7 @@ Source: CLAUDE.md MEMORY section (various commits, Jan-Feb 2026).
 
 ### Single Upsert / Delete Under Load (105.3M, 8 concurrent workers)
 
-Source: `docs/benchmark-mixed-workload.md`.
+Source: `docs/benchmarks/benchmark-mixed-workload.md`.
 
 | Operation | p50 (wall clock) | mean | Notes |
 |---|---|---|---|
@@ -140,7 +140,7 @@ Source: `docs/benchmark-mixed-workload.md`.
 
 ### Unified Cache Under Mixed Workload (105.3M, 8 workers)
 
-Source: `docs/benchmark-mixed-workload.md` (Mar 11, 2026).
+Source: `docs/benchmarks/benchmark-mixed-workload.md` (Mar 11, 2026).
 
 | Metric | Value |
 |---|---|
@@ -181,7 +181,7 @@ Cold miss times vary widely based on filter selectivity and sort field. Cache hi
 
 ### Warm Bound Cache vs No Bounds (104.6M)
 
-Source: `docs/benchmark-comparison-loading-mode.md`, bound cache cold/warm comparison.
+Source: `docs/benchmarks/benchmark-comparison-loading-mode.md`, bound cache cold/warm comparison.
 
 | Query | No Bounds p50 | Warm Bounds p50 | Speedup |
 |---|---|---|---|
@@ -243,7 +243,7 @@ These are guidelines, not hard gates. Hardware, OS, background load, and session
 
 | Document | Content | Date |
 |---|---|---|
-| `docs/benchmark-report.md` | 5M/50M/100M/104.6M scaling analysis, no bound cache | Feb 19, 2026 |
-| `docs/benchmark-comparison-loading-mode.md` | 104.6M bound cache before/after, write perf | Feb 21, 2026 |
-| `docs/benchmark-mixed-workload.md` | 105.3M mixed workload, unified cache, 8 workers | Mar 11, 2026 |
+| `docs/benchmarks/benchmark-report.md` | 5M/50M/100M/104.6M scaling analysis, no bound cache | Feb 19, 2026 |
+| `docs/benchmarks/benchmark-comparison-loading-mode.md` | 104.6M bound cache before/after, write perf | Feb 21, 2026 |
+| `docs/benchmarks/benchmark-mixed-workload.md` | 105.3M mixed workload, unified cache, 8 workers | Mar 11, 2026 |
 | `CLAUDE.md` | Memory tables, loading pipeline throughput | Ongoing |

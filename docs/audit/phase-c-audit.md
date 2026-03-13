@@ -2,7 +2,7 @@
 
 **Auditor:** Claude Opus 4.6
 **Date:** 2026-02-21
-**Spec Source:** `docs/roadmap-performance-and-persistence.md`, Phase C (lines 221-272)
+**Spec Source:** `docs/plans/roadmap-performance-and-persistence.md`, Phase C (lines 221-272)
 
 ---
 

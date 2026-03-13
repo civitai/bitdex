@@ -2,8 +2,8 @@
 
 **Auditor:** Claude Opus 4.6
 **Date:** 2026-02-21
-**Scope:** P1 through P10 of the Prerequisite phase per `docs/roadmap-performance-and-persistence.md`
-**Reference docs:** `docs/design-arcswap-redb-reconciliation.md`, `docs/architecture-risk-review.md`
+**Scope:** P1 through P10 of the Prerequisite phase per `docs/plans/roadmap-performance-and-persistence.md`
+**Reference docs:** `docs/design/design-arcswap-redb-reconciliation.md`, `docs/reviews/architecture-risk-review.md`
 
 ---
 

@@ -16,9 +16,9 @@ Decouple query performance from dataset size. Every query — even unfiltered so
 
 ## Reference Documents
 
-- [`docs/design-arcswap-redb-reconciliation.md`](design-arcswap-redb-reconciliation.md) — Full design for the diff-based ArcSwap + two-tier redb model
-- [`docs/architecture-risk-review.md`](architecture-risk-review.md) — Reviewed risks and resolutions for the concurrency/storage model
-- [`docs/benchmark-report.md`](benchmark-report.md) — 5M to 104.6M scaling analysis
+- [`docs/design/design-arcswap-redb-reconciliation.md`](../design/design-arcswap-redb-reconciliation.md) — Full design for the diff-based ArcSwap + two-tier redb model
+- [`docs/reviews/architecture-risk-review.md`](../reviews/architecture-risk-review.md) — Reviewed risks and resolutions for the concurrency/storage model
+- [`docs/benchmarks/benchmark-report.md`](../benchmarks/benchmark-report.md) — 5M to 104.6M scaling analysis
 
 ---
 

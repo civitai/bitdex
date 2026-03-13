@@ -146,9 +146,9 @@ Additional memory is negligible relative to the existing 14.51 GB RSS.
 
 ## Reference
 
-- **Design doc**: `docs/design-backpressure-implementation.md` — Pipeline redesign with put() simplification
-- **Auto-throttle design**: `docs/design-backpressure-autothrottle.md` — Unified 4-layer design with thread model
+- **Design doc**: `docs/design/design-backpressure-implementation.md` — Pipeline redesign with put() simplification
+- **Auto-throttle design**: `docs/design/design-backpressure-autothrottle.md` — Unified 4-layer design with thread model
 - **Pressure state machine**: `src/pressure.rs` — PressureState with hysteresis-based escalation/de-escalation
 - **Bulk accumulator**: `src/bulk_accumulator.rs` — BulkAccumulator with accumulate/flush/apply
 - **Project principles**: `CLAUDE.md` — Inviolable design principles
-- **Benchmark data**: `docs/benchmark-comparison-loading-mode.md` — Current 104M numbers with loading mode + bound cache
+- **Benchmark data**: `docs/benchmarks/benchmark-comparison-loading-mode.md` — Current 104M numbers with loading mode + bound cache

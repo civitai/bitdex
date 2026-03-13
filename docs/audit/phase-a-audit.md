@@ -2,7 +2,7 @@
 
 **Auditor:** Claude Opus 4.6
 **Date:** 2026-02-21
-**Scope:** All A-items (A1--A12) from `docs/roadmap-performance-and-persistence.md`
+**Scope:** All A-items (A1--A12) from `docs/plans/roadmap-performance-and-persistence.md`
 **Baseline commits:** 11a5d75 through 2dceeea
 
 ---

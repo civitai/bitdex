@@ -3,7 +3,7 @@
 **Date:** 2026-02-21
 **Auditor:** Claude Opus 4.6
 **Scope:** All roadmap phases (Prereq P1-P10, Phase A A1-A12, Phase B B1-B4, Phase C C1-C7, Phase D D1-D10, Phase E E1-E6)
-**Spec source:** `docs/roadmap-performance-and-persistence.md`
+**Spec source:** `docs/plans/roadmap-performance-and-persistence.md`
 
 ---
 

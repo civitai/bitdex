@@ -2,7 +2,7 @@
 
 **Auditor:** Claude Opus 4.6
 **Date:** 2026-02-21
-**Spec Source:** `docs/roadmap-performance-and-persistence.md`, Phase E section
+**Spec Source:** `docs/plans/roadmap-performance-and-persistence.md`, Phase E section
 **Codebase SHA:** HEAD of `main` branch
 
 ---

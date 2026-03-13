@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-21
 **Auditor:** Claude Opus 4.6
-**Spec Source:** `docs/roadmap-performance-and-persistence.md`, Phase D section
+**Spec Source:** `docs/plans/roadmap-performance-and-persistence.md`, Phase D section
 **Codebase Commit:** `2dceeea` (main branch, HEAD)
 
 ---

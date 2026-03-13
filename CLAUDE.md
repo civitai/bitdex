@@ -107,17 +107,18 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 ### Architecture & Design Docs
 
-- **ArcSwap + Storage Reconciliation**: `docs/design-arcswap-redb-reconciliation.md` — How the ArcSwap snapshot architecture and filesystem persistence layer work together. Two-tier storage (Tier 1 in-memory, Tier 2 on-disk via BitmapFs + DocStore), startup sequence, and memory budget analysis.
-- **Performance & Persistence Roadmap**: `docs/roadmap-performance-and-persistence.md` — Full implementation roadmap (Prereq→A→B→C→D→E phases) with detailed task breakdowns for bitmap persistence, sort-by-slot, time handling, bound caches, and meta-index.
-- **Architecture Risk Review**: `docs/architecture-risk-review.md` — Risk analysis of architectural decisions and mitigations.
-- **Backpressure Design**: `docs/design-backpressure-implementation.md` — Backpressure and auto-throttle design for the write pipeline.
+- **ArcSwap + Storage Reconciliation**: `docs/design/design-arcswap-redb-reconciliation.md` — How the ArcSwap snapshot architecture and filesystem persistence layer work together. Two-tier storage (Tier 1 in-memory, Tier 2 on-disk via BitmapFs + DocStore), startup sequence, and memory budget analysis.
+- **Performance & Persistence Roadmap**: `docs/plans/roadmap-performance-and-persistence.md` — Full implementation roadmap (Prereq→A→B→C→D→E phases) with detailed task breakdowns for bitmap persistence, sort-by-slot, time handling, bound caches, and meta-index.
+- **Architecture Risk Review**: `docs/reviews/architecture-risk-review.md` — Risk analysis of architectural decisions and mitigations.
+- **Backpressure Design**: `docs/design/design-backpressure-implementation.md` — Backpressure and auto-throttle design for the write pipeline.
 
 ### Specifications & Benchmarks
 
 - **Full Project Brief & Development Guide**: `docs/in/prepared-prompt.md` — Contains complete architecture, API specs, config schemas, testing strategy, development phases, and team structure. This is the authoritative specification.
-- **Benchmark Report**: `docs/benchmark-report.md` — 5M/50M/100M/104.6M scaling analysis with memory and query latency breakdowns.
-- **Loading Mode Comparison**: `docs/benchmark-comparison-loading-mode.md` — Before/after comparison showing loading mode fix impact.
-- **Write Regression Analysis**: `docs/write-regression-loading-mode.md` — Root cause analysis of the ArcSwap clone cascade write regression and the loading mode fix.
+- **Benchmark Report**: `docs/benchmarks/benchmark-report.md` — 5M/50M/100M/104.6M scaling analysis with memory and query latency breakdowns.
+- **Loading Mode Comparison**: `docs/benchmarks/benchmark-comparison-loading-mode.md` — Before/after comparison showing loading mode fix impact.
+- **Write Regression Analysis**: `docs/benchmarks/write-regression-loading-mode.md` — Root cause analysis of the ArcSwap clone cascade write regression and the loading mode fix.
+- **Performance Baselines**: `docs/benchmarks/performance-baseline.md` — Consolidated baselines with commit hashes and regression thresholds.
 
 ### Phase Audits
 
@@ -134,12 +135,13 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 ### Phase 1: Core Engine — COMPLETE (commit 7bc60fd)
 Slot allocation, alive bitmap, filter bitmaps, sort layer bitmaps, mutation API (PUT/PATCH/DELETE/DELETE WHERE), query execution, JSON query parser, config loading. Full test coverage.
 
-### Phase 2: Persistence — PARTIAL
-Custom filesystem storage: BitmapFs for bitmap persistence (hex-bucketed pack files), sharded DocStore for documents (zstd-compressed msgpack). WAL and sidecar snapshot builder are NOT yet implemented.
+### Phase 2: Persistence — COMPLETE
+Custom filesystem storage: BitmapFs for bitmap persistence (hex-bucketed pack files), sharded DocStore for documents (zstd-compressed msgpack). Save-and-unload with zero-copy `fused_cow()` for memory reclamation. Lazy bitmap loading per-field on first query (<1s startup at 105M). No WAL (not needed — Postgres is the source of truth).
 
 ### Phase 3: Performance — COMPLETE (commits 95df2a5 through bdccbe2)
 - Cardinality-based query planning (planner.rs)
 - Trie cache with prefix matching and generation-counter invalidation (cache.rs)
+- Unified cache with bounded top-K bitmaps per (filter, sort, direction) (unified_cache.rs)
 - ArcSwap lock-free snapshot reads with Arc-per-bitmap CoW (concurrent_engine.rs)
 - Write coalescing via crossbeam channels with batched flush loop (write_coalescer.rs)
 - Targeted cache invalidation — sort-only flushes skip invalidation
@@ -147,13 +149,23 @@ Custom filesystem storage: BitmapFs for bitmap persistence (hex-bucketed pack fi
 - Loading mode for bulk inserts — skips snapshot publishing to avoid clone cascade (6fb2b78)
 - Bound cache with tiered bounds for sort query acceleration (2-13x at 104M)
 - Meta-index for targeted bound cache invalidation
+- Idle eviction for high-cardinality multi-value fields (tagIds)
+- Fused parse+bitmap loader pipeline (320-460K/s sustained)
 - Benchmark harness with 20 query types + contention benchmark, memory reporting
 
-### Phase 4: Operations
-Prometheus metrics, autovac, admin API, graceful shutdown, health check. NOT yet started.
+### Phase 4: Operations — PARTIAL
+- Prometheus metrics endpoint (`/metrics`) — COMPLETE
+- HTTP server with index management, query, upsert, delete endpoints — COMPLETE
+- Web UI with infinite scroll image grid — COMPLETE
+- Grafana dashboard — COMPLETE
+- Autovac, admin API, graceful shutdown — NOT yet started
 
-### Phase 5: Integration
-Postgres WAL consumer, backfill pipeline, shadow mode, end-to-end tests. NOT yet started.
+### Phase 5: Integration — IN PROGRESS
+- NDJSON bulk loading from file — COMPLETE
+- Upsert/delete endpoints — COMPLETE
+- E2E test suite (6 self-contained suites, 31 tests) — COMPLETE
+- Postgres CDC sync (pg-sync) — COMPLETE (external tool)
+- Shadow mode comparison — IN PROGRESS
 
 ---
 
@@ -200,7 +212,7 @@ Run `/testing` for the full guide. Key points:
 | 104.6M (bound cache) | 6.51 GB | 14.51 GB | 6.08ms |
 
 tagIds dominates filter memory at 79-80% across all scales.
-Full results: `docs/benchmark-report.md`, `docs/benchmark-comparison-loading-mode.md`
+Full results: `docs/benchmarks/benchmark-report.md`, `docs/benchmarks/benchmark-comparison-loading-mode.md`
 
 ### Extrapolation to 150M
 

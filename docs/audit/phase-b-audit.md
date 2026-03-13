@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-21
 **Auditor:** Claude Opus 4.6
-**Spec source:** `docs/roadmap-performance-and-persistence.md`, lines 198-217
+**Spec source:** `docs/plans/roadmap-performance-and-persistence.md`, lines 198-217
 **Files audited:**
 - `src/executor.rs`
 - `src/planner.rs`

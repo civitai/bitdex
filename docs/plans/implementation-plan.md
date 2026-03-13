@@ -1,7 +1,7 @@
 # Bitdex V2 -- Spec Compliance Implementation Plan
 
 **Date:** 2026-02-21
-**Source:** `docs/audit/synthesis.md` (audit findings), `docs/roadmap-performance-and-persistence.md` (authoritative spec), `docs/architecture-risk-review.md` (risk constraints), `CLAUDE.md` (inviolable design principles)
+**Source:** `docs/audit/synthesis.md` (audit findings), `docs/plans/roadmap-performance-and-persistence.md` (authoritative spec), `docs/reviews/architecture-risk-review.md` (risk constraints), `CLAUDE.md` (inviolable design principles)
 
 ---
 
@@ -118,7 +118,7 @@ Per the architecture-risk-review.md (issues 3, 4, 5) and roadmap spec:
 
 #### S1.5: Scope alignment verification
 
-**Files:** `docs/architecture-risk-review.md` (read-only reference)
+**Files:** `docs/reviews/architecture-risk-review.md` (read-only reference)
 **What to verify:**
 - Issue 3 (merge blocking flush): Confirm flush and merge are separate threads, merge never blocks flush.
 - Issue 4 (sort diff fusion overhead): Confirm sort diffs are merged by flush thread before publishing; readers never see dirty sort diffs.

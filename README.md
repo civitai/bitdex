@@ -313,6 +313,7 @@ src/
   query.rs               Query types (FilterClause, SortClause, Value)
   planner.rs             Cardinality-based query planning
   cache.rs               Trie cache with prefix matching
+  unified_cache.rs       Bounded top-K result cache per (filter, sort, direction)
   bound_cache.rs         Approximate top-K bitmaps for sort acceleration
   meta_index.rs          Bitmaps indexing bitmaps for cache invalidation
   mutation.rs            Mutation operations (insert, update, delete)
@@ -334,12 +335,49 @@ src/
 ## Testing
 
 ```bash
-# Run all tests
+# All Rust unit + integration tests
 cargo test --release
 
-# Run benchmarks
-cargo bench
+# All self-contained E2E tests (builds server, runs 6 suites, 31 tests)
+node tools/run-e2e.mjs
+
+# Skip rebuild if binary is current
+node tools/run-e2e.mjs --skip-build
 ```
+
+E2E test suites:
+
+| Suite | Tests | What it covers |
+|-------|-------|---------------|
+| Write Handling | 7 | Insert, upsert, delete, concurrent, multi-value |
+| Eviction | 5 | Load, idle, evict, reload, existence set |
+| Query Operators | 4 | Range (Gt/Gte/Lt/Lte), NotEq, combined |
+| Error Handling | 5 | Invalid JSON, unknown index, empty index, slot recycling |
+| Pagination & Overhead | 6 | Cursor pagination, cache acceleration, expansion, overhead |
+| Save/Unload/Lazy | 4 | Snapshot save, query after save, mutation survival, stats |
+
+Full testing guide: [`docs/testing.md`](docs/testing.md)
+
+## Documentation
+
+```
+docs/
+  api.md                    API reference
+  testing.md                Testing guide + coverage gap analysis
+  config-schema.md          Configuration reference
+  bitdex-civitai-schema.md  Civitai dataset schema
+  benchmarks/               Performance reports and baselines
+  design/                   Architecture and design docs
+  plans/                    Roadmaps and implementation plans
+  reviews/                  Architecture reviews and QA
+  audit/                    Phase completion audits
+  in/                       Original design conversations
+```
+
+Key docs:
+- **[Performance Baselines](docs/benchmarks/performance-baseline.md)** — Consolidated numbers with commit hashes and regression thresholds
+- **[Benchmark Report](docs/benchmarks/benchmark-report.md)** — 5M-105M scaling analysis
+- **[API Reference](docs/api.md)** — Full endpoint documentation
 
 ## License
 
