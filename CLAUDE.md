@@ -85,90 +85,17 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 ## Reference Materials
 
-> **Before proposing architectural changes**, read the relevant design doc in `docs/design/`. These documents capture the rationale behind decisions and prevent re-inventing approaches that were already evaluated. See `docs/learnings/` for things we tried that didn't work.
->
-> See `docs/README.md` for the full folder structure explanation.
+Run `/architecture` for the full guide — design docs, learnings, known gaps, and expectations for updating docs when changing architecture.
 
-### Design Documents (read before changing architecture)
-
-- **Concurrency**: `docs/design/design-concurrency.md` — ArcSwap snapshot architecture, Arc-per-bitmap CoW, VersionedBitmap diffs, flush/merge threads, loading mode, lazy bitmap loading
-- **Storage**: `docs/design/design-storage.md` — BitmapFs (hex-bucketed bitmap persistence), DocStore (sharded zstd-compressed msgpack documents), persistence lifecycle
-- **Unified Cache**: `docs/design/design-unified-cache-final.md` — Cache architecture consolidating filter+sort+time bucket caching
-- **Cache Persistence**: `docs/design/design-unified-cache-persistence.md` — BoundStore design for warm cache restarts (APPROVED, not yet built)
-- **Idle Eviction**: `docs/design/design-idle-eviction.md` — Per-value bitmap eviction for multi_value fields
-- **Radix Sort**: `docs/design/design-radix-sort-trie.md` — 8-bit radix bucketing for large cache entries (Phase 1 implemented)
-- **Rolling Restart Cursors**: `docs/design/design-rolling-restart-cursors.md` — Named cursors for zero-downtime restarts (Phases 1-3 implemented)
-
-### Design Conversations (understand WHY decisions were made)
-
-- **Architecture Conversations**: `docs/_in/architecture-conversations.md` — Merged design conversations covering the evolution from OpenSearch to bitmaps, slot model, sort layer design, meta-index innovation, bound cache tiering, time buckets, and bulk loading. Has a navigable summary with line references.
-- **Full Project Brief**: `docs/_in/prepared-prompt.md` — Authoritative specification with complete architecture, API specs, config schemas, testing strategy, and development phases.
-- **Storage Overhaul**: `docs/_in/storage-overhaul.md` — Requirements for the redb-to-filesystem pivot
-
-### Learnings (what we tried that didn't work)
-
-- `docs/learnings/write-pipeline.md` — Loading mode vs adaptive pressure, persist thread, bulk accumulator
-- `docs/learnings/storage.md` — Lazy loading vs tiered caching, redb vs custom filesystem
-- `docs/learnings/ingestion.md` — Parsing bottlenecks, simd-json/rkyv evaluation
-
-### Benchmarks
-
-- **Performance Baselines**: `docs/benchmarks/performance-baseline.md` — Consolidated baselines with regression thresholds (authoritative)
-- **Benchmark Report**: `docs/benchmarks/benchmark-report.md` — 5M/50M/100M/104.6M scaling analysis
-- **Loading Mode Comparison**: `docs/benchmarks/benchmark-comparison-loading-mode.md` — Before/after bound cache impact
-- **Write Regression Analysis**: `docs/benchmarks/write-regression-loading-mode.md` — ArcSwap clone cascade root cause
-- **Loadtest Guide**: `docs/benchmarks/loadtest-guide.md` — Rust loadtest binary usage and baselines
-
-### Guides
-
-- **HTTP API**: `docs/guide/api.md` — All endpoints, request/response examples
-- **Config Schema**: `docs/guide/config-schema.md` — Configuration reference
-- **Civitai Schema**: `docs/guide/bitdex-civitai-schema.md` — Field mapping for Civitai dataset
-- **Testing**: `docs/guide/testing.md` — Test suite guide
-
-### External References
-
-- **V1 Codebase**: `C:\Dev\Repos\open-source\bitdex\` — Reference for reusable code (filter bitmaps, WAL consumer, server scaffolding). DO NOT bring over Vecs, skip lists, sorted arrays, forward maps, or reverse indexes.
+Key guides: `docs/guide/api.md` (HTTP API), `docs/guide/config-schema.md` (config), `docs/guide/testing.md` (tests), `docs/guide/bitdex-civitai-schema.md` (Civitai fields).
 
 ---
 
-## Development Phases
+## Development Status
 
-### Phase 1: Core Engine — COMPLETE (commit 7bc60fd)
-Slot allocation, alive bitmap, filter bitmaps, sort layer bitmaps, mutation API (PUT/PATCH/DELETE/DELETE WHERE), query execution, JSON query parser, config loading. Full test coverage.
+Run `/dev-guide` for full phase details, workflow expectations, and what's built vs not.
 
-### Phase 2: Persistence — COMPLETE
-Custom filesystem storage: BitmapFs for bitmap persistence (hex-bucketed pack files), sharded DocStore for documents (zstd-compressed msgpack). Save-and-unload with zero-copy `fused_cow()` for memory reclamation. Lazy bitmap loading per-field on first query (<1s startup at 105M). No WAL (not needed — Postgres is the source of truth).
-
-### Phase 3: Performance — COMPLETE (commits 95df2a5 through bdccbe2)
-- Cardinality-based query planning (planner.rs)
-- Trie cache with prefix matching and generation-counter invalidation (cache.rs)
-- Unified cache with bounded top-K bitmaps per (filter, sort, direction) (unified_cache.rs)
-- ArcSwap lock-free snapshot reads with Arc-per-bitmap CoW (concurrent_engine.rs)
-- Write coalescing via crossbeam channels with batched flush loop (write_coalescer.rs)
-- Targeted cache invalidation — sort-only flushes skip invalidation
-- Arc<str> field name interning for zero-copy mutation ops
-- Loading mode for bulk inserts — skips snapshot publishing to avoid clone cascade (6fb2b78)
-- Bound cache with tiered bounds for sort query acceleration (2-13x at 104M)
-- Meta-index for targeted bound cache invalidation
-- Idle eviction for high-cardinality multi-value fields (tagIds)
-- Fused parse+bitmap loader pipeline (320-460K/s sustained)
-- Benchmark harness with 20 query types + contention benchmark, memory reporting
-
-### Phase 4: Operations — PARTIAL
-- Prometheus metrics endpoint (`/metrics`) — COMPLETE
-- HTTP server with index management, query, upsert, delete endpoints — COMPLETE
-- Web UI with infinite scroll image grid — COMPLETE
-- Grafana dashboard — COMPLETE
-- Rebuild from docstore (`--rebuild` flag) — COMPLETE: deletes existing bitmaps, rebuilds all indexes from docstore using current config, persists via `save_and_unload()`, then starts serving. Benchmark binary: `rebuild_bench --full`
-- Autovac, admin API, graceful shutdown — NOT yet started
-
-### Phase 5: Integration — IN PROGRESS
-- NDJSON bulk loading from file — COMPLETE
-- Upsert/delete endpoints — COMPLETE
-- E2E test suite (6 self-contained suites, 31 tests) — COMPLETE
-- Postgres CDC sync (pg-sync) — COMPLETE (external tool)
-- Shadow mode comparison — IN PROGRESS
+**Summary:** Phases 1-3 COMPLETE. Phase 4 partial (server/metrics/UI done, autovac/admin not started). Phase 5 in progress (shadow mode comparison).
 
 ---
 
@@ -194,42 +121,15 @@ cargo run --release --features server --bin bitdex-server -- --port 3001 --data-
 
 ### Testing Guide
 
-Run `/testing` for the full guide. Key points:
-
-- **Before committing**, check which tests cover your changed files. The `/testing` command has a change→test mapping table.
-- **Rust tests** (`cargo test`) for bitmap correctness, property-based testing, and high-throughput benchmarks. Node can't match Rust's throughput for load tests.
-- **Node E2E tests** (`node tests/e2e/e2e-*.mjs`) for HTTP API behavior, full write pipeline, and observable client behavior.
-- **Automated runner**: `node tests/e2e/run-e2e.mjs` starts a fresh server, runs all self-contained E2E suites, and produces JSON results.
-- **Full docs**: `docs/guide/testing.md` — master reference for all test suites, run commands, and coverage gap analysis.
+Run `/testing` for the full guide — change→test mapping, E2E development patterns, and test data directory standards. Run `/microbench` for throwaway performance experiments.
 
 ---
 
-## Measured Memory (Civitai dataset, remapped IDs, 4 threads)
+## Performance & Memory
 
-| Scale | Bitmap Memory | RSS | Worst Query p50 |
-|------:|-------------:|----:|----------------:|
-| 5M | 328 MB | 1.20 GB | 0.83ms |
-| 50M | 2.95 GB | 6.09 GB | 13.5ms |
-| 100M | 6.19 GB | 11.66 GB | 18.7ms |
-| 104.6M | 6.49 GB | 12.14 GB | 21.1ms |
-| 104.6M (bound cache) | 6.51 GB | 14.51 GB | 6.08ms |
+Run `/perf` for memory baselines at scale, measurement methodology, regression thresholds, and benchmark commands.
 
-tagIds dominates filter memory at 79-80% across all scales.
-Full results: `docs/benchmarks/benchmark-report.md`, `docs/benchmarks/benchmark-comparison-loading-mode.md`
-
-### Extrapolation to 150M
-
-| Component | Estimated Size |
-|---|---|
-| Filter bitmaps | ~8.1 GB |
-| Sort bitmaps | ~1.1 GB |
-| Trie cache | ~160 MB |
-| **Total bitmap memory** | **~9.3 GB** |
-| **Total RSS** | **~17.4 GB** |
-
-Within the original 7-11 GB bitmap target. RSS overhead is ~48% from allocator + OS page cache.
-
-Document store on disk: ~6 GB at 100M records.
+**Quick reference:** 104.6M records = 6.51 GB bitmap memory, 14.51 GB RSS. tagIds = 79-80% of filter memory. ~62 bytes/record scaling.
 
 ---
 
