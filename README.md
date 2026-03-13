@@ -9,27 +9,32 @@ Built for datasets in the 100M+ record range on a single node. No clustering, no
 
 ## Performance
 
-Tested against 105M records (Civitai image dataset) on a single machine:
-
-### Query Latency
-
-| Query Type | p50 | p99 |
-|---|---|---|
-| Sparse filter (userId=1) | 0.03ms | 0.05ms |
-| Dense filter (nsfwLevel=1, 90M matches) | 0.03ms | 0.06ms |
-| Dense filter + sort (sortAt desc) | 0.08ms | 0.15ms |
-| Mixed filters + sort | 0.10ms | 0.25ms |
+Tested against 105M records (Civitai image dataset) on a single machine (Windows 11, NVMe SSD):
 
 ### Concurrent Throughput (HTTP, 105M records)
 
-| Concurrency | QPS | p50 | p95 | p99 |
-|--:|--:|--:|--:|--:|
-| 1 | 1,461 | 0.64ms | 1.53ms | 1.77ms |
-| 4 | 6,164 | 0.60ms | 1.36ms | 1.73ms |
-| 8 | 11,799 | 0.62ms | 1.33ms | 1.98ms |
-| 16 | 19,223 | 0.66ms | 1.83ms | 3.97ms |
-| 32 | 18,974 | 1.00ms | 5.14ms | 13.43ms |
-| 64 | 22,606 | 2.37ms | 5.93ms | 11.13ms |
+| Concurrency | QPS | p50 | p95 | p99 | max |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 6,349 | 0.14ms | 0.21ms | 0.26ms | 0.61ms |
+| 4 | 21,994 | 0.17ms | 0.26ms | 0.33ms | 1.65ms |
+| 8 | 33,815 | 0.21ms | 0.37ms | 0.47ms | 15.29ms |
+| 16 | 34,899 | 0.43ms | 0.91ms | 1.27ms | 7.58ms |
+| 32 | 34,217 | 0.89ms | 2.20ms | 3.18ms | 8.37ms |
+| 64 | 34,052 | 1.77ms | 3.49ms | 4.60ms | 10.81ms |
+
+Production workload mix (filter + sort queries). Unified cache at 99.98% hit rate.
+
+### Query Latency (single-threaded benchmark harness, cache warm)
+
+| Query Type | p50 |
+|---|---|
+| Sparse filter (userId Eq) | 0.041ms |
+| Dense filter (nsfwLevel Eq, 90M matches) | 7.84ms |
+| Sort + filter (nsfwLevel=1, reactionCount Desc) | 1.68ms |
+| Sort + filter (id Asc) | 1.61ms |
+| Range filter + 3-clause sort | 6.08ms |
+
+Bound cache provides 2-13x speedup on sort queries. Full breakdown in [`docs/benchmarks/performance-baseline.md`](docs/benchmarks/performance-baseline.md).
 
 ### Memory
 
@@ -39,6 +44,8 @@ Tested against 105M records (Civitai image dataset) on a single machine:
 | 50M | 2.95 GB | 6.09 GB |
 | 100M | 6.19 GB | 11.66 GB |
 | 105M | 6.51 GB | 14.51 GB |
+
+Scaling is linear at ~62 bytes/record. With lazy loading, RSS starts near zero and fields load on demand — only queried fields consume memory.
 
 ## How It Works
 
@@ -51,12 +58,14 @@ Sortable fields are decomposed into bit layers (one bitmap per bit position). To
 ### Key Components
 
 - **Filter bitmaps** — One roaring bitmap per distinct value per field. Boolean, integer, string, and multi-value fields supported.
-- **Sort layer bitmaps** — Numeric fields decomposed into N bitmaps (one per bit). A u32 sort field = 32 bitmaps.
-- **Bound cache** — Pre-computed approximate top-K bitmaps per sort field. Reduces sort working set by 10-100x.
-- **Trie cache** — Query result cache keyed by canonically sorted filter clauses. Prefix matching for partial hits.
-- **ArcSwap snapshots** — Lock-free reads via immutable snapshots. Writers publish atomically. Zero reader contention.
-- **Document store** — Custom packed-shard filesystem store keyed by slot ID. Enables upsert diffing and serving full documents alongside query results (via `include_docs: true`).
+- **Sort layer bitmaps** — Numeric fields decomposed into N bitmaps (one per bit). A u32 sort field = 32 bitmaps. Top-N via MSB-to-LSB traversal.
+- **Unified cache** — Bounded top-K result cache per (filter combo, sort field, direction). 99.98% hit rate under production workload. ~103 bytes/entry.
+- **Bound cache** — Pre-computed approximate top-K bitmaps per sort field. Reduces sort working set by 10-100x. 2-13x speedup on sort queries.
+- **ArcSwap snapshots** — Lock-free reads via immutable snapshots. Writers publish atomically via crossbeam channels. Zero reader contention.
+- **Document store** — Custom packed-shard filesystem store (512 docs/shard, zstd-compressed msgpack). Enables upsert diffing and serving full documents via `include_docs: true`.
 - **Lazy loading** — Bitmaps load per-field on first query. Server starts in <1s at 105M records; fields load on demand (typically <100ms each).
+- **Idle eviction** — High-cardinality multi-value fields (e.g., tagIds with 31K+ values) automatically evict rarely-queried values from memory after a configurable idle period. Reloads from disk on next query.
+- **Save and unload** — Zero-copy bitmap snapshot save via `fused_cow()`, then unload all fields from memory. Combined with lazy loading, enables memory reclamation without restart.
 - **Clean deletes** — Deletes clear all filter/sort bitmap bits, keeping bitmaps permanently clean. No alive bitmap AND in the query hot path.
 
 ## Getting Started
