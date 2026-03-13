@@ -598,6 +598,28 @@ Clears all unified cache entries. Cache will rebuild on subsequent queries.
 
 ---
 
+### Save Snapshot
+
+```
+POST /api/indexes/{name}/snapshot
+```
+
+Persist current bitmap state to disk. Blocks until save is complete (synchronous).
+
+**Request body:** None
+
+**Response:** `200 OK`
+
+```json
+{ "status": "saved", "elapsed_secs": 37.2 }
+```
+
+**Errors:**
+- `404` — Index not found
+- `500` — Snapshot save failed
+
+---
+
 ### Rebuild Fields
 
 ```
@@ -798,6 +820,50 @@ Look up a specific task by ID. Checks the active task first, then searches histo
 **Task statuses:** `running`, `saving`, `complete`, `error`
 
 **Errors:** `404` — Task not found
+
+---
+
+## Named Cursors
+
+Named cursors store opaque string values (typically Postgres LSNs or timestamps) that persist across server restarts. Used by pg-sync and other CDC consumers to track replication position.
+
+### List Cursors
+
+```
+GET /api/indexes/{name}/cursors
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "cursors": [
+    { "name": "pg-sync", "value": "0/1A3B4C0" },
+    { "name": "cdc-checkpoint", "value": "2026-03-13T12:00:00Z" }
+  ]
+}
+```
+
+Returns an empty array if no cursors are set.
+
+**Errors:** `404` — Index not found
+
+---
+
+### Get Cursor
+
+```
+GET /api/indexes/{name}/cursors/{cursor_name}
+```
+
+**Response:** `200 OK`
+
+```json
+{ "name": "pg-sync", "value": "0/1A3B4C0" }
+```
+
+**Errors:**
+- `404` — Index or cursor not found
 
 ---
 

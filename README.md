@@ -214,6 +214,7 @@ Set `include_docs: false` (or omit it) to return only IDs — useful when you ju
 | POST | `/api/indexes/{name}/rebuild` | Rebuild bitmaps from docstore |
 | POST | `/api/indexes/{name}/fields` | Hot-add filter/sort fields |
 | DELETE | `/api/indexes/{name}/fields` | Remove filter/sort fields |
+| POST | `/api/indexes/{name}/snapshot` | Persist bitmap snapshot to disk |
 | GET | `/api/indexes/{name}/tasks` | List tasks (active + history) |
 | GET | `/api/tasks/{task_id}` | Get task status by ID |
 
@@ -225,7 +226,11 @@ Set `include_docs: false` (or omit it) to return only IDs — useful when you ju
 | POST | `/api/indexes/{name}/document` | Get a single document by slot ID |
 | POST | `/api/indexes/{name}/documents` | Get documents by slot IDs (batch) |
 | GET | `/api/indexes/{name}/stats` | Index statistics |
+| DELETE | `/api/indexes/{name}/cache` | Clear unified cache |
+| GET | `/api/indexes/{name}/cursors` | List named cursors |
+| GET | `/api/indexes/{name}/cursors/{name}` | Get cursor value |
 | GET | `/api/health` | Health check |
+| GET | `/metrics` | Prometheus metrics |
 
 ### Filter Clauses
 
