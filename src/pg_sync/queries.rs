@@ -224,8 +224,27 @@ pub struct MetricRow {
 
 /// Run the setup SQL to create BitdexOutbox table and triggers.
 pub async fn run_setup(pool: &PgPool) -> Result<(), sqlx::Error> {
+    // Check if triggers are already set up and ENABLE ALWAYS.
+    // If so, skip the full setup to avoid exclusive table locks on large tables
+    // (ALTER TABLE ... ENABLE ALWAYS TRIGGER requires AccessExclusive lock).
+    let already_setup = check_triggers_exist(pool).await.unwrap_or(false);
+    if already_setup {
+        eprintln!("BitdexOutbox triggers already exist and are ENABLE ALWAYS — skipping setup.");
+        return Ok(());
+    }
     sqlx::raw_sql(SETUP_SQL).execute(pool).await?;
     Ok(())
+}
+
+/// Check if all bitdex triggers exist and are ENABLE ALWAYS ('A').
+async fn check_triggers_exist(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE 'bitdex_%' AND tgenabled = 'A'"
+    )
+    .fetch_one(pool)
+    .await?;
+    // We expect 8 triggers: image, tags, tool, technique, resource, post, mv, model
+    Ok(row.0 >= 8)
 }
 
 /// Get the max image ID for range-based bulk loading.
