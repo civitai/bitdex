@@ -135,15 +135,11 @@ benchmark-full:
 benchmark-persist:
     cargo run --release --bin bitdex-benchmark -- --stages persist,restore
 
-# ─── Server ────────────────────────────────────────────────────────
+# ─── Server (standalone, no daemon) ───────────────────────────────
 
-# Build + run server (fast profile)
-dev: build-server
-    {{justfile_directory() / "target" / "fast" / "bitdex-server"}} --port {{PORT}} --data-dir {{DATA_DIR}}
-
-# Run server without rebuilding (instant start)
+# Run server without rebuilding (instant start, no daemon)
 run:
-    {{justfile_directory() / "target" / "fast" / "bitdex-server"}} --port {{PORT}} --data-dir {{DATA_DIR}}
+    {{justfile_directory() / "target" / "fast" / "bitdex-server"}} --port {{PORT}} --data-dir {{DATA_DIR}} --log-level info
 
 # ─── Load Testing ──────────────────────────────────────────────────
 
@@ -174,6 +170,50 @@ docker-simd:
 # Usage: just release [patch|minor|major]
 release BUMP="patch":
     bash tools/release.sh {{BUMP}}
+
+# ─── Dev Server (managed instances via daemon) ──────────────────
+
+_cli := ".claude/skills/dev-server/cli.mjs"
+
+# Start server (or show status if already running)
+dev *ARGS:
+    node {{_cli}} start {{ARGS}}
+
+# Start an additional server instance (for agents/parallel work)
+dev-new *ARGS:
+    node {{_cli}} new {{ARGS}}
+
+# Open the dev-server TUI dashboard
+dev-dash:
+    node {{_cli}} dash
+
+# Show status of all managed instances, datasets, and locks
+dev-status:
+    node {{_cli}} status
+
+# Stop a server instance (defaults to first running; or specify ID)
+dev-stop *ARGS:
+    node {{_cli}} stop {{ARGS}}
+
+# View server logs (defaults to first running; or specify ID)
+dev-logs *ARGS:
+    node {{_cli}} logs {{ARGS}}
+
+# List known datasets and data directories
+dev-datasets:
+    node {{_cli}} datasets
+
+# Coordinated build (acquires lock, builds, releases)
+dev-build *ARGS:
+    node {{_cli}} build {{ARGS}}
+
+# Coordinated E2E test run (acquires lock, runs suite, releases)
+dev-test-e2e:
+    node {{_cli}} test-e2e
+
+# Shut down all managed instances and the daemon
+dev-shutdown:
+    node {{_cli}} shutdown
 
 # ─── Cleanup ───────────────────────────────────────────────────────
 
