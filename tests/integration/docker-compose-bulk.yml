@@ -1,0 +1,164 @@
+# Docker Compose for BitDex bulk-load + sync integration test.
+#
+# Architecture:
+#   postgres         — PG with pre-existing seed data (10 images)
+#   loader-0         — Runs `pg-sync load`: setup triggers + bulk load + save snapshot (exits)
+#   loader-1         — Same for replica 1
+#   bitdex-0         — Server (port 3011), restores bulk-loaded data from disk
+#   bitdex-1         — Server (port 3012), restores bulk-loaded data from disk
+#   sidecar-0        — Runs `pg-sync sync`: polls outbox for new changes
+#   sidecar-1        — Same for replica 1
+#
+# Orchestration (handled by run-bulk.sh):
+#   1. Start postgres (wait healthy)
+#   2. Run loader-0 + loader-1 (one-shot, exit after load)
+#   3. Start bitdex-0 + bitdex-1 (restore from disk, wait healthy)
+#   4. Start sidecar-0 + sidecar-1 (sync mode)
+#   5. Run test-bulk-load.sh
+#
+# Usage:
+#   bash run-bulk.sh           # build + orchestrate + test + teardown
+#   bash run-bulk.sh --keep    # leave containers running for debugging
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: bitdex_test
+      POSTGRES_USER: bitdex
+      POSTGRES_PASSWORD: bitdex
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./seed-bulk.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bitdex -d bitdex_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # One-shot loader for replica 0: setup triggers + bulk load from PG + save snapshot
+  loader-0:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["bitdex-pg-sync", "--config", "/etc/bitdex/sync.toml", "load"]
+    environment:
+      DATABASE_URL: postgres://bitdex:bitdex@postgres:5432/bitdex_test
+      BITDEX_REPLICA_ID: bitdex-0
+    volumes:
+      - bitdex-data-0:/data
+      - ./sync.toml:/etc/bitdex/sync.toml:ro
+      - ./config.json:/etc/bitdex/config.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # One-shot loader for replica 1
+  loader-1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["bitdex-pg-sync", "--config", "/etc/bitdex/sync.toml", "load"]
+    environment:
+      DATABASE_URL: postgres://bitdex:bitdex@postgres:5432/bitdex_test
+      BITDEX_REPLICA_ID: bitdex-1
+    volumes:
+      - bitdex-data-1:/data
+      - ./sync.toml:/etc/bitdex/sync.toml:ro
+      - ./config.json:/etc/bitdex/config.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bitdex-0:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["bitdex-server", "--port", "3000", "--data-dir", "/data"]
+    ports:
+      - "3011:3000"
+    volumes:
+      - bitdex-data-0:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  bitdex-1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["bitdex-server", "--port", "3000", "--data-dir", "/data"]
+    ports:
+      - "3012:3000"
+    volumes:
+      - bitdex-data-1:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  # Sync sidecar for bitdex-0: polls outbox for changes after bulk load
+  sidecar-0:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for bitdex-0..."
+        until curl -sf http://bitdex-0:3000/api/health > /dev/null 2>&1; do sleep 1; done
+        echo "bitdex-0 is ready. Starting sync..."
+        exec bitdex-pg-sync --config /etc/bitdex/sync.toml sync
+    environment:
+      DATABASE_URL: postgres://bitdex:bitdex@postgres:5432/bitdex_test
+      BITDEX_URL: http://bitdex-0:3000/api/indexes/test
+      BITDEX_REPLICA_ID: bitdex-0
+    volumes:
+      - ./sync.toml:/etc/bitdex/sync.toml:ro
+      - ./config.json:/etc/bitdex/config.json:ro
+    depends_on:
+      bitdex-0:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # Sync sidecar for bitdex-1
+  sidecar-1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for bitdex-1..."
+        until curl -sf http://bitdex-1:3000/api/health > /dev/null 2>&1; do sleep 1; done
+        echo "bitdex-1 is ready. Starting sync..."
+        exec bitdex-pg-sync --config /etc/bitdex/sync.toml sync
+    environment:
+      DATABASE_URL: postgres://bitdex:bitdex@postgres:5432/bitdex_test
+      BITDEX_URL: http://bitdex-1:3000/api/indexes/test
+      BITDEX_REPLICA_ID: bitdex-1
+    volumes:
+      - ./sync.toml:/etc/bitdex/sync.toml:ro
+      - ./config.json:/etc/bitdex/config.json:ro
+    depends_on:
+      bitdex-1:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  bitdex-data-0:
+  bitdex-data-1:

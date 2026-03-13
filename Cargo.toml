@@ -55,6 +55,9 @@ clap = { version = "4", features = ["derive"], optional = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false, optional = true }
 chrono = { version = "0.4", optional = true }
 
+# Memory-mapped files (slot arena for bulk loading)
+memmap2 = "0.9"
+
 # RNG (used by benchmark binary)
 rand = "0.8"
 
@@ -75,6 +78,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # Test utilities
 rand = "0.8"
 tempfile = "3"
+memmap2 = "0.9"
 
 
 [[bench]]
@@ -83,6 +87,22 @@ harness = false
 
 [[bench]]
 name = "radix_sort_bench"
+harness = false
+
+[[bench]]
+name = "docstore_merge"
+harness = false
+
+[[bench]]
+name = "bitmap_stream"
+harness = false
+
+[[bench]]
+name = "slot_loader"
+harness = false
+
+[[bench]]
+name = "columnar_loader"
 harness = false
 
 [[bin]]

@@ -387,3 +387,138 @@ pub async fn get_max_outbox_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
     .await?;
     Ok(row.0.unwrap_or(0))
 }
+
+// ---------------------------------------------------------------------------
+// Streaming bulk queries — table-at-a-time loading
+// ---------------------------------------------------------------------------
+
+/// Row type for streaming tags ordered by tagId (for bitmap-efficient insertion).
+#[derive(Debug, FromRow)]
+pub struct StreamTagRow {
+    #[sqlx(rename = "tagId")]
+    pub tag_id: i64,
+    #[sqlx(rename = "imageId")]
+    pub image_id: i64,
+}
+
+/// Row type for streaming resources (one row per imageId, pre-aggregated).
+#[derive(Debug, FromRow)]
+pub struct StreamResourceRow {
+    #[sqlx(rename = "imageId")]
+    pub image_id: i64,
+    #[sqlx(rename = "baseModel")]
+    pub base_model: Option<String>,
+    #[sqlx(rename = "modelVersionIds")]
+    pub model_version_ids: Vec<i64>,
+    #[sqlx(rename = "modelVersionIdsManual")]
+    pub model_version_ids_manual: Vec<i64>,
+    #[sqlx(rename = "resourcePoi")]
+    pub resource_poi: Option<bool>,
+}
+
+/// Get max tag ID for range iteration.
+pub async fn get_max_tag_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        r#"SELECT COALESCE(MAX("tagId"), 0) FROM "TagsOnImageDetails""#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Fetch tags by tagId range, ordered by tagId then imageId.
+/// This produces bitmap-optimal ordering: all images for one tagId together.
+pub async fn fetch_tags_by_tag_range(
+    pool: &PgPool,
+    start: i64,
+    end: i64,
+) -> Result<Vec<StreamTagRow>, sqlx::Error> {
+    sqlx::query_as::<_, StreamTagRow>(
+        r#"SELECT "tagId", "imageId" FROM "TagsOnImageDetails"
+        WHERE "tagId" >= $1 AND "tagId" < $2
+          AND disabled = false
+        ORDER BY "tagId", "imageId""#,
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await
+}
+
+/// Get max tool ID for range iteration.
+pub async fn get_max_tool_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        r#"SELECT COALESCE(MAX("toolId"), 0) FROM "ImageTool""#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Fetch tools by toolId range, ordered by toolId then imageId.
+pub async fn fetch_tools_by_tool_range(
+    pool: &PgPool,
+    start: i64,
+    end: i64,
+) -> Result<Vec<ToolRow>, sqlx::Error> {
+    sqlx::query_as::<_, ToolRow>(
+        r#"SELECT "imageId", "toolId" FROM "ImageTool"
+        WHERE "toolId" >= $1 AND "toolId" < $2
+        ORDER BY "toolId", "imageId""#,
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await
+}
+
+/// Get max technique ID for range iteration.
+pub async fn get_max_technique_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        r#"SELECT COALESCE(MAX("techniqueId"), 0) FROM "ImageTechnique""#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Fetch techniques by techniqueId range, ordered by techniqueId then imageId.
+pub async fn fetch_techniques_by_technique_range(
+    pool: &PgPool,
+    start: i64,
+    end: i64,
+) -> Result<Vec<TechniqueRow>, sqlx::Error> {
+    sqlx::query_as::<_, TechniqueRow>(
+        r#"SELECT "imageId", "techniqueId" FROM "ImageTechnique"
+        WHERE "techniqueId" >= $1 AND "techniqueId" < $2
+        ORDER BY "techniqueId", "imageId""#,
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await
+}
+
+/// Fetch resources by imageId range (pre-aggregated per imageId).
+pub async fn fetch_resources_by_range(
+    pool: &PgPool,
+    start: i64,
+    end: i64,
+) -> Result<Vec<StreamResourceRow>, sqlx::Error> {
+    sqlx::query_as::<_, StreamResourceRow>(
+        r#"SELECT ir."imageId",
+           string_agg(CASE WHEN m.type = 'Checkpoint' THEN mv."baseModel" ELSE NULL END, '') as "baseModel",
+           coalesce(array_agg(mv.id) FILTER (WHERE ir.detected), '{}') as "modelVersionIds",
+           coalesce(array_agg(mv.id) FILTER (WHERE NOT ir.detected), '{}') as "modelVersionIdsManual",
+           bool_or(m.poi) as "resourcePoi"
+        FROM "ImageResourceNew" ir
+        JOIN "ModelVersion" mv ON ir."modelVersionId" = mv.id
+        JOIN "Model" m ON mv."modelId" = m.id
+        WHERE ir."imageId" >= $1 AND ir."imageId" < $2
+        GROUP BY ir."imageId""#,
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await
+}

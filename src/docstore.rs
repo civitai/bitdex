@@ -34,6 +34,9 @@ use crate::query::Value;
 /// 9 → 512 docs per shard → ~75KB per shard compressed, ~205K shards at 105M records.
 const SHARD_SHIFT: u32 = 9;
 
+/// Public accessor for SHARD_SHIFT (used by slot_arena finalization).
+pub const SHARD_SHIFT_PUB: u32 = SHARD_SHIFT;
+
 /// Shard file version. Bump if format changes.
 const SHARD_VERSION: u32 = 1;
 
@@ -501,6 +504,26 @@ impl DocStore {
             Self::write_shard_file(&path, &entries)?;
         }
         Ok(())
+    }
+
+    /// Public wrapper for `write_shard_file` (for benchmarks).
+    pub fn write_shard_file_pub(path: &Path, entries: &[(u32, Vec<u8>)]) -> Result<()> {
+        Self::write_shard_file(path, entries)
+    }
+
+    /// Public wrapper for `read_shard_file` (for benchmarks).
+    pub fn read_shard_file_pub(data: &[u8]) -> Result<(Vec<(u32, u32, u32)>, Vec<u8>)> {
+        Self::read_shard_file(data)
+    }
+
+    /// Encode a doc using the field dictionary (public for benchmarks).
+    pub fn encode_doc_pub(&mut self, doc: &StoredDoc) -> Result<Vec<u8>> {
+        self.encode_doc(doc)
+    }
+
+    /// Decode raw bytes into a StoredDoc (public for benchmarks).
+    pub fn decode_doc_pub(&self, raw: &[u8]) -> Result<StoredDoc> {
+        self.decode_doc(raw)
     }
 
     /// No-op for filesystem store.

@@ -12,3 +12,5 @@ pub mod metrics_poller;
 pub mod outbox_poller;
 pub mod queries;
 pub mod row_assembler;
+pub mod slot_arena;
+pub mod table_streams;
