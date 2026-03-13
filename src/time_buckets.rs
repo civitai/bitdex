@@ -209,6 +209,23 @@ impl TimeBucketManager {
         best_name
     }
 
+    /// Snap to the nearest bucket that covers the requested duration.
+    /// Always returns a result (the smallest bucket >= duration, or the largest bucket if
+    /// duration exceeds all buckets). Never returns None.
+    /// Used when `allow_unsnapped_range_queries` is false (the default).
+    pub fn snap_nearest(&self, duration_secs: u64) -> &str {
+        // sorted_names is sorted by duration ascending.
+        // Find the smallest bucket whose duration >= the requested duration.
+        for name in &self.sorted_names {
+            let bucket = &self.buckets[name];
+            if bucket.duration_secs >= duration_secs {
+                return name.as_str();
+            }
+        }
+        // Duration exceeds all buckets — use the largest one.
+        self.sorted_names.last().map(|s| s.as_str()).unwrap_or("_none")
+    }
+
     /// Live maintenance: add a slot to all buckets whose time window includes the given timestamp.
     /// Called on insert/upsert when the sort field value is known.
     pub fn insert_slot(&mut self, slot: u32, timestamp: u64, now: u64) {

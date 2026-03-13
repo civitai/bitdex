@@ -73,6 +73,66 @@ impl fmt::Display for Value {
     }
 }
 
+impl fmt::Display for FilterClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FilterClause::Eq(field, val) => write!(f, "{field} = {val}"),
+            FilterClause::NotEq(field, val) => write!(f, "{field} != {val}"),
+            FilterClause::In(field, vals) => {
+                let vals_str: Vec<String> = vals.iter().map(|v| v.to_string()).collect();
+                write!(f, "{field} IN [{}]", vals_str.join(", "))
+            }
+            FilterClause::NotIn(field, vals) => {
+                let vals_str: Vec<String> = vals.iter().map(|v| v.to_string()).collect();
+                write!(f, "{field} NOT IN [{}]", vals_str.join(", "))
+            }
+            FilterClause::Gt(field, val) => write!(f, "{field} > {val}"),
+            FilterClause::Lt(field, val) => write!(f, "{field} < {val}"),
+            FilterClause::Gte(field, val) => write!(f, "{field} >= {val}"),
+            FilterClause::Lte(field, val) => write!(f, "{field} <= {val}"),
+            FilterClause::Not(inner) => write!(f, "NOT({inner})"),
+            FilterClause::And(clauses) => {
+                let parts: Vec<String> = clauses.iter().map(|c| c.to_string()).collect();
+                write!(f, "({})", parts.join(" AND "))
+            }
+            FilterClause::Or(clauses) => {
+                let parts: Vec<String> = clauses.iter().map(|c| c.to_string()).collect();
+                write!(f, "({})", parts.join(" OR "))
+            }
+            FilterClause::BucketBitmap { field, bucket_name, .. } => {
+                write!(f, "{field} ~bucket({bucket_name})")
+            }
+        }
+    }
+}
+
+impl fmt::Display for BitdexQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Filters
+        if self.filters.is_empty() {
+            write!(f, "WHERE *")?;
+        } else {
+            let parts: Vec<String> = self.filters.iter().map(|c| c.to_string()).collect();
+            write!(f, "WHERE {}", parts.join(" AND "))?;
+        }
+        // Sort
+        if let Some(ref sort) = self.sort {
+            write!(f, " ORDER BY {} {:?}", sort.field, sort.direction)?;
+        }
+        // Limit
+        write!(f, " LIMIT {}", self.limit)?;
+        // Offset
+        if let Some(offset) = self.offset {
+            write!(f, " OFFSET {offset}")?;
+        }
+        // Cursor
+        if let Some(ref cursor) = self.cursor {
+            write!(f, " CURSOR(val={}, slot={})", cursor.sort_value, cursor.slot_id)?;
+        }
+        Ok(())
+    }
+}
+
 /// Sort specification for query results.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SortClause {
@@ -131,6 +191,9 @@ pub struct BucketSnapContext<'a> {
     pub now_secs: u64,
     /// Snap tolerance as a fraction (e.g. 0.10 for 10%).
     pub tolerance_pct: f64,
+    /// If true, queries outside tolerance snap to the nearest bucket instead of returning empty.
+    /// Default: true (always snap for safety).
+    pub always_snap: bool,
 }
 
 /// Pre-process filter clauses: replace range filters on bucketed timestamp fields with
@@ -159,14 +222,32 @@ fn snap_clause(clause: &FilterClause, ctx: &BucketSnapContext<'_>) -> FilterClau
         FilterClause::Gt(field, Value::Integer(ts)) | FilterClause::Gte(field, Value::Integer(ts)) => {
             if let Some(snapped) = try_snap_to_bucket(field, *ts, ctx) {
                 snapped
-            } else if ctx.managers.contains_key(field.as_str()) {
-                // Field is a time bucket field but the requested range doesn't match any
-                // pre-computed bucket (duration too far from any configured bucket).
-                // Return an empty bitmap — no results for this range.
-                FilterClause::BucketBitmap {
-                    field: field.clone(),
-                    bucket_name: "_none".to_string(),
-                    bitmap: Arc::new(RoaringBitmap::new()),
+            } else if let Some(manager) = ctx.managers.get(field.as_str()) {
+                if ctx.always_snap {
+                    // Always snap to nearest bucket for safety — returns the smallest
+                    // bucket that covers the requested duration, or the largest bucket.
+                    let duration_secs = ctx.now_secs.saturating_sub(*ts as u64);
+                    let bucket_name = manager.snap_nearest(duration_secs);
+                    if let Some(bucket) = manager.get_bucket(bucket_name) {
+                        FilterClause::BucketBitmap {
+                            field: field.clone(),
+                            bucket_name: bucket_name.to_string(),
+                            bitmap: Arc::new(bucket.bitmap().clone()),
+                        }
+                    } else {
+                        FilterClause::BucketBitmap {
+                            field: field.clone(),
+                            bucket_name: "_none".to_string(),
+                            bitmap: Arc::new(RoaringBitmap::new()),
+                        }
+                    }
+                } else {
+                    // Unsnapped queries allowed — return empty bitmap for out-of-range.
+                    FilterClause::BucketBitmap {
+                        field: field.clone(),
+                        bucket_name: "_none".to_string(),
+                        bitmap: Arc::new(RoaringBitmap::new()),
+                    }
                 }
             } else {
                 clause.clone()
@@ -221,6 +302,7 @@ mod tests {
             managers,
             now_secs,
             tolerance_pct: 0.10,
+            always_snap: true,
         }
     }
 
@@ -291,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_snap_outside_tolerance() {
+    fn test_snap_nearest_outside_tolerance() {
         let now: u64 = 1_700_000_000;
         let mgr = make_manager_with_data(now);
         let mut managers = HashMap::new();
@@ -299,11 +381,32 @@ mod tests {
         let ctx = make_ctx(&managers, now);
 
         // Duration = 200000s. Neither 24h (86400) nor 7d (604800) is within 10% tolerance.
+        // With always_snap=true, should snap to 7d (smallest bucket >= 200000s).
         let ts = (now - 200000) as i64;
         let clauses = vec![FilterClause::Gt("sortAt".to_string(), Value::Integer(ts))];
         let snapped = snap_range_clauses(&clauses, &ctx);
 
-        // Field IS a time bucket field but outside tolerance — becomes empty BucketBitmap
+        assert!(matches!(&snapped[0], FilterClause::BucketBitmap { bucket_name, .. } if bucket_name == "7d"));
+    }
+
+    #[test]
+    fn test_snap_nearest_with_always_snap_false() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_manager_with_data(now);
+        let mut managers = HashMap::new();
+        managers.insert("sortAt".to_string(), &mgr);
+        let ctx = BucketSnapContext {
+            managers: &managers,
+            now_secs: now,
+            tolerance_pct: 0.10,
+            always_snap: false,
+        };
+
+        // Duration = 200000s, outside tolerance, always_snap=false → empty bitmap
+        let ts = (now - 200000) as i64;
+        let clauses = vec![FilterClause::Gt("sortAt".to_string(), Value::Integer(ts))];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+
         assert!(matches!(&snapped[0], FilterClause::BucketBitmap { bitmap, .. } if bitmap.is_empty()));
     }
 

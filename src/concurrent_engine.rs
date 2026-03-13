@@ -2000,6 +2000,7 @@ impl ConcurrentEngine {
                 managers: &managers,
                 now_secs: now_unix,
                 tolerance_pct: 0.10,
+                always_snap: true,
             };
             snapped_filters = crate::query::snap_range_clauses(&query.filters, &ctx);
             &snapped_filters[..]
@@ -2469,6 +2470,7 @@ impl ConcurrentEngine {
                 managers: &managers,
                 now_secs: now_unix,
                 tolerance_pct: 0.10,
+                always_snap: true,
             };
             snapped = crate::query::snap_range_clauses(filters, &ctx);
             &snapped[..]
