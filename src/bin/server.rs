@@ -35,6 +35,7 @@ struct Config {
     data_dir: PathBuf,
     rebuild: bool,
     default_query_format: Option<String>,
+    log_level: String,
 }
 
 /// Get the directory containing the current executable.
@@ -75,6 +76,7 @@ fn parse_config() -> Config {
     let mut cli_rebuild = false;
     let mut cli_config: Option<PathBuf> = None;
     let mut cli_default_query_format: Option<String> = None;
+    let mut cli_log_level: Option<String> = None;
 
     let mut i = 1;
     while i < cli_args.len() {
@@ -98,6 +100,10 @@ fn parse_config() -> Config {
                 i += 1;
                 cli_default_query_format = Some(cli_args[i].clone());
             }
+            "--log-level" => {
+                i += 1;
+                cli_log_level = Some(cli_args[i].clone());
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -111,10 +117,11 @@ fn parse_config() -> Config {
     let mut data_dir = exe_dir.join("data");
     let mut rebuild = false;
     let mut default_query_format: Option<String> = None;
+    let mut log_level = "warn".to_string();
 
     // --- Config file ---
     // Only auto-generate bitdex.toml if no CLI args were passed at all
-    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some();
+    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some() || cli_log_level.is_some();
     let config_path = match &cli_config {
         Some(path) => path.clone(),
         None => {
@@ -143,6 +150,9 @@ fn parse_config() -> Config {
         if let Some(v) = table.get("default_query_format").and_then(|v| v.as_str()) {
             default_query_format = Some(v.to_string());
         }
+        if let Some(v) = table.get("log_level").and_then(|v| v.as_str()) {
+            log_level = v.to_string();
+        }
     }
 
     // --- CLI flags override everything ---
@@ -158,8 +168,11 @@ fn parse_config() -> Config {
     if let Some(f) = cli_default_query_format {
         default_query_format = Some(f);
     }
+    if let Some(l) = cli_log_level {
+        log_level = l;
+    }
 
-    Config { port, data_dir, rebuild, default_query_format }
+    Config { port, data_dir, rebuild, default_query_format, log_level }
 }
 
 #[tokio::main]
@@ -170,6 +183,15 @@ async fn main() {
     }));
 
     let config = parse_config();
+
+    // Initialize tracing with configured log level (RUST_LOG env var overrides)
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.log_level));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .compact()
+        .init();
 
     // Ensure data directory exists
     if !config.data_dir.exists() {

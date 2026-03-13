@@ -26,3 +26,8 @@ data_dir = "data"
 # Default query format: "bitdex", "compact", or "meilisearch"
 # Callers can override per-request with ?format= query parameter
 # default_query_format = "bitdex"
+
+# Log level: "error", "warn", "info", "debug", "trace"
+# "info" logs all incoming queries with timing and result counts
+# RUST_LOG env var overrides this setting
+# log_level = "warn"

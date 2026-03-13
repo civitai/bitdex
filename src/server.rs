@@ -1372,12 +1372,14 @@ async fn handle_query(
         }
     };
 
+    tracing::info!("[{name}] {query}");
     let start = Instant::now();
     let m = &state.metrics;
     match engine.execute_query(&query) {
         Ok(result) => {
             let elapsed = start.elapsed();
             let elapsed_us = elapsed.as_micros() as u64;
+            tracing::info!("[{name}]   → {} results, {elapsed_us}μs", result.total_matched);
             m.query_total.with_label_values(&[&name]).inc();
             m.query_duration_seconds
                 .with_label_values(&[&name])
@@ -1413,6 +1415,8 @@ async fn handle_query(
             Json(response).into_response()
         }
         Err(e) => {
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            tracing::warn!("[{name}]   → ERROR: {e}, {elapsed_us}μs");
             m.query_total.with_label_values(&[&name]).inc();
             m.query_duration_seconds
                 .with_label_values(&[&name])
