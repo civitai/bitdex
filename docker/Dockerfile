@@ -2,7 +2,7 @@
 # Build: docker build -t bitdex:latest -f docker/Dockerfile .
 # Run:   docker run -p 3000:3000 -v bitdex-data:/data bitdex:latest
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
 COPY . .
@@ -23,8 +23,6 @@ RUN apt-get update && \
 COPY --from=builder /build/target/release/bitdex-server /usr/local/bin/bitdex-server
 COPY --from=builder /build/target/release/bitdex-pg-sync /usr/local/bin/bitdex-pg-sync
 COPY --from=builder /build/static /opt/bitdex/static
-
-ENV MALLOC_CONF="background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:3000"
 
 EXPOSE 3000
 ENTRYPOINT ["bitdex-server"]
