@@ -10,30 +10,36 @@ NDJSON         := 'C:/Dev/Repos/open-source/bitdex/data/images-full-v2.ndjson'
 LOADTEST_QPS   := "500"
 LOADTEST_DUR   := "30"
 
-# ─── Build ─────────────────────────────────────────────────────────
+# ─── Build (fast profile — use for daily work) ──────────────────────
 
-# Build core library (release)
+# Build core library (fast profile: thin LTO, parallel codegen)
 build:
-    cargo build --release
+    cargo build --profile fast
 
 # Build HTTP server binary
 build-server:
-    cargo build --release --features server --bin bitdex-server
+    cargo build --profile fast --features server --bin bitdex-server
 
 # Build loadtest binary
 build-loadtest:
-    cargo build --release --features loadtest --bin bitdex-loadtest
+    cargo build --profile fast --features loadtest --bin bitdex-loadtest
 
 # Build pg-sync binary
 build-pg-sync:
-    cargo build --release --features pg-sync --bin bitdex-pg-sync
-
-# Build with SIMD roaring (Linux only)
-build-simd:
-    cargo build --release --features simd,server --bin bitdex-server
+    cargo build --profile fast --features pg-sync --bin bitdex-pg-sync
 
 # Build everything
 build-all: build build-server build-loadtest
+
+# ─── Build (full release — use for distribution only) ────────────────
+
+# Build server with full optimization (fat LTO, single codegen unit)
+dist:
+    cargo build --release --features server --bin bitdex-server
+
+# Build with SIMD roaring (Linux only, full release)
+dist-simd:
+    cargo build --release --features simd,server --bin bitdex-server
 
 # ─── Code Quality ──────────────────────────────────────────────────
 
@@ -105,6 +111,7 @@ bench-all:
     cargo bench
 
 # ─── Benchmark Binary (large-scale) ───────────────────────────────
+# Benchmarks always use full --release for accurate numbers.
 
 # Run benchmark binary (query-only by default)
 benchmark:
@@ -128,11 +135,11 @@ benchmark-persist:
 
 # ─── Server ────────────────────────────────────────────────────────
 
-# Run server (release, port 3001)
+# Run server (fast profile — good perf, quick rebuilds)
 server:
-    cargo run --release --features server --bin bitdex-server -- --port {{PORT}} --data-dir {{DATA_DIR}}
+    cargo run --profile fast --features server --bin bitdex-server -- --port {{PORT}} --data-dir {{DATA_DIR}}
 
-# Run server (debug build, faster compile)
+# Run server (debug build, fastest compile)
 server-dev:
     cargo run --features server --bin bitdex-server -- --port {{PORT}} --data-dir {{DATA_DIR}}
 
@@ -158,6 +165,13 @@ docker:
 # Build Docker image with SIMD
 docker-simd:
     docker build -f docker/Dockerfile.simd -t bitdex-v2-simd .
+
+# ─── Release ──────────────────────────────────────────────────────
+
+# Release: bump version, commit, tag, push (triggers CI image build)
+# Usage: just release [patch|minor|major]
+release BUMP="patch":
+    bash tools/release.sh {{BUMP}}
 
 # ─── Cleanup ───────────────────────────────────────────────────────
 
