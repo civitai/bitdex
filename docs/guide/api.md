@@ -212,32 +212,6 @@ Loads documents from a newline-delimited JSON file on disk. Runs asynchronously 
 
 ---
 
-### Load Status (backward compat)
-
-```
-GET /api/indexes/{name}/load/status
-```
-
-Returns the current state of the index in the legacy format. Proxies to the task registry internally — any active task type maps to the equivalent legacy status.
-
-**Response:** `200 OK`
-
-```json
-{ "status": "loading", "records_loaded": 52000000, "elapsed_secs": 142.5 }
-```
-
-Status values: `idle`, `loading`, `saving`, `complete`, `error`
-
-| Status | Fields |
-|--------|--------|
-| `idle` | — |
-| `loading` | `records_loaded`, `elapsed_secs` |
-| `saving` | `records_loaded`, `elapsed_secs` |
-| `complete` | `records_loaded`, `elapsed_secs` |
-| `error` | `message` |
-
----
-
 ## Querying
 
 ### Query

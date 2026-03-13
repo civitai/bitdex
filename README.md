@@ -209,9 +209,13 @@ Set `include_docs: false` (or omit it) to return only IDs — useful when you ju
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/indexes/{name}/load` | Bulk load from NDJSON file |
-| GET | `/api/indexes/{name}/load/status` | Check load progress |
 | POST | `/api/indexes/{name}/documents/upsert` | Upsert documents |
 | DELETE | `/api/indexes/{name}/documents` | Delete documents by ID |
+| POST | `/api/indexes/{name}/rebuild` | Rebuild bitmaps from docstore |
+| POST | `/api/indexes/{name}/fields` | Hot-add filter/sort fields |
+| DELETE | `/api/indexes/{name}/fields` | Remove filter/sort fields |
+| GET | `/api/indexes/{name}/tasks` | List tasks (active + history) |
+| GET | `/api/tasks/{task_id}` | Get task status by ID |
 
 ### Query & Stats
 

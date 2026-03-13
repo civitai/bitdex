@@ -656,7 +656,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}", delete(handle_delete_index))
             // Data loading
             .route("/api/indexes/{name}/load", post(handle_load))
-            .route("/api/indexes/{name}/load/status", get(handle_load_status))
+            // Legacy /load/status removed — use /tasks or /tasks/{id} instead
             // Query & documents
             .route("/api/indexes/{name}/query", post(handle_query))
             .route("/api/indexes/{name}/document", post(handle_document))
@@ -1239,60 +1239,6 @@ async fn handle_load(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({"task_id": task_id})),
     ).into_response()
-}
-
-async fn handle_load_status(
-    State(state): State<SharedState>,
-    AxumPath(name): AxumPath<String>,
-) -> impl IntoResponse {
-    let guard = state.index.lock();
-    match guard.as_ref() {
-        Some(idx) if idx.definition.name == name => {
-            let snap = idx.tasks.snapshot();
-            // Map task registry state to old LoadStatus JSON shape for backward compat
-            let status_json = if let Some(ref active) = snap.active {
-                match active.status {
-                    TaskStatus::Running => serde_json::json!({
-                        "status": "loading",
-                        "records_loaded": active.progress.records_processed,
-                        "elapsed_secs": active.elapsed_secs,
-                    }),
-                    TaskStatus::Saving => serde_json::json!({
-                        "status": "saving",
-                        "records_loaded": active.progress.records_processed,
-                        "elapsed_secs": active.elapsed_secs,
-                    }),
-                    _ => serde_json::json!({"status": "idle"}),
-                }
-            } else if let Some(recent) = snap.history.first() {
-                match recent.status {
-                    TaskStatus::Complete => {
-                        let records = recent.result.as_ref()
-                            .and_then(|r| r.get("records_loaded"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(recent.progress.records_processed);
-                        serde_json::json!({
-                            "status": "complete",
-                            "records_loaded": records,
-                            "elapsed_secs": recent.elapsed_secs,
-                        })
-                    }
-                    TaskStatus::Error => serde_json::json!({
-                        "status": "error",
-                        "message": recent.error.as_deref().unwrap_or("Unknown error"),
-                    }),
-                    _ => serde_json::json!({"status": "idle"}),
-                }
-            } else {
-                serde_json::json!({"status": "idle"})
-            };
-            Json(status_json).into_response()
-        }
-        _ => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-        ).into_response(),
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@
  *   - e2e-error-handling.mjs         (self-contained)
  *   - e2e-pagination-overhead.mjs    (self-contained)
  *   - e2e-save-unload-lazy.mjs       (self-contained)
+ *   - e2e-task-system.mjs            (self-contained)
  *   - e2e-low-cardinality-string.mjs (self-contained)
  *   - e2e-delisting.mjs              (self-contained)
  *   - e2e-schema-versioning.mjs      (self-contained)
@@ -82,6 +83,11 @@ const SUITES = [
     name: 'save-unload-lazy',
     file: 'tests/e2e/e2e-save-unload-lazy.mjs',
     description: 'Save-snapshot lifecycle (snapshot save, query correctness, mutation survival, stats)',
+  },
+  {
+    name: 'task-system',
+    file: 'tests/e2e/e2e-task-system.mjs',
+    description: 'Task tracking (task IDs, polling, history, add/remove fields, conflict, legacy removal)',
   },
   {
     name: 'low-cardinality-string',
