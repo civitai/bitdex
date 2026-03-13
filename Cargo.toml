@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "scratch"]
+default-members = ["."]
+
 [package]
 name = "bitdex-v2"
 version = "0.1.0"
@@ -85,6 +89,17 @@ tempfile = "3"
 memmap2 = "0.9"
 
 
+# Fast release builds for development — `cargo build --profile fast`
+# Good perf (~90% of full release), much faster compile times.
+[profile.fast]
+inherits = "release"
+opt-level = 3
+lto = "thin"        # thin LTO: most of the benefit, fraction of the cost
+codegen-units = 4   # parallel codegen (vs 1 for full release)
+strip = false       # keep symbols for profiling/debugging
+
+# Full release builds for distribution — `cargo build --release`
+# Maximum optimization, slow to compile. Use for final binaries only.
 [profile.release]
 opt-level = 3
 lto = "fat"

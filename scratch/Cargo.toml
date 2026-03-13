@@ -1,0 +1,24 @@
+[package]
+name = "scratch"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Scratch crate for throwaway microbenchmarks and experiments.
+#
+# Agents: write your hypothesis-testing benchmarks here, NOT in tests/*.rs.
+# Files in tests/ get compiled+linked on every `cargo test` and slow down
+# the entire test suite.
+#
+# Usage:
+#   cargo test -p scratch                    # run all scratch tests
+#   cargo test -p scratch --release -- --nocapture bench_name
+#   cargo run -p scratch --bin my_bench      # if you add a [[bin]]
+#
+# Feel free to add dependencies as needed. This crate is disposable.
+
+[dependencies]
+roaring = "0.10"
+dashmap = "6"
+parking_lot = "0.12"
+rand = "0.8"
