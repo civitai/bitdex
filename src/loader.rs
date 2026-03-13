@@ -71,6 +71,143 @@ impl BitmapAccum {
         }
     }
 
+    /// Save this accumulator to a checkpoint file for crash recovery.
+    ///
+    /// Format: [alive_len:u64][alive_bytes][filter_count:u64]
+    ///   for each filter: [name_len:u64][name_bytes][value_count:u64]
+    ///     for each value: [value:u64][bitmap_len:u64][bitmap_bytes]
+    ///   [sort_count:u64]
+    ///   for each sort: [name_len:u64][name_bytes][bit_count:u64]
+    ///     for each bit: [bit:u64][bitmap_len:u64][bitmap_bytes]
+    pub(crate) fn save_checkpoint(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(64 * 1024 * 1024);
+
+        // Alive bitmap
+        let alive_bytes = self.alive.serialized_size();
+        buf.extend_from_slice(&(alive_bytes as u64).to_le_bytes());
+        self.alive.serialize_into(&mut buf)?;
+
+        // Filter maps
+        buf.extend_from_slice(&(self.filter_maps.len() as u64).to_le_bytes());
+        for (name, value_map) in &self.filter_maps {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u64).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&(value_map.len() as u64).to_le_bytes());
+            for (&value, bitmap) in value_map {
+                buf.extend_from_slice(&value.to_le_bytes());
+                let bm_size = bitmap.serialized_size();
+                buf.extend_from_slice(&(bm_size as u64).to_le_bytes());
+                bitmap.serialize_into(&mut buf)?;
+            }
+        }
+
+        // Sort maps
+        buf.extend_from_slice(&(self.sort_maps.len() as u64).to_le_bytes());
+        for (name, bit_map) in &self.sort_maps {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u64).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&(bit_map.len() as u64).to_le_bytes());
+            for (&bit, bitmap) in bit_map {
+                buf.extend_from_slice(&(bit as u64).to_le_bytes());
+                let bm_size = bitmap.serialized_size();
+                buf.extend_from_slice(&(bm_size as u64).to_le_bytes());
+                bitmap.serialize_into(&mut buf)?;
+            }
+        }
+
+        // Atomic write: write to temp file, then rename
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, path)?;
+        eprintln!(
+            "Checkpoint saved: {} ({:.1} MB)",
+            path.display(),
+            buf.len() as f64 / (1024.0 * 1024.0)
+        );
+        Ok(())
+    }
+
+    /// Load an accumulator from a checkpoint file.
+    pub(crate) fn load_checkpoint(path: &std::path::Path) -> std::io::Result<Self> {
+        let data = std::fs::read(path)?;
+        let mut pos = 0;
+
+        let read_u64 = |pos: &mut usize| -> u64 {
+            let val = u64::from_le_bytes(data[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            val
+        };
+
+        // Alive bitmap
+        let alive_len = read_u64(&mut pos) as usize;
+        let alive = RoaringBitmap::deserialize_from(&data[pos..pos + alive_len])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        pos += alive_len;
+
+        // Filter maps
+        let filter_count = read_u64(&mut pos) as usize;
+        let mut filter_maps = HashMap::with_capacity(filter_count);
+        for _ in 0..filter_count {
+            let name_len = read_u64(&mut pos) as usize;
+            let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
+            pos += name_len;
+            let value_count = read_u64(&mut pos) as usize;
+            let mut value_map = HashMap::with_capacity(value_count);
+            for _ in 0..value_count {
+                let value = read_u64(&mut pos);
+                let bm_size = read_u64(&mut pos) as usize;
+                let bitmap = RoaringBitmap::deserialize_from(&data[pos..pos + bm_size])
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                pos += bm_size;
+                value_map.insert(value, bitmap);
+            }
+            filter_maps.insert(name, value_map);
+        }
+
+        // Sort maps
+        let sort_count = read_u64(&mut pos) as usize;
+        let mut sort_maps = HashMap::with_capacity(sort_count);
+        for _ in 0..sort_count {
+            let name_len = read_u64(&mut pos) as usize;
+            let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
+            pos += name_len;
+            let bit_count = read_u64(&mut pos) as usize;
+            let mut bit_map = HashMap::with_capacity(bit_count);
+            for _ in 0..bit_count {
+                let bit = read_u64(&mut pos) as usize;
+                let bm_size = read_u64(&mut pos) as usize;
+                let bitmap = RoaringBitmap::deserialize_from(&data[pos..pos + bm_size])
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                pos += bm_size;
+                bit_map.insert(bit, bitmap);
+            }
+            sort_maps.insert(name, bit_map);
+        }
+
+        eprintln!(
+            "Checkpoint loaded: {} ({:.1} MB, {} alive)",
+            path.display(),
+            data.len() as f64 / (1024.0 * 1024.0),
+            alive.len()
+        );
+
+        Ok(BitmapAccum {
+            filter_maps,
+            sort_maps,
+            alive,
+            encoded_docs: Vec::new(),
+            count: 0,
+            errors: 0,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alive_len(&self) -> u64 {
+        self.alive.len()
+    }
+
     pub(crate) fn merge(mut self, other: Self) -> Self {
         self.alive |= &other.alive;
         for (field, value_map) in other.filter_maps {
@@ -1394,5 +1531,109 @@ mod tests {
 
         // Original casing preserved
         assert_eq!(loaded_snap.originals.get("alpha"), Some(&"Alpha".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn test_checkpoint_roundtrip() {
+        let filter_names: Vec<String> = vec!["nsfwLevel", "userId", "tagIds"]
+            .into_iter().map(String::from).collect();
+        let sort_configs: Vec<(String, u8)> = vec![("sortAt".to_string(), 32), ("id".to_string(), 32)];
+
+        let mut accum = BitmapAccum::new(&filter_names, &sort_configs);
+
+        // Add alive bits
+        for i in [100u32, 200, 300, 50000] {
+            accum.alive.insert(i);
+        }
+
+        // Add filter values
+        if let Some(fm) = accum.filter_maps.get_mut("nsfwLevel") {
+            fm.entry(1).or_insert_with(RoaringBitmap::new).insert(100);
+            fm.entry(1).or_insert_with(RoaringBitmap::new).insert(200);
+            fm.entry(8).or_insert_with(RoaringBitmap::new).insert(300);
+        }
+        if let Some(fm) = accum.filter_maps.get_mut("userId") {
+            fm.entry(42).or_insert_with(RoaringBitmap::new).insert(100);
+            fm.entry(42).or_insert_with(RoaringBitmap::new).insert(300);
+            fm.entry(99).or_insert_with(RoaringBitmap::new).insert(200);
+        }
+        if let Some(fm) = accum.filter_maps.get_mut("tagIds") {
+            fm.entry(1000).or_insert_with(RoaringBitmap::new).insert(100);
+            fm.entry(1000).or_insert_with(RoaringBitmap::new).insert(200);
+            fm.entry(2000).or_insert_with(RoaringBitmap::new).insert(300);
+        }
+
+        // Add sort bits (sortAt = 1700000000 for slot 100)
+        let val: u32 = 1700000000;
+        if let Some(sm) = accum.sort_maps.get_mut("sortAt") {
+            for bit in 0..32usize {
+                if (val >> bit) & 1 == 1 {
+                    sm.entry(bit).or_insert_with(RoaringBitmap::new).insert(100);
+                }
+            }
+        }
+
+        // Save checkpoint
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ckpt");
+        accum.save_checkpoint(&path).unwrap();
+
+        // Load checkpoint
+        let loaded = BitmapAccum::load_checkpoint(&path).unwrap();
+
+        // Verify alive
+        assert_eq!(loaded.alive.len(), 4);
+        assert!(loaded.alive.contains(100));
+        assert!(loaded.alive.contains(200));
+        assert!(loaded.alive.contains(300));
+        assert!(loaded.alive.contains(50000));
+
+        // Verify filters
+        let nsfw = loaded.filter_maps.get("nsfwLevel").unwrap();
+        assert_eq!(nsfw.get(&1).unwrap().len(), 2);
+        assert_eq!(nsfw.get(&8).unwrap().len(), 1);
+
+        let users = loaded.filter_maps.get("userId").unwrap();
+        assert_eq!(users.get(&42).unwrap().len(), 2);
+        assert_eq!(users.get(&99).unwrap().len(), 1);
+
+        let tags = loaded.filter_maps.get("tagIds").unwrap();
+        assert_eq!(tags.get(&1000).unwrap().len(), 2);
+        assert_eq!(tags.get(&2000).unwrap().len(), 1);
+
+        // Verify sort bits
+        let sort_at = loaded.sort_maps.get("sortAt").unwrap();
+        // Reconstruct the value from bits
+        let mut reconstructed: u32 = 0;
+        for bit in 0..32usize {
+            if let Some(bm) = sort_at.get(&bit) {
+                if bm.contains(100) {
+                    reconstructed |= 1 << bit;
+                }
+            }
+        }
+        assert_eq!(reconstructed, 1700000000);
+    }
+
+    #[test]
+    fn test_checkpoint_empty_accum() {
+        let filter_names: Vec<String> = vec!["field1".to_string()];
+        let sort_configs: Vec<(String, u8)> = vec![("sort1".to_string(), 16)];
+
+        let accum = BitmapAccum::new(&filter_names, &sort_configs);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.ckpt");
+        accum.save_checkpoint(&path).unwrap();
+
+        let loaded = BitmapAccum::load_checkpoint(&path).unwrap();
+        assert_eq!(loaded.alive.len(), 0);
+        assert!(loaded.filter_maps.get("field1").unwrap().is_empty());
+        assert!(loaded.sort_maps.get("sort1").unwrap().is_empty());
     }
 }
