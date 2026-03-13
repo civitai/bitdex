@@ -9,12 +9,15 @@
  *   node tests/e2e/run-e2e.mjs [--port 3100] [--skip-build] [--keep] [--verbose]
  *
  * Suites run:
- *   - e2e-write-handling.mjs  (self-contained)
- *   - e2e-eviction.mjs        (self-contained)
- *   - e2e-query-operators.mjs     (self-contained)
- *   - e2e-error-handling.mjs       (self-contained)
- *   - e2e-pagination-overhead.mjs  (self-contained)
- *   - e2e-save-unload-lazy.mjs    (self-contained)
+ *   - e2e-write-handling.mjs         (self-contained)
+ *   - e2e-eviction.mjs               (self-contained)
+ *   - e2e-query-operators.mjs        (self-contained)
+ *   - e2e-error-handling.mjs         (self-contained)
+ *   - e2e-pagination-overhead.mjs    (self-contained)
+ *   - e2e-save-unload-lazy.mjs       (self-contained)
+ *   - e2e-low-cardinality-string.mjs (self-contained)
+ *   - e2e-delisting.mjs              (self-contained)
+ *   - e2e-schema-versioning.mjs      (self-contained)
  *
  * NOT run automatically (requires production data):
  *   - e2e-unified-cache.mjs   (use --data-dir with loaded data manually)
@@ -77,6 +80,21 @@ const SUITES = [
     name: 'save-unload-lazy',
     file: 'tests/e2e/e2e-save-unload-lazy.mjs',
     description: 'Save-snapshot lifecycle (snapshot save, query correctness, mutation survival, stats)',
+  },
+  {
+    name: 'low-cardinality-string',
+    file: 'tests/e2e/e2e-low-cardinality-string.mjs',
+    description: 'LowCardinalityString fields (auto-dictionary, case-insensitive, upsert, doc serving)',
+  },
+  {
+    name: 'delisting',
+    file: 'tests/e2e/e2e-delisting.mjs',
+    description: 'Document delisting / visibility (availability, blockedFor, delist/relist, combined)',
+  },
+  {
+    name: 'schema-versioning',
+    file: 'tests/e2e/e2e-schema-versioning.mjs',
+    description: 'Schema versioning & field elision (defaults, reconstruction, null handling, round-trip)',
   },
 ];
 
