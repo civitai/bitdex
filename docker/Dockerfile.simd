@@ -19,8 +19,10 @@ FROM rust:1.94.0-nightly-bookworm AS builder
 WORKDIR /build
 COPY . .
 
-# EPYC 4585PX (Zen 5): unlocks AVX-512, AVX2, BMI2, POPCNT (use znver4 for Genoa, znver3 for Milan)
-ENV RUSTFLAGS="-C target-cpu=znver5"
+# Build for the native CPU architecture of the build host.
+# Override at build time: docker build --build-arg TARGET_CPU=znver5 ...
+ARG TARGET_CPU=native
+ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 
 # Remove dev-only scratch workspace member (not included via .dockerignore)
 # Enable the roaring simd feature for this build

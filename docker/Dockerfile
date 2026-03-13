@@ -10,8 +10,10 @@ COPY . .
 # Remove dev-only scratch workspace member (not included via .dockerignore)
 RUN sed -i 's/members = \[".", "scratch"\]/members = ["."]/' Cargo.toml
 
-# EPYC 4585PX (Zen 5): unlocks AVX-512, AVX2, BMI2, POPCNT
-ENV RUSTFLAGS="-C target-cpu=znver5"
+# Build for the native CPU architecture of the build host.
+# Override at build time: docker build --build-arg TARGET_CPU=znver5 ...
+ARG TARGET_CPU=native
+ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 
 RUN cargo build --release --features server --bin bitdex-server && \
     cargo build --release --features pg-sync --bin bitdex-pg-sync
