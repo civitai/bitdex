@@ -18,7 +18,7 @@
  *
  * Prerequisites:
  *   Server running with NO existing index (or use --keep to skip cleanup):
- *     cargo run --release --features server --bin server -- --port 3000 --data-dir ./test-pagination-data
+ *     cargo run --release --features server --bin bitdex-server -- --port 3000 --data-dir ./test-pagination-data
  */
 
 import { writeFileSync, mkdirSync } from 'node:fs';
@@ -476,7 +476,7 @@ async function main() {
     log(`\nERROR: Cannot reach server at ${BASE_URL}`);
     log(`  ${e.message}`);
     log(`\nStart the server first:`);
-    log(`  cargo run --release --features server --bin server -- --port 3000 --data-dir ./test-pagination-data`);
+    log(`  cargo run --release --features server --bin bitdex-server -- --port 3000 --data-dir ./test-pagination-data`);
     process.exit(1);
   }
 

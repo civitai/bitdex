@@ -175,7 +175,7 @@ Custom filesystem storage: BitmapFs for bitmap persistence (hex-bucketed pack fi
 
 ```bash
 # Run the server for testing (port 3001 to avoid conflicts with other dev servers)
-cargo run --release --features server --bin server -- --port 3001 --data-dir ./data
+cargo run --release --features server --bin bitdex-server -- --port 3001 --data-dir ./data
 ```
 
 ---

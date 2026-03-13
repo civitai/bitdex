@@ -3,7 +3,7 @@
 //! Starts blank — create indexes and load data via the API.
 //!
 //! Usage:
-//!   cargo run --release --features server --bin server -- [OPTIONS]
+//!   cargo run --release --features server --bin bitdex-server -- [OPTIONS]
 //!
 //! Options:
 //!   --port <N>         HTTP port (default: 3000)

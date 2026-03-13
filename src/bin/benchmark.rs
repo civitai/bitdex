@@ -4,7 +4,7 @@
 //! and query performance at scale.
 //!
 //! Usage:
-//!   cargo run --release --bin benchmark -- [OPTIONS]
+//!   cargo run --release --bin bitdex-benchmark -- [OPTIONS]
 //!
 //! Options:
 //!   --data <PATH>     Path to images.ndjson (default: auto-detect)

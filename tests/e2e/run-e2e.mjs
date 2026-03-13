@@ -19,6 +19,7 @@
  *   - e2e-delisting.mjs              (self-contained)
  *   - e2e-schema-versioning.mjs      (self-contained)
  *   - e2e-unload-memory.mjs          (self-contained)
+ *   - e2e-cache-maintenance.mjs     (self-contained)
  *
  * NOT run automatically (requires production data):
  *   - e2e-unified-cache.mjs   (use --data-dir with loaded data manually)
@@ -102,6 +103,11 @@ const SUITES = [
     file: 'tests/e2e/e2e-unload-memory.mjs',
     description: 'Bitmap memory drops after save_and_unload, stays low, queries work via lazy reload',
   },
+  {
+    name: 'cache-maintenance',
+    file: 'tests/e2e/e2e-cache-maintenance.mjs',
+    description: 'Cache maintenance after mutations (filter, sort, delete, multi-value, fan-out, burst)',
+  },
 ];
 
 // Suites that require production data (documented but not auto-run)
@@ -126,9 +132,9 @@ function buildServer() {
     log('Skipping build (--skip-build)');
     return;
   }
-  log('Building server (cargo build --release --features server --bin server)...');
+  log('Building server (cargo build --release --features server --bin bitdex-server)...');
   try {
-    execSync('cargo build --release --features server --bin server', {
+    execSync('cargo build --release --features server --bin bitdex-server', {
       cwd: PROJECT_ROOT,
       stdio: 'inherit',
       timeout: 300_000, // 5 minutes
@@ -156,7 +162,7 @@ function startServer() {
   log(`Starting server on port ${PORT} with data-dir ${DATA_DIR}`);
 
   const args = [
-    '--release', '--features', 'server', '--bin', 'server', '--',
+    '--release', '--features', 'server', '--bin', 'bitdex-server', '--',
     '--port', String(PORT),
     '--data-dir', DATA_DIR,
   ];

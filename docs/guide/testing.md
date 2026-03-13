@@ -434,7 +434,7 @@ cargo test --release --test bench_hashmap_keys -- --nocapture
 
 ```bash
 # 1. Start server with production data
-cargo run --release --features server --bin server -- --port 3000
+cargo run --release --features server --bin bitdex-server -- --port 3000
 
 # 2. Wait for data to load, then run unified cache tests
 node tests/e2e/e2e-unified-cache.mjs --url http://localhost:3000

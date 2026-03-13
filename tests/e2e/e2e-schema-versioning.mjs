@@ -21,7 +21,7 @@
  *
  * Prerequisites:
  *   Server running with NO existing index:
- *     cargo run --release --features server --bin server -- --port 3000 --data-dir ./test-data
+ *     cargo run --release --features server --bin bitdex-server -- --port 3000 --data-dir ./test-data
  */
 
 import { writeFileSync, mkdirSync } from 'node:fs';

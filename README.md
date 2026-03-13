@@ -77,13 +77,13 @@ Sortable fields are decomposed into bit layers (one bitmap per bit position). To
 cargo build --release
 
 # HTTP server
-cargo build --release --features server --bin server
+cargo build --release --features server --bin bitdex-server
 
 # Load tester
-cargo build --release --features loadtest --bin loadtest
+cargo build --release --features loadtest --bin bitdex-loadtest
 
 # Benchmark harness
-cargo build --release --bin benchmark
+cargo build --release --bin bitdex-benchmark
 ```
 
 #### SIMD build (nightly)
@@ -96,7 +96,7 @@ Requires Rust nightly. The `portable_simd` API broke in nightly 1.95+ (January 2
 rustup install nightly-2025-12-15
 
 # Build with SIMD
-cargo +nightly-2025-12-15 build --release --features server,simd --bin server
+cargo +nightly-2025-12-15 build --release --features server,simd --bin bitdex-server
 ```
 
 #### Docker
@@ -104,7 +104,7 @@ cargo +nightly-2025-12-15 build --release --features server,simd --bin server
 Production and SIMD Docker images are in the `docker/` directory.
 
 ```bash
-# Production image (stable Rust, fat LTO, target-cpu=znver3)
+# Production image (stable Rust, fat LTO, target-cpu=znver5)
 docker build -t bitdex:latest -f docker/Dockerfile .
 
 # SIMD image (pinned nightly, roaring portable_simd)
@@ -114,12 +114,12 @@ docker build -t bitdex:simd -f docker/Dockerfile.simd .
 docker run -p 3000:3000 -v bitdex-data:/data bitdex:latest
 ```
 
-The production image sets `MALLOC_CONF` for jemalloc memory return tuning (important in K8s to avoid OOMKill). Both images compile with `-C target-cpu=znver3` for AMD EPYC (AVX2, BMI2, POPCNT). Change to `znver4` for Genoa/Bergamo or `native` for auto-detection.
+The production image sets `MALLOC_CONF` for jemalloc memory return tuning (important in K8s to avoid OOMKill). Both images compile with `-C target-cpu=znver5` for AMD EPYC (AVX2, BMI2, POPCNT). Change to `znver4` for Genoa/Bergamo or `native` for auto-detection.
 
 ### Run the Server
 
 ```bash
-cargo run --release --features server --bin server -- --port 3001 --data-dir ./data
+cargo run --release --features server --bin bitdex-server -- --port 3001 --data-dir ./data
 ```
 
 The server starts blank. Create an index, then load data.
@@ -284,13 +284,13 @@ The built-in load tester measures throughput and latency at configurable concurr
 
 ```bash
 # Test against a running server
-cargo run --release --features loadtest --bin loadtest -- \
+cargo run --release --features loadtest --bin bitdex-loadtest -- \
   --mode http --url http://localhost:3001 \
   --concurrency 1,4,8,16,32,64 \
   --duration 10
 
 # Test bitmap layer directly
-cargo run --release --features loadtest --bin loadtest -- \
+cargo run --release --features loadtest --bin bitdex-loadtest -- \
   --mode direct --data-dir ./data \
   --concurrency 1,4,8,16,32,64 \
   --duration 10
@@ -336,7 +336,7 @@ Create a JSON file with your queries:
 ```
 
 ```bash
-cargo run --release --features loadtest --bin loadtest -- \
+cargo run --release --features loadtest --bin bitdex-loadtest -- \
   --mode http --workload my-workload.json
 ```
 
@@ -377,7 +377,7 @@ src/
 # All Rust unit + integration tests
 cargo test --release
 
-# All self-contained E2E tests (builds server, runs 9 suites, 50 tests)
+# All self-contained E2E tests (builds server, runs 10 suites, 59 tests)
 node tests/e2e/run-e2e.mjs
 
 # Skip rebuild if binary is current
@@ -397,6 +397,7 @@ E2E test suites:
 | LowCardinalityString | 7 | Auto-dictionary, case-insensitive, upsert, doc serving, persistence |
 | Delisting | 5 | Availability filtering, delist/relist, blockedFor, combined |
 | Schema Versioning | 7 | Default elision, reconstruction, missing fields, round-trip, snapshot |
+| Cache Maintenance | 9 | Filter/sort/delete maintenance, multi-value, fan-out, burst writes |
 
 Full testing guide: [`docs/guide/testing.md`](docs/guide/testing.md)
 

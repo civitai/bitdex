@@ -399,7 +399,7 @@ async function main() {
     log(`\nERROR: Cannot reach server at ${BASE_URL}`);
     log(`  ${e.message}`);
     log(`\nStart the server first:`);
-    log(`  cargo run --release --bin server -- --port 3000`);
+    log(`  cargo run --release --bin bitdex-server -- --port 3000`);
     process.exit(1);
   }
 

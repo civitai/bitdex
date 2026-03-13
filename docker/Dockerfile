@@ -7,11 +7,11 @@ FROM rust:1.85-bookworm AS builder
 WORKDIR /build
 COPY . .
 
-# EPYC-optimized: unlock AVX2, BMI2, POPCNT
-ENV RUSTFLAGS="-C target-cpu=znver3"
+# EPYC 4585PX (Zen 5): unlocks AVX-512, AVX2, BMI2, POPCNT
+ENV RUSTFLAGS="-C target-cpu=znver5"
 
-RUN cargo build --release --features server --bin server && \
-    cargo build --release --features pg-sync --bin pg-sync
+RUN cargo build --release --features server --bin bitdex-server && \
+    cargo build --release --features pg-sync --bin bitdex-pg-sync
 
 # --- Runtime ---
 FROM debian:bookworm-slim
@@ -20,8 +20,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/server /usr/local/bin/bitdex-server
-COPY --from=builder /build/target/release/pg-sync /usr/local/bin/bitdex-pg-sync
+COPY --from=builder /build/target/release/bitdex-server /usr/local/bin/bitdex-server
+COPY --from=builder /build/target/release/bitdex-pg-sync /usr/local/bin/bitdex-pg-sync
 COPY --from=builder /build/static /opt/bitdex/static
 
 ENV MALLOC_CONF="background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:3000"

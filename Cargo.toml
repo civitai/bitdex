@@ -117,20 +117,20 @@ name = "columnar_loader"
 harness = false
 
 [[bin]]
-name = "benchmark"
+name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"
 
 [[bin]]
-name = "server"
+name = "bitdex-server"
 path = "src/bin/server.rs"
 required-features = ["server"]
 
 [[bin]]
-name = "loadtest"
+name = "bitdex-loadtest"
 path = "src/bin/loadtest.rs"
 required-features = ["loadtest"]
 
 [[bin]]
-name = "pg-sync"
+name = "bitdex-pg-sync"
 path = "src/bin/pg_sync.rs"
 required-features = ["pg-sync"]

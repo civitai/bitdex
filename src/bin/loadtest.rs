@@ -6,8 +6,8 @@
 //!   --mode http     Sends HTTP requests to a running server (tests full stack)
 //!
 //! Usage:
-//!   cargo run --release --bin loadtest --features loadtest -- --mode direct --data-dir ./data
-//!   cargo run --release --bin loadtest --features loadtest -- --mode http --url http://localhost:3001
+//!   cargo run --release --bin bitdex-loadtest --features loadtest -- --mode direct --data-dir ./data
+//!   cargo run --release --bin bitdex-loadtest --features loadtest -- --mode http --url http://localhost:3001
 //!
 //! Options:
 //!   --concurrency <LIST>   Comma-separated concurrency levels (default: 1,4,8,16,32,64)

@@ -4,10 +4,10 @@
 
 ```bash
 # 1. Start the server (port 3001 to avoid conflicts with other dev servers)
-cargo run --release --features server --bin server -- --port 3001
+cargo run --release --features server --bin bitdex-server -- --port 3001
 
 # 2. Run the Rust loadtest against it
-cargo run --release --bin loadtest --features loadtest -- \
+cargo run --release --bin bitdex-loadtest --features loadtest -- \
   --mode http --url http://localhost:3001 \
   --workload tests/loadtest/workload.json \
   --concurrency 1,4,16,64 --duration 10
@@ -24,7 +24,7 @@ The loadtest supports two modes:
 Tests the full stack: HTTP parsing, query execution, serialization, cache.
 
 ```bash
-cargo run --release --bin loadtest --features loadtest -- \
+cargo run --release --bin bitdex-loadtest --features loadtest -- \
   --mode http \
   --url http://localhost:3001 \
   --workload tests/loadtest/workload.json \
@@ -40,7 +40,7 @@ Uses `ureq` with thread-local HTTP agents — one OS thread per concurrency leve
 Embeds the engine in-process. Bypasses HTTP entirely — tests pure bitmap query performance.
 
 ```bash
-cargo run --release --bin loadtest --features loadtest -- \
+cargo run --release --bin bitdex-loadtest --features loadtest -- \
   --mode direct \
   --data-dir ./data \
   --workload tests/loadtest/workload.json \

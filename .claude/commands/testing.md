@@ -77,7 +77,7 @@ node tests/e2e/run-e2e.mjs --keep                # Keep test data dir for debugg
 ### Manual (single suite against running server)
 ```bash
 # Start a test server
-cargo run --release --features server --bin server -- --port 3100 --data-dir ./test-data
+cargo run --release --features server --bin bitdex-server -- --port 3100 --data-dir ./test-data
 
 # Run one suite
 node tests/e2e/e2e-write-handling.mjs --url http://localhost:3100
