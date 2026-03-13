@@ -120,6 +120,11 @@ const SUITES = [
     file: 'tests/e2e/e2e-load-save-snapshot.mjs',
     description: 'NDJSON load with save_snapshot=true (race condition regression: alive_count, queries, lazy reload)',
   },
+  {
+    name: 'query-formats',
+    file: 'tests/e2e/e2e-query-formats.mjs',
+    description: 'Pluggable query formats (equivalence, ?format= param, compact/meilisearch, error handling)',
+  },
 ];
 
 // Suites that require production data (documented but not auto-run)

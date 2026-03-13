@@ -8,10 +8,11 @@
 # (i.e., next to the executable).
 #
 # CLI flags always override these values:
-#   --port <N>         Override port
-#   --data-dir <PATH>  Override data_dir
-#   --rebuild          Force rebuild on startup
-#   --config <PATH>    Use a different config file
+#   --port <N>              Override port
+#   --data-dir <PATH>       Override data_dir
+#   --rebuild               Force rebuild on startup
+#   --config <PATH>         Use a different config file
+#   --default-format <FMT>  Override default_query_format
 
 # HTTP port to listen on
 port = 3000
@@ -21,3 +22,7 @@ data_dir = "data"
 
 # Set to true to rebuild all bitmap indexes from docstore on startup
 # rebuild = false
+
+# Default query format: "bitdex", "compact", or "meilisearch"
+# Callers can override per-request with ?format= query parameter
+# default_query_format = "bitdex"

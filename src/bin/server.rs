@@ -11,10 +11,11 @@
 //!   bitdex-server [OPTIONS]
 //!
 //! Options:
-//!   --port <N>         HTTP port (default: 3000)
-//!   --data-dir <PATH>  Data directory for index storage (default: data/ next to exe)
-//!   --rebuild          Rebuild bitmap indexes from docstore on startup
-//!   --config <PATH>    Path to config file (default: bitdex.toml next to exe)
+//!   --port <N>              HTTP port (default: 3000)
+//!   --data-dir <PATH>       Data directory for index storage (default: data/ next to exe)
+//!   --rebuild               Rebuild bitmap indexes from docstore on startup
+//!   --config <PATH>         Path to config file (default: bitdex.toml next to exe)
+//!   --default-format <FMT>  Default query format: bitdex, compact, meilisearch (default: bitdex)
 
 #[global_allocator]
 static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
@@ -33,6 +34,7 @@ struct Config {
     port: u16,
     data_dir: PathBuf,
     rebuild: bool,
+    default_query_format: Option<String>,
 }
 
 /// Get the directory containing the current executable.
@@ -72,6 +74,7 @@ fn parse_config() -> Config {
     let mut cli_data_dir: Option<PathBuf> = None;
     let mut cli_rebuild = false;
     let mut cli_config: Option<PathBuf> = None;
+    let mut cli_default_query_format: Option<String> = None;
 
     let mut i = 1;
     while i < cli_args.len() {
@@ -91,6 +94,10 @@ fn parse_config() -> Config {
                 i += 1;
                 cli_config = Some(PathBuf::from(&cli_args[i]));
             }
+            "--default-format" => {
+                i += 1;
+                cli_default_query_format = Some(cli_args[i].clone());
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -103,10 +110,11 @@ fn parse_config() -> Config {
     let mut port: u16 = 3000;
     let mut data_dir = exe_dir.join("data");
     let mut rebuild = false;
+    let mut default_query_format: Option<String> = None;
 
     // --- Config file ---
     // Only auto-generate bitdex.toml if no CLI args were passed at all
-    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_rebuild || cli_config.is_some();
+    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some();
     let config_path = match &cli_config {
         Some(path) => path.clone(),
         None => {
@@ -132,6 +140,9 @@ fn parse_config() -> Config {
         if let Some(v) = table.get("rebuild").and_then(|v| v.as_bool()) {
             rebuild = v;
         }
+        if let Some(v) = table.get("default_query_format").and_then(|v| v.as_str()) {
+            default_query_format = Some(v.to_string());
+        }
     }
 
     // --- CLI flags override everything ---
@@ -144,8 +155,11 @@ fn parse_config() -> Config {
     if cli_rebuild {
         rebuild = true;
     }
+    if let Some(f) = cli_default_query_format {
+        default_query_format = Some(f);
+    }
 
-    Config { port, data_dir, rebuild }
+    Config { port, data_dir, rebuild, default_query_format }
 }
 
 #[tokio::main]
@@ -168,6 +182,9 @@ async fn main() {
     eprintln!("BitDex V2 Server");
     eprintln!("  port: {}", config.port);
     eprintln!("  data-dir: {}", config.data_dir.display());
+    if let Some(ref fmt) = config.default_query_format {
+        eprintln!("  default-format: {fmt}");
+    }
     if config.rebuild {
         eprintln!("  mode: REBUILD (will rebuild all bitmap indexes from docstore)");
     }
@@ -175,6 +192,9 @@ async fn main() {
     let mut server = BitdexServer::new(config.data_dir);
     if config.rebuild {
         server = server.with_rebuild(true);
+    }
+    if let Some(fmt) = config.default_query_format {
+        server = server.with_default_query_format(fmt);
     }
     server.serve(addr).await.expect("Server failed");
 }

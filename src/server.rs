@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path as AxumPath, State};
+use axum::body::Bytes;
+use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post, delete};
@@ -270,6 +271,7 @@ struct AppState {
     data_dir: PathBuf,
     index: Mutex<Option<IndexState>>,
     metrics: Metrics,
+    parser_registry: crate::parser::registry::ParserRegistry,
 }
 
 type SharedState = Arc<AppState>;
@@ -609,11 +611,12 @@ struct RemoveFieldsRequest {
 pub struct BitdexServer {
     data_dir: PathBuf,
     rebuild: bool,
+    default_query_format: Option<String>,
 }
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, rebuild: false }
+        Self { data_dir, rebuild: false, default_query_format: None }
     }
 
     /// Enable rebuild mode: on startup, delete existing bitmap indexes and
@@ -624,15 +627,28 @@ impl BitdexServer {
         self
     }
 
+    /// Set the default query format ("bitdex", "compact", "meilisearch").
+    /// Per-request `?format=` overrides this. Falls back to "bitdex" if not set.
+    pub fn with_default_query_format(mut self, format: impl Into<String>) -> Self {
+        self.default_query_format = Some(format.into());
+        self
+    }
+
     /// Start the HTTP server. Blocks until the server shuts down.
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
         // Ensure data directory exists
         std::fs::create_dir_all(&self.data_dir).ok();
 
+        let mut registry = crate::parser::registry::default_registry();
+        if let Some(fmt) = &self.default_query_format {
+            registry.set_default(fmt.clone());
+        }
+
         let state = Arc::new(AppState {
             data_dir: self.data_dir.clone(),
             index: Mutex::new(None),
             metrics: Metrics::new(),
+            parser_registry: registry,
         });
 
         // Try to restore an existing index from disk
@@ -676,6 +692,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
             // Utility
             .route("/api/health", get(handle_health))
+            .route("/api/formats", get(handle_list_formats))
             .route("/metrics", get(handle_metrics))
             // Serve static UI
             .route("/", get(handle_ui))
@@ -1277,6 +1294,7 @@ async fn handle_load(
 // ---------------------------------------------------------------------------
 
 /// Query request with optional field selection for document retrieval.
+/// Used for the default "bitdex" format (backward-compatible serde deserialization).
 #[derive(Deserialize)]
 struct QueryRequest {
     #[serde(flatten)]
@@ -1286,11 +1304,56 @@ struct QueryRequest {
     include_docs: IncludeDocs,
 }
 
+#[derive(Deserialize, Default)]
+struct QueryParams {
+    /// Query format: "bitdex" (default), "compact", "meilisearch"
+    format: Option<String>,
+}
+
 async fn handle_query(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(req): Json<QueryRequest>,
+    AxumQuery(params): AxumQuery<QueryParams>,
+    body: Bytes,
 ) -> impl IntoResponse {
+    // Resolve effective format: explicit ?format= overrides, otherwise use registry default
+    let effective_format = params
+        .format
+        .as_deref()
+        .unwrap_or(state.parser_registry.default_format());
+
+    // Parse the query body through the appropriate parser
+    let (query, include_docs) = if effective_format == "bitdex" {
+        // BitDex native format: use serde for backward compatibility (includes include_docs)
+        match serde_json::from_slice::<QueryRequest>(&body) {
+            Ok(req) => (req.query, req.include_docs),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("invalid query: {e}")})),
+                ).into_response();
+            }
+        }
+    } else {
+        // Pluggable format: parse through registry, extract include_docs separately
+        let query = match state.parser_registry.parse(Some(effective_format), &body) {
+            Ok(q) => q,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                ).into_response();
+            }
+        };
+        // Try to extract include_docs from the raw JSON (works for any format)
+        let include_docs = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("include_docs").cloned())
+            .and_then(|v| serde_json::from_value::<IncludeDocs>(v).ok())
+            .unwrap_or_default();
+        (query, include_docs)
+    };
+
     let (engine, schema, reverse_maps, schema_registry) = {
         let guard = state.index.lock();
         match guard.as_ref() {
@@ -1311,7 +1374,7 @@ async fn handle_query(
 
     let start = Instant::now();
     let m = &state.metrics;
-    match engine.execute_query(&req.query) {
+    match engine.execute_query(&query) {
         Ok(result) => {
             let elapsed = start.elapsed();
             let elapsed_us = elapsed.as_micros() as u64;
@@ -1321,13 +1384,13 @@ async fn handle_query(
                 .observe(elapsed.as_secs_f64());
             let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
 
-            let documents = if !req.include_docs.is_none() {
+            let documents = if !include_docs.is_none() {
                 let mut docs = Vec::with_capacity(result.ids.len());
                 for &id in &result.ids {
                     let doc = engine.get_document(id as u32);
                     docs.push(match doc {
                         Ok(Some(stored)) => {
-                            format_document(&stored, &schema, &reverse_maps, &req.include_docs, &schema_registry)
+                            format_document(&stored, &schema, &reverse_maps, &include_docs, &schema_registry)
                         }
                         _ => serde_json::json!({ "id": id }),
                     });
@@ -2166,6 +2229,15 @@ async fn handle_list_cursors(
 
 async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+async fn handle_list_formats(State(state): State<SharedState>) -> impl IntoResponse {
+    let mut formats = state.parser_registry.formats();
+    formats.sort();
+    Json(serde_json::json!({
+        "formats": formats,
+        "default": state.parser_registry.default_format(),
+    }))
 }
 
 async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
