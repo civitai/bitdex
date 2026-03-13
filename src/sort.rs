@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
@@ -71,14 +72,17 @@ impl SortField {
 
     /// Update a slot's value using XOR diff.
     /// Only flips the bit layers where old and new values differ.
+    /// Uses `old_value` to decide insert vs remove (data-driven, not state-driven),
+    /// so this works correctly even when bit layers are unloaded.
     pub fn update(&mut self, slot: u32, old_value: u32, new_value: u32) {
         let diff = old_value ^ new_value;
         for bit in 0..self.num_bits {
             if (diff >> bit) & 1 == 1 {
-                // This bit changed — check base+diff to determine current state
-                if self.bit_layers[bit].contains(slot) {
+                if (old_value >> bit) & 1 == 1 {
+                    // Old had this bit set, new doesn't → remove
                     self.bit_layers[bit].remove(slot);
                 } else {
+                    // Old didn't have this bit, new does → insert
                     self.bit_layers[bit].insert(slot);
                 }
             }
@@ -387,6 +391,22 @@ impl SortField {
             .collect()
     }
 
+    /// Get fused bitmap references for all layers (for zero-copy persistence).
+    /// Returns `Cow::Borrowed` when the layer is clean (zero copy),
+    /// `Cow::Owned` when the layer has pending diffs.
+    pub fn layer_bases_fused(&self) -> Vec<Cow<'_, RoaringBitmap>> {
+        self.bit_layers.iter().map(|vb| vb.fused_cow()).collect()
+    }
+
+    /// Drop all base bitmaps and mark layers as unloaded.
+    /// The diff layers are preserved so mutations can accumulate
+    /// while the sort field is not in memory.
+    pub fn clear_bases_and_unload(&mut self) {
+        for layer in &mut self.bit_layers {
+            layer.clear_base_and_unload();
+        }
+    }
+
     /// Return the serialized byte size of all bit layer bitmaps.
     pub fn bitmap_bytes(&self) -> usize {
         self.bit_layers.iter().map(|bm| bm.bitmap_bytes()).sum()
@@ -438,6 +458,46 @@ impl SortIndex {
     /// Iterate mutably over all fields.
     pub fn fields_mut(&mut self) -> impl Iterator<Item = (&String, &mut SortField)> {
         self.fields.iter_mut().map(|(k, v)| (k, Arc::make_mut(v)))
+    }
+
+    /// Unload a sort field: replace its Arc with a new field containing empty layers.
+    /// Diff layers are preserved for any in-flight mutations.
+    pub fn unload_field(&mut self, name: &str) {
+        if let Some(field_arc) = self.fields.get_mut(name) {
+            let old = field_arc.as_ref();
+            let mut new_field = SortField::new(old.config.clone());
+            for (i, vb) in old.bit_layers.iter().enumerate() {
+                if vb.is_dirty() {
+                    new_field.bit_layers[i] = vb.clone_diff_only();
+                } else {
+                    new_field.bit_layers[i] = VersionedBitmap::new_unloaded();
+                }
+            }
+            *field_arc = Arc::new(new_field);
+        }
+    }
+
+    /// Copy a field's Arc from another SortIndex (refcount bump only, no data copy).
+    pub fn copy_field_arc_from(&mut self, source: &SortIndex, name: &str) {
+        if let Some(arc) = source.fields.get(name) {
+            self.fields.insert(name.to_string(), Arc::clone(arc));
+        }
+    }
+
+    /// Build an unloaded version of a sort field from a source SortIndex.
+    /// Preserves diff layers for any in-flight mutations.
+    pub fn unload_from(&mut self, source: &SortIndex, name: &str) {
+        if let Some(source_field) = source.fields.get(name) {
+            let mut new_field = SortField::new(source_field.config.clone());
+            for (i, vb) in source_field.bit_layers.iter().enumerate() {
+                if vb.is_dirty() {
+                    new_field.bit_layers[i] = vb.clone_diff_only();
+                } else {
+                    new_field.bit_layers[i] = VersionedBitmap::new_unloaded();
+                }
+            }
+            self.fields.insert(name.to_string(), Arc::new(new_field));
+        }
     }
 
     /// Return the serialized byte size of all bitmaps across all sort fields.

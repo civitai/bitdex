@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -148,6 +149,12 @@ impl SlotAllocator {
         self.alive.base().as_ref()
     }
 
+    /// Zero-copy alive bitmap: borrows the base when clean, creates a temp
+    /// merged bitmap when dirty. Used for snapshot serialization.
+    pub fn alive_fused_cow(&self) -> Cow<'_, RoaringBitmap> {
+        self.alive.fused_cow()
+    }
+
     /// Bulk-insert slots into the alive bitmap's diff layer.
     /// Also updates the high-water mark (next_slot) for persistence.
     pub fn alive_insert_bulk(&mut self, slots: impl IntoIterator<Item = u32>) {
@@ -207,9 +214,9 @@ impl SlotAllocator {
         Arc::make_mut(&mut self.clean).insert(slot);
     }
 
-    /// Get the number of alive documents (from merged base).
+    /// Get the number of alive documents (fused base + diff, always accurate).
     pub fn alive_count(&self) -> u64 {
-        self.alive.base_len()
+        self.alive.fused_len()
     }
 
     /// Get the number of dead (deleted but not yet cleaned) slots.
@@ -219,7 +226,7 @@ impl SlotAllocator {
     /// autovac should scan `NOT alive AND NOT clean AND slot < counter`.
     pub fn dead_count(&self) -> u64 {
         let counter = self.next_slot.load(Ordering::Relaxed) as u64;
-        counter.saturating_sub(self.alive.base_len()).saturating_sub(self.clean.len())
+        counter.saturating_sub(self.alive.fused_len()).saturating_sub(self.clean.len())
     }
 
     /// Get the number of clean (recycled) slots available for reuse.

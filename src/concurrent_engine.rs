@@ -392,12 +392,16 @@ impl ConcurrentEngine {
                         match load {
                             LazyLoad::FilterField { name, bitmaps } => {
                                 if let Some(field) = staging.filters.get_field_mut(&name) {
-                                    field.load_from(bitmaps);
+                                    field.load_field_complete(bitmaps);
                                 }
                             }
                             LazyLoad::FilterValues { field, values } => {
                                 if let Some(f) = staging.filters.get_field_mut(&field) {
-                                    f.load_from(values);
+                                    // For per-value loads, we use load_from since only
+                                    // specific requested values are sent. The values in
+                                    // the map are all that were requested.
+                                    let requested: Vec<u64> = values.keys().copied().collect();
+                                    f.load_values(values, &requested);
                                 }
                             }
                             LazyLoad::SortField { name, layers } => {
@@ -1255,7 +1259,7 @@ impl ConcurrentEngine {
             let bitmaps = store.load_field(name)?;
             let count = bitmaps.len();
             if let Some(field) = updated.filters.get_field_mut(name) {
-                field.load_from(bitmaps.clone());
+                field.load_field_complete(bitmaps.clone());
             }
             eprintln!(
                 "Lazy-loaded filter '{}': {} values in {:.1}ms",
@@ -1279,7 +1283,13 @@ impl ConcurrentEngine {
                 values
                     .iter()
                     .copied()
-                    .filter(|v| field.get_versioned(*v).is_none())
+                    .filter(|v| {
+                        // Load if the value doesn't exist OR if it exists but is unloaded
+                        match field.get_versioned(*v) {
+                            None => true,
+                            Some(vb) => !vb.is_loaded(),
+                        }
+                    })
                     .collect()
             } else {
                 values.clone()
@@ -1305,7 +1315,8 @@ impl ConcurrentEngine {
             }
             let count = loaded.len();
             if let Some(field) = updated.filters.get_field_mut(field_name) {
-                field.load_from(loaded.clone());
+                let requested_keys: Vec<u64> = missing.clone();
+                field.load_values(loaded.clone(), &requested_keys);
             }
             eprintln!(
                 "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
@@ -2224,9 +2235,15 @@ impl ConcurrentEngine {
         Self::write_snapshot_to_store(&store, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)
     }
 
-    /// Internal: extract loaded state from the current published snapshot and write it
-    /// to the given BitmapFs. Skips fields that haven't been loaded yet (still pending
-    /// lazy-load) to avoid overwriting real persisted data with empty placeholders.
+    /// Internal: zero-copy snapshot serialization.
+    ///
+    /// Reads the published snapshot through Arc refs — no InnerEngine clone.
+    /// Uses `fused_cow()` to borrow base bitmaps directly (zero copy when clean)
+    /// or create temporary merged bitmaps (only when dirty). Processes one field
+    /// at a time so memory overhead is minimal (~1.7 MB for tagIds' 31K Cow refs).
+    ///
+    /// Skips fields that haven't been loaded yet (still pending lazy-load) to avoid
+    /// overwriting real persisted data with empty placeholders.
     fn write_snapshot_to_store(
         store: &BitmapFs,
         inner: &ArcSwap<InnerEngine>,
@@ -2235,78 +2252,155 @@ impl ConcurrentEngine {
         skip_filters: &HashSet<String>,
         skip_lazy_values: &HashSet<String>,
     ) -> Result<()> {
-        // Load the current published snapshot (lock-free).
+        use std::borrow::Cow;
+
+        let save_start = std::time::Instant::now();
+
+        // Load the current published snapshot (lock-free Arc clone, no data copy).
         let snap: Arc<InnerEngine> = inner.load_full();
-        let mut compacted: InnerEngine = (*snap).clone();
+        eprintln!("  save: snapshot loaded ({:.1}ms)",
+            save_start.elapsed().as_secs_f64() * 1000.0);
 
-        // Merge alive diffs
-        compacted.slots.merge_alive();
+        // Write alive bitmap + slot counter first (critical metadata).
+        let alive_cow = snap.slots.alive_fused_cow();
+        store.write_alive(&alive_cow)?;
+        store.write_slot_counter(snap.slots.slot_counter())?;
 
-        // Collect filter bitmap entries — skip unloaded fields.
-        // Lazy-value fields (multi_value with per-value loading) are only skipped
-        // if they have no loaded bitmaps. If they have data (from upserts or lazy loads),
-        // save whatever is currently in memory.
-        let mut filter_entries: Vec<(String, u64, RoaringBitmap)> = Vec::new();
-        for (name, field) in compacted.filters.fields_mut() {
-            if skip_filters.contains(name) {
-                continue;
-            }
-            if skip_lazy_values.contains(name) && field.loaded_value_count() == 0 {
-                continue;
-            }
-            field.merge_dirty();
-            for (&value, vb) in field.iter_versioned() {
-                filter_entries.push((
-                    name.clone(),
-                    value,
-                    vb.base().as_ref().clone(),
-                ));
-            }
-        }
-
-        // Collect sort layer bases — skip unloaded fields
-        let mut sort_data: Vec<(String, Vec<RoaringBitmap>)> = Vec::new();
+        // Sort fields — one at a time, zero-copy via fused_cow.
         for sc in &config.sort_fields {
             if skip_sorts.contains(&sc.name) {
                 continue;
             }
-            if let Some(sf) = compacted.sorts.get_field_mut(&sc.name) {
-                sf.merge_dirty();
-                let bases: Vec<RoaringBitmap> = sf
-                    .layer_bases()
-                    .iter()
-                    .map(|b| (*b).clone())
-                    .collect();
-                sort_data.push((sc.name.clone(), bases));
+            if let Some(sf) = snap.sorts.get_field(&sc.name) {
+                let t0 = std::time::Instant::now();
+                let fused_layers: Vec<Cow<'_, RoaringBitmap>> = sf.layer_bases_fused();
+                let layer_refs: Vec<&RoaringBitmap> =
+                    fused_layers.iter().map(|c| c.as_ref()).collect();
+                store.write_sort_layers(&sc.name, &layer_refs)?;
+                eprintln!("  save: sort {} in {:.1}ms",
+                    sc.name, t0.elapsed().as_secs_f64() * 1000.0);
             }
         }
 
-        // Build references for write_full_snapshot
-        let filter_refs: Vec<(&str, u64, &RoaringBitmap)> = filter_entries
-            .iter()
-            .map(|(f, v, b)| (f.as_str(), *v, b))
-            .collect();
-        let alive = compacted.slots.alive_bitmap().clone();
-        let slot_counter = compacted.slots.slot_counter();
+        // Filter fields — stream one bucket at a time to minimize memory overhead.
+        // Lazy-value fields (multi_value with per-value loading) are only skipped
+        // if they have no loaded bitmaps. If they have data (from inserts or lazy
+        // loads), save whatever is currently in memory so evict-then-reload works.
+        for (name, field) in snap.filters.fields() {
+            if skip_filters.contains(name) {
+                continue;
+            }
+            if skip_lazy_values.contains(name) && field.bitmap_count() == 0 {
+                continue;
+            }
+            let t0 = std::time::Instant::now();
+            let num_values = field.bitmap_count();
+            // Group entries by bucket (256 buckets max)
+            let mut by_bucket: HashMap<u8, Vec<(u64, Cow<'_, RoaringBitmap>)>> = HashMap::new();
+            for (&value, vb) in field.iter_versioned() {
+                let bucket = (value >> 8) as u8;
+                by_bucket.entry(bucket).or_default().push((value, vb.fused_cow()));
+            }
+            let num_buckets = by_bucket.len();
+            // Write one bucket at a time
+            for (bucket, entries) in by_bucket {
+                let refs: Vec<(u64, &RoaringBitmap)> = entries
+                    .iter()
+                    .map(|(v, c)| (*v, c.as_ref()))
+                    .collect();
+                store.write_filter_bucket(name, bucket, &refs)?;
+            }
+            eprintln!("  save: filter {} ({} values, {} buckets) in {:.1}ms",
+                name, num_values, num_buckets, t0.elapsed().as_secs_f64() * 1000.0);
+        }
 
-        // Sort layer refs: owned Vec<&BM> must outlive the slice refs
-        let sort_owned_refs: Vec<(String, Vec<&RoaringBitmap>)> = sort_data
-            .iter()
-            .map(|(name, layers)| {
-                (name.clone(), layers.iter().collect::<Vec<&RoaringBitmap>>())
-            })
-            .collect();
-        let sort_slice_refs: Vec<(&str, &[&RoaringBitmap])> = sort_owned_refs
-            .iter()
-            .map(|(name, refs)| (name.as_str(), refs.as_slice()))
-            .collect();
+        eprintln!("  save: total write {:.1}s", save_start.elapsed().as_secs_f64());
+        Ok(())
+    }
 
-        store.write_full_snapshot(
-            &filter_refs,
-            &alive,
-            &sort_slice_refs,
-            slot_counter,
-        )
+    /// Save the current snapshot to disk, then unload all loaded fields from memory.
+    /// After this call, bitmap memory drops to near-zero — fields are marked pending
+    /// and will lazy-load from disk on the next query that touches them.
+    ///
+    /// Safe with concurrent mutations: bases are cleared but diff layers are preserved,
+    /// so any mutations that arrive during/after unload accumulate in diffs and are
+    /// merged into the reloaded bases on lazy-load.
+    pub fn save_and_unload(&self) -> Result<()> {
+        let store = self.bitmap_store.as_ref().ok_or_else(|| {
+            crate::error::BitdexError::Config(
+                "no bitmap_path configured; cannot save_and_unload".to_string(),
+            )
+        })?;
+
+        // Snapshot what's already pending — don't save or unload those.
+        let skip_sorts = self.pending_sort_loads.lock().clone();
+        let skip_filters = self.pending_filter_loads.lock().clone();
+        let skip_lazy = self.lazy_value_fields.lock().clone();
+
+        // Phase 1: Zero-copy write to disk.
+        Self::write_snapshot_to_store(
+            store,
+            &self.inner,
+            &self.config,
+            &skip_sorts,
+            &skip_filters,
+            &skip_lazy,
+        )?;
+
+        // Phase 2: Build an unloaded snapshot directly — no clone_staging().
+        // clone_staging() would bump refcounts on all Arc<FilterField>s, preventing
+        // the old bitmap data from being freed until publish. Instead, we build the
+        // new InnerEngine field by field: keep slots (always needed), and for each
+        // filter/sort field either move the Arc as-is (if skipped) or create a new
+        // empty field (if unloading). This way old Arcs are freed immediately on publish.
+        let snap = self.inner.load_full();
+        let slots = snap.slots.clone();
+
+        let mut new_filters = crate::filter::FilterIndex::new();
+        for fc in &self.config.filter_fields {
+            new_filters.add_field(fc.clone());
+        }
+        // For each field: either copy the existing Arc (skipped) or leave empty (unloading).
+        // Skipped fields keep their data; unloaded fields start with empty HashMaps.
+        for fc in &self.config.filter_fields {
+            if skip_filters.contains(&fc.name) || skip_lazy.contains(&fc.name) {
+                // Keep existing data — copy the Arc (refcount bump only, no data copy)
+                new_filters.copy_field_arc_from(&snap.filters, &fc.name);
+            } else {
+                // Field will be unloaded — the new FilterIndex already has an empty field.
+                // Any in-flight diffs from the old snapshot are preserved by unload_from().
+                new_filters.unload_from(&snap.filters, &fc.name);
+                self.pending_filter_loads.lock().insert(fc.name.clone());
+            }
+        }
+
+        let mut new_sorts = crate::sort::SortIndex::new();
+        for sc in &self.config.sort_fields {
+            new_sorts.add_field(sc.clone());
+        }
+        for sc in &self.config.sort_fields {
+            if skip_sorts.contains(&sc.name) {
+                new_sorts.copy_field_arc_from(&snap.sorts, &sc.name);
+            } else {
+                new_sorts.unload_from(&snap.sorts, &sc.name);
+                self.pending_sort_loads.lock().insert(sc.name.clone());
+            }
+        }
+
+        // Drop our reference to the old snapshot before publishing.
+        // This way publish_staging is the only thing holding the old Arcs,
+        // and they're freed as soon as readers release their Guards.
+        drop(snap);
+
+        let staging = InnerEngine {
+            slots,
+            filters: new_filters,
+            sorts: new_sorts,
+        };
+
+        // Phase 3: Publish. Old bitmap Arcs freed when readers release Guards.
+        self.publish_staging(staging);
+        Ok(())
     }
 
     /// Get a reference to the config.
@@ -4573,5 +4667,153 @@ mod tests {
         // Create a new engine from the same path — cursor should be loaded
         let engine2 = ConcurrentEngine::new_with_path(config, &doc_path).unwrap();
         assert_eq!(engine2.get_cursor("pg-sync-0").unwrap(), "99999");
+    }
+
+    #[test]
+    fn test_save_and_unload_then_query() {
+        // Verify: save_and_unload drops bitmap memory but queries still work via lazy reload.
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        let mut engine =
+            ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+        // Insert test data
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("tagIds", FieldValue::Multi(vec![Value::Integer(100), Value::Integer(200)])),
+                    ("onSite", FieldValue::Single(Value::Bool(true))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(500))),
+                ]),
+            )
+            .unwrap();
+        engine
+            .put(
+                2,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
+                    ("tagIds", FieldValue::Multi(vec![Value::Integer(200), Value::Integer(300)])),
+                    ("onSite", FieldValue::Single(Value::Bool(false))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(100))),
+                ]),
+            )
+            .unwrap();
+        engine
+            .put(
+                3,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("tagIds", FieldValue::Multi(vec![Value::Integer(100)])),
+                    ("onSite", FieldValue::Single(Value::Bool(true))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(300))),
+                ]),
+            )
+            .unwrap();
+
+        engine.shutdown();
+        assert_eq!(engine.alive_count(), 3);
+
+        // Capture pre-unload bitmap memory
+        let bytes_before = {
+            let snap = engine.inner.load_full();
+            snap.filters.bitmap_bytes() + snap.sorts.bitmap_bytes()
+        };
+        assert!(bytes_before > 0, "should have bitmap data before unload");
+
+        // Save and unload
+        engine.save_and_unload().unwrap();
+
+        // Verify bitmap memory dropped
+        let bytes_after = {
+            let snap = engine.inner.load_full();
+            snap.filters.bitmap_bytes() + snap.sorts.bitmap_bytes()
+        };
+        assert!(
+            bytes_after < bytes_before,
+            "bitmap bytes should drop after unload: {} -> {}",
+            bytes_before,
+            bytes_after
+        );
+
+        // Verify fields are marked as pending
+        assert!(
+            !engine.pending_filter_loads.lock().is_empty(),
+            "filter fields should be pending after unload"
+        );
+        assert!(
+            !engine.pending_sort_loads.lock().is_empty(),
+            "sort fields should be pending after unload"
+        );
+
+        // Query should still work via lazy reload
+        let sort = SortClause {
+            field: "reactionCount".to_string(),
+            direction: crate::query::SortDirection::Desc,
+        };
+        let filters = vec![FilterClause::Eq(
+            "nsfwLevel".to_string(),
+            Value::Integer(1),
+        )];
+        let result = engine.query(&filters, Some(&sort), 10).unwrap();
+
+        assert_eq!(result.ids, vec![1, 3], "query after unload should match pre-unload results");
+    }
+
+    #[test]
+    fn test_save_and_unload_mutation_race() {
+        // Verify: mutations during unloaded state are preserved after lazy reload.
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        let mut engine =
+            ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+        // Insert initial data
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(500))),
+                ]),
+            )
+            .unwrap();
+        engine
+            .put(
+                2,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(100))),
+                ]),
+            )
+            .unwrap();
+
+        engine.shutdown();
+
+        // Save and unload
+        engine.save_and_unload().unwrap();
+
+        // Mutate while fields are unloaded — directly at the data structure level
+        {
+            let mut staging = engine.clone_staging();
+            // Simulate a mutation: add nsfwLevel=1 for slot 10
+            if let Some(field) = staging.filters.get_field_mut("nsfwLevel") {
+                field.insert(1, 10);
+            }
+            engine.publish_staging(staging);
+        }
+
+        // The mutation (slot 10 in nsfwLevel=1) should be visible in the diff
+        let snap = engine.inner.load_full();
+        let field = snap.filters.get_field("nsfwLevel").unwrap();
+        let vb = field.get_versioned(1).unwrap();
+        assert!(vb.contains(10), "mutation during unloaded state should be visible");
     }
 }

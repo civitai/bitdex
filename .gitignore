@@ -4,5 +4,9 @@
 !/data/indexes/
 !/data/indexes/civitai/
 !/data/indexes/civitai/config.json
+/data-*/
 *.redb
 /benchmark_*.txt
+*.stackdump
+server_stderr.log
+server_stdout.log

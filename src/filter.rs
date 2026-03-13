@@ -42,6 +42,11 @@ impl FilterField {
         }
     }
 
+    /// Get the field configuration.
+    pub fn config(&self) -> &FilterFieldConfig {
+        &self.config
+    }
+
     /// Get the field name.
     pub fn name(&self) -> &str {
         &self.config.name
@@ -61,11 +66,13 @@ impl FilterField {
     }
 
     /// Clear a slot's bit from the bitmap for the given value.
+    /// Always records the diff, even if the value is unloaded — creates a diff-only
+    /// placeholder so the remove is preserved until the base is reloaded from disk.
     pub fn remove(&mut self, value: u64, slot: u32) {
-        if let Some(vb) = self.bitmaps.get_mut(&value) {
-            vb.remove(slot);
-            // Defer cleanup to merge_dirty/autovac since checking emptiness requires merge
-        }
+        self.bitmaps
+            .entry(value)
+            .or_insert_with(VersionedBitmap::new_unloaded)
+            .remove(slot);
     }
 
     /// Bulk-insert multiple slots into the bitmap for the given value.
@@ -220,6 +227,51 @@ impl FilterField {
         self.bitmaps.values().map(|vb| vb.bitmap_bytes()).sum()
     }
 
+    /// Drop all base bitmaps and mark every value as unloaded.
+    /// The diff layers are preserved so mutations can accumulate
+    /// while the field is not in memory.
+    pub fn clear_bases_and_unload(&mut self) {
+        for vb in self.bitmaps.values_mut() {
+            vb.clear_base_and_unload();
+        }
+    }
+
+    /// Reload a complete field from disk, merging persisted bases into any
+    /// existing diff-only placeholders. After loading, all values are marked loaded
+    /// so merge_dirty() can compact their diffs normally.
+    pub fn load_field_complete(&mut self, data: HashMap<u64, RoaringBitmap>) {
+        for (value, bitmap) in data {
+            self.bitmaps
+                .entry(value)
+                .or_insert_with(VersionedBitmap::new_unloaded)
+                .load_base(&bitmap);
+        }
+        // Mark any diff-only values (mutated while unloaded, not on disk) as loaded
+        for vb in self.bitmaps.values_mut() {
+            vb.mark_loaded();
+        }
+    }
+
+    /// Reload specific values from disk (for per-value lazy loading of high-cardinality fields).
+    /// Only the requested values are marked as loaded; others remain unloaded.
+    pub fn load_values(&mut self, data: HashMap<u64, RoaringBitmap>, requested: &[u64]) {
+        for &value in requested {
+            if let Some(bitmap) = data.get(&value) {
+                self.bitmaps
+                    .entry(value)
+                    .or_insert_with(VersionedBitmap::new_unloaded)
+                    .load_base(bitmap);
+            } else {
+                // Value wasn't on disk — it's a new value created since last save.
+                // Mark it as loaded so its diffs can be compacted.
+                self.bitmaps
+                    .entry(value)
+                    .or_insert_with(VersionedBitmap::new_empty)
+                    .mark_loaded();
+            }
+        }
+    }
+
     /// Merge all dirty VersionedBitmaps in this field.
     pub fn merge_all(&mut self) {
         for vb in self.bitmaps.values_mut() {
@@ -309,6 +361,47 @@ impl FilterIndex {
     /// Iterate mutably over all fields.
     pub fn fields_mut(&mut self) -> impl Iterator<Item = (&String, &mut FilterField)> {
         self.fields.iter_mut().map(|(k, v)| (k, Arc::make_mut(v)))
+    }
+
+    /// Unload a field: replace its Arc with a new empty field, preserving only
+    /// entries that have pending diffs (mutations received while loading/unloaded).
+    /// This avoids Arc::make_mut deep-cloning the HashMap and drops all clean entries
+    /// entirely — critical for high-cardinality fields like postId (13M entries).
+    pub fn unload_field(&mut self, name: &str) {
+        if let Some(field_arc) = self.fields.get_mut(name) {
+            let old = field_arc.as_ref();
+            let mut new_field = FilterField::new(old.config.clone());
+            // Preserve only entries with pending diffs
+            for (&value, vb) in old.iter_versioned() {
+                if vb.is_dirty() {
+                    new_field.bitmaps.insert(value, vb.clone_diff_only());
+                }
+            }
+            *field_arc = Arc::new(new_field);
+        }
+    }
+
+    /// Copy a field's Arc from another FilterIndex (refcount bump only, no data copy).
+    /// Used to preserve skipped fields during save_and_unload.
+    pub fn copy_field_arc_from(&mut self, source: &FilterIndex, name: &str) {
+        if let Some(arc) = source.fields.get(name) {
+            self.fields.insert(name.to_string(), Arc::clone(arc));
+        }
+    }
+
+    /// Build an unloaded version of a field from a source FilterIndex.
+    /// Only preserves entries with pending diffs; all clean entries are dropped.
+    pub fn unload_from(&mut self, source: &FilterIndex, name: &str) {
+        if let Some(source_field) = source.fields.get(name) {
+            let config = source_field.config.clone();
+            let mut new_field = FilterField::new(config);
+            for (&value, vb) in source_field.iter_versioned() {
+                if vb.is_dirty() {
+                    new_field.bitmaps.insert(value, vb.clone_diff_only());
+                }
+            }
+            self.fields.insert(name.to_string(), Arc::new(new_field));
+        }
     }
 
     /// Get the total number of bitmaps across all fields.

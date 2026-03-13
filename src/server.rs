@@ -805,11 +805,12 @@ async fn handle_load(
                         elapsed_secs: stats.elapsed.as_secs_f64(),
                     };
 
+                    // Save bitmap snapshot and unload to free memory (lazy reload on demand)
                     let snap_start = Instant::now();
-                    if let Err(e) = engine.save_snapshot() {
-                        eprintln!("Warning: failed to save bitmap snapshot: {e}");
+                    if let Err(e) = engine.save_and_unload() {
+                        eprintln!("Warning: failed to save_and_unload: {e}");
                     } else {
-                        eprintln!("Bitmap snapshot saved in {:.1}s", snap_start.elapsed().as_secs_f64());
+                        eprintln!("save_and_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
                     }
                 }
 
@@ -1298,10 +1299,10 @@ async fn handle_rebuild(
                     };
 
                     let snap_start = Instant::now();
-                    if let Err(e) = engine.save_snapshot() {
-                        eprintln!("rebuild: failed to save bitmap snapshot: {e}");
+                    if let Err(e) = engine.save_and_unload() {
+                        eprintln!("rebuild: failed to save_and_unload: {e}");
                     } else {
-                        eprintln!("rebuild: bitmap snapshot saved in {:.1}s", snap_start.elapsed().as_secs_f64());
+                        eprintln!("rebuild: save_and_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
                     }
                 }
 

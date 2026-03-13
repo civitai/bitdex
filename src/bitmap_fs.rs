@@ -366,6 +366,15 @@ impl BitmapFs {
     }
 
     /// Write multiple filter bitmap entries, grouped by field + hex bucket.
+    /// Write a single filter bucket directly (used by streaming save).
+    pub fn write_filter_bucket(&self, field: &str, bucket: u8, entries: &[(u64, &RoaringBitmap)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let path = self.filter_pack_path(field, bucket);
+        Self::write_pack_file(&path, entries)
+    }
+
     pub fn write_batch(&self, entries: &[(&str, u64, &RoaringBitmap)]) -> Result<()> {
         // Group by (field, bucket)
         let mut by_bucket: HashMap<(&str, u8), Vec<(u64, &RoaringBitmap)>> = HashMap::new();

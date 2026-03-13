@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
@@ -73,6 +74,11 @@ pub struct VersionedBitmap {
     base: Arc<RoaringBitmap>,
     diff: Arc<BitmapDiff>,
     generation: u64,
+    /// Whether the base bitmap contains real data (true) or is an empty placeholder
+    /// because the field was unloaded to save memory (false). When `is_loaded` is false,
+    /// `merge()` is a no-op — this prevents compacting diffs against an empty placeholder,
+    /// which would destroy pending clears that need to be applied when the base reloads.
+    is_loaded: bool,
 }
 
 impl VersionedBitmap {
@@ -82,6 +88,7 @@ impl VersionedBitmap {
             base: Arc::new(base),
             diff: Arc::new(BitmapDiff::new()),
             generation: 0,
+            is_loaded: true,
         }
     }
 
@@ -90,12 +97,25 @@ impl VersionedBitmap {
         Self::new(RoaringBitmap::new())
     }
 
+    /// Create a new unloaded VersionedBitmap — empty placeholder that accumulates diffs.
+    /// Used when a field has been saved to disk and unloaded from memory. Mutations
+    /// write to the diff layer; `merge()` is blocked until the base is reloaded.
+    pub fn new_unloaded() -> Self {
+        Self {
+            base: Arc::new(RoaringBitmap::new()),
+            diff: Arc::new(BitmapDiff::new()),
+            generation: 0,
+            is_loaded: false,
+        }
+    }
+
     /// Create a new VersionedBitmap from an existing Arc<RoaringBitmap>.
     pub fn from_arc(base: Arc<RoaringBitmap>) -> Self {
         Self {
             base,
             diff: Arc::new(BitmapDiff::new()),
             generation: 0,
+            is_loaded: true,
         }
     }
 
@@ -149,6 +169,19 @@ impl VersionedBitmap {
         result
     }
 
+    /// Return the fully fused bitmap as a Cow — borrows the base when clean (zero copy),
+    /// creates a temporary merged bitmap only when dirty. Used for zero-copy serialization.
+    pub fn fused_cow(&self) -> Cow<'_, RoaringBitmap> {
+        if self.diff.is_empty() {
+            Cow::Borrowed(self.base.as_ref())
+        } else {
+            let mut result = self.base.as_ref().clone();
+            result |= &self.diff.sets;
+            result -= &self.diff.clears;
+            Cow::Owned(result)
+        }
+    }
+
     /// Access the base bitmap directly. Sort layers always use merged bases.
     pub fn base(&self) -> &Arc<RoaringBitmap> {
         &self.base
@@ -157,6 +190,16 @@ impl VersionedBitmap {
     /// Cardinality of the base bitmap (does not account for diff).
     pub fn base_len(&self) -> u64 {
         self.base.len()
+    }
+
+    /// Cardinality of the fused bitmap (base + diff). Always accurate regardless
+    /// of whether merge has been called.
+    pub fn fused_len(&self) -> u64 {
+        if self.diff.is_empty() {
+            self.base.len()
+        } else {
+            self.fused_cow().len()
+        }
     }
 
     /// Access the diff layer.
@@ -181,7 +224,7 @@ impl VersionedBitmap {
     /// replaces the diff with a fresh empty Arc<BitmapDiff> and bumps
     /// the generation counter.
     pub fn merge(&mut self) {
-        if self.diff.is_empty() {
+        if self.diff.is_empty() || !self.is_loaded {
             return;
         }
         let base = Arc::make_mut(&mut self.base);
@@ -218,6 +261,46 @@ impl VersionedBitmap {
     pub fn or_into_base(&mut self, bitmap: &RoaringBitmap) {
         let base = Arc::make_mut(&mut self.base);
         *base |= bitmap;
+    }
+
+    /// Whether this bitmap's base contains real data (not an unloaded placeholder).
+    pub fn is_loaded(&self) -> bool {
+        self.is_loaded
+    }
+
+    /// Drop the base bitmap and mark as unloaded. The diff layer is preserved
+    /// so mutations can accumulate while the field is not in memory.
+    pub fn clear_base_and_unload(&mut self) {
+        self.base = Arc::new(RoaringBitmap::new());
+        self.is_loaded = false;
+    }
+
+    /// Create a new unloaded VersionedBitmap carrying only this bitmap's diff layer.
+    /// Used when unloading a field: entries with pending diffs need to survive,
+    /// but the base (which was just saved to disk) can be dropped entirely.
+    pub fn clone_diff_only(&self) -> Self {
+        Self {
+            base: Arc::new(RoaringBitmap::new()),
+            diff: Arc::clone(&self.diff),
+            generation: self.generation,
+            is_loaded: false,
+        }
+    }
+
+    /// Merge a loaded bitmap into the base (OR), then mark as loaded.
+    /// Used when reloading a field from disk after it was unloaded —
+    /// the OR merges the persisted data into whatever placeholder state exists.
+    pub fn load_base(&mut self, bitmap: &RoaringBitmap) {
+        let base = Arc::make_mut(&mut self.base);
+        *base |= bitmap;
+        self.is_loaded = true;
+    }
+
+    /// Mark this bitmap as loaded without changing the base data.
+    /// Used for values that were mutated while unloaded but have no persisted base
+    /// (e.g., a brand-new value created by an insert after unload).
+    pub fn mark_loaded(&mut self) {
+        self.is_loaded = true;
     }
 
     /// Replace the diff with a new Arc. Used by the flush thread publish pattern
@@ -495,5 +578,118 @@ mod tests {
         base.insert(3);
         let vb = VersionedBitmap::new(base);
         assert_eq!(vb.base_len(), 3);
+    }
+
+    #[test]
+    fn fused_cow_borrows_when_clean() {
+        let mut base = RoaringBitmap::new();
+        base.insert(1);
+        base.insert(2);
+        let vb = VersionedBitmap::new(base);
+
+        let cow = vb.fused_cow();
+        assert!(matches!(cow, Cow::Borrowed(_)));
+        assert!(cow.contains(1));
+        assert!(cow.contains(2));
+    }
+
+    #[test]
+    fn fused_cow_owns_when_dirty() {
+        let mut base = RoaringBitmap::new();
+        base.insert(1);
+        let mut vb = VersionedBitmap::new(base);
+        vb.insert(2);
+
+        let cow = vb.fused_cow();
+        assert!(matches!(cow, Cow::Owned(_)));
+        assert!(cow.contains(1));
+        assert!(cow.contains(2));
+    }
+
+    #[test]
+    fn merge_skips_when_unloaded() {
+        let mut vb = VersionedBitmap::new_unloaded();
+        assert!(!vb.is_loaded());
+
+        // Accumulate some diffs
+        vb.insert(10);
+        vb.remove(20);
+        assert!(vb.is_dirty());
+
+        // Merge should be a no-op — diffs must survive
+        vb.merge();
+        assert!(vb.is_dirty());
+        assert!(vb.diff().sets.contains(10));
+        assert!(vb.diff().clears.contains(20));
+        assert_eq!(vb.generation(), 0); // not bumped
+    }
+
+    #[test]
+    fn clear_base_and_unload() {
+        let mut base = RoaringBitmap::new();
+        for i in 0..1000 {
+            base.insert(i);
+        }
+        let mut vb = VersionedBitmap::new(base);
+        assert!(vb.is_loaded());
+        assert_eq!(vb.base_len(), 1000);
+
+        vb.clear_base_and_unload();
+        assert!(!vb.is_loaded());
+        assert_eq!(vb.base_len(), 0);
+    }
+
+    #[test]
+    fn unload_preserves_diffs_then_reload_merges() {
+        // Start with base {1, 2, 3}
+        let mut base = RoaringBitmap::new();
+        for i in 1..=3 {
+            base.insert(i);
+        }
+        let mut vb = VersionedBitmap::new(base.clone());
+
+        // Unload
+        vb.clear_base_and_unload();
+        assert!(!vb.is_loaded());
+
+        // Mutate while unloaded: add 4, remove 2
+        vb.insert(4);
+        vb.remove(2);
+
+        // merge should be no-op while unloaded
+        vb.merge();
+        assert!(vb.is_dirty());
+
+        // Reload from disk
+        vb.load_base(&base);
+        assert!(vb.is_loaded());
+        // Base should now be {1, 2, 3} (from disk)
+        assert!(vb.base().contains(1));
+        assert!(vb.base().contains(2));
+        assert!(vb.base().contains(3));
+
+        // Now merge should work — apply diffs to reloaded base
+        vb.merge();
+        assert!(!vb.is_dirty());
+        assert!(vb.base().contains(1));
+        assert!(!vb.base().contains(2)); // removed
+        assert!(vb.base().contains(3));
+        assert!(vb.base().contains(4)); // added
+    }
+
+    #[test]
+    fn new_unloaded_constructor() {
+        let vb = VersionedBitmap::new_unloaded();
+        assert!(!vb.is_loaded());
+        assert!(!vb.is_dirty());
+        assert_eq!(vb.base_len(), 0);
+    }
+
+    #[test]
+    fn mark_loaded() {
+        let mut vb = VersionedBitmap::new_unloaded();
+        assert!(!vb.is_loaded());
+        vb.mark_loaded();
+        assert!(vb.is_loaded());
     }
 }
