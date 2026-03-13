@@ -1988,11 +1988,30 @@ impl ConcurrentEngine {
             }
         };
 
+        // ── Snap range filters to bucket bitmaps BEFORE cache key ──
+        // This ensures cache keys use stable bucket names ("7d") instead of
+        // moving timestamps, so all queries within the same bucket window share
+        // a single cache entry.
+        let snapped_filters;
+        let effective_filters = if let Some(ref tb) = tb_guard {
+            let mut managers = std::collections::HashMap::new();
+            managers.insert(tb.field_name().to_string(), &**tb);
+            let ctx = crate::query::BucketSnapContext {
+                managers: &managers,
+                now_secs: now_unix,
+                tolerance_pct: 0.10,
+            };
+            snapped_filters = crate::query::snap_range_clauses(&query.filters, &ctx);
+            &snapped_filters[..]
+        } else {
+            &query.filters[..]
+        };
+
         // ── Fast path: unified cache hit without expansion ──
         // Try cache lookup BEFORE computing filters. If we hit, we can skip
         // the expensive filter bitmap computation entirely (~2ms saved at 105M).
         if let Some(sort_clause) = query.sort.as_ref() {
-            if let Some(clauses) = cache::canonicalize(&query.filters) {
+            if let Some(clauses) = cache::canonicalize(effective_filters) {
                 let ukey = UnifiedKey {
                     filter_clauses: clauses,
                     sort_field: sort_clause.field.clone(),
@@ -2070,7 +2089,7 @@ impl ConcurrentEngine {
                         // Compute filters (we skipped this) and expand.
                         if result.ids.len() < fetch_limit && query.cursor.is_some() && has_more {
                             let (filter_arc, use_simple_sort) = self.resolve_filters(
-                                &executor, &query.filters, tb_guard.as_deref(), now_unix,
+                                &executor, effective_filters, tb_guard.as_deref(), now_unix,
                             )?;
                             let max_cap = self.unified_cache.lock().config().max_capacity;
                             let expand_limit = max_cap.saturating_sub(capacity);
@@ -2146,7 +2165,7 @@ impl ConcurrentEngine {
 
                     // Expansion needed — fall through to slow path with pre-fetched cache data.
                     return self.execute_query_slow_path(
-                        query, &snap, &executor, tb_guard.as_deref(), now_unix,
+                        query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix,
                         Some((ukey, unified_bm, has_more, min_val, capacity, cached_total)),
                     );
                 }
@@ -2155,7 +2174,7 @@ impl ConcurrentEngine {
 
         // ── Slow path: cache miss or unsorted query ──
         self.execute_query_slow_path(
-            query, &snap, &executor, tb_guard.as_deref(), now_unix, None,
+            query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix, None,
         )
     }
 
@@ -2164,6 +2183,7 @@ impl ConcurrentEngine {
     fn execute_query_slow_path(
         &self,
         query: &BitdexQuery,
+        snapped_filters: &[FilterClause],
         snap: &Arc<InnerEngine>,
         executor: &QueryExecutor,
         time_buckets: Option<&TimeBucketManager>,
@@ -2172,7 +2192,7 @@ impl ConcurrentEngine {
         cached: Option<(UnifiedKey, Arc<RoaringBitmap>, bool, u32, usize, u64)>,
     ) -> Result<QueryResult> {
         let (filter_arc, use_simple_sort) =
-            self.resolve_filters(executor, &query.filters, time_buckets, now_unix)?;
+            self.resolve_filters(executor, snapped_filters, time_buckets, now_unix)?;
 
         let full_total_matched = filter_arc.len();
 
@@ -2184,7 +2204,7 @@ impl ConcurrentEngine {
             let mut uc = self.unified_cache.lock();
             let min_size = uc.config().min_filter_size as u64;
             if full_total_matched >= min_size {
-                if let Some(clauses) = cache::canonicalize(&query.filters) {
+                if let Some(clauses) = cache::canonicalize(snapped_filters) {
                     let ukey = UnifiedKey {
                         filter_clauses: clauses,
                         sort_field: sort_clause.field.clone(),
