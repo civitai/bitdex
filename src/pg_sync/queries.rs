@@ -214,7 +214,7 @@ pub async fn run_setup(pool: &PgPool) -> Result<(), sqlx::Error> {
 
 /// Get the max image ID for range-based bulk loading.
 pub async fn get_max_image_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(id), 0) FROM \"Image\"")
+    let row: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(id)::int8, 0) FROM \"Image\"")
         .fetch_one(pool)
         .await?;
     Ok(row.0)
@@ -419,7 +419,7 @@ pub struct StreamResourceRow {
 /// Get max tag ID for range iteration.
 pub async fn get_max_tag_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
-        r#"SELECT COALESCE(MAX("tagId"), 0) FROM "TagsOnImageDetails""#,
+        r#"SELECT COALESCE(MAX("tagId")::int8, 0) FROM "TagsOnImageDetails""#,
     )
     .fetch_one(pool)
     .await?;
@@ -448,7 +448,7 @@ pub async fn fetch_tags_by_tag_range(
 /// Get max tool ID for range iteration.
 pub async fn get_max_tool_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
-        r#"SELECT COALESCE(MAX("toolId"), 0) FROM "ImageTool""#,
+        r#"SELECT COALESCE(MAX("toolId")::int8, 0) FROM "ImageTool""#,
     )
     .fetch_one(pool)
     .await?;
@@ -475,7 +475,7 @@ pub async fn fetch_tools_by_tool_range(
 /// Get max technique ID for range iteration.
 pub async fn get_max_technique_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
-        r#"SELECT COALESCE(MAX("techniqueId"), 0) FROM "ImageTechnique""#,
+        r#"SELECT COALESCE(MAX("techniqueId")::int8, 0) FROM "ImageTechnique""#,
     )
     .fetch_one(pool)
     .await?;
