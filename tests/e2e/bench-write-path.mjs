@@ -695,7 +695,7 @@ async function main() {
   }
 
   // Write JSON results
-  const resultsDir = resolve(PROJECT_ROOT, 'docs', 'benchmarks');
+  const resultsDir = resolve(PROJECT_ROOT, 'docs', 'benchmarks', 'results');
   mkdirSync(resultsDir, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const outFile = resolve(resultsDir, `bench-write-path-${ts}.json`);
