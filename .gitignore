@@ -10,8 +10,9 @@ server_*_stdout.log
 server_stderr.log
 server_stdout.log
 .claude/worktrees/
+.claude/skills/dev-server/state/
 .test-data/
 
-# Benchmark and test results — keep only latest per-suite, ignore timestamped runs
+# Benchmark and test results — keep only latest per-suite, ignore timestamped history
 docs/test-results/e2e-2*.json
-docs/benchmarks/results/
+docs/benchmarks/results/history/
