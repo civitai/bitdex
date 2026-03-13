@@ -38,6 +38,16 @@ enum FlushCommand {
         /// Oneshot sender — caller blocks on the receiver until publish completes.
         done: crossbeam_channel::Sender<()>,
     },
+    /// Replace staging with an unloaded snapshot and publish it.
+    /// Used by `save_and_unload()` to ensure the flush thread's private
+    /// staging is synced to the unloaded state, preventing re-inflation
+    /// on the next publish cycle.
+    SyncUnloaded {
+        /// The unloaded InnerEngine to replace staging with.
+        unloaded: InnerEngine,
+        /// Oneshot sender — caller blocks until staging is replaced and published.
+        done: crossbeam_channel::Sender<()>,
+    },
 }
 
 /// Lazy-load request sent from query threads to the flush thread.
@@ -681,6 +691,28 @@ impl ConcurrentEngine {
                                 inner.store(Arc::new(staging.clone()));
                                 staging_dirty = false;
                                 // Signal caller that publish is complete
+                                let _ = done.send(());
+                            }
+                            FlushCommand::SyncUnloaded { unloaded, done } => {
+                                // Drain any mutations that arrived between the save
+                                // snapshot and now. prepare() drains + groups without
+                                // applying, so we can swap staging first.
+                                let pending = coalescer.prepare();
+                                // Replace staging with the unloaded version.
+                                staging = unloaded;
+                                // Apply drained mutations to the new unloaded staging.
+                                // These go into diff layers (bases are empty/unloaded),
+                                // which is correct — they'll merge on lazy reload.
+                                if pending > 0 {
+                                    coalescer.apply_prepared(
+                                        &mut staging.slots,
+                                        &mut staging.filters,
+                                        &mut staging.sorts,
+                                    );
+                                }
+                                flush_unified_cache.lock().clear();
+                                inner.store(Arc::new(staging.clone()));
+                                staging_dirty = false;
                                 let _ = done.send(());
                             }
                         }
@@ -2587,9 +2619,13 @@ impl ConcurrentEngine {
     /// After this call, bitmap memory drops to near-zero — fields are marked pending
     /// and will lazy-load from disk on the next query that touches them.
     ///
-    /// Safe with concurrent mutations: bases are cleared but diff layers are preserved,
-    /// so any mutations that arrive during/after unload accumulate in diffs and are
-    /// merged into the reloaded bases on lazy-load.
+    /// The unload is routed through the flush thread's command channel so that
+    /// the flush thread's private staging is also replaced. This prevents the
+    /// old staging from re-inflating the snapshot on the next publish cycle.
+    ///
+    /// Safe with concurrent mutations: the flush thread drains any pending
+    /// mutations and applies them to the unloaded staging's diff layers before
+    /// publishing.
     pub fn save_and_unload(&self) -> Result<()> {
         let store = self.bitmap_store.as_ref().ok_or_else(|| {
             crate::error::BitdexError::Config(
@@ -2625,17 +2661,24 @@ impl ConcurrentEngine {
         for fc in &self.config.filter_fields {
             new_filters.add_field(fc.clone());
         }
-        // For each field: either copy the existing Arc (skipped) or leave empty (unloading).
-        // Skipped fields keep their data; unloaded fields start with empty HashMaps.
+        // Unload ALL loaded fields — including lazy_value_fields (multi_value).
+        // Previously, lazy_value_fields were skipped from unload, which kept
+        // tagIds (~80% of bitmap memory) resident. Now they're unloaded and
+        // will reload per-value on demand via the lazy loading path.
         for fc in &self.config.filter_fields {
-            if skip_filters.contains(&fc.name) || skip_lazy.contains(&fc.name) {
-                // Keep existing data — copy the Arc (refcount bump only, no data copy)
+            if skip_filters.contains(&fc.name) {
+                // Field was never loaded (still pending) — keep as-is
                 new_filters.copy_field_arc_from(&snap.filters, &fc.name);
             } else {
-                // Field will be unloaded — the new FilterIndex already has an empty field.
-                // Any in-flight diffs from the old snapshot are preserved by unload_from().
+                // Unload: clear bases, preserve any in-flight diffs
                 new_filters.unload_from(&snap.filters, &fc.name);
-                self.pending_filter_loads.lock().insert(fc.name.clone());
+                // Route to correct reload path: multi_value fields use
+                // per-value lazy loading, others use full-field loading.
+                if skip_lazy.contains(&fc.name) {
+                    // Already in lazy_value_fields — will reload per-value
+                } else {
+                    self.pending_filter_loads.lock().insert(fc.name.clone());
+                }
             }
         }
 
@@ -2652,19 +2695,42 @@ impl ConcurrentEngine {
             }
         }
 
-        // Drop our reference to the old snapshot before publishing.
-        // This way publish_staging is the only thing holding the old Arcs,
-        // and they're freed as soon as readers release their Guards.
+        // Drop our reference to the old snapshot before sending to flush thread.
         drop(snap);
 
-        let staging = InnerEngine {
+        let unloaded = InnerEngine {
             slots,
             filters: new_filters,
             sorts: new_sorts,
         };
 
-        // Phase 3: Publish. Old bitmap Arcs freed when readers release Guards.
-        self.publish_staging(staging);
+        // Phase 3: Route through flush thread — replaces both staging and
+        // published snapshot atomically. Flush thread drains any pending
+        // mutations and applies them to the unloaded staging before publishing.
+        //
+        // Fallback: if the flush thread is already shut down (e.g., tests that
+        // call shutdown() before save_and_unload), publish directly. This is
+        // safe because there's no flush thread to re-inflate the snapshot.
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        match self.cmd_tx.send(FlushCommand::SyncUnloaded {
+            unloaded: unloaded.clone(),
+            done: done_tx,
+        }) {
+            Ok(()) => {
+                match done_rx.recv_timeout(Duration::from_secs(60)) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        eprintln!("Warning: save_and_unload timed out waiting for flush thread sync");
+                        // Fallback: publish directly
+                        self.publish_staging(unloaded);
+                    }
+                }
+            }
+            Err(_) => {
+                // Channel disconnected — flush thread is gone, publish directly
+                self.publish_staging(unloaded);
+            }
+        }
         Ok(())
     }
 
