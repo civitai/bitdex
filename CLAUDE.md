@@ -72,57 +72,59 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 - **Cache**: Separate `Arc<Mutex<TrieCache>>` with brief locks (lookup ~μs, store ~μs). Targeted invalidation: only filter fields that actually changed are invalidated; sort-only flushes skip cache invalidation entirely.
 - **Loading mode**: `enter_loading_mode()` / `exit_loading_mode()` skips snapshot publishing and all maintenance during bulk inserts. Avoids `Arc::make_mut()` deep-cloning FilterField HashMaps every flush cycle. On exit, force-publishes staging and invalidates all caches.
 
-### Bound Cache
+### Unified Cache
 
-- Pre-filters sort candidates with approximate top-K bitmaps (one per sort field + direction)
-- Tiered bounds: tight bound (top 2K) attempted first, loose bound (top 200K) as fallback
-- Negligible memory: 6 bounds = 2.28 KB at 104M records
-- Lazy refresh: updated during flush cycles when sort fields change
-- Sort queries 2-13x faster at 104M scale
-
-### Meta-Index
-
-- Bitmaps indexing bitmaps: tracks which cache IDs contain each (field, value) pair
-- Enables targeted bound cache invalidation without scanning all bounds
-- Negligible memory: 6 entries = 180 B at 104M records
-
-### Trie Cache
-
-- Keyed by canonically sorted filter clauses (sorted by field name, then value)
-- Supports prefix matching for partial cache hits
-- Automatic promotion/demotion based on exponential-decay hit stats
-- Lazy invalidation via generation counters per filter field
-- Sort fields (reactionCount, etc.) are NOT part of cache keys — sort is applied after cache lookup
+- Flat HashMap keyed by (filter_clauses, sort_field, direction) — consolidates former trie cache + bound cache
+- Dynamic capacity: 4K initial (sorted vec binary search), expands to 64K (8-bit radix bucketing) on pagination
+- Live maintenance: flush thread adds/removes slots on mutations for all clause types
+- LRU eviction by `max_bytes` (512MB default) with `last_used` timestamps
+- Meta-index for targeted invalidation: bitmaps tracking which cache entries reference each (field, value) pair
+- Sort queries 2-13x faster at 104M scale via pre-filtered working sets
 
 ---
 
 ## Reference Materials
 
-### Design Conversations (read these to understand WHY decisions were made)
+> **Before proposing architectural changes**, read the relevant design doc in `docs/design/`. These documents capture the rationale behind decisions and prevent re-inventing approaches that were already evaluated. See `docs/learnings/` for things we tried that didn't work.
+>
+> See `docs/README.md` for the full folder structure explanation.
 
-- **Original Architecture**: `docs/in/Claude-Bitdex.md` — Full brainstorming conversation showing the evolution from OpenSearch to the bitmap-only architecture. Covers the core "bitmaps all the way down" philosophy, slot model, sort layer design, and why we rejected Vecs/skip lists/B-trees.
-- **Continued Design (Persistence + Bulk Loading)**: `docs/in/claude-bitdex-continued-1.md` — Continuation covering bulk loading pipeline design, put_bulk() architecture, decompose/apply worker pools, accumulator buffers, sharded doc persistence, and performance targets.
-- **Parallelization Strategy**: `docs/in/new-parallelization-strat.md` — Justin's design notes on the dual-endpoint write pipeline (put vs put_bulk), decomposition pools, accumulator buffers, size-based promotion, and doc persistence batching.
-- **Workers vs Threads**: `docs/in/Claude-Workers vs threads in Rust.md` — Discussion of Rust concurrency patterns relevant to the worker pool design.
+### Design Documents (read before changing architecture)
 
-### Architecture & Design Docs
+- **Concurrency**: `docs/design/design-concurrency.md` — ArcSwap snapshot architecture, Arc-per-bitmap CoW, VersionedBitmap diffs, flush/merge threads, loading mode, lazy bitmap loading
+- **Storage**: `docs/design/design-storage.md` — BitmapFs (hex-bucketed bitmap persistence), DocStore (sharded zstd-compressed msgpack documents), persistence lifecycle
+- **Unified Cache**: `docs/design/design-unified-cache-final.md` — Cache architecture consolidating filter+sort+time bucket caching
+- **Cache Persistence**: `docs/design/design-unified-cache-persistence.md` — BoundStore design for warm cache restarts (APPROVED, not yet built)
+- **Idle Eviction**: `docs/design/design-idle-eviction.md` — Per-value bitmap eviction for multi_value fields
+- **Radix Sort**: `docs/design/design-radix-sort-trie.md` — 8-bit radix bucketing for large cache entries (Phase 1 implemented)
+- **Rolling Restart Cursors**: `docs/design/design-rolling-restart-cursors.md` — Named cursors for zero-downtime restarts (Phases 1-3 implemented)
 
-- **ArcSwap + Storage Reconciliation**: `docs/design/design-arcswap-redb-reconciliation.md` — How the ArcSwap snapshot architecture and filesystem persistence layer work together. Two-tier storage (Tier 1 in-memory, Tier 2 on-disk via BitmapFs + DocStore), startup sequence, and memory budget analysis.
-- **Performance & Persistence Roadmap**: `docs/plans/roadmap-performance-and-persistence.md` — Full implementation roadmap (Prereq→A→B→C→D→E phases) with detailed task breakdowns for bitmap persistence, sort-by-slot, time handling, bound caches, and meta-index.
-- **Architecture Risk Review**: `docs/reviews/architecture-risk-review.md` — Risk analysis of architectural decisions and mitigations.
-- **Backpressure Design**: `docs/design/design-backpressure-implementation.md` — Backpressure and auto-throttle design for the write pipeline.
+### Design Conversations (understand WHY decisions were made)
 
-### Specifications & Benchmarks
+- **Architecture Conversations**: `docs/_in/architecture-conversations.md` — Merged design conversations covering the evolution from OpenSearch to bitmaps, slot model, sort layer design, meta-index innovation, bound cache tiering, time buckets, and bulk loading. Has a navigable summary with line references.
+- **Full Project Brief**: `docs/_in/prepared-prompt.md` — Authoritative specification with complete architecture, API specs, config schemas, testing strategy, and development phases.
+- **Storage Overhaul**: `docs/_in/storage-overhaul.md` — Requirements for the redb-to-filesystem pivot
 
-- **Full Project Brief & Development Guide**: `docs/in/prepared-prompt.md` — Contains complete architecture, API specs, config schemas, testing strategy, development phases, and team structure. This is the authoritative specification.
-- **Benchmark Report**: `docs/benchmarks/benchmark-report.md` — 5M/50M/100M/104.6M scaling analysis with memory and query latency breakdowns.
-- **Loading Mode Comparison**: `docs/benchmarks/benchmark-comparison-loading-mode.md` — Before/after comparison showing loading mode fix impact.
-- **Write Regression Analysis**: `docs/benchmarks/write-regression-loading-mode.md` — Root cause analysis of the ArcSwap clone cascade write regression and the loading mode fix.
-- **Performance Baselines**: `docs/benchmarks/performance-baseline.md` — Consolidated baselines with commit hashes and regression thresholds.
+### Learnings (what we tried that didn't work)
 
-### Phase Audits
+- `docs/learnings/write-pipeline.md` — Loading mode vs adaptive pressure, persist thread, bulk accumulator
+- `docs/learnings/storage.md` — Lazy loading vs tiered caching, redb vs custom filesystem
+- `docs/learnings/ingestion.md` — Parsing bottlenecks, simd-json/rkyv evaluation
 
-- `docs/audit/prereq-audit.md` through `docs/audit/phase-e-audit.md` — Post-implementation audits for each roadmap phase. `docs/audit/synthesis.md` has the cross-phase summary.
+### Benchmarks
+
+- **Performance Baselines**: `docs/benchmarks/performance-baseline.md` — Consolidated baselines with regression thresholds (authoritative)
+- **Benchmark Report**: `docs/benchmarks/benchmark-report.md` — 5M/50M/100M/104.6M scaling analysis
+- **Loading Mode Comparison**: `docs/benchmarks/benchmark-comparison-loading-mode.md` — Before/after bound cache impact
+- **Write Regression Analysis**: `docs/benchmarks/write-regression-loading-mode.md` — ArcSwap clone cascade root cause
+- **Loadtest Guide**: `docs/benchmarks/loadtest-guide.md` — Rust loadtest binary usage and baselines
+
+### Guides
+
+- **HTTP API**: `docs/guide/api.md` — All endpoints, request/response examples
+- **Config Schema**: `docs/guide/config-schema.md` — Configuration reference
+- **Civitai Schema**: `docs/guide/bitdex-civitai-schema.md` — Field mapping for Civitai dataset
+- **Testing**: `docs/guide/testing.md` — Test suite guide
 
 ### External References
 
@@ -187,7 +189,7 @@ cargo run --release --features server --bin server -- --port 3001 --data-dir ./d
 - **Fuzz the JSON query parser** with arbitrary input — nothing should panic or corrupt state
 - **Benchmark suite** must run on every PR — any PR that degrades benchmarks by >10% gets flagged
 - Correctness first, performance second
-- When in doubt, refer to `docs/in/prepared-prompt.md` for the authoritative specification
+- When in doubt, refer to `docs/_in/prepared-prompt.md` for the authoritative specification
 
 ### Testing Guide
 
@@ -197,7 +199,7 @@ Run `/testing` for the full guide. Key points:
 - **Rust tests** (`cargo test`) for bitmap correctness, property-based testing, and high-throughput benchmarks. Node can't match Rust's throughput for load tests.
 - **Node E2E tests** (`node tests/e2e/e2e-*.mjs`) for HTTP API behavior, full write pipeline, and observable client behavior.
 - **Automated runner**: `node tests/e2e/run-e2e.mjs` starts a fresh server, runs all self-contained E2E suites, and produces JSON results.
-- **Full docs**: `docs/testing.md` — master reference for all test suites, run commands, and coverage gap analysis.
+- **Full docs**: `docs/guide/testing.md` — master reference for all test suites, run commands, and coverage gap analysis.
 
 ---
 

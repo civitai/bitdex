@@ -1,8 +1,15 @@
+---
+status: IMPLEMENTED (Phase 1), PROPOSED (Phases 2-3 — adaptive splitting, leaf sorted vecs)
+created: 2026-03-11
+updated: 2026-03-13
+---
+
 # Radix Sort Trie for Unified Cache
 
 ## Status
 
-**Proposed** — Not yet implemented. Microbenchmarks required before proceeding.
+**Phase 1 (8-bit radix bucketing)** — Fully implemented in `src/radix_sort.rs` with integration in unified cache and executor. 12 unit tests + 8 benchmark groups.
+**Phases 2-3 (adaptive splitting, leaf sorted vecs)** — Proposed. Microbenchmarks required before proceeding.
 
 ## Context
 

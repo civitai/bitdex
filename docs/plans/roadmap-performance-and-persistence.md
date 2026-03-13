@@ -1,5 +1,7 @@
 # Bitdex V2 — Roadmap: Performance & Persistence
 
+> **Status: COMPLETE (historical)** — All phases (Prereq through E) are implemented. This document references redb which was replaced by custom BitmapFs + DocStore. Kept as historical reference for the phase structure and design rationale. See `docs/design/` for current architecture.
+
 _Derived from benchmark analysis (104.6M records) and design conversations (2026-02-19/20). Incorporates architecture risk review findings._
 
 ---

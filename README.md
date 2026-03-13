@@ -347,7 +347,7 @@ src/
 # All Rust unit + integration tests
 cargo test --release
 
-# All self-contained E2E tests (builds server, runs 6 suites, 31 tests)
+# All self-contained E2E tests (builds server, runs 9 suites, 50 tests)
 node tests/e2e/run-e2e.mjs
 
 # Skip rebuild if binary is current
@@ -364,8 +364,11 @@ E2E test suites:
 | Error Handling | 5 | Invalid JSON, unknown index, empty index, slot recycling |
 | Pagination & Overhead | 6 | Cursor pagination, cache acceleration, expansion, overhead |
 | Save/Unload/Lazy | 4 | Snapshot save, query after save, mutation survival, stats |
+| LowCardinalityString | 7 | Auto-dictionary, case-insensitive, upsert, doc serving, persistence |
+| Delisting | 5 | Availability filtering, delist/relist, blockedFor, combined |
+| Schema Versioning | 7 | Default elision, reconstruction, missing fields, round-trip, snapshot |
 
-Full testing guide: [`docs/testing.md`](docs/testing.md)
+Full testing guide: [`docs/guide/testing.md`](docs/guide/testing.md)
 
 ## Documentation
 
@@ -386,7 +389,7 @@ docs/
 Key docs:
 - **[Performance Baselines](docs/benchmarks/performance-baseline.md)** — Consolidated numbers with commit hashes and regression thresholds
 - **[Benchmark Report](docs/benchmarks/benchmark-report.md)** — 5M-105M scaling analysis
-- **[API Reference](docs/api.md)** — Full endpoint documentation
+- **[API Reference](docs/guide/api.md)** — Full endpoint documentation
 
 ## License
 

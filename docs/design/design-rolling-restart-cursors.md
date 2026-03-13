@@ -1,3 +1,9 @@
+---
+status: IMPLEMENTED (Phases 1-3), APPROVED (Phase 4 — K8s deployment)
+created: 2026-03-10
+updated: 2026-03-13
+---
+
 # Design: Rolling Restarts via Named Cursors
 
 ## Problem

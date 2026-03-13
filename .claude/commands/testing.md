@@ -28,8 +28,9 @@ Guide for running the right tests based on what you changed, and for developing 
 | Files Changed | Required Tests | Command |
 |--------------|----------------|---------|
 | `src/bitmap_fs.rs` | Lib tests + restart test | `cargo test --lib && cargo test --test restart_test` |
-| `src/docstore.rs` | Lib tests + restart test | `cargo test --lib && cargo test --test restart_test` |
+| `src/docstore.rs` | Lib tests + restart test + E2E schema versioning | `cargo test --lib && cargo test --test restart_test` then `node tests/e2e/e2e-schema-versioning.mjs --url <server>` |
 | Snapshot save/restore logic | Restart test + E2E eviction + E2E save-unload | `cargo test --test restart_test` then `node tests/e2e/e2e-eviction.mjs --url <server>` and `node tests/e2e/e2e-save-unload-lazy.mjs --url <server>` |
+| Schema versioning / field elision | Lib tests + E2E schema versioning | `cargo test --lib` then `node tests/e2e/e2e-schema-versioning.mjs --url <server>` |
 
 ### Eviction Changes
 
@@ -199,7 +200,7 @@ const groupResults = [];
 
 ## Existing Test Suites
 
-Full descriptions of all test suites are in `docs/testing.md`.
+Full descriptions of all test suites are in `docs/guide/testing.md`.
 
 ### E2E (Node, against live server)
 | Suite | File | Self-contained | Tests |
@@ -210,6 +211,9 @@ Full descriptions of all test suites are in `docs/testing.md`.
 | Error Handling | `tests/e2e/e2e-error-handling.mjs` | Yes | Invalid JSON, unknown index 404, empty index, slot recycling |
 | Pagination & Overhead | `tests/e2e/e2e-pagination-overhead.mjs` | Yes | Cursor pagination, cache acceleration, expansion, structural overhead |
 | Save/Unload/Lazy | `tests/e2e/e2e-save-unload-lazy.mjs` | Yes | Snapshot save, query after save, mutation survival, stats integrity |
+| LowCardinalityString | `tests/e2e/e2e-low-cardinality-string.mjs` | Yes | Auto-dictionary, case-insensitive, upsert, doc serving, nonexistent value, dict persistence |
+| Delisting | `tests/e2e/e2e-delisting.mjs` | Yes | Availability filtering, delist/relist, blockedFor moderation, combined |
+| Schema Versioning | `tests/e2e/e2e-schema-versioning.mjs` | Yes | Default elision, reconstruction, missing fields, upsert round-trip, snapshot preserves defaults |
 | Unified Cache | `tests/e2e/e2e-unified-cache.mjs` | No (prod data) | Cache population, pagination, mutation/delete maintenance |
 
 ### Integration (Rust, in-process)
@@ -233,4 +237,4 @@ Full descriptions of all test suites are in `docs/testing.md`.
 
 ## Coverage Gaps
 
-See the "E2E Coverage Gap Analysis" section in `docs/testing.md` for 36 prioritized missing scenarios and suggested new test suites.
+See the "E2E Coverage Gap Analysis" section in `docs/guide/testing.md` for 36 prioritized missing scenarios and suggested new test suites.

@@ -1,0 +1,5 @@
+# Storage Learnings
+
+- **Lazy loading beat tiered caching**: Originally designed a two-tier system — Tier 1 (always in memory: alive, sort, low-cardinality filters) + Tier 2 (moka LRU cache over redb for high-cardinality filters like tagIds). Never implemented — the simpler approach of lazy loading bitmaps per-field on first query from BitmapFs achieves the same memory goals. OS page cache transparently manages hot/cold data without application-level cache management. Startup is instant (<1s at 105M), and first-query lazy load times are acceptable (87ms for small fields, 6.6s for tagIds with 31K values).
+
+- **redb replaced by custom filesystem stores**: Started with redb (embedded key-value store) for bitmap persistence. Replaced with custom BitmapFs (hex-bucketed .fpack files) and DocStore (sharded zstd-compressed msgpack). Reasons: simpler, more transparent, POSIX guarantees via atomic rename, better memory control via OS page cache. No embedded transaction manager needed since Postgres is the source of truth.

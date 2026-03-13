@@ -1,6 +1,10 @@
-# BoundStore — Unified Cache Persistence Design
+---
+status: APPROVED
+created: 2026-03-12
+updated: 2026-03-13
+---
 
-**Status:** Approved for implementation
+# BoundStore — Unified Cache Persistence Design
 **Date:** 2026-03-12
 **Authors:** Justin + Claude `1021b98a-d668-4c91-a789-8408e84a35a5`
 **Reviewed by:** Gemini 3.1 Pro, GPT 5.4 (external gap review)

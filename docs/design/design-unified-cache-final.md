@@ -1,6 +1,10 @@
-# Unified Cache Architecture — Final Design
+---
+status: IMPLEMENTED
+created: 2026-03-12
+updated: 2026-03-13
+---
 
-## Status: APPROVED — Ready for implementation
+# Unified Cache Architecture — Final Design
 
 This document captures the finalized design for merging BitDex's trie cache, bound cache, and time bucket systems into a single unified cache. All open questions have been resolved through design discussion.
 
