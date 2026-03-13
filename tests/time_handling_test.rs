@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
-use bitdex_v2::config::{BucketConfig, Config, FilterFieldConfig, SortFieldConfig};
+use bitdex_v2::config::{BucketConfig, Config, DeferredAliveConfig, FilterFieldConfig, SortFieldConfig};
 use bitdex_v2::filter::FilterFieldType;
 use bitdex_v2::mutation::{Document, FieldValue};
 use bitdex_v2::query::{FilterClause, Value};
@@ -40,11 +40,7 @@ fn test_deferred_alive_far_future_invisible() {
             FilterFieldConfig {
                 name: "publishedAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                behaviors: Some(bitdex_v2::config::FieldBehaviors {
-                    deferred_alive: true,
-                    range_buckets: vec![],
-                    sort_field: None,
-                }),
+                behaviors: None,
                 eviction: None,
             },
             FilterFieldConfig {
@@ -64,6 +60,10 @@ fn test_deferred_alive_far_future_invisible() {
         flush_interval_us: 50,
         merge_interval_ms: 100,
         channel_capacity: 10_000,
+        deferred_alive: Some(DeferredAliveConfig {
+            source_field: "publishedAt".to_string(),
+            ms_to_seconds: false,
+        }),
         ..Default::default()
     };
 
@@ -112,11 +112,7 @@ fn test_deferred_alive_past_timestamp_visible() {
             FilterFieldConfig {
                 name: "publishedAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                behaviors: Some(bitdex_v2::config::FieldBehaviors {
-                    deferred_alive: true,
-                    range_buckets: vec![],
-                    sort_field: None,
-                }),
+                behaviors: None,
                 eviction: None,
             },
             FilterFieldConfig {
@@ -136,6 +132,10 @@ fn test_deferred_alive_past_timestamp_visible() {
         flush_interval_us: 50,
         merge_interval_ms: 100,
         channel_capacity: 10_000,
+        deferred_alive: Some(DeferredAliveConfig {
+            source_field: "publishedAt".to_string(),
+            ms_to_seconds: false,
+        }),
         ..Default::default()
     };
 
@@ -171,11 +171,7 @@ fn test_mixed_deferred_and_immediate() {
             FilterFieldConfig {
                 name: "publishedAt".to_string(),
                 field_type: FilterFieldType::SingleValue,
-                behaviors: Some(bitdex_v2::config::FieldBehaviors {
-                    deferred_alive: true,
-                    range_buckets: vec![],
-                    sort_field: None,
-                }),
+                behaviors: None,
                 eviction: None,
             },
         ],
@@ -189,6 +185,10 @@ fn test_mixed_deferred_and_immediate() {
         flush_interval_us: 50,
         merge_interval_ms: 100,
         channel_capacity: 10_000,
+        deferred_alive: Some(DeferredAliveConfig {
+            source_field: "publishedAt".to_string(),
+            ms_to_seconds: false,
+        }),
         ..Default::default()
     };
 

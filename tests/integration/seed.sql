@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS "Image" (
     url TEXT,
     "nsfwLevel" INT DEFAULT 1,
     hash TEXT,
+    flags SMALLINT DEFAULT 0,
     "hideMeta" BOOLEAN DEFAULT false,
     type TEXT DEFAULT 'image',
     "userId" BIGINT DEFAULT 1,

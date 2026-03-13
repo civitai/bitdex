@@ -282,6 +282,57 @@ else
     fail "bitdex-0 has $actual records after post-delete insert (expected >= $expected)"
 fi
 
+# --- Test 11: Health gate — sidecar pauses PG polling when BitDex is down ---
+info "Test 11: Sidecar health gate (BitDex down → no wasted PG work)"
+
+count_before_stop=$(query_count "$BITDEX_0")
+
+# Stop bitdex-0 while sidecar-0 is running
+docker compose -f "$COMPOSE_FILE" stop bitdex-0 2>/dev/null
+echo "  Stopped bitdex-0. Sidecar should detect and pause PG polling."
+
+# Wait for at least 2 poll cycles (poll_interval=2s) so sidecar detects the failure
+sleep 8
+
+# Insert rows into PG while BitDex is down — outbox will grow
+pg_sql "INSERT INTO \"Image\" (id, \"postId\", url, \"nsfwLevel\", type, \"userId\") VALUES (301, 10, 'during-down-301.jpg', 1, 'image', 888)"
+pg_sql "INSERT INTO \"Image\" (id, \"postId\", url, \"nsfwLevel\", type, \"userId\") VALUES (302, 10, 'during-down-302.jpg', 1, 'image', 888)"
+pg_sql "INSERT INTO \"Image\" (id, \"postId\", url, \"nsfwLevel\", type, \"userId\") VALUES (303, 10, 'during-down-303.jpg', 1, 'image', 888)"
+echo "  Inserted 3 images while bitdex-0 is down."
+
+# Wait for sidecar to log the health gate message
+sleep 5
+sidecar_logs=$(docker compose -f "$COMPOSE_FILE" logs sidecar-0 2>/dev/null)
+if echo "$sidecar_logs" | grep -q "BitDex is unreachable"; then
+    pass "sidecar-0 detected BitDex down and paused PG polling"
+else
+    fail "sidecar-0 did not log health gate message"
+fi
+
+# Restart bitdex-0
+docker compose -f "$COMPOSE_FILE" start bitdex-0 2>/dev/null
+echo "  Restarted bitdex-0. Waiting for health..."
+until curl -sf "$BITDEX_0/api/health" > /dev/null 2>&1; do sleep 1; done
+echo "  bitdex-0 is back."
+
+# Verify sidecar resumed and the 3 images eventually propagate
+expected=$((count_before_stop + 3))
+if wait_for_gte "bitdex-0 has >= $expected records" "query_count $BITDEX_0" "$expected" 45; then
+    actual=$(query_count "$BITDEX_0")
+    pass "bitdex-0 received queued inserts after recovery (total: $actual)"
+else
+    actual=$(query_count "$BITDEX_0" 2>/dev/null || echo "error")
+    fail "bitdex-0 has $actual records after recovery (expected >= $expected)"
+fi
+
+# Verify sidecar logged the resumption
+sidecar_logs_after=$(docker compose -f "$COMPOSE_FILE" logs sidecar-0 2>/dev/null)
+if echo "$sidecar_logs_after" | grep -q "BitDex is back"; then
+    pass "sidecar-0 detected BitDex recovery and resumed"
+else
+    fail "sidecar-0 did not log resumption message"
+fi
+
 # ===========================================================================
 echo ""
 echo "========================================"
