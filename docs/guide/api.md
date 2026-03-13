@@ -6,6 +6,53 @@ All endpoints accept and return JSON. Content-Type: `application/json`.
 
 ---
 
+## Server CLI
+
+```bash
+cargo run --release --features server --bin server -- [OPTIONS]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port <N>` | `3000` | HTTP listen port |
+| `--data-dir <PATH>` | `./data` | Root directory for index storage (config, docstore, bitmaps) |
+| `--rebuild` | off | Rebuild all bitmap indexes from docstore before serving (see below) |
+
+### `--rebuild` — Full Bitmap Rebuild on Boot
+
+Deletes existing bitmap files, rebuilds every filter and sort index from the on-disk docstore using the current config, persists the result via `save_and_unload()`, then starts the HTTP listener.
+
+**Use cases:**
+- **Config changes** — added/removed fields, changed field types, updated sort encoding
+- **Corruption recovery** — bitmap files damaged or out of sync with docstore
+- **Fresh deployment** — docstore populated by pg-sync or NDJSON loader, bitmaps not yet built
+
+**What happens:**
+1. Server loads the index config and docstore (normal restore path)
+2. Existing bitmaps directory is deleted and recreated
+3. `build_all_from_docstore()` reads every docstore shard using packed decode, builds all filter + sort bitmaps via channel-based merge (rayon workers → bounded channel → merge thread)
+4. `save_and_unload()` persists bitmaps to disk via zero-copy `fused_cow()`, then unloads them from memory
+5. Server starts listening — first queries trigger lazy bitmap loading from the freshly written files
+
+**Performance at 105M records** (Justin's dev machine, NVMe):
+- Build phase: 98–120s (~1M docs/s)
+- Persist phase: 37–49s
+- Total: ~2.5 min, 20–22 GB peak RSS
+- Disk footprint: ~8 GB (7.2 GB filter + 866 MB sort + 15 MB system)
+
+See `docs/benchmarks/performance-baseline.md` for full baselines and regression thresholds.
+
+**Example:**
+```bash
+cargo run --release --features server --bin server -- --rebuild --port 3001 --data-dir ./data
+```
+
+### Normal Boot (no `--rebuild`)
+
+Restores config and docstore from `--data-dir`. Bitmaps load lazily from disk on first query per field. Startup completes in <1s at 105M records.
+
+---
+
 ## Index Management
 
 ### Create Index
@@ -583,7 +630,7 @@ Clears all unified cache entries. Cache will rebuild on subsequent queries.
 POST /api/indexes/{name}/rebuild
 ```
 
-Reconstructs sort and/or filter bitmaps from the on-disk document store. Runs asynchronously. Poll `/load/status` for progress.
+Reconstructs sort and/or filter bitmaps from the on-disk document store. Runs asynchronously. Poll `/load/status` for progress. Uses the same `build_all_from_docstore()` pipeline as the `--rebuild` CLI flag, but supports selective field rebuilds.
 
 **Request body:**
 
