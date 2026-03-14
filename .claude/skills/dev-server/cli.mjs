@@ -448,15 +448,12 @@ const LOG_FORMATTERS = [
   {
     match: /^(WHERE\s+.+)$/,
     format: (m, w) => {
+      // Use function replacers (not string patterns) to avoid escaping issues
       let q = m[1];
-      // Color SQL-like keywords
-      q = q.replace(/\b(WHERE|AND|OR|NOT|IN|ORDER BY|LIMIT|CURSOR)\b/g, `${MAG}$1${R}`);
-      // Color operators
-      q = q.replace(/([><=!]+)/g, `${DIM}$1${R}`);
-      // Color field names before operators
-      q = q.replace(/\b(nsfwLevel|userId|baseModel|isPublished|type|sortAtUnix|collectedCount|reactionCount|sortAt)\b/g, `${BLU}$1${R}`);
-      // Color sort direction
-      q = q.replace(/\b(Asc|Desc)\b/g, `${YLW}$1${R}`);
+      q = q.replace(/\b(WHERE|AND|OR|NOT|IN|ORDER BY|LIMIT|CURSOR)\b/g, (kw) => MAG + kw + R);
+      q = q.replace(/([><=!]+)/g, (op) => DIM + op + R);
+      q = q.replace(/\b(nsfwLevel|userId|baseModel|isPublished|type|sortAtUnix|collectedCount|reactionCount|sortAt|modelVersionIds|modelVersionIdsManual|tagIds|toolIds|techniqueIds|postId|availability|blockedFor|hasMeta|isRemix|minor|onSite|poi)\b/g, (f) => BLU + f + R);
+      q = q.replace(/\b(Asc|Desc)\b/g, (d) => YLW + d + R);
       return q;
     },
   },
@@ -483,17 +480,13 @@ const LOG_FORMATTERS = [
 ];
 
 function formatLogBody(body, maxW) {
+  // Truncate plain text FIRST, then apply formatting — this keeps ANSI sequences intact
+  const truncated = body.length > maxW ? body.slice(0, maxW) : body;
   for (const fmt of LOG_FORMATTERS) {
-    const m = body.match(fmt.match);
-    if (m) {
-      const result = fmt.format(m, maxW);
-      // Strip ANSI for length check, truncate visible content
-      const vis = result.replace(ANSI_RE, '');
-      return vis.length > maxW ? result.slice(0, result.length - (vis.length - maxW)) : result;
-    }
+    const m = truncated.match(fmt.match);
+    if (m) return fmt.format(m, maxW);
   }
-  // No formatter matched — return plain, truncated
-  return body.length > maxW ? body.slice(0, maxW) : body;
+  return truncated;
 }
 
 function trunc(str, n) {
@@ -647,18 +640,15 @@ async function cmdDashboard() {
           lvlStr = entry.level === 'daemon' ? 'DAE' : '';
           body = raw;
         }
-        // Color the level
+        // Level indicator
         let lvl;
         switch (lvlStr) {
-          case 'ERROR': lvl = `${RED}ERR${R}`; break;
-          case 'WARN':  lvl = `${YLW}WRN${R}`; break;
-          case 'INFO':  lvl = `${GRN}INF${R}`; break;
-          case 'DEBUG': lvl = `${DIM}DBG${R}`; break;
-          case 'TRACE': lvl = `${DIM}TRC${R}`; break;
-          case 'DAE':   lvl = `${CYN}DAE${R}`; break;
-          default:      lvl = '   ';
+          case 'ERROR': lvl = `${RED}✖${R}`; break;
+          case 'WARN':  lvl = `${YLW}⚠${R}`; break;
+          case 'DAE':   lvl = `${CYN}●${R}`; break;
+          default:      lvl = ' ';
         }
-        const msgMax = cols - 14;
+        const msgMax = cols - 13;
         const msg = formatLogBody(body, msgMax);
         buf.push(CLR_LINE + `  ${DIM}${ts}${R} ${lvl} ${msg}` + '\n');
       } else {
