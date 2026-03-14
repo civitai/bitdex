@@ -311,6 +311,24 @@ impl<'a> QueryExecutor<'a> {
 
         for (i, clause) in clauses.iter().enumerate() {
             let t0 = std::time::Instant::now();
+
+            // Fast path: for Eq on clean bitmaps, AND directly by reference
+            // without materializing the full clause bitmap.
+            if let Some(ref mut acc) = result {
+                if let Some(applied) = self.try_and_by_ref(acc, clause) {
+                    let elapsed = t0.elapsed();
+                    let result_card = acc.len();
+                    tracing::debug!(
+                        "    clause[{}]: and_ref={:.1}ms → {} | {}",
+                        i, elapsed.as_secs_f64() * 1000.0, result_card, clause
+                    );
+                    if let Err(e) = applied {
+                        return Err(e);
+                    }
+                    continue;
+                }
+            }
+
             let bitmap = self.evaluate_clause(clause)?;
             let eval_elapsed = t0.elapsed();
             let bm_card = bitmap.len();
@@ -329,6 +347,46 @@ impl<'a> QueryExecutor<'a> {
         }
 
         Ok(result.unwrap_or_default())
+    }
+
+    /// Try to AND a clause directly into the accumulator by reference, avoiding
+    /// materialization of the full clause bitmap. Returns Some(Ok(())) if handled,
+    /// Some(Err) on error, None if this clause can't be fast-pathed.
+    fn try_and_by_ref(&self, acc: &mut RoaringBitmap, clause: &FilterClause) -> Option<Result<()>> {
+        match clause {
+            FilterClause::Eq(field, value) => {
+                if field == "id" { return None; }
+                let ff = self.filters.get_field(field)?;
+                let key = self.resolve_value_key(field, value)?;
+                let vb = ff.get_versioned(key)?;
+                // AND accumulator directly with the base/fused bitmap by reference
+                let cow = vb.fused_cow();
+                *acc &= cow.as_ref();
+                Some(Ok(()))
+            }
+            FilterClause::In(field, values) => {
+                if field == "id" { return None; }
+                let ff = self.filters.get_field(field)?;
+                // Distribute AND over OR: (acc & val1) | (acc & val2) | ...
+                // When acc is small, this avoids materializing the full union.
+                let mut union = RoaringBitmap::new();
+                for v in values {
+                    if let Some(key) = self.resolve_value_key(field, v) {
+                        if let Some(vb) = ff.get_versioned(key) {
+                            let cow = vb.fused_cow();
+                            union |= &*acc & cow.as_ref();
+                        }
+                    }
+                }
+                *acc = union;
+                Some(Ok(()))
+            }
+            FilterClause::BucketBitmap { bitmap, .. } => {
+                *acc &= bitmap.as_ref();
+                Some(Ok(()))
+            }
+            _ => None, // Can't fast-path compound/Not/range clauses
+        }
     }
 
     /// Evaluate a single filter clause to a bitmap.
