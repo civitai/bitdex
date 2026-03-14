@@ -46,10 +46,8 @@ use super::table_streams;
 /// This replaces the 60GB memory-mapped SlotArena.
 #[derive(Debug)]
 struct ImageScalars {
-    // Doc-only fields (not in any bitmap, must be stored)
-    url: Option<String>,
-    hash: Option<String>,
-    // Scalar fields also in bitmaps, but cheaper to store than reconstruct
+    url: Option<Box<str>>,   // Box<str> instead of String saves 8 bytes/entry (no capacity field)
+    hash: Option<Box<str>>,
     nsfw_level: u8,
     user_id: u64,
     image_type: u8,      // encoded via encode_image_type
@@ -576,10 +574,14 @@ pub async fn run_bulk_load_copy(
         let sort_at = row.sort_at_secs();
         let published_at_ms = (row.published_at_secs.unwrap_or(0) * 1000) as u64;
 
-        // Store compact scalars (replaces arena.write_scalars)
+        // Extract strings before borrowing row for flags
+        let url_box = row.url.take().map(|s| s.into_boxed_str());
+        let hash_box = row.hash.take().map(|s| s.into_boxed_str());
+
+        // Store scalars + doc_only strings (Box<str> saves capacity overhead vs String)
         image_scalars.insert(slot, ImageScalars {
-            url: row.url.clone(),
-            hash: row.hash.clone(),
+            url: url_box,
+            hash: hash_box,
             nsfw_level: row.nsfw_level as u8,
             user_id: row.user_id as u64,
             image_type: super::slot_arena::encode_image_type(Some(&row.image_type)),
@@ -1079,10 +1081,10 @@ fn scalars_to_json(
             obj.insert("minor".into(), serde_json::json!(true));
         }
         if let Some(ref url) = s.url {
-            obj.insert("url".into(), serde_json::json!(url));
+            obj.insert("url".into(), serde_json::json!(url.as_ref()));
         }
         if let Some(ref hash) = s.hash {
-            obj.insert("hash".into(), serde_json::json!(hash));
+            obj.insert("hash".into(), serde_json::json!(hash.as_ref()));
         }
         if s.blocked_for > 0 {
             obj.insert("blockedFor".into(), serde_json::json!("blocked"));
@@ -1129,8 +1131,8 @@ mod tests {
 
     fn make_scalars(slot: u32) -> ImageScalars {
         ImageScalars {
-            url: Some(format!("https://example.com/{slot}.jpg")),
-            hash: Some(format!("hash{slot}")),
+            url: Some(format!("https://example.com/{slot}.jpg").into_boxed_str()),
+            hash: Some(format!("hash{slot}").into_boxed_str()),
             nsfw_level: 1,
             user_id: slot as u64 * 7,
             image_type: 0, // "image"
