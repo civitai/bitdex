@@ -27,6 +27,8 @@ pub struct QueryTrace {
     pub sort_us: u64,
     pub result_count: u64,
     pub cache_hit: bool,
+    pub docs_us: u64,
+    pub docs_count: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -101,6 +103,8 @@ impl QueryTraceCollector {
             sort_us: self.sort_us,
             result_count,
             cache_hit: self.cache_hit,
+            docs_us: 0,
+            docs_count: 0,
             clauses: self.clauses,
             sort: self.sort,
         }
@@ -313,6 +317,8 @@ mod tests {
             filter_us: 800,
             sort_us: 150,
             result_count: 42,
+            docs_us: 0,
+            docs_count: 0,
             cache_hit: false,
             clauses: vec![],
             sort: None,

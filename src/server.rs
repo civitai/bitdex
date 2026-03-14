@@ -1381,24 +1381,15 @@ async fn handle_query(
         Ok((result, trace)) => {
             let elapsed = start.elapsed();
             let elapsed_us = elapsed.as_micros() as u64;
-            let cache_tag = if trace.cache_hit { " cache" } else { "" };
-            tracing::info!(
-                "[{name}]   → {} results  total={elapsed_us}μs  plan={}μs  filter={}μs  sort={}μs{cache_tag}",
-                result.total_matched, trace.plan_us, trace.filter_us, trace.sort_us
-            );
             m.query_total.with_label_values(&[&name]).inc();
             m.query_duration_seconds
                 .with_label_values(&[&name])
                 .observe(elapsed.as_secs_f64());
 
-            // Write trace to JSONL in background (non-blocking)
-            let data_dir = state.data_dir.clone();
-            std::thread::spawn(move || {
-                crate::query_metrics::write_trace(&data_dir, &trace);
-            });
-
             let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
 
+            // Fetch documents (timed separately for trace)
+            let doc_start = Instant::now();
             let documents = if !include_docs.is_none() {
                 let mut docs = Vec::with_capacity(result.ids.len());
                 for &id in &result.ids {
@@ -1414,6 +1405,26 @@ async fn handle_query(
             } else {
                 None
             };
+            let docs_us = doc_start.elapsed().as_micros() as u64;
+            let docs_count = documents.as_ref().map_or(0, |d| d.len()) as u64;
+
+            // Update trace with doc fetch timing
+            let mut trace = trace;
+            trace.docs_us = docs_us;
+            trace.docs_count = docs_count;
+
+            let cache_tag = if trace.cache_hit { " cache" } else { "" };
+            let docs_tag = if docs_count > 0 { format!("  docs={}μs({})", docs_us, docs_count) } else { String::new() };
+            tracing::info!(
+                "[{name}]   → {} results  total={elapsed_us}μs  plan={}μs  filter={}μs  sort={}μs{docs_tag}{cache_tag}",
+                result.total_matched, trace.plan_us, trace.filter_us, trace.sort_us
+            );
+
+            // Write trace to JSONL in background (non-blocking)
+            let data_dir = state.data_dir.clone();
+            std::thread::spawn(move || {
+                crate::query_metrics::write_trace(&data_dir, &trace);
+            });
 
             let mut response = serde_json::json!({
                 "ids": result.ids,
