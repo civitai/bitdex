@@ -2529,6 +2529,115 @@ impl ConcurrentEngine {
         };
         let fetch_limit = query.limit.saturating_add(offset);
 
+        // ── Cache miss with sort: seed cache FIRST, serve from cache (one traversal) ──
+        // The seed traversal (4K results) is a superset of the user's request (e.g. 50),
+        // so we do one traversal instead of two.
+        if unified_hit.is_none() && unified_key.is_some() && query.sort.is_some() {
+            let ukey = unified_key.unwrap();
+            let sort_clause = query.sort.as_ref().unwrap();
+
+            if full_total_matched == 0 {
+                // Zero-result cache: empty bitmap, no sort traversal needed.
+                let value_fn = |_slot: u32| -> u32 { 0 };
+                self.unified_cache.lock().form_and_store(
+                    ukey,
+                    &[],
+                    false,
+                    full_total_matched,
+                    value_fn,
+                );
+                let result = QueryResult {
+                    ids: vec![],
+                    total_matched: full_total_matched,
+                    cursor: None,
+                };
+                // post_validate not needed for empty results, but call for consistency
+                let mut result = result;
+                self.post_validate(&mut result, &query.filters, executor)?;
+                return Ok(result);
+            }
+
+            // Seed the cache with initial_capacity (4K) results — single sort traversal.
+            let initial_cap = self.unified_cache.lock().config().initial_capacity;
+            let seed_result = executor.execute_from_bitmap_unclamped(
+                &filter_arc,
+                query.sort.as_ref(),
+                initial_cap,
+                None,
+                use_simple_sort,
+            )?;
+            let sort_field = snap.sorts.get_field(&sort_clause.field);
+            let sorted_slots: Vec<u32> = seed_result.ids.iter().map(|&id| id as u32).collect();
+            let has_more = full_total_matched > sorted_slots.len() as u64;
+            let value_fn = |slot: u32| -> u32 {
+                sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+            };
+            self.unified_cache.lock().form_and_store(
+                ukey.clone(),
+                &sorted_slots,
+                has_more,
+                full_total_matched,
+                value_fn,
+            );
+
+            // Serve the user's results from the freshly seeded cache.
+            let cached_keys = {
+                let mut uc = self.unified_cache.lock();
+                uc.lookup(&ukey).and_then(|entry| entry.sorted_keys().map(Arc::clone))
+            };
+
+            let mut result = if let Some(ref keys) = cached_keys {
+                executor.execute_from_sorted_keys(
+                    keys, &sort_clause.field, sort_clause.direction,
+                    fetch_limit, query.cursor.as_ref(), full_total_matched,
+                )?
+            } else {
+                // sorted_keys not available (shouldn't happen for fresh seed), fall back to bitmap
+                let cached_bm = {
+                    let mut uc = self.unified_cache.lock();
+                    uc.lookup(&ukey).map(|entry| Arc::clone(entry.bitmap()))
+                };
+                if let Some(ref bm) = cached_bm {
+                    let use_simple = bm.len() < 10_000;
+                    executor.execute_from_bitmap(
+                        bm, query.sort.as_ref(), fetch_limit,
+                        query.cursor.as_ref(), use_simple,
+                    )?
+                } else {
+                    // Cache entry vanished (eviction race), fall back to filter bitmap
+                    executor.execute_from_bitmap(
+                        &filter_arc, query.sort.as_ref(), fetch_limit,
+                        query.cursor.as_ref(), use_simple_sort,
+                    )?
+                }
+            };
+
+            result.total_matched = full_total_matched;
+
+            // Apply offset
+            if offset > 0 && !result.ids.is_empty() {
+                if offset >= result.ids.len() {
+                    result.ids.clear();
+                    result.cursor = None;
+                } else {
+                    result.ids = result.ids.split_off(offset);
+                    if let Some(&last_id) = result.ids.last() {
+                        let slot = last_id as u32;
+                        if let Some(sort_field_ref) = snap.sorts.get_field(&sort_clause.field) {
+                            result.cursor = Some(crate::query::CursorPosition {
+                                sort_value: sort_field_ref.reconstruct_value(slot) as u64,
+                                slot_id: slot,
+                            });
+                        }
+                    }
+                }
+            }
+
+            self.post_validate(&mut result, &query.filters, executor)?;
+            return Ok(result);
+        }
+
+        // ── Cache hit or unsorted query path ──
         let bound_was_applied = effective_bitmap.len() < filter_arc.len();
         let mut result = executor.execute_from_bitmap(
             &effective_bitmap,
@@ -2621,46 +2730,6 @@ impl ConcurrentEngine {
                             });
                         }
                     }
-                }
-            }
-        }
-
-        // Unified cache formation: on miss, seed a cache entry.
-        // Zero-result queries get an empty entry (costs ~1 byte, avoids repeated filter traversals).
-        if unified_hit.is_none() {
-            if let Some(ukey) = unified_key {
-                if result.ids.is_empty() {
-                    // Zero-result cache: empty bitmap, total_matched=0, no sort traversal needed.
-                    let value_fn = |_slot: u32| -> u32 { 0 };
-                    self.unified_cache.lock().form_and_store(
-                        ukey,
-                        &[],
-                        false,
-                        full_total_matched,
-                        value_fn,
-                    );
-                } else {
-                    let initial_cap = self.unified_cache.lock().config().initial_capacity;
-                    let seed_result = executor.execute_from_bitmap_unclamped(
-                        &filter_arc,
-                        query.sort.as_ref(),
-                        initial_cap,
-                        None,
-                        use_simple_sort,
-                    )?;
-                    let sort_field = snap.sorts.get_field(&ukey.sort_field);
-                    let sorted_slots: Vec<u32> = seed_result.ids.iter().map(|&id| id as u32).collect();
-                    let has_more = full_total_matched > sorted_slots.len() as u64;
-                    let value_fn = |slot: u32| -> u32 {
-                        sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                    };
-                    self.unified_cache.lock().form_and_store(
-                        ukey,
-                        &sorted_slots,
-                        has_more,
-                        full_total_matched,
-                        value_fn,
-                    );
                 }
             }
         }
