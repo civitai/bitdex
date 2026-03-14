@@ -131,6 +131,10 @@ harness = false
 name = "columnar_loader"
 harness = false
 
+[[bench]]
+name = "bound_store_bench"
+harness = false
+
 [[bin]]
 name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"

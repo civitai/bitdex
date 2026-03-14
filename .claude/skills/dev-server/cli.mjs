@@ -357,6 +357,12 @@ async function cmdTestE2e() {
   }
 }
 
+async function cmdForceKill() {
+  const result = await daemonFetch('/force-kill', { method: 'POST' });
+  console.error(result.message);
+  console.log(JSON.stringify(result, null, 2));
+}
+
 async function cmdShutdown() {
   const result = await daemonFetch('/shutdown', { method: 'POST' });
   console.log(JSON.stringify(result, null, 2));
@@ -454,6 +460,7 @@ async function cmdDashboard() {
   let running = true;
   let actionMsg = '';
   let inputMode = null;  // null or { prompt, buffer, callback }
+  let showStats = false; // 'i' toggles detailed stats panel
 
   function flash(msg) { actionMsg = msg; setTimeout(() => { actionMsg = ''; }, 4000); }
 
@@ -487,16 +494,20 @@ async function cmdDashboard() {
     }
     buf.push(CLR_LINE + DIM + '─'.repeat(cols) + R + '\n');
 
-    // ── Datasets + Locks
+    // ── Stats + Locks (side by side)
     const hw = Math.floor(cols / 2);
-    buf.push(CLR_LINE + B + ' Datasets' + R + ' '.repeat(Math.max(0, hw - 10)) + B + 'Locks' + R + '\n');
+    const selInst = showInstances.find(i => i.id === (selectedInstance || showInstances[0]?.id));
+    const st = selInst?.stats;
 
-    const dsL = status.datasets.length === 0
-      ? [`  ${DIM}(none)${R}`]
-      : status.datasets.map(ds => {
-          const rel = relative(PROJECT_ROOT, ds.path).replace(/\\/g, '/') || ds.path;
-          return `  ${pad(trunc(rel, hw - 20), hw - 18)}${pad(fmtCount(ds.recordCount), 8)}${pad(fmtBytes(ds.diskBytes), 8)}`;
-        });
+    buf.push(CLR_LINE + B + ' Stats' + R + ' '.repeat(Math.max(0, hw - 7)) + B + 'Locks' + R + '\n');
+
+    const stL = [];
+    if (st) {
+      stL.push(`  Bitmaps: ${CYN}${st.total_bitmap_mb}${R} MB ${DIM}(filter ${st.filter_bitmap_mb} + sort ${st.sort_bitmap_mb} + slot ${st.slot_bitmap_mb})${R}`);
+      stL.push(`  Cache:   ${CYN}${st.cache_entries}${R} entries ${DIM}(${fmtBytes(st.cache_bytes)}, hit ${st.cache_hit_rate})${R}`);
+    } else {
+      stL.push(`  ${DIM}(waiting for stats...)${R}`);
+    }
 
     const lkL = [];
     lkL.push(status.build.locked
@@ -506,11 +517,24 @@ async function cmdDashboard() {
       ? `  E2E:   ${YLW}HELD${R} by ${trunc(status.e2e.holder, 20)} (${status.e2e.elapsed_s}s)`
       : `  E2E:   ${GRN}FREE${R}`);
 
-    for (let i = 0; i < Math.max(dsL.length, lkL.length); i++) {
-      const dl = dsL[i] || '';
+    for (let i = 0; i < Math.max(stL.length, lkL.length); i++) {
+      const sl = stL[i] || '';
       const ll = lkL[i] || '';
-      const dv = dl.replace(/\x1b\[[0-9;]*m/g, '');
-      buf.push(CLR_LINE + dl + ' '.repeat(Math.max(0, hw - dv.length)) + ll + '\n');
+      const sv = sl.replace(/\x1b\[[0-9;]*m/g, '');
+      buf.push(CLR_LINE + sl + ' '.repeat(Math.max(0, hw - sv.length)) + ll + '\n');
+    }
+
+    // ── Expanded stats panel (toggle with 'i')
+    if (showStats && st) {
+      buf.push(CLR_LINE + DIM + '─── detail ' + '─'.repeat(Math.max(0, cols - 12)) + R + '\n');
+      buf.push(CLR_LINE + `  ${DIM}Alive:${R} ${fmtCount(st.alive_count)}  ${DIM}Slots:${R} ${fmtCount(st.slot_count)}  ${DIM}Flush:${R} ${st.flush_cycle}` + '\n');
+      buf.push(CLR_LINE + `  ${DIM}Cache hits:${R} ${st.cache_hits}  ${DIM}misses:${R} ${st.cache_misses}  ${DIM}rate:${R} ${st.cache_hit_rate}` + '\n');
+      if (st.cache_details.length > 0) {
+        buf.push(CLR_LINE + `  ${DIM}Cache entries:${R}` + '\n');
+        for (const ce of st.cache_details.slice(0, 5)) {
+          buf.push(CLR_LINE + `    ${CYN}${ce.sort_field}${R} ${ce.direction} — ${ce.cardinality}/${ce.capacity} items, ${ce.filter_count} filters ${ce.has_more ? DIM + '(more)' + R : ''}` + '\n');
+        }
+      }
     }
 
     // ── Build status
@@ -531,7 +555,7 @@ async function cmdDashboard() {
     buf.push(CLR_LINE + DIM + sep + '─'.repeat(Math.max(0, cols - sep.length)) + R + '\n');
 
     // ── Log area (fixed row count, matches ai-notifications pattern)
-    const HEADER_ROWS = 11;
+    const HEADER_ROWS = showStats ? 18 : 12;
     const FOOTER_ROWS = 2;
     const logAreaRows = Math.max(1, rows - HEADER_ROWS - FOOTER_ROWS);
     const visible = logLines.slice(-logAreaRows);
@@ -556,7 +580,7 @@ async function cmdDashboard() {
     if (actionMsg) {
       buf.push(CLR_LINE + ` ${YLW}${actionMsg}${R}` + CLR_BELOW);
     } else {
-      buf.push(CLR_LINE + `  ${DIM}1-9${R} select  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill all${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
+      buf.push(CLR_LINE + `  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill all${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
     }
 
     write(buf.join(''));
@@ -604,9 +628,12 @@ async function cmdDashboard() {
       process.exit(0);
     }
 
-    if (key === 's' && selectedInstance) {
-      flash(`Stopping ${selectedInstance}...`);
-      await daemonFetch(`/instances/${selectedInstance}`, { method: 'DELETE' });
+    if (key === 's') {
+      const st = await daemonFetch('/status');
+      const target = selectedInstance || st.instances.find(i => i.status === 'running' || i.status === 'starting')?.id;
+      if (!target) { flash('No instance to stop'); return; }
+      flash(`Stopping ${target}...`);
+      await daemonFetch(`/instances/${target}`, { method: 'DELETE' });
       selectedInstance = null;
     }
 
@@ -616,6 +643,11 @@ async function cmdDashboard() {
       selectedInstance = null;
     }
 
+    if (key === 'i') {
+      showStats = !showStats;
+      flash(showStats ? 'Stats: expanded' : 'Stats: compact');
+    }
+
     if (key === 'b') {
       flash('Building bitdex-server...');
       try {
@@ -623,15 +655,28 @@ async function cmdDashboard() {
       } catch (e) { flash(`Build error: ${e.message}`); }
     }
 
-    if (key === 'r' && selectedInstance) {
-      flash(`Restarting ${selectedInstance}...`);
-      const inst = (await daemonFetch('/status')).instances.find(i => i.id === selectedInstance);
+    if (key === 'r') {
+      const st = await daemonFetch('/status');
+      const target = selectedInstance || st.instances.find(i => i.status === 'running' || i.status === 'starting')?.id;
+      if (!target) { flash('No instance to restart'); return; }
+      const inst = st.instances.find(i => i.id === target);
       if (inst) {
-        await daemonFetch(`/instances/${selectedInstance}`, { method: 'DELETE' });
+        flash(`Restarting ${target}...`);
+        await daemonFetch(`/instances/${target}`, { method: 'DELETE' });
         await sleep(1500);
         await daemonFetch('/instances', { method: 'POST', body: { port: inst.port, dataDir: inst.dataDir, worktree: inst.worktree } });
-        flash(`Restarted ${selectedInstance}`);
+        flash(`Restarted ${target}`);
+        logLines = []; logCursor = -1; lastLogTarget = null;
       }
+    }
+
+    if (key === 'K') {
+      flash('Force-killing ALL bitdex-server processes...');
+      try {
+        const result = await daemonFetch('/force-kill', { method: 'POST' });
+        flash(result.message);
+        selectedInstance = null;
+      } catch (e) { flash(`Error: ${e.message}`); }
     }
 
     if (key === 'n') {
@@ -752,6 +797,7 @@ async function main() {
     case 'build': return cmdBuild();
     case 'test-e2e': return cmdTestE2e();
     case 'dash': case 'dashboard': return cmdDashboard();
+    case 'force-kill': return cmdForceKill();
     case 'shutdown': return cmdShutdown();
     default:
       console.error(`Unknown command: ${command}`);

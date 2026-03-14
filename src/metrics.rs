@@ -45,6 +45,18 @@ pub struct Metrics {
     // -- Eviction --
     pub eviction_total: IntGaugeVec,
     pub eviction_resident_values: IntGaugeVec,
+
+    // -- BoundStore (cache persistence) --
+    pub boundstore_meta_entries: IntGaugeVec,
+    pub boundstore_tombstones: IntGaugeVec,
+    pub boundstore_pending_shards: IntGaugeVec,
+    pub boundstore_disk_bytes: IntGaugeVec,
+    pub boundstore_shard_loads_total: IntGaugeVec,
+    pub boundstore_tombstones_created: IntGaugeVec,
+    pub boundstore_tombstones_cleaned: IntGaugeVec,
+    pub boundstore_entries_restored: IntGaugeVec,
+    pub boundstore_bytes_written: IntGaugeVec,
+    pub boundstore_bytes_read: IntGaugeVec,
 }
 
 impl Metrics {
@@ -204,6 +216,48 @@ impl Metrics {
         )
         .unwrap();
 
+        // BoundStore metrics
+        let boundstore_meta_entries = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_meta_entries", "Cache entries registered in meta-index"),
+            &["index"],
+        ).unwrap();
+        let boundstore_tombstones = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_tombstones", "Current tombstone count"),
+            &["index"],
+        ).unwrap();
+        let boundstore_pending_shards = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_pending_shards", "Shards awaiting lazy load"),
+            &["index"],
+        ).unwrap();
+        let boundstore_disk_bytes = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_disk_bytes", "Total bounds directory size on disk"),
+            &["index"],
+        ).unwrap();
+        let boundstore_shard_loads_total = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_shard_loads_total", "Cumulative shard load events"),
+            &["index"],
+        ).unwrap();
+        let boundstore_tombstones_created = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_tombstones_created_total", "Cumulative tombstones created"),
+            &["index"],
+        ).unwrap();
+        let boundstore_tombstones_cleaned = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_tombstones_cleaned_total", "Cumulative tombstones cleaned"),
+            &["index"],
+        ).unwrap();
+        let boundstore_entries_restored = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_entries_restored_total", "Cumulative entries loaded from shard"),
+            &["index"],
+        ).unwrap();
+        let boundstore_bytes_written = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_bytes_written_total", "Cumulative bytes written to bounds"),
+            &["index"],
+        ).unwrap();
+        let boundstore_bytes_read = IntGaugeVec::new(
+            Opts::new("bitdex_boundstore_bytes_read_total", "Cumulative bytes read from bounds"),
+            &["index"],
+        ).unwrap();
+
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
         registry.register(Box::new(slot_high_water.clone())).unwrap();
@@ -251,6 +305,16 @@ impl Metrics {
         registry
             .register(Box::new(eviction_resident_values.clone()))
             .unwrap();
+        registry.register(Box::new(boundstore_meta_entries.clone())).unwrap();
+        registry.register(Box::new(boundstore_tombstones.clone())).unwrap();
+        registry.register(Box::new(boundstore_pending_shards.clone())).unwrap();
+        registry.register(Box::new(boundstore_disk_bytes.clone())).unwrap();
+        registry.register(Box::new(boundstore_shard_loads_total.clone())).unwrap();
+        registry.register(Box::new(boundstore_tombstones_created.clone())).unwrap();
+        registry.register(Box::new(boundstore_tombstones_cleaned.clone())).unwrap();
+        registry.register(Box::new(boundstore_entries_restored.clone())).unwrap();
+        registry.register(Box::new(boundstore_bytes_written.clone())).unwrap();
+        registry.register(Box::new(boundstore_bytes_read.clone())).unwrap();
 
         Self {
             registry,
@@ -274,6 +338,16 @@ impl Metrics {
             pending_fields,
             eviction_total,
             eviction_resident_values,
+            boundstore_meta_entries,
+            boundstore_tombstones,
+            boundstore_pending_shards,
+            boundstore_disk_bytes,
+            boundstore_shard_loads_total,
+            boundstore_tombstones_created,
+            boundstore_tombstones_cleaned,
+            boundstore_entries_restored,
+            boundstore_bytes_written,
+            boundstore_bytes_read,
         }
     }
 

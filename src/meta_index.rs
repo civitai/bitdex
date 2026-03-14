@@ -80,6 +80,10 @@ pub struct MetaIndex {
 
     /// Registration records for clean deregistration.
     registrations: HashMap<CacheEntryId, EntryRegistration>,
+
+    /// Tombstoned entry IDs — entries that can't be maintained because their
+    /// shard isn't loaded. Persisted in meta.bin, cleaned up on shard rewrite.
+    tombstoned: RoaringBitmap,
 }
 
 impl MetaIndex {
@@ -91,6 +95,7 @@ impl MetaIndex {
             field_bitmaps: HashMap::new(),
             sort_bitmaps: HashMap::new(),
             registrations: HashMap::new(),
+            tombstoned: RoaringBitmap::new(),
         }
     }
 
@@ -294,6 +299,119 @@ impl MetaIndex {
             op: op.to_string(),
             value_repr: value_repr.to_string(),
         })
+    }
+
+    // ── Persistence Support ──────────────────────────────────────────────
+
+    /// Register an entry with a specific ID (for restoring from disk).
+    /// Updates next_id if needed. Does NOT allocate from free_ids.
+    pub fn register_with_id(
+        &mut self,
+        id: CacheEntryId,
+        filter_clauses: &[CanonicalClause],
+        sort_field: Option<&str>,
+        sort_direction: Option<SortDirection>,
+    ) {
+        // Ensure next_id stays ahead of any restored ID
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
+
+        let mut clause_keys = Vec::with_capacity(filter_clauses.len());
+        let mut field_keys = Vec::new();
+        let mut seen_fields = std::collections::HashSet::new();
+
+        for clause in filter_clauses {
+            let ck = ClauseKey::from_canonical(clause);
+            self.clause_bitmaps
+                .entry(ck.clone())
+                .or_default()
+                .insert(id);
+            clause_keys.push(ck);
+
+            if seen_fields.insert(clause.field.clone()) {
+                let fk = FieldKey(clause.field.clone());
+                self.field_bitmaps
+                    .entry(fk.clone())
+                    .or_default()
+                    .insert(id);
+                field_keys.push(fk);
+            }
+        }
+
+        let sort_key = match (sort_field, sort_direction) {
+            (Some(field), Some(dir)) => {
+                let sk = SortKey {
+                    field: field.to_string(),
+                    direction: dir,
+                };
+                self.sort_bitmaps.entry(sk.clone()).or_default().insert(id);
+                Some(sk)
+            }
+            _ => None,
+        };
+
+        self.registrations.insert(
+            id,
+            EntryRegistration {
+                clause_keys,
+                field_keys,
+                sort_key,
+            },
+        );
+    }
+
+    /// Set the next_entry_id counter (for restoring from disk).
+    pub fn set_next_id(&mut self, id: CacheEntryId) {
+        self.next_id = id;
+    }
+
+    /// Get the next_entry_id counter (for persistence).
+    pub fn next_id(&self) -> CacheEntryId {
+        self.next_id
+    }
+
+    // ── Tombstone Support ──────────────────────────────────────────────
+
+    /// Mark an entry as tombstoned (stale, can't be maintained).
+    /// The entry stays registered in the meta-index but is skipped on shard load.
+    pub fn tombstone(&mut self, id: CacheEntryId) {
+        self.tombstoned.insert(id);
+    }
+
+    /// Check if an entry is tombstoned.
+    pub fn is_tombstoned(&self, id: CacheEntryId) -> bool {
+        self.tombstoned.contains(id)
+    }
+
+    /// Get the tombstone bitmap (for persistence).
+    pub fn tombstones(&self) -> &RoaringBitmap {
+        &self.tombstoned
+    }
+
+    /// Set the tombstone bitmap (for restoring from disk).
+    pub fn set_tombstones(&mut self, tombstones: RoaringBitmap) {
+        self.tombstoned = tombstones;
+    }
+
+    /// Remove a tombstone (entry cleaned up on shard rewrite → transition to Free).
+    pub fn clear_tombstone(&mut self, id: CacheEntryId) {
+        self.tombstoned.remove(id);
+    }
+
+    /// Number of tombstoned entries.
+    pub fn tombstone_count(&self) -> u64 {
+        self.tombstoned.len()
+    }
+
+    /// Check if an entry is registered (regardless of tombstone state).
+    pub fn is_registered(&self, id: CacheEntryId) -> bool {
+        self.registrations.contains_key(&id)
+    }
+
+    /// Iterator over all registered entry IDs (for tombstoning all unloaded).
+    pub fn all_registered_ids(&self) -> impl Iterator<Item = CacheEntryId> + '_ {
+        self.registrations.keys().copied()
     }
 
     /// Number of registered entries.

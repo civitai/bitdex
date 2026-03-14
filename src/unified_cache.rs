@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use roaring::RoaringBitmap;
 
+use crate::bound_store::ShardKey;
 use crate::cache::CanonicalClause;
 use crate::filter::FilterIndex;
 use crate::meta_index::{CacheEntryId, MetaIndex};
@@ -91,6 +92,9 @@ pub struct UnifiedEntry {
     last_used: Instant,
     /// Meta-index entry ID for this cache entry.
     meta_id: CacheEntryId,
+    /// Dirty flag for persistence: set when bitmap modified by live maintenance,
+    /// cleared when merge thread writes the shard. LRU eviction skips dirty entries.
+    persist_dirty: bool,
     /// Pre-sorted packed keys for O(1) pagination via binary search at initial capacity.
     /// Each key is `(sort_value as u64) << 32 | slot_id`. Sorted in traversal order.
     /// Cleared on expand() when radix takes over.
@@ -152,8 +156,42 @@ impl UnifiedEntry {
             rebuilding: AtomicBool::new(false),
             last_used: Instant::now(),
             meta_id,
+            persist_dirty: true, // New entries need persisting
             sorted_keys,
             radix: None, // No radix at initial capacity — sorted vec is faster
+            direction,
+        }
+    }
+
+    /// Create an entry restored from disk (shard load).
+    /// Has bitmap but no sorted_keys/radix — those are reconstructed lazily.
+    pub fn from_restored(
+        bitmap: RoaringBitmap,
+        meta_id: CacheEntryId,
+        initial_capacity: usize,
+        max_capacity: usize,
+        direction: SortDirection,
+    ) -> Self {
+        let card = bitmap.len() as usize;
+        let capacity = if card > initial_capacity {
+            max_capacity
+        } else {
+            initial_capacity
+        };
+        Self {
+            bitmap: Arc::new(bitmap),
+            min_tracked_value: 0, // Will be updated from meta on next access
+            capacity,
+            max_capacity,
+            has_more: true,
+            total_matched: 0,
+            needs_rebuild: false,
+            rebuilding: AtomicBool::new(false),
+            last_used: Instant::now(),
+            meta_id,
+            persist_dirty: false, // Just loaded from disk — clean
+            sorted_keys: None, // Lazy reconstruction on first query
+            radix: None,
             direction,
         }
     }
@@ -214,6 +252,7 @@ impl UnifiedEntry {
     /// `sort_value` is needed to maintain the radix index when present.
     pub fn add_slot(&mut self, slot: u32, sort_value: u32) -> bool {
         Arc::make_mut(&mut self.bitmap).insert(slot);
+        self.persist_dirty = true;
 
         // Invalidate sorted_keys — maintaining sorted order in a Vec is O(n)
         // per operation. The bitmap path is only slightly slower and correct.
@@ -238,6 +277,7 @@ impl UnifiedEntry {
     /// `sort_value` is needed to maintain the radix index when present.
     pub fn remove_slot(&mut self, slot: u32, sort_value: u32) {
         Arc::make_mut(&mut self.bitmap).remove(slot);
+        self.persist_dirty = true;
 
         // Invalidate sorted_keys — stale keys would return removed slots.
         self.sorted_keys = None;
@@ -251,6 +291,7 @@ impl UnifiedEntry {
     /// Remove a slot without knowing its sort value. Uses blind scan for radix.
     pub fn remove_slot_blind(&mut self, slot: u32) {
         Arc::make_mut(&mut self.bitmap).remove(slot);
+        self.persist_dirty = true;
 
         // Invalidate sorted_keys — stale keys would return removed slots.
         self.sorted_keys = None;
@@ -363,6 +404,21 @@ impl UnifiedEntry {
         self.direction
     }
 
+    /// Whether this entry has unsaved bitmap modifications.
+    pub fn is_persist_dirty(&self) -> bool {
+        self.persist_dirty
+    }
+
+    /// Mark this entry as having unsaved modifications.
+    pub fn mark_persist_dirty(&mut self) {
+        self.persist_dirty = true;
+    }
+
+    /// Clear the persist dirty flag (after successful shard write).
+    pub fn clear_persist_dirty(&mut self) {
+        self.persist_dirty = false;
+    }
+
     /// Get the pre-sorted keys for binary search pagination (initial capacity only).
     /// Returns None after expand() when radix takes over.
     pub fn sorted_keys(&self) -> Option<&Arc<Vec<u64>>> {
@@ -401,6 +457,12 @@ pub struct UnifiedCacheStats {
     pub memory_bytes: usize,
     pub meta_index_entries: usize,
     pub meta_index_bytes: usize,
+    // Persistence stats
+    pub persistence_enabled: bool,
+    pub tombstone_count: u64,
+    pub pending_shard_count: usize,
+    pub dirty_shard_count: usize,
+    pub meta_dirty: bool,
 }
 
 /// Per-entry diagnostic detail.
@@ -426,6 +488,18 @@ pub struct UnifiedCache {
     misses: u64,
     /// Running total of entry memory (bitmap + sorted_keys + radix bytes).
     total_bytes: usize,
+
+    // ── Persistence State ──────────────────────────────────────────────
+    /// Shards that exist on disk but haven't been loaded into RAM yet.
+    pending_shards: HashSet<ShardKey>,
+    /// Shards currently being loaded by another thread (loading sentinel).
+    loading_shards: HashSet<ShardKey>,
+    /// Whether meta.bin needs rewriting (new entry, expansion, tombstone).
+    meta_dirty: bool,
+    /// Which shards need rewriting (bitmap modified by maintenance).
+    shard_dirty: HashSet<ShardKey>,
+    /// Whether persistence is enabled (BoundStore exists).
+    persistence_enabled: bool,
 }
 
 impl UnifiedCache {
@@ -438,6 +512,11 @@ impl UnifiedCache {
             hits: 0,
             misses: 0,
             total_bytes: 0,
+            pending_shards: HashSet::new(),
+            loading_shards: HashSet::new(),
+            meta_dirty: false,
+            shard_dirty: HashSet::new(),
+            persistence_enabled: false,
         }
     }
 
@@ -485,6 +564,13 @@ impl UnifiedCache {
             self.evict_lru();
         }
 
+        // Mark dirty for persistence
+        if self.persistence_enabled {
+            self.meta_dirty = true;
+            let shard_key = ShardKey::new(key.sort_field.clone(), key.direction);
+            self.shard_dirty.insert(shard_key);
+        }
+
         self.total_bytes += new_bytes;
         self.meta_id_to_key.insert(meta_id, key.clone());
         self.entries.insert(key, entry);
@@ -524,12 +610,31 @@ impl UnifiedCache {
     }
 
     /// Evict the least-recently-used entry. Returns the evicted key, if any.
+    ///
+    /// When persistence is enabled:
+    /// - Skips dirty entries (unsaved bitmap modifications)
+    /// - Does NOT deregister from meta-index (entry stays on disk as orphan)
     pub fn evict_lru(&mut self) -> Option<UnifiedKey> {
-        let lru_key = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, _)| key.clone())?;
+        let lru_key = if self.persistence_enabled {
+            // Skip dirty entries — they have unsaved bitmap modifications
+            self.entries
+                .iter()
+                .filter(|(_, entry)| !entry.persist_dirty)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+                .or_else(|| {
+                    // All entries dirty — fall back to oldest regardless
+                    self.entries
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(key, _)| key.clone())
+                })
+        } else {
+            self.entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+        }?;
 
         if let Some(evicted) = self.entries.remove(&lru_key) {
             tracing::info!(
@@ -539,7 +644,12 @@ impl UnifiedCache {
             );
             self.total_bytes = self.total_bytes.saturating_sub(evicted.memory_bytes());
             self.meta_id_to_key.remove(&evicted.meta_id);
-            self.meta.deregister(evicted.meta_id);
+            if !self.persistence_enabled {
+                // Without persistence, deregister fully (original behavior)
+                self.meta.deregister(evicted.meta_id);
+            }
+            // With persistence: meta-index keeps the registration.
+            // Entry stays on disk as orphan — can be reloaded from shard.
         }
 
         Some(lru_key)
@@ -589,6 +699,10 @@ impl UnifiedCache {
         self.hits = 0;
         self.misses = 0;
         self.total_bytes = 0;
+        self.pending_shards.clear();
+        self.loading_shards.clear();
+        self.meta_dirty = false;
+        self.shard_dirty.clear();
     }
 
     /// Return a stats snapshot.
@@ -600,6 +714,11 @@ impl UnifiedCache {
             memory_bytes: self.total_memory_bytes(),
             meta_index_entries: self.meta.entry_count(),
             meta_index_bytes: self.meta.memory_bytes(),
+            persistence_enabled: self.persistence_enabled,
+            tombstone_count: self.meta.tombstone_count(),
+            pending_shard_count: self.pending_shards.len(),
+            dirty_shard_count: self.shard_dirty.len(),
+            meta_dirty: self.meta_dirty,
         }
     }
 
@@ -644,6 +763,235 @@ impl UnifiedCache {
     /// Get the key for a meta_id. O(1) via reverse index.
     pub fn key_for_meta_id(&self, meta_id: CacheEntryId) -> Option<&UnifiedKey> {
         self.meta_id_to_key.get(&meta_id)
+    }
+
+    /// Iterate over all meta_id → key mappings (for persistence snapshot).
+    pub fn iter_meta_id_to_key(&self) -> impl Iterator<Item = (&CacheEntryId, &UnifiedKey)> {
+        self.meta_id_to_key.iter()
+    }
+
+    // ── Persistence Support ──────────────────────────────────────────────────
+
+    /// Enable persistence mode. Called when a BoundStore is available.
+    pub fn enable_persistence(&mut self) {
+        self.persistence_enabled = true;
+    }
+
+    /// Whether persistence is enabled.
+    pub fn persistence_enabled(&self) -> bool {
+        self.persistence_enabled
+    }
+
+    /// Check if a shard is pending (exists on disk, not loaded).
+    pub fn is_shard_pending(&self, sort_field: &str, direction: SortDirection) -> bool {
+        self.pending_shards.contains(&ShardKey::new(sort_field.to_string(), direction))
+    }
+
+    /// Check if a shard is currently being loaded.
+    pub fn is_shard_loading(&self, sort_field: &str, direction: SortDirection) -> bool {
+        self.loading_shards.contains(&ShardKey::new(sort_field.to_string(), direction))
+    }
+
+    /// Mark a shard as loading (sentinel to prevent concurrent loads).
+    pub fn mark_shard_loading(&mut self, sort_field: &str, direction: SortDirection) {
+        let key = ShardKey::new(sort_field.to_string(), direction);
+        self.pending_shards.remove(&key);
+        self.loading_shards.insert(key);
+    }
+
+    /// Mark a shard as loaded (remove from pending and loading).
+    pub fn mark_shard_loaded(&mut self, sort_field: &str, direction: SortDirection) {
+        let key = ShardKey::new(sort_field.to_string(), direction);
+        self.pending_shards.remove(&key);
+        self.loading_shards.remove(&key);
+    }
+
+    /// Add pending shards (from meta.bin on startup).
+    pub fn add_pending_shards(&mut self, shards: impl IntoIterator<Item = ShardKey>) {
+        self.pending_shards.extend(shards);
+    }
+
+    /// Get all pending shard keys.
+    pub fn pending_shards(&self) -> &HashSet<ShardKey> {
+        &self.pending_shards
+    }
+
+    /// Insert a restored entry from disk (shard load). Does NOT register with
+    /// meta-index (that was done during meta.bin load). Does NOT set meta_dirty.
+    pub fn insert_restored_entry(&mut self, key: UnifiedKey, entry: UnifiedEntry) {
+        let meta_id = entry.meta_id;
+        let bytes = entry.memory_bytes();
+
+        // Evict if needed
+        while (self.total_bytes + bytes > self.config.max_bytes
+            || self.entries.len() >= self.config.max_entries)
+            && !self.entries.is_empty()
+        {
+            self.evict_lru();
+        }
+
+        self.total_bytes += bytes;
+        self.meta_id_to_key.insert(meta_id, key.clone());
+        self.entries.insert(key, entry);
+    }
+
+    /// Check if meta needs writing.
+    pub fn is_meta_dirty(&self) -> bool {
+        self.meta_dirty
+    }
+
+    /// Clear the meta dirty flag (after successful write).
+    pub fn clear_meta_dirty(&mut self) {
+        self.meta_dirty = false;
+    }
+
+    /// Set the meta dirty flag.
+    pub fn set_meta_dirty(&mut self) {
+        self.meta_dirty = true;
+    }
+
+    /// Get dirty shards that need writing.
+    pub fn dirty_shards(&self) -> &HashSet<ShardKey> {
+        &self.shard_dirty
+    }
+
+    /// Mark a shard as dirty.
+    pub fn mark_shard_dirty(&mut self, key: ShardKey) {
+        self.shard_dirty.insert(key);
+    }
+
+    /// Clear a shard dirty flag (after successful write).
+    pub fn clear_shard_dirty(&mut self, key: &ShardKey) {
+        self.shard_dirty.remove(key);
+    }
+
+    /// Check if an entry ID is in RAM (for tombstone decisions).
+    pub fn has_entry_id(&self, meta_id: CacheEntryId) -> bool {
+        self.meta_id_to_key.contains_key(&meta_id)
+    }
+
+    /// Collect entries for a specific shard (for merge thread shard write).
+    /// Returns (meta_id, key, bitmap_clone) for each entry in the shard.
+    pub fn entries_for_shard(&self, shard_key: &ShardKey) -> Vec<(CacheEntryId, UnifiedKey, RoaringBitmap)> {
+        self.entries
+            .iter()
+            .filter(|(key, _)| key.sort_field == shard_key.sort_field && key.direction == shard_key.direction)
+            .map(|(key, entry)| (entry.meta_id, key.clone(), entry.bitmap.as_ref().clone()))
+            .collect()
+    }
+
+    /// Clear persist_dirty flags for entries in a specific shard (after successful write).
+    pub fn clear_shard_entry_dirty(&mut self, shard_key: &ShardKey) {
+        for (key, entry) in self.entries.iter_mut() {
+            if key.sort_field == shard_key.sort_field && key.direction == shard_key.direction {
+                entry.persist_dirty = false;
+            }
+        }
+    }
+
+    /// Tombstone an entry that isn't in RAM (flush thread: mutation to unloaded entry).
+    /// Sets meta_dirty. Does NOT touch the shard (tombstone cleanup is deferred).
+    pub fn tombstone_entry(&mut self, meta_id: CacheEntryId) {
+        self.meta.tombstone(meta_id);
+        self.meta_dirty = true;
+    }
+
+    /// Finalize shard write: clean up tombstones for entries that were omitted,
+    /// deregister them from meta-index, and recycle their IDs.
+    pub fn finalize_shard_write(&mut self, cleaned_ids: &[CacheEntryId]) {
+        for &id in cleaned_ids {
+            self.meta.clear_tombstone(id);
+            self.meta.deregister(id);
+        }
+    }
+
+    /// Check if >50% of a shard's entries are tombstoned (triggers forced cleanup).
+    pub fn shard_needs_cleanup(&self, shard_key: &ShardKey) -> bool {
+        // Count entries registered for this shard's sort spec
+        let total = self.meta.entries_for_sort(&shard_key.sort_field, shard_key.direction)
+            .map(|bm| bm.len())
+            .unwrap_or(0);
+        if total == 0 {
+            return false;
+        }
+        let tombstoned = self.meta.entries_for_sort(&shard_key.sort_field, shard_key.direction)
+            .map(|bm| {
+                let mut count = 0u64;
+                for id in bm.iter() {
+                    if self.meta.is_tombstoned(id) {
+                        count += 1;
+                    }
+                }
+                count
+            })
+            .unwrap_or(0);
+        tombstoned * 2 > total
+    }
+
+    /// Tombstone unloaded entries affected by filter field mutations.
+    /// Returns the number of entries tombstoned.
+    pub fn tombstone_unloaded_for_filter(&mut self, changed_fields: &[&str]) -> u64 {
+        if !self.persistence_enabled {
+            return 0;
+        }
+        let mut to_tombstone = Vec::new();
+        for field in changed_fields {
+            if let Some(bm) = self.meta.entries_for_filter_field(field) {
+                for id in bm.iter() {
+                    if !self.meta_id_to_key.contains_key(&id) && !self.meta.is_tombstoned(id) {
+                        to_tombstone.push(id);
+                    }
+                }
+            }
+        }
+        let count = to_tombstone.len() as u64;
+        for id in to_tombstone {
+            self.meta.tombstone(id);
+            self.meta_dirty = true;
+        }
+        count
+    }
+
+    /// Tombstone unloaded entries affected by sort field mutations.
+    /// Returns the number of entries tombstoned.
+    pub fn tombstone_unloaded_for_sort(&mut self, changed_fields: &[&str]) -> u64 {
+        if !self.persistence_enabled {
+            return 0;
+        }
+        let mut to_tombstone = Vec::new();
+        for field in changed_fields {
+            let affected = self.meta.entries_for_sort_field(field);
+            for id in affected.iter() {
+                if !self.meta_id_to_key.contains_key(&id) && !self.meta.is_tombstoned(id) {
+                    to_tombstone.push(id);
+                }
+            }
+        }
+        let count = to_tombstone.len() as u64;
+        for id in to_tombstone {
+            self.meta.tombstone(id);
+            self.meta_dirty = true;
+        }
+        count
+    }
+
+    /// Tombstone ALL unloaded entries (registered in meta but not in RAM).
+    /// Used when alive changes (deletes) affect all cache entries — we can't
+    /// selectively remove a deleted slot from an unloaded entry's bitmap.
+    /// Returns the number of entries tombstoned.
+    pub fn tombstone_all_unloaded(&mut self) -> u64 {
+        if !self.persistence_enabled {
+            return 0;
+        }
+        let to_tombstone: Vec<u32> = self.meta.all_registered_ids()
+            .filter(|id| !self.meta_id_to_key.contains_key(id) && !self.meta.is_tombstoned(*id))
+            .collect();
+        let count = to_tombstone.len() as u64;
+        for id in to_tombstone {
+            self.meta.tombstone(id);
+            self.meta_dirty = true;
+        }
+        count
     }
 
     // ── Live Maintenance (Phase 3) ──────────────────────────────────────────

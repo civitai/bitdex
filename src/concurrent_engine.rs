@@ -25,7 +25,7 @@ use crate::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
-use crate::unified_cache::{UnifiedCache, UnifiedCacheConfig, UnifiedKey};
+use crate::unified_cache::{UnifiedCache, UnifiedCacheConfig, UnifiedEntry, UnifiedKey};
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 
 /// Commands sent to the flush thread for state transitions that must
@@ -202,6 +202,8 @@ pub struct ConcurrentEngine {
     dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
     /// Unified cache: primary query result cache.
     unified_cache: Arc<parking_lot::Mutex<UnifiedCache>>,
+    /// BoundStore for unified cache persistence (None if no bitmap_path).
+    bound_store: Option<Arc<crate::bound_store::BoundStore>>,
     /// Flush loop stats: total snapshot publishes (monotonic counter).
     flush_publish_count: Arc<AtomicU64>,
     /// Flush loop stats: cumulative flush duration in nanoseconds.
@@ -224,6 +226,21 @@ pub struct ConcurrentEngine {
     flush_cycle: Arc<AtomicU64>,
     /// Cumulative eviction counts per field (for Prometheus metrics).
     eviction_total: Arc<DashMap<String, AtomicU64>>,
+    // ── BoundStore operational counters ─────────────────────────────────
+    /// Cumulative shard load events.
+    boundstore_shard_loads: Arc<AtomicU64>,
+    /// Cumulative tombstones created by flush thread.
+    boundstore_tombstones_created: Arc<AtomicU64>,
+    /// Cumulative tombstones cleaned up by merge thread.
+    boundstore_tombstones_cleaned: Arc<AtomicU64>,
+    /// Cumulative bytes written to bounds directory.
+    boundstore_bytes_written: Arc<AtomicU64>,
+    /// Cumulative bytes read from bounds directory.
+    boundstore_bytes_read: Arc<AtomicU64>,
+    /// Cumulative entries restored from shard files.
+    boundstore_entries_restored: Arc<AtomicU64>,
+    /// Cumulative entries skipped (tombstoned + orphan) during shard load.
+    boundstore_entries_skipped: Arc<AtomicU64>,
 }
 
 impl ConcurrentEngine {
@@ -454,9 +471,75 @@ impl ConcurrentEngine {
             }
         }
 
-        let unified_cache = Arc::new(parking_lot::Mutex::new(UnifiedCache::new(
-            UnifiedCacheConfig::default(),
-        )));
+        let mut uc = UnifiedCache::new(UnifiedCacheConfig::default());
+
+        // Initialize BoundStore for unified cache persistence
+        let bound_store = if let Some(ref store) = bitmap_store {
+            let bounds_path = store.root_path().join("bounds");
+            match crate::bound_store::BoundStore::new(&bounds_path) {
+                Ok(bs) => {
+                    // Load meta.bin: populate meta-index, record pending shards
+                    match bs.load_meta() {
+                        Ok(Some(meta)) => {
+                            eprintln!(
+                                "BoundStore: loaded meta.bin ({} entries, {} tombstones, next_id={})",
+                                meta.entries.len(),
+                                meta.tombstones.len(),
+                                meta.next_entry_id
+                            );
+                            // Restore meta-index registrations
+                            for entry in &meta.entries {
+                                uc.meta_mut().register_with_id(
+                                    entry.entry_id,
+                                    &entry.filter_clauses,
+                                    Some(&entry.sort_field),
+                                    Some(entry.direction),
+                                );
+                            }
+                            uc.meta_mut().set_next_id(meta.next_entry_id);
+                            uc.meta_mut().set_tombstones(meta.tombstones);
+
+                            // Record pending shards from registered entries
+                            let mut shard_keys = HashSet::new();
+                            for entry in &meta.entries {
+                                shard_keys.insert(crate::bound_store::ShardKey::new(
+                                    entry.sort_field.clone(),
+                                    entry.direction,
+                                ));
+                            }
+                            uc.add_pending_shards(shard_keys);
+                            uc.enable_persistence();
+                        }
+                        Ok(None) => {
+                            // No meta.bin — clean orphaned .ucpack files if any
+                            if let Ok(shards) = bs.list_shards() {
+                                if !shards.is_empty() {
+                                    eprintln!(
+                                        "BoundStore: no meta.bin, purging {} orphaned shard files",
+                                        shards.len()
+                                    );
+                                    let _ = bs.purge();
+                                }
+                            }
+                            uc.enable_persistence();
+                        }
+                        Err(e) => {
+                            eprintln!("BoundStore: failed to load meta.bin: {e}");
+                            uc.enable_persistence();
+                        }
+                    }
+                    Some(Arc::new(bs))
+                }
+                Err(e) => {
+                    eprintln!("BoundStore: failed to create: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let unified_cache = Arc::new(parking_lot::Mutex::new(uc));
         let loading_mode = Arc::new(AtomicBool::new(false));
 
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
@@ -586,6 +669,15 @@ impl ConcurrentEngine {
         let flush_duration_nanos = Arc::new(AtomicU64::new(0));
         let flush_last_duration_nanos = Arc::new(AtomicU64::new(0));
 
+        // BoundStore operational counters (defined before flush/merge threads)
+        let boundstore_shard_loads = Arc::new(AtomicU64::new(0));
+        let boundstore_tombstones_created = Arc::new(AtomicU64::new(0));
+        let boundstore_tombstones_cleaned = Arc::new(AtomicU64::new(0));
+        let boundstore_bytes_written = Arc::new(AtomicU64::new(0));
+        let boundstore_bytes_read = Arc::new(AtomicU64::new(0));
+        let boundstore_entries_restored = Arc::new(AtomicU64::new(0));
+        let boundstore_entries_skipped = Arc::new(AtomicU64::new(0));
+
         let flush_handle = {
             let inner = Arc::clone(&inner);
             let shutdown = Arc::clone(&shutdown);
@@ -607,6 +699,7 @@ impl ConcurrentEngine {
             let flush_config = Arc::clone(&config);
             let flush_field_registry = field_registry.clone();
             let eviction_sweep_interval = config.eviction_sweep_interval;
+            let flush_tombstones_created = Arc::clone(&boundstore_tombstones_created);
             // Build eviction config map: field_name → idle_seconds
             let eviction_configs: HashMap<String, f64> = config.filter_fields.iter()
                 .filter_map(|fc| fc.eviction.as_ref().map(|e| (fc.name.clone(), e.idle_seconds)))
@@ -764,6 +857,48 @@ impl ConcurrentEngine {
                                     }
                                     // Reconcile tracked byte total after in-place mutations
                                     uc.reconcile_bytes();
+                                }
+                                // Tombstone unloaded entries affected by mutations.
+                                // Runs OUTSIDE the is_empty() gate because after restart,
+                                // the cache has 0 RAM entries but the meta-index IS populated
+                                // from meta.bin. Tombstoning uses meta-index field registrations,
+                                // not the RAM HashMap. Without this, stale entries would be
+                                // served after restart+mutation (§3.2 violation).
+                                if uc.persistence_enabled() {
+                                    let filter_fields: Vec<&str> = coalescer
+                                        .mutated_filter_fields()
+                                        .iter()
+                                        .copied()
+                                        .collect();
+                                    if !filter_fields.is_empty() {
+                                        let n = uc.tombstone_unloaded_for_filter(&filter_fields);
+                                        if n > 0 {
+                                            flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
+                                        }
+                                    }
+                                    let sort_mutations = coalescer.mutated_sort_slots();
+                                    let sort_fields: Vec<&str> = sort_mutations
+                                        .keys()
+                                        .copied()
+                                        .collect();
+                                    if !sort_fields.is_empty() {
+                                        let n = uc.tombstone_unloaded_for_sort(&sort_fields);
+                                        if n > 0 {
+                                            flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
+                                        }
+                                    }
+                                    // Alive removals (deletes) affect ALL cache entries.
+                                    // For in-RAM entries, remove_slot_from_all handles it.
+                                    // For unloaded entries, tombstone them — a deleted slot
+                                    // in a cached bitmap would be served as a stale result.
+                                    if coalescer.has_alive_mutations()
+                                        && !coalescer.alive_removes().is_empty()
+                                    {
+                                        let n = uc.tombstone_all_unloaded();
+                                        if n > 0 {
+                                            flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
+                                        }
+                                    }
                                 }
                             }
 
@@ -1302,6 +1437,8 @@ impl ConcurrentEngine {
             let merge_lazy_values = Arc::clone(&lazy_value_fields);
             let merge_time_buckets = time_buckets.as_ref().map(Arc::clone);
             let merge_cursors = Arc::clone(&cursors);
+            let merge_bound_store = bound_store.clone();
+            let merge_unified_cache = Arc::clone(&unified_cache);
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
@@ -1410,7 +1547,177 @@ impl ConcurrentEngine {
                             }
                         }
                     }
+
                     } // needs_write
+
+                    // ── BoundStore persistence ──────────────────────────────
+                    // Runs on every merge cycle, independent of bitmap dirty flag.
+                    // Cache has its own dirty tracking (meta_dirty, shard_dirty).
+                    if let Some(ref bs) = merge_bound_store {
+                        let mut uc = merge_unified_cache.lock();
+                        let meta_dirty = uc.is_meta_dirty();
+                        let dirty_shards: Vec<crate::bound_store::ShardKey> =
+                            uc.dirty_shards().iter().cloned().collect();
+
+                        // Also check for shards needing tombstone cleanup
+                        let mut cleanup_shards: Vec<crate::bound_store::ShardKey> = Vec::new();
+                        if let Ok(shard_list) = bs.list_shards() {
+                            for sk in &shard_list {
+                                if uc.shard_needs_cleanup(sk) && !dirty_shards.contains(sk) {
+                                    cleanup_shards.push(sk.clone());
+                                }
+                            }
+                        }
+
+                        if meta_dirty || !dirty_shards.is_empty() || !cleanup_shards.is_empty() {
+                            // Collect meta entries from meta-index registrations
+                            let meta_entries: Vec<crate::bound_store::MetaEntry> = {
+                                let meta = uc.meta();
+                                // Iterate all registered entries to build meta entries
+                                let mut entries = Vec::new();
+                                // We need to collect from the meta_id_to_key reverse index
+                                // and the entries themselves
+                                for (&meta_id, key) in uc.iter_meta_id_to_key() {
+                                    if let Some(entry) = uc.get(key) {
+                                        entries.push(crate::bound_store::MetaEntry {
+                                            entry_id: meta_id,
+                                            sort_field: key.sort_field.clone(),
+                                            direction: key.direction,
+                                            filter_clauses: key.filter_clauses.clone(),
+                                            capacity: entry.capacity() as u32,
+                                            max_capacity: entry.max_capacity() as u32,
+                                            min_tracked_value: entry.min_tracked_value(),
+                                            total_matched: entry.total_matched(),
+                                            has_more: entry.has_more(),
+                                        });
+                                    } else {
+                                        // Entry is not in RAM (orphan) — reconstruct
+                                        // meta from pending on-disk data. We still have
+                                        // the registration, just no live entry. Use defaults.
+                                        entries.push(crate::bound_store::MetaEntry {
+                                            entry_id: meta_id,
+                                            sort_field: key.sort_field.clone(),
+                                            direction: key.direction,
+                                            filter_clauses: key.filter_clauses.clone(),
+                                            capacity: 4000,
+                                            max_capacity: 64000,
+                                            min_tracked_value: 0,
+                                            total_matched: 0,
+                                            has_more: true,
+                                        });
+                                    }
+                                }
+                                entries
+                            };
+
+                            let tombstones = uc.meta().tombstones().clone();
+                            let next_id = uc.meta().next_id();
+
+                            // Collect shard data for dirty shards
+                            let all_dirty: Vec<crate::bound_store::ShardKey> = dirty_shards
+                                .iter()
+                                .chain(cleanup_shards.iter())
+                                .cloned()
+                                .collect();
+
+                            let shard_snapshots: Vec<(
+                                crate::bound_store::ShardKey,
+                                Vec<(u32, Vec<crate::cache::CanonicalClause>, roaring::RoaringBitmap)>,
+                            )> = all_dirty
+                                .iter()
+                                .map(|sk| {
+                                    let entries = uc.entries_for_shard(sk);
+                                    let data: Vec<_> = entries
+                                        .into_iter()
+                                        .map(|(id, key, bm)| (id, key.filter_clauses, bm))
+                                        .collect();
+                                    (sk.clone(), data)
+                                })
+                                .collect();
+
+                            // Clear dirty flags under lock
+                            if meta_dirty {
+                                uc.clear_meta_dirty();
+                            }
+                            for sk in &all_dirty {
+                                uc.clear_shard_dirty(sk);
+                                uc.clear_shard_entry_dirty(sk);
+                            }
+
+                            drop(uc); // Release lock for I/O
+
+                            // Write meta.bin FIRST (ordering guarantee)
+                            if meta_dirty {
+                                let meta_file = crate::bound_store::MetaFile {
+                                    entries: meta_entries,
+                                    tombstones,
+                                    next_entry_id: next_id,
+                                };
+                                if let Err(e) = bs.write_meta(&meta_file) {
+                                    eprintln!("merge thread: meta.bin write failed: {e}");
+                                }
+                            }
+
+                            // Write dirty shards with read-modify-write
+                            for (sk, ram_entries) in &shard_snapshots {
+                                // Read existing shard from disk
+                                let mut merged: Vec<crate::bound_store::ShardEntry> = Vec::new();
+
+                                if let Ok(Some(disk_entries)) = bs.load_shard(sk) {
+                                    // Preserve orphaned entries (on disk, not in RAM,
+                                    // not tombstoned)
+                                    let uc = merge_unified_cache.lock();
+                                    let ram_ids: std::collections::HashSet<u32> =
+                                        ram_entries.iter().map(|(id, _, _)| *id).collect();
+                                    for de in disk_entries {
+                                        if !ram_ids.contains(&de.entry_id)
+                                            && !uc.meta().is_tombstoned(de.entry_id)
+                                            && uc.meta().is_registered(de.entry_id)
+                                        {
+                                            merged.push(de);
+                                        }
+                                    }
+                                    drop(uc);
+                                }
+
+                                // Add RAM entries
+                                for (id, clauses, bm) in ram_entries {
+                                    merged.push(crate::bound_store::ShardEntry {
+                                        entry_id: *id,
+                                        filter_clauses: clauses.clone(),
+                                        bitmap: bm.clone(),
+                                    });
+                                }
+
+                                if let Err(e) = bs.write_shard(sk, &merged) {
+                                    eprintln!(
+                                        "merge thread: shard {} write failed: {e}",
+                                        sk.filename()
+                                    );
+                                }
+
+                                // Clean up tombstones that were omitted
+                                let mut uc = merge_unified_cache.lock();
+                                let cleaned: Vec<u32> = uc
+                                    .meta()
+                                    .tombstones()
+                                    .iter()
+                                    .filter(|id| {
+                                        // Only clean tombstones for this shard
+                                        uc.key_for_meta_id(*id)
+                                            .map(|k| {
+                                                k.sort_field == sk.sort_field
+                                                    && k.direction == sk.direction
+                                            })
+                                            .unwrap_or(false)
+                                    })
+                                    .collect();
+                                if !cleaned.is_empty() {
+                                    uc.finalize_shard_write(&cleaned);
+                                }
+                            }
+                        }
+                    }
                 }
             })
         };
@@ -1439,6 +1746,7 @@ impl ConcurrentEngine {
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
             unified_cache,
+            bound_store,
             flush_publish_count,
             flush_duration_nanos,
             flush_last_duration_nanos,
@@ -1447,6 +1755,13 @@ impl ConcurrentEngine {
             eviction_stamps,
             flush_cycle,
             eviction_total,
+            boundstore_shard_loads,
+            boundstore_tombstones_created,
+            boundstore_tombstones_cleaned,
+            boundstore_bytes_written,
+            boundstore_bytes_read,
+            boundstore_entries_restored,
+            boundstore_entries_skipped,
         })
     }
 
@@ -2173,6 +2488,85 @@ impl ConcurrentEngine {
     }
 
     /// Execute a parsed BitdexQuery.
+    /// Load a pending cache shard from disk if needed (loading sentinel pattern).
+    /// Called before cache lookup in the query path.
+    fn ensure_cache_shard_loaded(&self, sort_field: &str, direction: crate::query::SortDirection) {
+        if let Some(ref bs) = self.bound_store {
+            let mut uc = self.unified_cache.lock();
+            if !uc.is_shard_pending(sort_field, direction) {
+                return;
+            }
+            if uc.is_shard_loading(sort_field, direction) {
+                // Another thread is loading — drop lock, proceed without cache
+                return;
+            }
+            // We are the loading thread. Set sentinel, release lock for I/O.
+            uc.mark_shard_loading(sort_field, direction);
+            drop(uc);
+
+            let shard_key = crate::bound_store::ShardKey::new(
+                sort_field.to_string(),
+                direction,
+            );
+            match bs.load_shard(&shard_key) {
+                Ok(Some(shard_entries)) => {
+                    let mut uc = self.unified_cache.lock();
+                    let mut loaded = 0usize;
+                    let mut skipped = 0usize;
+                    for se in shard_entries {
+                        // Skip entries not in meta-index (orphan from crash)
+                        if !uc.meta().is_registered(se.entry_id) {
+                            skipped += 1;
+                            continue;
+                        }
+                        // Skip tombstoned entries
+                        if uc.meta().is_tombstoned(se.entry_id) {
+                            skipped += 1;
+                            continue;
+                        }
+                        // Build key and insert restored entry
+                        let key = UnifiedKey {
+                            filter_clauses: se.filter_clauses,
+                            sort_field: sort_field.to_string(),
+                            direction,
+                        };
+                        // Get metadata from meta entry (if available) or use defaults
+                        let config = uc.config().clone();
+                        let entry = UnifiedEntry::from_restored(
+                            se.bitmap,
+                            se.entry_id,
+                            config.initial_capacity,
+                            config.max_capacity,
+                            direction,
+                        );
+                        uc.insert_restored_entry(key, entry);
+                        loaded += 1;
+                        self.boundstore_entries_restored.fetch_add(1, Ordering::Relaxed);
+                    }
+                    uc.mark_shard_loaded(sort_field, direction);
+                    self.boundstore_shard_loads.fetch_add(1, Ordering::Relaxed);
+                    self.boundstore_entries_skipped.fetch_add(skipped as u64, Ordering::Relaxed);
+                    if loaded > 0 || skipped > 0 {
+                        eprintln!(
+                            "BoundStore: loaded shard {}_{:?} ({loaded} entries, {skipped} skipped)",
+                            sort_field, direction
+                        );
+                    }
+                }
+                Ok(None) => {
+                    // Shard file doesn't exist — mark as loaded
+                    let mut uc = self.unified_cache.lock();
+                    uc.mark_shard_loaded(sort_field, direction);
+                }
+                Err(e) => {
+                    eprintln!("BoundStore: failed to load shard {}_{:?}: {e}", sort_field, direction);
+                    let mut uc = self.unified_cache.lock();
+                    uc.mark_shard_loaded(sort_field, direction);
+                }
+            }
+        }
+    }
+
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
         let query_start = std::time::Instant::now();
 
@@ -2185,6 +2579,11 @@ impl ConcurrentEngine {
         let ensure_elapsed = t0.elapsed();
         if ensure_elapsed.as_millis() > 10 {
             tracing::debug!("  ensure_fields_loaded: {:.1}ms", ensure_elapsed.as_secs_f64() * 1000.0);
+        }
+
+        // Lazy-load cached shard from disk if pending
+        if let Some(sort_clause) = query.sort.as_ref() {
+            self.ensure_cache_shard_loaded(&sort_clause.field, sort_clause.direction);
         }
 
         let snap = self.snapshot(); // lock-free
@@ -3003,6 +3402,32 @@ impl ConcurrentEngine {
     }
 
     /// Return unified cache stats (entries, hits, misses, memory).
+    // ── BoundStore Counters ───────────────────────────────────────────────
+
+    pub fn boundstore_shard_loads(&self) -> u64 { self.boundstore_shard_loads.load(Ordering::Relaxed) }
+    pub fn boundstore_tombstones_created(&self) -> u64 { self.boundstore_tombstones_created.load(Ordering::Relaxed) }
+    pub fn boundstore_tombstones_cleaned(&self) -> u64 { self.boundstore_tombstones_cleaned.load(Ordering::Relaxed) }
+    pub fn boundstore_bytes_written(&self) -> u64 { self.boundstore_bytes_written.load(Ordering::Relaxed) }
+    pub fn boundstore_bytes_read(&self) -> u64 { self.boundstore_bytes_read.load(Ordering::Relaxed) }
+    pub fn boundstore_entries_restored(&self) -> u64 { self.boundstore_entries_restored.load(Ordering::Relaxed) }
+    pub fn boundstore_entries_skipped(&self) -> u64 { self.boundstore_entries_skipped.load(Ordering::Relaxed) }
+
+    /// Get the total size of the bounds directory on disk (meta.bin + shards).
+    pub fn boundstore_disk_bytes(&self) -> u64 {
+        self.bound_store.as_ref().map(|bs| {
+            let root = bs.root_path();
+            if !root.exists() { return 0u64; }
+            std::fs::read_dir(root)
+                .ok()
+                .map(|entries| {
+                    entries.filter_map(|e| e.ok())
+                        .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                        .sum()
+                })
+                .unwrap_or(0)
+        }).unwrap_or(0)
+    }
+
     pub fn unified_cache_stats(&self) -> crate::unified_cache::UnifiedCacheStats {
         self.unified_cache.lock().stats()
     }
@@ -3012,9 +3437,32 @@ impl ConcurrentEngine {
         self.unified_cache.lock().entry_details()
     }
 
-    /// Clear unified cache entries and reset counters.
+    /// Clear unified cache entries and reset counters (RAM only).
     pub fn clear_unified_cache(&self) {
         self.unified_cache.lock().clear();
+    }
+
+    /// Purge the entire BoundStore: disk first, then memory.
+    /// Order matters: wipe disk before clearing RAM to prevent stale shard loads.
+    /// Safe to call while the server is running — the merge thread will simply
+    /// start writing fresh data on the next cycle with dirty entries.
+    pub fn purge_bounds(&self) -> crate::error::Result<()> {
+        // Step 1: Purge disk (meta.bin + all .ucpack shards)
+        if let Some(ref bs) = self.bound_store {
+            bs.purge()?;
+            eprintln!("BoundStore: purged disk (meta.bin + all shards)");
+        }
+        // Step 2: Clear RAM cache + meta-index (after disk is gone)
+        {
+            let mut uc = self.unified_cache.lock();
+            uc.clear();
+            // Re-enable persistence so new entries get persisted
+            if self.bound_store.is_some() {
+                uc.enable_persistence();
+            }
+        }
+        eprintln!("BoundStore: cleared RAM cache + meta-index");
+        Ok(())
     }
 
     /// Enter loading mode: skip snapshot publishing and maintenance during bulk inserts.
@@ -6842,6 +7290,105 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(result.ids, vec![1]);
+        }
+    }
+
+    #[test]
+    fn test_bound_store_persist_and_restore() {
+            // Phase 1: Create engine, insert data, query to build cache, save
+            let dir = tempfile::tempdir().unwrap();
+            let bitmap_path = dir.path().join("bitmaps");
+            let doc_path = dir.path().join("docs");
+
+            let result_ids;
+            {
+                let config = test_config_with_bitmap_path(bitmap_path.clone());
+                let mut engine = ConcurrentEngine::new_with_path(config, &doc_path).unwrap();
+
+                // Insert 100 documents with nsfwLevel cycling 1-5 and reactionCount = slot*10
+                for i in 1u32..=100 {
+                    let nsfw_level = (i % 5) + 1;
+                    let reaction_count = i * 10;
+                    let doc = make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(nsfw_level as i64))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(reaction_count as i64))),
+                    ]);
+                    engine.put(i, &doc).unwrap();
+                }
+                // Wait for flush thread to apply all mutations
+                wait_for_flush(&engine, 100, 5000);
+
+                // Query to build a cache entry (must use execute_query for cache)
+                let bq = BitdexQuery {
+                    filters: vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                    sort: Some(SortClause {
+                        field: "reactionCount".to_string(),
+                        direction: SortDirection::Desc,
+                    }),
+                    limit: 5,
+                    cursor: None,
+                    offset: None,
+                };
+                let result = engine.execute_query(&bq).unwrap();
+                result_ids = result.ids.clone();
+                assert!(!result_ids.is_empty(), "should have query results");
+
+                // Run the query again to ensure cache hit
+                let _ = engine.execute_query(&bq).unwrap();
+
+                // Verify cache is populated
+                {
+                    let uc = engine.unified_cache.lock();
+                    assert!(uc.len() > 0, "cache should have entries after query");
+                }
+
+                // Save bitmap snapshot (triggers merge thread persistence)
+                engine.save_snapshot().unwrap();
+
+                // Wait for merge thread to write BoundStore
+                std::thread::sleep(std::time::Duration::from_millis(
+                    engine.config.merge_interval_ms * 2 + 200,
+                ));
+
+                // Verify files exist on disk
+                let bounds_dir = bitmap_path.join("bounds");
+                assert!(bounds_dir.join("meta.bin").exists(), "meta.bin should exist");
+
+                engine.shutdown();
+            }
+
+            // Phase 2: Restore engine and verify warm cache
+            {
+                let config = test_config_with_bitmap_path(bitmap_path.clone());
+                let mut engine = ConcurrentEngine::new_with_path(config, &doc_path).unwrap();
+
+                // Verify BoundStore loaded meta
+                {
+                    let uc = engine.unified_cache.lock();
+                    assert!(uc.persistence_enabled(), "persistence should be enabled");
+                    assert!(uc.meta().entry_count() > 0, "meta-index should have restored entries");
+                }
+
+                // Query again — should trigger shard lazy load and get a cache hit
+                let bq = BitdexQuery {
+                    filters: vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                    sort: Some(SortClause {
+                        field: "reactionCount".to_string(),
+                        direction: SortDirection::Desc,
+                    }),
+                    limit: 5,
+                    cursor: None,
+                    offset: None,
+                };
+                let result = engine.execute_query(&bq).unwrap();
+
+                // Results should match (same data, same query)
+                assert_eq!(
+                    result.ids, result_ids,
+                    "restored query should return same IDs as original"
+                );
+
+            engine.shutdown();
         }
     }
 }

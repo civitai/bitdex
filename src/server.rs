@@ -682,6 +682,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
             .route("/api/indexes/{name}/stats", get(handle_stats))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
+            .route("/api/indexes/{name}/cache/persistent", delete(handle_purge_cache))
             .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
             .route("/api/indexes/{name}/fields", post(handle_add_fields).delete(handle_remove_fields))
             .route("/api/indexes/{name}/tasks", get(handle_list_tasks))
@@ -1680,6 +1681,19 @@ async fn handle_stats(
         "unified_cache_bytes": uc.memory_bytes,
         "unified_cache_meta_entries": uc.meta_index_entries,
         "unified_cache_meta_bytes": uc.meta_index_bytes,
+        "unified_cache_persistence_enabled": uc.persistence_enabled,
+        "unified_cache_tombstones": uc.tombstone_count,
+        "unified_cache_pending_shards": uc.pending_shard_count,
+        "unified_cache_dirty_shards": uc.dirty_shard_count,
+        "unified_cache_meta_dirty": uc.meta_dirty,
+        "unified_cache_disk_bytes": engine.boundstore_disk_bytes(),
+        "unified_cache_shard_load_count": engine.boundstore_shard_loads(),
+        "unified_cache_tombstones_created": engine.boundstore_tombstones_created(),
+        "unified_cache_tombstones_cleaned": engine.boundstore_tombstones_cleaned(),
+        "unified_cache_entries_restored": engine.boundstore_entries_restored(),
+        "unified_cache_entries_skipped": engine.boundstore_entries_skipped(),
+        "unified_cache_bytes_written": engine.boundstore_bytes_written(),
+        "unified_cache_bytes_read": engine.boundstore_bytes_read(),
         "unified_cache_entry_details": entries,
         "eviction": eviction,
     })).into_response()
@@ -1703,7 +1717,39 @@ async fn handle_clear_cache(
     };
 
     engine.clear_unified_cache();
-    Json(serde_json::json!({"cleared": true})).into_response()
+    Json(serde_json::json!({"cleared": true, "scope": "ram_only"})).into_response()
+}
+
+/// DELETE /api/indexes/{name}/cache/persistent — purge disk + RAM cache.
+/// Wipes all BoundStore files (meta.bin + shards) then clears the in-memory
+/// cache and meta-index. Safe to call while the server is running.
+async fn handle_purge_cache(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    match engine.purge_bounds() {
+        Ok(()) => Json(serde_json::json!({
+            "purged": true,
+            "scope": "disk_and_ram",
+        })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("purge failed: {e}")})),
+        ).into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2321,6 +2367,38 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                     .with_label_values(&[name, &field])
                     .set(resident as i64);
             }
+
+            // BoundStore stats
+            m.boundstore_meta_entries
+                .with_label_values(&[name])
+                .set(uc.meta_index_entries as i64);
+            m.boundstore_tombstones
+                .with_label_values(&[name])
+                .set(uc.tombstone_count as i64);
+            m.boundstore_pending_shards
+                .with_label_values(&[name])
+                .set(uc.pending_shard_count as i64);
+            m.boundstore_disk_bytes
+                .with_label_values(&[name])
+                .set(engine.boundstore_disk_bytes() as i64);
+            m.boundstore_shard_loads_total
+                .with_label_values(&[name])
+                .set(engine.boundstore_shard_loads() as i64);
+            m.boundstore_tombstones_created
+                .with_label_values(&[name])
+                .set(engine.boundstore_tombstones_created() as i64);
+            m.boundstore_tombstones_cleaned
+                .with_label_values(&[name])
+                .set(engine.boundstore_tombstones_cleaned() as i64);
+            m.boundstore_entries_restored
+                .with_label_values(&[name])
+                .set(engine.boundstore_entries_restored() as i64);
+            m.boundstore_bytes_written
+                .with_label_values(&[name])
+                .set(engine.boundstore_bytes_written() as i64);
+            m.boundstore_bytes_read
+                .with_label_values(&[name])
+                .set(engine.boundstore_bytes_read() as i64);
         }
     }
 

@@ -373,7 +373,7 @@ async function startInstance({ port, dataDir, worktree, binary, name } = {}) {
   const proc = spawn(runBinary, [
     '--port', String(resolvedPort),
     '--data-dir', resolvedDataDir,
-    '--log-level', 'info',
+    '--log-level', 'debug',
   ], {
     cwd: wt,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -488,7 +488,7 @@ function findInstance(idOrPort) {
 
 function serializeInstance(i) {
   const { process, activeBinary, ...rest } = i;
-  return rest;
+  return rest;  // stats included — TUI needs them
 }
 
 // ─── Dataset Management ─────────────────────────────────────────
@@ -758,6 +758,35 @@ function releaseE2eLock() {
   return { released: true };
 }
 
+// ─── Instance Stats Polling ─────────────────────────────────────
+
+async function pollInstanceStats(instance) {
+  if (instance.status !== 'running' || !instance.dataset) return;
+  try {
+    const res = await fetch(`http://127.0.0.1:${instance.port}/api/indexes/${instance.dataset}/stats`);
+    if (res.ok) {
+      const stats = await res.json();
+      instance.stats = {
+        alive_count: stats.alive_count,
+        slot_count: stats.slot_count,
+        filter_bitmap_mb: (stats.filter_bitmap_bytes / (1024 * 1024)).toFixed(1),
+        sort_bitmap_mb: (stats.sort_bitmap_bytes / (1024 * 1024)).toFixed(1),
+        slot_bitmap_mb: (stats.slot_bitmap_bytes / (1024 * 1024)).toFixed(1),
+        total_bitmap_mb: ((stats.filter_bitmap_bytes + stats.sort_bitmap_bytes + stats.slot_bitmap_bytes) / (1024 * 1024)).toFixed(1),
+        cache_bytes: stats.unified_cache_bytes,
+        cache_entries: stats.unified_cache_entries,
+        cache_hits: stats.unified_cache_hits,
+        cache_misses: stats.unified_cache_misses,
+        cache_hit_rate: stats.unified_cache_hits + stats.unified_cache_misses > 0
+          ? ((stats.unified_cache_hits / (stats.unified_cache_hits + stats.unified_cache_misses)) * 100).toFixed(1) + '%'
+          : '—',
+        cache_details: stats.unified_cache_entry_details || [],
+        flush_cycle: stats.flush_cycle,
+      };
+    }
+  } catch { /* optional */ }
+}
+
 // ─── Health Check ───────────────────────────────────────────────
 
 async function waitForHealth(url, timeoutMs) {
@@ -775,6 +804,11 @@ async function waitForHealth(url, timeoutMs) {
 // ─── Heartbeat ──────────────────────────────────────────────────
 
 function heartbeat() {
+  // Poll stats for running instances
+  for (const [id, inst] of instances) {
+    if (inst.status === 'running') pollInstanceStats(inst);
+  }
+
   // Check instance liveness
   for (const [id, inst] of instances) {
     if (inst.status === 'stopped') continue;
@@ -827,6 +861,36 @@ function heartbeat() {
       portReservations.delete(p);
     }
   }
+}
+
+// ─── Force Kill ─────────────────────────────────────────────────
+
+function forceKillByName() {
+  // Kill ALL bitdex-server processes on the system — managed or orphaned
+  const names = ['bitdex-server.exe', 'bitdex-server.active.exe'];
+  const killed = [];
+  for (const name of names) {
+    try {
+      if (IS_WIN) {
+        execSync(`taskkill /IM "${name}" /F`, { stdio: 'ignore', windowsHide: true, timeout: 5000 });
+      } else {
+        execSync(`pkill -f "${name}"`, { stdio: 'ignore' });
+      }
+      killed.push(name);
+    } catch { /* no matching processes */ }
+  }
+
+  // Mark all tracked instances as stopped
+  for (const [id, inst] of instances) {
+    if (inst.status !== 'stopped') {
+      inst.status = 'stopped';
+      inst.process = null;
+      pushLog(id, 'daemon', 'Force-killed');
+    }
+  }
+  saveInstances();
+
+  return { killed, message: `Force-killed all bitdex-server processes (${killed.join(', ') || 'none found'})` };
 }
 
 // ─── Status ─────────────────────────────────────────────────────
@@ -1013,6 +1077,11 @@ async function handleRequest(req, res) {
       return json(res, 200, e2eLock.holder
         ? { locked: true, ...e2eLock, elapsed_s: Math.round((Date.now() - new Date(e2eLock.startedAt).getTime()) / 1000) }
         : { locked: false });
+    }
+
+    // POST /force-kill — kill ALL bitdex-server processes by name (including orphans)
+    if (method === 'POST' && path === '/force-kill') {
+      return json(res, 200, forceKillByName());
     }
 
     // POST /stop-all

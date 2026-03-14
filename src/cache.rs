@@ -5,11 +5,13 @@
 // that equivalent filter sets always produce the same cache key regardless
 // of clause ordering.
 
+use serde::{Deserialize, Serialize};
+
 use crate::query::{FilterClause, Value};
 
 /// A single canonicalized filter clause key component.
 /// Clauses are sorted by field name, then by string representation of value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CanonicalClause {
     pub field: String,
     pub op: String,

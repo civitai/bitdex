@@ -1,7 +1,8 @@
 ---
-status: APPROVED
+status: IMPLEMENTED
 created: 2026-03-12
 updated: 2026-03-13
+implemented: 2026-03-13
 ---
 
 # BoundStore — Unified Cache Persistence Design
@@ -638,3 +639,51 @@ This is a future optimization — not needed for v1.
 - **Separate autovac** — tombstone cleanup happens naturally on shard rewrite; forced cleanup at >50% threshold
 - **Persisted sort index** — the sorted Vec / radix bucket index that accelerates cache-hit pagination is reconstructed lazily from bitmap + sort layers on first access after shard load (~700µs at 4K capacity). Persisting it would add 3.9x storage overhead per entry with marginal benefit (one-time 700µs vs ongoing write amplification). If 64K-capacity entries become common on disk and the 12ms reconstruction cost is problematic, a v2 shard format can add an optional `sort_vec` section (see §6.3).
 - **Radix bucket persistence** — the 8-bit radix structure (256 sub-bitmaps per entry) is even more complex to serialize and only relevant for expanded 64K entries. Lazy reconstruction at 64K costs ~1.2ms with precomputed values. Not needed for v1.
+
+---
+
+## 16. Implementation Notes (2026-03-13)
+
+Deviations from the approved design, discovered during implementation and E2E testing.
+
+### 16.1 Merge Thread Independence (§8.1 fix)
+
+**Design said:** BoundStore persistence runs inside the bitmap `needs_write` gate.
+
+**Implemented:** BoundStore runs on every merge cycle, independent of the bitmap dirty flag. The cache has its own dirty tracking (`meta_dirty`, `shard_dirty`) — a query can form cache entries without any bitmap mutations, so gating on bitmap dirty would leave cache entries unpersisted until the next unrelated write.
+
+### 16.2 Dirty Flag Simplification (§8.3)
+
+**Design said:** `meta_dirty: AtomicBool`, `shard_dirty: HashMap<..., AtomicBool>`.
+
+**Implemented:** `meta_dirty: bool`, `shard_dirty: HashSet<ShardKey>`. Both are behind the same `parking_lot::Mutex` as the cache, so atomics add overhead without benefit.
+
+### 16.3 No lazy_tx Sync for Shard Loads (§14 Phase 3)
+
+**Design said:** Sync loaded shard data to flush thread via `lazy_tx` channel.
+
+**Implemented:** Not needed. Both query and flush threads access the same `Arc<Mutex<UnifiedCache>>`. The flush thread sees loaded entries automatically on its next lock acquisition.
+
+### 16.4 Sort Index Reconstruction Deferred (§14 Phase 3)
+
+**Design said:** Per-entry `AtomicBool` guard for sort index reconstruction on shard load.
+
+**Implemented:** Entries load with `sort_index: None`. The existing query fast path handles this by falling back to bitmap traversal (the pre-sort-index path). Sort index reconstruction will be addressed when the sorted Vec pagination path is extended to handle restored entries.
+
+### 16.5 Bug Fix: Tombstoning After Restart (§3.2 Correctness)
+
+**Original implementation** had the tombstoning code inside the `if !uc.is_empty()` gate
+in the flush thread. After restart, the cache has 0 RAM entries (shards pending), so
+the gate prevented tombstoning from running — even though the meta-index WAS populated
+from `meta.bin`. This meant stale entries could be served after restart + mutation,
+violating §3.2 "Never serve stale data."
+
+**Root cause:** Tombstoning uses meta-index field registrations (`entries_for_filter_field`),
+not the RAM HashMap. The `is_empty()` gate was appropriate for live maintenance (which
+operates on RAM entries) but not for tombstoning (which operates on meta-index entries).
+
+**Fix:** Moved tombstoning outside the `is_empty()` gate. Now runs whenever persistence
+is enabled and mutations affect registered fields, regardless of RAM cache state.
+
+**Caught by:** External review (Gemini 3.1 Pro + GPT 5.4) identified the §3.2 violation.
+E2E test D1 now asserts tombstones are created after restart + mutation.

@@ -211,6 +211,10 @@ dev-build *ARGS:
 dev-test-e2e:
     node {{_cli}} test-e2e
 
+# Force-kill ALL bitdex-server processes (including orphans)
+dev-kill:
+    node {{_cli}} force-kill
+
 # Shut down all managed instances and the daemon
 dev-shutdown:
     node {{_cli}} shutdown
