@@ -52,18 +52,13 @@ let globalLogIndex = 0;
 
 // ─── Process Utilities ──────────────────────────────────────────
 
+// Non-blocking PID check — uses process.kill(pid, 0) which is instant
+// (no execSync/tasklist that blocks the event loop for 200ms+)
 function isPidAlive(pid) {
   if (!pid) return false;
   try {
-    if (IS_WIN) {
-      const out = execSync(`tasklist /FI "PID eq ${pid}" /NH`, {
-        encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, timeout: 5000,
-      });
-      return out.includes(String(pid));
-    } else {
-      process.kill(pid, 0);
-      return true;
-    }
+    process.kill(pid, 0); // signal 0 = check existence, works on Windows Node 18+
+    return true;
   } catch {
     return false;
   }
@@ -1019,7 +1014,8 @@ async function handleRequest(req, res) {
 
 async function main() {
   // Scan for existing datasets on disk
-  scanForDatasets();
+  // Dataset scanning removed — was blocking event loop on large data dirs.
+  // Datasets are discovered when instances start and report their index stats.
 
   const server = http.createServer(handleRequest);
 
