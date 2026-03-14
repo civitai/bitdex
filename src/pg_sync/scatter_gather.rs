@@ -480,11 +480,24 @@ fn run_gather_and_apply(
         // Phase C: Encode docs to msgpack
         let te = Instant::now();
         let mut encoded_docs: Vec<(u32, Vec<u8>)> = Vec::with_capacity(slot_docs.len());
+        let mut metrics_hit_count = 0u32;
         for doc in &slot_docs {
             let doc_metrics = metrics_map_ref.get(&doc.slot).copied();
+            if doc_metrics.is_some() {
+                metrics_hit_count += 1;
+            }
             let json = scratch::slot_doc_to_json(doc, doc_metrics);
             let bytes = bulk_writer_ref.encode_json(&json, schema_ref);
             encoded_docs.push((doc.slot, bytes));
+        }
+        // Log first shard's metrics hit rate for diagnostics
+        if shards_done_ref.load(Ordering::Relaxed) == 0 && metrics_hit_count > 0 {
+            eprintln!(
+                "  [metrics-diag] first shard: {}/{} docs had metrics (sample slot={}, metrics={:?})",
+                metrics_hit_count, slot_docs.len(),
+                slot_docs[0].slot,
+                metrics_map_ref.get(&slot_docs[0].slot)
+            );
         }
         let encode_ms = te.elapsed().as_millis() as u64;
 

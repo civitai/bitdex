@@ -872,4 +872,44 @@ mod tests {
             .collect();
         assert_eq!(tags, vec![100, 200]);
     }
+
+    #[test]
+    fn test_slot_doc_to_json_with_metrics() {
+        let doc = SlotDoc {
+            slot: 42,
+            nsfw_level: 1,
+            user_id: 100,
+            image_type: 0,
+            sort_at: 1700000000,
+            poi: false,
+            minor: false,
+            has_meta: false,
+            on_site: false,
+            post_id: 1,
+            posted_to_id: 0,
+            availability: 0,
+            blocked_for: 0,
+            published_at_ms: 1700000000000,
+            url: None,
+            hash: None,
+            tag_ids: vec![],
+            tool_ids: vec![],
+            technique_ids: vec![],
+            model_version_ids: vec![],
+            base_model: 0,
+            resource_poi: false,
+        };
+
+        // Without metrics
+        let json_no_metrics = slot_doc_to_json(&doc, None);
+        assert_eq!(json_no_metrics["reactionCount"], 0);
+        assert_eq!(json_no_metrics["commentCount"], 0);
+        assert_eq!(json_no_metrics["collectedCount"], 0);
+
+        // With metrics
+        let json_with_metrics = slot_doc_to_json(&doc, Some((500, 10, 5)));
+        assert_eq!(json_with_metrics["reactionCount"], 500);
+        assert_eq!(json_with_metrics["commentCount"], 10);
+        assert_eq!(json_with_metrics["collectedCount"], 5);
+    }
 }
