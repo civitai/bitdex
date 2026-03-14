@@ -3881,6 +3881,11 @@ impl ConcurrentEngine {
         &self.config
     }
 
+    /// Get a reference to the BitmapFs store, if configured.
+    pub fn bitmap_store(&self) -> Option<&Arc<BitmapFs>> {
+        self.bitmap_store.as_ref()
+    }
+
     /// Get a reference to the in-flight tracker.
     pub fn in_flight(&self) -> &InFlightTracker {
         &self.in_flight

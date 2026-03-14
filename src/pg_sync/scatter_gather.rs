@@ -20,8 +20,8 @@ use std::time::Instant;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
+use crate::bitmap_fs::BitmapFs;
 use crate::concurrent_engine::ConcurrentEngine;
-use crate::loader::BitmapAccum;
 
 use super::bulk_loader::BulkLoadStats;
 use super::config::IndexDefinition;
@@ -29,7 +29,6 @@ use super::copy_queries::{
     parse_image_row, parse_model_row, parse_model_version_row, parse_post_row, parse_resource_row,
     parse_technique_row, parse_tool_row,
 };
-use super::copy_streams;
 use super::progress::LoadProgress;
 use super::scratch::{self, ScratchWriter, SlotDoc, DEFAULT_SHARD_SHIFT};
 
@@ -56,8 +55,8 @@ pub fn run_bulk_load_scatter(
         .iter()
         .map(|f| (f.name.clone(), f.bits))
         .collect();
-    let filter_set: HashSet<String> = filter_names.iter().cloned().collect();
-    let sort_bits: HashMap<String, u8> = sort_configs.iter().cloned().collect();
+    let _filter_set: HashSet<String> = filter_names.iter().cloned().collect();
+    let _sort_bits: HashMap<String, u8> = sort_configs.iter().cloned().collect();
 
     let scratch_dir = stage_dir
         .parent()
@@ -173,7 +172,70 @@ pub fn run_gather_only(
     })
 }
 
+/// Result returned by the streaming merge thread: only the data NOT yet saved to disk.
+struct MergeResult {
+    /// Number of filter fields already saved and dropped during merge.
+    fields_streamed: usize,
+    /// Number of filter values saved to disk during merge.
+    values_streamed: usize,
+    /// Total bytes saved to disk during merge (approximate).
+    bytes_streamed: u64,
+}
+
+/// Save a single filter field's bitmaps to BitmapFs using write_filter_bucket.
+/// Groups values by hex bucket and writes one .fpack file per bucket.
+fn save_filter_field_to_disk(
+    fs: &BitmapFs,
+    field_name: &str,
+    values: &HashMap<u64, RoaringBitmap>,
+) -> Result<u64, String> {
+    // Group by bucket
+    let mut by_bucket: HashMap<u8, Vec<(u64, &RoaringBitmap)>> = HashMap::new();
+    for (value, bm) in values {
+        let bucket = ((*value >> 8) & 0xFF) as u8;
+        by_bucket.entry(bucket).or_default().push((*value, bm));
+    }
+    let mut total_bytes = 0u64;
+    for (bucket, entries) in &by_bucket {
+        // Estimate serialized size for logging
+        for (_, bm) in entries {
+            total_bytes += bm.serialized_size() as u64;
+        }
+        fs.write_filter_bucket(field_name, *bucket, entries)
+            .map_err(|e| format!("write_filter_bucket({field_name}, {bucket:02x}): {e}"))?;
+    }
+    Ok(total_bytes)
+}
+
+/// Save sort field bitmaps to BitmapFs.
+fn save_sort_field_to_disk(
+    fs: &BitmapFs,
+    field_name: &str,
+    bit_map: &HashMap<usize, RoaringBitmap>,
+    num_bits: u8,
+) -> Result<(), String> {
+    let mut layers: Vec<&RoaringBitmap> = Vec::with_capacity(num_bits as usize);
+    // Build a vec of layer refs in bit order, using empty bitmaps for missing bits
+    let empty = RoaringBitmap::new();
+    for bit in 0..(num_bits as usize) {
+        layers.push(bit_map.get(&bit).unwrap_or(&empty));
+    }
+    fs.write_sort_layers(field_name, &layers)
+        .map_err(|e| format!("write_sort_layers({field_name}): {e}"))
+}
+
 /// Shared gather + apply + save logic used by both full pipeline and phase2-only.
+///
+/// The merge thread streams bitmap saves to BitmapFs during gather, instead of
+/// accumulating all shard bitmaps in memory. This reduces peak RSS from ~20 GB
+/// to ~8 GB for 107M records.
+///
+/// Flow:
+/// 1. Rayon workers build per-shard bitmaps and send via bounded channel
+/// 2. Merge thread merges fragments into global accumulators
+/// 3. After all shards: save filter fields one at a time (largest first), dropping each after save
+/// 4. Save sort fields, alive bitmap, slot counter
+/// 5. Engine exits loading mode — bitmaps are already on disk for lazy-load
 fn run_gather_and_apply(
     engine: &ConcurrentEngine,
     index_def: &IndexDefinition,
@@ -183,6 +245,11 @@ fn run_gather_and_apply(
 ) -> Result<(), String> {
     let schema = &index_def.data_schema;
     let config = engine.config();
+
+    // Get BitmapFs for streaming saves
+    let bitmap_fs = engine.bitmap_store()
+        .ok_or_else(|| "no bitmap_path configured; cannot stream saves".to_string())?
+        .clone();
 
     let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
     let sort_configs: Vec<(String, u8)> = config
@@ -194,7 +261,7 @@ fn run_gather_and_apply(
     let sort_bits: HashMap<String, u8> = sort_configs.iter().cloned().collect();
 
     progress.set_phase(2);
-    eprintln!("\n=== Phase 2: Gather (scratch shards → bitmaps + docstore) ===");
+    eprintln!("\n=== Phase 2: Gather (scratch shards → bitmaps + docstore, streaming saves) ===");
     let gather_start = Instant::now();
 
     // Prepare BulkWriter for doc encoding
@@ -214,7 +281,7 @@ fn run_gather_and_apply(
     let shard_files = scratch::list_shard_files(&scratch_dir)
         .map_err(|e| format!("list_shard_files: {e}"))?;
     let num_shards = shard_files.len();
-    eprintln!("Processing {} shard files with rayon...", num_shards);
+    eprintln!("Processing {} shard files with rayon (streaming saves to BitmapFs)...", num_shards);
 
     // Doc writes: each rayon worker writes directly via BulkWriter
     // (BulkWriter has per-shard DashMap locking — safe for concurrent use)
@@ -228,35 +295,131 @@ fn run_gather_and_apply(
     // climbing unbounded when rayon workers outpace the merge thread.
     let (bm_tx, bm_rx) = crossbeam_channel::bounded::<ShardBitmaps>(32);
 
-    // Bitmap merge thread — merges fragments as they arrive
+    // Streaming merge thread — merges fragments and saves to BitmapFs incrementally.
+    //
+    // Filter fields are saved to disk after all shards are merged, largest first.
+    // tagIds (31K values, ~5.1 GB) is the primary target — saving and dropping it
+    // prevents the 15-20 GB peak from the old accumulate-everything approach.
     let f_names = filter_names.clone();
     let s_configs = sort_configs.clone();
-    let merge_handle = std::thread::spawn(move || {
-        let mut global = BitmapAccum::new(&f_names, &s_configs);
+    let merge_fs = bitmap_fs.clone();
+    let merge_handle = std::thread::spawn(move || -> Result<MergeResult, String> {
+        let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = f_names
+            .iter()
+            .map(|n| (n.clone(), HashMap::new()))
+            .collect();
+        let mut sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>> = s_configs
+            .iter()
+            .map(|(n, _)| (n.clone(), HashMap::new()))
+            .collect();
+        let mut alive = RoaringBitmap::new();
         let mut merged_count = 0u64;
+        let mut fields_streamed = 0usize;
+        let mut values_streamed = 0usize;
+        let mut bytes_streamed = 0u64;
+        let mut flushed_fields: HashSet<String> = HashSet::new();
+
         while let Ok(shard_bm) = bm_rx.recv() {
+            // Merge filter bitmaps
             for (field, value_map) in shard_bm.filter_maps {
-                if let Some(target) = global.filter_maps.get_mut(&field) {
+                if flushed_fields.contains(&field) {
+                    eprintln!("Warning: shard data for already-flushed field {field}");
+                    continue;
+                }
+                if let Some(target) = filter_maps.get_mut(&field) {
                     for (value, bm) in value_map {
                         target.entry(value).and_modify(|e| *e |= &bm).or_insert(bm);
                     }
                 }
             }
+            // Merge sort bitmaps
             for (field, bit_map) in shard_bm.sort_maps {
-                if let Some(target) = global.sort_maps.get_mut(&field) {
+                if let Some(target) = sort_maps.get_mut(&field) {
                     for (bit, bm) in bit_map {
                         target.entry(bit).and_modify(|e| *e |= &bm).or_insert(bm);
                     }
                 }
             }
-            global.alive |= &shard_bm.alive;
+            alive |= &shard_bm.alive;
             merged_count += 1;
+
             if merged_count % 100 == 0 {
                 eprintln!("  merged {}/{} bitmap fragments", merged_count, num_shards);
             }
         }
-        eprintln!("  merged all {} bitmap fragments", merged_count);
-        global
+
+        eprintln!("  merged all {} bitmap fragments — streaming saves to disk...", merged_count);
+
+        // ---- Stream filter fields to BitmapFs ----
+        // Save largest fields first to free memory sooner.
+        let mut field_sizes: Vec<(String, usize)> = filter_maps
+            .iter()
+            .map(|(name, vals)| (name.clone(), vals.len()))
+            .collect();
+        field_sizes.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (field_name, value_count) in &field_sizes {
+            if *value_count == 0 {
+                continue;
+            }
+            let t0 = Instant::now();
+            // Take the field out of the map to free memory after save
+            let values = filter_maps.remove(field_name).unwrap();
+            let saved_bytes = save_filter_field_to_disk(&merge_fs, field_name, &values)?;
+            let elapsed = t0.elapsed();
+            eprintln!(
+                "  saved filter {}: {} values ({:.1} MB) in {:.1}s",
+                field_name, value_count,
+                saved_bytes as f64 / (1024.0 * 1024.0),
+                elapsed.as_secs_f64()
+            );
+            values_streamed += value_count;
+            bytes_streamed += saved_bytes;
+            fields_streamed += 1;
+            flushed_fields.insert(field_name.clone());
+            // Memory for this field is freed here (values dropped)
+        }
+
+        // ---- Save sort fields ----
+        for (field_name, bits) in &s_configs {
+            if let Some(bit_map) = sort_maps.get(field_name) {
+                if bit_map.is_empty() {
+                    continue;
+                }
+                let t0 = Instant::now();
+                save_sort_field_to_disk(&merge_fs, field_name, bit_map, *bits)?;
+                eprintln!(
+                    "  saved sort {}: {} layers in {:.1}ms",
+                    field_name, bits, t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+        drop(sort_maps);
+
+        // ---- Save alive bitmap ----
+        let max_slot = alive.max().unwrap_or(0);
+        let t0 = Instant::now();
+        merge_fs.write_alive(&alive)
+            .map_err(|e| format!("write_alive: {e}"))?;
+        eprintln!(
+            "  saved alive bitmap: {} bits ({:.1} MB) in {:.1}ms",
+            alive.len(),
+            alive.serialized_size() as f64 / (1024.0 * 1024.0),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        drop(alive);
+
+        // ---- Save slot counter ----
+        let slot_counter = max_slot.saturating_add(1);
+        merge_fs.write_slot_counter(slot_counter)
+            .map_err(|e| format!("write_slot_counter: {e}"))?;
+        eprintln!("  saved slot counter: {}", slot_counter);
+
+        Ok(MergeResult {
+            fields_streamed,
+            values_streamed,
+            bytes_streamed,
+        })
     });
 
     // Progress + timing accumulators (atomics, updated by rayon workers)
@@ -324,7 +487,7 @@ fn run_gather_and_apply(
         }
         let encode_ms = te.elapsed().as_millis() as u64;
 
-        // Send bitmaps to merge thread (unbounded, never blocks)
+        // Send bitmaps to merge thread (bounded, backpressure)
         let _ = bm_tx_ref.send(bitmaps);
 
         // Phase D: Write docs to docstore
@@ -361,47 +524,38 @@ fn run_gather_and_apply(
         }
     });
 
-    // Close bitmap channel, wait for merge thread
+    // Close bitmap channel, wait for merge thread to finish streaming saves
     drop(bm_tx);
-    let global_accum = merge_handle.join().unwrap();
+    let merge_result = merge_handle.join()
+        .map_err(|_| "merge thread panicked".to_string())?
+        .map_err(|e| format!("merge thread error: {e}"))?;
     let docs_written = docs_written.load(Ordering::Relaxed);
     let bytes_written = bytes_written.load(Ordering::Relaxed);
 
     eprintln!(
-        "Gather complete: {} docs ({:.1} GB) in {:.1}s ({:.0}/s)",
+        "Gather complete: {} docs ({:.1} GB docstore), {} filter fields ({} values, {:.1} GB bitmaps) streamed to disk in {:.1}s ({:.0} docs/s)",
         docs_written,
         bytes_written as f64 / (1024.0 * 1024.0 * 1024.0),
+        merge_result.fields_streamed,
+        merge_result.values_streamed,
+        merge_result.bytes_streamed as f64 / (1024.0 * 1024.0 * 1024.0),
         gather_start.elapsed().as_secs_f64(),
         docs_written as f64 / gather_start.elapsed().as_secs_f64().max(0.001)
     );
 
     // ===================================================================
-    // Phase 3: Apply bitmaps + save snapshot (no clone spike)
+    // Phase 3: Exit loading mode (bitmaps already on disk)
     // ===================================================================
+    // All bitmaps are already saved to BitmapFs by the merge thread.
+    // The engine will lazy-load them from disk on first query.
+    // We just need to exit loading mode — no need to apply bitmaps to staging
+    // or do the expensive clone+save cycle.
     progress.set_phase(3);
-    eprintln!("\n=== Phase 3: Apply bitmaps + save snapshot ===");
-    let apply_start = Instant::now();
+    eprintln!("\n=== Phase 3: Exit loading mode (bitmaps already on disk) ===");
+    let phase3_start = Instant::now();
 
-    // Apply bitmaps directly to staging (in loading mode, no snapshot publish).
-    // Uses apply_bitmap_maps on a clone — but we're in loading mode so
-    // the staging refcount is 1 (no readers), making Arc::make_mut a no-op.
-    let mut staging = engine.clone_staging();
-    ConcurrentEngine::apply_bitmap_maps(
-        &mut staging,
-        global_accum.filter_maps,
-        global_accum.sort_maps,
-        global_accum.alive,
-    );
-    engine.publish_staging(staging);
-    eprintln!("Bitmaps applied in {:.1}s", apply_start.elapsed().as_secs_f64());
-
-    // Save snapshot + unload in one step — avoids the 22GB→38GB RSS spike
-    // from the intermediate staging.clone() that exit_loading_mode() would do.
-    eprintln!("Saving bitmap snapshot (save_and_unload)...");
-    engine
-        .exit_loading_mode_and_save_unload()
-        .map_err(|e| format!("exit_loading_mode_and_save_unload: {e}"))?;
-    eprintln!("Snapshot saved and unloaded in {:.1}s", apply_start.elapsed().as_secs_f64());
+    engine.exit_loading_mode();
+    eprintln!("Loading mode exited in {:.1}s", phase3_start.elapsed().as_secs_f64());
 
     // Clean up scratch shards
     if let Err(e) = std::fs::remove_dir_all(&scratch_dir) {
