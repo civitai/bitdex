@@ -22,18 +22,21 @@ fn test_config() -> Config {
                 field_type: FilterFieldType::SingleValue,
                 behaviors: None,
                 eviction: None,
+                eager_load: false,
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
                 field_type: FilterFieldType::MultiValue,
                 behaviors: None,
                 eviction: None,
+                eager_load: false,
             },
             FilterFieldConfig {
                 name: "active".to_string(),
                 field_type: FilterFieldType::Boolean,
                 behaviors: None,
                 eviction: None,
+                eager_load: false,
             },
         ],
         sort_fields: vec![SortFieldConfig {
@@ -41,6 +44,7 @@ fn test_config() -> Config {
             source_type: "uint32".to_string(),
             encoding: "linear".to_string(),
             bits: 32,
+            eager_load: false,
         }],
         max_page_size: 1000,
         ..Default::default()

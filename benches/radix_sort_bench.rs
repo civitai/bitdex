@@ -32,6 +32,7 @@ fn make_sort_config() -> SortFieldConfig {
         source_type: "uint32".to_string(),
         encoding: "linear".to_string(),
         bits: 32,
+        eager_load: false,
     }
 }
 

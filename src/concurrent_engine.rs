@@ -329,6 +329,131 @@ impl ConcurrentEngine {
                 }
             }
         }
+        // Eager-load fields marked with `eager_load: true` in config.
+        // These are loaded in parallel from BitmapFs and applied to the
+        // filters/sorts before constructing the InnerEngine.
+        if let Some(ref store) = bitmap_store {
+            let eager_filter_names: Vec<String> = config.filter_fields.iter()
+                .filter(|fc| fc.eager_load && fc.field_type != FilterFieldType::MultiValue)
+                .filter(|fc| pending_filter_loads.contains(&fc.name))
+                .map(|fc| fc.name.clone())
+                .collect();
+            let eager_sort_configs: Vec<(String, usize)> = config.sort_fields.iter()
+                .filter(|sc| sc.eager_load)
+                .filter(|sc| pending_sort_loads.contains(&sc.name))
+                .map(|sc| (sc.name.clone(), sc.bits as usize))
+                .collect();
+
+            if !eager_filter_names.is_empty() || !eager_sort_configs.is_empty() {
+                let t0 = std::time::Instant::now();
+                let total_eager = eager_filter_names.len() + eager_sort_configs.len();
+
+                if total_eager > 1 {
+                    // Parallel eager loading
+                    use std::sync::Mutex;
+                    let eager_filter_results: Mutex<Vec<(String, HashMap<u64, RoaringBitmap>)>> = Mutex::new(Vec::new());
+                    let eager_sort_results: Mutex<Vec<(String, Vec<RoaringBitmap>)>> = Mutex::new(Vec::new());
+
+                    std::thread::scope(|s| {
+                        for name in &eager_filter_names {
+                            let store = store.clone();
+                            let results = &eager_filter_results;
+                            s.spawn(move || {
+                                let ft0 = std::time::Instant::now();
+                                match store.load_field(name) {
+                                    Ok(bitmaps) => {
+                                        let count = bitmaps.len();
+                                        eprintln!(
+                                            "Eager-loaded filter '{}': {} values in {:.1}ms",
+                                            name, count, ft0.elapsed().as_secs_f64() * 1000.0
+                                        );
+                                        results.lock().unwrap().push((name.clone(), bitmaps));
+                                    }
+                                    Err(e) => eprintln!("Warning: eager load failed for filter '{}': {}", name, e),
+                                }
+                            });
+                        }
+                        for (name, bits) in &eager_sort_configs {
+                            let store = store.clone();
+                            let results = &eager_sort_results;
+                            let name = name.clone();
+                            let bits = *bits;
+                            s.spawn(move || {
+                                let st0 = std::time::Instant::now();
+                                match store.load_sort_layers(&name, bits) {
+                                    Ok(Some(layers)) if !layers.is_empty() => {
+                                        let layer_count = layers.len();
+                                        eprintln!(
+                                            "Eager-loaded sort '{}': {} layers in {:.1}ms",
+                                            name, layer_count, st0.elapsed().as_secs_f64() * 1000.0
+                                        );
+                                        results.lock().unwrap().push((name, layers));
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => eprintln!("Warning: eager load failed for sort '{}': {}", name, e),
+                                }
+                            });
+                        }
+                    });
+
+                    for (name, bitmaps) in eager_filter_results.into_inner().unwrap() {
+                        if let Some(field) = filters.get_field_mut(&name) {
+                            field.load_field_complete(bitmaps);
+                        }
+                        pending_filter_loads.remove(&name);
+                    }
+                    for (name, layers) in eager_sort_results.into_inner().unwrap() {
+                        if let Some(field) = sorts.get_field_mut(&name) {
+                            field.load_layers(layers);
+                        }
+                        pending_sort_loads.remove(&name);
+                    }
+                } else {
+                    // Single eager field — load serially (no thread overhead)
+                    for name in &eager_filter_names {
+                        let ft0 = std::time::Instant::now();
+                        match store.load_field(name) {
+                            Ok(bitmaps) => {
+                                let count = bitmaps.len();
+                                eprintln!(
+                                    "Eager-loaded filter '{}': {} values in {:.1}ms",
+                                    name, count, ft0.elapsed().as_secs_f64() * 1000.0
+                                );
+                                if let Some(field) = filters.get_field_mut(name) {
+                                    field.load_field_complete(bitmaps);
+                                }
+                                pending_filter_loads.remove(name);
+                            }
+                            Err(e) => eprintln!("Warning: eager load failed for filter '{}': {}", name, e),
+                        }
+                    }
+                    for (name, bits) in &eager_sort_configs {
+                        let st0 = std::time::Instant::now();
+                        match store.load_sort_layers(name, *bits) {
+                            Ok(Some(layers)) if !layers.is_empty() => {
+                                let layer_count = layers.len();
+                                eprintln!(
+                                    "Eager-loaded sort '{}': {} layers in {:.1}ms",
+                                    name, layer_count, st0.elapsed().as_secs_f64() * 1000.0
+                                );
+                                if let Some(field) = sorts.get_field_mut(name) {
+                                    field.load_layers(layers);
+                                }
+                                pending_sort_loads.remove(name);
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("Warning: eager load failed for sort '{}': {}", name, e),
+                        }
+                    }
+                }
+
+                eprintln!(
+                    "Eager loading complete: {} fields in {:.1}ms",
+                    total_eager, t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+
         let unified_cache = Arc::new(parking_lot::Mutex::new(UnifiedCache::new(
             UnifiedCacheConfig::default(),
         )));
@@ -1715,43 +1840,33 @@ impl ConcurrentEngine {
             None => return Ok(()), // no store, nothing to load
         };
 
-        // Do all expensive disk I/O outside the rcu closure, collecting loaded data.
+        // Do all expensive disk I/O in parallel, collecting loaded data.
+        // Filter field reads, sort field reads, and per-value reads are all
+        // independent I/O operations that benefit from concurrent NVMe access.
         let mut loaded_filters: Vec<(String, HashMap<u64, RoaringBitmap>)> = Vec::new();
         let mut loaded_values: Vec<(String, HashMap<u64, RoaringBitmap>, Vec<u64>)> = Vec::new();
         let mut loaded_sort: Option<(String, Vec<RoaringBitmap>)> = None;
 
-        // Full-field loads (low-cardinality)
-        for name in &needed_filters {
-            let t0 = std::time::Instant::now();
-            let bitmaps = store.load_field(name)?;
-            let count = bitmaps.len();
-            eprintln!(
-                "Lazy-loaded filter '{}': {} values in {:.1}ms",
-                name,
-                count,
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
+        // Resolve sort bits config before entering the parallel scope.
+        let sort_bits = needed_sort.as_ref().map(|sort_name| {
+            self.config
+                .sort_fields
+                .iter()
+                .find(|sc| sc.name == *sort_name)
+                .map(|sc| sc.bits as usize)
+                .unwrap_or(32)
+        });
 
-            let _ = self.lazy_tx.send(LazyLoad::FilterField {
-                name: name.clone(),
-                bitmaps: bitmaps.clone(),
-            });
-            self.pending_filter_loads.lock().remove(name);
-            loaded_filters.push((name.clone(), bitmaps));
-        }
-
-        // Per-value loads (high-cardinality multi_value)
-        // We need the current snapshot to determine which values are missing.
+        // Determine missing per-value keys before entering parallel scope.
+        let mut value_load_tasks: Vec<(String, Vec<u64>)> = Vec::new();
         {
             let current: Arc<InnerEngine> = self.inner.load_full();
             for (field_name, values) in &needed_values {
-                // Filter out values already present in the snapshot
                 let missing: Vec<u64> = if let Some(field) = current.filters.get_field(field_name) {
                     values
                         .iter()
                         .copied()
                         .filter(|v| {
-                            // Load if the value doesn't exist OR if it exists but is unloaded
                             match field.get_versioned(*v) {
                                 None => true,
                                 Some(vb) => !vb.is_loaded(),
@@ -1763,7 +1878,6 @@ impl ConcurrentEngine {
                 };
 
                 // Filter out values that don't exist on disk (positive existence set).
-                // This eliminates 30-50ms disk I/O per nonexistent value.
                 let missing: Vec<u64> = if let Some(ek) = self.existing_keys.get(field_name.as_str()) {
                     let keys = ek.load();
                     missing.into_iter().filter(|v| keys.contains(v)).collect()
@@ -1771,57 +1885,164 @@ impl ConcurrentEngine {
                     missing
                 };
 
-                if missing.is_empty() {
-                    continue;
+                if !missing.is_empty() {
+                    value_load_tasks.push((field_name.clone(), missing));
                 }
-
-                let t0 = std::time::Instant::now();
-                let loaded = store.load_field_values(field_name, &missing)?;
-                if loaded.is_empty() {
-                    continue;
-                }
-                let count = loaded.len();
-                eprintln!(
-                    "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
-                    field_name,
-                    count,
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-
-                let _ = self.lazy_tx.send(LazyLoad::FilterValues {
-                    field: field_name.clone(),
-                    values: loaded.clone(),
-                });
-                loaded_values.push((field_name.clone(), loaded, missing));
             }
         }
 
-        // Sort field loads
-        if let Some(ref sort_name) = needed_sort {
-            let t0 = std::time::Instant::now();
-            let bits = self
-                .config
-                .sort_fields
-                .iter()
-                .find(|sc| sc.name == *sort_name)
-                .map(|sc| sc.bits as usize)
-                .unwrap_or(32);
-            if let Some(layers) = store.load_sort_layers(sort_name, bits)? {
-                let layer_count = layers.len();
-                eprintln!(
-                    "Lazy-loaded sort '{}': {} layers in {:.1}ms",
-                    sort_name,
-                    layer_count,
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
+        // Count total parallel work items to decide whether parallelism is worthwhile.
+        let total_tasks = needed_filters.len()
+            + if needed_sort.is_some() { 1 } else { 0 }
+            + value_load_tasks.len();
 
-                let _ = self.lazy_tx.send(LazyLoad::SortField {
-                    name: sort_name.clone(),
-                    layers: layers.clone(),
-                });
-                loaded_sort = Some((sort_name.clone(), layers));
+        if total_tasks > 1 {
+            // --- Parallel loading via std::thread::scope ---
+            // Each thread reads from BitmapFs (Arc, safe to share). Results collected
+            // into thread-safe containers, then applied sequentially.
+            use std::sync::Mutex;
+            let par_filters: Mutex<Vec<(String, HashMap<u64, RoaringBitmap>)>> = Mutex::new(Vec::new());
+            let par_sort: Mutex<Option<(String, Vec<RoaringBitmap>)>> = Mutex::new(None);
+            let par_values: Mutex<Vec<(String, HashMap<u64, RoaringBitmap>, Vec<u64>)>> = Mutex::new(Vec::new());
+            let par_error: Mutex<Option<crate::error::BitdexError>> = Mutex::new(None);
+
+            std::thread::scope(|s| {
+                // Spawn filter field loaders
+                for name in &needed_filters {
+                    let store = store.clone();
+                    let par_filters = &par_filters;
+                    let par_error = &par_error;
+                    s.spawn(move || {
+                        if par_error.lock().unwrap().is_some() { return; }
+                        let t0 = std::time::Instant::now();
+                        match store.load_field(name) {
+                            Ok(bitmaps) => {
+                                let count = bitmaps.len();
+                                eprintln!(
+                                    "Lazy-loaded filter '{}': {} values in {:.1}ms",
+                                    name, count, t0.elapsed().as_secs_f64() * 1000.0
+                                );
+                                par_filters.lock().unwrap().push((name.clone(), bitmaps));
+                            }
+                            Err(e) => { *par_error.lock().unwrap() = Some(e); }
+                        }
+                    });
+                }
+
+                // Spawn sort field loader
+                if let (Some(sort_name), Some(bits)) = (&needed_sort, sort_bits) {
+                    let store = store.clone();
+                    let par_sort = &par_sort;
+                    let par_error = &par_error;
+                    let sort_name = sort_name.clone();
+                    s.spawn(move || {
+                        if par_error.lock().unwrap().is_some() { return; }
+                        let t0 = std::time::Instant::now();
+                        match store.load_sort_layers(&sort_name, bits) {
+                            Ok(Some(layers)) => {
+                                let layer_count = layers.len();
+                                eprintln!(
+                                    "Lazy-loaded sort '{}': {} layers in {:.1}ms",
+                                    sort_name, layer_count, t0.elapsed().as_secs_f64() * 1000.0
+                                );
+                                *par_sort.lock().unwrap() = Some((sort_name, layers));
+                            }
+                            Ok(None) => {}
+                            Err(e) => { *par_error.lock().unwrap() = Some(e); }
+                        }
+                    });
+                }
+
+                // Spawn per-value loaders
+                for (field_name, missing) in &value_load_tasks {
+                    let store = store.clone();
+                    let par_values = &par_values;
+                    let par_error = &par_error;
+                    s.spawn(move || {
+                        if par_error.lock().unwrap().is_some() { return; }
+                        let t0 = std::time::Instant::now();
+                        match store.load_field_values(field_name, missing) {
+                            Ok(loaded) if !loaded.is_empty() => {
+                                let count = loaded.len();
+                                eprintln!(
+                                    "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
+                                    field_name, count, t0.elapsed().as_secs_f64() * 1000.0
+                                );
+                                par_values.lock().unwrap().push((field_name.clone(), loaded, missing.clone()));
+                            }
+                            Ok(_) => {}
+                            Err(e) => { *par_error.lock().unwrap() = Some(e); }
+                        }
+                    });
+                }
+            });
+
+            // Check for errors from parallel threads
+            if let Some(e) = par_error.into_inner().unwrap() {
+                return Err(e);
             }
 
+            loaded_filters = par_filters.into_inner().unwrap();
+            loaded_sort = par_sort.into_inner().unwrap();
+            loaded_values = par_values.into_inner().unwrap();
+        } else {
+            // --- Serial path: single task, no threading overhead ---
+            for name in &needed_filters {
+                let t0 = std::time::Instant::now();
+                let bitmaps = store.load_field(name)?;
+                let count = bitmaps.len();
+                eprintln!(
+                    "Lazy-loaded filter '{}': {} values in {:.1}ms",
+                    name, count, t0.elapsed().as_secs_f64() * 1000.0
+                );
+                loaded_filters.push((name.clone(), bitmaps));
+            }
+
+            if let (Some(sort_name), Some(bits)) = (&needed_sort, sort_bits) {
+                let t0 = std::time::Instant::now();
+                if let Some(layers) = store.load_sort_layers(sort_name, bits)? {
+                    let layer_count = layers.len();
+                    eprintln!(
+                        "Lazy-loaded sort '{}': {} layers in {:.1}ms",
+                        sort_name, layer_count, t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    loaded_sort = Some((sort_name.clone(), layers));
+                }
+            }
+
+            for (field_name, missing) in &value_load_tasks {
+                let t0 = std::time::Instant::now();
+                let loaded = store.load_field_values(field_name, missing)?;
+                if !loaded.is_empty() {
+                    let count = loaded.len();
+                    eprintln!(
+                        "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
+                        field_name, count, t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    loaded_values.push((field_name.clone(), loaded, missing.clone()));
+                }
+            }
+        }
+
+        // Sequential phase: send LazyLoad messages to flush thread and update pending sets.
+        for (name, bitmaps) in &loaded_filters {
+            let _ = self.lazy_tx.send(LazyLoad::FilterField {
+                name: name.clone(),
+                bitmaps: bitmaps.clone(),
+            });
+            self.pending_filter_loads.lock().remove(name);
+        }
+        for (field_name, loaded_vals, _missing) in &loaded_values {
+            let _ = self.lazy_tx.send(LazyLoad::FilterValues {
+                field: field_name.clone(),
+                values: loaded_vals.clone(),
+            });
+        }
+        if let Some((ref sort_name, ref layers)) = loaded_sort {
+            let _ = self.lazy_tx.send(LazyLoad::SortField {
+                name: sort_name.clone(),
+                layers: layers.clone(),
+            });
             self.pending_sort_loads.lock().remove(sort_name);
         }
 
@@ -4328,18 +4549,21 @@ mod tests {
                     field_type: FilterFieldType::SingleValue,
                     behaviors: None,
                     eviction: None,
+                    eager_load: false,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
                     behaviors: None,
                     eviction: None,
+                    eager_load: false,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
                     behaviors: None,
                     eviction: None,
+                    eager_load: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -4347,6 +4571,7 @@ mod tests {
                 source_type: "uint32".to_string(),
                 encoding: "linear".to_string(),
                 bits: 32,
+                eager_load: false,
             }],
             max_page_size: 100,
             flush_interval_us: 50, // Fast flush for tests
@@ -5471,18 +5696,21 @@ mod tests {
                     field_type: FilterFieldType::SingleValue,
                     behaviors: None,
                     eviction: None,
+                    eager_load: false,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
                     field_type: FilterFieldType::MultiValue,
                     behaviors: None,
                     eviction: None,
+                    eager_load: false,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
                     field_type: FilterFieldType::Boolean,
                     behaviors: None,
                     eviction: None,
+                    eager_load: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -5490,6 +5718,7 @@ mod tests {
                 source_type: "uint32".to_string(),
                 encoding: "linear".to_string(),
                 bits: 32,
+                eager_load: false,
             }],
             max_page_size: 100,
             flush_interval_us: 50,
@@ -6401,6 +6630,117 @@ mod tests {
                 .unwrap();
             assert_eq!(result.ids.len(), 10);
             assert_eq!(result.ids[0], 29, "slot 29 should be first in desc sort");
+        }
+    }
+
+    #[test]
+    fn test_eager_load_fields_not_pending_after_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+
+        // Config: nsfwLevel is eager_load=true, onSite is eager_load=false
+        let config = Config {
+            filter_fields: vec![
+                FilterFieldConfig {
+                    name: "nsfwLevel".to_string(),
+                    field_type: FilterFieldType::SingleValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: true, // <-- eager
+                },
+                FilterFieldConfig {
+                    name: "onSite".to_string(),
+                    field_type: FilterFieldType::Boolean,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false, // <-- lazy (default)
+                },
+            ],
+            sort_fields: vec![
+                SortFieldConfig {
+                    name: "reactionCount".to_string(),
+                    source_type: "uint32".to_string(),
+                    encoding: "linear".to_string(),
+                    bits: 32,
+                    eager_load: true, // <-- eager
+                },
+            ],
+            max_page_size: 100,
+            flush_interval_us: 50,
+            channel_capacity: 10_000,
+            storage: crate::config::StorageConfig {
+                bitmap_path: Some(bitmap_path.clone()),
+            },
+            ..Default::default()
+        };
+
+        // Insert some data, save snapshot
+        {
+            let mut engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            engine
+                .put(
+                    1,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("onSite", FieldValue::Single(Value::Bool(true))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(42))),
+                    ]),
+                )
+                .unwrap();
+            engine
+                .put(
+                    2,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
+                        ("onSite", FieldValue::Single(Value::Bool(false))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(99))),
+                    ]),
+                )
+                .unwrap();
+
+            engine.shutdown();
+            engine.save_snapshot().unwrap();
+        }
+
+        // Restore — nsfwLevel and reactionCount should be eagerly loaded (not pending).
+        // onSite should still be pending (lazy).
+        {
+            let engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            // nsfwLevel should NOT be in pending_filter_loads (eagerly loaded)
+            assert!(
+                !engine.pending_filter_loads.lock().contains("nsfwLevel"),
+                "nsfwLevel should be eagerly loaded, not pending"
+            );
+
+            // onSite SHOULD be in pending_filter_loads (lazy)
+            assert!(
+                engine.pending_filter_loads.lock().contains("onSite"),
+                "onSite should remain pending (lazy)"
+            );
+
+            // reactionCount should NOT be in pending_sort_loads (eagerly loaded)
+            assert!(
+                !engine.pending_sort_loads.lock().contains("reactionCount"),
+                "reactionCount should be eagerly loaded, not pending"
+            );
+
+            // Eagerly loaded fields should be queryable without triggering lazy load
+            let result = engine
+                .query(
+                    &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                    Some(&SortClause {
+                        field: "reactionCount".to_string(),
+                        direction: SortDirection::Desc,
+                    }),
+                    10,
+                )
+                .unwrap();
+            assert_eq!(result.ids, vec![1]);
         }
     }
 }

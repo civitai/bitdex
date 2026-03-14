@@ -412,6 +412,10 @@ pub struct FilterFieldConfig {
     /// re-loaded from BitmapFs on the next query.
     #[serde(default)]
     pub eviction: Option<EvictionConfig>,
+    /// If true, load this field's bitmaps eagerly on startup instead of
+    /// deferring to first query (lazy loading). Default: false.
+    #[serde(default)]
+    pub eager_load: bool,
 }
 
 /// Per-value idle eviction configuration.
@@ -477,6 +481,10 @@ pub struct SortFieldConfig {
     /// Number of bitmap layers. Defaults to 32 for uint32.
     #[serde(default = "default_bits")]
     pub bits: u8,
+    /// If true, load this field's bitmaps eagerly on startup instead of
+    /// deferring to first query (lazy loading). Default: false.
+    #[serde(default)]
+    pub eager_load: bool,
 }
 
 fn default_source_type() -> String {
@@ -833,12 +841,14 @@ cache:
                     field_type: FilterFieldType::SingleValue,
                     behaviors: None,
                     eviction: None,
+                    eager_load: false,
                 },
                 FilterFieldConfig {
                     name: "status".to_string(),
                     field_type: FilterFieldType::SingleValue,
                     behaviors: None,
                     eviction: None,
+                    eager_load: false,
                 },
             ],
             ..Default::default()
@@ -855,12 +865,14 @@ cache:
                     source_type: "uint32".to_string(),
                     encoding: "linear".to_string(),
                     bits: 32,
+                    eager_load: false,
                 },
                 SortFieldConfig {
                     name: "x".to_string(),
                     source_type: "uint32".to_string(),
                     encoding: "linear".to_string(),
                     bits: 32,
+                    eager_load: false,
                 },
             ],
             ..Default::default()
@@ -876,6 +888,7 @@ cache:
                 field_type: FilterFieldType::SingleValue,
                 behaviors: None,
                 eviction: None,
+                eager_load: false,
             }],
             ..Default::default()
         };
@@ -887,6 +900,7 @@ cache:
                 source_type: "uint32".to_string(),
                 encoding: "linear".to_string(),
                 bits: 32,
+                eager_load: false,
             }],
             ..Default::default()
         };
@@ -901,6 +915,7 @@ cache:
                 source_type: "uint32".to_string(),
                 encoding: "linear".to_string(),
                 bits: 0,
+                eager_load: false,
             }],
             ..Default::default()
         };
@@ -912,6 +927,7 @@ cache:
                 source_type: "uint32".to_string(),
                 encoding: "linear".to_string(),
                 bits: 65,
+                eager_load: false,
             }],
             ..Default::default()
         };
@@ -1054,12 +1070,14 @@ sort_fields:
                 source_type: "uint32".into(),
                 encoding: "linear".into(),
                 bits: 32,
+                eager_load: false,
             }],
             filter_fields: vec![FilterFieldConfig {
                 name: "status".into(),
                 field_type: FilterFieldType::SingleValue,
                 behaviors: None,
                 eviction: None,
+                eager_load: false,
             }],
             ..Config::default()
         };
@@ -1234,6 +1252,7 @@ ms_to_seconds = true
                     sort_field: None,
                 }),
                 eviction: None,
+                eager_load: false,
             }],
             ..Config::default()
         };
@@ -1256,6 +1275,7 @@ ms_to_seconds = true
                     sort_field: None,
                 }),
                 eviction: None,
+                eager_load: false,
             }],
             ..Config::default()
         };
@@ -1278,6 +1298,7 @@ ms_to_seconds = true
                     sort_field: None,
                 }),
                 eviction: None,
+                eager_load: false,
             }],
             ..Config::default()
         };
@@ -1300,6 +1321,7 @@ ms_to_seconds = true
                     sort_field: None,
                 }),
                 eviction: None,
+                eager_load: false,
             }],
             deferred_alive: Some(DeferredAliveConfig {
                 source_field: "scheduledAt".into(),

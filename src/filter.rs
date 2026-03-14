@@ -444,6 +444,7 @@ mod tests {
             field_type: FilterFieldType::SingleValue,
             behaviors: None,
             eviction: None,
+            eager_load: false,
         }
     }
 
@@ -453,6 +454,7 @@ mod tests {
             field_type: FilterFieldType::MultiValue,
             behaviors: None,
             eviction: None,
+            eager_load: false,
         }
     }
 
@@ -462,6 +464,7 @@ mod tests {
             field_type: FilterFieldType::Boolean,
             behaviors: None,
             eviction: None,
+            eager_load: false,
         }
     }
 

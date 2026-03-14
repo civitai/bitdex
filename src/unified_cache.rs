@@ -1761,6 +1761,7 @@ mod tests {
                 field_type: FilterFieldType::SingleValue,
                 behaviors: None,
                 eviction: None,
+                eager_load: false,
             });
             let field = fi.get_field_mut(name).unwrap();
             for (value, slots) in *values {
@@ -1779,6 +1780,7 @@ mod tests {
                 source_type: "uint32".to_string(),
                 encoding: "linear".to_string(),
                 bits: 32,
+                eager_load: false,
             });
             let field = si.get_field_mut(name).unwrap();
             for &(slot, value) in *slot_values {
