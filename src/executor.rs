@@ -7,6 +7,7 @@ use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
 use crate::planner;
 use crate::query::{FilterClause, SortClause, SortDirection, Value};
+use crate::query_metrics::{ClauseTrace, QueryTraceCollector};
 use crate::slot::SlotAllocator;
 use crate::sort::SortIndex;
 use crate::types::QueryResult;
@@ -303,6 +304,15 @@ impl<'a> QueryExecutor<'a> {
     /// Top-level clauses are implicitly ANDed together.
     /// Clauses are expected to be pre-ordered by the planner for optimal evaluation.
     pub(crate) fn compute_filters(&self, clauses: &[FilterClause]) -> Result<RoaringBitmap> {
+        self.compute_filters_traced(clauses, None)
+    }
+
+    /// Like `compute_filters`, but records per-clause metrics into a trace collector.
+    pub(crate) fn compute_filters_traced(
+        &self,
+        clauses: &[FilterClause],
+        mut trace_collector: Option<&mut QueryTraceCollector>,
+    ) -> Result<RoaringBitmap> {
         if clauses.is_empty() {
             return Ok(self.slots.alive_bitmap().clone());
         }
@@ -311,6 +321,7 @@ impl<'a> QueryExecutor<'a> {
 
         for (i, clause) in clauses.iter().enumerate() {
             let t0 = std::time::Instant::now();
+            let acc_before = result.as_ref().map(|r| r.len()).unwrap_or(0);
 
             // Fast path: for Eq on clean bitmaps, AND directly by reference
             // without materializing the full clause bitmap.
@@ -322,6 +333,20 @@ impl<'a> QueryExecutor<'a> {
                         "    clause[{}]: and_ref={:.1}ms → {} | {}",
                         i, elapsed.as_secs_f64() * 1000.0, result_card, clause
                     );
+                    if let Some(ref mut collector) = trace_collector {
+                        collector.record_clause(ClauseTrace {
+                            ord: i,
+                            field: clause.field_name().unwrap_or("").to_string(),
+                            op: clause.op_name().to_string(),
+                            values: clause.values_repr(),
+                            card: 0, // not materialized in by-ref path
+                            acc_before,
+                            acc_after: result_card,
+                            eval_us: 0,
+                            and_us: elapsed.as_micros() as u64,
+                            mode: "by_ref".to_string(),
+                        });
+                    }
                     if let Err(e) = applied {
                         return Err(e);
                     }
@@ -333,6 +358,7 @@ impl<'a> QueryExecutor<'a> {
             let eval_elapsed = t0.elapsed();
             let bm_card = bitmap.len();
             let t1 = std::time::Instant::now();
+            let is_first = result.is_none();
             result = Some(match result {
                 Some(existing) => existing & &bitmap,
                 None => bitmap,
@@ -344,6 +370,20 @@ impl<'a> QueryExecutor<'a> {
                 i, eval_elapsed.as_secs_f64() * 1000.0, bm_card,
                 and_elapsed.as_secs_f64() * 1000.0, result_card, clause
             );
+            if let Some(ref mut collector) = trace_collector {
+                collector.record_clause(ClauseTrace {
+                    ord: i,
+                    field: clause.field_name().unwrap_or("").to_string(),
+                    op: clause.op_name().to_string(),
+                    values: clause.values_repr(),
+                    card: bm_card,
+                    acc_before,
+                    acc_after: result_card,
+                    eval_us: eval_elapsed.as_micros() as u64,
+                    and_us: and_elapsed.as_micros() as u64,
+                    mode: if is_first { "first" } else { "eval_and" }.to_string(),
+                });
+            }
         }
 
         Ok(result.unwrap_or_default())

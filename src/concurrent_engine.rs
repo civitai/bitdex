@@ -23,6 +23,7 @@ use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
 use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, value_to_sort_u32, Document, FieldRegistry, PatchPayload};
 use crate::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause};
+use crate::query_metrics::{QueryTrace, QueryTraceCollector, SortTrace};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
 use crate::unified_cache::{UnifiedCache, UnifiedCacheConfig, UnifiedEntry, UnifiedKey};
@@ -2818,6 +2819,105 @@ impl ConcurrentEngine {
         self.execute_query_slow_path(
             query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix, None,
         )
+    }
+
+    /// Execute a query and produce a trace alongside the result.
+    /// The trace captures overall timing, per-clause filter metrics (on cache miss),
+    /// sort timing, and cache hit/miss status.
+    pub fn execute_query_traced(&self, query: &BitdexQuery, index_name: &str) -> Result<(QueryResult, QueryTrace)> {
+        let mut collector = QueryTraceCollector::new();
+
+        // Time the filter computation separately for clause-level detail.
+        // We build a snapshot + executor just to trace compute_filters,
+        // then run the real execute_query for the full (cache-aware) result.
+        let filter_start = Instant::now();
+        {
+            self.ensure_fields_loaded(
+                &query.filters,
+                query.sort.as_ref().map(|s| s.field.as_str()),
+            )?;
+            let snap = self.snapshot();
+            let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let executor = {
+                let mut base = QueryExecutor::new(
+                    &snap.slots, &snap.filters, &snap.sorts, self.config.max_page_size,
+                );
+                if let Some(ref maps) = self.string_maps {
+                    base = base.with_string_maps(maps);
+                }
+                if let Some(ref cs) = self.case_sensitive_fields {
+                    base = base.with_case_sensitive_fields(cs);
+                }
+                if !self.dictionaries.is_empty() {
+                    base = base.with_dictionaries(&self.dictionaries);
+                }
+                if let Some(ref tb) = tb_guard {
+                    base.with_time_buckets(tb, now_unix)
+                } else {
+                    base
+                }
+            };
+
+            // Snap filters for planning (same logic as resolve_filters)
+            let snapped;
+            let effective_filters = if let Some(ref tb) = tb_guard {
+                let mut managers = std::collections::HashMap::new();
+                managers.insert(tb.field_name().to_string(), &**tb);
+                let ctx = crate::query::BucketSnapContext {
+                    managers: &managers,
+                    now_secs: now_unix,
+                    tolerance_pct: 0.10,
+                    always_snap: true,
+                };
+                snapped = crate::query::snap_range_clauses(&query.filters, &ctx);
+                &snapped[..]
+            } else {
+                &query.filters[..]
+            };
+
+            let planner_ctx = planner::PlannerContext {
+                string_maps: executor.string_maps(),
+                dictionaries: executor.dictionaries(),
+            };
+            let plan = planner::plan_query_with_context(
+                effective_filters, executor.filter_index(), executor.slot_allocator(),
+                Some(&planner_ctx),
+            );
+            // Traced filter computation — records clause metrics into collector
+            let _ = executor.compute_filters_traced(&plan.ordered_clauses, Some(&mut collector));
+        }
+        collector.filter_us = filter_start.elapsed().as_micros() as u64;
+
+        // Run the real execute_query (uses cache, etc.)
+        let sort_start = Instant::now();
+        let result = self.execute_query(query)?;
+        let total_exec_us = sort_start.elapsed().as_micros() as u64;
+
+        // Approximate sort_us: total execution minus the filter time we measured
+        collector.sort_us = total_exec_us.saturating_sub(collector.filter_us);
+
+        // Detect cache hit: if total execution was much faster than our traced filter
+        // computation, the real execute_query likely hit cache
+        if total_exec_us < collector.filter_us / 2 {
+            collector.cache_hit = true;
+        }
+
+        if let Some(sort_clause) = query.sort.as_ref() {
+            collector.record_sort(SortTrace {
+                field: sort_clause.field.clone(),
+                dir: format!("{:?}", sort_clause.direction),
+                input: result.total_matched,
+                output: result.ids.len() as u64,
+                time_us: collector.sort_us,
+            });
+        }
+
+        let trace = collector.finalize(index_name, result.ids.len() as u64);
+        Ok((result, trace))
     }
 
     /// Slow path for execute_query: computes full filter bitmap.

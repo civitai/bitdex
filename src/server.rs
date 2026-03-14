@@ -680,6 +680,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/document", post(handle_document))
             .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
+            .route("/api/indexes/{name}/traces", get(handle_traces))
             .route("/api/indexes/{name}/stats", get(handle_stats))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/cache/persistent", delete(handle_purge_cache))
@@ -1376,8 +1377,8 @@ async fn handle_query(
     tracing::info!("[{name}] {query}");
     let start = Instant::now();
     let m = &state.metrics;
-    match engine.execute_query(&query) {
-        Ok(result) => {
+    match engine.execute_query_traced(&query, &name) {
+        Ok((result, trace)) => {
             let elapsed = start.elapsed();
             let elapsed_us = elapsed.as_micros() as u64;
             tracing::info!("[{name}]   → {} results, {elapsed_us}μs", result.total_matched);
@@ -1385,6 +1386,13 @@ async fn handle_query(
             m.query_duration_seconds
                 .with_label_values(&[&name])
                 .observe(elapsed.as_secs_f64());
+
+            // Write trace to JSONL in background (non-blocking)
+            let data_dir = state.data_dir.clone();
+            std::thread::spawn(move || {
+                crate::query_metrics::write_trace(&data_dir, &trace);
+            });
+
             let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
 
             let documents = if !include_docs.is_none() {
@@ -1428,6 +1436,41 @@ async fn handle_query(
             ).into_response()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/indexes/{name}/traces?last=N
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct TracesParams {
+    #[serde(default = "default_traces_last")]
+    last: usize,
+}
+
+fn default_traces_last() -> usize { 50 }
+
+async fn handle_traces(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    AxumQuery(params): AxumQuery<TracesParams>,
+) -> impl IntoResponse {
+    // Verify the index exists
+    {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => {}
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    }
+
+    let traces = crate::query_metrics::read_traces(&state.data_dir, params.last);
+    Json(serde_json::json!({ "traces": traces })).into_response()
 }
 
 async fn handle_document(

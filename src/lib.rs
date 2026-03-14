@@ -16,6 +16,7 @@ pub mod mutation;
 pub mod parser;
 pub mod planner;
 pub mod query;
+pub mod query_metrics;
 pub mod radix_sort;
 #[cfg(feature = "server")]
 pub mod metrics;
