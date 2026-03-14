@@ -1,0 +1,333 @@
+//! Query trace collection and JSONL persistence.
+//!
+//! `QueryTraceCollector` is threaded through query execution to record per-clause
+//! timing, cardinalities, and sort metrics. After execution, the trace is serialized
+//! to a JSONL file for later retrieval via the `/traces` endpoint.
+
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
+use std::time::{Instant, SystemTime};
+
+use serde::{Deserialize, Serialize};
+
+use crate::query::FilterClause;
+
+// ---------------------------------------------------------------------------
+// Trace structs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryTrace {
+    pub ts: String,
+    pub index: String,
+    pub total_us: u64,
+    pub plan_us: u64,
+    pub filter_us: u64,
+    pub sort_us: u64,
+    pub result_count: u64,
+    pub cache_hit: bool,
+    pub clauses: Vec<ClauseTrace>,
+    pub sort: Option<SortTrace>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClauseTrace {
+    pub ord: usize,
+    pub field: String,
+    pub op: String,
+    pub values: String,
+    pub card: u64,
+    pub acc_before: u64,
+    pub acc_after: u64,
+    pub eval_us: u64,
+    pub and_us: u64,
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortTrace {
+    pub field: String,
+    pub dir: String,
+    pub input: u64,
+    pub output: u64,
+    pub time_us: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Collector
+// ---------------------------------------------------------------------------
+
+pub struct QueryTraceCollector {
+    start: Instant,
+    pub plan_us: u64,
+    pub filter_us: u64,
+    pub sort_us: u64,
+    pub cache_hit: bool,
+    pub clauses: Vec<ClauseTrace>,
+    pub sort: Option<SortTrace>,
+}
+
+impl QueryTraceCollector {
+    pub fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            plan_us: 0,
+            filter_us: 0,
+            sort_us: 0,
+            cache_hit: false,
+            clauses: Vec::new(),
+            sort: None,
+        }
+    }
+
+    pub fn record_clause(&mut self, trace: ClauseTrace) {
+        self.clauses.push(trace);
+    }
+
+    pub fn record_sort(&mut self, trace: SortTrace) {
+        self.sort = Some(trace);
+    }
+
+    pub fn finalize(self, index: &str, result_count: u64) -> QueryTrace {
+        let total_us = self.start.elapsed().as_micros() as u64;
+        let ts = iso_now();
+        QueryTrace {
+            ts,
+            index: index.to_string(),
+            total_us,
+            plan_us: self.plan_us,
+            filter_us: self.filter_us,
+            sort_us: self.sort_us,
+            result_count,
+            cache_hit: self.cache_hit,
+            clauses: self.clauses,
+            sort: self.sort,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSONL writer
+// ---------------------------------------------------------------------------
+
+pub fn write_trace(data_dir: &Path, trace: &QueryTrace) {
+    let path = data_dir.join("traces.jsonl");
+    let res = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        serde_json::to_writer(&mut file, trace)?;
+        file.write_all(b"\n")?;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        tracing::warn!("Failed to write query trace: {e}");
+    }
+}
+
+/// Read the last N traces from the JSONL file.
+pub fn read_traces(data_dir: &Path, last: usize) -> Vec<QueryTrace> {
+    let path = data_dir.join("traces.jsonl");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(last);
+    lines[start..]
+        .iter()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn iso_now() -> String {
+    let dur = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    let millis = dur.subsec_millis();
+    // Manual ISO 8601 without chrono dependency
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Compute year/month/day from days since epoch (1970-01-01)
+    let (year, month, day) = days_to_ymd(days_since_epoch);
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z"
+    )
+}
+
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    days += 719468;
+    let era = days / 146097;
+    let doe = days - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+// ---------------------------------------------------------------------------
+// Helper methods on FilterClause for trace extraction
+// ---------------------------------------------------------------------------
+
+impl FilterClause {
+    /// Extract the field name from a filter clause, if applicable.
+    pub fn field_name(&self) -> Option<&str> {
+        match self {
+            FilterClause::Eq(f, _)
+            | FilterClause::NotEq(f, _)
+            | FilterClause::In(f, _)
+            | FilterClause::NotIn(f, _)
+            | FilterClause::Gt(f, _)
+            | FilterClause::Lt(f, _)
+            | FilterClause::Gte(f, _)
+            | FilterClause::Lte(f, _) => Some(f.as_str()),
+            FilterClause::BucketBitmap { field, .. } => Some(field.as_str()),
+            FilterClause::Not(inner) => inner.field_name(),
+            FilterClause::And(_) => Some("AND"),
+            FilterClause::Or(_) => Some("OR"),
+        }
+    }
+
+    /// Return a short string describing the operator.
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            FilterClause::Eq(..) => "Eq",
+            FilterClause::NotEq(..) => "NotEq",
+            FilterClause::In(..) => "In",
+            FilterClause::NotIn(..) => "NotIn",
+            FilterClause::Gt(..) => "Gt",
+            FilterClause::Lt(..) => "Lt",
+            FilterClause::Gte(..) => "Gte",
+            FilterClause::Lte(..) => "Lte",
+            FilterClause::Not(..) => "Not",
+            FilterClause::And(..) => "And",
+            FilterClause::Or(..) => "Or",
+            FilterClause::BucketBitmap { .. } => "BucketBitmap",
+        }
+    }
+
+    /// Compact representation of the filter values.
+    pub fn values_repr(&self) -> String {
+        match self {
+            FilterClause::Eq(_, v)
+            | FilterClause::NotEq(_, v)
+            | FilterClause::Gt(_, v)
+            | FilterClause::Lt(_, v)
+            | FilterClause::Gte(_, v)
+            | FilterClause::Lte(_, v) => v.to_string(),
+            FilterClause::In(_, vs) | FilterClause::NotIn(_, vs) => {
+                if vs.len() <= 5 {
+                    let strs: Vec<String> = vs.iter().map(|v| v.to_string()).collect();
+                    format!("[{}]", strs.join(","))
+                } else {
+                    let strs: Vec<String> = vs.iter().take(3).map(|v| v.to_string()).collect();
+                    format!("[{},...+{}]", strs.join(","), vs.len() - 3)
+                }
+            }
+            FilterClause::Not(inner) => format!("NOT({})", inner.values_repr()),
+            FilterClause::And(cs) => format!("{} clauses", cs.len()),
+            FilterClause::Or(cs) => format!("{} clauses", cs.len()),
+            FilterClause::BucketBitmap { bucket_name, .. } => bucket_name.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::Value;
+
+    #[test]
+    fn test_iso_now_format() {
+        let ts = iso_now();
+        // Should look like 2026-03-14T12:34:56.789Z
+        assert!(ts.ends_with('Z'));
+        assert_eq!(ts.len(), 24);
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[7..8], "-");
+        assert_eq!(&ts[10..11], "T");
+    }
+
+    #[test]
+    fn test_collector_finalize() {
+        let mut collector = QueryTraceCollector::new();
+        collector.record_clause(ClauseTrace {
+            ord: 0,
+            field: "nsfwLevel".into(),
+            op: "In".into(),
+            values: "[1,2,4]".into(),
+            card: 50_000_000,
+            acc_before: 0,
+            acc_after: 50_000_000,
+            eval_us: 100,
+            and_us: 0,
+            mode: "first".into(),
+        });
+        collector.filter_us = 200;
+        let trace = collector.finalize("test-index", 100);
+        assert_eq!(trace.index, "test-index");
+        assert_eq!(trace.result_count, 100);
+        assert_eq!(trace.clauses.len(), 1);
+        assert_eq!(trace.clauses[0].field, "nsfwLevel");
+    }
+
+    #[test]
+    fn test_clause_helpers() {
+        let clause = FilterClause::Eq("status".into(), Value::Integer(1));
+        assert_eq!(clause.field_name(), Some("status"));
+        assert_eq!(clause.op_name(), "Eq");
+        assert_eq!(clause.values_repr(), "1");
+
+        let clause = FilterClause::In("tags".into(), vec![Value::Integer(1), Value::Integer(2)]);
+        assert_eq!(clause.op_name(), "In");
+        assert_eq!(clause.values_repr(), "[1,2]");
+    }
+
+    #[test]
+    fn test_write_and_read_traces() {
+        let dir = std::env::temp_dir().join(format!("bitdex-trace-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let trace = QueryTrace {
+            ts: "2026-03-14T00:00:00.000Z".into(),
+            index: "test".into(),
+            total_us: 1000,
+            plan_us: 50,
+            filter_us: 800,
+            sort_us: 150,
+            result_count: 42,
+            cache_hit: false,
+            clauses: vec![],
+            sort: None,
+        };
+
+        write_trace(&dir, &trace);
+        write_trace(&dir, &trace);
+
+        let traces = read_traces(&dir, 10);
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[0].result_count, 42);
+
+        let traces = read_traces(&dir, 1);
+        assert_eq!(traces.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

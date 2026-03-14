@@ -520,6 +520,7 @@ async function cmdDashboard() {
   let inputMode = null;  // null or { prompt, buffer, callback }
   let showStats = false; // 'i' toggles detailed stats panel
   let logScroll = 0;    // 0 = live tail, >0 = scrolled up N lines from bottom
+  let explainTrace = null; // expanded trace object (toggle with 'e')
 
   function flash(msg) { actionMsg = msg; setTimeout(() => { actionMsg = ''; }, 4000); }
 
@@ -615,10 +616,32 @@ async function cmdDashboard() {
     const sepVis = sep.replace(/\x1b\[[0-9;]*m/g, '');
     buf.push(CLR_LINE + DIM + sep + '─'.repeat(Math.max(0, cols - sepVis.length)) + R + '\n');
 
+    // ── Explain trace panel (rendered between logs and footer)
+    const explainRows = [];
+    if (explainTrace) {
+      const t = explainTrace;
+      const cacheTag = t.cache_hit ? `${GRN}CACHE HIT${R}` : `${YLW}MISS${R}`;
+      explainRows.push(`${DIM}── explain ──────────────────────────────────────────${R}`);
+      explainRows.push(`  ${B}${t.index}${R}  ${cacheTag}  total=${CYN}${(t.total_us/1000).toFixed(1)}ms${R}  plan=${DIM}${t.plan_us}us${R}  filter=${DIM}${t.filter_us}us${R}  sort=${DIM}${t.sort_us}us${R}  results=${WHT}${t.result_count}${R}`);
+      if (t.clauses && t.clauses.length > 0) {
+        explainRows.push(`  ${DIM}${pad('#', 3)}${pad('field', 18)}${pad('op', 10)}${pad('card', 12)}${pad('acc', 12)}${pad('delta', 8)}${pad('eval', 10)}${pad('and', 10)}${pad('mode', 8)}${R}`);
+        for (const c of t.clauses) {
+          const delta = c.acc_before > 0 ? `${((1 - c.acc_after / c.acc_before) * 100).toFixed(0)}%` : '—';
+          const deltaColor = delta !== '—' && parseInt(delta) > 50 ? GRN : (delta !== '—' && parseInt(delta) > 10 ? YLW : '');
+          explainRows.push(`  ${pad(String(c.ord), 3)}${BLU}${pad(trunc(c.field, 16), 18)}${R}${pad(c.op, 10)}${pad(fmtCount(c.card), 12)}${pad(fmtCount(c.acc_after), 12)}${deltaColor}${pad(delta, 8)}${R}${DIM}${pad(c.eval_us + 'us', 10)}${pad(c.and_us + 'us', 10)}${R}${pad(c.mode, 8)}`);
+        }
+      }
+      if (t.sort) {
+        explainRows.push(`  ${DIM}sort:${R} ${BLU}${t.sort.field}${R} ${YLW}${t.sort.dir}${R}  in=${fmtCount(t.sort.input)} out=${fmtCount(t.sort.output)}  ${DIM}${t.sort.time_us}us${R}`);
+      }
+      explainRows.push(`${DIM}── /explain (press e to close) ──${R}`);
+    }
+
     // ── Log area with scroll support
     const HEADER_ROWS = showStats ? 18 : 12;
     const FOOTER_ROWS = 2;
-    const logAreaRows = Math.max(1, rows - HEADER_ROWS - FOOTER_ROWS);
+    const explainHeight = explainRows.length;
+    const logAreaRows = Math.max(1, rows - HEADER_ROWS - FOOTER_ROWS - explainHeight);
     const endIdx = logLines.length - logScroll;
     const startIdx = Math.max(0, endIdx - logAreaRows);
     const visible = logLines.slice(startIdx, endIdx);
@@ -656,12 +679,17 @@ async function cmdDashboard() {
       }
     }
 
+    // ── Explain panel (between logs and footer)
+    for (const row of explainRows) {
+      buf.push(CLR_LINE + row + '\n');
+    }
+
     // ── Footer
     buf.push(CLR_LINE + DIM + '─'.repeat(cols) + R + '\n');
     if (actionMsg) {
       buf.push(CLR_LINE + ` ${YLW}${actionMsg}${R}` + CLR_BELOW);
     } else {
-      buf.push(CLR_LINE + `  ${DIM}↑↓${R} scroll  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
+      buf.push(CLR_LINE + `  ${DIM}↑↓${R} scroll  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}e${R}${DIM}xplain${R}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
     }
 
     write(buf.join(''));
@@ -752,6 +780,33 @@ async function cmdDashboard() {
     if (key === 'i') {
       showStats = !showStats;
       flash(showStats ? 'Stats: expanded' : 'Stats: compact');
+    }
+
+    if (key === 'e') {
+      if (explainTrace) {
+        explainTrace = null;
+        return;
+      }
+      // Fetch latest trace from the running instance
+      try {
+        const st = await daemonFetch('/status');
+        const inst = st.instances.find(i => i.id === (selectedInstance || st.instances[0]?.id));
+        if (!inst || inst.status !== 'running' || !inst.dataset) {
+          flash('No running instance with index loaded');
+          return;
+        }
+        const url = `http://127.0.0.1:${inst.port}/api/indexes/${inst.dataset}/traces?last=1`;
+        const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+        const traces = await res.json();
+        if (Array.isArray(traces) && traces.length > 0) {
+          explainTrace = traces[traces.length - 1];
+        } else {
+          flash('No traces available');
+        }
+      } catch (e) {
+        flash(`Trace fetch failed: ${e.message}`);
+      }
+      return;
     }
 
     if (key === 'b') {
@@ -851,6 +906,48 @@ async function cmdDashboard() {
   }
 }
 
+// ─── Traces ─────────────────────────────────────────────────────
+
+async function resolveRunningInstance() {
+  const status = await daemonFetch('/status');
+  const running = status.instances.filter(i => i.status === 'running');
+  if (running.length === 0) {
+    console.error('No running instances. Start one with: just dev');
+    process.exit(1);
+  }
+  const explicit = process.argv[3];
+  if (explicit) {
+    const found = running.find(i => i.id === explicit || String(i.port) === explicit);
+    if (!found) {
+      console.error(`Instance '${explicit}' not found or not running`);
+      process.exit(1);
+    }
+    return found;
+  }
+  return running[0];
+}
+
+async function cmdTraces() {
+  const last = parseInt(getArg('--last', '5'), 10);
+  const inst = await resolveRunningInstance();
+
+  if (!inst.dataset) {
+    console.error(`Instance ${inst.id} has no index loaded yet`);
+    console.log(JSON.stringify({ error: 'no index loaded', instance: inst.id }));
+    return;
+  }
+
+  const url = `http://127.0.0.1:${inst.port}/api/indexes/${inst.dataset}/traces?last=${last}`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const data = await res.json();
+    console.log(JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error(`Failed to fetch traces from ${url}: ${e.message}`);
+    console.log(JSON.stringify({ error: e.message }));
+  }
+}
+
 // ─── Help ───────────────────────────────────────────────────────
 
 function cmdHelp() {
@@ -868,6 +965,7 @@ Commands:
   datasets                            List known data directories
   reserve-port [--preferred N]        Reserve next available port
   build [--target T] [--profile P]    Acquire lock, build, release (default: fast profile)
+  traces [id|port] [--last N]         Fetch recent query traces (default last=5)
   test-e2e [--port N]                 Acquire lock, run E2E suite, release
   dash                                TUI dashboard
   shutdown                            Kill all instances + stop daemon
@@ -901,6 +999,7 @@ async function main() {
     case 'datasets': return cmdDatasets();
     case 'reserve-port': return cmdReservePort();
     case 'build': return cmdBuild();
+    case 'traces': return cmdTraces();
     case 'test-e2e': return cmdTestE2e();
     case 'dash': case 'dashboard': return cmdDashboard();
     case 'force-kill': return cmdForceKill();

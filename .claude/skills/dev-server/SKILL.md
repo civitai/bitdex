@@ -104,6 +104,7 @@ Acquires E2E lock (only one run at a time — shared port 3100), runs the suite 
 | `datasets` | List known data directories | JSON |
 | `reserve-port` | Reserve next available port | JSON |
 | `build [--target T] [--profile P]` | Coordinated cargo build | JSON |
+| `traces [id\|port] [--last N]` | Fetch recent query traces (default last=5) | JSON |
 | `test-e2e [--port N]` | Coordinated E2E test run | JSON |
 | `shutdown` | Kill all instances + daemon | JSON |
 
