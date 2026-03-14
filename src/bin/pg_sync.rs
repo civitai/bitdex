@@ -22,6 +22,7 @@ use bitdex_v2::pg_sync::metrics_poller;
 use bitdex_v2::pg_sync::outbox_poller;
 use bitdex_v2::pg_sync::progress::{self, LoadProgress};
 use bitdex_v2::pg_sync::queries;
+use bitdex_v2::pg_sync::scatter_gather;
 
 #[derive(Parser)]
 #[command(name = "pg-sync", about = "Postgres-to-Bitdex sync system")]
@@ -180,15 +181,29 @@ async fn main() {
                 None
             };
 
-            let stats = bulk_loader::run_bulk_load_copy(
-                &pool,
+            // Phase 1: Download CSVs to staging dir (reuses .done markers)
+            let index_storage_dir_ref = index_storage_dir.clone();
+            let stage_dir = index_storage_dir_ref
+                .parent()
+                .unwrap_or(&index_storage_dir_ref)
+                .join("load_stage");
+            bulk_loader::download_all_tables(&pool, &stage_dir)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("CSV download failed: {e}");
+                    std::process::exit(1);
+                });
+
+            // Phase 2+3: Scatter-gather pipeline (peak ~20 GB vs old loader's 40+ GB OOM)
+            eprintln!("=== Using scatter-gather pipeline ===");
+            let stats = scatter_gather::run_bulk_load_scatter(
                 &engine,
                 &index_def,
+                &stage_dir,
                 Arc::clone(&load_progress),
             )
-            .await
             .unwrap_or_else(|e| {
-                eprintln!("Bulk load failed: {e}");
+                eprintln!("Scatter-gather bulk load failed: {e}");
                 std::process::exit(1);
             });
 

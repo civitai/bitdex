@@ -369,7 +369,7 @@ async fn download_table(
 
 /// Download all tables from PG to CSV files on the PVC.
 /// Each table runs concurrently. Completed tables are skipped on retry.
-async fn download_all_tables(
+pub async fn download_all_tables(
     pool: &PgPool,
     stage_dir: &std::path::Path,
 ) -> Result<(), String> {
