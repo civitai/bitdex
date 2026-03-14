@@ -135,6 +135,10 @@ harness = false
 name = "bound_store_bench"
 harness = false
 
+[[bench]]
+name = "docstore_perf"
+harness = false
+
 [[bin]]
 name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"
