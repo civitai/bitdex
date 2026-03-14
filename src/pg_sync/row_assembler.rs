@@ -38,26 +38,26 @@ impl EnrichmentData {
     ) -> Self {
         let mut tag_map: HashMap<i64, Vec<i64>> = HashMap::new();
         for t in tags {
-            tag_map.entry(t.image_id).or_default().push(t.tag_id);
+            tag_map.entry(t.image_id as i64).or_default().push(t.tag_id as i64);
         }
 
         let mut tool_map: HashMap<i64, Vec<i64>> = HashMap::new();
         for t in tools {
-            tool_map.entry(t.image_id).or_default().push(t.tool_id);
+            tool_map.entry(t.image_id as i64).or_default().push(t.tool_id as i64);
         }
 
         let mut technique_map: HashMap<i64, Vec<i64>> = HashMap::new();
         for t in techniques {
             technique_map
-                .entry(t.image_id)
+                .entry(t.image_id as i64)
                 .or_default()
-                .push(t.technique_id);
+                .push(t.technique_id as i64);
         }
 
         let mut resource_map: HashMap<i64, ResourceInfo> = HashMap::new();
         for r in resources {
             resource_map.insert(
-                r.image_id,
+                r.image_id as i64,
                 ResourceInfo {
                     base_model: r.base_model,
                     model_version_ids: r.model_version_ids,

@@ -165,31 +165,31 @@ pub struct ImageRow {
 #[derive(Debug, FromRow)]
 pub struct TagRow {
     #[sqlx(rename = "imageId")]
-    pub image_id: i64,
+    pub image_id: i32,
     #[sqlx(rename = "tagId")]
-    pub tag_id: i64,
+    pub tag_id: i32,
 }
 
 #[derive(Debug, FromRow)]
 pub struct ToolRow {
     #[sqlx(rename = "imageId")]
-    pub image_id: i64,
+    pub image_id: i32,
     #[sqlx(rename = "toolId")]
-    pub tool_id: i64,
+    pub tool_id: i32,
 }
 
 #[derive(Debug, FromRow)]
 pub struct TechniqueRow {
     #[sqlx(rename = "imageId")]
-    pub image_id: i64,
+    pub image_id: i32,
     #[sqlx(rename = "techniqueId")]
-    pub technique_id: i64,
+    pub technique_id: i32,
 }
 
 #[derive(Debug, FromRow)]
 pub struct ResourceRow {
     #[sqlx(rename = "imageId")]
-    pub image_id: i64,
+    pub image_id: i32,
     #[sqlx(rename = "baseModel")]
     pub base_model: Option<String>,
     #[sqlx(rename = "modelVersionIds")]
