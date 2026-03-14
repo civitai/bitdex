@@ -104,6 +104,16 @@ impl<'a> QueryExecutor<'a> {
         self.slots
     }
 
+    /// Get string maps (for planner context).
+    pub fn string_maps(&self) -> Option<&'a StringMaps> {
+        self.string_maps
+    }
+
+    /// Get dictionaries (for planner context).
+    pub fn dictionaries(&self) -> Option<&'a HashMap<String, FieldDictionary>> {
+        self.dictionaries
+    }
+
     /// Resolve a Value to a bitmap key, consulting string_maps for MappedString fields
     /// and live dictionaries for LowCardinalityString fields.
     /// Applies case-insensitive normalization (lowercase) unless the field is in case_sensitive_fields.
@@ -186,7 +196,11 @@ impl<'a> QueryExecutor<'a> {
         let limit = limit.min(self.max_page_size);
 
         // Step 1: Plan the query (reorder clauses by cardinality)
-        let plan = planner::plan_query(filters, self.filters, self.slots);
+        let ctx = planner::PlannerContext {
+            string_maps: self.string_maps,
+            dictionaries: self.dictionaries,
+        };
+        let plan = planner::plan_query_with_context(filters, self.filters, self.slots, Some(&ctx));
 
         // Step 2: Compute filter bitmap using planned clause order
         let filter_bitmap = self.compute_filters(&plan.ordered_clauses)?;

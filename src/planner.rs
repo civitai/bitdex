@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::filter::FilterIndex;
 use crate::query::{FilterClause, Value};
 use crate::slot::SlotAllocator;
@@ -6,13 +8,21 @@ use crate::slot::SlotAllocator;
 /// For very small result sets, extracting IDs and sorting is faster than walking 32 bit layers.
 const SORT_FIRST_THRESHOLD: u64 = 1000;
 
+/// Optional context for resolving string values to bitmap keys during cardinality estimation.
+pub struct PlannerContext<'a> {
+    /// String maps: field_name → (string_value → integer_key).
+    pub string_maps: Option<&'a HashMap<String, HashMap<String, i64>>>,
+    /// Live dictionaries: field_name → FieldDictionary for LCS fields.
+    pub dictionaries: Option<&'a HashMap<String, crate::dictionary::FieldDictionary>>,
+}
+
 /// Estimates the cardinality of a filter clause using bitmap metadata.
 /// Returns the estimated number of matching documents.
-fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_count: u64) -> u64 {
+fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_count: u64, ctx: Option<&PlannerContext<'_>>) -> u64 {
     match clause {
         FilterClause::Eq(field, value) => {
             if let Some(ff) = filters.get_field(field) {
-                if let Some(key) = value_to_bitmap_key(value) {
+                if let Some(key) = resolve_value_key(field, value, ctx) {
                     return ff.cardinality(key);
                 }
             }
@@ -22,7 +32,7 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
 
         FilterClause::NotEq(field, value) => {
             if let Some(ff) = filters.get_field(field) {
-                if let Some(key) = value_to_bitmap_key(value) {
+                if let Some(key) = resolve_value_key(field, value, ctx) {
                     return alive_count.saturating_sub(ff.cardinality(key));
                 }
             }
@@ -33,7 +43,7 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
             if let Some(ff) = filters.get_field(field) {
                 let mut total = 0u64;
                 for v in values {
-                    if let Some(key) = value_to_bitmap_key(v) {
+                    if let Some(key) = resolve_value_key(field, v, ctx) {
                         total += ff.cardinality(key);
                     }
                 }
@@ -47,7 +57,7 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
             if let Some(ff) = filters.get_field(field) {
                 let mut total = 0u64;
                 for v in values {
-                    if let Some(key) = value_to_bitmap_key(v) {
+                    if let Some(key) = resolve_value_key(field, v, ctx) {
                         total += ff.cardinality(key);
                     }
                 }
@@ -57,7 +67,7 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
         }
 
         FilterClause::Not(inner) => {
-            let inner_card = estimate_cardinality(inner, filters, alive_count);
+            let inner_card = estimate_cardinality(inner, filters, alive_count, ctx);
             alive_count.saturating_sub(inner_card)
         }
 
@@ -65,7 +75,7 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
             // Estimate as the minimum of child cardinalities (upper bound on intersection)
             clauses
                 .iter()
-                .map(|c| estimate_cardinality(c, filters, alive_count))
+                .map(|c| estimate_cardinality(c, filters, alive_count, ctx))
                 .min()
                 .unwrap_or(0)
         }
@@ -74,7 +84,7 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
             // Estimate as the sum of child cardinalities, capped at alive_count
             let total: u64 = clauses
                 .iter()
-                .map(|c| estimate_cardinality(c, filters, alive_count))
+                .map(|c| estimate_cardinality(c, filters, alive_count, ctx))
                 .sum();
             total.min(alive_count)
         }
@@ -88,6 +98,35 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
         // Pre-computed bucket bitmap: use the actual bitmap length as cardinality.
         FilterClause::BucketBitmap { bitmap, .. } => bitmap.len(),
     }
+}
+
+/// Resolve a Value to a bitmap key, using string maps/dictionaries for String values.
+fn resolve_value_key(field: &str, val: &Value, ctx: Option<&PlannerContext<'_>>) -> Option<u64> {
+    // Try direct conversion first (Integer, Bool)
+    if let Some(key) = value_to_bitmap_key(val) {
+        return Some(key);
+    }
+    // For String values, consult string maps and dictionaries
+    if let Value::String(s) = val {
+        if let Some(ctx) = ctx {
+            // Try string maps first
+            if let Some(maps) = ctx.string_maps {
+                if let Some(field_map) = maps.get(field) {
+                    let lookup = s.to_lowercase();
+                    if let Some(&v) = field_map.get(&lookup) {
+                        return Some(v as u64);
+                    }
+                }
+            }
+            // Fallback: live dictionaries
+            if let Some(dicts) = ctx.dictionaries {
+                if let Some(dict) = dicts.get(field) {
+                    return dict.get(s).map(|v| v as u64);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Convert a Value to a u64 bitmap key for cardinality lookups.
@@ -118,6 +157,15 @@ pub fn plan_query(
     filters: &FilterIndex,
     slots: &SlotAllocator,
 ) -> QueryPlan {
+    plan_query_with_context(clauses, filters, slots, None)
+}
+
+pub fn plan_query_with_context(
+    clauses: &[FilterClause],
+    filters: &FilterIndex,
+    slots: &SlotAllocator,
+    ctx: Option<&PlannerContext<'_>>,
+) -> QueryPlan {
     let alive_count = slots.alive_count();
 
     if clauses.is_empty() {
@@ -132,7 +180,7 @@ pub fn plan_query(
     let mut clause_estimates: Vec<(FilterClause, u64)> = clauses
         .iter()
         .map(|c| {
-            let est = estimate_cardinality(c, filters, alive_count);
+            let est = estimate_cardinality(c, filters, alive_count, ctx);
             (c.clone(), est)
         })
         .collect();
@@ -167,7 +215,7 @@ pub fn optimize_and_clause(
     let mut clause_estimates: Vec<(FilterClause, u64)> = clauses
         .iter()
         .map(|c| {
-            let est = estimate_cardinality(c, filters, alive_count);
+            let est = estimate_cardinality(c, filters, alive_count, None);
             (c.clone(), est)
         })
         .collect();
@@ -181,7 +229,7 @@ pub fn optimize_and_clause(
 pub fn should_use_andnot(clause: &FilterClause, filters: &FilterIndex, alive_count: u64) -> bool {
     match clause {
         FilterClause::Not(inner) => {
-            let inner_card = estimate_cardinality(inner, filters, alive_count);
+            let inner_card = estimate_cardinality(inner, filters, alive_count, None);
             inner_card < alive_count / 10
         }
         FilterClause::NotEq(field, value) => {
@@ -400,7 +448,7 @@ mod tests {
             FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(28)),
         ));
 
-        let est = estimate_cardinality(&clause, &h.filters, h.slots.alive_count());
+        let est = estimate_cardinality(&clause, &h.filters, h.slots.alive_count(), None);
         assert_eq!(est, 95);
     }
 
@@ -421,7 +469,7 @@ mod tests {
             vec![Value::Integer(0), Value::Integer(1)],
         );
 
-        let est = estimate_cardinality(&clause, &h.filters, h.slots.alive_count());
+        let est = estimate_cardinality(&clause, &h.filters, h.slots.alive_count(), None);
         assert_eq!(est, 20);
     }
 
@@ -442,7 +490,7 @@ mod tests {
             FilterClause::Eq("userId".to_string(), Value::Integer(42)),     // 10
         ]);
 
-        let est = estimate_cardinality(&clause, &h.filters, h.slots.alive_count());
+        let est = estimate_cardinality(&clause, &h.filters, h.slots.alive_count(), None);
         assert_eq!(est, 10); // min of children
     }
 
@@ -462,7 +510,7 @@ mod tests {
             FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(2)),  // 70
         ]);
 
-        let est = estimate_cardinality(&clause, &h.filters, h.slots.alive_count());
+        let est = estimate_cardinality(&clause, &h.filters, h.slots.alive_count(), None);
         assert_eq!(est, 100); // sum, capped at alive_count
     }
 
