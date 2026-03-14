@@ -181,7 +181,7 @@ async fn main() {
                 None
             };
 
-            // Phase 1: Download CSVs to staging dir (reuses .done markers)
+            // Phase 1a: Download PG CSVs to staging dir (reuses .done markers)
             // stage_dir = {data_dir}/indexes/{name}/load_stage/
             let stage_dir = index_storage_dir.join("load_stage");
             bulk_loader::download_all_tables(&pool, &stage_dir)
@@ -190,6 +190,24 @@ async fn main() {
                     eprintln!("CSV download failed: {e}");
                     std::process::exit(1);
                 });
+
+            // Phase 1b: Download ClickHouse metrics (reactionCount, commentCount, collectedCount)
+            if let Some(ref ch_url) = sync_config.clickhouse_url {
+                scatter_gather::download_metrics_from_clickhouse(
+                    &stage_dir,
+                    ch_url,
+                    sync_config.clickhouse_username.as_deref(),
+                    sync_config.clickhouse_password.as_deref(),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("WARNING: ClickHouse metrics download failed: {e}");
+                    eprintln!("Continuing without metrics — sort by reactionCount will use zeros");
+                    0
+                });
+            } else {
+                eprintln!("WARNING: No clickhouse_url configured — metric sort fields will be 0");
+            }
 
             // Phase 2+3: Scatter-gather pipeline (peak ~20 GB vs old loader's 40+ GB OOM)
             eprintln!("=== Using scatter-gather pipeline ===");

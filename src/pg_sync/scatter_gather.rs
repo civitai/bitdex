@@ -126,7 +126,11 @@ pub fn run_bulk_load_scatter(
     // Drop the writer to close all file handles
     drop(scratch);
 
-    run_gather_and_apply(engine, index_def, &scratch_dir, &progress)?;
+    // Load ClickHouse metrics (if metrics.csv exists in staging dir)
+    let metrics_map = load_metrics_csv(stage_dir);
+    eprintln!("Loaded {} image metrics from ClickHouse", metrics_map.len());
+
+    run_gather_and_apply(engine, index_def, &scratch_dir, &progress, &metrics_map)?;
 
     progress.set_phase(6);
     let elapsed = wall_start.elapsed();
@@ -156,7 +160,10 @@ pub fn run_gather_only(
         .unwrap_or(stage_dir)
         .join("scratch_shards");
 
-    run_gather_and_apply(engine, index_def, &scratch_dir, &progress)?;
+    let metrics_map = load_metrics_csv(stage_dir);
+    eprintln!("Loaded {} image metrics from ClickHouse", metrics_map.len());
+
+    run_gather_and_apply(engine, index_def, &scratch_dir, &progress, &metrics_map)?;
 
     let elapsed = wall_start.elapsed();
     Ok(BulkLoadStats {
@@ -172,6 +179,7 @@ fn run_gather_and_apply(
     index_def: &IndexDefinition,
     scratch_dir: &Path,
     progress: &Arc<LoadProgress>,
+    metrics_map: &MetricsMap,
 ) -> Result<(), String> {
     let schema = &index_def.data_schema;
     let config = engine.config();
@@ -271,6 +279,7 @@ fn run_gather_and_apply(
     let sort_bits_ref = &sort_bits;
     let filter_names_ref = &filter_names;
     let sort_configs_ref = &sort_configs;
+    let metrics_map_ref = metrics_map;
 
     shard_files.par_iter().for_each(|shard_path| {
         // Phase A: Read + parse shard
@@ -299,6 +308,7 @@ fn run_gather_and_apply(
                 doc, filter_set_ref, sort_bits_ref, schema_ref,
                 &mut bitmaps.filter_maps,
                 &mut bitmaps.sort_maps,
+                metrics_map_ref,
             );
             bitmaps.alive.insert(doc.slot);
         }
@@ -419,6 +429,9 @@ struct ShardBitmaps {
 // but also handles multi-value fields from scratch tuples)
 // ---------------------------------------------------------------------------
 
+/// Metrics for a single image: (reactionCount, commentCount, collectedCount).
+pub type MetricsMap = HashMap<u32, (u32, u32, u32)>;
+
 fn build_bitmaps_from_slot_doc(
     doc: &SlotDoc,
     filter_set: &HashSet<String>,
@@ -426,6 +439,7 @@ fn build_bitmaps_from_slot_doc(
     schema: &crate::config::DataSchema,
     filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
     sort_maps: &mut HashMap<String, HashMap<usize, RoaringBitmap>>,
+    metrics_map: &MetricsMap,
 ) {
     let slot = doc.slot;
 
@@ -517,14 +531,16 @@ fn build_bitmaps_from_slot_doc(
         let pub_secs = (doc.published_at_ms / 1000) as u32;
         insert_sort_bits(sort_maps, "publishedAt", pub_secs, bits, slot);
     }
+    let (reaction_count, comment_count, collected_count) =
+        metrics_map.get(&slot).copied().unwrap_or((0, 0, 0));
     if let Some(&bits) = sort_bits.get("reactionCount") {
-        insert_sort_bits(sort_maps, "reactionCount", 0, bits, slot);
+        insert_sort_bits(sort_maps, "reactionCount", reaction_count, bits, slot);
     }
     if let Some(&bits) = sort_bits.get("commentCount") {
-        insert_sort_bits(sort_maps, "commentCount", 0, bits, slot);
+        insert_sort_bits(sort_maps, "commentCount", comment_count, bits, slot);
     }
     if let Some(&bits) = sort_bits.get("collectedCount") {
-        insert_sort_bits(sort_maps, "collectedCount", 0, bits, slot);
+        insert_sort_bits(sort_maps, "collectedCount", collected_count, bits, slot);
     }
     if let Some(&bits) = sort_bits.get("id") {
         insert_sort_bits(sort_maps, "id", slot, bits, slot);
@@ -874,6 +890,118 @@ fn load_model_map(stage_dir: &Path) -> Result<HashMap<i64, (bool, String)>, Stri
         }
     }
     Ok(map)
+}
+
+/// Load ClickHouse metrics CSV into a HashMap.
+/// Format: id\treactionCount\tcommentCount\tcollectedCount (TSV, no header).
+/// Returns empty map if file doesn't exist (graceful degradation).
+pub fn load_metrics_csv(stage_dir: &Path) -> MetricsMap {
+    let path = stage_dir.join("metrics.csv");
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("No metrics.csv found at {} — metric sort fields will be 0", path.display());
+            return HashMap::new();
+        }
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut map = HashMap::new();
+    let mut count = 0u64;
+    for line in reader.split(b'\n') {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        // TSV: id\treactionCount\tcommentCount\tcollectedCount
+        let parts: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let id = fast_parse_u32(parts[0]);
+        let reaction = fast_parse_u32(parts[1]);
+        let comment = fast_parse_u32(parts[2]);
+        let collected = fast_parse_u32(parts[3]);
+        if id > 0 {
+            map.insert(id, (reaction, comment, collected));
+            count += 1;
+            if count % 10_000_000 == 0 {
+                eprintln!("  metrics: {} rows loaded", count);
+            }
+        }
+    }
+    map
+}
+
+fn fast_parse_u32(bytes: &[u8]) -> u32 {
+    let s = std::str::from_utf8(bytes).unwrap_or("0");
+    s.trim().parse::<u32>().unwrap_or(0)
+}
+
+/// Download all-time aggregate metrics from ClickHouse to a TSV file.
+/// Query: entityMetricDailyAgg grouped by entityId for entityType='Image'.
+/// Output: metrics.csv in stage_dir (id\treactionCount\tcommentCount\tcollectedCount).
+pub async fn download_metrics_from_clickhouse(
+    stage_dir: &std::path::Path,
+    ch_url: &str,
+    ch_username: Option<&str>,
+    ch_password: Option<&str>,
+) -> Result<u64, String> {
+    let done_path = stage_dir.join("metrics.csv.done");
+    if done_path.exists() {
+        eprintln!("metrics.csv already downloaded (found .done marker)");
+        return Ok(0);
+    }
+
+    let csv_path = stage_dir.join("metrics.csv");
+    eprintln!("Downloading ClickHouse metrics to {} ...", csv_path.display());
+
+    let query = r#"SELECT
+        entityId,
+        sumIf(total, metricType IN ('ReactionLike','ReactionHeart','ReactionLaugh','ReactionCry')) as reactionCount,
+        sumIf(total, metricType = 'Comment') as commentCount,
+        sumIf(total, metricType = 'Collection') as collectedCount
+    FROM entityMetricDailyAgg
+    WHERE entityType = 'Image'
+    GROUP BY entityId
+    FORMAT TSV"#;
+
+    let http = reqwest::Client::new();
+    let mut req = http.post(ch_url).body(query.to_string());
+
+    if let Some(username) = ch_username {
+        let password = ch_password.unwrap_or("");
+        req = req.basic_auth(username, Some(password));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("ClickHouse request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("ClickHouse returned {status}: {body}"));
+    }
+
+    // Stream response body to file
+    let mut file = std::fs::File::create(&csv_path)
+        .map_err(|e| format!("create metrics.csv: {e}"))?;
+    let body = resp.bytes().await.map_err(|e| format!("read CH body: {e}"))?;
+    std::io::Write::write_all(&mut file, &body)
+        .map_err(|e| format!("write metrics.csv: {e}"))?;
+
+    let row_count = body.iter().filter(|&&b| b == b'\n').count() as u64;
+    eprintln!("Downloaded {} metric rows from ClickHouse", row_count);
+
+    // Write .done marker
+    std::fs::write(&done_path, format!("{row_count}"))
+        .map_err(|e| format!("write .done marker: {e}"))?;
+
+    Ok(row_count)
 }
 
 /// Fast inline tag CSV parser — two integers, no quoting.

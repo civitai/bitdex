@@ -302,7 +302,7 @@ pub(crate) async fn stream_tools(
         let mut current_images: Vec<u32> = Vec::with_capacity(100);
 
         for row in &rows {
-            if current_tool != Some(row.tool_id) {
+            if current_tool != Some(row.tool_id as i64) {
                 if let Some(tool_id) = current_tool {
                     flush_id_batch(
                         "toolIds",
@@ -312,7 +312,7 @@ pub(crate) async fn stream_tools(
                         &mut accum.filter_maps,
                     );
                 }
-                current_tool = Some(row.tool_id);
+                current_tool = Some(row.tool_id as i64);
                 current_images.clear();
             }
             current_images.push(row.image_id as u32);
@@ -377,7 +377,7 @@ pub(crate) async fn stream_techniques(
         let mut current_images: Vec<u32> = Vec::with_capacity(100);
 
         for row in &rows {
-            if current_tech != Some(row.technique_id) {
+            if current_tech != Some(row.technique_id as i64) {
                 if let Some(tech_id) = current_tech {
                     flush_id_batch(
                         "techniqueIds",
@@ -387,7 +387,7 @@ pub(crate) async fn stream_techniques(
                         &mut accum.filter_maps,
                     );
                 }
-                current_tech = Some(row.technique_id);
+                current_tech = Some(row.technique_id as i64);
                 current_images.clear();
             }
             current_images.push(row.image_id as u32);
