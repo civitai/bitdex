@@ -267,7 +267,7 @@ pub async fn fetch_images_by_range(
            i.minor, i.poi, i."blockedFor", i."scannedAt"::timestamptz, i."createdAt"::timestamptz,
            i.meta,
            p."publishedAt"::timestamptz, p.availability::text, p."modelVersionId"::int8 as "postedToId",
-           GREATEST(p."publishedAt", i."scannedAt", i."createdAt") as "sortAt"
+           GREATEST(p."publishedAt", i."scannedAt", i."createdAt")::timestamptz as "sortAt"
         FROM "Image" i
         JOIN "Post" p ON p.id = i."postId"
         WHERE i.id >= $1 AND i.id < $2"#,
@@ -289,7 +289,7 @@ pub async fn fetch_images_by_ids(
            i.minor, i.poi, i."blockedFor", i."scannedAt"::timestamptz, i."createdAt"::timestamptz,
            i.meta,
            p."publishedAt"::timestamptz, p.availability::text, p."modelVersionId"::int8 as "postedToId",
-           GREATEST(p."publishedAt", i."scannedAt", i."createdAt") as "sortAt"
+           GREATEST(p."publishedAt", i."scannedAt", i."createdAt")::timestamptz as "sortAt"
         FROM "Image" i
         JOIN "Post" p ON p.id = i."postId"
         WHERE i.id = ANY($1)"#,
