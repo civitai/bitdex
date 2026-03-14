@@ -481,7 +481,8 @@ fn run_gather_and_apply(
         let te = Instant::now();
         let mut encoded_docs: Vec<(u32, Vec<u8>)> = Vec::with_capacity(slot_docs.len());
         for doc in &slot_docs {
-            let json = scratch::slot_doc_to_json(doc);
+            let doc_metrics = metrics_map_ref.get(&doc.slot).copied();
+            let json = scratch::slot_doc_to_json(doc, doc_metrics);
             let bytes = bulk_writer_ref.encode_json(&json, schema_ref);
             encoded_docs.push((doc.slot, bytes));
         }

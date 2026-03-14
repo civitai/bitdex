@@ -567,7 +567,8 @@ fn assemble_slot_doc(slot: u32, tuples: Vec<ScratchTuple>) -> SlotDoc {
 }
 
 /// Convert a SlotDoc to a serde_json::Value for docstore encoding.
-pub fn slot_doc_to_json(doc: &SlotDoc) -> serde_json::Value {
+/// `metrics` is (reactionCount, commentCount, collectedCount) from ClickHouse.
+pub fn slot_doc_to_json(doc: &SlotDoc, metrics: Option<(u32, u32, u32)>) -> serde_json::Value {
     use super::slot_arena::{decode_availability, decode_base_model, decode_image_type};
 
     let mut json = serde_json::json!({
@@ -584,9 +585,9 @@ pub fn slot_doc_to_json(doc: &SlotDoc) -> serde_json::Value {
         "modelVersionIdsManual": serde_json::json!([]),
         "toolIds": doc.tool_ids.iter().map(|&t| t as i64).collect::<Vec<i64>>(),
         "techniqueIds": doc.technique_ids.iter().map(|&t| t as i64).collect::<Vec<i64>>(),
-        "reactionCount": 0i64,
-        "commentCount": 0i64,
-        "collectedCount": 0i64,
+        "reactionCount": metrics.map_or(0i64, |m| m.0 as i64),
+        "commentCount": metrics.map_or(0i64, |m| m.1 as i64),
+        "collectedCount": metrics.map_or(0i64, |m| m.2 as i64),
         "sortAt": doc.sort_at as i64,
         "sortAtUnix": doc.sort_at as i64 * 1000,
         "publishedAtUnix": doc.published_at_ms as i64,
@@ -855,7 +856,7 @@ mod tests {
             resource_poi: false,
         };
 
-        let json = slot_doc_to_json(&doc);
+        let json = slot_doc_to_json(&doc, None);
         let obj = json.as_object().unwrap();
         assert_eq!(obj["id"], 42);
         assert_eq!(obj["nsfwLevel"], 8);
