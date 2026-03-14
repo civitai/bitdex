@@ -2504,12 +2504,17 @@ impl ConcurrentEngine {
             uc.mark_shard_loading(sort_field, direction);
             drop(uc);
 
+            let t0 = std::time::Instant::now();
             let shard_key = crate::bound_store::ShardKey::new(
                 sort_field.to_string(),
                 direction,
             );
             match bs.load_shard(&shard_key) {
                 Ok(Some(shard_entries)) => {
+                    let disk_elapsed = t0.elapsed();
+                    let snap = self.snapshot();
+                    let sf = snap.sorts.get_field(sort_field);
+
                     let mut uc = self.unified_cache.lock();
                     let mut loaded = 0usize;
                     let mut skipped = 0usize;
@@ -2532,12 +2537,16 @@ impl ConcurrentEngine {
                         };
                         // Get metadata from meta entry (if available) or use defaults
                         let config = uc.config().clone();
+                        let value_fn = |slot: u32| -> u32 {
+                            sf.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                        };
                         let entry = UnifiedEntry::from_restored(
                             se.bitmap,
                             se.entry_id,
                             config.initial_capacity,
                             config.max_capacity,
                             direction,
+                            &value_fn,
                         );
                         uc.insert_restored_entry(key, entry);
                         loaded += 1;
@@ -2546,10 +2555,13 @@ impl ConcurrentEngine {
                     uc.mark_shard_loaded(sort_field, direction);
                     self.boundstore_shard_loads.fetch_add(1, Ordering::Relaxed);
                     self.boundstore_entries_skipped.fetch_add(skipped as u64, Ordering::Relaxed);
+                    let total_elapsed = t0.elapsed();
                     if loaded > 0 || skipped > 0 {
-                        eprintln!(
-                            "BoundStore: loaded shard {}_{:?} ({loaded} entries, {skipped} skipped)",
-                            sort_field, direction
+                        tracing::info!(
+                            "BoundStore: loaded shard {}_{:?} ({loaded} entries, {skipped} skipped) disk={:.1}ms total={:.1}ms",
+                            sort_field, direction,
+                            disk_elapsed.as_secs_f64() * 1000.0,
+                            total_elapsed.as_secs_f64() * 1000.0,
                         );
                     }
                 }

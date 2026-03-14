@@ -171,6 +171,7 @@ impl UnifiedEntry {
         initial_capacity: usize,
         max_capacity: usize,
         direction: SortDirection,
+        value_fn: impl Fn(u32) -> u32,
     ) -> Self {
         let card = bitmap.len() as usize;
         let capacity = if card > initial_capacity {
@@ -178,19 +179,37 @@ impl UnifiedEntry {
         } else {
             initial_capacity
         };
+
+        // Build sorted_keys for fast binary search pagination
+        let slots: Vec<u32> = bitmap.iter().collect();
+        let sorted_keys = if !slots.is_empty() && card <= max_capacity {
+            Some(Arc::new(Self::build_sorted_keys(&slots, direction, &value_fn)))
+        } else {
+            None
+        };
+
+        // Compute min_tracked_value from the sorted keys
+        let min_tracked_value = sorted_keys.as_ref().and_then(|keys| {
+            keys.last().map(|&k| (k >> 32) as u32)
+        }).unwrap_or(0);
+
+        // Compute total_matched from bitmap cardinality (approximation —
+        // the true total may be larger if has_more was true)
+        let total_matched = card as u64;
+
         Self {
             bitmap: Arc::new(bitmap),
-            min_tracked_value: 0, // Will be updated from meta on next access
+            min_tracked_value,
             capacity,
             max_capacity,
             has_more: true,
-            total_matched: 0,
+            total_matched,
             needs_rebuild: false,
             rebuilding: AtomicBool::new(false),
             last_used: Instant::now(),
             meta_id,
             persist_dirty: false, // Just loaded from disk — clean
-            sorted_keys: None, // Lazy reconstruction on first query
+            sorted_keys,
             radix: None,
             direction,
         }
