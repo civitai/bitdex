@@ -2174,11 +2174,18 @@ impl ConcurrentEngine {
 
     /// Execute a parsed BitdexQuery.
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
+        let query_start = std::time::Instant::now();
+
         // Lazy-load any fields not yet loaded from disk
+        let t0 = std::time::Instant::now();
         self.ensure_fields_loaded(
             &query.filters,
             query.sort.as_ref().map(|s| s.field.as_str()),
         )?;
+        let ensure_elapsed = t0.elapsed();
+        if ensure_elapsed.as_millis() > 10 {
+            tracing::debug!("  ensure_fields_loaded: {:.1}ms", ensure_elapsed.as_secs_f64() * 1000.0);
+        }
 
         let snap = self.snapshot(); // lock-free
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
@@ -2413,10 +2420,18 @@ impl ConcurrentEngine {
         // Pre-fetched cache data from fast path that detected expansion needed
         cached: Option<(UnifiedKey, Arc<RoaringBitmap>, bool, u32, usize, u64)>,
     ) -> Result<QueryResult> {
+        let slow_start = std::time::Instant::now();
+
+        let t0 = std::time::Instant::now();
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(executor, snapped_filters, time_buckets, now_unix)?;
+        let filter_elapsed = t0.elapsed();
 
         let full_total_matched = filter_arc.len();
+        tracing::debug!(
+            "  slow_path: resolve_filters={:.1}ms, matched={}, use_simple={}",
+            filter_elapsed.as_secs_f64() * 1000.0, full_total_matched, use_simple_sort
+        );
 
         // If we have pre-fetched cache data (expansion case), use it.
         // Otherwise, do a fresh cache lookup (miss case).
@@ -2559,6 +2574,7 @@ impl ConcurrentEngine {
 
             // Seed the cache with initial_capacity (4K) results — single sort traversal.
             let initial_cap = self.unified_cache.lock().config().initial_capacity;
+            let t0 = std::time::Instant::now();
             let seed_result = executor.execute_from_bitmap_unclamped(
                 &filter_arc,
                 query.sort.as_ref(),
@@ -2566,18 +2582,30 @@ impl ConcurrentEngine {
                 None,
                 use_simple_sort,
             )?;
+            let sort_elapsed = t0.elapsed();
+            tracing::debug!(
+                "  slow_path: sort_seed={:.1}ms ({}→{} slots, simple={})",
+                sort_elapsed.as_secs_f64() * 1000.0, full_total_matched, seed_result.ids.len(), use_simple_sort
+            );
             let sort_field = snap.sorts.get_field(&sort_clause.field);
             let sorted_slots: Vec<u32> = seed_result.ids.iter().map(|&id| id as u32).collect();
             let has_more = full_total_matched > sorted_slots.len() as u64;
             let value_fn = |slot: u32| -> u32 {
                 sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
             };
+            let t0 = std::time::Instant::now();
             self.unified_cache.lock().form_and_store(
                 ukey.clone(),
                 &sorted_slots,
                 has_more,
                 full_total_matched,
                 value_fn,
+            );
+            let cache_elapsed = t0.elapsed();
+            tracing::debug!(
+                "  slow_path: cache_form={:.1}ms, total_slow={:.1}ms",
+                cache_elapsed.as_secs_f64() * 1000.0,
+                slow_start.elapsed().as_secs_f64() * 1000.0
             );
 
             // Serve the user's results from the freshly seeded cache.
