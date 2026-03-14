@@ -20,13 +20,31 @@ struct CursorResponse {
 }
 
 impl BitdexClient {
+    /// Create a new BitdexClient.
+    ///
+    /// `base_url` can be either:
+    ///   - Full index URL: "http://host:3000/api/indexes/civitai"
+    ///   - Server root: "http://host:3000" (index_name required)
+    ///
+    /// If `base_url` already contains `/api/indexes/`, it's used as-is.
+    /// Otherwise, `index_name` is appended as `/api/indexes/{name}`.
     pub fn new(base_url: &str) -> Self {
+        Self::with_index(base_url, None)
+    }
+
+    pub fn with_index(base_url: &str, index_name: Option<&str>) -> Self {
         let base = base_url.trim_end_matches('/').to_string();
-        // Derive server root from base_url by stripping /api/indexes/{name}.
-        // e.g. "http://host:3000/api/indexes/test" → "http://host:3000"
-        let server_root = base
+        let base_url = if base.contains("/api/indexes/") {
+            base.clone()
+        } else if let Some(name) = index_name {
+            format!("{}/api/indexes/{}", base, name)
+        } else {
+            base.clone()
+        };
+        // Derive server root for health checks
+        let server_root = base_url
             .find("/api/indexes/")
-            .map(|pos| base[..pos].to_string())
+            .map(|pos| base_url[..pos].to_string())
             .unwrap_or_else(|| base.clone());
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -35,7 +53,7 @@ impl BitdexClient {
             .expect("failed to build HTTP client");
         Self {
             client,
-            base_url: base,
+            base_url,
             server_root,
         }
     }

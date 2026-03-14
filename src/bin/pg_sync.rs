@@ -239,7 +239,7 @@ async fn main() {
 
         Commands::Sync => {
             let bitdex_url = sync_config.bitdex_url.as_deref().unwrap_or("http://localhost:3000");
-            let bitdex_client = BitdexClient::new(bitdex_url);
+            let bitdex_client = BitdexClient::with_index(bitdex_url, Some(&index_def.name));
 
             eprintln!("Starting sync (bitdex={bitdex_url})...");
 
