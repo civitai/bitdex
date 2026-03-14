@@ -302,7 +302,7 @@ pub async fn fetch_images_by_ids(
 /// Fetch tags for a batch of image IDs.
 pub async fn fetch_tags(pool: &PgPool, image_ids: &[i64]) -> Result<Vec<TagRow>, sqlx::Error> {
     sqlx::query_as::<_, TagRow>(
-        r#"SELECT "imageId"::int8, "tagId"::int8 FROM "TagsOnImageDetails"
+        r#"SELECT "imageId", "tagId" FROM "TagsOnImageDetails"
         WHERE "imageId" = ANY($1) AND disabled = false"#,
     )
     .bind(image_ids)
@@ -313,7 +313,7 @@ pub async fn fetch_tags(pool: &PgPool, image_ids: &[i64]) -> Result<Vec<TagRow>,
 /// Fetch tools for a batch of image IDs.
 pub async fn fetch_tools(pool: &PgPool, image_ids: &[i64]) -> Result<Vec<ToolRow>, sqlx::Error> {
     sqlx::query_as::<_, ToolRow>(
-        r#"SELECT "imageId"::int8, "toolId"::int8 FROM "ImageTool" WHERE "imageId" = ANY($1)"#,
+        r#"SELECT "imageId", "toolId" FROM "ImageTool" WHERE "imageId" = ANY($1)"#,
     )
     .bind(image_ids)
     .fetch_all(pool)
@@ -326,7 +326,7 @@ pub async fn fetch_techniques(
     image_ids: &[i64],
 ) -> Result<Vec<TechniqueRow>, sqlx::Error> {
     sqlx::query_as::<_, TechniqueRow>(
-        r#"SELECT "imageId"::int8, "techniqueId"::int8 FROM "ImageTechnique" WHERE "imageId" = ANY($1)"#,
+        r#"SELECT "imageId", "techniqueId" FROM "ImageTechnique" WHERE "imageId" = ANY($1)"#,
     )
     .bind(image_ids)
     .fetch_all(pool)
@@ -339,7 +339,7 @@ pub async fn fetch_resources(
     image_ids: &[i64],
 ) -> Result<Vec<ResourceRow>, sqlx::Error> {
     sqlx::query_as::<_, ResourceRow>(
-        r#"SELECT ir."imageId"::int8,
+        r#"SELECT ir."imageId",
            string_agg(CASE WHEN m.type = 'Checkpoint' THEN mv."baseModel" ELSE NULL END, '') as "baseModel",
            coalesce(array_agg(mv.id::int8) FILTER (WHERE ir.detected), '{}') as "modelVersionIds",
            coalesce(array_agg(mv.id::int8) FILTER (WHERE NOT ir.detected), '{}') as "modelVersionIdsManual",
