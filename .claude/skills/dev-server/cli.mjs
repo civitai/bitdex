@@ -926,37 +926,62 @@ async function cmdDashboard() {
     }
   });
 
-  // Main poll loop
-  while (running) {
+  // SSE event stream — replaces polling loop
+  let lastStatus = null;
+
+  async function connectSSE() {
     try {
-      const status = await daemonFetch('/status');
+      const res = await fetch(`${DAEMON_URL}/events`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      // Fetch logs for selected instance (skip when in explain mode — logs paused)
-      const logTarget = selectedInstance || (status.instances[0]?.id) || null;
-      if (logTarget && !explainMode) {
-        // Reset cursor when switching instances
-        if (logTarget !== lastLogTarget) {
-          logLines = [];
-          logCursor = -1;
-          lastLogTarget = logTarget;
-        }
-        try {
-          const ld = await daemonFetch(`/instances/${logTarget}/logs?tail=100&since=${logCursor}`);
-          for (const entry of ld.logs || []) {
-            logLines.push(entry);
-            logCursor = entry.index;
+      while (running) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop(); // keep incomplete event
+
+        for (const raw of events) {
+          if (!raw.trim()) continue;
+          let eventType = 'message';
+          let data = '';
+          for (const line of raw.split('\n')) {
+            if (line.startsWith('event: ')) eventType = line.slice(7);
+            else if (line.startsWith('data: ')) data = line.slice(6);
           }
-          if (logLines.length > 500) logLines = logLines.slice(-300);
-        } catch {}
+          if (!data) continue;
+
+          try {
+            const parsed = JSON.parse(data);
+
+            if (eventType === 'status') {
+              lastStatus = parsed;
+              if (!explainMode) render(lastStatus);
+            } else if (eventType === 'log') {
+              // Log event from daemon — add to logLines if it's our target instance
+              const logTarget = selectedInstance || (lastStatus?.instances?.[0]?.id) || null;
+              if (parsed.instanceId === logTarget && !explainMode) {
+                logLines.push(parsed);
+                logCursor = parsed.index;
+                if (logLines.length > 500) logLines = logLines.slice(-300);
+                if (lastStatus) render(lastStatus);
+              }
+            }
+          } catch { /* malformed event */ }
+        }
       }
-
-      render(status);
     } catch {
-      write(HOME + CLR_LINE + `${RED}Daemon not responding${R}` + CLR_BELOW);
+      // SSE connection failed — fall back to single render with error
+      write(HOME + CLR_LINE + `${RED}Daemon not responding — reconnecting...${R}` + CLR_BELOW);
+      await sleep(2000);
+      if (running) connectSSE(); // auto-reconnect
     }
-
-    await sleep(1000);
   }
+
+  connectSSE();
 }
 
 // ─── Traces ─────────────────────────────────────────────────────

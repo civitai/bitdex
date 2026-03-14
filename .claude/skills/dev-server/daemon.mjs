@@ -46,6 +46,16 @@ let e2eLock = { holder: null, startedAt: null, pid: null };
 let portReservations = new Map(); // port → { reservedAt, reservedBy }
 let daemonStartedAt = new Date().toISOString();
 
+// SSE clients — connected response objects for event streaming
+const sseClients = new Set();
+
+function sseBroadcast(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(payload); } catch { sseClients.delete(res); }
+  }
+}
+
 // Per-instance log ring buffers (in-memory for fast TUI access)
 let logBuffers = new Map();   // instanceId → { lines: [], globalIndex: 0 }
 let globalLogIndex = 0;
@@ -178,6 +188,8 @@ function pushLog(instanceId, level, message) {
     buf.startIndex = buf.lines[buf.lines.length - MAX_LOG_LINES].index;
     buf.lines = buf.lines.slice(-MAX_LOG_LINES);
   }
+  // Broadcast to SSE clients
+  if (sseClients.size > 0) sseBroadcast('log', { instanceId, ...entry });
   return entry;
 }
 
@@ -760,6 +772,9 @@ function heartbeat() {
       portReservations.delete(p);
     }
   }
+
+  // Broadcast status to SSE clients
+  if (sseClients.size > 0) sseBroadcast('status', getStatus());
 }
 
 // ─── Force Kill ─────────────────────────────────────────────────
@@ -849,6 +864,21 @@ async function handleRequest(req, res) {
     // GET /health
     if (method === 'GET' && path === '/health') {
       return json(res, 200, { ok: true, pid: process.pid });
+    }
+
+    // GET /events — Server-Sent Events stream
+    if (method === 'GET' && path === '/events') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      });
+      // Send initial status immediately
+      res.write(`event: status\ndata: ${JSON.stringify(getStatus())}\n\n`);
+      sseClients.add(res);
+      req.on('close', () => sseClients.delete(res));
+      // Don't end the response — keep it open for streaming
+      return;
     }
 
     // GET /status
