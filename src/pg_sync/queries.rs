@@ -262,8 +262,8 @@ pub async fn fetch_images_by_range(
     end: i64,
 ) -> Result<Vec<ImageRow>, sqlx::Error> {
     sqlx::query_as::<_, ImageRow>(
-        r#"SELECT i.id, i."postId", i.url, i."nsfwLevel", i.hash,
-           i."hideMeta", i.type::text, i."userId",
+        r#"SELECT i.id::int8, i."postId"::int8, i.url, i."nsfwLevel", i.hash,
+           i."hideMeta", i.type::text, i."userId"::int8,
            i.minor, i.poi, i."blockedFor", i."scannedAt", i."createdAt",
            i.meta,
            p."publishedAt", p.availability::text, p."modelVersionId" as "postedToId",
@@ -284,8 +284,8 @@ pub async fn fetch_images_by_ids(
     ids: &[i64],
 ) -> Result<Vec<ImageRow>, sqlx::Error> {
     sqlx::query_as::<_, ImageRow>(
-        r#"SELECT i.id, i."postId", i.url, i."nsfwLevel", i.hash,
-           i."hideMeta", i.type::text, i."userId",
+        r#"SELECT i.id::int8, i."postId"::int8, i.url, i."nsfwLevel", i.hash,
+           i."hideMeta", i.type::text, i."userId"::int8,
            i.minor, i.poi, i."blockedFor", i."scannedAt", i."createdAt",
            i.meta,
            p."publishedAt", p.availability::text, p."modelVersionId" as "postedToId",
