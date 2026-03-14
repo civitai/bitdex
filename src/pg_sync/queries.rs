@@ -264,9 +264,9 @@ pub async fn fetch_images_by_range(
     sqlx::query_as::<_, ImageRow>(
         r#"SELECT i.id::int8, i."postId"::int8, i.url, i."nsfwLevel", i.hash,
            i."hideMeta", i.type::text, i."userId"::int8,
-           i.minor, i.poi, i."blockedFor", i."scannedAt", i."createdAt",
+           i.minor, i.poi, i."blockedFor", i."scannedAt"::timestamptz, i."createdAt"::timestamptz,
            i.meta,
-           p."publishedAt", p.availability::text, p."modelVersionId" as "postedToId",
+           p."publishedAt"::timestamptz, p.availability::text, p."modelVersionId"::int8 as "postedToId",
            GREATEST(p."publishedAt", i."scannedAt", i."createdAt") as "sortAt"
         FROM "Image" i
         JOIN "Post" p ON p.id = i."postId"
@@ -286,9 +286,9 @@ pub async fn fetch_images_by_ids(
     sqlx::query_as::<_, ImageRow>(
         r#"SELECT i.id::int8, i."postId"::int8, i.url, i."nsfwLevel", i.hash,
            i."hideMeta", i.type::text, i."userId"::int8,
-           i.minor, i.poi, i."blockedFor", i."scannedAt", i."createdAt",
+           i.minor, i.poi, i."blockedFor", i."scannedAt"::timestamptz, i."createdAt"::timestamptz,
            i.meta,
-           p."publishedAt", p.availability::text, p."modelVersionId" as "postedToId",
+           p."publishedAt"::timestamptz, p.availability::text, p."modelVersionId"::int8 as "postedToId",
            GREATEST(p."publishedAt", i."scannedAt", i."createdAt") as "sortAt"
         FROM "Image" i
         JOIN "Post" p ON p.id = i."postId"
