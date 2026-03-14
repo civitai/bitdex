@@ -69,7 +69,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 - **Arc-per-bitmap CoW**: Each `RoaringBitmap` wrapped in `Arc`. `Arc::make_mut()` only clones bitmaps with refcount > 1. Filter/sort fields also Arc-wrapped for O(num_fields) snapshot clone.
 - **Write path**: Writers compute diffs and send `MutationOp`s to a crossbeam channel. Flush thread drains, batches, applies to staging, publishes new snapshot atomically.
 - **In-flight tracking**: Writers mark slot IDs in an atomic in-flight set before mutation, clear after. Readers post-validate overlapping IDs.
-- **Cache**: Separate `Arc<Mutex<TrieCache>>` with brief locks (lookup ~μs, store ~μs). Targeted invalidation: only filter fields that actually changed are invalidated; sort-only flushes skip cache invalidation entirely.
+- **Cache**: `Arc<Mutex<UnifiedCache>>` flat HashMap keyed by (filter_clauses, sort_field, direction). Live maintenance by flush thread. Persistent on disk via BoundStore (`bitmaps/bounds/`). Targeted invalidation: only filter fields that actually changed are invalidated; sort-only flushes skip cache invalidation entirely.
 - **Loading mode**: `enter_loading_mode()` / `exit_loading_mode()` skips snapshot publishing and all maintenance during bulk inserts. Avoids `Arc::make_mut()` deep-cloning FilterField HashMaps every flush cycle. On exit, force-publishes staging and invalidates all caches.
 
 ### Unified Cache
@@ -79,6 +79,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 - Live maintenance: flush thread adds/removes slots on mutations for all clause types
 - LRU eviction by `max_bytes` (512MB default) with `last_used` timestamps
 - Meta-index for targeted invalidation: bitmaps tracking which cache entries reference each (field, value) pair
+- **Persistent via BoundStore** (`src/bound_store.rs`): meta.bin loaded eagerly on startup, bitmap shards lazy-loaded on first query per sort field. Tombstoning invalidates unloaded entries on mutations. Purge via `DELETE /cache/persistent`.
 - Sort queries 2-13x faster at 104M scale via pre-filtered working sets
 
 ---
@@ -95,7 +96,7 @@ Key guides: `docs/guide/api.md` (HTTP API), `docs/guide/query-formats.md` (query
 
 Run `/dev-guide` for full phase details, workflow expectations, and what's built vs not.
 
-**Summary:** Phases 1-3 COMPLETE. Phase 4 partial (server/metrics/UI done, autovac/admin not started). Phase 5 in progress (shadow mode comparison).
+**Summary:** Phases 1-3 COMPLETE. Phase 4 partial (server/metrics/UI done, cache persistence COMPLETE, autovac/admin not started). Phase 5 in progress (shadow mode comparison).
 
 ---
 

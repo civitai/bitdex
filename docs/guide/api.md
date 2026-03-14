@@ -555,7 +555,7 @@ Delete documents by slot ID. Performs clean deletes (clears all filter/sort bitm
 GET /api/indexes/{name}/stats
 ```
 
-Returns index statistics and unified cache state.
+Returns index statistics, unified cache state, and persistence metrics.
 
 **Response:** `200 OK`
 
@@ -567,8 +567,18 @@ Returns index statistics and unified cache state.
   "unified_cache_hits": 18394,
   "unified_cache_misses": 291,
   "unified_cache_bytes": 524288,
-  "unified_cache_meta_entries": 6,
+  "unified_cache_meta_entries": 48,
   "unified_cache_meta_bytes": 180,
+  "unified_cache_persistence_enabled": true,
+  "unified_cache_tombstones": 3,
+  "unified_cache_pending_shards": 0,
+  "unified_cache_dirty_shards": 0,
+  "unified_cache_disk_bytes": 52428,
+  "unified_cache_shard_load_count": 4,
+  "unified_cache_tombstones_created": 12,
+  "unified_cache_tombstones_cleaned": 9,
+  "unified_cache_entries_restored": 42,
+  "unified_cache_entries_skipped": 3,
   "unified_cache_entry_details": [
     {
       "sort_field": "reactionCount",
@@ -584,20 +594,52 @@ Returns index statistics and unified cache state.
 }
 ```
 
+**Persistence fields:**
+
+| Field | Description |
+|-------|-------------|
+| `unified_cache_persistence_enabled` | Whether BoundStore is active |
+| `unified_cache_tombstones` | Entries marked stale (pending cleanup) |
+| `unified_cache_pending_shards` | Shard files not yet loaded into RAM |
+| `unified_cache_disk_bytes` | Total bounds directory size on disk |
+| `unified_cache_shard_load_count` | Cumulative shard load events |
+| `unified_cache_tombstones_created` | Cumulative tombstones created |
+| `unified_cache_tombstones_cleaned` | Cumulative tombstones cleaned on shard rewrite |
+| `unified_cache_entries_restored` | Entries loaded from shard files |
+| `unified_cache_entries_skipped` | Entries skipped (tombstoned or orphaned) |
+
 ---
 
-### Clear Cache
+### Clear Cache (RAM only)
 
 ```
 DELETE /api/indexes/{name}/cache
 ```
 
-Clears all unified cache entries. Cache will rebuild on subsequent queries.
+Clears in-memory unified cache entries. Does NOT affect persistent cache on disk. Cache rebuilds on subsequent queries.
 
 **Response:** `200 OK`
 
 ```json
-{ "cleared": true }
+{ "cleared": true, "scope": "ram_only" }
+```
+
+---
+
+### Purge Persistent Cache (disk + RAM)
+
+```
+DELETE /api/indexes/{name}/cache/persistent
+```
+
+Purges all persistent cache files from disk (meta.bin + all .ucpack shard files), then clears the in-memory cache. Safe to call while the server is running — no restart needed. Cache rebuilds organically from query traffic.
+
+Order: disk first, then RAM (prevents stale shard loads during purge).
+
+**Response:** `200 OK`
+
+```json
+{ "purged": true, "scope": "disk_and_ram" }
 ```
 
 ---

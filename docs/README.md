@@ -16,7 +16,7 @@ Each design doc has front matter with a status field:
 | `design-storage.md` | BitmapFs, DocStore, persistence lifecycle | IMPLEMENTED |
 | `design-idle-eviction.md` | Per-value eviction for multi_value fields | IMPLEMENTED |
 | `design-unified-cache-final.md` | Unified cache (trie + bound + time buckets merged) | IMPLEMENTED |
-| `design-unified-cache-persistence.md` | Cache warm-start from disk | APPROVED |
+| `design-unified-cache-persistence.md` | Cache warm-start from disk (BoundStore) | IMPLEMENTED |
 | `design-rolling-restart-cursors.md` | Named cursors for zero-downtime restarts | IMPLEMENTED (Ph 1-3) |
 | `design-radix-sort-trie.md` | 8-bit radix bucketing for large cache entries | IMPLEMENTED (Ph 1) |
 | `meilisearch-syntax-reference.md` | Meilisearch filter/sort syntax mapping to BitDex | IMPLEMENTED |

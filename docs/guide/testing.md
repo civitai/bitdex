@@ -238,6 +238,53 @@ node tests/e2e/e2e-save-unload-lazy.mjs --url http://localhost:3100 --results-di
 
 ---
 
+### e2e-cache-persistence.mjs
+
+**File:** `tests/e2e/e2e-cache-persistence.mjs`
+
+**What it tests:** BoundStore (unified cache persistence) lifecycle: cache formation, disk persistence, warm restart with shard lazy loading, tombstoning on mutations, corruption recovery, and the persistent cache purge endpoint.
+
+**Self-contained:** YES. Manages its own server lifecycle (start/stop/restart). Creates own index, tests persistence across restarts, cleans up.
+
+**Test groups (30 assertions):**
+
+| Group | What it validates |
+|-------|-------------------|
+| A | Cache entries form on sorted queries, visible in stats |
+| B | meta.bin + .ucpack shard files written to disk after snapshot |
+| C | Server restart: meta loaded, shards pending, lazy load on query, results match |
+| D | Mutations tombstone unloaded entries after restart |
+| E | Meta-index tracks entries beyond RAM (disk orphans), shard load populates RAM |
+| F | Tombstoned entries skipped during shard load |
+| G | Missing meta.bin → graceful purge + cold start |
+| H | DELETE /cache/persistent purges disk + RAM, persistence re-enables |
+
+**How to run:**
+```bash
+node tests/e2e/e2e-cache-persistence.mjs [--port 3100] [--verbose]
+```
+
+**Expected output:** 30 assertions pass (groups A-H). Exit code 0.
+
+---
+
+### e2e-boundstore-smoke.mjs
+
+**File:** `tests/e2e/e2e-boundstore-smoke.mjs`
+
+**What it tests:** BoundStore performance regression detection. Measures disk footprint, save/load latency, warm vs cold query speed, and tombstone churn. Outputs a one-line summary with PASS/WARN/FAIL thresholds.
+
+**Self-contained:** YES. Manages own server. Uses 1K-doc synthetic dataset.
+
+**Target runtime:** ~25 seconds.
+
+**How to run:**
+```bash
+node tests/e2e/e2e-boundstore-smoke.mjs [--port 3100] [--verbose] [--results-dir docs/test-results]
+```
+
+---
+
 ## Integration Tests (Rust, In-Process)
 
 Integration tests run inside the Rust test harness using `cargo test`. They exercise the engine API directly without HTTP or the server binary. All are self-contained.

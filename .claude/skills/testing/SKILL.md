@@ -32,6 +32,7 @@ Guide for running the right tests based on what you changed, and for developing 
 |--------------|----------------|---------|
 | `src/bitmap_fs.rs` | Lib tests + restart test | `cargo test --lib && cargo test --test restart_test` |
 | `src/docstore.rs` | Lib tests + restart test + E2E schema versioning | `cargo test --lib && cargo test --test restart_test` then `node tests/e2e/e2e-schema-versioning.mjs --url <server>` |
+| `src/bound_store.rs` | Lib tests + E2E cache persistence + smoke benchmark | `cargo test --lib` then `node tests/e2e/e2e-cache-persistence.mjs` and `node tests/e2e/e2e-boundstore-smoke.mjs` |
 | Snapshot save/restore logic | Restart test + E2E eviction + E2E save-unload | `cargo test --test restart_test` then `node tests/e2e/e2e-eviction.mjs --url <server>` and `node tests/e2e/e2e-save-unload-lazy.mjs --url <server>` |
 | Schema versioning / field elision | Lib tests + E2E schema versioning | `cargo test --lib` then `node tests/e2e/e2e-schema-versioning.mjs --url <server>` |
 

@@ -25,6 +25,10 @@
  *
  * NOT run automatically (requires production data):
  *   - e2e-unified-cache.mjs   (use --data-dir with loaded data manually)
+ *
+ * NOT run automatically (manage own server lifecycle):
+ *   - e2e-cache-persistence.mjs    (starts/stops/restarts server, 30 assertions)
+ *   - e2e-boundstore-smoke.mjs     (performance smoke benchmark, ~25s)
  */
 
 import { spawn, execSync } from 'node:child_process';
@@ -126,6 +130,11 @@ const SUITES = [
     description: 'Pluggable query formats (equivalence, ?format= param, compact/meilisearch, error handling)',
   },
 ];
+
+// Suites that manage their own server lifecycle (not auto-run)
+// These start/stop/restart the server to test persistence across restarts.
+// Run them standalone: node tests/e2e/e2e-cache-persistence.mjs [--port 3100]
+//                      node tests/e2e/e2e-boundstore-smoke.mjs [--port 3100]
 
 // Suites that require production data (documented but not auto-run)
 const MANUAL_SUITES = [
