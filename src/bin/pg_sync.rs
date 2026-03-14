@@ -23,6 +23,7 @@ use bitdex_v2::pg_sync::outbox_poller;
 use bitdex_v2::pg_sync::progress::{self, LoadProgress};
 use bitdex_v2::pg_sync::queries;
 use bitdex_v2::pg_sync::scatter_gather;
+use bitdex_v2::pg_sync::single_pass;
 
 #[derive(Parser)]
 #[command(name = "pg-sync", about = "Postgres-to-Bitdex sync system")]
@@ -209,16 +210,16 @@ async fn main() {
                 eprintln!("WARNING: No clickhouse_url configured — metric sort fields will be 0");
             }
 
-            // Phase 2+3: Scatter-gather pipeline (peak ~20 GB vs old loader's 40+ GB OOM)
-            eprintln!("=== Using scatter-gather pipeline ===");
-            let stats = scatter_gather::run_bulk_load_scatter(
+            // Single-pass V2 loader: CSV → bitmaps + V2 docstore tuples in one pass
+            eprintln!("=== Using single-pass V2 loader ===");
+            let stats = single_pass::run_single_pass_v2(
                 &engine,
                 &index_def,
                 &stage_dir,
                 Arc::clone(&load_progress),
             )
             .unwrap_or_else(|e| {
-                eprintln!("Scatter-gather bulk load failed: {e}");
+                eprintln!("Single-pass V2 bulk load failed: {e}");
                 std::process::exit(1);
             });
 

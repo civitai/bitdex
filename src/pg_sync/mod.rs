@@ -17,5 +17,6 @@ pub mod queries;
 pub mod row_assembler;
 pub mod scatter_gather;
 pub mod scratch;
+pub mod single_pass;
 pub mod slot_arena;
 pub mod table_streams;

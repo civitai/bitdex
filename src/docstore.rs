@@ -1347,6 +1347,11 @@ impl BulkWriter {
             let _ = w.flush();
         }
     }
+
+    /// Get the field name → u16 dictionary index mapping.
+    pub fn field_to_idx(&self) -> &HashMap<String, u16> {
+        &self.field_to_idx
+    }
 }
 
 // ---------------------------------------------------------------------------
