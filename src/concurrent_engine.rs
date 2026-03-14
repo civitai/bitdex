@@ -2824,87 +2824,13 @@ impl ConcurrentEngine {
     /// Execute a query and produce a trace alongside the result.
     /// The trace captures overall timing, per-clause filter metrics (on cache miss),
     /// sort timing, and cache hit/miss status.
+    ///
+    /// Unlike the previous implementation which ran filters twice (once for tracing,
+    /// once for the real result), this threads the trace collector through the real
+    /// query path so timings reflect actual execution.
     pub fn execute_query_traced(&self, query: &BitdexQuery, index_name: &str) -> Result<(QueryResult, QueryTrace)> {
         let mut collector = QueryTraceCollector::new();
-
-        // Time the filter computation separately for clause-level detail.
-        // We build a snapshot + executor just to trace compute_filters,
-        // then run the real execute_query for the full (cache-aware) result.
-        let filter_start = Instant::now();
-        {
-            self.ensure_fields_loaded(
-                &query.filters,
-                query.sort.as_ref().map(|s| s.field.as_str()),
-            )?;
-            let snap = self.snapshot();
-            let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
-            let now_unix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let executor = {
-                let mut base = QueryExecutor::new(
-                    &snap.slots, &snap.filters, &snap.sorts, self.config.max_page_size,
-                );
-                if let Some(ref maps) = self.string_maps {
-                    base = base.with_string_maps(maps);
-                }
-                if let Some(ref cs) = self.case_sensitive_fields {
-                    base = base.with_case_sensitive_fields(cs);
-                }
-                if !self.dictionaries.is_empty() {
-                    base = base.with_dictionaries(&self.dictionaries);
-                }
-                if let Some(ref tb) = tb_guard {
-                    base.with_time_buckets(tb, now_unix)
-                } else {
-                    base
-                }
-            };
-
-            // Snap filters for planning (same logic as resolve_filters)
-            let snapped;
-            let effective_filters = if let Some(ref tb) = tb_guard {
-                let mut managers = std::collections::HashMap::new();
-                managers.insert(tb.field_name().to_string(), &**tb);
-                let ctx = crate::query::BucketSnapContext {
-                    managers: &managers,
-                    now_secs: now_unix,
-                    tolerance_pct: 0.10,
-                    always_snap: true,
-                };
-                snapped = crate::query::snap_range_clauses(&query.filters, &ctx);
-                &snapped[..]
-            } else {
-                &query.filters[..]
-            };
-
-            let planner_ctx = planner::PlannerContext {
-                string_maps: executor.string_maps(),
-                dictionaries: executor.dictionaries(),
-            };
-            let plan = planner::plan_query_with_context(
-                effective_filters, executor.filter_index(), executor.slot_allocator(),
-                Some(&planner_ctx),
-            );
-            // Traced filter computation — records clause metrics into collector
-            let _ = executor.compute_filters_traced(&plan.ordered_clauses, Some(&mut collector));
-        }
-        collector.filter_us = filter_start.elapsed().as_micros() as u64;
-
-        // Run the real execute_query (uses cache, etc.)
-        let sort_start = Instant::now();
-        let result = self.execute_query(query)?;
-        let total_exec_us = sort_start.elapsed().as_micros() as u64;
-
-        // Approximate sort_us: total execution minus the filter time we measured
-        collector.sort_us = total_exec_us.saturating_sub(collector.filter_us);
-
-        // Detect cache hit: if total execution was much faster than our traced filter
-        // computation, the real execute_query likely hit cache
-        if total_exec_us < collector.filter_us / 2 {
-            collector.cache_hit = true;
-        }
+        let result = self.execute_query_with_collector(query, &mut collector)?;
 
         if let Some(sort_clause) = query.sort.as_ref() {
             collector.record_sort(SortTrace {
@@ -2918,6 +2844,584 @@ impl ConcurrentEngine {
 
         let trace = collector.finalize(index_name, result.ids.len() as u64);
         Ok((result, trace))
+    }
+
+    /// Execute a query while recording trace metrics into the collector.
+    /// Mirrors `execute_query` but threads the collector through the real
+    /// cache-aware path so timings are accurate.
+    fn execute_query_with_collector(
+        &self,
+        query: &BitdexQuery,
+        collector: &mut QueryTraceCollector,
+    ) -> Result<QueryResult> {
+        let query_start = std::time::Instant::now();
+
+        // Lazy-load any fields not yet loaded from disk
+        self.ensure_fields_loaded(
+            &query.filters,
+            query.sort.as_ref().map(|s| s.field.as_str()),
+        )?;
+
+        // Lazy-load cached shard from disk if pending
+        if let Some(sort_clause) = query.sort.as_ref() {
+            self.ensure_cache_shard_loaded(&sort_clause.field, sort_clause.direction);
+        }
+
+        let snap = self.snapshot();
+        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let executor = {
+            let mut base = QueryExecutor::new(
+                &snap.slots,
+                &snap.filters,
+                &snap.sorts,
+                self.config.max_page_size,
+            );
+            if let Some(ref maps) = self.string_maps {
+                base = base.with_string_maps(maps);
+            }
+            if let Some(ref cs) = self.case_sensitive_fields {
+                base = base.with_case_sensitive_fields(cs);
+            }
+            if !self.dictionaries.is_empty() {
+                base = base.with_dictionaries(&self.dictionaries);
+            }
+            if let Some(ref tb) = tb_guard {
+                base.with_time_buckets(tb, now_unix)
+            } else {
+                base
+            }
+        };
+
+        // Snap range filters to bucket bitmaps BEFORE cache key
+        let snapped_filters;
+        let effective_filters = if let Some(ref tb) = tb_guard {
+            let mut managers = std::collections::HashMap::new();
+            managers.insert(tb.field_name().to_string(), &**tb);
+            let ctx = crate::query::BucketSnapContext {
+                managers: &managers,
+                now_secs: now_unix,
+                tolerance_pct: 0.10,
+                always_snap: true,
+            };
+            snapped_filters = crate::query::snap_range_clauses(&query.filters, &ctx);
+            &snapped_filters[..]
+        } else {
+            &query.filters[..]
+        };
+
+        // ── Fast path: unified cache hit without expansion ──
+        if let Some(sort_clause) = query.sort.as_ref() {
+            if let Some(clauses) = cache::canonicalize(effective_filters) {
+                let ukey = UnifiedKey {
+                    filter_clauses: clauses,
+                    sort_field: sort_clause.field.clone(),
+                    direction: sort_clause.direction,
+                };
+
+                let cache_data = {
+                    let mut uc = self.unified_cache.lock();
+                    uc.lookup(&ukey).map(|entry| {
+                        let bm = Arc::clone(entry.bitmap());
+                        let has_more = entry.has_more();
+                        let min_val = entry.min_tracked_value();
+                        let cap = entry.capacity();
+                        let total = entry.total_matched();
+                        let radix = entry.radix().cloned();
+                        let direction = entry.direction();
+                        let sorted_keys = entry.sorted_keys().map(Arc::clone);
+                        (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
+                    })
+                };
+
+                if let Some((unified_bm, has_more, min_val, capacity, cached_total, cached_radix, _cached_direction, cached_sorted_keys)) = cache_data {
+                    let needs_expansion = if let Some(cursor) = query.cursor.as_ref() {
+                        let strictly_past = match sort_clause.direction {
+                            crate::query::SortDirection::Desc => cursor.sort_value < min_val as u64,
+                            crate::query::SortDirection::Asc => cursor.sort_value > min_val as u64,
+                        };
+                        if strictly_past {
+                            true
+                        } else if cursor.sort_value == min_val as u64 {
+                            !unified_bm.contains(cursor.slot_id)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !needs_expansion {
+                        // CACHE HIT: record in trace — no filter computation happened
+                        collector.cache_hit = true;
+                        collector.filter_us = 0;
+
+                        let offset = if query.cursor.is_none() {
+                            query.offset.unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let fetch_limit = query.limit.saturating_add(offset);
+
+                        let sort_start = Instant::now();
+
+                        let mut result = if let Some(ref keys) = cached_sorted_keys {
+                            executor.execute_from_sorted_keys(
+                                keys, &sort_clause.field, sort_clause.direction,
+                                fetch_limit, query.cursor.as_ref(), cached_total,
+                            )?
+                        } else if let Some(ref radix) = cached_radix {
+                            executor.execute_from_radix(
+                                radix, sort_clause, fetch_limit,
+                                query.cursor.as_ref(), cached_total,
+                            )?
+                        } else {
+                            let use_simple = unified_bm.len() < 10_000;
+                            executor.execute_from_bitmap(
+                                &unified_bm,
+                                query.sort.as_ref(),
+                                fetch_limit,
+                                query.cursor.as_ref(),
+                                use_simple,
+                            )?
+                        };
+
+                        // Short page from cache = cursor at boundary, need expansion.
+                        if result.ids.len() < fetch_limit && query.cursor.is_some() && has_more {
+                            // Expansion needs filters — trace them
+                            let filter_start = Instant::now();
+                            let (filter_arc, use_simple_sort) = self.resolve_filters_traced(
+                                &executor, effective_filters, tb_guard.as_deref(), now_unix, collector,
+                            )?;
+                            collector.filter_us = filter_start.elapsed().as_micros() as u64;
+                            collector.cache_hit = false; // expansion needed filters
+
+                            let max_cap = self.unified_cache.lock().config().max_capacity;
+                            let expand_limit = max_cap.saturating_sub(capacity);
+                            let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
+                            let expand_result = executor.execute_from_bitmap_unclamped(
+                                &filter_arc, query.sort.as_ref(), expand_limit,
+                                expand_cursor, use_simple_sort,
+                            )?;
+                            if !expand_result.ids.is_empty() {
+                                let sorted_slots: Vec<u32> = expand_result.ids.iter()
+                                    .map(|&id| id as u32).collect();
+                                let sort_field = snap.sorts.get_field(&sort_clause.field);
+                                let value_fn = |slot: u32| -> u32 {
+                                    sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                                };
+                                let mut uc = self.unified_cache.lock();
+                                if let Some(entry) = uc.lookup(&ukey) {
+                                    entry.expand(&sorted_slots, value_fn);
+                                }
+                            }
+                            let expanded_data = {
+                                let mut uc = self.unified_cache.lock();
+                                uc.lookup(&ukey).map(|e| {
+                                    let radix = e.radix().cloned();
+                                    let bm = Arc::clone(e.bitmap());
+                                    (radix, bm)
+                                })
+                            };
+                            if let Some((radix, bm)) = expanded_data {
+                                if let Some(ref r) = radix {
+                                    result = executor.execute_from_radix(
+                                        r, sort_clause, fetch_limit,
+                                        query.cursor.as_ref(), filter_arc.len(),
+                                    )?;
+                                } else {
+                                    result = executor.execute_from_bitmap(
+                                        &bm, query.sort.as_ref(), fetch_limit,
+                                        query.cursor.as_ref(), bm.len() < 10_000,
+                                    )?;
+                                }
+                            }
+                            result.total_matched = filter_arc.len();
+                            collector.sort_us = sort_start.elapsed().as_micros() as u64;
+                            self.post_validate(&mut result, &query.filters, &executor)?;
+                            return Ok(result);
+                        }
+
+                        collector.sort_us = sort_start.elapsed().as_micros() as u64;
+                        result.total_matched = cached_total;
+
+                        // Apply offset
+                        if offset > 0 && !result.ids.is_empty() {
+                            if offset >= result.ids.len() {
+                                result.ids.clear();
+                                result.cursor = None;
+                            } else {
+                                result.ids = result.ids.split_off(offset);
+                                if let Some(&last_id) = result.ids.last() {
+                                    let slot = last_id as u32;
+                                    if let Some(sort_field) = snap.sorts.get_field(&sort_clause.field) {
+                                        result.cursor = Some(crate::query::CursorPosition {
+                                            sort_value: sort_field.reconstruct_value(slot) as u64,
+                                            slot_id: slot,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        self.post_validate(&mut result, &query.filters, &executor)?;
+                        return Ok(result);
+                    }
+
+                    // Expansion needed — fall through to slow path
+                    return self.execute_query_slow_path_traced(
+                        query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix,
+                        Some((ukey, unified_bm, has_more, min_val, capacity, cached_total)),
+                        collector,
+                    );
+                }
+            }
+        }
+
+        // ── Slow path: cache miss or unsorted query ──
+        self.execute_query_slow_path_traced(
+            query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix, None,
+            collector,
+        )
+    }
+
+    /// Slow path for execute_query_with_collector: computes full filter bitmap
+    /// with trace collection. Mirrors `execute_query_slow_path` but uses
+    /// `resolve_filters_traced` for clause-level detail.
+    fn execute_query_slow_path_traced(
+        &self,
+        query: &BitdexQuery,
+        snapped_filters: &[FilterClause],
+        snap: &Arc<InnerEngine>,
+        executor: &QueryExecutor,
+        time_buckets: Option<&TimeBucketManager>,
+        now_unix: u64,
+        cached: Option<(UnifiedKey, Arc<RoaringBitmap>, bool, u32, usize, u64)>,
+        collector: &mut QueryTraceCollector,
+    ) -> Result<QueryResult> {
+        let slow_start = std::time::Instant::now();
+
+        let filter_start = Instant::now();
+        let (filter_arc, use_simple_sort) =
+            self.resolve_filters_traced(executor, snapped_filters, time_buckets, now_unix, collector)?;
+        collector.filter_us = filter_start.elapsed().as_micros() as u64;
+
+        let full_total_matched = filter_arc.len();
+
+        // If we have pre-fetched cache data (expansion case), use it.
+        // Otherwise, do a fresh cache lookup (miss case).
+        let (unified_key, unified_hit) = if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
+            (Some(ukey), Some((bm, has_more, min_val, cap)))
+        } else if let Some(sort_clause) = query.sort.as_ref() {
+            let mut uc = self.unified_cache.lock();
+            let min_size = uc.config().min_filter_size as u64;
+            if full_total_matched >= min_size {
+                if let Some(clauses) = cache::canonicalize(snapped_filters) {
+                    let ukey = UnifiedKey {
+                        filter_clauses: clauses,
+                        sort_field: sort_clause.field.clone(),
+                        direction: sort_clause.direction,
+                    };
+                    let hit = uc.lookup(&ukey).map(|entry| {
+                        let bm = Arc::clone(entry.bitmap());
+                        let has_more = entry.has_more();
+                        let min_val = entry.min_tracked_value();
+                        let cap = entry.capacity();
+                        (bm, has_more, min_val, cap)
+                    });
+                    (Some(ukey), hit)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        let needs_expansion = if let (Some((ref unified_bm, _, min_val, _)), Some(cursor), Some(sort_clause))
+            = (&unified_hit, query.cursor.as_ref(), query.sort.as_ref())
+        {
+            let strictly_past = match sort_clause.direction {
+                crate::query::SortDirection::Desc => cursor.sort_value < *min_val as u64,
+                crate::query::SortDirection::Asc => cursor.sort_value > *min_val as u64,
+            };
+            let at_boundary = cursor.sort_value == *min_val as u64;
+            if strictly_past {
+                true
+            } else if at_boundary {
+                !unified_bm.contains(cursor.slot_id)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let (effective_bitmap, use_simple) = if needs_expansion {
+            if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
+                if *has_more {
+                    let max_cap = self.unified_cache.lock().config().max_capacity;
+                    let expand_limit = max_cap.saturating_sub(*capacity);
+                    let expand_result = executor.execute_from_bitmap_unclamped(
+                        &filter_arc,
+                        query.sort.as_ref(),
+                        expand_limit,
+                        query.cursor.as_ref(),
+                        use_simple_sort,
+                    )?;
+
+                    if !expand_result.ids.is_empty() {
+                        let sorted_slots: Vec<u32> = expand_result.ids.iter()
+                            .map(|&id| id as u32).collect();
+                        let sort_field = snap.sorts.get_field(&ukey.sort_field);
+                        let value_fn = |slot: u32| -> u32 {
+                            sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                        };
+                        let mut uc = self.unified_cache.lock();
+                        if let Some(entry) = uc.lookup(ukey) {
+                            entry.expand(&sorted_slots, value_fn);
+                        }
+                    }
+
+                    let mut uc = self.unified_cache.lock();
+                    if let Some(entry) = uc.lookup(ukey) {
+                        let bm = Arc::clone(entry.bitmap());
+                        let use_simple = bm.len() < 10_000;
+                        (bm, use_simple)
+                    } else {
+                        (Arc::clone(&filter_arc), use_simple_sort)
+                    }
+                } else {
+                    if let Some((ref unified_bm, ..)) = unified_hit {
+                        let use_simple = unified_bm.len() < 10_000;
+                        (Arc::clone(unified_bm), use_simple)
+                    } else {
+                        (Arc::clone(&filter_arc), use_simple_sort)
+                    }
+                }
+            } else {
+                (Arc::clone(&filter_arc), use_simple_sort)
+            }
+        } else if let Some((ref unified_bm, ..)) = unified_hit {
+            let use_simple = unified_bm.len() < 10_000;
+            (Arc::clone(unified_bm), use_simple)
+        } else {
+            (Arc::clone(&filter_arc), use_simple_sort)
+        };
+
+        let offset = if query.cursor.is_none() {
+            query.offset.unwrap_or(0)
+        } else {
+            0
+        };
+        let fetch_limit = query.limit.saturating_add(offset);
+
+        let sort_start = Instant::now();
+
+        // ── Cache miss with sort: seed cache FIRST, serve from cache ──
+        if unified_hit.is_none() && unified_key.is_some() && query.sort.is_some() {
+            let ukey = unified_key.unwrap();
+            let sort_clause = query.sort.as_ref().unwrap();
+
+            if full_total_matched == 0 {
+                let value_fn = |_slot: u32| -> u32 { 0 };
+                self.unified_cache.lock().form_and_store(
+                    ukey,
+                    &[],
+                    false,
+                    full_total_matched,
+                    value_fn,
+                );
+                let mut result = QueryResult {
+                    ids: vec![],
+                    total_matched: full_total_matched,
+                    cursor: None,
+                };
+                collector.sort_us = sort_start.elapsed().as_micros() as u64;
+                self.post_validate(&mut result, &query.filters, executor)?;
+                return Ok(result);
+            }
+
+            let initial_cap = self.unified_cache.lock().config().initial_capacity;
+            let seed_result = executor.execute_from_bitmap_unclamped(
+                &filter_arc,
+                query.sort.as_ref(),
+                initial_cap,
+                None,
+                use_simple_sort,
+            )?;
+            let sort_field = snap.sorts.get_field(&sort_clause.field);
+            let sorted_slots: Vec<u32> = seed_result.ids.iter().map(|&id| id as u32).collect();
+            let has_more = full_total_matched > sorted_slots.len() as u64;
+            let value_fn = |slot: u32| -> u32 {
+                sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+            };
+            self.unified_cache.lock().form_and_store(
+                ukey.clone(),
+                &sorted_slots,
+                has_more,
+                full_total_matched,
+                value_fn,
+            );
+
+            let cached_keys = {
+                let mut uc = self.unified_cache.lock();
+                uc.lookup(&ukey).and_then(|entry| entry.sorted_keys().map(Arc::clone))
+            };
+
+            let mut result = if let Some(ref keys) = cached_keys {
+                executor.execute_from_sorted_keys(
+                    keys, &sort_clause.field, sort_clause.direction,
+                    fetch_limit, query.cursor.as_ref(), full_total_matched,
+                )?
+            } else {
+                let cached_bm = {
+                    let mut uc = self.unified_cache.lock();
+                    uc.lookup(&ukey).map(|entry| Arc::clone(entry.bitmap()))
+                };
+                if let Some(ref bm) = cached_bm {
+                    let use_simple = bm.len() < 10_000;
+                    executor.execute_from_bitmap(
+                        bm, query.sort.as_ref(), fetch_limit,
+                        query.cursor.as_ref(), use_simple,
+                    )?
+                } else {
+                    executor.execute_from_bitmap(
+                        &filter_arc, query.sort.as_ref(), fetch_limit,
+                        query.cursor.as_ref(), use_simple_sort,
+                    )?
+                }
+            };
+
+            result.total_matched = full_total_matched;
+
+            // Apply offset
+            if offset > 0 && !result.ids.is_empty() {
+                if offset >= result.ids.len() {
+                    result.ids.clear();
+                    result.cursor = None;
+                } else {
+                    result.ids = result.ids.split_off(offset);
+                    if let Some(&last_id) = result.ids.last() {
+                        let slot = last_id as u32;
+                        if let Some(sort_field_ref) = snap.sorts.get_field(&sort_clause.field) {
+                            result.cursor = Some(crate::query::CursorPosition {
+                                sort_value: sort_field_ref.reconstruct_value(slot) as u64,
+                                slot_id: slot,
+                            });
+                        }
+                    }
+                }
+            }
+
+            collector.sort_us = sort_start.elapsed().as_micros() as u64;
+            self.post_validate(&mut result, &query.filters, executor)?;
+            return Ok(result);
+        }
+
+        // ── Cache hit or unsorted query path ──
+        let bound_was_applied = effective_bitmap.len() < filter_arc.len();
+        let mut result = executor.execute_from_bitmap(
+            &effective_bitmap,
+            query.sort.as_ref(),
+            fetch_limit,
+            query.cursor.as_ref(),
+            use_simple,
+        )?;
+
+        // Bound exhaustion: expand if needed
+        if result.ids.len() < fetch_limit && query.cursor.is_some() && bound_was_applied {
+            let did_expand = if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
+                if *has_more {
+                    let max_cap = self.unified_cache.lock().config().max_capacity;
+                    let expand_limit = max_cap.saturating_sub(*capacity);
+                    let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
+                    let expand_result = executor.execute_from_bitmap_unclamped(
+                        &filter_arc,
+                        query.sort.as_ref(),
+                        expand_limit,
+                        expand_cursor,
+                        use_simple_sort,
+                    )?;
+                    if !expand_result.ids.is_empty() {
+                        let sorted_slots: Vec<u32> = expand_result.ids.iter()
+                            .map(|&id| id as u32).collect();
+                        let sort_field = snap.sorts.get_field(&ukey.sort_field);
+                        let value_fn = |slot: u32| -> u32 {
+                            sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                        };
+                        let mut uc = self.unified_cache.lock();
+                        if let Some(entry) = uc.lookup(ukey) {
+                            entry.expand(&sorted_slots, value_fn);
+                        }
+                    }
+                    true
+                } else { false }
+            } else { false };
+
+            let re_data = if did_expand {
+                if let Some(ref ukey) = unified_key {
+                    let mut uc = self.unified_cache.lock();
+                    uc.lookup(ukey).map(|e| {
+                        let radix = e.radix().cloned();
+                        let bm = Arc::clone(e.bitmap());
+                        (radix, bm)
+                    })
+                } else { None }
+            } else { None };
+            if let Some(sort_clause) = query.sort.as_ref() {
+                if let Some((radix, bm)) = re_data {
+                    if let Some(ref r) = radix {
+                        result = executor.execute_from_radix(
+                            r, sort_clause, fetch_limit,
+                            query.cursor.as_ref(), full_total_matched,
+                        )?;
+                    } else {
+                        result = executor.execute_from_bitmap(
+                            &bm, query.sort.as_ref(), fetch_limit,
+                            query.cursor.as_ref(), bm.len() < 10_000,
+                        )?;
+                    }
+                } else {
+                    result = executor.execute_from_bitmap(
+                        filter_arc.as_ref(), query.sort.as_ref(), fetch_limit,
+                        query.cursor.as_ref(), false,
+                    )?;
+                }
+            }
+        }
+
+        result.total_matched = full_total_matched;
+
+        // Apply offset
+        if offset > 0 && !result.ids.is_empty() {
+            if offset >= result.ids.len() {
+                result.ids.clear();
+                result.cursor = None;
+            } else {
+                result.ids = result.ids.split_off(offset);
+                if let Some(sort_clause) = query.sort.as_ref() {
+                    if let Some(&last_id) = result.ids.last() {
+                        let slot = last_id as u32;
+                        if let Some(sort_field) = snap.sorts.get_field(&sort_clause.field) {
+                            result.cursor = Some(crate::query::CursorPosition {
+                                sort_value: sort_field.reconstruct_value(slot) as u64,
+                                slot_id: slot,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        collector.sort_us = sort_start.elapsed().as_micros() as u64;
+        self.post_validate(&mut result, &query.filters, executor)?;
+        Ok(result)
     }
 
     /// Slow path for execute_query: computes full filter bitmap.
@@ -3277,6 +3781,41 @@ impl ConcurrentEngine {
 
         self.post_validate(&mut result, &query.filters, executor)?;
         Ok(result)
+    }
+
+    /// Like `resolve_filters`, but records per-clause metrics into a trace collector.
+    fn resolve_filters_traced(
+        &self,
+        executor: &QueryExecutor,
+        filters: &[FilterClause],
+        time_buckets: Option<&TimeBucketManager>,
+        now_unix: u64,
+        collector: &mut QueryTraceCollector,
+    ) -> Result<(Arc<roaring::RoaringBitmap>, bool)> {
+        let snapped;
+        let effective_filters = if let Some(tb) = time_buckets {
+            let mut managers = std::collections::HashMap::new();
+            managers.insert(tb.field_name().to_string(), tb);
+            let ctx = crate::query::BucketSnapContext {
+                managers: &managers,
+                now_secs: now_unix,
+                tolerance_pct: 0.10,
+                always_snap: true,
+            };
+            snapped = crate::query::snap_range_clauses(filters, &ctx);
+            &snapped[..]
+        } else {
+            filters
+        };
+
+        let planner_ctx = planner::PlannerContext {
+            string_maps: executor.string_maps(),
+            dictionaries: executor.dictionaries(),
+        };
+        let plan = planner::plan_query_with_context(effective_filters, executor.filter_index(), executor.slot_allocator(), Some(&planner_ctx));
+        let filter_bitmap = Arc::new(executor.compute_filters_traced(&plan.ordered_clauses, Some(collector))?);
+
+        Ok((filter_bitmap, plan.use_simple_sort))
     }
 
     /// Resolve filter clauses to a bitmap.
