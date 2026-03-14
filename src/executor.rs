@@ -385,7 +385,97 @@ impl<'a> QueryExecutor<'a> {
                 *acc &= bitmap.as_ref();
                 Some(Ok(()))
             }
-            _ => None, // Can't fast-path compound/Not/range clauses
+            FilterClause::Not(inner) => {
+                // Not(inner) with accumulator: acc -= (acc & inner)
+                // Evaluates inner only against the accumulator, not the full universe.
+                match self.evaluate_clause_with_candidates(inner, acc) {
+                    Ok(inner_hits) => {
+                        *acc -= &inner_hits;
+                        Some(Ok(()))
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            FilterClause::NotEq(field, value) => {
+                if field == "id" { return None; }
+                if let Some(ff) = self.filters.get_field(field) {
+                    if let Some(key) = self.resolve_value_key(field, value) {
+                        if let Some(vb) = ff.get_versioned(key) {
+                            *acc -= vb.fused_cow().as_ref();
+                            return Some(Ok(()));
+                        }
+                    }
+                }
+                None
+            }
+            FilterClause::NotIn(field, values) => {
+                if field == "id" { return None; }
+                if let Some(ff) = self.filters.get_field(field) {
+                    for v in values {
+                        if let Some(key) = self.resolve_value_key(field, v) {
+                            if let Some(vb) = ff.get_versioned(key) {
+                                *acc -= vb.fused_cow().as_ref();
+                            }
+                        }
+                    }
+                    return Some(Ok(()));
+                }
+                None
+            }
+            _ => None, // Can't fast-path range clauses
+        }
+    }
+
+    /// Evaluate a clause narrowed to a candidate set.
+    /// Returns only the slots in `candidates` that match the clause.
+    fn evaluate_clause_with_candidates(&self, clause: &FilterClause, candidates: &RoaringBitmap) -> Result<RoaringBitmap> {
+        match clause {
+            FilterClause::Eq(field, value) => {
+                if let Some(ff) = self.filters.get_field(field) {
+                    if let Some(key) = self.resolve_value_key(field, value) {
+                        if let Some(vb) = ff.get_versioned(key) {
+                            return Ok(candidates & vb.fused_cow().as_ref());
+                        }
+                    }
+                    return Ok(RoaringBitmap::new());
+                }
+                let full = self.evaluate_clause(clause)?;
+                Ok(candidates & &full)
+            }
+            FilterClause::In(field, values) => {
+                if let Some(ff) = self.filters.get_field(field) {
+                    let mut result = RoaringBitmap::new();
+                    for v in values {
+                        if let Some(key) = self.resolve_value_key(field, v) {
+                            if let Some(vb) = ff.get_versioned(key) {
+                                result |= candidates & vb.fused_cow().as_ref();
+                            }
+                        }
+                    }
+                    return Ok(result);
+                }
+                let full = self.evaluate_clause(clause)?;
+                Ok(candidates & &full)
+            }
+            FilterClause::And(inner) => {
+                let mut result = candidates.clone();
+                for c in inner {
+                    result = self.evaluate_clause_with_candidates(c, &result)?;
+                    if result.is_empty() { break; }
+                }
+                Ok(result)
+            }
+            FilterClause::Or(inner) => {
+                let mut result = RoaringBitmap::new();
+                for c in inner {
+                    result |= self.evaluate_clause_with_candidates(c, candidates)?;
+                }
+                Ok(result)
+            }
+            _ => {
+                let full = self.evaluate_clause(clause)?;
+                Ok(candidates & &full)
+            }
         }
     }
 
