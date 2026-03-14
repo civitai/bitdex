@@ -265,6 +265,59 @@ pub(crate) async fn stream_images_copy(
 }
 
 // ---------------------------------------------------------------------------
+// Public bitmap builder for use from bulk_loader (file-based Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Build filter and sort bitmaps for a single image row.
+/// Called from bulk_loader when building from local CSV files.
+pub(crate) fn build_image_bitmaps(
+    row: &CopyImageRow,
+    slot: u32,
+    sort_at: u64,
+    schema: &DataSchema,
+    filter_set: &HashSet<String>,
+    sort_bits: &HashMap<String, u8>,
+    filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
+    sort_maps: &mut HashMap<String, HashMap<usize, RoaringBitmap>>,
+) {
+    let published_at_secs = row.published_at_secs.unwrap_or(0);
+
+    // Filter bitmaps
+    if filter_set.contains("nsfwLevel") { insert_filter(filter_maps, "nsfwLevel", row.nsfw_level as u64, slot); }
+    if filter_set.contains("userId") { insert_filter(filter_maps, "userId", row.user_id as u64, slot); }
+    if filter_set.contains("type") {
+        let key = lookup_string_map(&resolve_string_map(schema, "type"), &row.image_type);
+        insert_filter(filter_maps, "type", key, slot);
+    }
+    if filter_set.contains("availability") {
+        let key = lookup_string_map(&resolve_string_map(schema, "availability"), &row.availability);
+        insert_filter(filter_maps, "availability", key, slot);
+    }
+    if filter_set.contains("blockedFor") {
+        if let Some(ref bf) = row.blocked_for {
+            let key = lookup_string_map(&resolve_string_map(schema, "blockedFor"), bf);
+            insert_filter(filter_maps, "blockedFor", key, slot);
+        }
+    }
+    if filter_set.contains("postId") { insert_filter(filter_maps, "postId", row.post_id.unwrap_or(0) as u64, slot); }
+    if filter_set.contains("postedToId") { insert_filter(filter_maps, "postedToId", row.posted_to_id.unwrap_or(0) as u64, slot); }
+    if filter_set.contains("hasMeta") { insert_filter(filter_maps, "hasMeta", if row.has_meta() { 1 } else { 0 }, slot); }
+    if filter_set.contains("onSite") { insert_filter(filter_maps, "onSite", if row.on_site() { 1 } else { 0 }, slot); }
+    if filter_set.contains("poi") { insert_filter(filter_maps, "poi", if row.poi() { 1 } else { 0 }, slot); }
+    if filter_set.contains("minor") { insert_filter(filter_maps, "minor", if row.minor() { 1 } else { 0 }, slot); }
+    if filter_set.contains("isPublished") { insert_filter(filter_maps, "isPublished", if published_at_secs != 0 { 1 } else { 0 }, slot); }
+    if filter_set.contains("isRemix") { insert_filter(filter_maps, "isRemix", 0, slot); }
+
+    // Sort bitmaps
+    if let Some(&bits) = sort_bits.get("sortAt") { insert_sort_bits(sort_maps, "sortAt", sort_at as u32, bits, slot); }
+    if let Some(&bits) = sort_bits.get("publishedAt") { insert_sort_bits(sort_maps, "publishedAt", published_at_secs.max(0) as u32, bits, slot); }
+    if let Some(&bits) = sort_bits.get("reactionCount") { insert_sort_bits(sort_maps, "reactionCount", 0, bits, slot); }
+    if let Some(&bits) = sort_bits.get("commentCount") { insert_sort_bits(sort_maps, "commentCount", 0, bits, slot); }
+    if let Some(&bits) = sort_bits.get("collectedCount") { insert_sort_bits(sort_maps, "collectedCount", 0, bits, slot); }
+    if let Some(&bits) = sort_bits.get("id") { insert_sort_bits(sort_maps, "id", slot, bits, slot); }
+}
+
+// ---------------------------------------------------------------------------
 // Direct bitmap helpers (no JSON allocation)
 // ---------------------------------------------------------------------------
 
