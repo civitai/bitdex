@@ -26,12 +26,9 @@
 import { spawn, execSync } from 'node:child_process';
 import { resolve, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, readFileSync } from 'node:fs';
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const DAEMON_SCRIPT = resolve(__dirname, 'daemon.mjs');
-const PID_FILE = resolve(__dirname, 'state', 'daemon.pid');
 const PROJECT_ROOT = resolve(__dirname, '..', '..', '..');
 const DAEMON_URL = 'http://127.0.0.1:9851';
 
@@ -73,16 +70,7 @@ async function isDaemonRunning() {
 async function ensureDaemon() {
   if (await isDaemonRunning()) return true;
 
-  // Check stale PID file
-  if (existsSync(PID_FILE)) {
-    try {
-      const pid = JSON.parse(readFileSync(PID_FILE, 'utf8'));
-      // PID file exists but daemon not responding — it's stale
-    } catch { /* corrupt PID file */ }
-  }
-
   // Start daemon — detached, no console window, no stdio
-  // (matches ai-notifications pattern: process.execPath, no shell)
   const child = spawn(process.execPath, [DAEMON_SCRIPT], {
     detached: true,
     stdio: 'ignore',

@@ -6,7 +6,7 @@
  * Manages server instances, datasets, build locks, and E2E test locks.
  *
  * Port: 9851 (one above ai-notifications at 9850)
- * State: persisted to state/*.json, survives daemon restarts
+ * State: pure in-memory, no persistence across restarts
  */
 
 import http from 'node:http';
@@ -14,17 +14,15 @@ import { spawn, execSync } from 'node:child_process';
 import { resolve, dirname, basename, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  mkdirSync, writeFileSync, readFileSync, existsSync,
-  readdirSync, statSync, renameSync, unlinkSync,
-  createWriteStream, copyFileSync,
+  mkdirSync, existsSync,
+  readdirSync, statSync, unlinkSync,
+  copyFileSync,
 } from 'node:fs';
 import net from 'node:net';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PROJECT_ROOT = resolve(__dirname, '..', '..', '..');
-const STATE_DIR = resolve(__dirname, 'state');
-const LOGS_DIR = resolve(STATE_DIR, 'logs');
 
 const DAEMON_PORT = 9851;
 const MAX_LOG_LINES = 1000;
@@ -51,74 +49,6 @@ let daemonStartedAt = new Date().toISOString();
 // Per-instance log ring buffers (in-memory for fast TUI access)
 let logBuffers = new Map();   // instanceId → { lines: [], globalIndex: 0 }
 let globalLogIndex = 0;
-
-// ─── State Persistence ──────────────────────────────────────────
-
-function ensureDirs() {
-  mkdirSync(STATE_DIR, { recursive: true });
-  mkdirSync(LOGS_DIR, { recursive: true });
-}
-
-function atomicWrite(filePath, data) {
-  const tmp = filePath + '.tmp';
-  writeFileSync(tmp, JSON.stringify(data, null, 2));
-  renameSync(tmp, filePath);
-}
-
-function loadState() {
-  try {
-    const inst = JSON.parse(readFileSync(resolve(STATE_DIR, 'instances.json'), 'utf8'));
-    for (const i of inst) instances.set(i.id, { ...i, process: null });
-  } catch { /* first run */ }
-
-  try {
-    const ds = JSON.parse(readFileSync(resolve(STATE_DIR, 'datasets.json'), 'utf8'));
-    for (const d of ds) datasets.set(d.path, d);
-  } catch { /* first run */ }
-
-  try {
-    const bl = JSON.parse(readFileSync(resolve(STATE_DIR, 'builds.json'), 'utf8'));
-    if (bl.holder) buildLock = bl;
-  } catch { /* first run */ }
-
-  try {
-    const el = JSON.parse(readFileSync(resolve(STATE_DIR, 'e2e.json'), 'utf8'));
-    if (el.holder) e2eLock = el;
-  } catch { /* first run */ }
-}
-
-function saveInstances() {
-  const data = [...instances.values()].map(({ process, ...rest }) => rest);
-  atomicWrite(resolve(STATE_DIR, 'instances.json'), data);
-}
-
-function saveDatasets() {
-  atomicWrite(resolve(STATE_DIR, 'datasets.json'), [...datasets.values()]);
-}
-
-function saveBuildLock() {
-  // Don't persist process handle or log buffer — they're in-memory only
-  const { process: _, logBuffer: __, ...rest } = buildLock;
-  atomicWrite(resolve(STATE_DIR, 'builds.json'), rest);
-}
-
-function saveE2eLock() {
-  atomicWrite(resolve(STATE_DIR, 'e2e.json'), e2eLock);
-}
-
-// ─── PID File ───────────────────────────────────────────────────
-
-function writePidFile() {
-  atomicWrite(resolve(STATE_DIR, 'daemon.pid'), {
-    pid: process.pid,
-    port: DAEMON_PORT,
-    startedAt: daemonStartedAt,
-  });
-}
-
-function removePidFile() {
-  try { unlinkSync(resolve(STATE_DIR, 'daemon.pid')); } catch { /* ok */ }
-}
 
 // ─── Process Utilities ──────────────────────────────────────────
 
@@ -196,21 +126,6 @@ function createShadowCopy(binaryPath) {
 function cleanShadowCopy(binaryPath) {
   const active = activePath(binaryPath);
   try { unlinkSync(active); } catch { /* already gone or locked */ }
-}
-
-function cleanStaleShadowCopies() {
-  // On daemon startup, clean up any .active files from previous runs
-  const dirs = ['target/fast', 'target/release'].map(d => resolve(PROJECT_ROOT, d));
-  for (const dir of dirs) {
-    if (!existsSync(dir)) continue;
-    try {
-      for (const entry of readdirSync(dir)) {
-        if (entry.includes('.active')) {
-          try { unlinkSync(resolve(dir, entry)); } catch { /* in use */ }
-        }
-      }
-    } catch { /* ok */ }
-  }
 }
 
 // ─── Port Utilities ─────────────────────────────────────────────
@@ -328,7 +243,6 @@ async function waitForHealthAndUpdate(instance, port, dataDir, id) {
     instance.status = 'error';
     pushLog(id, 'daemon', 'Server did not become ready within 60s');
   }
-  saveInstances();
 }
 
 async function startInstance({ port, dataDir, worktree, binary, name } = {}) {
@@ -356,9 +270,6 @@ async function startInstance({ port, dataDir, worktree, binary, name } = {}) {
 
   // Reserve the port
   portReservations.set(resolvedPort, { reservedAt: new Date().toISOString(), reservedBy: wt });
-
-  const logFile = resolve(LOGS_DIR, `${id}.log`);
-  const logStream = createWriteStream(logFile, { flags: 'a' });
 
   // Shadow copy: run from .active so cargo builds don't lock the original
   let runBinary;
@@ -397,19 +308,15 @@ async function startInstance({ port, dataDir, worktree, binary, name } = {}) {
 
   instances.set(id, instance);
 
-  // Wire stdout/stderr to logs
+  // Wire stdout/stderr to in-memory log ring buffer
   proc.stdout.on('data', (data) => {
-    const text = data.toString();
-    logStream.write(`[stdout] ${text}`);
-    for (const line of text.split('\n').filter(Boolean)) {
+    for (const line of data.toString().split('\n').filter(Boolean)) {
       pushLog(id, 'stdout', line);
     }
   });
 
   proc.stderr.on('data', (data) => {
-    const text = data.toString();
-    logStream.write(`[stderr] ${text}`);
-    for (const line of text.split('\n').filter(Boolean)) {
+    for (const line of data.toString().split('\n').filter(Boolean)) {
       pushLog(id, 'stderr', line);
     }
   });
@@ -418,7 +325,6 @@ async function startInstance({ port, dataDir, worktree, binary, name } = {}) {
     pushLog(id, 'daemon', `Process error: ${err.message}`);
     instance.status = 'error';
     instance.process = null;
-    saveInstances();
   });
 
   proc.on('exit', (code, signal) => {
@@ -426,16 +332,14 @@ async function startInstance({ port, dataDir, worktree, binary, name } = {}) {
     instance.status = 'stopped';
     instance.exitCode = code;
     instance.process = null;
-    logStream.end();
     portReservations.delete(resolvedPort);
     // Clean up shadow copy
     if (instance.activeBinary && instance.activeBinary !== instance.binary) {
       cleanShadowCopy(instance.binary);
     }
-    saveInstances();
   });
 
-  saveInstances();
+
 
   // Wait for health async — don't block the HTTP response
   waitForHealthAndUpdate(instance, resolvedPort, resolvedDataDir, id);
@@ -468,10 +372,10 @@ async function stopInstance(idOrPort) {
     const ds = datasets.get(instance.dataDir);
     ds.ownedBy = null;
     ds.lastUsed = new Date().toISOString();
-    saveDatasets();
+  
   }
 
-  saveInstances();
+
   return { stopped: instance.id };
 }
 
@@ -505,7 +409,7 @@ function registerDataset(dataDir, { indexName, recordCount, loadedFrom, ownedBy,
     lastUsed: new Date().toISOString(),
     ownedBy: ownedBy || existing.ownedBy || null,
   });
-  saveDatasets();
+
 }
 
 function getDirSize(dir) {
@@ -664,7 +568,7 @@ async function requestBuild({ target, profile, holder }) {
 
   // Clear logs for fresh build
   buildLock.logBuffer = [];
-  saveBuildLock();
+
 
   const cargoArgs = buildCargoArgs(tgt, profile);
   pushBuildLog('daemon', `Building: cargo ${cargoArgs.join(' ')}`);
@@ -706,7 +610,7 @@ async function requestBuild({ target, profile, holder }) {
     const savedLogs = buildLock.logBuffer;
     const savedExit = buildLock.exitCode;
     buildLock = { holder: null, target: null, startedAt: null, pid: null, targetDir: null, logBuffer: savedLogs, exitCode: savedExit, process: null };
-    saveBuildLock();
+  
   });
 
   proc.on('error', (err) => {
@@ -721,7 +625,7 @@ async function requestBuild({ target, profile, holder }) {
 function releaseBuildLock() {
   const savedLogs = buildLock.logBuffer;
   buildLock = { holder: null, target: null, startedAt: null, pid: null, targetDir: null, logBuffer: savedLogs || [], exitCode: null, process: null };
-  saveBuildLock();
+
   return { released: true };
 }
 
@@ -748,13 +652,13 @@ function acquireE2eLock({ holder, pid }) {
     startedAt: new Date().toISOString(),
     pid: pid || null,
   };
-  saveE2eLock();
+
   return { granted: true };
 }
 
 function releaseE2eLock() {
   e2eLock = { holder: null, startedAt: null, pid: null };
-  saveE2eLock();
+
   return { released: true };
 }
 
@@ -820,9 +724,9 @@ function heartbeat() {
         portReservations.delete(inst.port);
         if (datasets.has(inst.dataDir)) {
           datasets.get(inst.dataDir).ownedBy = null;
-          saveDatasets();
+        
         }
-        saveInstances();
+      
       }
     }
   }
@@ -888,7 +792,7 @@ function forceKillByName() {
       pushLog(id, 'daemon', 'Force-killed');
     }
   }
-  saveInstances();
+
 
   return { killed, message: `Force-killed all bitdex-server processes (${killed.join(', ') || 'none found'})` };
 }
@@ -1114,25 +1018,8 @@ async function handleRequest(req, res) {
 // ─── Startup ────────────────────────────────────────────────────
 
 async function main() {
-  ensureDirs();
-  loadState();
-  cleanStaleShadowCopies();
-
-  // Verify loaded instances are still alive
-  for (const [id, inst] of instances) {
-    if (inst.status !== 'stopped' && !isPidAlive(inst.pid)) {
-      inst.status = 'stopped';
-      inst.process = null;
-    }
-  }
-  saveInstances();
-
-  // Scan for existing datasets
+  // Scan for existing datasets on disk
   scanForDatasets();
-
-  // Verify loaded locks
-  if (buildLock.holder && !isPidAlive(buildLock.pid)) releaseBuildLock();
-  if (e2eLock.holder && !isPidAlive(e2eLock.pid)) releaseE2eLock();
 
   const server = http.createServer(handleRequest);
 
@@ -1146,22 +1033,11 @@ async function main() {
   });
 
   server.listen(DAEMON_PORT, '127.0.0.1', () => {
-    writePidFile();
     console.log(`BitDex dev-server daemon running on port ${DAEMON_PORT} (PID ${process.pid})`);
   });
 
   // Heartbeat
   setInterval(heartbeat, HEARTBEAT_INTERVAL);
-
-  // Cleanup on exit
-  const cleanup = () => {
-    removePidFile();
-    // Don't kill instances on daemon exit — they're independent processes
-  };
-
-  process.on('SIGINT', () => { cleanup(); process.exit(0); });
-  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
-  process.on('exit', cleanup);
 }
 
 main().catch(err => {
