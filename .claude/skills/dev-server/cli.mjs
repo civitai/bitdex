@@ -431,6 +431,71 @@ function pad(str, w) {
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 function stripAnsi(s) { return s.replace(ANSI_RE, ''); }
 
+// ─── Log Formatter Pipeline ─────────────────────────────────────
+// Each formatter: { match: RegExp, format: (match, maxW) => string }
+// First match wins. Formatters operate on the body AFTER tracing prefix is stripped.
+const MAG = '\x1b[35m';
+const WHT = '\x1b[37m';
+const BLU = '\x1b[34m';
+
+const LOG_FORMATTERS = [
+  // Query result: "  → 4000 results, 16μs"
+  {
+    match: /^\s*→\s*(\d[\d,]*)\s+results?,\s*(.+)$/,
+    format: (m, w) => `  ${GRN}→${R} ${WHT}${m[1]}${R} results, ${CYN}${m[2]}${R}`,
+  },
+  // Query: "WHERE ... ORDER BY ... LIMIT ..."
+  {
+    match: /^(WHERE\s+.+)$/,
+    format: (m, w) => {
+      let q = m[1];
+      // Color SQL-like keywords
+      q = q.replace(/\b(WHERE|AND|OR|NOT|IN|ORDER BY|LIMIT|CURSOR)\b/g, `${MAG}$1${R}`);
+      // Color operators
+      q = q.replace(/([><=!]+)/g, `${DIM}$1${R}`);
+      // Color field names before operators
+      q = q.replace(/\b(nsfwLevel|userId|baseModel|isPublished|type|sortAtUnix|collectedCount|reactionCount|sortAt)\b/g, `${BLU}$1${R}`);
+      // Color sort direction
+      q = q.replace(/\b(Asc|Desc)\b/g, `${YLW}$1${R}`);
+      return q;
+    },
+  },
+  // Lazy load: "Lazy-loaded filter 'nsfwLevel': 7 values in 49.7ms"
+  {
+    match: /^Lazy-loaded\s+(filter|sort)\s+'([^']+)':\s*(.+)$/,
+    format: (m, w) => `${DIM}lazy${R} ${BLU}${m[2]}${R} ${DIM}(${m[1]})${R} ${m[3]}`,
+  },
+  // Restored index: "Restored index 'civitai' from disk (105335773 records)"
+  {
+    match: /^Restored index '([^']+)' from disk \((\d+) records\)$/,
+    format: (m, w) => `${GRN}✓${R} Restored ${WHT}${m[1]}${R} — ${CYN}${(parseInt(m[2])/1e6).toFixed(1)}M${R} records`,
+  },
+  // Server listening: "BitDex server listening on http://..."
+  {
+    match: /^BitDex server listening on (.+)$/,
+    format: (m, w) => `${GRN}✓${R} Listening on ${CYN}${m[1]}${R}`,
+  },
+  // Existence set: "Existence set for 'modelVersionIds': 477324 keys"
+  {
+    match: /^Existence set for '([^']+)':\s*(\d+)\s*keys$/,
+    format: (m, w) => `${DIM}existence${R} ${BLU}${m[1]}${R} ${DIM}${parseInt(m[2]).toLocaleString()} keys${R}`,
+  },
+];
+
+function formatLogBody(body, maxW) {
+  for (const fmt of LOG_FORMATTERS) {
+    const m = body.match(fmt.match);
+    if (m) {
+      const result = fmt.format(m, maxW);
+      // Strip ANSI for length check, truncate visible content
+      const vis = result.replace(ANSI_RE, '');
+      return vis.length > maxW ? result.slice(0, result.length - (vis.length - maxW)) : result;
+    }
+  }
+  // No formatter matched — return plain, truncated
+  return body.length > maxW ? body.slice(0, maxW) : body;
+}
+
 function trunc(str, n) {
   return str.length <= n ? str : str.slice(0, n - 1) + '…';
 }
@@ -461,6 +526,7 @@ async function cmdDashboard() {
   let actionMsg = '';
   let inputMode = null;  // null or { prompt, buffer, callback }
   let showStats = false; // 'i' toggles detailed stats panel
+  let logScroll = 0;    // 0 = live tail, >0 = scrolled up N lines from bottom
 
   function flash(msg) { actionMsg = msg; setTimeout(() => { actionMsg = ''; }, 4000); }
 
@@ -551,24 +617,49 @@ async function cmdDashboard() {
     // ── Log separator
     const logTarget = selectedInstance || (status.instances[0]?.id) || null;
     const logLabel = logTarget || '(no instance)';
-    const sep = `── logs: ${logLabel} `;
-    buf.push(CLR_LINE + DIM + sep + '─'.repeat(Math.max(0, cols - sep.length)) + R + '\n');
+    const scrollLabel = logScroll > 0 ? ` ${YLW}↑ scroll +${logScroll}${R} ` : ' ';
+    const sep = `── logs: ${logLabel}${scrollLabel}`;
+    const sepVis = sep.replace(/\x1b\[[0-9;]*m/g, '');
+    buf.push(CLR_LINE + DIM + sep + '─'.repeat(Math.max(0, cols - sepVis.length)) + R + '\n');
 
-    // ── Log area (fixed row count, matches ai-notifications pattern)
+    // ── Log area with scroll support
     const HEADER_ROWS = showStats ? 18 : 12;
     const FOOTER_ROWS = 2;
     const logAreaRows = Math.max(1, rows - HEADER_ROWS - FOOTER_ROWS);
-    const visible = logLines.slice(-logAreaRows);
+    const endIdx = logLines.length - logScroll;
+    const startIdx = Math.max(0, endIdx - logAreaRows);
+    const visible = logLines.slice(startIdx, endIdx);
 
     for (let i = 0; i < logAreaRows; i++) {
       const entry = visible[i];
       if (entry) {
-        const ts = new Date(entry.timestamp).toLocaleTimeString('en-US', { hour12: false });
-        const rawMsg = stripAnsi(entry.message || '');
-        const isErr = /\berror\b|\bpanic\b|\bfailed\b|\bFATAL\b/i.test(rawMsg);
-        const lvl = isErr ? `${RED}ERR${R}` : '   ';
-        const msgMax = cols - 16;
-        const msg = rawMsg.length > msgMax ? rawMsg.slice(0, msgMax) : rawMsg;
+        const raw = stripAnsi(entry.message || '');
+        // Parse tracing format: "2026-03-14T07:15:17.512198Z  INFO [civitai] message..."
+        const tracingMatch = raw.match(/^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})\.\d+Z\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(?:\[([^\]]+)\]\s+)?(.*)$/);
+        let ts, lvlStr, body;
+        if (tracingMatch) {
+          ts = tracingMatch[1];
+          lvlStr = tracingMatch[2];
+          body = tracingMatch[4];
+        } else {
+          // Non-tracing line (daemon messages, plain stderr)
+          ts = new Date(entry.timestamp).toLocaleTimeString('en-US', { hour12: false });
+          lvlStr = entry.level === 'daemon' ? 'DAE' : '';
+          body = raw;
+        }
+        // Color the level
+        let lvl;
+        switch (lvlStr) {
+          case 'ERROR': lvl = `${RED}ERR${R}`; break;
+          case 'WARN':  lvl = `${YLW}WRN${R}`; break;
+          case 'INFO':  lvl = `${GRN}INF${R}`; break;
+          case 'DEBUG': lvl = `${DIM}DBG${R}`; break;
+          case 'TRACE': lvl = `${DIM}TRC${R}`; break;
+          case 'DAE':   lvl = `${CYN}DAE${R}`; break;
+          default:      lvl = '   ';
+        }
+        const msgMax = cols - 14;
+        const msg = formatLogBody(body, msgMax);
         buf.push(CLR_LINE + `  ${DIM}${ts}${R} ${lvl} ${msg}` + '\n');
       } else {
         buf.push(CLR_LINE + '\n');
@@ -580,7 +671,7 @@ async function cmdDashboard() {
     if (actionMsg) {
       buf.push(CLR_LINE + ` ${YLW}${actionMsg}${R}` + CLR_BELOW);
     } else {
-      buf.push(CLR_LINE + `  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill all${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
+      buf.push(CLR_LINE + `  ${DIM}↑↓${R} scroll  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
     }
 
     write(buf.join(''));
@@ -618,7 +709,32 @@ async function cmdDashboard() {
       return;
     }
 
-    // Ignore multi-byte escape sequences (arrow keys etc.)
+    // Arrow keys for log scrolling
+    if (key === '\x1b[A') { // Up arrow
+      logScroll = Math.min(logScroll + 3, Math.max(0, logLines.length - 5));
+      return;
+    }
+    if (key === '\x1b[B') { // Down arrow
+      logScroll = Math.max(0, logScroll - 3);
+      return;
+    }
+    if (key === '\x1b[5~') { // Page Up
+      logScroll = Math.min(logScroll + 20, Math.max(0, logLines.length - 5));
+      return;
+    }
+    if (key === '\x1b[6~') { // Page Down
+      logScroll = Math.max(0, logScroll - 20);
+      return;
+    }
+    if (key === '\x1b[F' || key === '\x1b[4~') { // End key
+      logScroll = 0;
+      return;
+    }
+    if (key === '\x1b[H' || key === '\x1b[1~') { // Home key
+      logScroll = Math.max(0, logLines.length - 5);
+      return;
+    }
+    // Ignore other multi-byte escape sequences
     if (key.length > 1 && key[0] === '\x1b') return;
 
     if (key === 'q' || key === '\x03') {
