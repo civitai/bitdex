@@ -211,6 +211,10 @@ dev-build *ARGS:
 dev-test-e2e:
     node {{_cli}} test-e2e
 
+# Restart the daemon (picks up new daemon code)
+dev-restart:
+    node {{_cli}} restart
+
 # Force-kill ALL bitdex-server processes (including orphans)
 dev-kill:
     node {{_cli}} force-kill

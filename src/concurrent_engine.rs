@@ -2842,7 +2842,7 @@ impl ConcurrentEngine {
             });
         }
 
-        let trace = collector.finalize(index_name, result.ids.len() as u64);
+        let trace = collector.finalize(index_name, result.total_matched as u64);
         Ok((result, trace))
     }
 

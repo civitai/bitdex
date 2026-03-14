@@ -1381,7 +1381,11 @@ async fn handle_query(
         Ok((result, trace)) => {
             let elapsed = start.elapsed();
             let elapsed_us = elapsed.as_micros() as u64;
-            tracing::info!("[{name}]   → {} results, {elapsed_us}μs", result.total_matched);
+            let cache_tag = if trace.cache_hit { " cache" } else { "" };
+            tracing::info!(
+                "[{name}]   → {} results  total={elapsed_us}μs  plan={}μs  filter={}μs  sort={}μs{cache_tag}",
+                result.total_matched, trace.plan_us, trace.filter_us, trace.sort_us
+            );
             m.query_total.with_label_values(&[&name]).inc();
             m.query_duration_seconds
                 .with_label_values(&[&name])

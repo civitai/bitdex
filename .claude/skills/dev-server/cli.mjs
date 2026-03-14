@@ -363,6 +363,25 @@ async function cmdForceKill() {
   console.log(JSON.stringify(result, null, 2));
 }
 
+async function cmdRestart() {
+  console.error('Stopping daemon...');
+  try { await daemonFetch('/shutdown', { method: 'POST' }); } catch { /* already dead */ }
+  // Wait for daemon to die
+  for (let i = 0; i < 15; i++) {
+    await new Promise(r => setTimeout(r, 200));
+    if (!await isDaemonRunning()) break;
+  }
+  console.error('Starting daemon...');
+  if (!await ensureDaemon()) {
+    console.error('Failed to restart daemon');
+    process.exit(1);
+  }
+  // Restart all previously running instances
+  const status = await daemonFetch('/status');
+  console.error('Daemon restarted (PID ' + status.daemon.pid + ')');
+  console.log(JSON.stringify({ restarted: true, daemon_pid: status.daemon.pid }));
+}
+
 async function cmdShutdown() {
   const result = await daemonFetch('/shutdown', { method: 'POST' });
   console.log(JSON.stringify(result, null, 2));
@@ -431,6 +450,16 @@ function pad(str, w) {
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 function stripAnsi(s) { return s.replace(ANSI_RE, ''); }
 
+// Adaptive time formatting: ns → μs → ms → s
+function fmtTime(us) {
+  if (us == null) return '—';
+  if (us === 0) return '0';
+  if (us < 1) return `${Math.round(us * 1000)}ns`;
+  if (us < 1000) return `${Math.round(us)}μs`;
+  if (us < 1000000) return `${(us / 1000).toFixed(1)}ms`;
+  return `${(us / 1000000).toFixed(2)}s`;
+}
+
 // ─── Log Formatter Pipeline ─────────────────────────────────────
 // Each formatter: { match: RegExp, format: (match, maxW) => string }
 // First match wins. Formatters operate on the body AFTER tracing prefix is stripped.
@@ -439,7 +468,22 @@ const WHT = '\x1b[37m';
 const BLU = '\x1b[34m';
 
 const LOG_FORMATTERS = [
-  // Query result: "  → 4000 results, 16μs"
+  // Query result with breakdown: "→ 4000 results  total=89μs  plan=0μs  filter=71μs  sort=16μs cache"
+  {
+    match: /^\s*→\s*(\d[\d,]*)\s+results\s+total=(\d+)μs\s+plan=(\d+)μs\s+filter=(\d+)μs\s+sort=(\d+)μs\s*(cache)?/,
+    format: (m, w) => {
+      const results = m[1];
+      const total = parseInt(m[2], 10);
+      const plan = parseInt(m[3], 10);
+      const filter = parseInt(m[4], 10);
+      const sort = parseInt(m[5], 10);
+      const cache = m[6] ? ` ${GRN}cache${R}` : '';
+      const n = parseInt(results.replace(/,/g, ''), 10);
+      const countStr = n >= 100000 ? fmtCount(n) : results;
+      return `  ${GRN}→${R} ${WHT}${countStr}${R} results  total=${CYN}${fmtTime(total)}${R}  plan=${DIM}${fmtTime(plan)}${R}  filter=${DIM}${fmtTime(filter)}${R}  sort=${DIM}${fmtTime(sort)}${R}${cache}`;
+    },
+  },
+  // Legacy result format: "→ 4000 results, 16μs"
   {
     match: /^\s*→\s*(\d[\d,]*)\s+results?,\s*(.+)$/,
     format: (m, w) => `  ${GRN}→${R} ${WHT}${m[1]}${R} results, ${CYN}${m[2]}${R}`,
@@ -520,7 +564,9 @@ async function cmdDashboard() {
   let inputMode = null;  // null or { prompt, buffer, callback }
   let showStats = false; // 'i' toggles detailed stats panel
   let logScroll = 0;    // 0 = live tail, >0 = scrolled up N lines from bottom
-  let explainTrace = null; // expanded trace object (toggle with 'e')
+  let explainTraces = [];   // array of fetched traces
+  let explainIdx = 0;       // current index in explainTraces
+  let explainMode = false;  // when true, logs are paused and arrow keys navigate traces
 
   function flash(msg) { actionMsg = msg; setTimeout(() => { actionMsg = ''; }, 4000); }
 
@@ -618,23 +664,26 @@ async function cmdDashboard() {
 
     // ── Explain trace panel (rendered between logs and footer)
     const explainRows = [];
+    const explainTrace = explainMode && explainTraces.length > 0 ? explainTraces[explainIdx] : null;
     if (explainTrace) {
       const t = explainTrace;
+      const navLabel = `trace ${explainIdx + 1}/${explainTraces.length}`;
+      explainRows.push(`${DIM}── explain ${navLabel} (←→ navigate, e close) ──────────────${R}`);
       const cacheTag = t.cache_hit ? `${GRN}CACHE HIT${R}` : `${YLW}MISS${R}`;
-      explainRows.push(`${DIM}── explain ──────────────────────────────────────────${R}`);
-      explainRows.push(`  ${B}${t.index}${R}  ${cacheTag}  total=${CYN}${(t.total_us/1000).toFixed(1)}ms${R}  plan=${DIM}${t.plan_us}us${R}  filter=${DIM}${t.filter_us}us${R}  sort=${DIM}${t.sort_us}us${R}  results=${WHT}${t.result_count}${R}`);
+      // nav header already pushed above
+      explainRows.push(`  ${B}${t.index}${R}  ${cacheTag}  total=${CYN}${fmtTime(t.total_us)}${R}  plan=${DIM}${fmtTime(t.plan_us)}${R}  filter=${DIM}${fmtTime(t.filter_us)}${R}  sort=${DIM}${fmtTime(t.sort_us)}${R}  results=${WHT}${t.result_count}${R}`);
       if (t.clauses && t.clauses.length > 0) {
         explainRows.push(`  ${DIM}${pad('#', 3)}${pad('field', 18)}${pad('op', 10)}${pad('card', 12)}${pad('acc', 12)}${pad('delta', 8)}${pad('eval', 10)}${pad('and', 10)}${pad('mode', 8)}${R}`);
         for (const c of t.clauses) {
           const delta = c.acc_before > 0 ? `${((1 - c.acc_after / c.acc_before) * 100).toFixed(0)}%` : '—';
           const deltaColor = delta !== '—' && parseInt(delta) > 50 ? GRN : (delta !== '—' && parseInt(delta) > 10 ? YLW : '');
-          explainRows.push(`  ${pad(String(c.ord), 3)}${BLU}${pad(trunc(c.field, 16), 18)}${R}${pad(c.op, 10)}${pad(fmtCount(c.card), 12)}${pad(fmtCount(c.acc_after), 12)}${deltaColor}${pad(delta, 8)}${R}${DIM}${pad(c.eval_us + 'us', 10)}${pad(c.and_us + 'us', 10)}${R}${pad(c.mode, 8)}`);
+          explainRows.push(`  ${pad(String(c.ord), 3)}${BLU}${pad(trunc(c.field, 16), 18)}${R}${pad(c.op, 10)}${pad(fmtCount(c.card), 12)}${pad(fmtCount(c.acc_after), 12)}${deltaColor}${pad(delta, 8)}${R}${DIM}${pad(fmtTime(c.eval_us), 10)}${pad(fmtTime(c.and_us), 10)}${R}${pad(c.mode, 8)}`);
         }
       }
       if (t.sort) {
-        explainRows.push(`  ${DIM}sort:${R} ${BLU}${t.sort.field}${R} ${YLW}${t.sort.dir}${R}  in=${fmtCount(t.sort.input)} out=${fmtCount(t.sort.output)}  ${DIM}${t.sort.time_us}us${R}`);
+        explainRows.push(`  ${DIM}sort:${R} ${BLU}${t.sort.field}${R} ${YLW}${t.sort.dir}${R}  in=${fmtCount(t.sort.input)} out=${fmtCount(t.sort.output)}  ${DIM}${fmtTime(t.sort.time_us)}${R}`);
       }
-      explainRows.push(`${DIM}── /explain (press e to close) ──${R}`);
+      explainRows.push(`${DIM}── ←→ prev/next  e close  ${YLW}PAUSED${R}${DIM} ──${R}`);
     }
 
     // ── Log area with scroll support
@@ -727,12 +776,22 @@ async function cmdDashboard() {
       return;
     }
 
-    // Arrow keys for log scrolling
-    if (key === '\x1b[A') { // Up arrow
+    // Arrow keys: in explain mode, left/right navigate traces; otherwise up/down scroll logs
+    if (explainMode) {
+      if (key === '\x1b[D' || key === '\x1b[A') { // Left or Up — older trace
+        explainIdx = Math.max(0, explainIdx - 1);
+        return;
+      }
+      if (key === '\x1b[C' || key === '\x1b[B') { // Right or Down — newer trace
+        explainIdx = Math.min(explainTraces.length - 1, explainIdx + 1);
+        return;
+      }
+    }
+    if (key === '\x1b[A') { // Up arrow (log scroll)
       logScroll = Math.min(logScroll + 3, Math.max(0, logLines.length - 5));
       return;
     }
-    if (key === '\x1b[B') { // Down arrow
+    if (key === '\x1b[B') { // Down arrow (log scroll)
       logScroll = Math.max(0, logScroll - 3);
       return;
     }
@@ -783,11 +842,13 @@ async function cmdDashboard() {
     }
 
     if (key === 'e') {
-      if (explainTrace) {
-        explainTrace = null;
+      if (explainMode) {
+        // Close explain mode, resume logs
+        explainMode = false;
+        explainTraces = [];
         return;
       }
-      // Fetch latest trace from the running instance
+      // Open explain mode: fetch recent traces, pause logs
       try {
         const st = await daemonFetch('/status');
         const inst = st.instances.find(i => i.id === (selectedInstance || st.instances[0]?.id));
@@ -795,11 +856,15 @@ async function cmdDashboard() {
           flash('No running instance with index loaded');
           return;
         }
-        const url = `http://127.0.0.1:${inst.port}/api/indexes/${inst.dataset}/traces?last=1`;
+        const url = `http://127.0.0.1:${inst.port}/api/indexes/${inst.dataset}/traces?last=50`;
         const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
-        const traces = await res.json();
+        const body = await res.json();
+        const traces = body.traces || body;
         if (Array.isArray(traces) && traces.length > 0) {
-          explainTrace = traces[traces.length - 1];
+          explainTraces = traces;
+          explainIdx = traces.length - 1; // start at most recent
+          explainMode = true;
+          flash(`Explain: ${traces.length} traces loaded (logs paused)`);
         } else {
           flash('No traces available');
         }
@@ -878,9 +943,9 @@ async function cmdDashboard() {
     try {
       const status = await daemonFetch('/status');
 
-      // Fetch logs for selected instance
+      // Fetch logs for selected instance (skip when in explain mode — logs paused)
       const logTarget = selectedInstance || (status.instances[0]?.id) || null;
-      if (logTarget) {
+      if (logTarget && !explainMode) {
         // Reset cursor when switching instances
         if (logTarget !== lastLogTarget) {
           logLines = [];
@@ -1002,6 +1067,7 @@ async function main() {
     case 'traces': return cmdTraces();
     case 'test-e2e': return cmdTestE2e();
     case 'dash': case 'dashboard': return cmdDashboard();
+    case 'restart': return cmdRestart();
     case 'force-kill': return cmdForceKill();
     case 'shutdown': return cmdShutdown();
     default:

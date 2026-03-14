@@ -1,6 +1,6 @@
 ---
 name: dev-server
-description: Manage BitDex server instances, coordinate builds, tests, and datasets across multiple agents/worktrees. Use when you need to start a server, run E2E tests, check logs, or see if another agent is using resources.
+description: Manage BitDex server instances, coordinate builds, tests, datasets, and query traces across multiple agents/worktrees. Use when you need to start a server, run E2E tests, check logs, inspect query traces, or see if another agent is using resources.
 user-invocable: true
 ---
 
@@ -73,6 +73,23 @@ node .claude/skills/dev-server/cli.mjs build --target bitdex-benchmark
 
 The daemon runs cargo and captures all output. The `build` command polls and streams logs automatically. If another agent is already building, running `build` will watch their build output. If you request a new build while one is in progress, the old one gets killed and yours starts. Lock auto-releases if the holder dies or after 10 minutes.
 
+## Query Traces
+
+```bash
+# Fetch last 5 query traces from the running instance
+node .claude/skills/dev-server/cli.mjs traces
+
+# Fetch last 20 traces
+node .claude/skills/dev-server/cli.mjs traces --last 20
+
+# Traces from a specific instance
+node .claude/skills/dev-server/cli.mjs traces srv-3005
+```
+
+Returns JSON with per-query trace data: total/plan/filter/sort timing (microseconds), clause-level cardinality and evaluation costs, cache hit/miss, and result count. Traces are collected server-side on every query and persisted to JSONL.
+
+**TUI explain panel:** In the dashboard (`dash`), press `e` to toggle the explain panel. It renders the most recent query trace inline — clause ordering, cardinality reduction per step, sort timing, and cache status.
+
 ## Running E2E Tests (with Lock)
 
 ```bash
@@ -106,6 +123,7 @@ Acquires E2E lock (only one run at a time — shared port 3100), runs the suite 
 | `build [--target T] [--profile P]` | Coordinated cargo build | JSON |
 | `traces [id\|port] [--last N]` | Fetch recent query traces (default last=5) | JSON |
 | `test-e2e [--port N]` | Coordinated E2E test run | JSON |
+| `dash` | TUI dashboard with live logs, metrics, and explain panel | Interactive |
 | `shutdown` | Kill all instances + daemon | JSON |
 
 ## Build Targets
@@ -115,6 +133,21 @@ Acquires E2E lock (only one run at a time — shared port 3100), runs the suite 
 | `bitdex-server` (default) | `fast` | Dev build, thin LTO |
 | `bitdex-loadtest` | `fast` | Dev build |
 | `bitdex-benchmark` | `release` | Always full optimization |
+
+## TUI Dashboard
+
+```bash
+node .claude/skills/dev-server/cli.mjs dash
+```
+
+Live terminal dashboard with instance status, Prometheus metrics, log streaming, and query trace explain panel. Key bindings:
+
+| Key | Action |
+|-----|--------|
+| `e` | Toggle explain panel (latest query trace with clause-level timing) |
+| `s` | Toggle stats panel (Prometheus metrics) |
+| `j/k` | Scroll logs |
+| `q` | Quit |
 
 ## How It Works
 
