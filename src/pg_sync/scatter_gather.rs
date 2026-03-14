@@ -22,6 +22,7 @@ use roaring::RoaringBitmap;
 
 use crate::bitmap_fs::BitmapFs;
 use crate::concurrent_engine::ConcurrentEngine;
+use crate::docstore::PackedValue;
 
 use super::bulk_loader::BulkLoadStats;
 use super::config::IndexDefinition;
@@ -477,29 +478,25 @@ fn run_gather_and_apply(
         }
         let bitmap_ms = tb.elapsed().as_millis() as u64;
 
-        // Phase C: Encode docs to msgpack
+        // Phase C: Encode + write docs as V2 tuples (per-field append)
         let te = Instant::now();
-        let mut encoded_docs: Vec<(u32, Vec<u8>)> = Vec::with_capacity(slot_docs.len());
+        let field_idx = bulk_writer_ref.field_to_idx();
+        let mut tuple_count: u64 = 0;
         for doc in &slot_docs {
             let doc_metrics = metrics_map_ref.get(&doc.slot).copied();
-            let json = scratch::slot_doc_to_json(doc, doc_metrics);
-            let bytes = bulk_writer_ref.encode_json(&json, schema_ref);
-            encoded_docs.push((doc.slot, bytes));
+            let n = encode_slot_doc_v2_tuples(doc, doc_metrics, field_idx, bulk_writer_ref);
+            tuple_count += n as u64;
         }
         let encode_ms = te.elapsed().as_millis() as u64;
 
         // Send bitmaps to merge thread (bounded, backpressure)
         let _ = bm_tx_ref.send(bitmaps);
 
-        // Phase D: Write docs to docstore
+        // Phase D: V2 writes are append-only, already done in Phase C
         let tw = Instant::now();
-        if !encoded_docs.is_empty() {
-            let batch_bytes: u64 = encoded_docs.iter().map(|(_, b)| b.len() as u64).sum();
-            let batch_count = encoded_docs.len() as u64;
-            bulk_writer_ref.write_batch_fresh(encoded_docs);
-            docs_written_ref.fetch_add(batch_count, Ordering::Relaxed);
-            bytes_written_ref.fetch_add(batch_bytes, Ordering::Relaxed);
-        }
+        docs_written_ref.fetch_add(slot_docs.len() as u64, Ordering::Relaxed);
+        // Approximate bytes: 8 bytes header + value per tuple
+        bytes_written_ref.fetch_add(tuple_count * 12, Ordering::Relaxed);
         let write_ms = tw.elapsed().as_millis() as u64;
 
         // Accumulate timing
@@ -524,6 +521,9 @@ fn run_gather_and_apply(
             );
         }
     });
+
+    // Flush all V2 docstore writers
+    bulk_writer.flush_v2_writers();
 
     // Close bitmap channel, wait for merge thread to finish streaming saves
     drop(bm_tx);
@@ -1181,4 +1181,90 @@ fn parse_i64_fast(bytes: &[u8]) -> Option<i64> {
         val = val.wrapping_mul(10).wrapping_add((b - b'0') as i64);
     }
     if negative { Some(-val) } else { Some(val) }
+}
+
+// ---------------------------------------------------------------------------
+// V2 tuple encoding: SlotDoc fields → per-field msgpack → BulkWriter append
+// ---------------------------------------------------------------------------
+
+/// Encode a SlotDoc's fields directly to V2 tuples, bypassing JSON intermediate.
+/// Each field is serialized as a PackedValue msgpack blob and appended via
+/// BulkWriter::append_tuple_raw. Returns the number of tuples written.
+fn encode_slot_doc_v2_tuples(
+    doc: &SlotDoc,
+    metrics: Option<(u32, u32, u32)>,
+    field_idx: &HashMap<String, u16>,
+    writer: &crate::docstore::BulkWriter,
+) -> usize {
+    use super::slot_arena::{decode_availability, decode_base_model, decode_image_type};
+
+    let slot = doc.slot;
+    let mut count = 0usize;
+
+    // Helper: serialize PackedValue to msgpack bytes and append as tuple.
+    macro_rules! emit {
+        ($name:expr, $pv:expr) => {
+            if let Some(&idx) = field_idx.get($name) {
+                let bytes = rmp_serde::to_vec(&$pv).unwrap_or_default();
+                writer.append_tuple_raw(slot, idx, &bytes);
+                count += 1;
+            }
+        };
+    }
+
+    // Scalar fields
+    emit!("id", PackedValue::I(doc.slot as i64));
+    emit!("nsfwLevel", PackedValue::I(doc.nsfw_level as i64));
+    emit!("userId", PackedValue::I(doc.user_id as i64));
+    emit!("postId", PackedValue::I(doc.post_id as i64));
+    emit!("postedToId", PackedValue::I(doc.posted_to_id as i64));
+    emit!("type", PackedValue::S(decode_image_type(doc.image_type).to_string()));
+    emit!("baseModel", PackedValue::S(decode_base_model(doc.base_model).to_string()));
+    emit!("availability", PackedValue::S(decode_availability(doc.availability).to_string()));
+    emit!("sortAt", PackedValue::I(doc.sort_at as i64));
+    emit!("sortAtUnix", PackedValue::I(doc.sort_at as i64 * 1000));
+    emit!("publishedAtUnix", PackedValue::I(doc.published_at_ms as i64));
+    emit!("existedAtUnix", PackedValue::I(0));
+
+    // Metrics
+    let (rc, cc, col) = metrics.unwrap_or((0, 0, 0));
+    emit!("reactionCount", PackedValue::I(rc as i64));
+    emit!("commentCount", PackedValue::I(cc as i64));
+    emit!("collectedCount", PackedValue::I(col as i64));
+
+    // Multi-value fields
+    emit!("tagIds", PackedValue::Mi(doc.tag_ids.iter().map(|&t| t as i64).collect()));
+    emit!("modelVersionIds", PackedValue::Mi(doc.model_version_ids.iter().map(|&t| t as i64).collect()));
+    emit!("modelVersionIdsManual", PackedValue::Mi(Vec::new()));
+    emit!("toolIds", PackedValue::Mi(doc.tool_ids.iter().map(|&t| t as i64).collect()));
+    emit!("techniqueIds", PackedValue::Mi(doc.technique_ids.iter().map(|&t| t as i64).collect()));
+
+    // Boolean fields (only emit non-default)
+    if doc.has_meta {
+        emit!("hasMeta", PackedValue::B(true));
+    }
+    if doc.on_site {
+        emit!("onSite", PackedValue::B(true));
+    }
+    if doc.poi {
+        emit!("poi", PackedValue::B(true));
+    }
+    if doc.minor {
+        emit!("minor", PackedValue::B(true));
+    }
+
+    // String fields (only emit when present)
+    if let Some(ref url) = doc.url {
+        emit!("url", PackedValue::S(url.clone()));
+    }
+    if let Some(ref hash) = doc.hash {
+        emit!("hash", PackedValue::S(hash.clone()));
+    }
+
+    // blockedFor
+    if doc.blocked_for > 0 {
+        emit!("blockedFor", PackedValue::S("blocked".to_string()));
+    }
+
+    count
 }

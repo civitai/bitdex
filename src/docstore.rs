@@ -187,6 +187,11 @@ impl DocStore {
         Ok(())
     }
 
+    /// Public wrapper for `ensure_field_idx` (for benchmarks).
+    pub fn ensure_field_idx_pub(&mut self, name: &str) -> u16 {
+        self.ensure_field_idx(name)
+    }
+
     fn ensure_field_idx(&mut self, name: &str) -> u16 {
         if let Some(&idx) = self.field_to_idx.get(name) {
             return idx;
@@ -808,6 +813,16 @@ impl DocStore {
         Self::read_shard_file(data)
     }
 
+    /// Public wrapper for `shard_id` (for benchmarks).
+    pub fn shard_id_pub(slot_id: u32) -> u32 {
+        Self::shard_id(slot_id)
+    }
+
+    /// Public wrapper for `shard_path` (for benchmarks).
+    pub fn shard_path_pub(root: &Path, shard_id: u32) -> PathBuf {
+        Self::shard_path(root, shard_id)
+    }
+
     /// Encode a doc using the field dictionary (public for benchmarks).
     pub fn encode_doc_pub(&mut self, doc: &StoredDoc) -> Result<Vec<u8>> {
         self.encode_doc(doc)
@@ -1346,6 +1361,11 @@ impl BulkWriter {
             let mut w = entry.value().lock();
             let _ = w.flush();
         }
+    }
+
+    /// Get the field name → u16 dictionary index mapping (for V2 tuple encoding).
+    pub fn field_to_idx(&self) -> &HashMap<String, u16> {
+        &self.field_to_idx
     }
 }
 
