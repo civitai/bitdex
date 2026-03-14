@@ -309,12 +309,23 @@ impl<'a> QueryExecutor<'a> {
 
         let mut result: Option<RoaringBitmap> = None;
 
-        for clause in clauses {
+        for (i, clause) in clauses.iter().enumerate() {
+            let t0 = std::time::Instant::now();
             let bitmap = self.evaluate_clause(clause)?;
+            let eval_elapsed = t0.elapsed();
+            let bm_card = bitmap.len();
+            let t1 = std::time::Instant::now();
             result = Some(match result {
                 Some(existing) => existing & &bitmap,
                 None => bitmap,
             });
+            let and_elapsed = t1.elapsed();
+            let result_card = result.as_ref().map(|r| r.len()).unwrap_or(0);
+            tracing::debug!(
+                "    clause[{}]: eval={:.1}ms ({}), and={:.1}ms → {} | {}",
+                i, eval_elapsed.as_secs_f64() * 1000.0, bm_card,
+                and_elapsed.as_secs_f64() * 1000.0, result_card, clause
+            );
         }
 
         Ok(result.unwrap_or_default())
@@ -368,7 +379,7 @@ impl<'a> QueryExecutor<'a> {
                     let mut result = RoaringBitmap::new();
                     for &key in &keys {
                         if let Some(vb) = filter_field.get_versioned(key) {
-                            result |= vb.fused();
+                            result |= vb.fused_cow().as_ref();
                         }
                     }
                     return Ok(result);
