@@ -19,6 +19,7 @@
 //! At 105M records with 16K/shard = 6400 files (vs 105M individual files).
 
 use std::collections::HashMap;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -39,6 +40,12 @@ pub const SHARD_SHIFT_PUB: u32 = SHARD_SHIFT;
 
 /// Shard file version. Bump if format changes.
 const SHARD_VERSION: u32 = 1;
+
+/// V2 shard magic number: "BDX2" in little-endian.
+const V2_MAGIC: u32 = 0x42445832;
+
+/// V2 shard header size in bytes: magic(4) + version(4) + flags(4) + num_tuples(4).
+const V2_HEADER_SIZE: usize = 16;
 
 /// Marker byte indicating the document has a version prefix.
 /// Chosen as 0x00 because msgpack arrays (our doc format) always start at 0x90+.
@@ -70,6 +77,9 @@ pub struct DocStore {
     /// Historical defaults keyed by schema version.
     /// Used to reconstruct elided fields from documents encoded with older schemas.
     historical_defaults: HashMap<u8, HashMap<u16, PackedValue>>,
+    /// Per-shard buffered writers for V2 append-only tuple format.
+    /// Lazily opened on first append to each shard.
+    v2_writers: Arc<DashMap<u32, parking_lot::Mutex<BufWriter<std::fs::File>>>>,
 }
 
 impl DocStore {
@@ -93,6 +103,7 @@ impl DocStore {
             field_defaults: HashMap::new(),
             schema_version: 1,
             historical_defaults,
+            v2_writers: Arc::new(DashMap::new()),
         })
     }
 
@@ -107,6 +118,7 @@ impl DocStore {
             field_defaults: HashMap::new(),
             schema_version: 1,
             historical_defaults: HashMap::new(),
+            v2_writers: Arc::new(DashMap::new()),
         })
     }
 
@@ -555,6 +567,7 @@ impl DocStore {
     // ---- Public API ----
 
     /// Get a stored document by slot ID.
+    /// Auto-detects V1 vs V2 shard format by checking the first 4 bytes.
     pub fn get(&self, id: u32) -> Result<Option<StoredDoc>> {
         if self.in_memory {
             return match self.memory_store.get(&id) {
@@ -568,9 +581,13 @@ impl DocStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
         };
-        match Self::find_in_shard(&data, id)? {
-            Some(compressed) => Ok(Some(self.decode_doc(&compressed)?)),
-            None => Ok(None),
+        if Self::is_v2_shard(&data) {
+            self.get_v2_from_data(&data, id)
+        } else {
+            match Self::find_in_shard(&data, id)? {
+                Some(compressed) => Ok(Some(self.decode_doc(&compressed)?)),
+                None => Ok(None),
+            }
         }
     }
 
@@ -806,6 +823,253 @@ impl DocStore {
         Ok(false)
     }
 
+    // ---- V2 shard format (append-only BitTuple log) ----
+
+    /// Check if raw shard data starts with the V2 magic number.
+    fn is_v2_shard(data: &[u8]) -> bool {
+        data.len() >= 4
+            && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == V2_MAGIC
+    }
+
+    /// Write a V2 shard header to a new file.
+    fn write_v2_header(writer: &mut impl Write) -> Result<()> {
+        writer
+            .write_all(&V2_MAGIC.to_le_bytes())
+            .map_err(|e| BitdexError::DocStore(format!("write v2 magic: {e}")))?;
+        writer
+            .write_all(&2u32.to_le_bytes()) // version = 2
+            .map_err(|e| BitdexError::DocStore(format!("write v2 version: {e}")))?;
+        writer
+            .write_all(&0u32.to_le_bytes()) // flags = 0
+            .map_err(|e| BitdexError::DocStore(format!("write v2 flags: {e}")))?;
+        writer
+            .write_all(&0u32.to_le_bytes()) // num_tuples = 0
+            .map_err(|e| BitdexError::DocStore(format!("write v2 num_tuples: {e}")))?;
+        Ok(())
+    }
+
+    /// Write a single V2 tuple to a writer.
+    /// Format: [u32 slot_id LE] [u16 field_idx LE] [u16 value_len LE] [value_len bytes]
+    fn write_v2_tuple(writer: &mut impl Write, slot: u32, field_idx: u16, value: &[u8]) -> Result<()> {
+        writer
+            .write_all(&slot.to_le_bytes())
+            .map_err(|e| BitdexError::DocStore(format!("write v2 slot: {e}")))?;
+        writer
+            .write_all(&field_idx.to_le_bytes())
+            .map_err(|e| BitdexError::DocStore(format!("write v2 field_idx: {e}")))?;
+        writer
+            .write_all(&(value.len() as u16).to_le_bytes())
+            .map_err(|e| BitdexError::DocStore(format!("write v2 value_len: {e}")))?;
+        writer
+            .write_all(value)
+            .map_err(|e| BitdexError::DocStore(format!("write v2 value: {e}")))?;
+        Ok(())
+    }
+
+    /// Parse all V2 tuples from raw shard data.
+    /// Returns tuples in file order (append order).
+    fn parse_v2_tuples(data: &[u8]) -> Result<Vec<(u32, u16, Vec<u8>)>> {
+        if data.len() < V2_HEADER_SIZE {
+            return Err(BitdexError::DocStore("v2 shard too short".into()));
+        }
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        if magic != V2_MAGIC {
+            return Err(BitdexError::DocStore(format!("not a v2 shard: magic={magic:#x}")));
+        }
+        let mut pos = V2_HEADER_SIZE;
+        let mut tuples = Vec::new();
+        while pos + 8 <= data.len() {
+            let slot = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            let field_idx = u16::from_le_bytes([data[pos + 4], data[pos + 5]]);
+            let value_len = u16::from_le_bytes([data[pos + 6], data[pos + 7]]) as usize;
+            pos += 8;
+            if pos + value_len > data.len() {
+                break; // truncated tuple at end of file — skip
+            }
+            tuples.push((slot, field_idx, data[pos..pos + value_len].to_vec()));
+            pos += value_len;
+        }
+        Ok(tuples)
+    }
+
+    /// Read a single document from V2 shard data.
+    /// Scans tuples LIFO: newest (slot, field) wins.
+    fn get_v2_from_data(&self, data: &[u8], slot_id: u32) -> Result<Option<StoredDoc>> {
+        let tuples = Self::parse_v2_tuples(data)?;
+        // Walk backwards — newest entry for each field wins
+        let mut fields: HashMap<u16, PackedValue> = HashMap::new();
+        for (s, field_idx, value_bytes) in tuples.iter().rev() {
+            if *s != slot_id {
+                continue;
+            }
+            if fields.contains_key(field_idx) {
+                continue; // already have a newer value
+            }
+            let pv: PackedValue = rmp_serde::from_slice(&value_bytes)
+                .map_err(|e| BitdexError::DocStore(format!("v2 decode field {field_idx}: {e}")))?;
+            fields.insert(*field_idx, pv);
+        }
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let mut doc_fields = HashMap::with_capacity(fields.len());
+        for (idx, pv) in fields {
+            if let Some(name) = self.idx_to_field.get(idx as usize) {
+                doc_fields.insert(name.clone(), unpack_field_value(pv));
+            }
+        }
+        Ok(Some(StoredDoc {
+            fields: doc_fields,
+            schema_version: 0,
+        }))
+    }
+
+    /// Get a stored document from a V2 shard by slot ID.
+    pub fn get_v2(&self, slot_id: u32) -> Result<Option<StoredDoc>> {
+        if self.in_memory {
+            return self.get(slot_id);
+        }
+        let path = Self::shard_path(&self.root, Self::shard_id(slot_id));
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
+        };
+        if !Self::is_v2_shard(&data) {
+            return Err(BitdexError::DocStore("shard is not v2 format".into()));
+        }
+        self.get_v2_from_data(&data, slot_id)
+    }
+
+    /// Get or create a buffered writer for a V2 shard.
+    /// Creates the file with a V2 header if it doesn't exist.
+    fn get_v2_writer(&self, shard_id: u32) -> Result<()> {
+        // Already have a writer for this shard
+        if self.v2_writers.contains_key(&shard_id) {
+            return Ok(());
+        }
+        let path = Self::shard_path(&self.root, shard_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| BitdexError::DocStore(format!("create v2 shard dir: {e}")))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| BitdexError::DocStore(format!("open v2 shard: {e}")))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| BitdexError::DocStore(format!("stat v2 shard: {e}")))?
+            .len();
+        let mut buf_writer = BufWriter::new(file);
+        if file_len == 0 {
+            Self::write_v2_header(&mut buf_writer)?;
+        }
+        self.v2_writers.insert(shard_id, parking_lot::Mutex::new(buf_writer));
+        Ok(())
+    }
+
+    /// Append a single tuple to the V2 shard for the given slot.
+    pub fn append_tuple(&self, slot: u32, field_idx: u16, value: &[u8]) -> Result<()> {
+        let sid = Self::shard_id(slot);
+        self.get_v2_writer(sid)?;
+        let entry = self.v2_writers.get(&sid).unwrap();
+        let mut w = entry.lock();
+        Self::write_v2_tuple(&mut *w, slot, field_idx, value)?;
+        w.flush()
+            .map_err(|e| BitdexError::DocStore(format!("flush v2 shard: {e}")))?;
+        Ok(())
+    }
+
+    /// Batch append tuples, grouped internally by shard.
+    pub fn append_tuples_batch(&self, tuples: Vec<(u32, u16, Vec<u8>)>) -> Result<()> {
+        // Group by shard
+        let mut by_shard: HashMap<u32, Vec<(u32, u16, Vec<u8>)>> = HashMap::new();
+        for (slot, field_idx, value) in tuples {
+            by_shard
+                .entry(Self::shard_id(slot))
+                .or_default()
+                .push((slot, field_idx, value));
+        }
+        for (sid, entries) in by_shard {
+            self.get_v2_writer(sid)?;
+            let entry = self.v2_writers.get(&sid).unwrap();
+            let mut w = entry.lock();
+            for (slot, field_idx, value) in &entries {
+                Self::write_v2_tuple(&mut *w, *slot, *field_idx, value)?;
+            }
+            w.flush()
+                .map_err(|e| BitdexError::DocStore(format!("flush v2 shard: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Compact a V2 shard: read all tuples, deduplicate (newest wins per slot+field),
+    /// write a clean shard via atomic tmp+rename.
+    pub fn compact_shard(&self, shard_id: u32) -> Result<()> {
+        let path = Self::shard_path(&self.root, shard_id);
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
+        };
+        if !Self::is_v2_shard(&data) {
+            return Err(BitdexError::DocStore("compact_shard: not a v2 shard".into()));
+        }
+        let tuples = Self::parse_v2_tuples(&data)?;
+
+        // Deduplicate: newest (last in file) wins per (slot, field)
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped: Vec<(u32, u16, Vec<u8>)> = Vec::new();
+        for (slot, field_idx, value) in tuples.into_iter().rev() {
+            if seen.insert((slot, field_idx)) {
+                deduped.push((slot, field_idx, value));
+            }
+        }
+        deduped.reverse(); // restore original order for stable output
+
+        // Remove any existing buffered writer for this shard (we'll replace the file)
+        self.v2_writers.remove(&shard_id);
+
+        // Write clean shard via atomic tmp+rename
+        let tmp = path.with_extension("bin.tmp");
+        {
+            let file = std::fs::File::create(&tmp)
+                .map_err(|e| BitdexError::DocStore(format!("create v2 tmp: {e}")))?;
+            let mut w = BufWriter::new(file);
+            Self::write_v2_header(&mut w)?;
+            for (slot, field_idx, value) in &deduped {
+                Self::write_v2_tuple(&mut w, *slot, *field_idx, value)?;
+            }
+            w.flush()
+                .map_err(|e| BitdexError::DocStore(format!("flush v2 tmp: {e}")))?;
+            w.into_inner()
+                .map_err(|e| BitdexError::DocStore(format!("into_inner v2 tmp: {e}")))?
+                .sync_all()
+                .map_err(|e| BitdexError::DocStore(format!("fsync v2 tmp: {e}")))?;
+        }
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| BitdexError::DocStore(format!("rename v2 shard: {e}")))?;
+
+        // Update num_tuples in the header
+        let num = deduped.len() as u32;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| BitdexError::DocStore(format!("open v2 for header update: {e}")))?;
+        use std::io::Seek;
+        let mut file = file;
+        file.seek(std::io::SeekFrom::Start(12))
+            .map_err(|e| BitdexError::DocStore(format!("seek v2 header: {e}")))?;
+        file.write_all(&num.to_le_bytes())
+            .map_err(|e| BitdexError::DocStore(format!("write v2 num_tuples: {e}")))?;
+        file.sync_all()
+            .map_err(|e| BitdexError::DocStore(format!("fsync v2 header: {e}")))?;
+
+        Ok(())
+    }
+
     /// Prepare for bulk loading: ensure field dictionary contains all field names,
     /// then return a BulkWriter that can encode and write docs without the DocStore lock.
     pub fn prepare_bulk_load(&mut self, field_names: &[String]) -> Result<BulkWriter> {
@@ -826,6 +1090,7 @@ impl DocStore {
             shard_locks: Arc::new(DashMap::new()),
             field_defaults: self.field_defaults.clone(),
             schema_version: self.schema_version,
+            v2_writers: Arc::new(DashMap::new()),
         })
     }
 }
@@ -851,6 +1116,8 @@ pub struct BulkWriter {
     field_defaults: HashMap<u16, PackedValue>,
     /// Schema version to prepend to each encoded document.
     schema_version: u8,
+    /// Per-shard buffered writers for V2 append-only tuple format.
+    v2_writers: Arc<DashMap<u32, parking_lot::Mutex<BufWriter<std::fs::File>>>>,
 }
 
 impl BulkWriter {
@@ -1029,6 +1296,56 @@ impl BulkWriter {
 
         let msgpack = rmp_serde::to_vec(&pairs).unwrap_or_default();
         DocStore::prepend_version(self.schema_version, msgpack)
+    }
+
+    // ---- V2 append-only tuple methods ----
+
+    /// Append a single raw tuple to the V2 shard for the given slot.
+    /// No compression, no read-modify-write. Files opened lazily on first write.
+    pub fn append_tuple_raw(&self, slot: u32, field_idx: u16, value_bytes: &[u8]) {
+        let sid = DocStore::shard_id(slot);
+
+        // Ensure writer exists for this shard
+        if !self.v2_writers.contains_key(&sid) {
+            let path = DocStore::shard_path(&self.root, sid);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("BulkWriter: v2 open shard {sid}: {e}");
+                    return;
+                }
+            };
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut bw = BufWriter::new(file);
+            if file_len == 0 {
+                if let Err(e) = DocStore::write_v2_header(&mut bw) {
+                    eprintln!("BulkWriter: v2 write header shard {sid}: {e}");
+                    return;
+                }
+            }
+            self.v2_writers.insert(sid, parking_lot::Mutex::new(bw));
+        }
+
+        let entry = self.v2_writers.get(&sid).unwrap();
+        let mut w = entry.lock();
+        if let Err(e) = DocStore::write_v2_tuple(&mut *w, slot, field_idx, value_bytes) {
+            eprintln!("BulkWriter: v2 write tuple shard {sid}: {e}");
+        }
+    }
+
+    /// Flush all open V2 writers. Call after bulk loading is complete.
+    pub fn flush_v2_writers(&self) {
+        for entry in self.v2_writers.iter() {
+            let mut w = entry.value().lock();
+            let _ = w.flush();
+        }
     }
 }
 
@@ -1830,5 +2147,234 @@ mod tests {
         let decoded = store.decode_doc(&encoded).unwrap();
         assert_eq!(decoded.schema_version, 1);
         assert!(decoded.fields.get("userId").is_some());
+    }
+
+    // ---- V2 shard format tests ----
+
+    #[test]
+    fn test_v2_append_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("name");
+        store.ensure_field_idx("score");
+        store.save_field_dict().unwrap();
+
+        let name_idx = store.field_to_idx["name"];
+        let score_idx = store.field_to_idx["score"];
+
+        // Append tuples for slot 42
+        let name_val = rmp_serde::to_vec(&PackedValue::S("hello".into())).unwrap();
+        let score_val = rmp_serde::to_vec(&PackedValue::I(99)).unwrap();
+
+        store.append_tuple(42, name_idx, &name_val).unwrap();
+        store.append_tuple(42, score_idx, &score_val).unwrap();
+
+        // Read back
+        let doc = store.get(42).unwrap().unwrap();
+        match &doc.fields["name"] {
+            FieldValue::Single(Value::String(s)) => assert_eq!(s, "hello"),
+            other => panic!("expected name=hello, got: {:?}", other),
+        }
+        match &doc.fields["score"] {
+            FieldValue::Single(Value::Integer(99)) => {}
+            other => panic!("expected score=99, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_v2_newest_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("val");
+        store.save_field_dict().unwrap();
+
+        let val_idx = store.field_to_idx["val"];
+
+        // Append val=1, then val=2
+        let v1 = rmp_serde::to_vec(&PackedValue::I(1)).unwrap();
+        let v2 = rmp_serde::to_vec(&PackedValue::I(2)).unwrap();
+        store.append_tuple(10, val_idx, &v1).unwrap();
+        store.append_tuple(10, val_idx, &v2).unwrap();
+
+        let doc = store.get(10).unwrap().unwrap();
+        match &doc.fields["val"] {
+            FieldValue::Single(Value::Integer(2)) => {}
+            other => panic!("expected val=2, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_v2_multiple_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("x");
+        store.save_field_dict().unwrap();
+        let x_idx = store.field_to_idx["x"];
+
+        // Slots 0, 1, 2 all in shard 0 (SHARD_SHIFT=9 → first 512 slots in shard 0)
+        for slot in 0..3u32 {
+            let val = rmp_serde::to_vec(&PackedValue::I(slot as i64 * 10)).unwrap();
+            store.append_tuple(slot, x_idx, &val).unwrap();
+        }
+
+        for slot in 0..3u32 {
+            let doc = store.get(slot).unwrap().unwrap();
+            match &doc.fields["x"] {
+                FieldValue::Single(Value::Integer(v)) => assert_eq!(*v, slot as i64 * 10),
+                other => panic!("slot {slot}: expected x={}, got: {:?}", slot * 10, other),
+            }
+        }
+        // Non-existent slot returns None
+        assert!(store.get(100).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_v2_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("val");
+        store.save_field_dict().unwrap();
+        let val_idx = store.field_to_idx["val"];
+
+        // Append stale entries: val=1, val=2, val=3 for slot 5
+        for i in 1..=3i64 {
+            let v = rmp_serde::to_vec(&PackedValue::I(i)).unwrap();
+            store.append_tuple(5, val_idx, &v).unwrap();
+        }
+
+        let sid = DocStore::shard_id(5);
+        let path = DocStore::shard_path(&docs_dir, sid);
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        // Compact
+        store.compact_shard(sid).unwrap();
+
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after < size_before,
+            "compacted file ({size_after}) should be smaller than original ({size_before})"
+        );
+
+        // Verify newest value survived
+        let doc = store.get(5).unwrap().unwrap();
+        match &doc.fields["val"] {
+            FieldValue::Single(Value::Integer(3)) => {}
+            other => panic!("expected val=3 after compaction, got: {:?}", other),
+        }
+
+        // Verify header num_tuples was updated
+        let data = std::fs::read(&path).unwrap();
+        let num_tuples = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        assert_eq!(num_tuples, 1, "compacted shard should have 1 tuple");
+    }
+
+    #[test]
+    fn test_v2_format_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+
+        // Write a V1 shard
+        {
+            let mut store = DocStore::open(&docs_dir).unwrap();
+            let doc = StoredDoc {
+                fields: vec![("x".to_string(), FieldValue::Single(Value::Integer(1)))]
+                    .into_iter()
+                    .collect(),
+                schema_version: 0,
+            };
+            store.put(0, &doc).unwrap();
+        }
+
+        // Write a V2 shard (different shard — use slot 512+ for shard 1)
+        {
+            let mut store = DocStore::open(&docs_dir).unwrap();
+            store.ensure_field_idx("x"); // already exists but need the idx
+            store.save_field_dict().unwrap();
+            let x_idx = store.field_to_idx["x"];
+            let val = rmp_serde::to_vec(&PackedValue::I(2)).unwrap();
+            store.append_tuple(512, x_idx, &val).unwrap();
+        }
+
+        // Read both — auto-detection should work
+        let store = DocStore::open(&docs_dir).unwrap();
+
+        // V1 shard read
+        let doc_v1 = store.get(0).unwrap().unwrap();
+        match &doc_v1.fields["x"] {
+            FieldValue::Single(Value::Integer(1)) => {}
+            other => panic!("v1 read: expected x=1, got: {:?}", other),
+        }
+
+        // V2 shard read
+        let doc_v2 = store.get(512).unwrap().unwrap();
+        match &doc_v2.fields["x"] {
+            FieldValue::Single(Value::Integer(2)) => {}
+            other => panic!("v2 read: expected x=2, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_v2_batch_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("name");
+        store.ensure_field_idx("age");
+        store.ensure_field_idx("tags");
+        store.save_field_dict().unwrap();
+
+        let name_idx = store.field_to_idx["name"];
+        let age_idx = store.field_to_idx["age"];
+        let tags_idx = store.field_to_idx["tags"];
+
+        // Simulate batch from multiple "CSVs"
+        let mut tuples = Vec::new();
+
+        // CSV 1: names
+        for slot in 0..5u32 {
+            let val = rmp_serde::to_vec(&PackedValue::S(format!("user_{slot}"))).unwrap();
+            tuples.push((slot, name_idx, val));
+        }
+        // CSV 2: ages
+        for slot in 0..5u32 {
+            let val = rmp_serde::to_vec(&PackedValue::I(20 + slot as i64)).unwrap();
+            tuples.push((slot, age_idx, val));
+        }
+        // CSV 3: tags (multi-value)
+        for slot in 0..5u32 {
+            let val = rmp_serde::to_vec(&PackedValue::Mi(vec![slot as i64, slot as i64 + 100]))
+                .unwrap();
+            tuples.push((slot, tags_idx, val));
+        }
+
+        store.append_tuples_batch(tuples).unwrap();
+
+        // Verify all fields assembled per slot
+        for slot in 0..5u32 {
+            let doc = store.get(slot).unwrap().unwrap();
+            assert_eq!(doc.fields.len(), 3, "slot {slot} should have 3 fields");
+            match &doc.fields["name"] {
+                FieldValue::Single(Value::String(s)) => {
+                    assert_eq!(s, &format!("user_{slot}"));
+                }
+                other => panic!("slot {slot} name: {:?}", other),
+            }
+            match &doc.fields["age"] {
+                FieldValue::Single(Value::Integer(v)) => {
+                    assert_eq!(*v, 20 + slot as i64);
+                }
+                other => panic!("slot {slot} age: {:?}", other),
+            }
+            match &doc.fields["tags"] {
+                FieldValue::Multi(vs) => {
+                    assert_eq!(vs.len(), 2);
+                }
+                other => panic!("slot {slot} tags: {:?}", other),
+            }
+        }
     }
 }
