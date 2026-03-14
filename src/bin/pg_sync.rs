@@ -182,11 +182,8 @@ async fn main() {
             };
 
             // Phase 1: Download CSVs to staging dir (reuses .done markers)
-            let index_storage_dir_ref = index_storage_dir.clone();
-            let stage_dir = index_storage_dir_ref
-                .parent()
-                .unwrap_or(&index_storage_dir_ref)
-                .join("load_stage");
+            // stage_dir = {data_dir}/indexes/{name}/load_stage/
+            let stage_dir = index_storage_dir.join("load_stage");
             bulk_loader::download_all_tables(&pool, &stage_dir)
                 .await
                 .unwrap_or_else(|e| {
