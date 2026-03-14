@@ -1622,14 +1622,14 @@ impl ConcurrentEngine {
 
                             let shard_snapshots: Vec<(
                                 crate::bound_store::ShardKey,
-                                Vec<(u32, Vec<crate::cache::CanonicalClause>, roaring::RoaringBitmap)>,
+                                Vec<(u32, Vec<crate::cache::CanonicalClause>, roaring::RoaringBitmap, Option<Vec<u64>>)>,
                             )> = all_dirty
                                 .iter()
                                 .map(|sk| {
                                     let entries = uc.entries_for_shard(sk);
                                     let data: Vec<_> = entries
                                         .into_iter()
-                                        .map(|(id, key, bm)| (id, key.filter_clauses, bm))
+                                        .map(|(id, key, bm, sk)| (id, key.filter_clauses, bm, sk))
                                         .collect();
                                     (sk.clone(), data)
                                 })
@@ -1668,7 +1668,7 @@ impl ConcurrentEngine {
                                     // not tombstoned)
                                     let uc = merge_unified_cache.lock();
                                     let ram_ids: std::collections::HashSet<u32> =
-                                        ram_entries.iter().map(|(id, _, _)| *id).collect();
+                                        ram_entries.iter().map(|(id, _, _, _)| *id).collect();
                                     for de in disk_entries {
                                         if !ram_ids.contains(&de.entry_id)
                                             && !uc.meta().is_tombstoned(de.entry_id)
@@ -1681,11 +1681,12 @@ impl ConcurrentEngine {
                                 }
 
                                 // Add RAM entries
-                                for (id, clauses, bm) in ram_entries {
+                                for (id, clauses, bm, sk) in ram_entries {
                                     merged.push(crate::bound_store::ShardEntry {
                                         entry_id: *id,
                                         filter_clauses: clauses.clone(),
                                         bitmap: bm.clone(),
+                                        sorted_keys: sk.clone(),
                                     });
                                 }
 
@@ -2546,6 +2547,7 @@ impl ConcurrentEngine {
                             config.initial_capacity,
                             config.max_capacity,
                             direction,
+                            se.sorted_keys,
                             &value_fn,
                         );
                         uc.insert_restored_entry(key, entry);

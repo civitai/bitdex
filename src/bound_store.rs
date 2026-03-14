@@ -49,7 +49,7 @@ use crate::query::SortDirection;
 // [u32 next_entry_id]
 
 const META_VERSION: u32 = 1;
-const SHARD_VERSION: u32 = 1;
+const SHARD_VERSION: u32 = 2; // v2: adds sorted_keys section
 
 /// Registration data for a single cache entry (persisted in meta.bin).
 #[derive(Debug, Clone)]
@@ -79,6 +79,9 @@ pub struct ShardEntry {
     pub entry_id: CacheEntryId,
     pub filter_clauses: Vec<CanonicalClause>,
     pub bitmap: RoaringBitmap,
+    /// Pre-computed sorted keys for binary search pagination.
+    /// Packed as (sort_value << 32 | slot_id), sorted in traversal order.
+    pub sorted_keys: Option<Vec<u64>>,
 }
 
 /// Key identifying a shard file: (sort_field, direction).
@@ -400,24 +403,29 @@ fn deserialize_meta(data: &[u8]) -> Result<MetaFile> {
 
 // ── Shard Serialization ─────────────────────────────────────────────────────
 //
-// [u32 version = 1]
+// v2 format (v1 omits sorted_keys fields and section):
+// [u32 version = 2]
 // [u32 num_entries]
 // [index: N × {
 //     u32 entry_id
-//     u32 key_offset     (into key section)
+//     u32 key_offset              (into key section)
 //     u32 key_length
-//     u32 bitmap_offset  (into bitmap section)
+//     u32 bitmap_offset           (into bitmap section)
 //     u32 bitmap_length
+//     u32 sorted_keys_offset      (into sorted_keys section, v2 only)
+//     u32 sorted_keys_length      (raw bytes, v2 only)
 // }]
 // [key section: concatenated msgpack keys]
 // [bitmap section: concatenated serialized roaring bitmaps]
+// [sorted_keys section: concatenated raw u64 LE arrays (v2 only)]
 
-const SHARD_INDEX_ENTRY_SIZE: usize = 20; // 5 × u32
+const SHARD_INDEX_ENTRY_SIZE: usize = 28; // 7 × u32 (v2: +sorted_keys_offset, +sorted_keys_len)
 
 fn serialize_shard(entries: &[ShardEntry]) -> Result<Vec<u8>> {
-    // Pre-serialize all keys and bitmaps
+    // Pre-serialize all keys, bitmaps, and sorted_keys
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
     let mut bitmaps: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+    let mut sorted_keys_bufs: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
 
     for entry in entries {
         let key_bytes = rmp_serde::to_vec(&entry.filter_clauses)
@@ -429,12 +437,26 @@ fn serialize_shard(entries: &[ShardEntry]) -> Result<Vec<u8>> {
             .serialize_into(&mut bm_buf)
             .map_err(|e| BitdexError::DocStore(format!("serialize shard bitmap: {e}")))?;
         bitmaps.push(bm_buf);
+
+        // Serialize sorted_keys as raw u64 LE bytes
+        let sk_buf = match &entry.sorted_keys {
+            Some(sk) => {
+                let mut buf = Vec::with_capacity(sk.len() * 8);
+                for &val in sk.iter() {
+                    buf.extend_from_slice(&val.to_le_bytes());
+                }
+                buf
+            }
+            None => Vec::new(),
+        };
+        sorted_keys_bufs.push(sk_buf);
     }
 
     let header_size = 8 + entries.len() * SHARD_INDEX_ENTRY_SIZE;
     let key_section_size: usize = keys.iter().map(|k| k.len()).sum();
     let bitmap_section_size: usize = bitmaps.iter().map(|b| b.len()).sum();
-    let total_size = header_size + key_section_size + bitmap_section_size;
+    let sorted_keys_section_size: usize = sorted_keys_bufs.iter().map(|s| s.len()).sum();
+    let total_size = header_size + key_section_size + bitmap_section_size + sorted_keys_section_size;
 
     let mut buf = Vec::with_capacity(total_size);
 
@@ -442,17 +464,21 @@ fn serialize_shard(entries: &[ShardEntry]) -> Result<Vec<u8>> {
     buf.extend_from_slice(&SHARD_VERSION.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
-    // Index
+    // Index (7 × u32 per entry: entry_id, key_offset, key_length, bitmap_offset, bitmap_length, sorted_keys_offset, sorted_keys_length)
     let mut key_offset: u32 = 0;
     let mut bitmap_offset: u32 = 0;
+    let mut sk_offset: u32 = 0;
     for i in 0..entries.len() {
         buf.extend_from_slice(&entries[i].entry_id.to_le_bytes());
         buf.extend_from_slice(&key_offset.to_le_bytes());
         buf.extend_from_slice(&(keys[i].len() as u32).to_le_bytes());
         buf.extend_from_slice(&bitmap_offset.to_le_bytes());
         buf.extend_from_slice(&(bitmaps[i].len() as u32).to_le_bytes());
+        buf.extend_from_slice(&sk_offset.to_le_bytes());
+        buf.extend_from_slice(&(sorted_keys_bufs[i].len() as u32).to_le_bytes());
         key_offset += keys[i].len() as u32;
         bitmap_offset += bitmaps[i].len() as u32;
+        sk_offset += sorted_keys_bufs[i].len() as u32;
     }
 
     // Key section
@@ -465,6 +491,11 @@ fn serialize_shard(entries: &[ShardEntry]) -> Result<Vec<u8>> {
         buf.extend_from_slice(bm);
     }
 
+    // Sorted keys section
+    for sk in &sorted_keys_bufs {
+        buf.extend_from_slice(sk);
+    }
+
     Ok(buf)
 }
 
@@ -472,12 +503,15 @@ fn deserialize_shard(data: &[u8]) -> Result<Vec<ShardEntry>> {
     let mut pos = 0;
 
     let version = read_u32(data, &mut pos)?;
-    if version != SHARD_VERSION {
+    if version != 1 && version != SHARD_VERSION {
         return Err(BitdexError::DocStore(format!("unsupported shard version: {version}")));
     }
 
+    let is_v2 = version >= 2;
+    let index_entry_size = if is_v2 { SHARD_INDEX_ENTRY_SIZE } else { 20 }; // v1: 5 × u32 = 20
+
     let num_entries = read_u32(data, &mut pos)? as usize;
-    let index_size = num_entries * SHARD_INDEX_ENTRY_SIZE;
+    let index_size = num_entries * index_entry_size;
     if pos + index_size > data.len() {
         return Err(BitdexError::DocStore("shard index truncated".into()));
     }
@@ -489,16 +523,30 @@ fn deserialize_shard(data: &[u8]) -> Result<Vec<ShardEntry>> {
         key_length: u32,
         bitmap_offset: u32,
         bitmap_length: u32,
+        sorted_keys_offset: u32,
+        sorted_keys_length: u32,
     }
 
     let mut index = Vec::with_capacity(num_entries);
     for _ in 0..num_entries {
+        let entry_id = read_u32(data, &mut pos)?;
+        let key_offset = read_u32(data, &mut pos)?;
+        let key_length = read_u32(data, &mut pos)?;
+        let bitmap_offset = read_u32(data, &mut pos)?;
+        let bitmap_length = read_u32(data, &mut pos)?;
+        let (sorted_keys_offset, sorted_keys_length) = if is_v2 {
+            (read_u32(data, &mut pos)?, read_u32(data, &mut pos)?)
+        } else {
+            (0, 0)
+        };
         index.push(IndexEntry {
-            entry_id: read_u32(data, &mut pos)?,
-            key_offset: read_u32(data, &mut pos)?,
-            key_length: read_u32(data, &mut pos)?,
-            bitmap_offset: read_u32(data, &mut pos)?,
-            bitmap_length: read_u32(data, &mut pos)?,
+            entry_id,
+            key_offset,
+            key_length,
+            bitmap_offset,
+            bitmap_length,
+            sorted_keys_offset,
+            sorted_keys_length,
         });
     }
 
@@ -506,6 +554,8 @@ fn deserialize_shard(data: &[u8]) -> Result<Vec<ShardEntry>> {
     let key_section_start = pos;
     let key_section_size: usize = index.iter().map(|e| e.key_length as usize).sum();
     let bitmap_section_start = key_section_start + key_section_size;
+    let bitmap_section_size: usize = index.iter().map(|e| e.bitmap_length as usize).sum();
+    let sorted_keys_section_start = bitmap_section_start + bitmap_section_size;
 
     let mut entries = Vec::with_capacity(num_entries);
     for ie in &index {
@@ -527,10 +577,37 @@ fn deserialize_shard(data: &[u8]) -> Result<Vec<ShardEntry>> {
         let bitmap = RoaringBitmap::deserialize_from(&data[bs..be])
             .map_err(|e| BitdexError::DocStore(format!("deserialize shard bitmap: {e}")))?;
 
+        // Deserialize sorted_keys (v2 only)
+        let sorted_keys = if ie.sorted_keys_length > 0 {
+            let sks = sorted_keys_section_start + ie.sorted_keys_offset as usize;
+            let ske = sks + ie.sorted_keys_length as usize;
+            if ske > data.len() {
+                return Err(BitdexError::DocStore("shard sorted_keys data truncated".into()));
+            }
+            let sk_data = &data[sks..ske];
+            if sk_data.len() % 8 != 0 {
+                return Err(BitdexError::DocStore("sorted_keys length not aligned to u64".into()));
+            }
+            let mut keys = Vec::with_capacity(sk_data.len() / 8);
+            let mut sk_pos = 0;
+            while sk_pos + 8 <= sk_data.len() {
+                let val = u64::from_le_bytes([
+                    sk_data[sk_pos], sk_data[sk_pos + 1], sk_data[sk_pos + 2], sk_data[sk_pos + 3],
+                    sk_data[sk_pos + 4], sk_data[sk_pos + 5], sk_data[sk_pos + 6], sk_data[sk_pos + 7],
+                ]);
+                keys.push(val);
+                sk_pos += 8;
+            }
+            Some(keys)
+        } else {
+            None
+        };
+
         entries.push(ShardEntry {
             entry_id: ie.entry_id,
             filter_clauses,
             bitmap,
+            sorted_keys,
         });
     }
 
@@ -731,6 +808,7 @@ mod tests {
                 entry_id: 0,
                 filter_clauses: vec![make_clause("nsfwLevel", "1")],
                 bitmap: bm1.clone(),
+                sorted_keys: None,
             },
             ShardEntry {
                 entry_id: 3,
@@ -739,6 +817,7 @@ mod tests {
                     make_clause("onSite", "true"),
                 ],
                 bitmap: bm2.clone(),
+                sorted_keys: None,
             },
         ];
 
@@ -794,6 +873,7 @@ mod tests {
             entry_id: 0,
             filter_clauses: vec![make_clause("nsfwLevel", "1")],
             bitmap: bm.clone(),
+            sorted_keys: None,
         }];
         store.write_shard(&key, &entries).unwrap();
 
@@ -874,6 +954,108 @@ mod tests {
 
         // Deleting non-existent shard is fine
         store.delete_shard(&key).unwrap();
+    }
+
+    #[test]
+    fn test_shard_round_trip_with_sorted_keys() {
+        let mut bm = RoaringBitmap::new();
+        bm.insert(10);
+        bm.insert(20);
+        bm.insert(30);
+
+        // sorted_keys: (sort_value << 32) | slot_id, sorted descending
+        let sorted_keys = vec![
+            (500u64 << 32) | 30,
+            (300u64 << 32) | 10,
+            (100u64 << 32) | 20,
+        ];
+
+        let entries = vec![
+            ShardEntry {
+                entry_id: 0,
+                filter_clauses: vec![make_clause("nsfwLevel", "1")],
+                bitmap: bm.clone(),
+                sorted_keys: Some(sorted_keys.clone()),
+            },
+            ShardEntry {
+                entry_id: 1,
+                filter_clauses: vec![make_clause("onSite", "true")],
+                bitmap: bm.clone(),
+                sorted_keys: None, // Entry without sorted_keys
+            },
+        ];
+
+        let buf = serialize_shard(&entries).unwrap();
+        let restored = deserialize_shard(&buf).unwrap();
+
+        assert_eq!(restored.len(), 2);
+
+        // First entry has sorted_keys
+        assert_eq!(restored[0].entry_id, 0);
+        assert_eq!(restored[0].bitmap, bm);
+        assert_eq!(restored[0].sorted_keys, Some(sorted_keys));
+
+        // Second entry has no sorted_keys
+        assert_eq!(restored[1].entry_id, 1);
+        assert_eq!(restored[1].bitmap, bm);
+        assert!(restored[1].sorted_keys.is_none());
+    }
+
+    #[test]
+    fn test_shard_v1_compat_loads_without_sorted_keys() {
+        // Manually build a v1 shard (5 × u32 index entries, no sorted_keys section)
+        let mut bm = RoaringBitmap::new();
+        bm.insert(42);
+
+        let key_bytes = rmp_serde::to_vec(&vec![make_clause("nsfwLevel", "1")]).unwrap();
+        let mut bm_buf = Vec::new();
+        bm.serialize_into(&mut bm_buf).unwrap();
+
+        let mut buf = Vec::new();
+        // Version 1
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        // 1 entry
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        // Index: entry_id, key_offset, key_length, bitmap_offset, bitmap_length (5 × u32)
+        buf.extend_from_slice(&7u32.to_le_bytes()); // entry_id
+        buf.extend_from_slice(&0u32.to_le_bytes()); // key_offset
+        buf.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes()); // key_length
+        buf.extend_from_slice(&0u32.to_le_bytes()); // bitmap_offset
+        buf.extend_from_slice(&(bm_buf.len() as u32).to_le_bytes()); // bitmap_length
+        // Key section
+        buf.extend_from_slice(&key_bytes);
+        // Bitmap section
+        buf.extend_from_slice(&bm_buf);
+
+        let restored = deserialize_shard(&buf).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].entry_id, 7);
+        assert_eq!(restored[0].bitmap, bm);
+        assert!(restored[0].sorted_keys.is_none()); // v1 has no sorted_keys
+    }
+
+    #[test]
+    fn test_shard_sorted_keys_large_values() {
+        // Test with realistic packed keys at the u64 boundary
+        let mut bm = RoaringBitmap::new();
+        let mut sorted_keys = Vec::new();
+        for i in 0..100u32 {
+            bm.insert(i);
+            sorted_keys.push(((u32::MAX - i) as u64) << 32 | (i as u64));
+        }
+
+        let entries = vec![ShardEntry {
+            entry_id: 42,
+            filter_clauses: vec![make_clause("reactionCount", "100")],
+            bitmap: bm.clone(),
+            sorted_keys: Some(sorted_keys.clone()),
+        }];
+
+        let buf = serialize_shard(&entries).unwrap();
+        let restored = deserialize_shard(&buf).unwrap();
+
+        assert_eq!(restored[0].sorted_keys.as_ref().unwrap().len(), 100);
+        assert_eq!(restored[0].sorted_keys, Some(sorted_keys));
     }
 
     #[test]

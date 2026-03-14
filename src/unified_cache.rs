@@ -164,13 +164,17 @@ impl UnifiedEntry {
     }
 
     /// Create an entry restored from disk (shard load).
-    /// Has bitmap but no sorted_keys/radix — those are reconstructed lazily.
+    ///
+    /// If `persisted_sorted_keys` is provided (from ucpack v2), uses them directly —
+    /// skipping the expensive `reconstruct_value()` calls (4000 × 32 = 128K bitmap contains).
+    /// If not provided (v1 shards or None), falls back to rebuilding from `value_fn`.
     pub fn from_restored(
         bitmap: RoaringBitmap,
         meta_id: CacheEntryId,
         initial_capacity: usize,
         max_capacity: usize,
         direction: SortDirection,
+        persisted_sorted_keys: Option<Vec<u64>>,
         value_fn: impl Fn(u32) -> u32,
     ) -> Self {
         let card = bitmap.len() as usize;
@@ -180,12 +184,17 @@ impl UnifiedEntry {
             initial_capacity
         };
 
-        // Build sorted_keys for fast binary search pagination
-        let slots: Vec<u32> = bitmap.iter().collect();
-        let sorted_keys = if !slots.is_empty() && card <= max_capacity {
-            Some(Arc::new(Self::build_sorted_keys(&slots, direction, &value_fn)))
+        // Use persisted sorted_keys if available, otherwise rebuild from value_fn
+        let sorted_keys = if let Some(sk) = persisted_sorted_keys {
+            if !sk.is_empty() { Some(Arc::new(sk)) } else { None }
         } else {
-            None
+            // Fallback: rebuild from bitmap + value_fn (v1 compat path)
+            let slots: Vec<u32> = bitmap.iter().collect();
+            if !slots.is_empty() && card <= max_capacity {
+                Some(Arc::new(Self::build_sorted_keys(&slots, direction, &value_fn)))
+            } else {
+                None
+            }
         };
 
         // Compute min_tracked_value from the sorted keys
@@ -890,12 +899,15 @@ impl UnifiedCache {
     }
 
     /// Collect entries for a specific shard (for merge thread shard write).
-    /// Returns (meta_id, key, bitmap_clone) for each entry in the shard.
-    pub fn entries_for_shard(&self, shard_key: &ShardKey) -> Vec<(CacheEntryId, UnifiedKey, RoaringBitmap)> {
+    /// Returns (meta_id, key, bitmap_clone, sorted_keys_clone) for each entry in the shard.
+    pub fn entries_for_shard(&self, shard_key: &ShardKey) -> Vec<(CacheEntryId, UnifiedKey, RoaringBitmap, Option<Vec<u64>>)> {
         self.entries
             .iter()
             .filter(|(key, _)| key.sort_field == shard_key.sort_field && key.direction == shard_key.direction)
-            .map(|(key, entry)| (entry.meta_id, key.clone(), entry.bitmap.as_ref().clone()))
+            .map(|(key, entry)| {
+                let sk = entry.sorted_keys().map(|arc| arc.as_ref().clone());
+                (entry.meta_id, key.clone(), entry.bitmap.as_ref().clone(), sk)
+            })
             .collect()
     }
 
