@@ -916,6 +916,34 @@ impl BulkWriter {
         });
     }
 
+    /// Write pre-encoded docs to fresh shard files. No read-back, no merge.
+    /// For bulk load where every slot is new — skips the read-modify-write cycle.
+    /// No nested rayon — caller handles parallelism.
+    pub fn write_batch_fresh(&self, encoded: Vec<(u32, Vec<u8>)>) {
+        if encoded.is_empty() {
+            return;
+        }
+
+        // Group by docstore shard
+        let mut by_shard: HashMap<u32, Vec<(u32, Vec<u8>)>> = HashMap::new();
+        for (slot, bytes) in encoded {
+            by_shard
+                .entry(DocStore::shard_id(slot))
+                .or_default()
+                .push((slot, bytes));
+        }
+
+        // Write each shard file directly — no read-back, no locks needed
+        // (each scratch shard maps to non-overlapping docstore shards)
+        for (sid, mut entries) in by_shard {
+            entries.sort_by_key(|e| e.0);
+            let path = DocStore::shard_path(&self.root, sid);
+            if let Err(e) = DocStore::write_shard_file(&path, &entries) {
+                eprintln!("BulkWriter: shard {} write failed: {e}", sid);
+            }
+        }
+    }
+
     /// Encode a StoredDoc to msgpack bytes using the snapshotted field dictionary.
     pub fn encode_doc(&self, doc: &StoredDoc) -> Vec<u8> {
         let mut pairs: Vec<(u16, PackedValue)> = Vec::with_capacity(doc.fields.len());
