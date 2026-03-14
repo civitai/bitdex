@@ -799,7 +799,7 @@ pub async fn run_bulk_load_copy(
     eprintln!("\n=== Applying bitmaps to staging ===");
     let merge_start = Instant::now();
 
-    let merged = image_accum
+    let mut merged = image_accum
         .merge(tag_accum)
         .merge(tool_accum)
         .merge(tech_accum)
@@ -807,14 +807,16 @@ pub async fn run_bulk_load_copy(
 
     let alive_bitmap = merged.alive.clone();
 
-    // Clone the multi-value filter maps for docstore reconstruction.
-    // These bitmaps are needed during finalization to reconstruct per-slot
-    // tag/tool/technique/modelVersion lists without the arena.
-    let tag_bitmaps = merged.filter_maps.get("tagIds").cloned().unwrap_or_default();
-    let tool_bitmaps = merged.filter_maps.get("toolIds").cloned().unwrap_or_default();
-    let technique_bitmaps = merged.filter_maps.get("techniqueIds").cloned().unwrap_or_default();
-    let mv_bitmaps = merged.filter_maps.get("modelVersionIds").cloned().unwrap_or_default();
+    // Extract multi-value filter maps by REMOVING (not cloning) from merged.
+    // This avoids duplicating 6-19GB of roaring bitmaps in memory.
+    // We hold references to these for finalization while applying the rest to staging.
+    let tag_bitmaps = merged.filter_maps.remove("tagIds").unwrap_or_default();
+    let tool_bitmaps = merged.filter_maps.remove("toolIds").unwrap_or_default();
+    let technique_bitmaps = merged.filter_maps.remove("techniqueIds").unwrap_or_default();
+    let mv_bitmaps = merged.filter_maps.remove("modelVersionIds").unwrap_or_default();
 
+    // Apply remaining bitmaps (scalar filters + sorts) to engine staging.
+    // Multi-value bitmaps applied separately below after finalization.
     let mut staging = engine.clone_staging();
     ConcurrentEngine::apply_bitmap_maps(
         &mut staging,
@@ -864,6 +866,23 @@ pub async fn run_bulk_load_copy(
         finalize_start.elapsed().as_secs_f64(),
         docs_finalized as f64 / finalize_start.elapsed().as_secs_f64().max(0.001)
     );
+
+    // Apply multi-value bitmaps to engine (removed earlier to avoid clone).
+    // These are needed for query filtering.
+    let mut mv_filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
+    mv_filter_maps.insert("tagIds".to_string(), tag_bitmaps);
+    mv_filter_maps.insert("toolIds".to_string(), tool_bitmaps);
+    mv_filter_maps.insert("techniqueIds".to_string(), technique_bitmaps);
+    mv_filter_maps.insert("modelVersionIds".to_string(), mv_bitmaps);
+    let mut staging = engine.clone_staging();
+    ConcurrentEngine::apply_bitmap_maps(
+        &mut staging,
+        mv_filter_maps,
+        HashMap::new(), // no sort maps
+        RoaringBitmap::new(), // alive already applied
+    );
+    engine.publish_staging(staging);
+    eprintln!("Multi-value bitmaps applied to engine.");
 
     // Step 7: Save snapshot
     progress.set_phase(5); // saving
