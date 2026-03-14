@@ -1109,9 +1109,9 @@ impl ConcurrentEngine {
                                     .or_insert_with(|| AtomicU64::new(0))
                                     .fetch_add(count as u64, Ordering::Relaxed);
 
-                                eprintln!(
-                                    "Evicted {} idle values from filter '{}' (idle_ms={}, now={})",
-                                    count, field_name, idle_ms, now_ms
+                                tracing::info!(
+                                    "Evicted {} idle values from filter '{}' (idle_threshold={}s)",
+                                    count, field_name, idle_seconds
                                 );
                                 any_evicted = true;
                             }

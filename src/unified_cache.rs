@@ -532,6 +532,11 @@ impl UnifiedCache {
             .map(|(key, _)| key.clone())?;
 
         if let Some(evicted) = self.entries.remove(&lru_key) {
+            tracing::info!(
+                "Cache evicted entry: sort={} {:?} | filters={} | card={} | bytes={}",
+                lru_key.sort_field, lru_key.direction, lru_key.filter_clauses.len(),
+                evicted.cardinality(), evicted.memory_bytes()
+            );
             self.total_bytes = self.total_bytes.saturating_sub(evicted.memory_bytes());
             self.meta_id_to_key.remove(&evicted.meta_id);
             self.meta.deregister(evicted.meta_id);
