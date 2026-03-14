@@ -227,7 +227,17 @@ async fn main() {
                 let _ = tx.send(());
             }
 
-            engine.exit_loading_mode();
+            // Use save_unload variant to avoid the staging.clone() RSS spike.
+            // Plain exit_loading_mode() doubles memory via Arc refcount bump;
+            // save_unload saves directly from staging then drops bitmaps.
+            eprintln!("Exiting loading mode (save + unload to avoid RSS spike)...");
+            engine
+                .exit_loading_mode_and_save_unload()
+                .unwrap_or_else(|e| {
+                    eprintln!("exit_loading_mode_and_save_unload failed: {e}");
+                    // Fall back to plain exit if save_unload fails
+                    engine.exit_loading_mode();
+                });
 
             eprintln!(
                 "Bulk load complete: {} records in {:.1}s ({:.0}/s)",
