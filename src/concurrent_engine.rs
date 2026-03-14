@@ -1073,7 +1073,7 @@ impl ConcurrentEngine {
                                         for (i, (bucket_name, _)) in rebuild_info.iter().enumerate() {
                                             // Capture old bitmap for diff computation
                                             let old_bm = tb.get_bucket(bucket_name)
-                                                .map(|b| b.bitmap().clone())
+                                                .map(|b| RoaringBitmap::clone(b.bitmap()))
                                                 .unwrap_or_default();
                                             let new_bm = &bitmaps[i];
                                             let dropped = &old_bm - new_bm;

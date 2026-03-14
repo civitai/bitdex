@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
@@ -13,7 +14,7 @@ pub struct TimeBucket {
     /// How often to rebuild this bucket's bitmap, in seconds.
     pub refresh_interval_secs: u64,
     /// Pre-computed bitmap of slots whose timestamp value falls within [now - duration, now].
-    bitmap: RoaringBitmap,
+    bitmap: Arc<RoaringBitmap>,
     /// Unix timestamp (seconds) when this bucket was last rebuilt.
     last_refreshed: u64,
 }
@@ -24,7 +25,7 @@ impl TimeBucket {
             name,
             duration_secs,
             refresh_interval_secs,
-            bitmap: RoaringBitmap::new(),
+            bitmap: Arc::new(RoaringBitmap::new()),
             last_refreshed: 0,
         }
     }
@@ -34,7 +35,7 @@ impl TimeBucket {
         now.saturating_sub(self.last_refreshed) >= self.refresh_interval_secs
     }
 
-    pub fn bitmap(&self) -> &RoaringBitmap {
+    pub fn bitmap(&self) -> &Arc<RoaringBitmap> {
         &self.bitmap
     }
 
@@ -44,12 +45,12 @@ impl TimeBucket {
 
     /// Add a slot to this bucket's bitmap (live maintenance on insert).
     pub fn insert_slot(&mut self, slot: u32) {
-        self.bitmap.insert(slot);
+        Arc::make_mut(&mut self.bitmap).insert(slot);
     }
 
     /// Remove a slot from this bucket's bitmap (live maintenance on delete).
     pub fn remove_slot(&mut self, slot: u32) {
-        self.bitmap.remove(slot);
+        Arc::make_mut(&mut self.bitmap).remove(slot);
     }
 }
 
@@ -110,7 +111,7 @@ impl TimeBucketManager {
     pub fn load_persisted(&mut self, persisted: &[(String, RoaringBitmap)], now: u64) {
         for (name, bitmap) in persisted {
             if let Some(bucket) = self.buckets.get_mut(name.as_str()) {
-                bucket.bitmap = bitmap.clone();
+                bucket.bitmap = Arc::new(bitmap.clone());
                 bucket.last_refreshed = now;
             }
         }
@@ -120,7 +121,7 @@ impl TimeBucketManager {
     pub fn all_buckets(&self) -> impl Iterator<Item = (&str, &RoaringBitmap)> {
         self.sorted_names.iter().map(move |name| {
             let bucket = &self.buckets[name.as_str()];
-            (name.as_str(), &bucket.bitmap)
+            (name.as_str(), bucket.bitmap.as_ref())
         })
     }
 
@@ -160,7 +161,7 @@ impl TimeBucketManager {
             }
         }
 
-        bucket.bitmap = new_bitmap;
+        bucket.bitmap = Arc::new(new_bitmap);
         bucket.last_refreshed = now;
     }
 
@@ -178,7 +179,7 @@ impl TimeBucketManager {
         now: u64,
     ) {
         if let Some(bucket) = self.buckets.get_mut(bucket_name) {
-            bucket.bitmap = bitmap;
+            bucket.bitmap = Arc::new(bitmap);
             bucket.last_refreshed = now;
         }
     }

@@ -232,7 +232,7 @@ fn snap_clause(clause: &FilterClause, ctx: &BucketSnapContext<'_>) -> FilterClau
                         FilterClause::BucketBitmap {
                             field: field.clone(),
                             bucket_name: bucket_name.to_string(),
-                            bitmap: Arc::new(bucket.bitmap().clone()),
+                            bitmap: Arc::clone(bucket.bitmap()),
                         }
                     } else {
                         FilterClause::BucketBitmap {
@@ -282,7 +282,7 @@ fn try_snap_to_bucket(
     Some(FilterClause::BucketBitmap {
         field: field.to_string(),
         bucket_name: bucket_name.to_string(),
-        bitmap: Arc::new(bucket.bitmap().clone()),
+        bitmap: Arc::clone(bucket.bitmap()),
     })
 }
 

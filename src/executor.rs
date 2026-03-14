@@ -415,7 +415,7 @@ impl<'a> QueryExecutor<'a> {
                             let duration = self.now_unix.saturating_sub(threshold);
                             if let Some(bucket_name) = tb.snap_duration(duration, 0.10) {
                                 if let Some(bucket) = tb.get_bucket(bucket_name) {
-                                    return Ok(bucket.bitmap().clone());
+                                    return Ok(RoaringBitmap::clone(bucket.bitmap()));
                                 }
                             }
                         }
