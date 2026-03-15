@@ -600,17 +600,29 @@ impl ConcurrentEngine {
             crossbeam_channel::bounded(32);
         docstore.set_compact_channel(compact_tx.clone());
 
+        // Extract root and v2_writers BEFORE wrapping docstore in Mutex.
+        // The compaction worker uses these directly — no full DocStore lock needed.
+        let compact_root = docstore.root().to_path_buf();
+        let compact_v2_writers = docstore.v2_writers_handle();
+
         let docstore = Arc::new(parking_lot::Mutex::new(docstore));
 
-        // Spawn compaction worker thread. Loops on compact_rx, compacting each
-        // shard from the pre-loaded buffer. Exits when the sender is dropped.
+        // Spawn compaction worker thread. Uses the standalone compact_shard_from_buffer
+        // with pre-extracted root/v2_writers — never holds the DocStore mutex during I/O.
         let compact_handle = {
-            let docstore = Arc::clone(&docstore);
             thread::spawn(move || {
                 while let Ok((shard_id, data)) = compact_rx.recv() {
-                    let ds = docstore.lock();
-                    if let Err(e) = ds.compact_shard_from_buffer(shard_id, &data) {
+                    let start = std::time::Instant::now();
+                    if let Err(e) = crate::docstore::compact_shard_from_buffer(
+                        shard_id,
+                        &data,
+                        &compact_root,
+                        &compact_v2_writers,
+                    ) {
                         eprintln!("Compaction worker: shard {shard_id} failed: {e}");
+                    } else {
+                        let _elapsed = start.elapsed();
+                        // Metrics are recorded by the server layer if available
                     }
                 }
             })

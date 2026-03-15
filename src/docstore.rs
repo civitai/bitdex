@@ -137,6 +137,18 @@ impl DocStore {
         &self.root
     }
 
+    // ---- Accessors for lock-free compaction ----
+
+    /// Root path of the docstore directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Shared handle to per-shard V2 writers (DashMap, safe without full DocStore lock).
+    pub fn v2_writers_handle(&self) -> Arc<DashMap<u32, parking_lot::Mutex<BufWriter<std::fs::File>>>> {
+        Arc::clone(&self.v2_writers)
+    }
+
     // ---- Shard path helpers ----
 
     pub(crate) fn shard_id(slot_id: u32) -> u32 {
@@ -908,24 +920,37 @@ impl DocStore {
     /// Read a single document from V2 shard data.
     /// Scans tuples LIFO: newest (slot, field) wins.
     /// Returns (doc, total_tuples, unique_tuples) for staleness calculation.
+    /// When compact_tx is None, skips the per-shard staleness counting entirely
+    /// to keep reads at ~4 us (no HashSet allocation overhead).
     fn get_v2_from_data(&self, data: &[u8], slot_id: u32) -> Result<(Option<StoredDoc>, u64, u64)> {
         let tuples = Self::parse_v2_tuples(data)?;
         let total_tuples = tuples.len() as u64;
 
-        // Walk backwards — newest entry for each (slot, field) wins.
-        // Count unique pairs across all slots for staleness detection.
-        let mut seen_all = std::collections::HashSet::new();
+        // Only count shard-wide staleness when a compaction worker exists.
+        let track_staleness = self.compact_tx.is_some();
+        let mut seen_all: Option<std::collections::HashSet<(u32, u16)>> = if track_staleness {
+            Some(std::collections::HashSet::new())
+        } else {
+            None
+        };
+
+        // Walk backwards — newest entry for each field wins for target slot.
         let mut fields: HashMap<u16, PackedValue> = HashMap::new();
         for (s, field_idx, value_bytes) in tuples.iter().rev() {
-            let is_new = seen_all.insert((*s, *field_idx));
-            if *s != slot_id || !is_new {
+            if let Some(ref mut sa) = seen_all {
+                sa.insert((*s, *field_idx));
+            }
+            if *s != slot_id {
                 continue;
+            }
+            if fields.contains_key(field_idx) {
+                continue; // already have a newer value
             }
             let pv: PackedValue = rmp_serde::from_slice(&value_bytes)
                 .map_err(|e| BitdexError::DocStore(format!("v2 decode field {field_idx}: {e}")))?;
             fields.insert(*field_idx, pv);
         }
-        let unique_tuples = seen_all.len() as u64;
+        let unique_tuples = seen_all.map_or(total_tuples, |sa| sa.len() as u64);
 
         if fields.is_empty() {
             return Ok((None, total_tuples, unique_tuples));
@@ -1040,8 +1065,7 @@ impl DocStore {
         Ok(())
     }
 
-    /// Compact a V2 shard: read all tuples, deduplicate (newest wins per slot+field),
-    /// write a clean shard via atomic tmp+rename.
+    /// Compact a V2 shard: read file, delegate to zero-copy `compact_shard_from_buffer`.
     pub fn compact_shard(&self, shard_id: u32) -> Result<()> {
         let path = Self::shard_path(&self.root, shard_id);
         let data = match std::fs::read(&path) {
@@ -1049,11 +1073,10 @@ impl DocStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
         };
-        if !Self::is_v2_shard(&data) {
+        if data.len() < V2_HEADER_SIZE || !Self::is_v2_shard(&data) {
             return Err(BitdexError::DocStore("compact_shard: not a v2 shard".into()));
         }
-        let tuples = Self::parse_v2_tuples(&data)?;
-        Self::write_compacted_shard(&self.root, shard_id, tuples, &self.v2_writers)
+        compact_shard_from_buffer(shard_id, &data, &self.root, &self.v2_writers)
     }
 
     /// Set the compaction channel. Called by ConcurrentEngine after spawning the
@@ -1061,58 +1084,6 @@ impl DocStore {
     /// the shard buffer over this channel.
     pub fn set_compact_channel(&mut self, tx: crossbeam_channel::Sender<(u32, Vec<u8>)>) {
         self.compact_tx = Some(tx);
-    }
-
-    /// Compact a V2 shard from a pre-loaded buffer. Skips the fs::read since the
-    /// reader already has the data. Shared dedup+write logic with compact_shard().
-    pub fn compact_shard_from_buffer(&self, shard_id: u32, data: &[u8]) -> Result<()> {
-        if !Self::is_v2_shard(data) {
-            return Err(BitdexError::DocStore("compact_shard_from_buffer: not a v2 shard".into()));
-        }
-        let tuples = Self::parse_v2_tuples(data)?;
-        Self::write_compacted_shard(&self.root, shard_id, tuples, &self.v2_writers)
-    }
-
-    /// Shared dedup+write logic used by both `compact_shard` and `compact_shard_from_buffer`.
-    fn write_compacted_shard(
-        root: &Path,
-        shard_id: u32,
-        tuples: Vec<(u32, u16, Vec<u8>)>,
-        v2_writers: &DashMap<u32, parking_lot::Mutex<BufWriter<std::fs::File>>>,
-    ) -> Result<()> {
-        // Deduplicate: newest (last in file) wins per (slot, field)
-        let mut seen = std::collections::HashSet::new();
-        let mut deduped: Vec<(u32, u16, Vec<u8>)> = Vec::new();
-        for (slot, field_idx, value) in tuples.into_iter().rev() {
-            if seen.insert((slot, field_idx)) {
-                deduped.push((slot, field_idx, value));
-            }
-        }
-        deduped.reverse(); // restore original order for stable output
-
-        // Remove any existing buffered writer for this shard (we'll replace the file)
-        v2_writers.remove(&shard_id);
-
-        let path = Self::shard_path(root, shard_id);
-
-        // Write clean shard via atomic tmp+rename
-        let tmp = path.with_extension("bin.tmp");
-        {
-            let file = std::fs::File::create(&tmp)
-                .map_err(|e| BitdexError::DocStore(format!("create v2 tmp: {e}")))?;
-            let mut w = BufWriter::new(file);
-            Self::write_v2_header(&mut w)?;
-            for (slot, field_idx, value) in &deduped {
-                Self::write_v2_tuple(&mut w, *slot, *field_idx, value)?;
-            }
-            w.flush()
-                .map_err(|e| BitdexError::DocStore(format!("flush v2 tmp: {e}")))?;
-            // No fsync — compaction is best-effort, crash loses at most one re-compact
-        }
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| BitdexError::DocStore(format!("rename v2 shard: {e}")))?;
-
-        Ok(())
     }
 
     /// Prepare for bulk loading: ensure field dictionary contains all field names,
@@ -1138,6 +1109,102 @@ impl DocStore {
             v2_writers: Arc::new(DashMap::new()),
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone zero-copy shard compaction — no DocStore lock required
+// ---------------------------------------------------------------------------
+
+/// Zero-copy V2 shard compaction. Scans `data` to build an offset index,
+/// reverse-iterates for LIFO dedup, writes winning tuples directly from the
+/// source buffer. No per-tuple allocations. No fsync.
+///
+/// This is a standalone function so the compaction worker can call it without
+/// holding the DocStore mutex — only a brief DashMap remove is needed.
+pub fn compact_shard_from_buffer(
+    shard_id: u32,
+    data: &[u8],
+    root: &Path,
+    v2_writers: &DashMap<u32, parking_lot::Mutex<BufWriter<std::fs::File>>>,
+) -> Result<()> {
+    if data.len() < V2_HEADER_SIZE {
+        return Err(BitdexError::DocStore("compact_shard_from_buffer: shard too short".into()));
+    }
+    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if magic != V2_MAGIC {
+        return Err(BitdexError::DocStore(format!(
+            "compact_shard_from_buffer: not a v2 shard (magic={magic:#x})"
+        )));
+    }
+
+    // Forward scan: build offset index — (slot, field_idx, tuple_start, tuple_len).
+    // No data copying — just byte positions into the source buffer.
+    let mut offsets: Vec<(u32, u16, usize, usize)> = Vec::new();
+    let mut pos = V2_HEADER_SIZE;
+    while pos + 8 <= data.len() {
+        let slot = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        let field_idx = u16::from_le_bytes([data[pos + 4], data[pos + 5]]);
+        let value_len = u16::from_le_bytes([data[pos + 6], data[pos + 7]]) as usize;
+        let tuple_len = 8 + value_len;
+        if pos + tuple_len > data.len() {
+            break; // truncated tuple
+        }
+        offsets.push((slot, field_idx, pos, tuple_len));
+        pos += tuple_len;
+    }
+
+    // Reverse-iterate to find winners (LIFO dedup), collect their indices
+    let mut seen = std::collections::HashSet::new();
+    let mut winner_indices: Vec<usize> = Vec::new();
+    for (i, (slot, field_idx, _, _)) in offsets.iter().enumerate().rev() {
+        if seen.insert((*slot, *field_idx)) {
+            winner_indices.push(i);
+        }
+    }
+    winner_indices.reverse(); // restore file order
+
+    // Early exit: nothing to compact
+    if winner_indices.len() == offsets.len() {
+        return Ok(());
+    }
+
+    // Remove any existing buffered writer for this shard
+    v2_writers.remove(&shard_id);
+
+    let path = DocStore::shard_path(root, shard_id);
+
+    // Write clean shard: header with correct num_tuples + winning tuples
+    // directly from source buffer. No fsync — background janitor work.
+    let tmp = path.with_extension("bin.tmp");
+    {
+        let file = std::fs::File::create(&tmp)
+            .map_err(|e| BitdexError::DocStore(format!("create v2 tmp: {e}")))?;
+        let mut w = BufWriter::new(file);
+        // Header with correct count upfront
+        w.write_all(&V2_MAGIC.to_le_bytes())
+            .map_err(|e| BitdexError::DocStore(format!("write v2 magic: {e}")))?;
+        w.write_all(&2u32.to_le_bytes())
+            .map_err(|e| BitdexError::DocStore(format!("write v2 version: {e}")))?;
+        w.write_all(&0u32.to_le_bytes())
+            .map_err(|e| BitdexError::DocStore(format!("write v2 flags: {e}")))?;
+        w.write_all(&(winner_indices.len() as u32).to_le_bytes())
+            .map_err(|e| BitdexError::DocStore(format!("write v2 num_tuples: {e}")))?;
+
+        // Write winning tuples — zero-copy slices from source buffer
+        for &idx in &winner_indices {
+            let (_, _, start, len) = offsets[idx];
+            w.write_all(&data[start..start + len])
+                .map_err(|e| BitdexError::DocStore(format!("write v2 tuple: {e}")))?;
+        }
+        w.flush()
+            .map_err(|e| BitdexError::DocStore(format!("flush v2 tmp: {e}")))?;
+    }
+    // Atomic rename — on Windows, remove destination first
+    let _ = std::fs::remove_file(&path);
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| BitdexError::DocStore(format!("rename v2 shard: {e}")))?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2434,6 +2501,9 @@ mod tests {
         store.ensure_field_idx("val");
         store.save_field_dict().unwrap();
         let val_idx = store.field_to_idx["val"];
+        // Set compact channel so staleness tracking is enabled in get_v2_from_data
+        let (compact_tx, _compact_rx) = crossbeam_channel::bounded::<(u32, Vec<u8>)>(32);
+        store.set_compact_channel(compact_tx);
 
         // Write 3 versions of the same (slot=0, field=val) — 2 are stale
         for v in 0..3i64 {
@@ -2512,8 +2582,8 @@ mod tests {
         let size_before = std::fs::metadata(&path).unwrap().len();
         let data = std::fs::read(&path).unwrap();
 
-        // Compact from buffer
-        store.compact_shard_from_buffer(shard_id, &data).unwrap();
+        // Compact from buffer (standalone function — no DocStore lock needed)
+        compact_shard_from_buffer(shard_id, &data, &store.root, &store.v2_writers).unwrap();
 
         let size_after = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -2567,7 +2637,7 @@ mod tests {
         match compact_rx.try_recv() {
             Ok((sid, data)) => {
                 assert_eq!(sid, shard_id);
-                store.compact_shard_from_buffer(sid, &data).unwrap();
+                compact_shard_from_buffer(sid, &data, &store.root, &store.v2_writers).unwrap();
             }
             Err(_) => panic!("expected compaction to be enqueued"),
         }
