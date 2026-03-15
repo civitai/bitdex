@@ -203,13 +203,16 @@ async function cmdNew() {
 }
 
 async function resolveTarget(explicit) {
-  if (explicit) return explicit;
+  if (explicit && !explicit.startsWith('--')) return explicit;
   // Default to first running instance
   const status = await daemonFetch('/status');
   const running = status.instances.filter(i => i.status === 'running' || i.status === 'starting');
   if (running.length === 0) {
     console.error('No running instances. Start one with: just dev');
     process.exit(1);
+  }
+  if (running.length > 1) {
+    console.error(`Using ${running[0].id} (${running.length} instances running — specify one with: logs <id>)`);
   }
   return running[0].id;
 }
@@ -1074,13 +1077,16 @@ async function resolveRunningInstance() {
     process.exit(1);
   }
   const explicit = process.argv[3];
-  if (explicit) {
+  if (explicit && !explicit.startsWith('--')) {
     const found = running.find(i => i.id === explicit || String(i.port) === explicit);
     if (!found) {
       console.error(`Instance '${explicit}' not found or not running`);
       process.exit(1);
     }
     return found;
+  }
+  if (running.length > 1) {
+    console.error(`Using ${running[0].id} (${running.length} instances running — specify one with: traces <id>)`);
   }
   return running[0];
 }

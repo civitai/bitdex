@@ -86,7 +86,7 @@ node .claude/skills/dev-server/cli.mjs traces --last 20
 node .claude/skills/dev-server/cli.mjs traces srv-3005
 ```
 
-Returns JSON with per-query trace data: total/plan/filter/sort timing (microseconds), clause-level cardinality and evaluation costs, cache hit/miss, and result count. Traces are collected server-side on every query and persisted to JSONL.
+Returns JSON with per-query trace data: total/plan/filter/sort timing (microseconds), clause-level cardinality and evaluation costs, cache hit/miss, and result count. Traces are opt-in (`enable_traces = true` in TOML or `--enable-traces` CLI flag). The dev-server daemon enables traces automatically.
 
 **TUI explain panel:** In the dashboard (`dash`), press `e` to toggle the explain panel. It renders the most recent query trace inline — clause ordering, cardinality reduction per step, sort timing, and cache status.
 
@@ -155,5 +155,5 @@ Live terminal dashboard with instance status, Prometheus metrics, log streaming,
 - **Shadow copy**: server runs from `.active.exe` so cargo builds don't lock the running binary
 - **Port range**: 3001-3099 for instances, 3100 reserved for E2E
 - **Heartbeat**: every 10s, detects dead processes, auto-releases stale locks
-- **State**: persisted to `.claude/skills/dev-server/state/` (gitignored)
+- **State**: in-memory only (no disk persistence — daemon restart resets state)
 - **Datasets**: tracked but never auto-deleted — stopping preserves data
