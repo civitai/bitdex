@@ -56,14 +56,13 @@ fn main() {
 
     let mut engine_config = index_def.config.clone();
     engine_config.storage.bitmap_path = Some(bitmap_dir);
+    engine_config.headless = true;
 
     let engine = ConcurrentEngine::new_with_path(engine_config, &docs_dir).unwrap_or_else(|e| {
         eprintln!("Failed to create engine: {e}");
         std::process::exit(1);
     });
 
-    // No enter/exit loading mode needed — single_pass writes directly to BitmapFs.
-    // Loading mode would trigger a snapshot save on exit that overwrites our bitmaps.
     let progress = Arc::new(LoadProgress::new());
 
     let result = single_pass::run_single_pass_v2(&engine, &index_def, &stage_dir, progress);
@@ -77,9 +76,6 @@ fn main() {
                 stats.records_loaded as f64 / stats.elapsed.as_secs_f64()
             );
             eprintln!("Server: cargo run --release --features server --bin bitdex-server -- --port 3001 --data-dir {}", data_dir.display());
-            // Exit immediately — engine Drop triggers flush thread shutdown which
-            // can overwrite bitmaps we already saved to BitmapFs.
-            std::process::exit(0);
         }
         Err(e) => {
             eprintln!("Load failed: {e}");

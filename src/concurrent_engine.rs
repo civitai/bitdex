@@ -686,6 +686,54 @@ impl ConcurrentEngine {
         let boundstore_entries_restored = Arc::new(AtomicU64::new(0));
         let boundstore_entries_skipped = Arc::new(AtomicU64::new(0));
 
+        // Headless mode: skip all background threads.
+        // The engine provides config, BitmapFs, and docstore access but
+        // no flush/merge/eviction threads run.
+        if config.headless {
+            eprintln!("Engine starting in headless mode (no background threads)");
+            return Ok(Self {
+                inner,
+                sender,
+                doc_tx,
+                docstore,
+                config,
+                field_registry,
+                in_flight: InFlightTracker::new(),
+                shutdown,
+                flush_handle: None,
+                merge_handle: None,
+                bitmap_store,
+                loading_mode,
+                dirty_since_snapshot: dirty_flag,
+                time_buckets,
+                pending_filter_loads,
+                pending_sort_loads,
+                lazy_value_fields,
+                lazy_tx,
+                cmd_tx,
+                string_maps: None,
+                case_sensitive_fields: None,
+                dictionaries: Arc::new(HashMap::new()),
+                unified_cache,
+                bound_store,
+                flush_publish_count,
+                flush_duration_nanos,
+                flush_last_duration_nanos,
+                cursors,
+                existing_keys,
+                eviction_stamps,
+                flush_cycle,
+                eviction_total,
+                boundstore_shard_loads,
+                boundstore_tombstones_created,
+                boundstore_tombstones_cleaned,
+                boundstore_bytes_written,
+                boundstore_bytes_read,
+                boundstore_entries_restored,
+                boundstore_entries_skipped,
+            });
+        }
+
         let flush_handle = {
             let inner = Arc::clone(&inner);
             let shutdown = Arc::clone(&shutdown);

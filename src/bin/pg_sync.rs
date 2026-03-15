@@ -183,6 +183,7 @@ async fn main() {
             let mut engine_config = index_def.config.clone();
             engine_config.storage.bitmap_path =
                 Some(index_storage_dir.join(&sync_config.bitmap_subdir));
+            engine_config.headless = true;
 
             let engine = ConcurrentEngine::new_with_path(
                 engine_config,
@@ -291,9 +292,6 @@ async fn main() {
                 stats.elapsed.as_secs_f64(),
                 stats.records_loaded as f64 / stats.elapsed.as_secs_f64()
             );
-            // Exit immediately — engine Drop triggers flush thread shutdown which
-            // overwrites bitmaps we already saved to BitmapFs.
-            std::process::exit(0);
         }
 
         Commands::Sync => {

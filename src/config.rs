@@ -69,6 +69,13 @@ pub struct Config {
     /// won't be marked alive until that time arrives. Only one field per document.
     #[serde(default)]
     pub deferred_alive: Option<DeferredAliveConfig>,
+
+    /// Headless mode: skip all background threads (flush, merge, eviction).
+    /// Used by bulk loaders that write directly to BitmapFs and don't need
+    /// the engine's write pipeline. The engine still provides config, BitmapFs
+    /// access, and docstore, but no background work runs.
+    #[serde(default)]
+    pub headless: bool,
 }
 
 fn default_max_page_size() -> usize {
@@ -126,6 +133,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             eviction_sweep_interval: default_eviction_sweep_interval(),
             deferred_alive: None,
+            headless: false,
         }
     }
 }

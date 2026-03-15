@@ -616,7 +616,7 @@ fn process_images_csv(
         let end = if i == num_threads - 1 {
             file_len
         } else {
-            let tentative = start + chunk_size;
+            let tentative = (start + chunk_size).min(file_len);
             match data[tentative..].iter().position(|&b| b == b'\n') {
                 Some(offset) => tentative + offset + 1,
                 None => file_len,
@@ -1129,7 +1129,7 @@ fn split_mmap_ranges(data: &[u8], num_threads: usize) -> Vec<(usize, usize)> {
         let end = if i == num_threads - 1 {
             file_len
         } else {
-            let tentative = start + chunk_size;
+            let tentative = (start + chunk_size).min(file_len);
             match data[tentative..].iter().position(|&b| b == b'\n') {
                 Some(offset) => tentative + offset + 1,
                 None => file_len,
