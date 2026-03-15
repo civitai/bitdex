@@ -194,6 +194,9 @@ async fn main() {
                 std::process::exit(1);
             });
 
+            // Set docstore field defaults (field dictionary + default values for V2 encoding)
+            engine.set_docstore_defaults(&index_def.data_schema);
+
             // Copy config.json into the index storage dir so the server finds it
             let config_dest = index_storage_dir.join("config.json");
             if !config_dest.exists() {
