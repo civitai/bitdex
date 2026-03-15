@@ -419,7 +419,7 @@ function fmtBytes(bytes) {
 }
 
 function fmtCount(n) {
-  if (!n) return '—';
+  if (n == null) return '—';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
@@ -462,9 +462,9 @@ const WHT = '\x1b[37m';
 const BLU = '\x1b[34m';
 
 const LOG_FORMATTERS = [
-  // Query result with breakdown: "→ 4000 results  total=89μs  plan=0μs  filter=71μs  sort=16μs cache"
+  // Query result with breakdown: "→ 4000 results  total=89μs  plan=0μs  filter=71μs  sort=16μs  docs=7764μs(40) cache"
   {
-    match: /^\s*→\s*(\d[\d,]*)\s+results\s+total=(\d+)μs\s+plan=(\d+)μs\s+filter=(\d+)μs\s+sort=(\d+)μs\s*(cache)?/,
+    match: /^\s*→\s*(\d[\d,]*)\s+results\s+total=(\d+)μs\s+plan=(\d+)μs\s+filter=(\d+)μs\s+sort=(\d+)μs\s*(?:docs=\d+μs\(\d+\))?\s*(cache)?/,
     format: (m, w) => {
       const results = m[1];
       const total = parseInt(m[2], 10);
@@ -474,7 +474,7 @@ const LOG_FORMATTERS = [
       const cache = m[6] ? ` ${GRN}cache${R}` : '';
       const n = parseInt(results.replace(/,/g, ''), 10);
       const countStr = n >= 100000 ? fmtCount(n) : results;
-      return `  ${GRN}→${R} ${WHT}${countStr}${R} results  total=${CYN}${fmtTime(total)}${R}  plan=${DIM}${fmtTime(plan)}${R}  filter=${DIM}${fmtTime(filter)}${R}  sort=${DIM}${fmtTime(sort)}${R}${cache}`;
+      return `  ${GRN}→${R} ${WHT}${countStr}${R} results  total=${CYN}${fmtTime(total)}${R}  ${DIM}plan=${R}${WHT}${fmtTime(plan)}${R}  ${DIM}filter=${R}${WHT}${fmtTime(filter)}${R}  ${DIM}sort=${R}${WHT}${fmtTime(sort)}${R}${cache}`;
     },
   },
   // Legacy result format: "→ 4000 results, 16μs"
@@ -529,6 +529,28 @@ const LOG_FORMATTERS = [
   {
     match: /^BoundStore:\s*(.+)$/,
     format: (m, w) => `${DIM}cache${R} ${m[1]}`,
+  },
+  // Clause with eval: "clause[0]: eval=123μs (50000), and=45μs → 48000 | type IN [image]"
+  {
+    match: /^clause\[(\d+)\]:\s*eval=(\d+)μs\s*\((\d+)\),?\s*and=(\d+)μs\s*→\s*(\d+)\s*\|\s*(.+)$/,
+    format: (m, w) => {
+      let expr = m[6];
+      expr = expr.replace(/\b(IN|NOT|AND|OR)\b/g, (kw) => MAG + kw + R);
+      expr = expr.replace(/\b(nsfwLevel|userId|baseModel|isPublished|type|sortAtUnix|collectedCount|reactionCount|sortAt|modelVersionIds|tagIds|toolIds|techniqueIds|postId|availability|blockedFor|hasMeta|isRemix|minor|onSite|poi)\b/g, (f) => BLU + f + R);
+      const evalTime = fmtTime(parseInt(m[2]));
+      return `  ${DIM}clause${R} ${DIM}#${m[1]}${R} ${CYN}${evalTime}${R} ${DIM}→${R} ${WHT}${fmtCount(parseInt(m[5]))}${R} ${DIM}|${R} ${expr}`;
+    },
+  },
+  // Clause with and_ref: "clause[1]: and_ref=45μs → 48000 | isPublished = true"
+  {
+    match: /^clause\[(\d+)\]:\s*and_ref=(\d+)μs\s*→\s*(\d+)\s*\|\s*(.+)$/,
+    format: (m, w) => {
+      let expr = m[4];
+      expr = expr.replace(/\b(IN|NOT|AND|OR)\b/g, (kw) => MAG + kw + R);
+      expr = expr.replace(/\b(nsfwLevel|userId|baseModel|isPublished|type|sortAtUnix|collectedCount|reactionCount|sortAt|modelVersionIds|tagIds|toolIds|techniqueIds|postId|availability|blockedFor|hasMeta|isRemix|minor|onSite|poi)\b/g, (f) => BLU + f + R);
+      const andTime = fmtTime(parseInt(m[2]));
+      return `  ${DIM}clause${R} ${DIM}#${m[1]}${R} ${CYN}${andTime}${R} ${DIM}→${R} ${WHT}${fmtCount(parseInt(m[3]))}${R} ${DIM}|${R} ${expr}`;
+    },
   },
 ];
 
@@ -586,6 +608,7 @@ async function cmdDashboard() {
   let inputMode = null;  // null or { prompt, buffer, callback }
   let showStats = false; // 'i' toggles detailed stats panel
   let logScroll = 0;    // 0 = live tail, >0 = scrolled up N lines from bottom
+  let wordWrap = false; // 'w' toggles word wrap in log panel
   let explainTraces = [];   // array of fetched traces
   let explainIdx = 0;       // current index in explainTraces
   let explainMode = false;  // when true, logs are paused and arrow keys navigate traces
@@ -733,37 +756,50 @@ async function cmdDashboard() {
     const startIdx = Math.max(0, endIdx - logAreaRows);
     const visible = logLines.slice(startIdx, endIdx);
 
-    for (let i = 0; i < logAreaRows; i++) {
-      const entry = visible[i];
-      if (entry) {
-        const raw = stripAnsi(entry.message || '');
-        // Parse tracing format: "2026-03-14T07:15:17.512198Z  INFO [civitai] message..."
-        const tracingMatch = raw.match(/^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})\.\d+Z\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(?:\[([^\]]+)\]\s+)?(.*)$/);
-        let ts, lvlStr, body;
-        if (tracingMatch) {
-          ts = tracingMatch[1];
-          lvlStr = tracingMatch[2];
-          body = tracingMatch[4];
-        } else {
-          // Non-tracing line (daemon messages, plain stderr)
-          ts = new Date(entry.timestamp).toLocaleTimeString('en-US', { hour12: false });
-          lvlStr = entry.level === 'daemon' ? 'DAE' : '';
-          body = raw;
-        }
-        // Level indicator
-        let lvl;
-        switch (lvlStr) {
-          case 'ERROR': lvl = `${RED}✖${R}`; break;
-          case 'WARN':  lvl = `${YLW}⚠${R}`; break;
-          case 'DAE':   lvl = `${CYN}●${R}`; break;
-          default:      lvl = ' ';
-        }
-        const msgMax = cols - 13;
-        const msg = formatLogBody(body, msgMax);
-        buf.push(CLR_LINE + `  ${DIM}${ts}${R} ${lvl} ${msg}` + '\n');
+    // Build visual lines from log entries
+    const visualLines = [];
+    for (const entry of visible) {
+      const raw = stripAnsi(entry.message || '');
+      const tracingMatch = raw.match(/^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})\.\d+Z\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(?:\[([^\]]+)\]\s+)?(.*)$/);
+      let ts, lvlStr, body;
+      if (tracingMatch) {
+        ts = tracingMatch[1];
+        lvlStr = tracingMatch[2];
+        body = tracingMatch[4];
       } else {
-        buf.push(CLR_LINE + '\n');
+        ts = new Date(entry.timestamp).toLocaleTimeString('en-US', { hour12: false });
+        lvlStr = entry.level === 'daemon' ? 'DAE' : '';
+        body = raw;
       }
+      let lvl;
+      switch (lvlStr) {
+        case 'ERROR': lvl = `${RED}✖${R}`; break;
+        case 'WARN':  lvl = `${YLW}⚠${R}`; break;
+        case 'DAE':   lvl = `${CYN}●${R}`; break;
+        default:      lvl = ' ';
+      }
+      const msgMax = cols - 13;
+      if (wordWrap && body.length > msgMax) {
+        // First line with timestamp + level
+        const firstLine = formatLogBody(body.slice(0, msgMax), msgMax);
+        visualLines.push(`  ${DIM}${ts}${R} ${lvl} ${firstLine}`);
+        // Continuation lines indented to align with message body
+        let pos = msgMax;
+        while (pos < body.length) {
+          const chunk = body.slice(pos, pos + msgMax - 2);
+          visualLines.push(`  ${DIM}       ${R}   ${formatLogBody(chunk, msgMax - 2)}`);
+          pos += msgMax - 2;
+        }
+      } else {
+        const msg = formatLogBody(body, msgMax);
+        visualLines.push(`  ${DIM}${ts}${R} ${lvl} ${msg}`);
+      }
+    }
+    // Render from the end of visual lines (tail view)
+    const visStart = Math.max(0, visualLines.length - logAreaRows);
+    for (let i = 0; i < logAreaRows; i++) {
+      const line = visualLines[visStart + i];
+      buf.push(CLR_LINE + (line || '') + '\n');
     }
 
     // ── Explain panel (between logs and footer)
@@ -776,7 +812,8 @@ async function cmdDashboard() {
     if (actionMsg) {
       buf.push(CLR_LINE + ` ${YLW}${actionMsg}${R}` + CLR_BELOW);
     } else {
-      buf.push(CLR_LINE + `  ${DIM}↑↓${R} scroll  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}e${R}${DIM}xplain${R}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
+      const wrapTag = wordWrap ? `${GRN}w${R}${DIM}rap${R}` : `${B}w${R}${DIM}rap${R}`;
+      buf.push(CLR_LINE + `  ${DIM}↑↓${R} scroll  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}e${R}${DIM}xplain${R}  ${wrapTag}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
     }
 
     // Single buffered write — cork/uncork to minimize terminal I/O
@@ -885,6 +922,12 @@ async function cmdDashboard() {
     if (key === 'i') {
       showStats = !showStats;
       flash(showStats ? 'Stats: expanded' : 'Stats: compact');
+    }
+
+    if (key === 'w') {
+      wordWrap = !wordWrap;
+      renderDirty = true;
+      flash(wordWrap ? 'Word wrap: ON' : 'Word wrap: OFF');
     }
 
     if (key === 'e') {

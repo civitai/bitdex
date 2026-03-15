@@ -317,16 +317,24 @@ async function startInstance({ port, dataDir, worktree, binary, name } = {}) {
 
   instances.set(id, instance);
 
-  // Wire stdout/stderr to in-memory log ring buffer
+  // Wire stdout/stderr to in-memory log ring buffer (with line buffering)
+  let stdoutBuf = '';
   proc.stdout.on('data', (data) => {
-    for (const line of data.toString().split('\n').filter(Boolean)) {
-      pushLog(id, 'stdout', line);
+    stdoutBuf += data.toString();
+    const lines = stdoutBuf.split('\n');
+    stdoutBuf = lines.pop(); // keep incomplete last line
+    for (const line of lines) {
+      if (line) pushLog(id, 'stdout', line);
     }
   });
 
+  let stderrBuf = '';
   proc.stderr.on('data', (data) => {
-    for (const line of data.toString().split('\n').filter(Boolean)) {
-      pushLog(id, 'stderr', line);
+    stderrBuf += data.toString();
+    const lines = stderrBuf.split('\n');
+    stderrBuf = lines.pop();
+    for (const line of lines) {
+      if (line) pushLog(id, 'stderr', line);
     }
   });
 

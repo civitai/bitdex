@@ -330,8 +330,8 @@ impl<'a> QueryExecutor<'a> {
                     let elapsed = t0.elapsed();
                     let result_card = acc.len();
                     tracing::debug!(
-                        "    clause[{}]: and_ref={:.1}ms → {} | {}",
-                        i, elapsed.as_secs_f64() * 1000.0, result_card, clause
+                        "    clause[{}]: and_ref={}μs → {} | {}",
+                        i, elapsed.as_micros(), result_card, clause
                     );
                     if let Some(ref mut collector) = trace_collector {
                         collector.record_clause(ClauseTrace {
@@ -366,9 +366,9 @@ impl<'a> QueryExecutor<'a> {
             let and_elapsed = t1.elapsed();
             let result_card = result.as_ref().map(|r| r.len()).unwrap_or(0);
             tracing::debug!(
-                "    clause[{}]: eval={:.1}ms ({}), and={:.1}ms → {} | {}",
-                i, eval_elapsed.as_secs_f64() * 1000.0, bm_card,
-                and_elapsed.as_secs_f64() * 1000.0, result_card, clause
+                "    clause[{}]: eval={}μs ({}), and={}μs → {} | {}",
+                i, eval_elapsed.as_micros(), bm_card,
+                and_elapsed.as_micros(), result_card, clause
             );
             if let Some(ref mut collector) = trace_collector {
                 collector.record_clause(ClauseTrace {
