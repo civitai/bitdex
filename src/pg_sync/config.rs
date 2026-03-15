@@ -53,6 +53,10 @@ pub struct PgSyncConfig {
     /// Set to None to disable. Default: 9091.
     #[serde(default = "default_progress_port")]
     pub progress_port: Option<u16>,
+    /// Directory containing pre-fetched CSV files for bulk loading.
+    /// If set, the loader reads CSVs from here instead of downloading from PG.
+    /// Defaults to `{storage_dir}/load_stage` when not specified.
+    pub stage_dir: Option<PathBuf>,
 }
 
 fn default_index_subdir() -> String {
@@ -136,12 +140,16 @@ pub struct IndexDefinition {
 }
 
 impl IndexDefinition {
+    /// Load an `IndexDefinition` from a JSON file path.
+    pub fn from_file(path: &Path) -> Result<Self, String> {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+        serde_json::from_str(&contents)
+            .map_err(|e| format!("failed to parse {}: {}", path.display(), e))
+    }
+
     /// Load an `IndexDefinition` from the `config.json` file inside `dir`.
     pub fn from_dir(dir: &Path) -> Result<Self, String> {
-        let config_path = dir.join("config.json");
-        let contents = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("failed to read {}: {}", config_path.display(), e))?;
-        serde_json::from_str(&contents)
-            .map_err(|e| format!("failed to parse {}: {}", config_path.display(), e))
+        Self::from_file(&dir.join("config.json"))
     }
 }

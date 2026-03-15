@@ -34,12 +34,8 @@ use super::copy_queries::{
     parse_technique_row, parse_tool_row,
 };
 use super::progress::LoadProgress;
-use super::scatter_gather::{load_metrics_csv, MetricsMap};
 
 const LOG_INTERVAL: u64 = 1_000_000;
-const PROGRESS_INTERVAL: u64 = 100_000;
-/// Number of lines per rayon work block.
-const BLOCK_SIZE: usize = 8192;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -328,19 +324,11 @@ pub fn run_single_pass_v2(
     // Step 6: Metrics (from metrics.csv)
     // ===================================================================
     {
-        eprintln!("\n--- Step 6: Metrics (reactionCount/commentCount/collectedCount sort bitmaps) ---");
-        let t = Instant::now();
-        let metrics_map = load_metrics_csv(stage_dir);
-        eprintln!(
-            "  Loaded {} metrics in {:.1}s",
-            metrics_map.len(),
-            t.elapsed().as_secs_f64()
-        );
-
-        if !metrics_map.is_empty() {
+        eprintln!("\n--- Step 6: Metrics CSV (reactionCount/commentCount/collectedCount sort bitmaps) ---");
+        {
             let t = Instant::now();
-            let metrics_sort = process_metrics(
-                &metrics_map,
+            let metrics_sort = process_metrics_csv(
+                stage_dir,
                 &bulk_writer,
                 &sort_bits,
                 &sort_configs,
@@ -514,50 +502,12 @@ fn process_tags_csv(
     Ok(result)
 }
 
-/// Process a block of tag lines with rayon fold+reduce.
-fn process_tag_block(
-    lines: &[Vec<u8>],
-    tag_field_idx: Option<u16>,
-    bulk_writer: &Arc<crate::docstore::BulkWriter>,
-) -> HashMap<u64, RoaringBitmap> {
-    lines
-        .par_chunks(BLOCK_SIZE)
-        .fold(
-            || HashMap::<u64, RoaringBitmap>::new(),
-            |mut accum, chunk| {
-                for line in chunk {
-                    if let Some((tag_id, image_id)) = parse_tag_line(line) {
-                        let slot = image_id as u32;
-                        let tag_val = tag_id as u64;
-
-                        // Build bitmap only — docstore tag arrays are written
-                        // per-image during the images CSV pass (one tagIds tuple
-                        // per image, not 50 individual tuples per tag row).
-                        accum
-                            .entry(tag_val)
-                            .or_insert_with(RoaringBitmap::new)
-                            .insert(slot);
-                    }
-                }
-                accum
-            },
-        )
-        .reduce(
-            || HashMap::new(),
-            |mut a, b| {
-                for (key, bm) in b {
-                    a.entry(key).and_modify(|e| *e |= &bm).or_insert(bm);
-                }
-                a
-            },
-        )
-}
-
 // ---------------------------------------------------------------------------
-// Multi-value CSV processor (tools, techniques) — simple sequential
+// Multi-value CSV processor (tools, techniques)
 // ---------------------------------------------------------------------------
 
 /// Process a two-column (value_id, image_id) CSV: build filter bitmaps + docstore tuples.
+/// Uses mmap + parallel byte-range splitting.
 fn process_multi_value_csv(
     stage_dir: &Path,
     filename: &str,
@@ -565,42 +515,59 @@ fn process_multi_value_csv(
     bulk_writer: &Arc<crate::docstore::BulkWriter>,
     field_name: &str,
 ) -> Result<HashMap<u64, RoaringBitmap>, String> {
-    let file = std::io::BufReader::new(
-        std::fs::File::open(stage_dir.join(filename))
-            .map_err(|e| format!("open {filename}: {e}"))?,
-    );
+    let file = std::fs::File::open(stage_dir.join(filename))
+        .map_err(|e| format!("open {filename}: {e}"))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("mmap {filename}: {e}"))?;
+    let data = &mmap[..];
 
     let field_idx = bulk_writer.field_to_idx().get(field_name).copied();
-    let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
-    let mut total = 0u64;
+    let ranges = split_mmap_ranges(data, rayon::current_num_threads());
+    let total = AtomicU64::new(0);
+    let total_ref = &total;
 
-    for line in file.split(b'\n') {
-        let line = line.map_err(|e| format!("read {filename}: {e}"))?;
-        if line.is_empty() {
-            continue;
-        }
-        if let Some((value_id, image_id)) = parse_fn(&line) {
-            let slot = image_id as u32;
-            let val = value_id as u64;
+    let thread_results: Vec<HashMap<u64, RoaringBitmap>> = ranges
+        .par_iter()
+        .map(|&(range_start, range_end)| {
+            let chunk = &data[range_start..range_end];
+            let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
+            let mut count = 0u64;
+            let mut line_start = 0;
 
-            // Build bitmap
-            bitmaps
-                .entry(val)
-                .or_insert_with(RoaringBitmap::new)
-                .insert(slot);
-
-            // Append docstore tuple
-            if let Some(fidx) = field_idx {
-                let value = rmp_serde::to_vec(&(value_id as i64)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &value);
+            for i in 0..chunk.len() {
+                if chunk[i] == b'\n' {
+                    let line = &chunk[line_start..i];
+                    line_start = i + 1;
+                    if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                        continue;
+                    }
+                    if let Some((value_id, image_id)) = parse_fn(line) {
+                        let slot = image_id as u32;
+                        let val = value_id as u64;
+                        bitmaps.entry(val).or_insert_with(RoaringBitmap::new).insert(slot);
+                        if let Some(fidx) = field_idx {
+                            let value = rmp_serde::to_vec(&(value_id as i64)).unwrap_or_default();
+                            bulk_writer.append_tuple_raw(slot, fidx, &value);
+                        }
+                        count += 1;
+                    }
+                }
             }
+            total_ref.fetch_add(count, Ordering::Relaxed);
+            bitmaps
+        })
+        .collect();
 
-            total += 1;
+    // Merge
+    let mut merged: HashMap<u64, RoaringBitmap> = HashMap::new();
+    for bitmaps in thread_results {
+        for (val, bm) in bitmaps {
+            merged.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
         }
     }
 
-    eprintln!("  {filename}: {} rows processed", total);
-    Ok(bitmaps)
+    eprintln!("  {filename}: {} rows processed", total.load(Ordering::Relaxed));
+    Ok(merged)
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +576,9 @@ fn process_multi_value_csv(
 
 /// Process images.csv: build all scalar filter bitmaps, sort bitmaps, alive bitmap,
 /// and append docstore tuples for every field.
+///
+/// Uses mmap + parallel byte-range splitting (same pattern as tags).
+/// Each thread builds thread-local bitmaps and appends docstore tuples concurrently.
 fn process_images_csv(
     stage_dir: &Path,
     bulk_writer: &Arc<crate::docstore::BulkWriter>,
@@ -620,76 +590,149 @@ fn process_images_csv(
     filter_names: &[String],
     sort_configs: &[(String, u8)],
 ) -> Result<ImageCsvResult, String> {
-    let file = std::io::BufReader::with_capacity(
-        4 * 1024 * 1024,
-        std::fs::File::open(stage_dir.join("images.csv"))
-            .map_err(|e| format!("open images.csv: {e}"))?,
+    let file = std::fs::File::open(stage_dir.join("images.csv"))
+        .map_err(|e| format!("open images.csv: {e}"))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("mmap images.csv: {e}"))?;
+    let data = &mmap[..];
+    let file_len = data.len();
+    eprintln!("  images: mmap'd {} ({:.1} GB)", file_len, file_len as f64 / (1024.0 * 1024.0 * 1024.0));
+
+    // Fields to process (exclude multi-value and metrics fields)
+    let img_filter_names: Vec<String> = filter_names
+        .iter()
+        .filter(|n| !["tagIds", "toolIds", "techniqueIds", "modelVersionIds", "baseModel"].contains(&n.as_str()))
+        .cloned()
+        .collect();
+    let img_sort_configs: Vec<(String, u8)> = sort_configs
+        .iter()
+        .filter(|(n, _)| !["reactionCount", "commentCount", "collectedCount"].contains(&n.as_str()))
+        .cloned()
+        .collect();
+
+    // Split file into byte ranges (one per thread), align to newlines.
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = file_len / num_threads;
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_threads);
+    let mut start = 0;
+    for i in 0..num_threads {
+        let end = if i == num_threads - 1 {
+            file_len
+        } else {
+            let tentative = start + chunk_size;
+            match data[tentative..].iter().position(|&b| b == b'\n') {
+                Some(offset) => tentative + offset + 1,
+                None => file_len,
+            }
+        };
+        let end = end.min(file_len);
+        if start < end {
+            ranges.push((start, end));
+        }
+        start = end;
+    }
+
+    let total = AtomicU64::new(0);
+    let total_ref = &total;
+
+    // Thread-local result: (filter_maps, sort_maps, alive, count)
+    type ThreadResult = (
+        HashMap<String, HashMap<u64, RoaringBitmap>>,
+        HashMap<String, HashMap<usize, RoaringBitmap>>,
+        RoaringBitmap,
+        u64,
     );
 
-    let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_names
-        .iter()
-        // Don't include multi-value fields here — they're handled in their own CSV steps
-        .filter(|n| !["tagIds", "toolIds", "techniqueIds", "modelVersionIds", "baseModel"].contains(&n.as_str()))
-        .map(|n| (n.clone(), HashMap::new()))
-        .collect();
-    let mut sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>> = sort_configs
-        .iter()
-        // Metrics sort fields are handled in step 6
-        .filter(|(n, _)| !["reactionCount", "commentCount", "collectedCount"].contains(&n.as_str()))
-        .map(|(n, _)| (n.clone(), HashMap::new()))
-        .collect();
-    let mut alive = RoaringBitmap::new();
-    let mut total = 0u64;
+    let thread_results: Vec<ThreadResult> = ranges
+        .par_iter()
+        .map(|&(range_start, range_end)| {
+            let chunk = &data[range_start..range_end];
 
-    for line in file.split(b'\n') {
-        let line = line.map_err(|e| format!("read images.csv: {e}"))?;
-        if line.is_empty() {
-            continue;
-        }
-        let mut row = match parse_image_row(&line) {
-            Some(r) => r,
-            None => continue,
-        };
+            // Thread-local bitmap accumulators
+            let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> =
+                img_filter_names.iter().map(|n| (n.clone(), HashMap::new())).collect();
+            let mut sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>> =
+                img_sort_configs.iter().map(|(n, _)| (n.clone(), HashMap::new())).collect();
+            let mut alive = RoaringBitmap::new();
+            let mut count = 0u64;
+            let mut line_start = 0;
 
-        // Enrich from Post lookup
-        if let Some(post_id) = row.post_id {
-            if let Some((pub_secs, avail, mv_id)) = post_map.get(&post_id) {
-                row.published_at_secs = *pub_secs;
-                row.availability = avail.clone();
-                row.posted_to_id = *mv_id;
+            for i in 0..chunk.len() {
+                if chunk[i] == b'\n' {
+                    let line = &chunk[line_start..i];
+                    line_start = i + 1;
+                    if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                        continue;
+                    }
+
+                    let mut row = match parse_image_row(line) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+
+                    // Enrich from Post lookup (read-only, shared across threads)
+                    if let Some(post_id) = row.post_id {
+                        if let Some((pub_secs, avail, mv_id)) = post_map.get(&post_id) {
+                            row.published_at_secs = *pub_secs;
+                            row.availability = avail.clone();
+                            row.posted_to_id = *mv_id;
+                        }
+                    }
+
+                    let slot = row.id as u32;
+
+                    alive.insert(slot);
+                    build_image_filter_bitmaps(&row, slot, filter_set, schema, &mut filter_maps);
+                    build_image_sort_bitmaps(&row, slot, sort_bits, &mut sort_maps);
+                    append_image_docstore_tuples(&row, slot, bulk_writer);
+
+                    count += 1;
+                    if count % LOG_INTERVAL == 0 {
+                        let t = total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed) + LOG_INTERVAL;
+                        eprintln!("  images: {}M rows...", t / 1_000_000);
+                    }
+                }
+            }
+            // Flush remaining count
+            total_ref.fetch_add(count % LOG_INTERVAL, Ordering::Relaxed);
+
+            (filter_maps, sort_maps, alive, count)
+        })
+        .collect();
+
+    // Merge all thread-local results
+    let mut merged_filters: HashMap<String, HashMap<u64, RoaringBitmap>> =
+        img_filter_names.iter().map(|n| (n.clone(), HashMap::new())).collect();
+    let mut merged_sorts: HashMap<String, HashMap<usize, RoaringBitmap>> =
+        img_sort_configs.iter().map(|(n, _)| (n.clone(), HashMap::new())).collect();
+    let mut merged_alive = RoaringBitmap::new();
+    let mut merged_count = 0u64;
+
+    for (filter_maps, sort_maps, alive, count) in thread_results {
+        merged_alive |= alive;
+        merged_count += count;
+
+        for (field, values) in filter_maps {
+            let dest = merged_filters.entry(field).or_default();
+            for (val, bm) in values {
+                dest.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
             }
         }
-
-        let slot = row.id as u32;
-
-        // Set alive
-        alive.insert(slot);
-
-        // Build filter bitmaps
-        build_image_filter_bitmaps(&row, slot, filter_set, schema, &mut filter_maps);
-
-        // Build sort bitmaps
-        build_image_sort_bitmaps(&row, slot, sort_bits, &mut sort_maps);
-
-        // Append docstore tuples for image fields
-        append_image_docstore_tuples(&row, slot, bulk_writer);
-
-        total += 1;
-        if total % PROGRESS_INTERVAL == 0 {
-            progress.image_rows.store(total, Ordering::Release);
-        }
-        if total % LOG_INTERVAL == 0 {
-            eprintln!("  images: {}M rows...", total / 1_000_000);
+        for (field, layers) in sort_maps {
+            let dest = merged_sorts.entry(field).or_default();
+            for (bit, bm) in layers {
+                dest.entry(bit).and_modify(|e| *e |= &bm).or_insert(bm);
+            }
         }
     }
 
-    progress.image_rows.store(total, Ordering::Release);
+    progress.image_rows.store(merged_count, Ordering::Release);
 
     Ok(ImageCsvResult {
-        row_count: total,
-        filter_maps,
-        sort_maps,
-        alive,
+        row_count: merged_count,
+        filter_maps: merged_filters,
+        sort_maps: merged_sorts,
+        alive: merged_alive,
     })
 }
 
@@ -862,6 +905,7 @@ fn append_image_docstore_tuples(
 
 /// Process resources.csv: build modelVersionIds + baseModel filter bitmaps,
 /// OR resource-level poi into existing poi filter bitmap docstore tuples.
+/// Uses mmap + parallel byte-range splitting.
 fn process_resources_csv(
     stage_dir: &Path,
     bulk_writer: &Arc<crate::docstore::BulkWriter>,
@@ -871,88 +915,95 @@ fn process_resources_csv(
     mv_map: &HashMap<i64, (Option<String>, i64)>,
     model_map: &HashMap<i64, (bool, String)>,
 ) -> Result<ResourceCsvResult, String> {
-    let file = std::io::BufReader::with_capacity(
-        4 * 1024 * 1024,
-        std::fs::File::open(stage_dir.join("resources.csv"))
-            .map_err(|e| format!("open resources.csv: {e}"))?,
-    );
+    let file = std::fs::File::open(stage_dir.join("resources.csv"))
+        .map_err(|e| format!("open resources.csv: {e}"))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("mmap resources.csv: {e}"))?;
+    let data = &mmap[..];
 
-    let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
-    if filter_set.contains("modelVersionIds") {
-        filter_maps.insert("modelVersionIds".to_string(), HashMap::new());
-    }
-    if filter_set.contains("baseModel") {
-        filter_maps.insert("baseModel".to_string(), HashMap::new());
-    }
-    // Resource-level poi (OR'd with image-level poi)
-    if filter_set.contains("poi") {
-        filter_maps.insert("poi".to_string(), HashMap::new());
-    }
-
+    let has_mv = filter_set.contains("modelVersionIds");
+    let has_bm = filter_set.contains("baseModel");
+    let has_poi = filter_set.contains("poi");
     let mv_field_idx = bulk_writer.field_to_idx().get("modelVersionIds").copied();
     let base_model_field_idx = bulk_writer.field_to_idx().get("baseModel").copied();
-    let mut total = 0u64;
 
-    for line in file.split(b'\n') {
-        let line = line.map_err(|e| format!("read resources.csv: {e}"))?;
-        if line.is_empty() {
-            continue;
-        }
-        let row = match parse_resource_row(&line) {
-            Some(r) => r,
-            None => continue,
-        };
+    let ranges = split_mmap_ranges(data, rayon::current_num_threads());
+    let total = AtomicU64::new(0);
+    let total_ref = &total;
 
-        let slot = row.image_id as u32;
+    let thread_results: Vec<HashMap<String, HashMap<u64, RoaringBitmap>>> = ranges
+        .par_iter()
+        .map(|&(range_start, range_end)| {
+            let chunk = &data[range_start..range_end];
+            let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
+            if has_mv { filter_maps.insert("modelVersionIds".into(), HashMap::new()); }
+            if has_bm { filter_maps.insert("baseModel".into(), HashMap::new()); }
+            if has_poi { filter_maps.insert("poi".into(), HashMap::new()); }
+            let mut count = 0u64;
+            let mut line_start = 0;
 
-        // modelVersionIds filter bitmap
-        if let Some(fm) = filter_maps.get_mut("modelVersionIds") {
-            fm.entry(row.model_version_id as u64)
-                .or_insert_with(RoaringBitmap::new)
-                .insert(slot);
-        }
+            for i in 0..chunk.len() {
+                if chunk[i] == b'\n' {
+                    let line = &chunk[line_start..i];
+                    line_start = i + 1;
+                    if line.is_empty() || (line.len() == 1 && line[0] == b'\r') { continue; }
 
-        // Docstore tuple for modelVersionIds
-        if let Some(fidx) = mv_field_idx {
-            let value = rmp_serde::to_vec(&(row.model_version_id as i64)).unwrap_or_default();
-            bulk_writer.append_tuple_raw(slot, fidx, &value);
-        }
+                    let row = match parse_resource_row(line) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let slot = row.image_id as u32;
 
-        // Enrich from MV/Model lookups
-        if let Some((mv_base_model, model_id)) = mv_map.get(&row.model_version_id) {
-            if let Some((poi, model_type)) = model_map.get(model_id) {
-                // baseModel — only for Checkpoint models
-                if model_type == "Checkpoint" {
-                    if let Some(ref bm_str) = mv_base_model {
-                        let key = resolve_base_model_key_str(bm_str, schema);
-                        if key > 0 {
-                            insert_filter(&mut filter_maps, "baseModel", key, slot);
-                        }
-                        // Docstore tuple
-                        if let Some(fidx) = base_model_field_idx {
-                            let value = rmp_serde::to_vec(&bm_str.as_str()).unwrap_or_default();
-                            bulk_writer.append_tuple_raw(slot, fidx, &value);
+                    if has_mv {
+                        filter_maps.get_mut("modelVersionIds").unwrap()
+                            .entry(row.model_version_id as u64)
+                            .or_insert_with(RoaringBitmap::new)
+                            .insert(slot);
+                    }
+                    if let Some(fidx) = mv_field_idx {
+                        let value = rmp_serde::to_vec(&(row.model_version_id as i64)).unwrap_or_default();
+                        bulk_writer.append_tuple_raw(slot, fidx, &value);
+                    }
+
+                    if let Some((mv_base_model, model_id)) = mv_map.get(&row.model_version_id) {
+                        if let Some((poi, model_type)) = model_map.get(model_id) {
+                            if model_type == "Checkpoint" {
+                                if let Some(ref bm_str) = mv_base_model {
+                                    let key = resolve_base_model_key_str(bm_str, schema);
+                                    if key > 0 {
+                                        insert_filter(&mut filter_maps, "baseModel", key, slot);
+                                    }
+                                    if let Some(fidx) = base_model_field_idx {
+                                        let value = rmp_serde::to_vec(&bm_str.as_str()).unwrap_or_default();
+                                        bulk_writer.append_tuple_raw(slot, fidx, &value);
+                                    }
+                                }
+                            }
+                            if *poi {
+                                insert_filter(&mut filter_maps, "poi", 1, slot);
+                            }
                         }
                     }
-                }
-                // Resource-level poi
-                if *poi {
-                    insert_filter(&mut filter_maps, "poi", 1, slot);
+                    count += 1;
                 }
             }
-        }
+            total_ref.fetch_add(count, Ordering::Relaxed);
+            filter_maps
+        })
+        .collect();
 
-        total += 1;
-        if total % LOG_INTERVAL == 0 {
-            progress.resource_rows.store(total, Ordering::Release);
-        }
+    // Merge
+    let mut merged: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
+    for fm in thread_results {
+        merge_filter_maps(&mut merged, fm);
     }
 
-    progress.resource_rows.store(total, Ordering::Release);
+    let t = total.load(Ordering::Relaxed);
+    progress.resource_rows.store(t, Ordering::Release);
 
     Ok(ResourceCsvResult {
-        row_count: total,
-        filter_maps,
+        row_count: t,
+        filter_maps: merged,
     })
 }
 
@@ -960,55 +1011,184 @@ fn process_resources_csv(
 // Metrics processor
 // ---------------------------------------------------------------------------
 
-/// Process metrics: build sort bitmaps + docstore tuples for reaction/comment/collected counts.
-fn process_metrics(
-    metrics_map: &MetricsMap,
+/// Process metrics.csv directly: mmap + parallel, build sort bitmaps + docstore tuples.
+/// TSV format: entityId\treactionCount\tcommentCount\tcollectedCount
+/// No intermediate HashMap — parse line → bitmaps + docstore in one pass.
+fn process_metrics_csv(
+    stage_dir: &Path,
     bulk_writer: &Arc<crate::docstore::BulkWriter>,
     sort_bits: &HashMap<String, u8>,
     sort_configs: &[(String, u8)],
 ) -> Result<HashMap<String, HashMap<usize, RoaringBitmap>>, String> {
-    let mut sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>> = sort_configs
+    let path = stage_dir.join("metrics.csv");
+    if !path.exists() {
+        eprintln!("  No metrics.csv found — metric sort fields will be 0");
+        return Ok(HashMap::new());
+    }
+
+    let file = std::fs::File::open(&path)
+        .map_err(|e| format!("open metrics.csv: {e}"))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("mmap metrics.csv: {e}"))?;
+    let data = &mmap[..];
+    eprintln!("  metrics: mmap'd {} ({:.1} MB)", data.len(), data.len() as f64 / (1024.0 * 1024.0));
+
+    let metric_sort_configs: Vec<(String, u8)> = sort_configs
         .iter()
         .filter(|(n, _)| ["reactionCount", "commentCount", "collectedCount"].contains(&n.as_str()))
-        .map(|(n, _)| (n.clone(), HashMap::new()))
+        .cloned()
         .collect();
 
+    let reaction_bits = sort_bits.get("reactionCount").copied();
+    let comment_bits = sort_bits.get("commentCount").copied();
+    let collected_bits = sort_bits.get("collectedCount").copied();
     let reaction_field_idx = bulk_writer.field_to_idx().get("reactionCount").copied();
     let comment_field_idx = bulk_writer.field_to_idx().get("commentCount").copied();
     let collected_field_idx = bulk_writer.field_to_idx().get("collectedCount").copied();
 
-    for (&slot, &(reaction, comment, collected)) in metrics_map {
-        // Sort bitmaps
-        if let Some(&bits) = sort_bits.get("reactionCount") {
-            insert_sort_bits(&mut sort_maps, "reactionCount", reaction, bits, slot);
-        }
-        if let Some(&bits) = sort_bits.get("commentCount") {
-            insert_sort_bits(&mut sort_maps, "commentCount", comment, bits, slot);
-        }
-        if let Some(&bits) = sort_bits.get("collectedCount") {
-            insert_sort_bits(&mut sort_maps, "collectedCount", collected, bits, slot);
-        }
+    let ranges = split_mmap_ranges(data, rayon::current_num_threads());
+    let total = AtomicU64::new(0);
+    let total_ref = &total;
 
-        // Docstore tuples
-        if let Some(fidx) = reaction_field_idx {
-            let value = rmp_serde::to_vec(&(reaction as i64)).unwrap_or_default();
-            bulk_writer.append_tuple_raw(slot, fidx, &value);
-        }
-        if let Some(fidx) = comment_field_idx {
-            let value = rmp_serde::to_vec(&(comment as i64)).unwrap_or_default();
-            bulk_writer.append_tuple_raw(slot, fidx, &value);
-        }
-        if let Some(fidx) = collected_field_idx {
-            let value = rmp_serde::to_vec(&(collected as i64)).unwrap_or_default();
-            bulk_writer.append_tuple_raw(slot, fidx, &value);
-        }
+    let thread_results: Vec<HashMap<String, HashMap<usize, RoaringBitmap>>> = ranges
+        .par_iter()
+        .map(|&(range_start, range_end)| {
+            let chunk = &data[range_start..range_end];
+            let mut sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>> =
+                metric_sort_configs.iter().map(|(n, _)| (n.clone(), HashMap::new())).collect();
+            let mut count = 0u64;
+            let mut line_start = 0;
+
+            for i in 0..chunk.len() {
+                if chunk[i] == b'\n' {
+                    let line = &chunk[line_start..i];
+                    line_start = i + 1;
+                    if line.is_empty() || (line.len() == 1 && line[0] == b'\r') { continue; }
+
+                    // Parse TSV: id\treaction\tcomment\tcollected
+                    let parts: Vec<&[u8]> = line.splitn(5, |&b| b == b'\t').collect();
+                    if parts.len() < 4 { continue; }
+
+                    let slot = fast_parse_u32(parts[0]);
+                    if slot == 0 { continue; }
+                    let reaction = fast_parse_u32(parts[1]);
+                    let comment = fast_parse_u32(parts[2]);
+                    let collected = fast_parse_u32(parts[3]);
+
+                    // Sort bitmaps
+                    if let Some(bits) = reaction_bits {
+                        insert_sort_bits(&mut sort_maps, "reactionCount", reaction, bits, slot);
+                    }
+                    if let Some(bits) = comment_bits {
+                        insert_sort_bits(&mut sort_maps, "commentCount", comment, bits, slot);
+                    }
+                    if let Some(bits) = collected_bits {
+                        insert_sort_bits(&mut sort_maps, "collectedCount", collected, bits, slot);
+                    }
+
+                    // Docstore tuples
+                    if let Some(fidx) = reaction_field_idx {
+                        let value = rmp_serde::to_vec(&(reaction as i64)).unwrap_or_default();
+                        bulk_writer.append_tuple_raw(slot, fidx, &value);
+                    }
+                    if let Some(fidx) = comment_field_idx {
+                        let value = rmp_serde::to_vec(&(comment as i64)).unwrap_or_default();
+                        bulk_writer.append_tuple_raw(slot, fidx, &value);
+                    }
+                    if let Some(fidx) = collected_field_idx {
+                        let value = rmp_serde::to_vec(&(collected as i64)).unwrap_or_default();
+                        bulk_writer.append_tuple_raw(slot, fidx, &value);
+                    }
+
+                    count += 1;
+                }
+            }
+            total_ref.fetch_add(count, Ordering::Relaxed);
+            sort_maps
+        })
+        .collect();
+
+    // Merge
+    let mut merged: HashMap<String, HashMap<usize, RoaringBitmap>> = HashMap::new();
+    for sm in thread_results {
+        merge_sort_maps(&mut merged, sm);
     }
 
-    Ok(sort_maps)
+    eprintln!("  metrics: {} rows processed", total.load(Ordering::Relaxed));
+    Ok(merged)
 }
 
 // ---------------------------------------------------------------------------
-// Shared bitmap helpers (reused from scatter_gather)
+// Shared mmap + parallel helpers
+// ---------------------------------------------------------------------------
+
+/// Split an mmap'd file into byte ranges aligned to newlines (one per thread).
+fn split_mmap_ranges(data: &[u8], num_threads: usize) -> Vec<(usize, usize)> {
+    let file_len = data.len();
+    let chunk_size = file_len / num_threads;
+    let mut ranges = Vec::with_capacity(num_threads);
+    let mut start = 0;
+    for i in 0..num_threads {
+        let end = if i == num_threads - 1 {
+            file_len
+        } else {
+            let tentative = start + chunk_size;
+            match data[tentative..].iter().position(|&b| b == b'\n') {
+                Some(offset) => tentative + offset + 1,
+                None => file_len,
+            }
+        }
+        .min(file_len);
+        if start < end {
+            ranges.push((start, end));
+        }
+        start = end;
+    }
+    ranges
+}
+
+/// Merge thread-local filter maps into a destination (OR bitmaps).
+fn merge_filter_maps(
+    dest: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
+    src: HashMap<String, HashMap<u64, RoaringBitmap>>,
+) {
+    for (field, values) in src {
+        let d = dest.entry(field).or_default();
+        for (val, bm) in values {
+            d.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
+        }
+    }
+}
+
+/// Merge thread-local sort maps into a destination (OR bitmaps).
+fn merge_sort_maps(
+    dest: &mut HashMap<String, HashMap<usize, RoaringBitmap>>,
+    src: HashMap<String, HashMap<usize, RoaringBitmap>>,
+) {
+    for (field, layers) in src {
+        let d = dest.entry(field).or_default();
+        for (bit, bm) in layers {
+            d.entry(bit).and_modify(|e| *e |= &bm).or_insert(bm);
+        }
+    }
+}
+
+/// Fast u32 parse from byte slice (no allocation).
+#[inline]
+fn fast_parse_u32(bytes: &[u8]) -> u32 {
+    let mut n: u32 = 0;
+    for &b in bytes {
+        if b >= b'0' && b <= b'9' {
+            n = n * 10 + (b - b'0') as u32;
+        } else if b == b'\r' || b == b' ' {
+            break;
+        }
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------
+// Shared bitmap helpers
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -1083,19 +1263,6 @@ fn save_sort_field_to_disk(
     }
     fs.write_sort_layers(field_name, &layers)
         .map_err(|e| format!("write_sort_layers({field_name}): {e}"))
-}
-
-/// Merge a single-field filter bitmap into the accumulator.
-fn merge_filter_bitmaps_single(
-    target: &mut HashMap<u64, RoaringBitmap>,
-    source: HashMap<u64, RoaringBitmap>,
-) {
-    for (key, bm) in source {
-        target
-            .entry(key)
-            .and_modify(|e| *e |= &bm)
-            .or_insert(bm);
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1337,3 +1337,69 @@ mod tests {
         assert!(!enrichment.resource_poi);
     }
 }
+
+// ---------------------------------------------------------------------------
+// ClickHouse metrics download
+// ---------------------------------------------------------------------------
+
+/// Download all-time aggregate metrics from ClickHouse to a TSV file.
+/// Query: entityMetricDailyAgg grouped by entityId for entityType='Image'.
+/// Output: metrics.csv in stage_dir (id\treactionCount\tcommentCount\tcollectedCount).
+pub async fn download_metrics_from_clickhouse(
+    stage_dir: &std::path::Path,
+    ch_url: &str,
+    ch_username: Option<&str>,
+    ch_password: Option<&str>,
+) -> Result<u64, String> {
+    let done_path = stage_dir.join("metrics.csv.done");
+    if done_path.exists() {
+        eprintln!("metrics.csv already downloaded (found .done marker)");
+        return Ok(0);
+    }
+
+    let csv_path = stage_dir.join("metrics.csv");
+    eprintln!("Downloading ClickHouse metrics to {} ...", csv_path.display());
+
+    let query = r#"SELECT
+        entityId,
+        sumIf(total, metricType IN ('ReactionLike','ReactionHeart','ReactionLaugh','ReactionCry')) as reactionCount,
+        sumIf(total, metricType = 'Comment') as commentCount,
+        sumIf(total, metricType = 'Collection') as collectedCount
+    FROM entityMetricDailyAgg
+    WHERE entityType = 'Image'
+    GROUP BY entityId
+    FORMAT TSV"#;
+
+    let http = reqwest::Client::new();
+    let mut req = http.post(ch_url).body(query.to_string());
+
+    if let Some(username) = ch_username {
+        let password = ch_password.unwrap_or("");
+        req = req.basic_auth(username, Some(password));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("ClickHouse request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("ClickHouse returned {status}: {body}"));
+    }
+
+    let mut file = std::fs::File::create(&csv_path)
+        .map_err(|e| format!("create metrics.csv: {e}"))?;
+    let body = resp.bytes().await.map_err(|e| format!("read CH body: {e}"))?;
+    std::io::Write::write_all(&mut file, &body)
+        .map_err(|e| format!("write metrics.csv: {e}"))?;
+
+    let row_count = body.iter().filter(|&&b| b == b'\n').count() as u64;
+    eprintln!("Downloaded {} metric rows from ClickHouse", row_count);
+
+    std::fs::write(&done_path, format!("{row_count}"))
+        .map_err(|e| format!("write .done marker: {e}"))?;
+
+    Ok(row_count)
+}
