@@ -741,6 +741,18 @@ impl DocStore {
         // Load existing entries for this shard
         let mut entries: Vec<(u32, Vec<u8>)> = match std::fs::read(&path) {
             Ok(file_data) => {
+                if Self::is_v2_shard(&file_data) {
+                    // V2 shard: append each field as a tuple instead of V1 read-modify-write
+                    for (field_name, fv) in &doc.fields {
+                        if let Some(&fidx) = self.field_to_idx.get(field_name.as_str()) {
+                            let packed = pack_field_value(fv);
+                            let bytes = rmp_serde::to_vec(&packed)
+                                .map_err(|e| BitdexError::DocStore(format!("serialize packed: {e}")))?;
+                            self.append_tuple(id, fidx, &bytes)?;
+                        }
+                    }
+                    return Ok(());
+                }
                 let (index, decompressed) = Self::read_shard_file(&file_data)?;
                 index.iter().filter(|(s, _, _)| *s != id).map(|(s, off, len)| {
                     let start = *off as usize;
@@ -751,7 +763,7 @@ impl DocStore {
             Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
         };
 
-        // Insert new entry in sorted position
+        // Insert new entry in sorted position (V1 path)
         let pos = entries.binary_search_by_key(&id, |e| e.0).unwrap_or_else(|p| p);
         entries.insert(pos, (id, raw_bytes));
 
@@ -799,24 +811,52 @@ impl DocStore {
             let path = Self::shard_path(&self.root, sid);
 
             // Load existing entries
-            let mut entries: Vec<(u32, Vec<u8>)> = match std::fs::read(&path) {
+            match std::fs::read(&path) {
+                Ok(file_data) if Self::is_v2_shard(&file_data) => {
+                    // V2 shard: append each doc's fields as tuples
+                    // Find the original StoredDocs for these entries
+                    for (id, _compressed) in &new_entries {
+                        if let Some((_, doc)) = docs.iter().find(|(did, _)| did == id) {
+                            for (field_name, fv) in &doc.fields {
+                                if let Some(&fidx) = self.field_to_idx.get(field_name.as_str()) {
+                                    let packed = pack_field_value(fv);
+                                    let bytes = rmp_serde::to_vec(&packed)
+                                        .map_err(|e| BitdexError::DocStore(format!("serialize packed: {e}")))?;
+                                    self.append_tuple(*id, fidx, &bytes)?;
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok(file_data) => {
+                    // V1 shard: read-modify-write
                     let (index, decompressed) = Self::read_shard_file(&file_data)?;
                     let new_ids: std::collections::HashSet<u32> = new_entries.iter().map(|(id, _)| *id).collect();
-                    index.iter().filter(|(s, _, _)| !new_ids.contains(s)).map(|(s, off, len)| {
+                    let mut entries: Vec<(u32, Vec<u8>)> = index.iter().filter(|(s, _, _)| !new_ids.contains(s)).map(|(s, off, len)| {
                         let start = *off as usize;
                         (*s, decompressed[start..start + *len as usize].to_vec())
-                    }).collect()
+                    }).collect();
+                    entries.append(&mut new_entries);
+                    entries.sort_by_key(|e| e.0);
+                    Self::write_shard_file(&path, &entries)?;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // New shard — write V2 tuples
+                    for (id, _compressed) in &new_entries {
+                        if let Some((_, doc)) = docs.iter().find(|(did, _)| did == id) {
+                            for (field_name, fv) in &doc.fields {
+                                if let Some(&fidx) = self.field_to_idx.get(field_name.as_str()) {
+                                    let packed = pack_field_value(fv);
+                                    let bytes = rmp_serde::to_vec(&packed)
+                                        .map_err(|e| BitdexError::DocStore(format!("serialize packed: {e}")))?;
+                                    self.append_tuple(*id, fidx, &bytes)?;
+                                }
+                            }
+                        }
+                    }
+                }
                 Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
             };
-
-            // Merge and sort
-            entries.append(&mut new_entries);
-            entries.sort_by_key(|e| e.0);
-
-            Self::write_shard_file(&path, &entries)?;
         }
 
         Ok(())
