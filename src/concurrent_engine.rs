@@ -500,6 +500,13 @@ impl ConcurrentEngine {
                             uc.meta_mut().set_next_id(meta.next_entry_id);
                             uc.meta_mut().set_tombstones(meta.tombstones);
 
+                            // Store has_more flags for shard restore
+                            let has_more_map: HashMap<crate::meta_index::CacheEntryId, bool> = meta.entries
+                                .iter()
+                                .map(|e| (e.entry_id, e.has_more))
+                                .collect();
+                            uc.set_meta_has_more(has_more_map);
+
                             // Record pending shards from registered entries
                             let mut shard_keys = HashSet::new();
                             for entry in &meta.entries {
@@ -2539,6 +2546,7 @@ impl ConcurrentEngine {
                         };
                         // Get metadata from meta entry (if available) or use defaults
                         let config = uc.config().clone();
+                        let has_more = uc.get_meta_has_more(se.entry_id);
                         let value_fn = |slot: u32| -> u32 {
                             sf.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                         };
@@ -2550,6 +2558,7 @@ impl ConcurrentEngine {
                             direction,
                             se.sorted_keys,
                             &value_fn,
+                            has_more,
                         );
                         uc.insert_restored_entry(key, entry);
                         loaded += 1;
