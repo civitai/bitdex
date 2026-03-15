@@ -728,6 +728,20 @@ impl BitdexServer {
         };
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        // Spawn background preload of all bitmap fields so lazy-loading
+        // doesn't block request threads or health checks during startup.
+        {
+            let engine_arc = shutdown_state.index.lock()
+                .as_ref()
+                .map(|s| Arc::clone(&s.engine));
+            if let Some(engine) = engine_arc {
+                tokio::task::spawn_blocking(move || {
+                    engine.preload_all_fields();
+                });
+            }
+        }
+
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal)
             .await?;

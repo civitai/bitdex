@@ -4220,6 +4220,38 @@ impl ConcurrentEngine {
         self.snapshot().slots.alive_count()
     }
 
+    /// Pre-load all pending filter and sort fields from disk.
+    /// Call from a background thread after server startup so lazy-loading
+    /// doesn't block request threads or health checks.
+    pub fn preload_all_fields(&self) {
+        use crate::query::{FilterClause, Value};
+        let t0 = std::time::Instant::now();
+
+        // Build synthetic filter clauses that touch every filter field
+        let mut clauses: Vec<FilterClause> = Vec::new();
+        for fc in &self.config.filter_fields {
+            // Eq with a dummy value triggers loading for the field
+            clauses.push(FilterClause::Eq(
+                fc.name.clone(),
+                Value::Integer(0),
+            ));
+        }
+
+        // Load all sort fields by iterating through each one
+        for sc in &self.config.sort_fields {
+            let _ = self.ensure_fields_loaded(&clauses, Some(&sc.name));
+        }
+        // One more call with no sort to load any remaining filters
+        let _ = self.ensure_fields_loaded(&clauses, None);
+
+        eprintln!(
+            "Background preload complete: {} filter + {} sort fields in {:.1}s",
+            self.config.filter_fields.len(),
+            self.config.sort_fields.len(),
+            t0.elapsed().as_secs_f64(),
+        );
+    }
+
     /// Flush loop stats: (publish_count, cumulative_duration_nanos, last_duration_nanos).
     pub fn flush_stats(&self) -> (u64, u64, u64) {
         (
