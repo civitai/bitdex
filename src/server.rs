@@ -707,6 +707,7 @@ impl BitdexServer {
             // Serve static UI
             .route("/", get(handle_ui))
             .layer(CorsLayer::permissive())
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)) // 64MB for bulk upserts
             .with_state(state);
 
         eprintln!("BitDex server listening on http://{}", addr);
