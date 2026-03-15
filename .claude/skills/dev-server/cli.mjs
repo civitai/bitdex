@@ -17,6 +17,8 @@
  *   datasets                            List known data directories
  *   reserve-port                        Reserve next available port
  *   build [--target T] [--profile P]    Acquire lock, build, release
+ *   test [filter] [--slot N]           Run cargo test in isolated slot
+ *   test-slots                         Show test slot status
  *   test-e2e [--port N]                 Acquire lock, run E2E, release
  *   dash                                TUI dashboard
  *   shutdown                            Kill all instances + stop daemon
@@ -26,8 +28,11 @@
 import { spawn, execSync } from 'node:child_process';
 import { resolve, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { appendFileSync } from 'node:fs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const DEBUG_LOG = resolve(__dirname, 'debug.log');
+function dbg(msg) { try { appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {} }
 const DAEMON_SCRIPT = resolve(__dirname, 'daemon.mjs');
 const PROJECT_ROOT = resolve(__dirname, '..', '..', '..');
 const DAEMON_URL = 'http://127.0.0.1:9851';
@@ -200,13 +205,16 @@ async function cmdNew() {
 }
 
 async function resolveTarget(explicit) {
-  if (explicit) return explicit;
+  if (explicit && !explicit.startsWith('--')) return explicit;
   // Default to first running instance
   const status = await daemonFetch('/status');
   const running = status.instances.filter(i => i.status === 'running' || i.status === 'starting');
   if (running.length === 0) {
     console.error('No running instances. Start one with: just dev');
     process.exit(1);
+  }
+  if (running.length > 1) {
+    console.error(`Using ${running[0].id} (${running.length} instances running — specify one with: logs <id>)`);
   }
   return running[0].id;
 }
@@ -345,6 +353,88 @@ async function cmdTestE2e() {
   }
 }
 
+async function cmdTest() {
+  const filter = getArg('--filter') || process.argv[3];
+  const slot = getArg('--slot');
+  const holder = getWorktree();
+
+  // If argv[3] starts with --, it's a flag not a filter
+  const resolvedFilter = (filter && !filter.startsWith('--')) ? filter : undefined;
+
+  console.error('Requesting test slot...');
+  const result = await daemonFetch('/test/run', {
+    method: 'POST',
+    body: { filter: resolvedFilter, slot: slot ? parseInt(slot, 10) : undefined, holder },
+  });
+
+  if (result.error) {
+    console.error(`Error: ${result.error}`);
+    if (result.slots) {
+      console.error('\nSlot status:');
+      for (const s of result.slots) {
+        const status = s.holder ? `RUNNING (${s.holder}, ${s.elapsed_s}s)` : 'FREE';
+        console.error(`  Slot ${s.id}: ${status}`);
+      }
+    }
+    console.log(JSON.stringify(result));
+    process.exit(1);
+  }
+
+  console.error(`Running in slot ${result.slot} (${result.command})`);
+  console.error(`Target dir: ${result.targetDir}`);
+
+  // Poll logs until done
+  let cursor = 0;
+  while (true) {
+    await new Promise(r => setTimeout(r, 1000));
+
+    const logs = await daemonFetch(`/test/slots/${result.slot}/logs?since=${cursor}`);
+
+    for (const entry of logs.logs || []) {
+      const lvl = ERROR_PATTERNS.test(entry.message) ? '\x1b[31mERR\x1b[0m' : '   ';
+      console.error(`${lvl} ${entry.message}`);
+      cursor = entry.index;
+    }
+
+    if (logs.exitCode != null) {
+      if (logs.exitCode === 0) {
+        console.error('\x1b[32mTests passed.\x1b[0m');
+        console.log(JSON.stringify({ success: true, slot: result.slot, exitCode: 0 }));
+      } else {
+        console.error(`\x1b[31mTests failed (exit ${logs.exitCode}).\x1b[0m`);
+        console.log(JSON.stringify({ success: false, slot: result.slot, exitCode: logs.exitCode }));
+        process.exit(1);
+      }
+      break;
+    }
+
+    // Check if holder cleared (process died without setting exitCode)
+    if (!logs.holder) {
+      console.error('\x1b[31mTest slot released unexpectedly.\x1b[0m');
+      console.log(JSON.stringify({ success: false, slot: result.slot, exitCode: null }));
+      process.exit(1);
+    }
+  }
+}
+
+async function cmdTestSlots() {
+  const slots = await daemonFetch('/test/slots');
+
+  const G = '\x1b[32m', Y = '\x1b[33m', R = '\x1b[0m', D = '\x1b[2m', B = '\x1b[1m';
+  console.error(`${B}Test Slots${R} (${slots.length} total)`);
+  console.error(`  ${D}${pad('Slot', 6)}${pad('Status', 12)}${pad('Holder', 30)}${pad('Elapsed', 10)}${pad('Command', 30)}${R}`);
+
+  for (const s of slots) {
+    const status = s.holder ? `${Y}RUNNING${R}` : `${G}FREE${R}`;
+    const holder = s.holder ? s.holder.split('/').pop() : '';
+    const elapsed = s.elapsed_s != null ? `${s.elapsed_s}s` : '';
+    const cmd = s.command || '';
+    console.error(`  ${pad(String(s.id), 6)}${pad(status, 12 + 9)}${pad(holder, 30)}${pad(elapsed, 10)}${pad(cmd, 30)}`);
+  }
+
+  console.log(JSON.stringify(slots, null, 2));
+}
+
 async function cmdForceKill() {
   const result = await daemonFetch('/force-kill', { method: 'POST' });
   console.error(result.message);
@@ -413,7 +503,7 @@ function fmtBytes(bytes) {
 }
 
 function fmtCount(n) {
-  if (!n) return '—';
+  if (n == null) return '—';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
@@ -456,9 +546,9 @@ const WHT = '\x1b[37m';
 const BLU = '\x1b[34m';
 
 const LOG_FORMATTERS = [
-  // Query result with breakdown: "→ 4000 results  total=89μs  plan=0μs  filter=71μs  sort=16μs cache"
+  // Query result with breakdown: "→ 4000 results  total=89μs  plan=0μs  filter=71μs  sort=16μs  docs=7764μs(40) cache"
   {
-    match: /^\s*→\s*(\d[\d,]*)\s+results\s+total=(\d+)μs\s+plan=(\d+)μs\s+filter=(\d+)μs\s+sort=(\d+)μs\s*(cache)?/,
+    match: /^\s*→\s*(\d[\d,]*)\s+results\s+total=(\d+)μs\s+plan=(\d+)μs\s+filter=(\d+)μs\s+sort=(\d+)μs\s*(?:docs=\d+μs\(\d+\))?\s*(cache)?/,
     format: (m, w) => {
       const results = m[1];
       const total = parseInt(m[2], 10);
@@ -468,7 +558,7 @@ const LOG_FORMATTERS = [
       const cache = m[6] ? ` ${GRN}cache${R}` : '';
       const n = parseInt(results.replace(/,/g, ''), 10);
       const countStr = n >= 100000 ? fmtCount(n) : results;
-      return `  ${GRN}→${R} ${WHT}${countStr}${R} results  total=${CYN}${fmtTime(total)}${R}  plan=${DIM}${fmtTime(plan)}${R}  filter=${DIM}${fmtTime(filter)}${R}  sort=${DIM}${fmtTime(sort)}${R}${cache}`;
+      return `  ${GRN}→${R} ${WHT}${countStr}${R} results  total=${CYN}${fmtTime(total)}${R}  ${DIM}plan=${R}${WHT}${fmtTime(plan)}${R}  ${DIM}filter=${R}${WHT}${fmtTime(filter)}${R}  ${DIM}sort=${R}${WHT}${fmtTime(sort)}${R}${cache}`;
     },
   },
   // Legacy result format: "→ 4000 results, 16μs"
@@ -499,9 +589,9 @@ const LOG_FORMATTERS = [
     match: /^Restored index '([^']+)' from disk \((\d+) records\)$/,
     format: (m, w) => `${GRN}✓${R} Restored ${WHT}${m[1]}${R} — ${CYN}${(parseInt(m[2])/1e6).toFixed(1)}M${R} records`,
   },
-  // Server listening: "BitDex server listening on http://..."
+  // Server listening: "BitDex server listening on http://..." (may be truncated)
   {
-    match: /^BitDex server listening on (.+)$/,
+    match: /^BitDex server listening on (.+)/,
     format: (m, w) => `${GRN}✓${R} Listening on ${CYN}${m[1]}${R}`,
   },
   // Existence set: "Existence set for 'modelVersionIds': 477324 keys"
@@ -509,16 +599,66 @@ const LOG_FORMATTERS = [
     match: /^Existence set for '([^']+)':\s*(\d+)\s*keys$/,
     format: (m, w) => `${DIM}existence${R} ${BLU}${m[1]}${R} ${DIM}${parseInt(m[2]).toLocaleString()} keys${R}`,
   },
+  // Eager-loaded filter/sort: "Eager-loaded filter 'baseModel': 981 values in 109.7ms"
+  {
+    match: /^Eager-loaded\s+(filter|sort)\s+'([^']+)':\s*(\d+)\s*(values|layers)\s+in\s+(.+)$/,
+    format: (m, w) => `${DIM}eager${R} ${BLU}${m[2]}${R} ${DIM}(${m[1]})${R} ${m[3]} ${m[4]} ${DIM}in${R} ${CYN}${m[5]}${R}`,
+  },
+  // Eager loading complete: "Eager loading complete: 8 fields in 1567.2ms"
+  {
+    match: /^Eager loading complete:\s*(.+)$/,
+    format: (m, w) => `${GRN}✓${R} Eager load complete: ${CYN}${m[1]}${R}`,
+  },
+  // BoundStore: "BoundStore: loaded meta.bin (4 entries, 2 tombstones, next_id=9)"
+  {
+    match: /^BoundStore:\s*(.+)$/,
+    format: (m, w) => `${DIM}cache${R} ${m[1]}`,
+  },
+  // Clause with eval: "clause[0]: eval=123μs (50000), and=45μs → 48000 | type IN [image]"
+  {
+    match: /^clause\[(\d+)\]:\s*eval=(\d+)μs\s*\((\d+)\),?\s*and=(\d+)μs\s*→\s*(\d+)\s*\|\s*(.+)$/,
+    format: (m, w) => {
+      let expr = m[6];
+      expr = expr.replace(/\b(IN|NOT|AND|OR)\b/g, (kw) => MAG + kw + R);
+      expr = expr.replace(/\b(nsfwLevel|userId|baseModel|isPublished|type|sortAtUnix|collectedCount|reactionCount|sortAt|modelVersionIds|tagIds|toolIds|techniqueIds|postId|availability|blockedFor|hasMeta|isRemix|minor|onSite|poi)\b/g, (f) => BLU + f + R);
+      const evalTime = fmtTime(parseInt(m[2]));
+      return `  ${DIM}clause${R} ${DIM}#${m[1]}${R} ${CYN}${evalTime}${R} ${DIM}→${R} ${WHT}${fmtCount(parseInt(m[5]))}${R} ${DIM}|${R} ${expr}`;
+    },
+  },
+  // Clause with and_ref: "clause[1]: and_ref=45μs → 48000 | isPublished = true"
+  {
+    match: /^clause\[(\d+)\]:\s*and_ref=(\d+)μs\s*→\s*(\d+)\s*\|\s*(.+)$/,
+    format: (m, w) => {
+      let expr = m[4];
+      expr = expr.replace(/\b(IN|NOT|AND|OR)\b/g, (kw) => MAG + kw + R);
+      expr = expr.replace(/\b(nsfwLevel|userId|baseModel|isPublished|type|sortAtUnix|collectedCount|reactionCount|sortAt|modelVersionIds|tagIds|toolIds|techniqueIds|postId|availability|blockedFor|hasMeta|isRemix|minor|onSite|poi)\b/g, (f) => BLU + f + R);
+      const andTime = fmtTime(parseInt(m[2]));
+      return `  ${DIM}clause${R} ${DIM}#${m[1]}${R} ${CYN}${andTime}${R} ${DIM}→${R} ${WHT}${fmtCount(parseInt(m[3]))}${R} ${DIM}|${R} ${expr}`;
+    },
+  },
 ];
 
 function formatLogBody(body, maxW) {
-  // Truncate plain text FIRST, then apply formatting — this keeps ANSI sequences intact
-  const truncated = body.length > maxW ? body.slice(0, maxW) : body;
+  // Match on full body first, then truncate the formatted result
   for (const fmt of LOG_FORMATTERS) {
-    const m = truncated.match(fmt.match);
-    if (m) return fmt.format(m, maxW);
+    const m = body.match(fmt.match);
+    if (m) {
+      const formatted = fmt.format(m, maxW);
+      // Truncate by visible length (strip ANSI for counting)
+      const vis = formatted.replace(/\x1b\[[0-9;]*m/g, '');
+      if (vis.length > maxW) {
+        // Find the cut point accounting for ANSI codes
+        let visLen = 0, i = 0;
+        while (i < formatted.length && visLen < maxW) {
+          if (formatted[i] === '\x1b') { while (i < formatted.length && formatted[i] !== 'm') i++; i++; }
+          else { visLen++; i++; }
+        }
+        return formatted.slice(0, i) + R;
+      }
+      return formatted;
+    }
   }
-  return truncated;
+  return body.length > maxW ? body.slice(0, maxW) : body;
 }
 
 function trunc(str, n) {
@@ -552,11 +692,28 @@ async function cmdDashboard() {
   let inputMode = null;  // null or { prompt, buffer, callback }
   let showStats = false; // 'i' toggles detailed stats panel
   let logScroll = 0;    // 0 = live tail, >0 = scrolled up N lines from bottom
+  let wordWrap = false; // 'w' toggles word wrap in log panel
   let explainTraces = [];   // array of fetched traces
   let explainIdx = 0;       // current index in explainTraces
   let explainMode = false;  // when true, logs are paused and arrow keys navigate traces
+  let renderDirty = false;  // SSE events set this; timer reads+clears it
 
-  function flash(msg) { actionMsg = msg; setTimeout(() => { actionMsg = ''; }, 4000); }
+  function flash(msg) { actionMsg = msg; renderDirty = true; setTimeout(() => { actionMsg = ''; renderDirty = true; }, 4000); }
+
+  // Throttled render: ~4fps max. During inputMode, skip full renders entirely.
+  let rendering = false;
+  const renderTimer = setInterval(() => {
+    if (!renderDirty || !lastStatus || rendering) return;
+    renderDirty = false;
+    if (inputMode) {
+      // Only redraw the input prompt line — no full screen render
+      write(`\x1b[${rows};1H` + CLR_LINE + `  ${inputMode.prompt}${inputMode.buffer}█`);
+      return;
+    }
+    rendering = true;
+    render(lastStatus);
+    rendering = false;
+  }, 250);
 
   function render(status) {
     const buf = [];
@@ -683,37 +840,50 @@ async function cmdDashboard() {
     const startIdx = Math.max(0, endIdx - logAreaRows);
     const visible = logLines.slice(startIdx, endIdx);
 
-    for (let i = 0; i < logAreaRows; i++) {
-      const entry = visible[i];
-      if (entry) {
-        const raw = stripAnsi(entry.message || '');
-        // Parse tracing format: "2026-03-14T07:15:17.512198Z  INFO [civitai] message..."
-        const tracingMatch = raw.match(/^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})\.\d+Z\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(?:\[([^\]]+)\]\s+)?(.*)$/);
-        let ts, lvlStr, body;
-        if (tracingMatch) {
-          ts = tracingMatch[1];
-          lvlStr = tracingMatch[2];
-          body = tracingMatch[4];
-        } else {
-          // Non-tracing line (daemon messages, plain stderr)
-          ts = new Date(entry.timestamp).toLocaleTimeString('en-US', { hour12: false });
-          lvlStr = entry.level === 'daemon' ? 'DAE' : '';
-          body = raw;
-        }
-        // Level indicator
-        let lvl;
-        switch (lvlStr) {
-          case 'ERROR': lvl = `${RED}✖${R}`; break;
-          case 'WARN':  lvl = `${YLW}⚠${R}`; break;
-          case 'DAE':   lvl = `${CYN}●${R}`; break;
-          default:      lvl = ' ';
-        }
-        const msgMax = cols - 13;
-        const msg = formatLogBody(body, msgMax);
-        buf.push(CLR_LINE + `  ${DIM}${ts}${R} ${lvl} ${msg}` + '\n');
+    // Build visual lines from log entries
+    const visualLines = [];
+    for (const entry of visible) {
+      const raw = stripAnsi(entry.message || '');
+      const tracingMatch = raw.match(/^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})\.\d+Z\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(?:\[([^\]]+)\]\s+)?(.*)$/);
+      let ts, lvlStr, body;
+      if (tracingMatch) {
+        ts = tracingMatch[1];
+        lvlStr = tracingMatch[2];
+        body = tracingMatch[4];
       } else {
-        buf.push(CLR_LINE + '\n');
+        ts = new Date(entry.timestamp).toLocaleTimeString('en-US', { hour12: false });
+        lvlStr = entry.level === 'daemon' ? 'DAE' : '';
+        body = raw;
       }
+      let lvl;
+      switch (lvlStr) {
+        case 'ERROR': lvl = `${RED}✖${R}`; break;
+        case 'WARN':  lvl = `${YLW}⚠${R}`; break;
+        case 'DAE':   lvl = `${CYN}●${R}`; break;
+        default:      lvl = ' ';
+      }
+      const msgMax = cols - 13;
+      if (wordWrap && body.length > msgMax) {
+        // First line with timestamp + level
+        const firstLine = formatLogBody(body.slice(0, msgMax), msgMax);
+        visualLines.push(`  ${DIM}${ts}${R} ${lvl} ${firstLine}`);
+        // Continuation lines indented to align with message body
+        let pos = msgMax;
+        while (pos < body.length) {
+          const chunk = body.slice(pos, pos + msgMax - 2);
+          visualLines.push(`  ${DIM}       ${R}   ${formatLogBody(chunk, msgMax - 2)}`);
+          pos += msgMax - 2;
+        }
+      } else {
+        const msg = formatLogBody(body, msgMax);
+        visualLines.push(`  ${DIM}${ts}${R} ${lvl} ${msg}`);
+      }
+    }
+    // Render from the end of visual lines (tail view)
+    const visStart = Math.max(0, visualLines.length - logAreaRows);
+    for (let i = 0; i < logAreaRows; i++) {
+      const line = visualLines[visStart + i];
+      buf.push(CLR_LINE + (line || '') + '\n');
     }
 
     // ── Explain panel (between logs and footer)
@@ -726,15 +896,20 @@ async function cmdDashboard() {
     if (actionMsg) {
       buf.push(CLR_LINE + ` ${YLW}${actionMsg}${R}` + CLR_BELOW);
     } else {
-      buf.push(CLR_LINE + `  ${DIM}↑↓${R} scroll  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}e${R}${DIM}xplain${R}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
+      const wrapTag = wordWrap ? `${GRN}w${R}${DIM}rap${R}` : `${B}w${R}${DIM}rap${R}`;
+      buf.push(CLR_LINE + `  ${DIM}↑↓${R} scroll  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}e${R}${DIM}xplain${R}  ${wrapTag}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
     }
 
+    // Single buffered write — cork/uncork to minimize terminal I/O
+    if (process.stdout.cork) process.stdout.cork();
     write(buf.join(''));
+    if (process.stdout.uncork) process.stdout.uncork();
   }
 
   // Keyboard handler
   process.stdin.on('data', async (key) => {
     if (!running) return;
+    dbg(`KEY: ${JSON.stringify(key)} at ${Date.now()}`);
 
     // Input mode: collecting a text value (e.g. data-dir path)
     if (inputMode) {
@@ -761,6 +936,8 @@ async function cmdDashboard() {
         inputMode.buffer += key;
       }
       actionMsg = `${inputMode.prompt}${inputMode.buffer}█`;
+      // Immediately draw the input line — don't wait for render timer
+      write(`\x1b[${rows};1H` + CLR_LINE + `  ${actionMsg}`);
       return;
     }
 
@@ -804,6 +981,8 @@ async function cmdDashboard() {
 
     if (key === 'q' || key === '\x03') {
       running = false;
+      clearInterval(renderTimer);
+      try { sseAbort.abort(); } catch {}
       write(CUR_SHOW + ALT_OFF);
       process.stdin.setRawMode(false);
       process.exit(0);
@@ -827,6 +1006,12 @@ async function cmdDashboard() {
     if (key === 'i') {
       showStats = !showStats;
       flash(showStats ? 'Stats: expanded' : 'Stats: compact');
+    }
+
+    if (key === 'w') {
+      wordWrap = !wordWrap;
+      renderDirty = true;
+      flash(wordWrap ? 'Word wrap: ON' : 'Word wrap: OFF');
     }
 
     if (key === 'e') {
@@ -928,38 +1113,55 @@ async function cmdDashboard() {
 
   // SSE event stream — replaces polling loop
   let lastStatus = null;
+  let sseAbort = new AbortController();
 
   async function connectSSE() {
     try {
-      const res = await fetch(`${DAEMON_URL}/events`);
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
+      // Use http.get instead of fetch — fetch's stream reader can starve stdin on Windows
+      const http = await import('node:http');
+      await new Promise((resolve, reject) => {
+        const req = http.get(`${DAEMON_URL}/events`, (res) => {
+          let buffer = '';
+          res.setEncoding('utf8');
 
-      while (running) {
-        const { done, value } = await reader.read();
-        if (done) break;
+          res.on('data', (chunk) => {
+            if (!running) return;
+            buffer += chunk;
+            const events = buffer.split('\n\n');
+            buffer = events.pop();
 
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split('\n\n');
-        buffer = events.pop(); // keep incomplete event
+            for (const raw of events) {
+              if (!raw.trim()) continue;
+              let eventType = 'message';
+              let data = '';
+              for (const line of raw.split('\n')) {
+                if (line.startsWith('event: ')) eventType = line.slice(7);
+                else if (line.startsWith('data: ')) data = line.slice(6);
+              }
+              if (!data) continue;
 
-        for (const raw of events) {
-          if (!raw.trim()) continue;
-          let eventType = 'message';
-          let data = '';
-          for (const line of raw.split('\n')) {
-            if (line.startsWith('event: ')) eventType = line.slice(7);
-            else if (line.startsWith('data: ')) data = line.slice(6);
-          }
-          if (!data) continue;
-
-          try {
-            const parsed = JSON.parse(data);
+              try {
+                const parsed = JSON.parse(data);
 
             if (eventType === 'status') {
               lastStatus = parsed;
-              if (!explainMode) render(lastStatus);
+              // Backfill logs on first status event if log panel is empty (fire-and-forget)
+              if (logLines.length === 0 && parsed.instances?.length > 0) {
+                const target = selectedInstance || parsed.instances[0]?.id;
+                if (target) {
+                  const logRows = Math.max(10, rows - 15);
+                  daemonFetch(`/instances/${target}/logs?tail=${logRows}`).then(resp => {
+                    const backfill = resp.logs || resp;
+                    if (Array.isArray(backfill) && backfill.length > 0) {
+                      logLines = backfill;
+                      logCursor = backfill[backfill.length - 1].index;
+                      lastLogTarget = target;
+                      renderDirty = true;
+                    }
+                  }).catch(() => {});
+                }
+              }
+              if (!explainMode) renderDirty = true;
             } else if (eventType === 'log') {
               // Log event from daemon — add to logLines if it's our target instance
               const logTarget = selectedInstance || (lastStatus?.instances?.[0]?.id) || null;
@@ -967,17 +1169,25 @@ async function cmdDashboard() {
                 logLines.push(parsed);
                 logCursor = parsed.index;
                 if (logLines.length > 500) logLines = logLines.slice(-300);
-                if (lastStatus) render(lastStatus);
+                renderDirty = true;
               }
             }
           } catch { /* malformed event */ }
         }
-      }
+          });
+
+          res.on('end', () => { resolve(); });
+          res.on('error', (e) => { reject(e); });
+        });
+
+        req.on('error', (e) => { reject(e); });
+        sseAbort.signal.addEventListener('abort', () => { req.destroy(); resolve(); });
+      });
     } catch {
-      // SSE connection failed — fall back to single render with error
-      write(HOME + CLR_LINE + `${RED}Daemon not responding — reconnecting...${R}` + CLR_BELOW);
-      await sleep(2000);
-      if (running) connectSSE(); // auto-reconnect
+      if (!running) return;
+      write(HOME + CLR_LINE + `${YLW} Daemon not responding — reconnecting...${R}` + CLR_BELOW);
+      await sleep(1000);
+      if (running) connectSSE();
     }
   }
 
@@ -994,13 +1204,16 @@ async function resolveRunningInstance() {
     process.exit(1);
   }
   const explicit = process.argv[3];
-  if (explicit) {
+  if (explicit && !explicit.startsWith('--')) {
     const found = running.find(i => i.id === explicit || String(i.port) === explicit);
     if (!found) {
       console.error(`Instance '${explicit}' not found or not running`);
       process.exit(1);
     }
     return found;
+  }
+  if (running.length > 1) {
+    console.error(`Using ${running[0].id} (${running.length} instances running — specify one with: traces <id>)`);
   }
   return running[0];
 }
@@ -1044,6 +1257,8 @@ Commands:
   reserve-port [--preferred N]        Reserve next available port
   build [--target T] [--profile P]    Acquire lock, build, release (default: fast profile)
   traces [id|port] [--last N]         Fetch recent query traces (default last=5)
+  test [filter] [--slot N]           Run cargo test in isolated slot
+  test-slots                         Show test slot status
   test-e2e [--port N]                 Acquire lock, run E2E suite, release
   dash                                TUI dashboard
   shutdown                            Kill all instances + stop daemon
@@ -1078,6 +1293,8 @@ async function main() {
     case 'reserve-port': return cmdReservePort();
     case 'build': return cmdBuild();
     case 'traces': return cmdTraces();
+    case 'test': return cmdTest();
+    case 'test-slots': return cmdTestSlots();
     case 'test-e2e': return cmdTestE2e();
     case 'dash': case 'dashboard': return cmdDashboard();
     case 'restart': return cmdRestart();

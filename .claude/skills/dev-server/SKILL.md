@@ -86,7 +86,7 @@ node .claude/skills/dev-server/cli.mjs traces --last 20
 node .claude/skills/dev-server/cli.mjs traces srv-3005
 ```
 
-Returns JSON with per-query trace data: total/plan/filter/sort timing (microseconds), clause-level cardinality and evaluation costs, cache hit/miss, and result count. Traces are collected server-side on every query and persisted to JSONL.
+Returns JSON with per-query trace data: total/plan/filter/sort timing (microseconds), clause-level cardinality and evaluation costs, cache hit/miss, and result count. Traces are opt-in (`enable_traces = true` in TOML or `--enable-traces` CLI flag). The dev-server daemon enables traces automatically.
 
 **TUI explain panel:** In the dashboard (`dash`), press `e` to toggle the explain panel. It renders the most recent query trace inline — clause ordering, cardinality reduction per step, sort timing, and cache status.
 
@@ -97,6 +97,24 @@ node .claude/skills/dev-server/cli.mjs test-e2e
 ```
 
 Acquires E2E lock (only one run at a time — shared port 3100), runs the suite with `--skip-build`, releases. Build separately via `build` if needed.
+
+## Running Tests (with Slots)
+
+```bash
+# Run all tests in next free slot
+node .claude/skills/dev-server/cli.mjs test
+
+# Run specific test
+node .claude/skills/dev-server/cli.mjs test test_name
+
+# Run with filter
+node .claude/skills/dev-server/cli.mjs test --filter "test_cache"
+
+# Check slot status
+node .claude/skills/dev-server/cli.mjs test-slots
+```
+
+3 test slots with isolated cargo target directories. No lock contention — agents can compile tests in parallel. Slots auto-release on completion or after 5 minute timeout.
 
 ## Rules
 
@@ -122,6 +140,8 @@ Acquires E2E lock (only one run at a time — shared port 3100), runs the suite 
 | `reserve-port` | Reserve next available port | JSON |
 | `build [--target T] [--profile P]` | Coordinated cargo build | JSON |
 | `traces [id\|port] [--last N]` | Fetch recent query traces (default last=5) | JSON |
+| `test [filter] [--slot N]` | Run cargo test in isolated slot | JSON |
+| `test-slots` | Show test slot status | JSON |
 | `test-e2e [--port N]` | Coordinated E2E test run | JSON |
 | `dash` | TUI dashboard with live logs, metrics, and explain panel | Interactive |
 | `shutdown` | Kill all instances + daemon | JSON |
@@ -155,5 +175,5 @@ Live terminal dashboard with instance status, Prometheus metrics, log streaming,
 - **Shadow copy**: server runs from `.active.exe` so cargo builds don't lock the running binary
 - **Port range**: 3001-3099 for instances, 3100 reserved for E2E
 - **Heartbeat**: every 10s, detects dead processes, auto-releases stale locks
-- **State**: persisted to `.claude/skills/dev-server/state/` (gitignored)
+- **State**: in-memory only (no disk persistence — daemon restart resets state)
 - **Datasets**: tracked but never auto-deleted — stopping preserves data

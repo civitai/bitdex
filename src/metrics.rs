@@ -46,6 +46,11 @@ pub struct Metrics {
     pub eviction_total: IntGaugeVec,
     pub eviction_resident_values: IntGaugeVec,
 
+    // -- Shard compaction --
+    pub compaction_total: IntCounterVec,
+    pub compaction_duration_seconds: HistogramVec,
+    pub compaction_skipped_total: IntCounterVec,
+
     // -- BoundStore (cache persistence) --
     pub boundstore_meta_entries: IntGaugeVec,
     pub boundstore_tombstones: IntGaugeVec,
@@ -216,6 +221,28 @@ impl Metrics {
         )
         .unwrap();
 
+        // Shard compaction metrics
+        let compaction_total = IntCounterVec::new(
+            Opts::new("bitdex_compaction_total", "Total shard compactions performed"),
+            &["index"],
+        )
+        .unwrap();
+        let compaction_buckets = vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1];
+        let compaction_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_compaction_duration_seconds",
+                "Shard compaction latency distribution",
+            )
+            .buckets(compaction_buckets),
+            &["index"],
+        )
+        .unwrap();
+        let compaction_skipped_total = IntCounterVec::new(
+            Opts::new("bitdex_compaction_skipped_total", "Compactions skipped (channel full)"),
+            &["index"],
+        )
+        .unwrap();
+
         // BoundStore metrics
         let boundstore_meta_entries = IntGaugeVec::new(
             Opts::new("bitdex_boundstore_meta_entries", "Cache entries registered in meta-index"),
@@ -305,6 +332,9 @@ impl Metrics {
         registry
             .register(Box::new(eviction_resident_values.clone()))
             .unwrap();
+        registry.register(Box::new(compaction_total.clone())).unwrap();
+        registry.register(Box::new(compaction_duration_seconds.clone())).unwrap();
+        registry.register(Box::new(compaction_skipped_total.clone())).unwrap();
         registry.register(Box::new(boundstore_meta_entries.clone())).unwrap();
         registry.register(Box::new(boundstore_tombstones.clone())).unwrap();
         registry.register(Box::new(boundstore_pending_shards.clone())).unwrap();
@@ -338,6 +368,9 @@ impl Metrics {
             pending_fields,
             eviction_total,
             eviction_resident_values,
+            compaction_total,
+            compaction_duration_seconds,
+            compaction_skipped_total,
             boundstore_meta_entries,
             boundstore_tombstones,
             boundstore_pending_shards,

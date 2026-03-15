@@ -100,6 +100,17 @@ Run `/dev-guide` for full phase details, workflow expectations, and what's built
 
 ---
 
+## Git Workflow
+
+- **All work merging to main goes through a PR.** Push your branch, open a PR with `gh pr create`, get review.
+- **Sub-agents working under a team lead** commit to their worktree branch. The team lead merges sub-agent work into their branch and opens one PR for the combined result.
+- **Always commit before reporting done.** Uncommitted worktree changes are invisible to reviewers.
+- **Never push directly to main.** No exceptions.
+
+See `/dev-guide` for the full worktree lifecycle, sub-agent commit rules, and PR process.
+
+---
+
 ## Running Locally
 
 ```bash

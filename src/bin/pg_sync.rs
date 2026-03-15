@@ -22,7 +22,7 @@ use bitdex_v2::pg_sync::metrics_poller;
 use bitdex_v2::pg_sync::outbox_poller;
 use bitdex_v2::pg_sync::progress::{self, LoadProgress};
 use bitdex_v2::pg_sync::queries;
-use bitdex_v2::pg_sync::scatter_gather;
+use bitdex_v2::pg_sync::single_pass;
 
 #[derive(Parser)]
 #[command(name = "pg-sync", about = "Postgres-to-Bitdex sync system")]
@@ -43,6 +43,8 @@ enum Commands {
     Sync,
     /// Create BitdexOutbox table/triggers only (no data load).
     Setup,
+    /// Validate config, paths, and CSV availability without loading.
+    Validate,
 }
 
 #[tokio::main]
@@ -71,13 +73,69 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // Create PG connection pool
+    // Compute derived paths
+    let index_storage_dir = sync_config
+        .data_dir
+        .join(&sync_config.index_subdir)
+        .join(&index_def.name);
+    let stage_dir = sync_config
+        .stage_dir
+        .clone()
+        .unwrap_or_else(|| index_storage_dir.join("load_stage"));
+
+    // Validate doesn't need PG — handle it before connecting
+    if matches!(cli.command, Commands::Validate) {
+        eprintln!("=== Validate ===");
+        eprintln!("Config:       {}", cli.config.display());
+        eprintln!("Index:        {} (from {})", index_def.name, sync_config.index_dir.display());
+        eprintln!("Data dir:     {}", sync_config.data_dir.display());
+        eprintln!("Storage dir:  {}", index_storage_dir.display());
+        eprintln!("Bitmap dir:   {}", index_storage_dir.join(&sync_config.bitmap_subdir).display());
+        eprintln!("Docs dir:     {}", index_storage_dir.join(&sync_config.docs_subdir).display());
+        eprintln!("Stage dir:    {}", stage_dir.display());
+        eprintln!("Postgres:     {}...{}", &sync_config.postgres_url[..sync_config.postgres_url.find('@').unwrap_or(20).min(20)], &sync_config.postgres_url[sync_config.postgres_url.rfind('/').unwrap_or(0)..]);
+        eprintln!("ClickHouse:   {}", sync_config.clickhouse_url.as_deref().unwrap_or("(not configured)"));
+
+        let mut ok = true;
+        let csvs = ["tags.csv", "images.csv", "resources.csv", "posts.csv",
+                     "tools.csv", "techniques.csv", "model_versions.csv", "models.csv", "metrics.csv"];
+        eprintln!("\nCSV files in {}:", stage_dir.display());
+        for csv in &csvs {
+            let path = stage_dir.join(csv);
+            if path.exists() {
+                let meta = std::fs::metadata(&path).unwrap();
+                let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
+                let done = stage_dir.join(format!("{csv}.done")).exists();
+                eprintln!("  {csv:25} {size_mb:>10.1} MB {}", if done { "(done)" } else { "" });
+            } else {
+                eprintln!("  {csv:25} MISSING");
+                if csv != &"metrics.csv" { ok = false; } // metrics optional
+            }
+        }
+
+        let config_path = sync_config.index_dir.join("config.json");
+        if !config_path.exists() {
+            eprintln!("\nERROR: config.json not found at {}", config_path.display());
+            ok = false;
+        }
+
+        eprintln!("\nFilter fields: {}", index_def.config.filter_fields.len());
+        eprintln!("Sort fields:   {}", index_def.config.sort_fields.len());
+
+        if ok {
+            eprintln!("\nVALIDATION PASSED — ready to load.");
+        } else {
+            eprintln!("\nVALIDATION FAILED — missing required files.");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Create PG connection pool (needed for load/sync/setup)
     let pool = PgPoolOptions::new()
         .max_connections(sync_config.pg_pool_size)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
-                // Disable statement_timeout for bulk COPY streams that can run for minutes.
-                // The default 2min timeout kills long-running COPY TO STDOUT queries.
                 sqlx::query("SET statement_timeout = 0")
                     .execute(&mut *conn)
                     .await?;
@@ -94,6 +152,7 @@ async fn main() {
     eprintln!("Connected to Postgres (pool_size={})", sync_config.pg_pool_size);
 
     match cli.command {
+        Commands::Validate => unreachable!(),
         Commands::Setup => {
             eprintln!("Running setup (BitdexOutbox table + triggers)...");
             queries::run_setup(&pool)
@@ -119,15 +178,12 @@ async fn main() {
             // Build engine with storage paths matching the server's layout:
             //   {data_dir}/{index_subdir}/{name}/{bitmap_subdir}/
             //   {data_dir}/{index_subdir}/{name}/{docs_subdir}/
-            let index_storage_dir = sync_config
-                .data_dir
-                .join(&sync_config.index_subdir)
-                .join(&index_def.name);
             std::fs::create_dir_all(&index_storage_dir).ok();
 
             let mut engine_config = index_def.config.clone();
             engine_config.storage.bitmap_path =
                 Some(index_storage_dir.join(&sync_config.bitmap_subdir));
+            engine_config.headless = true;
 
             let engine = ConcurrentEngine::new_with_path(
                 engine_config,
@@ -170,7 +226,8 @@ async fn main() {
                     std::process::exit(1);
                 });
 
-            engine.enter_loading_mode();
+            // No enter_loading_mode — single_pass writes directly to BitmapFs.
+            // Loading mode would trigger a snapshot save on exit that overwrites our bitmaps.
 
             // Set up progress tracking + HTTP endpoint
             let load_progress = Arc::new(LoadProgress::new());
@@ -182,8 +239,7 @@ async fn main() {
             };
 
             // Phase 1a: Download PG CSVs to staging dir (reuses .done markers)
-            // stage_dir = {data_dir}/indexes/{name}/load_stage/
-            let stage_dir = index_storage_dir.join("load_stage");
+            eprintln!("Stage dir: {}", stage_dir.display());
             bulk_loader::download_all_tables(&pool, &stage_dir)
                 .await
                 .unwrap_or_else(|e| {
@@ -193,7 +249,7 @@ async fn main() {
 
             // Phase 1b: Download ClickHouse metrics (reactionCount, commentCount, collectedCount)
             if let Some(ref ch_url) = sync_config.clickhouse_url {
-                scatter_gather::download_metrics_from_clickhouse(
+                bulk_loader::download_metrics_from_clickhouse(
                     &stage_dir,
                     ch_url,
                     sync_config.clickhouse_username.as_deref(),
@@ -209,16 +265,16 @@ async fn main() {
                 eprintln!("WARNING: No clickhouse_url configured — metric sort fields will be 0");
             }
 
-            // Phase 2+3: Scatter-gather pipeline (peak ~20 GB vs old loader's 40+ GB OOM)
-            eprintln!("=== Using scatter-gather pipeline ===");
-            let stats = scatter_gather::run_bulk_load_scatter(
+            // Single-pass V2 loader: CSV → bitmaps + V2 docstore tuples in one pass
+            eprintln!("=== Using single-pass V2 loader ===");
+            let stats = single_pass::run_single_pass_v2(
                 &engine,
                 &index_def,
                 &stage_dir,
                 Arc::clone(&load_progress),
             )
             .unwrap_or_else(|e| {
-                eprintln!("Scatter-gather bulk load failed: {e}");
+                eprintln!("Single-pass V2 bulk load failed: {e}");
                 std::process::exit(1);
             });
 
@@ -227,17 +283,8 @@ async fn main() {
                 let _ = tx.send(());
             }
 
-            // Use save_unload variant to avoid the staging.clone() RSS spike.
-            // Plain exit_loading_mode() doubles memory via Arc refcount bump;
-            // save_unload saves directly from staging then drops bitmaps.
-            eprintln!("Exiting loading mode (save + unload to avoid RSS spike)...");
-            engine
-                .exit_loading_mode_and_save_unload()
-                .unwrap_or_else(|e| {
-                    eprintln!("exit_loading_mode_and_save_unload failed: {e}");
-                    // Fall back to plain exit if save_unload fails
-                    engine.exit_loading_mode();
-                });
+            // No exit_loading_mode needed — single_pass wrote everything to BitmapFs directly.
+            // The process exits after this; the server will restore from disk on next start.
 
             eprintln!(
                 "Bulk load complete: {} records in {:.1}s ({:.0}/s)",

@@ -176,6 +176,7 @@ impl UnifiedEntry {
         direction: SortDirection,
         persisted_sorted_keys: Option<Vec<u64>>,
         value_fn: impl Fn(u32) -> u32,
+        has_more: bool,
     ) -> Self {
         let card = bitmap.len() as usize;
         let capacity = if card > initial_capacity {
@@ -211,7 +212,7 @@ impl UnifiedEntry {
             min_tracked_value,
             capacity,
             max_capacity,
-            has_more: true,
+            has_more,
             total_matched,
             needs_rebuild: false,
             rebuilding: AtomicBool::new(false),
@@ -528,6 +529,9 @@ pub struct UnifiedCache {
     shard_dirty: HashSet<ShardKey>,
     /// Whether persistence is enabled (BoundStore exists).
     persistence_enabled: bool,
+    /// Persisted has_more flags keyed by entry ID, populated from meta.bin on startup.
+    /// Consumed during shard restore to avoid hardcoding has_more=true.
+    meta_has_more: HashMap<CacheEntryId, bool>,
 }
 
 impl UnifiedCache {
@@ -545,7 +549,19 @@ impl UnifiedCache {
             meta_dirty: false,
             shard_dirty: HashSet::new(),
             persistence_enabled: false,
+            meta_has_more: HashMap::new(),
         }
+    }
+
+    /// Store persisted has_more flags from meta.bin, keyed by entry ID.
+    /// Called during startup after loading meta.bin.
+    pub fn set_meta_has_more(&mut self, map: HashMap<CacheEntryId, bool>) {
+        self.meta_has_more = map;
+    }
+
+    /// Look up persisted has_more for a given entry ID. Falls back to true if not found.
+    pub fn get_meta_has_more(&self, entry_id: CacheEntryId) -> bool {
+        self.meta_has_more.get(&entry_id).copied().unwrap_or(true)
     }
 
     /// Look up a cache entry by key. Returns None on miss.

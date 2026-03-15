@@ -59,6 +59,12 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
 
+    /// Compaction threshold: percentage of stale tuples that triggers background
+    /// compaction. Default 30 (compact when >30% stale). Set to 0 to disable
+    /// compaction entirely (no worker thread, no staleness tracking on reads).
+    #[serde(default = "default_compact_threshold_pct")]
+    pub compact_threshold_pct: u64,
+
     /// Eviction sweep interval: check for idle values every N flush cycles.
     /// Default 1000 (~0.1s at 100μs flush). Lower values make eviction more
     /// responsive (useful for testing).
@@ -69,6 +75,13 @@ pub struct Config {
     /// won't be marked alive until that time arrives. Only one field per document.
     #[serde(default)]
     pub deferred_alive: Option<DeferredAliveConfig>,
+
+    /// Headless mode: skip all background threads (flush, merge, eviction).
+    /// Used by bulk loaders that write directly to BitmapFs and don't need
+    /// the engine's write pipeline. The engine still provides config, BitmapFs
+    /// access, and docstore, but no background work runs.
+    #[serde(default)]
+    pub headless: bool,
 }
 
 fn default_max_page_size() -> usize {
@@ -85,6 +98,9 @@ fn default_prometheus_port() -> u16 {
 }
 fn default_flush_interval_us() -> u64 {
     100
+}
+fn default_compact_threshold_pct() -> u64 {
+    30
 }
 fn default_eviction_sweep_interval() -> u64 {
     1000
@@ -125,7 +141,9 @@ impl Default for Config {
             channel_capacity: default_channel_capacity(),
             storage: StorageConfig::default(),
             eviction_sweep_interval: default_eviction_sweep_interval(),
+            compact_threshold_pct: default_compact_threshold_pct(),
             deferred_alive: None,
+            headless: false,
         }
     }
 }

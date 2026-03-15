@@ -8,6 +8,7 @@ pub mod dictionary;
 pub mod docstore;
 pub mod engine;
 pub mod error;
+pub mod ingester;
 pub mod executor;
 pub mod filter;
 pub mod loader;

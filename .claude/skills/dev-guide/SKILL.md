@@ -60,6 +60,54 @@ LSH vector similarity, Postgres extension, log encoding, OpenSearch/Meilisearch 
 
 7. **Update design docs** when changing architecture. See `/architecture` for details.
 
+### Git Workflow: PRs, Worktrees, and Sub-Agents
+
+**Every change to main goes through a PR.** No direct commits. This gives us a review step, a paper trail, and prevents the "uncommitted worktree code reported as done" problem.
+
+**Solo agent workflow:**
+1. Work in a worktree (`isolation: "worktree"`)
+2. Commit all changes with a descriptive message
+3. Push branch: `git push origin HEAD`
+4. Open PR: `gh pr create --title "..." --body "..."`
+5. Wait for review or merge approval
+
+**Team lead with sub-agents:**
+1. Team lead spawns sub-agents in worktrees (`isolation: "worktree"`)
+2. Each sub-agent commits its work to its worktree branch before finishing
+3. Team lead reviews sub-agent branches, cherry-picks or merges into a feature branch
+4. Team lead opens one PR for the combined work
+5. Sub-agents do NOT push or open PRs themselves
+
+**Sub-agent commit rules:**
+- Commit before reporting done. Uncommitted changes are invisible.
+- Use descriptive commit messages: "Add write_batch_merge for incremental field appends" not "work done"
+- Run `cargo test` (or `cargo test --features pg-sync` for pg-sync code) before committing
+- Include `Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>` in commit messages
+
+**Worktree cleanup:**
+- Worktrees with no changes are auto-cleaned by Claude Code
+- After a PR merges, delete the worktree branch: `git branch -d worktree-agent-XXXX`
+- Check for stale worktrees: `ls .claude/worktrees/`
+
+### CI and Code Review
+
+**CI runs automatically on every PR** (`.github/workflows/test.yml`). It runs `cargo test --lib`, `cargo test --features pg-sync --lib`, checks benchmarks compile, and checks the server compiles. A green checkmark on the PR means tests passed — don't rely on agent self-reports alone.
+
+**Review agents post findings to the PR** as comments via `gh pr comment`. This creates a permanent record of what was reviewed, what passed, and what was flagged. The review flow:
+
+1. Implementation agent opens PR with `gh pr create`
+2. CI runs tests automatically
+3. Team lead composes a review checklist from design context (edge cases, platform issues, semantic correctness)
+4. Review sub-agent reads the diff, evaluates each checklist item, reports PASS/FAIL/WARN with line numbers
+5. Review agent posts results to the PR: `gh pr comment <number> --body "## Review\n\n- C1: PASS — ..."`
+6. If issues found, fix agent pushes commits to the same branch, CI re-runs
+7. Reviewer approves and merges
+
+**Why post to the PR instead of just reporting back:**
+- History — six months later, you can see exactly what was checked
+- Accountability — the checklist results are public, not buried in a chat transcript
+- Pattern recognition — recurring failures (e.g., Windows rename) become visible across PRs
+
 ### Running the Server Locally
 
 ```bash

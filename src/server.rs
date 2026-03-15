@@ -272,6 +272,7 @@ struct AppState {
     index: Mutex<Option<IndexState>>,
     metrics: Metrics,
     parser_registry: crate::parser::registry::ParserRegistry,
+    enable_traces: bool,
 }
 
 type SharedState = Arc<AppState>;
@@ -612,11 +613,12 @@ pub struct BitdexServer {
     data_dir: PathBuf,
     rebuild: bool,
     default_query_format: Option<String>,
+    enable_traces: bool,
 }
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, rebuild: false, default_query_format: None }
+        Self { data_dir, rebuild: false, default_query_format: None, enable_traces: false }
     }
 
     /// Enable rebuild mode: on startup, delete existing bitmap indexes and
@@ -631,6 +633,11 @@ impl BitdexServer {
     /// Per-request `?format=` overrides this. Falls back to "bitdex" if not set.
     pub fn with_default_query_format(mut self, format: impl Into<String>) -> Self {
         self.default_query_format = Some(format.into());
+        self
+    }
+
+    pub fn with_enable_traces(mut self, enable: bool) -> Self {
+        self.enable_traces = enable;
         self
     }
 
@@ -649,6 +656,7 @@ impl BitdexServer {
             index: Mutex::new(None),
             metrics: Metrics::new(),
             parser_registry: registry,
+            enable_traces: self.enable_traces,
         });
 
         // Try to restore an existing index from disk
@@ -1420,11 +1428,13 @@ async fn handle_query(
                 result.total_matched, trace.plan_us, trace.filter_us, trace.sort_us
             );
 
-            // Write trace to JSONL in background (non-blocking)
-            let data_dir = state.data_dir.clone();
-            std::thread::spawn(move || {
-                crate::query_metrics::write_trace(&data_dir, &trace);
-            });
+            // Write trace to JSONL in background (non-blocking), if enabled
+            if state.enable_traces {
+                let data_dir = state.data_dir.clone();
+                std::thread::spawn(move || {
+                    crate::query_metrics::write_trace(&data_dir, &trace);
+                });
+            }
 
             let mut response = serde_json::json!({
                 "ids": result.ids,
