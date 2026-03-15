@@ -2575,7 +2575,7 @@ mod tests {
         let (doc, total, unique) = store.get_v2_from_data(&data, 0).unwrap();
 
         // Should find the doc with newest value
-        assert!(doc.is_some());
+        // doc already unwrapped — existence proven by .unwrap().unwrap() above
         match &doc.unwrap().fields["val"] {
             FieldValue::Single(Value::Integer(2)) => {}
             other => panic!("expected val=2, got: {:?}", other),
@@ -2737,7 +2737,7 @@ mod tests {
 
         // First read fills the channel (1 slot)
         let doc = store.get_v2(0).unwrap().unwrap();
-        assert!(doc.is_some());
+        // doc already unwrapped — existence proven by .unwrap().unwrap() above
 
         // Write more stale data to a different slot in the same shard
         for v in 0..10i64 {
@@ -2747,8 +2747,7 @@ mod tests {
         store.v2_writers.clear();
 
         // Second read should try_send but the channel is full — must not block or panic
-        let doc2 = store.get_v2(1).unwrap().unwrap();
-        assert!(doc2.is_some());
+        let _doc2 = store.get_v2(1).unwrap().unwrap();
 
         // Verify exactly one message in the channel (capacity was 1)
         assert!(compact_rx.try_recv().is_ok());
