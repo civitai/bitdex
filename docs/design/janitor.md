@@ -1,4 +1,4 @@
-# Janitor: Reader-Triggered Compaction
+# Janitor: Reader-Triggered Compaction — DONE
 
 > Readers are the janitors. When `get_v2()` scans a shard and sees too many stale tuples, it hands the buffer to a background worker for compaction. No polling, no dirty tracker, no scanning. The system only cleans what it reads, and it only reads what matters.
 

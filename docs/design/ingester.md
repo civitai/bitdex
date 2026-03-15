@@ -46,11 +46,35 @@ Bench I1: 8 threads, 1000 upserts each, V1 vs V2 doc write
 
 **I4: Diff-then-append split.** Verify that diff_document can run for bitmaps only while the doc path does pure append. The diff reads the old doc from disk — with V2, that read is a tuple scan (4 us). Check that the diff output doesn't depend on the doc write format.
 
-## Implementation
+## Implementation Status: PARTIAL
 
-1. Define `BitmapSink` trait with `emit(slot, field_idx, value)` — two impls: `CoalescerSink` (sends MutationOps) and `AccumSink` (inserts into BitmapAccum)
-2. Define `DocSink` with `append(slot, field_idx, value)` — single impl using `append_tuple`
-3. `Ingester<B: BitmapSink>` struct holds both sinks
-4. Refactor `put()` in concurrent_engine.rs to use `Ingester<CoalescerSink>`
-5. Refactor loader to use `Ingester<AccumSink>`
-6. Delete duplicate decomposition code from loader.rs and scatter_gather.rs
+Steps 1-3 are done. Steps 4-6 are deferred — the trait exists but isn't wired into production code yet.
+
+### Done (src/ingester.rs)
+
+1. `BitmapSink` trait with `filter_insert/remove`, `sort_set/clear`, `alive_insert/remove`, `flush`
+2. `CoalescerSink` — buffers `MutationOp`s and sends to coalescer channel
+3. `AccumSink` — inserts directly into `BitmapAccum` (bulk loading path)
+4. `DocSink` — wraps `Arc<Mutex<DocStore>>` for V2 tuple appends
+5. `Ingester<B: BitmapSink>` — generic struct holding bitmap sink + optional doc sink
+6. 5 tests: RecordingSink, bitmap-only, AccumSink, DocSink, full pipeline
+
+### Not yet wired (deferred)
+
+- `put()` in concurrent_engine.rs still uses manual `diff_document()` → `sender.send_batch()` → `doc_tx.send()`
+- `put_bulk_into()` still uses manual thread-local HashMaps
+- PG loader and NDJSON loader still use old paths
+- No duplicate code has been deleted yet
+
+### Why deferred
+
+The `put()` path is the riskiest refactor — `diff_document()` returns `Vec<MutationOp>` rather than calling `BitmapSink` methods directly. To wire it, either refactor `diff_document` to accept a `&mut BitmapSink` (large change, touches mutation.rs), or iterate the Vec and dispatch to sink methods (same as today, just indirected). Neither is hard, but both touch the core write path and need careful testing.
+
+The trait adds the most value when we have more ingestion paths (outbox sync, webhook, streaming pipeline). With just `put` and `put_bulk` as callers today, the abstraction is ready but not urgent.
+
+### When to revisit
+
+Wire the ingester when:
+- Adding a new ingestion source (outbox sync, streaming)
+- Refactoring the PG loader to use V2 docstore directly
+- Unifying the doc write path (replace `doc_tx` channel with `DocSink.append_tuple`)
