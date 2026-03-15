@@ -354,4 +354,84 @@ mod tests {
         assert_eq!(sort_map[&0].len(), 1); // slot 10
         assert_eq!(sort_map[&1].len(), 1); // slot 10
     }
+
+    #[test]
+    fn test_doc_sink_append() {
+        // DocSink wrapping a real on-disk DocStore should persist tuples
+        // that are retrievable via get_v2.
+        use crate::docstore::{DocStore, PackedValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        // prepare_bulk_load ensures field dict is populated and saved
+        let _bw = store.prepare_bulk_load(&["val".to_string()]).unwrap();
+        // "val" is the first field → index 0
+        let val_idx: u16 = 0;
+
+        let store = Arc::new(parking_lot::Mutex::new(store));
+        let sink = DocSink::new(Arc::clone(&store));
+
+        // Append a tuple via DocSink
+        let packed = rmp_serde::to_vec(&PackedValue::I(42)).unwrap();
+        sink.append(5, val_idx, &packed).unwrap();
+
+        // Close buffered writers so data is fully on disk
+        store.lock().v2_writers_handle().clear();
+
+        // Read via get_v2 and verify
+        let doc = store.lock().get_v2(5).unwrap().unwrap();
+        match &doc.fields["val"] {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(42)) => {}
+            other => panic!("expected val=42, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_ingester_full_pipeline() {
+        // Ingester with RecordingSink + DocSink should route bitmap ops to the
+        // recording sink and doc tuples to the docstore.
+        use crate::docstore::{DocStore, PackedValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        // prepare_bulk_load ensures field dict is populated and saved
+        let _bw = store.prepare_bulk_load(&["color".to_string()]).unwrap();
+        // "color" is the first field → index 0
+        let color_idx: u16 = 0;
+
+        let store = Arc::new(parking_lot::Mutex::new(store));
+        let doc_sink = DocSink::new(Arc::clone(&store));
+        let bitmap_sink = RecordingSink::new();
+
+        let mut ingester = Ingester::new(bitmap_sink, doc_sink);
+
+        // Emit bitmap operations
+        ingester.filter_insert(Arc::from("color"), 7, 100);
+        ingester.sort_set(Arc::from("reactionCount"), 3, 100);
+        ingester.alive_insert(100);
+
+        // Emit a doc tuple
+        let packed = rmp_serde::to_vec(&PackedValue::I(7)).unwrap();
+        ingester.doc_append(100, color_idx, &packed).unwrap();
+
+        // Flush bitmaps
+        ingester.flush().unwrap();
+
+        // Verify bitmap sink recorded everything
+        assert_eq!(ingester.bitmap_sink.filter_inserts.len(), 1);
+        assert_eq!(ingester.bitmap_sink.filter_inserts[0], ("color".to_string(), 7, 100));
+        assert_eq!(ingester.bitmap_sink.sort_sets.len(), 1);
+        assert_eq!(ingester.bitmap_sink.sort_sets[0], ("reactionCount".to_string(), 3, 100));
+        assert_eq!(ingester.bitmap_sink.alive_inserts, vec![100]);
+
+        // Close buffered writers so data is fully on disk
+        store.lock().v2_writers_handle().clear();
+        let doc = store.lock().get_v2(100).unwrap().unwrap();
+        match &doc.fields["color"] {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(7)) => {}
+            other => panic!("expected color=7, got: {:?}", other),
+        }
+    }
 }

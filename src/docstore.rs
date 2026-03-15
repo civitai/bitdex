@@ -2655,4 +2655,165 @@ mod tests {
             other => panic!("expected val=9 after compaction, got: {:?}", other),
         }
     }
+
+    #[test]
+    fn test_janitor_channel_full_drops_silently() {
+        // A bounded(1) compact channel that is already full should not block or panic
+        // when a reader triggers another compaction enqueue.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("val");
+        store.save_field_dict().unwrap();
+        let val_idx = store.field_to_idx["val"];
+
+        // Bounded(1) — only one slot in the channel
+        let (compact_tx, compact_rx) = crossbeam_channel::bounded::<(u32, Vec<u8>)>(1);
+        store.set_compact_channel(compact_tx);
+
+        // Write enough stale tuples to trigger compaction (>30% stale)
+        for v in 0..10i64 {
+            let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
+            store.append_tuple(0, val_idx, &packed).unwrap();
+        }
+        store.v2_writers.clear();
+
+        // First read fills the channel (1 slot)
+        let doc = store.get_v2(0).unwrap().unwrap();
+        assert!(doc.is_some());
+
+        // Write more stale data to a different slot in the same shard
+        for v in 0..10i64 {
+            let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
+            store.append_tuple(1, val_idx, &packed).unwrap();
+        }
+        store.v2_writers.clear();
+
+        // Second read should try_send but the channel is full — must not block or panic
+        let doc2 = store.get_v2(1).unwrap().unwrap();
+        assert!(doc2.is_some());
+
+        // Verify exactly one message in the channel (capacity was 1)
+        assert!(compact_rx.try_recv().is_ok());
+        // Channel should now be empty (second enqueue was silently dropped)
+        assert!(compact_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_janitor_no_overhead_without_compact_channel() {
+        // Without a compact channel, get_v2 should skip staleness tracking entirely.
+        // Verify reads work correctly and no unnecessary overhead occurs.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("val");
+        store.save_field_dict().unwrap();
+        let val_idx = store.field_to_idx["val"];
+
+        // No compact channel set — compact_tx is None
+
+        // Write stale tuples (multiple versions of same field)
+        for v in 0..5i64 {
+            let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
+            store.append_tuple(0, val_idx, &packed).unwrap();
+        }
+        store.v2_writers.clear();
+
+        // Read should still return the newest value
+        let doc = store.get_v2(0).unwrap().unwrap();
+        match &doc.fields["val"] {
+            FieldValue::Single(Value::Integer(4)) => {}
+            other => panic!("expected val=4, got: {:?}", other),
+        }
+
+        // Verify compact_tx is indeed None (no channel set)
+        assert!(store.compact_tx.is_none());
+    }
+
+    #[test]
+    fn test_janitor_early_exit_when_clean() {
+        // When all tuples are unique (no stale data), compact_shard_from_buffer
+        // should exit early without rewriting the file.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("a");
+        store.ensure_field_idx("b");
+        store.save_field_dict().unwrap();
+        let a_idx = store.field_to_idx["a"];
+        let b_idx = store.field_to_idx["b"];
+
+        // Write exactly one tuple per (slot, field) — no stale data
+        let va = rmp_serde::to_vec(&PackedValue::I(10)).unwrap();
+        let vb = rmp_serde::to_vec(&PackedValue::I(20)).unwrap();
+        store.append_tuple(0, a_idx, &va).unwrap();
+        store.append_tuple(0, b_idx, &vb).unwrap();
+        store.append_tuple(1, a_idx, &va).unwrap();
+        store.v2_writers.clear();
+
+        let shard_id = DocStore::shard_id(0);
+        let path = DocStore::shard_path(&store.root, shard_id);
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        let data = std::fs::read(&path).unwrap();
+
+        // Compact — should be a no-op (early exit)
+        compact_shard_from_buffer(shard_id, &data, &store.root, &store.v2_writers).unwrap();
+
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            size_before, size_after,
+            "file should be unchanged when there are no stale tuples"
+        );
+    }
+
+    #[test]
+    fn test_janitor_num_tuples_header_correct() {
+        // After compaction, bytes 12-15 of the shard file should contain the
+        // correct num_tuples count as a little-endian u32.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("val");
+        store.ensure_field_idx("extra");
+        store.save_field_dict().unwrap();
+        let val_idx = store.field_to_idx["val"];
+        let extra_idx = store.field_to_idx["extra"];
+
+        // Write 5 versions of val for slot 0 (4 stale + 1 winner)
+        // plus 1 tuple for extra field (1 winner)
+        // Total = 6 tuples, after compaction = 2 winners
+        for v in 0..5i64 {
+            let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
+            store.append_tuple(0, val_idx, &packed).unwrap();
+        }
+        let extra_packed = rmp_serde::to_vec(&PackedValue::I(99)).unwrap();
+        store.append_tuple(0, extra_idx, &extra_packed).unwrap();
+        store.v2_writers.clear();
+
+        let shard_id = DocStore::shard_id(0);
+        let path = DocStore::shard_path(&store.root, shard_id);
+        let data = std::fs::read(&path).unwrap();
+
+        // Compact
+        compact_shard_from_buffer(shard_id, &data, &store.root, &store.v2_writers).unwrap();
+
+        // Read raw shard and check header bytes 12-15
+        let compacted = std::fs::read(&path).unwrap();
+        assert!(compacted.len() >= 16, "compacted shard too short");
+        let num_tuples = u32::from_le_bytes([
+            compacted[12], compacted[13], compacted[14], compacted[15],
+        ]);
+        assert_eq!(num_tuples, 2, "num_tuples header should be 2 (val + extra)");
+
+        // Verify data is still correct
+        let doc = store.get_v2(0).unwrap().unwrap();
+        match &doc.fields["val"] {
+            FieldValue::Single(Value::Integer(4)) => {}
+            other => panic!("expected val=4, got: {:?}", other),
+        }
+        match &doc.fields["extra"] {
+            FieldValue::Single(Value::Integer(99)) => {}
+            other => panic!("expected extra=99, got: {:?}", other),
+        }
+    }
 }

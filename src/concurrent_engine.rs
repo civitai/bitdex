@@ -6827,7 +6827,7 @@ mod tests {
     #[test]
     fn test_put_bulk_persists_to_docstore() {
         // Verify that put_bulk() persists docs so subsequent put() upserts can diff correctly.
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
 
         let docs: Vec<(u32, Document)> = vec![
             (1, make_doc(vec![
@@ -6876,6 +6876,8 @@ mod tests {
             None, 10,
         ).unwrap();
         assert_eq!(result.ids, vec![1]);
+
+        engine.shutdown();
     }
 
     #[test]
@@ -8093,5 +8095,56 @@ mod tests {
 
             engine.shutdown();
         }
+    }
+
+    #[test]
+    fn test_compaction_worker_e2e() {
+        use crate::docstore::{DocStore, PackedValue};
+
+        // Use an on-disk docstore so V2 tuples and compaction can run.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut engine = ConcurrentEngine::new_with_path(test_config(), &docs_dir).unwrap();
+
+        // Write V2 tuples directly to the docstore to create stale data.
+        // Use field_idx=0 — the field won't resolve to a name, but that's fine
+        // for testing compaction (which operates on raw tuples).
+        let field_idx: u16 = 0;
+        {
+            let ds = engine.docstore.lock();
+
+            // Write 10 versions of the same (slot=0, field=0) tuple — 90% stale
+            for v in 0..10i64 {
+                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
+                ds.append_tuple(0, field_idx, &packed).unwrap();
+            }
+            // Close buffered writers so data is fully on disk
+            ds.v2_writers_handle().clear();
+        }
+
+        // Record shard file size before compaction
+        let shard_id = DocStore::shard_id(0);
+        let shard_path = DocStore::shard_path(&docs_dir, shard_id);
+        let size_before = std::fs::metadata(&shard_path).unwrap().len();
+
+        // Read via get_v2 — this triggers compaction enqueue (>30% stale).
+        // The doc may come back empty (no field name in dict), but the read
+        // still scans all tuples and detects staleness.
+        {
+            let ds = engine.docstore.lock();
+            let _doc = ds.get_v2(0).unwrap();
+        }
+
+        // Wait for the background compaction worker to process the shard
+        thread::sleep(Duration::from_millis(100));
+
+        // Verify shard file shrank — proving the compaction worker ran
+        let size_after = std::fs::metadata(&shard_path).unwrap().len();
+        assert!(
+            size_after < size_before,
+            "compacted shard ({size_after}) should be smaller than original ({size_before})"
+        );
+
+        engine.shutdown();
     }
 }
