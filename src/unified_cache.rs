@@ -43,6 +43,10 @@ pub struct UnifiedCacheConfig {
     /// per-slot evaluation. Prevents positive feedback loops under burst writes.
     /// Default 50_000 (~5ms of maintenance work).
     pub max_maintenance_work: usize,
+    /// Prefetch threshold: trigger background expansion when the user has consumed
+    /// this fraction of the cached entries (default 0.95 = 95% consumed, 5% remaining).
+    /// Set to 0.0 or 1.0 to disable prefetching.
+    pub prefetch_threshold: f64,
 }
 
 impl Default for UnifiedCacheConfig {
@@ -54,6 +58,7 @@ impl Default for UnifiedCacheConfig {
             max_capacity: 64_000,
             min_filter_size: 0,
             max_maintenance_work: 50_000,
+            prefetch_threshold: 0.95,
         }
     }
 }
@@ -88,6 +93,8 @@ pub struct UnifiedEntry {
     needs_rebuild: bool,
     /// Guard to prevent concurrent rebuilds.
     rebuilding: AtomicBool,
+    /// Guard to prevent concurrent prefetch expansions.
+    prefetching: AtomicBool,
     /// LRU timestamp.
     last_used: Instant,
     /// Meta-index entry ID for this cache entry.
@@ -154,6 +161,7 @@ impl UnifiedEntry {
             total_matched,
             needs_rebuild: false,
             rebuilding: AtomicBool::new(false),
+            prefetching: AtomicBool::new(false),
             last_used: Instant::now(),
             meta_id,
             persist_dirty: true, // New entries need persisting
@@ -177,6 +185,7 @@ impl UnifiedEntry {
         persisted_sorted_keys: Option<Vec<u64>>,
         value_fn: impl Fn(u32) -> u32,
         has_more: bool,
+        persisted_total_matched: u64,
     ) -> Self {
         let card = bitmap.len() as usize;
         let capacity = if card > initial_capacity {
@@ -203,9 +212,13 @@ impl UnifiedEntry {
             keys.last().map(|&k| (k >> 32) as u32)
         }).unwrap_or(0);
 
-        // Compute total_matched from bitmap cardinality (approximation —
-        // the true total may be larger if has_more was true)
-        let total_matched = card as u64;
+        // Use persisted total_matched if available (non-zero), otherwise
+        // fall back to bitmap cardinality (old meta.bin without real total).
+        let total_matched = if persisted_total_matched > 0 {
+            persisted_total_matched
+        } else {
+            card as u64
+        };
 
         Self {
             bitmap: Arc::new(bitmap),
@@ -216,6 +229,7 @@ impl UnifiedEntry {
             total_matched,
             needs_rebuild: false,
             rebuilding: AtomicBool::new(false),
+            prefetching: AtomicBool::new(false),
             last_used: Instant::now(),
             meta_id,
             persist_dirty: false, // Just loaded from disk — clean
@@ -423,6 +437,16 @@ impl UnifiedEntry {
             .is_ok()
     }
 
+    /// Check if a background prefetch expansion is in progress.
+    pub fn is_prefetching(&self) -> bool {
+        self.prefetching.load(Ordering::Relaxed)
+    }
+
+    /// Set the prefetching flag.
+    pub fn set_prefetching(&self, val: bool) {
+        self.prefetching.store(val, Ordering::Relaxed);
+    }
+
     /// Get the radix sort index (present for expanded entries).
     pub fn radix(&self) -> Option<&Arc<RadixSortIndex>> {
         self.radix.as_ref()
@@ -532,6 +556,9 @@ pub struct UnifiedCache {
     /// Persisted has_more flags keyed by entry ID, populated from meta.bin on startup.
     /// Consumed during shard restore to avoid hardcoding has_more=true.
     meta_has_more: HashMap<CacheEntryId, bool>,
+    /// Persisted total_matched values keyed by entry ID, populated from meta.bin on startup.
+    /// Consumed during shard restore to get the real total instead of bitmap cardinality.
+    meta_total_matched: HashMap<CacheEntryId, u64>,
 }
 
 impl UnifiedCache {
@@ -550,6 +577,7 @@ impl UnifiedCache {
             shard_dirty: HashSet::new(),
             persistence_enabled: false,
             meta_has_more: HashMap::new(),
+            meta_total_matched: HashMap::new(),
         }
     }
 
@@ -562,6 +590,17 @@ impl UnifiedCache {
     /// Look up persisted has_more for a given entry ID. Falls back to true if not found.
     pub fn get_meta_has_more(&self, entry_id: CacheEntryId) -> bool {
         self.meta_has_more.get(&entry_id).copied().unwrap_or(true)
+    }
+
+    /// Store persisted total_matched values from meta.bin, keyed by entry ID.
+    /// Called during startup after loading meta.bin.
+    pub fn set_meta_total_matched(&mut self, map: HashMap<CacheEntryId, u64>) {
+        self.meta_total_matched = map;
+    }
+
+    /// Look up persisted total_matched for a given entry ID. Falls back to 0 if not found.
+    pub fn get_meta_total_matched(&self, entry_id: CacheEntryId) -> u64 {
+        self.meta_total_matched.get(&entry_id).copied().unwrap_or(0)
     }
 
     /// Look up a cache entry by key. Returns None on miss.
@@ -747,6 +786,7 @@ impl UnifiedCache {
         self.loading_shards.clear();
         self.meta_dirty = false;
         self.shard_dirty.clear();
+        self.meta_total_matched.clear();
     }
 
     /// Return a stats snapshot.

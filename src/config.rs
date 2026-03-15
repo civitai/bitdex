@@ -365,6 +365,11 @@ pub struct CacheConfig {
     /// Maximum number of bound cache entries before LRU eviction.
     #[serde(default = "default_bound_max_count")]
     pub bound_max_count: usize,
+    /// Prefetch threshold: trigger background expansion when the user has consumed
+    /// this fraction of the cached entries (0.0–1.0). Default 0.95 = 95% consumed.
+    /// Set to 0.0 or 1.0 to disable prefetching.
+    #[serde(default = "default_prefetch_threshold")]
+    pub prefetch_threshold: f64,
 }
 
 fn default_cache_max_entries() -> usize {
@@ -382,6 +387,9 @@ fn default_bound_max_size() -> usize {
 fn default_bound_max_count() -> usize {
     100
 }
+fn default_prefetch_threshold() -> f64 {
+    0.95
+}
 
 impl Default for CacheConfig {
     fn default() -> Self {
@@ -391,6 +399,7 @@ impl Default for CacheConfig {
             bound_target_size: default_bound_target_size(),
             bound_max_size: default_bound_max_size(),
             bound_max_count: default_bound_max_count(),
+            prefetch_threshold: default_prefetch_threshold(),
         }
     }
 }

@@ -22,7 +22,7 @@ use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
 use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, value_to_sort_u32, Document, FieldRegistry, PatchPayload};
 use crate::planner;
-use crate::query::{BitdexQuery, FilterClause, SortClause};
+use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
 use crate::query_metrics::{QueryTrace, QueryTraceCollector, SortTrace};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
@@ -247,6 +247,11 @@ pub struct ConcurrentEngine {
     compact_tx: Option<Sender<(u32, Vec<u8>)>>,
     /// Background compaction worker thread handle.
     compact_handle: Option<JoinHandle<()>>,
+    /// Prefetch channel sender — sends UnifiedKey to background worker for
+    /// async cache expansion. None when prefetch is disabled.
+    prefetch_tx: Option<Sender<UnifiedKey>>,
+    /// Background prefetch worker thread handle.
+    prefetch_handle: Option<JoinHandle<()>>,
 }
 
 impl ConcurrentEngine {
@@ -512,6 +517,13 @@ impl ConcurrentEngine {
                                 .collect();
                             uc.set_meta_has_more(has_more_map);
 
+                            // Store total_matched values for shard restore
+                            let total_matched_map: HashMap<crate::meta_index::CacheEntryId, u64> = meta.entries
+                                .iter()
+                                .map(|e| (e.entry_id, e.total_matched))
+                                .collect();
+                            uc.set_meta_total_matched(total_matched_map);
+
                             // Record pending shards from registered entries
                             let mut shard_keys = HashSet::new();
                             for entry in &meta.entries {
@@ -772,6 +784,10 @@ impl ConcurrentEngine {
                 boundstore_bytes_read,
                 boundstore_entries_restored,
                 boundstore_entries_skipped,
+                compact_handle: None,
+                compact_tx: None,
+                prefetch_tx: None,
+                prefetch_handle: None,
             });
         }
 
@@ -1820,6 +1836,152 @@ impl ConcurrentEngine {
             })
         };
 
+        // Prefetch worker: background cache expansion when cursor nears boundary.
+        // Disabled when threshold is 0.0 or 1.0.
+        let prefetch_threshold = config.cache.prefetch_threshold;
+        let (prefetch_tx, prefetch_handle) = if prefetch_threshold > 0.0 && prefetch_threshold < 1.0 {
+            let (tx, prefetch_rx): (Sender<UnifiedKey>, Receiver<UnifiedKey>) =
+                crossbeam_channel::bounded(16);
+
+            let pf_inner = Arc::clone(&inner);
+            let pf_cache = Arc::clone(&unified_cache);
+            let pf_config = Arc::clone(&config);
+
+            let handle = thread::Builder::new()
+                .name("bitdex-prefetch".to_string())
+                .spawn(move || {
+                    while let Ok(ukey) = prefetch_rx.recv() {
+                        // Read entry state under lock, then drop lock before doing work
+                        let work = {
+                            let uc = pf_cache.lock();
+                            if let Some(entry) = uc.get(&ukey) {
+                                if entry.is_prefetching() || !entry.has_more()
+                                    || entry.capacity() >= entry.max_capacity()
+                                {
+                                    None
+                                } else {
+                                    let cap = entry.capacity();
+                                    let max_cap = entry.max_capacity();
+                                    let min_val = entry.min_tracked_value();
+                                    entry.set_prefetching(true);
+                                    Some((cap, max_cap, min_val))
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        let Some((capacity, max_capacity, min_tracked_value)) = work else {
+                            continue;
+                        };
+
+                        tracing::debug!(
+                            "Prefetch: expanding {} {:?} (cap={}/{})",
+                            ukey.sort_field, ukey.direction, capacity, max_capacity,
+                        );
+
+                        // Load snapshot and build executor
+                        let snap = pf_inner.load();
+
+                        let mut executor = QueryExecutor::new(
+                            &snap.slots,
+                            &snap.filters,
+                            &snap.sorts,
+                            pf_config.max_page_size,
+                        );
+                        // Convert canonical clauses back to FilterClauses
+                        let filter_clauses: Vec<FilterClause> = ukey.filter_clauses.iter()
+                            .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
+                            .collect();
+
+                        // Resolve filters
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+
+                        let planner_ctx = crate::planner::PlannerContext {
+                            string_maps: executor.string_maps(),
+                            dictionaries: executor.dictionaries(),
+                        };
+                        let plan = crate::planner::plan_query_with_context(
+                            &filter_clauses,
+                            executor.filter_index(),
+                            executor.slot_allocator(),
+                            Some(&planner_ctx),
+                        );
+                        let filter_bitmap = match executor.compute_filters(&plan.ordered_clauses) {
+                            Ok(bm) => Arc::new(bm),
+                            Err(e) => {
+                                tracing::debug!("Prefetch: filter resolution failed: {e}");
+                                let uc = pf_cache.lock();
+                                if let Some(entry) = uc.get(&ukey) {
+                                    entry.set_prefetching(false);
+                                }
+                                continue;
+                            }
+                        };
+
+                        // Expand: traverse from min_tracked_value cursor
+                        let expand_limit = max_capacity.saturating_sub(capacity);
+                        let sort_clause = crate::query::SortClause {
+                            field: ukey.sort_field.clone(),
+                            direction: ukey.direction,
+                        };
+                        let cursor = crate::query::CursorPosition {
+                            sort_value: min_tracked_value as u64,
+                            slot_id: 0, // Will start after min_tracked_value
+                        };
+                        let expand_result = executor.execute_from_bitmap_unclamped(
+                            &filter_bitmap,
+                            Some(&sort_clause),
+                            expand_limit,
+                            Some(&cursor),
+                            plan.use_simple_sort,
+                        );
+
+                        match expand_result {
+                            Ok(result) if !result.ids.is_empty() => {
+                                let sorted_slots: Vec<u32> = result.ids.iter()
+                                    .map(|&id| id as u32).collect();
+                                let sort_field = snap.sorts.get_field(&sort_clause.field);
+                                let value_fn = |slot: u32| -> u32 {
+                                    sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                                };
+                                let mut uc = pf_cache.lock();
+                                if let Some(entry) = uc.get_mut(&ukey) {
+                                    entry.expand(&sorted_slots, value_fn);
+                                    entry.set_prefetching(false);
+                                    tracing::debug!(
+                                        "Prefetch: expanded {} {:?} by {} slots",
+                                        ukey.sort_field, ukey.direction, sorted_slots.len(),
+                                    );
+                                }
+                            }
+                            Ok(_) => {
+                                // No results — nothing to expand
+                                let uc = pf_cache.lock();
+                                if let Some(entry) = uc.get(&ukey) {
+                                    entry.set_prefetching(false);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("Prefetch: sort traversal failed: {e}");
+                                let uc = pf_cache.lock();
+                                if let Some(entry) = uc.get(&ukey) {
+                                    entry.set_prefetching(false);
+                                }
+                            }
+                        }
+                    }
+                })
+                .expect("Failed to spawn bitdex-prefetch thread");
+
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             inner,
             sender,
@@ -1862,6 +2024,8 @@ impl ConcurrentEngine {
             boundstore_entries_skipped,
             compact_tx,
             compact_handle,
+            prefetch_tx,
+            prefetch_handle,
         })
     }
 
@@ -2638,6 +2802,7 @@ impl ConcurrentEngine {
                         // Get metadata from meta entry (if available) or use defaults
                         let config = uc.config().clone();
                         let has_more = uc.get_meta_has_more(se.entry_id);
+                        let persisted_total = uc.get_meta_total_matched(se.entry_id);
                         let value_fn = |slot: u32| -> u32 {
                             sf.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                         };
@@ -2650,6 +2815,7 @@ impl ConcurrentEngine {
                             se.sorted_keys,
                             &value_fn,
                             has_more,
+                            persisted_total,
                         );
                         uc.insert_restored_entry(key, entry);
                         loaded += 1;
@@ -2829,8 +2995,12 @@ impl ConcurrentEngine {
                         };
 
                         // Short page from cache = cursor at boundary, need expansion.
-                        // Compute filters (we skipped this) and expand.
-                        if result.ids.len() < fetch_limit && query.cursor.is_some() && has_more {
+                        // Two cases: (a) short page with cursor (original), and
+                        // (b) cache exhausted — returned results but no cursor.
+                        if has_more && (
+                            (result.cursor.is_none() && !result.ids.is_empty()) ||
+                            (result.ids.len() < fetch_limit && query.cursor.is_some())
+                        ) {
                             let (filter_arc, use_simple_sort) = self.resolve_filters(
                                 &executor, effective_filters, tb_guard.as_deref(), now_unix,
                             )?;
@@ -2899,6 +3069,28 @@ impl ConcurrentEngine {
                                         });
                                     }
                                 }
+                            }
+                        }
+
+                        // Prefetch proximity detection: if cursor is near the cache
+                        // boundary, fire a background expansion request.
+                        if has_more && capacity < self.unified_cache.lock().config().max_capacity {
+                            if let Some(ref tx) = self.prefetch_tx {
+                                if let Some(ref keys) = cached_sorted_keys {
+                                    if let Some(ref cursor) = result.cursor {
+                                        let cursor_key = (cursor.sort_value << 32) | (cursor.slot_id as u64);
+                                        let sort_dir = query.sort.as_ref().map(|s| s.direction).unwrap_or(SortDirection::Desc);
+                                        let pos = match sort_dir {
+                                            SortDirection::Desc => keys.partition_point(|&k| k >= cursor_key),
+                                            SortDirection::Asc => keys.partition_point(|&k| k <= cursor_key),
+                                        };
+                                        let threshold = self.unified_cache.lock().config().prefetch_threshold;
+                                        if keys.len() > 0 && pos as f64 / keys.len() as f64 >= threshold {
+                                            let _ = tx.try_send(ukey.clone());
+                                        }
+                                    }
+                                }
+                                // Skip prefetch for radix path — expanded entries are already at max_capacity
                             }
                         }
 
@@ -3090,7 +3282,12 @@ impl ConcurrentEngine {
                         };
 
                         // Short page from cache = cursor at boundary, need expansion.
-                        if result.ids.len() < fetch_limit && query.cursor.is_some() && has_more {
+                        // Two cases: (a) short page with cursor (original), and
+                        // (b) cache exhausted — returned results but no cursor.
+                        if has_more && (
+                            (result.cursor.is_none() && !result.ids.is_empty()) ||
+                            (result.ids.len() < fetch_limit && query.cursor.is_some())
+                        ) {
                             // Expansion needs filters — trace them
                             let filter_start = Instant::now();
                             let (filter_arc, use_simple_sort) = self.resolve_filters_traced(
@@ -3162,6 +3359,26 @@ impl ConcurrentEngine {
                                             sort_value: sort_field.reconstruct_value(slot) as u64,
                                             slot_id: slot,
                                         });
+                                    }
+                                }
+                            }
+                        }
+
+                        // Prefetch proximity detection (traced path)
+                        if has_more && capacity < self.unified_cache.lock().config().max_capacity {
+                            if let Some(ref tx) = self.prefetch_tx {
+                                if let Some(ref keys) = cached_sorted_keys {
+                                    if let Some(ref cursor) = result.cursor {
+                                        let cursor_key = (cursor.sort_value << 32) | (cursor.slot_id as u64);
+                                        let sort_dir = query.sort.as_ref().map(|s| s.direction).unwrap_or(SortDirection::Desc);
+                                        let pos = match sort_dir {
+                                            SortDirection::Desc => keys.partition_point(|&k| k >= cursor_key),
+                                            SortDirection::Asc => keys.partition_point(|&k| k <= cursor_key),
+                                        };
+                                        let threshold = self.unified_cache.lock().config().prefetch_threshold;
+                                        if keys.len() > 0 && pos as f64 / keys.len() as f64 >= threshold {
+                                            let _ = tx.try_send(ukey.clone());
+                                        }
                                     }
                                 }
                             }
@@ -5833,6 +6050,12 @@ impl ConcurrentEngine {
         // then join it. Must drop before join to avoid deadlock.
         drop(self.compact_tx.take());
         if let Some(handle) = self.compact_handle.take() {
+            handle.join().ok();
+        }
+        // Drop the prefetch_tx sender to signal the prefetch worker to exit,
+        // then join it. Must drop before join to avoid deadlock.
+        drop(self.prefetch_tx.take());
+        if let Some(handle) = self.prefetch_handle.take() {
             handle.join().ok();
         }
     }

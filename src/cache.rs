@@ -114,6 +114,44 @@ impl CanonicalClause {
             }
         }
     }
+
+    /// Convert a canonical clause back to a FilterClause.
+    ///
+    /// This is a best-effort reverse mapping used by the prefetch worker.
+    /// Compound clauses (And, Or, Not) and BucketBitmap are not supported
+    /// and return None. The prefetch worker skips entries with unconvertible clauses.
+    pub fn to_filter_clause(cc: &CanonicalClause) -> Option<FilterClause> {
+        let parse_value = |s: &str| -> Value {
+            if let Ok(i) = s.parse::<i64>() {
+                Value::Integer(i)
+            } else if s == "true" {
+                Value::Bool(true)
+            } else if s == "false" {
+                Value::Bool(false)
+            } else if let Ok(f) = s.parse::<f64>() {
+                Value::Float(f)
+            } else {
+                Value::String(s.to_string())
+            }
+        };
+
+        let parse_values = |s: &str| -> Vec<Value> {
+            s.split(',').map(|v| parse_value(v)).collect()
+        };
+
+        match cc.op.as_str() {
+            "eq" => Some(FilterClause::Eq(cc.field.clone(), parse_value(&cc.value_repr))),
+            "neq" => Some(FilterClause::NotEq(cc.field.clone(), parse_value(&cc.value_repr))),
+            "in" => Some(FilterClause::In(cc.field.clone(), parse_values(&cc.value_repr))),
+            "notin" => Some(FilterClause::NotIn(cc.field.clone(), parse_values(&cc.value_repr))),
+            "gt" => Some(FilterClause::Gt(cc.field.clone(), parse_value(&cc.value_repr))),
+            "gte" => Some(FilterClause::Gte(cc.field.clone(), parse_value(&cc.value_repr))),
+            "lt" => Some(FilterClause::Lt(cc.field.clone(), parse_value(&cc.value_repr))),
+            "lte" => Some(FilterClause::Lte(cc.field.clone(), parse_value(&cc.value_repr))),
+            // Compound ops (and, or, not) and bucket are not reversible — skip
+            _ => None,
+        }
+    }
 }
 
 fn value_to_string(v: &Value) -> String {
