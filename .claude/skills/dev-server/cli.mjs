@@ -17,6 +17,8 @@
  *   datasets                            List known data directories
  *   reserve-port                        Reserve next available port
  *   build [--target T] [--profile P]    Acquire lock, build, release
+ *   test [filter] [--slot N]           Run cargo test in isolated slot
+ *   test-slots                         Show test slot status
  *   test-e2e [--port N]                 Acquire lock, run E2E, release
  *   dash                                TUI dashboard
  *   shutdown                            Kill all instances + stop daemon
@@ -349,6 +351,88 @@ async function cmdTestE2e() {
     await daemonFetch('/e2e/release', { method: 'POST' });
     console.error('E2E lock released');
   }
+}
+
+async function cmdTest() {
+  const filter = getArg('--filter') || process.argv[3];
+  const slot = getArg('--slot');
+  const holder = getWorktree();
+
+  // If argv[3] starts with --, it's a flag not a filter
+  const resolvedFilter = (filter && !filter.startsWith('--')) ? filter : undefined;
+
+  console.error('Requesting test slot...');
+  const result = await daemonFetch('/test/run', {
+    method: 'POST',
+    body: { filter: resolvedFilter, slot: slot ? parseInt(slot, 10) : undefined, holder },
+  });
+
+  if (result.error) {
+    console.error(`Error: ${result.error}`);
+    if (result.slots) {
+      console.error('\nSlot status:');
+      for (const s of result.slots) {
+        const status = s.holder ? `RUNNING (${s.holder}, ${s.elapsed_s}s)` : 'FREE';
+        console.error(`  Slot ${s.id}: ${status}`);
+      }
+    }
+    console.log(JSON.stringify(result));
+    process.exit(1);
+  }
+
+  console.error(`Running in slot ${result.slot} (${result.command})`);
+  console.error(`Target dir: ${result.targetDir}`);
+
+  // Poll logs until done
+  let cursor = 0;
+  while (true) {
+    await new Promise(r => setTimeout(r, 1000));
+
+    const logs = await daemonFetch(`/test/slots/${result.slot}/logs?since=${cursor}`);
+
+    for (const entry of logs.logs || []) {
+      const lvl = ERROR_PATTERNS.test(entry.message) ? '\x1b[31mERR\x1b[0m' : '   ';
+      console.error(`${lvl} ${entry.message}`);
+      cursor = entry.index;
+    }
+
+    if (logs.exitCode != null) {
+      if (logs.exitCode === 0) {
+        console.error('\x1b[32mTests passed.\x1b[0m');
+        console.log(JSON.stringify({ success: true, slot: result.slot, exitCode: 0 }));
+      } else {
+        console.error(`\x1b[31mTests failed (exit ${logs.exitCode}).\x1b[0m`);
+        console.log(JSON.stringify({ success: false, slot: result.slot, exitCode: logs.exitCode }));
+        process.exit(1);
+      }
+      break;
+    }
+
+    // Check if holder cleared (process died without setting exitCode)
+    if (!logs.holder) {
+      console.error('\x1b[31mTest slot released unexpectedly.\x1b[0m');
+      console.log(JSON.stringify({ success: false, slot: result.slot, exitCode: null }));
+      process.exit(1);
+    }
+  }
+}
+
+async function cmdTestSlots() {
+  const slots = await daemonFetch('/test/slots');
+
+  const G = '\x1b[32m', Y = '\x1b[33m', R = '\x1b[0m', D = '\x1b[2m', B = '\x1b[1m';
+  console.error(`${B}Test Slots${R} (${slots.length} total)`);
+  console.error(`  ${D}${pad('Slot', 6)}${pad('Status', 12)}${pad('Holder', 30)}${pad('Elapsed', 10)}${pad('Command', 30)}${R}`);
+
+  for (const s of slots) {
+    const status = s.holder ? `${Y}RUNNING${R}` : `${G}FREE${R}`;
+    const holder = s.holder ? s.holder.split('/').pop() : '';
+    const elapsed = s.elapsed_s != null ? `${s.elapsed_s}s` : '';
+    const cmd = s.command || '';
+    console.error(`  ${pad(String(s.id), 6)}${pad(status, 12 + 9)}${pad(holder, 30)}${pad(elapsed, 10)}${pad(cmd, 30)}`);
+  }
+
+  console.log(JSON.stringify(slots, null, 2));
 }
 
 async function cmdForceKill() {
@@ -1173,6 +1257,8 @@ Commands:
   reserve-port [--preferred N]        Reserve next available port
   build [--target T] [--profile P]    Acquire lock, build, release (default: fast profile)
   traces [id|port] [--last N]         Fetch recent query traces (default last=5)
+  test [filter] [--slot N]           Run cargo test in isolated slot
+  test-slots                         Show test slot status
   test-e2e [--port N]                 Acquire lock, run E2E suite, release
   dash                                TUI dashboard
   shutdown                            Kill all instances + stop daemon
@@ -1207,6 +1293,8 @@ async function main() {
     case 'reserve-port': return cmdReservePort();
     case 'build': return cmdBuild();
     case 'traces': return cmdTraces();
+    case 'test': return cmdTest();
+    case 'test-slots': return cmdTestSlots();
     case 'test-e2e': return cmdTestE2e();
     case 'dash': case 'dashboard': return cmdDashboard();
     case 'restart': return cmdRestart();

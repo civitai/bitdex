@@ -29,6 +29,8 @@ const MAX_LOG_LINES = 1000;
 const HEARTBEAT_INTERVAL = 10_000;
 const BUILD_LOCK_TIMEOUT = 600_000;  // 10 minutes
 const E2E_LOCK_TIMEOUT = 300_000;    // 5 minutes
+const TEST_SLOT_COUNT = 3;
+const TEST_SLOT_TIMEOUT = 300_000;   // 5 minutes
 const PORT_RANGE_START = 3001;
 const PORT_RANGE_END = 3099;
 const PORT_E2E_RESERVED = 3100;
@@ -44,6 +46,7 @@ let datasets = new Map();     // absolute dataDir path → dataset object
 let buildLock = { holder: null, target: null, startedAt: null, pid: null, targetDir: null, logBuffer: [], process: null, exitCode: null };
 let e2eLock = { holder: null, startedAt: null, pid: null };
 let portReservations = new Map(); // port → { reservedAt, reservedBy }
+let testSlots = Array.from({length: TEST_SLOT_COUNT}, (_, i) => ({ id: i + 1, holder: null, command: null, startedAt: null, pid: null, process: null, exitCode: null, logBuffer: [], targetDir: resolve(PROJECT_ROOT, `target-test${i + 1}`) }));
 let daemonStartedAt = new Date().toISOString();
 
 // SSE clients — connected response objects for event streaming
@@ -679,6 +682,170 @@ function releaseE2eLock() {
   return { released: true };
 }
 
+// ─── Test Slots ─────────────────────────────────────────────────
+
+const MAX_TEST_LOG_LINES = 500;
+
+function getTestSlots() {
+  return testSlots.map(s => {
+    const { process, ...rest } = s;
+    return {
+      ...rest,
+      alive: !!(process && s.pid && isPidAlive(s.pid)),
+      elapsed_s: s.startedAt ? Math.round((Date.now() - new Date(s.startedAt).getTime()) / 1000) : null,
+    };
+  });
+}
+
+function acquireTestSlot({ holder, slot }) {
+  let target;
+  if (slot != null) {
+    const idx = parseInt(slot, 10) - 1;
+    if (idx < 0 || idx >= testSlots.length) return { error: `Invalid slot ${slot} (valid: 1-${TEST_SLOT_COUNT})` };
+    target = testSlots[idx];
+    if (target.holder) return { error: `Slot ${slot} held by '${target.holder}'`, slots: getTestSlots() };
+  } else {
+    target = testSlots.find(s => !s.holder);
+    if (!target) return { error: 'No free test slots', slots: getTestSlots() };
+  }
+
+  target.holder = holder || 'unknown';
+  target.startedAt = new Date().toISOString();
+  target.exitCode = null;
+  target.command = null;
+  target.logBuffer = [];
+  target.pid = null;
+  target.process = null;
+
+  sseBroadcast('testSlots', getTestSlots());
+  return { slot: target.id, targetDir: target.targetDir };
+}
+
+function runTestInSlot(slotId, { command, filter, holder }) {
+  const idx = parseInt(slotId, 10) - 1;
+  if (idx < 0 || idx >= testSlots.length) return { error: `Invalid slot ${slotId}` };
+  const slot = testSlots[idx];
+
+  const filterArgs = filter ? ['--', filter] : [];
+  const args = ['test', ...filterArgs];
+  const cmdStr = `cargo test${filter ? ' -- ' + filter : ''}`;
+
+  mkdirSync(slot.targetDir, { recursive: true });
+
+  const proc = spawn('cargo', args, {
+    cwd: PROJECT_ROOT,
+    shell: IS_WIN,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, CARGO_TARGET_DIR: slot.targetDir },
+  });
+
+  slot.process = proc;
+  slot.pid = proc.pid;
+  slot.command = cmdStr;
+  slot.exitCode = null;
+
+  let stdoutBuf = '';
+  proc.stdout.on('data', (data) => {
+    stdoutBuf += data.toString();
+    const lines = stdoutBuf.split('\n');
+    stdoutBuf = lines.pop();
+    for (const line of lines) {
+      if (line) {
+        slot.logBuffer.push({
+          index: globalLogIndex++,
+          timestamp: new Date().toISOString(),
+          level: 'stdout',
+          message: line.trimEnd(),
+        });
+        if (slot.logBuffer.length > MAX_TEST_LOG_LINES) {
+          slot.logBuffer = slot.logBuffer.slice(-MAX_TEST_LOG_LINES);
+        }
+      }
+    }
+  });
+
+  let stderrBuf = '';
+  proc.stderr.on('data', (data) => {
+    stderrBuf += data.toString();
+    const lines = stderrBuf.split('\n');
+    stderrBuf = lines.pop();
+    for (const line of lines) {
+      if (line) {
+        slot.logBuffer.push({
+          index: globalLogIndex++,
+          timestamp: new Date().toISOString(),
+          level: 'stderr',
+          message: line.trimEnd(),
+        });
+        if (slot.logBuffer.length > MAX_TEST_LOG_LINES) {
+          slot.logBuffer = slot.logBuffer.slice(-MAX_TEST_LOG_LINES);
+        }
+      }
+    }
+  });
+
+  proc.on('error', (err) => {
+    slot.logBuffer.push({
+      index: globalLogIndex++,
+      timestamp: new Date().toISOString(),
+      level: 'daemon',
+      message: `Process error: ${err.message}`,
+    });
+    slot.exitCode = 1;
+    slot.process = null;
+    slot.holder = null;
+    sseBroadcast('testSlots', getTestSlots());
+  });
+
+  proc.on('exit', (code, signal) => {
+    slot.exitCode = code;
+    slot.process = null;
+    slot.holder = null;
+    slot.logBuffer.push({
+      index: globalLogIndex++,
+      timestamp: new Date().toISOString(),
+      level: 'daemon',
+      message: `Exited (code=${code}, signal=${signal})`,
+    });
+    sseBroadcast('testSlots', getTestSlots());
+  });
+
+  sseBroadcast('testSlots', getTestSlots());
+  return { slot: slot.id, targetDir: slot.targetDir, command: cmdStr, pid: proc.pid };
+}
+
+function releaseTestSlot(slotId) {
+  const idx = parseInt(slotId, 10) - 1;
+  if (idx < 0 || idx >= testSlots.length) return { error: `Invalid slot ${slotId}` };
+  const slot = testSlots[idx];
+
+  if (slot.process && slot.pid) {
+    killProcess(slot.pid);
+    slot.process = null;
+  }
+
+  slot.holder = null;
+  slot.command = null;
+  slot.startedAt = null;
+  slot.pid = null;
+  slot.exitCode = null;
+
+  sseBroadcast('testSlots', getTestSlots());
+  return { released: true, slot: slot.id };
+}
+
+function getTestSlotLogs(slotId, { since = 0, tail = 200 } = {}) {
+  const idx = parseInt(slotId, 10) - 1;
+  if (idx < 0 || idx >= testSlots.length) return { error: `Invalid slot ${slotId}` };
+  const slot = testSlots[idx];
+
+  let entries = slot.logBuffer;
+  if (since > 0) entries = entries.filter(e => e.index > since);
+  if (tail > 0) entries = entries.slice(-tail);
+  return { logs: entries, total: slot.logBuffer.length, exitCode: slot.exitCode, holder: slot.holder };
+}
+
 // ─── Instance Stats Polling ─────────────────────────────────────
 
 async function pollInstanceStats(instance) {
@@ -775,6 +942,41 @@ function heartbeat() {
     }
   }
 
+  // Check test slot liveness and timeouts
+  for (const slot of testSlots) {
+    if (!slot.holder) continue;
+    if (slot.process && slot.pid) {
+      if (!isPidAlive(slot.pid)) {
+        slot.logBuffer.push({
+          index: globalLogIndex++,
+          timestamp: new Date().toISOString(),
+          level: 'daemon',
+          message: 'Test process died (detected by heartbeat)',
+        });
+        slot.exitCode = 1;
+        slot.process = null;
+        slot.holder = null;
+        sseBroadcast('testSlots', getTestSlots());
+      } else if (Date.now() - new Date(slot.startedAt).getTime() > TEST_SLOT_TIMEOUT) {
+        slot.logBuffer.push({
+          index: globalLogIndex++,
+          timestamp: new Date().toISOString(),
+          level: 'daemon',
+          message: 'Test auto-killed (timeout)',
+        });
+        killProcess(slot.pid);
+        slot.exitCode = 1;
+        slot.process = null;
+        slot.holder = null;
+        sseBroadcast('testSlots', getTestSlots());
+      }
+    } else {
+      // Holder set but no process — stale, release
+      slot.holder = null;
+      sseBroadcast('testSlots', getTestSlots());
+    }
+  }
+
   // Clean expired port reservations
   const now = Date.now();
   for (const [p, r] of portReservations) {
@@ -833,6 +1035,7 @@ function getStatus() {
     e2e: e2eLock.holder
       ? { locked: true, ...e2eLock, elapsed_s: Math.round((Date.now() - new Date(e2eLock.startedAt).getTime()) / 1000) }
       : { locked: false },
+    testSlots: getTestSlots(),
   };
 }
 
@@ -1016,6 +1219,40 @@ async function handleRequest(req, res) {
       return json(res, 200, e2eLock.holder
         ? { locked: true, ...e2eLock, elapsed_s: Math.round((Date.now() - new Date(e2eLock.startedAt).getTime()) / 1000) }
         : { locked: false });
+    }
+
+    // GET /test/slots — list all test slots
+    if (method === 'GET' && path === '/test/slots') {
+      return json(res, 200, getTestSlots());
+    }
+
+    // POST /test/run — acquire slot + start cargo test
+    if (method === 'POST' && path === '/test/run') {
+      const body = await parseBody(req);
+      const acq = acquireTestSlot({ holder: body.holder, slot: body.slot });
+      if (acq.error) return json(res, 409, acq);
+      const result = runTestInSlot(acq.slot, { command: body.command, filter: body.filter, holder: body.holder });
+      if (result.error) return json(res, 500, result);
+      return json(res, 200, result);
+    }
+
+    // GET /test/slots/:id/logs — get logs from a test slot
+    const testLogMatch = path.match(/^\/test\/slots\/(\d+)\/logs$/);
+    if (method === 'GET' && testLogMatch) {
+      const result = getTestSlotLogs(testLogMatch[1], {
+        since: parseInt(query.since || '0', 10),
+        tail: parseInt(query.tail || '200', 10),
+      });
+      if (result.error) return json(res, 404, result);
+      return json(res, 200, result);
+    }
+
+    // POST /test/slots/:id/release — release a test slot
+    const testReleaseMatch = path.match(/^\/test\/slots\/(\d+)\/release$/);
+    if (method === 'POST' && testReleaseMatch) {
+      const result = releaseTestSlot(testReleaseMatch[1]);
+      if (result.error) return json(res, 404, result);
+      return json(res, 200, result);
     }
 
     // POST /force-kill — kill ALL bitdex-server processes by name (including orphans)

@@ -98,6 +98,24 @@ node .claude/skills/dev-server/cli.mjs test-e2e
 
 Acquires E2E lock (only one run at a time — shared port 3100), runs the suite with `--skip-build`, releases. Build separately via `build` if needed.
 
+## Running Tests (with Slots)
+
+```bash
+# Run all tests in next free slot
+node .claude/skills/dev-server/cli.mjs test
+
+# Run specific test
+node .claude/skills/dev-server/cli.mjs test test_name
+
+# Run with filter
+node .claude/skills/dev-server/cli.mjs test --filter "test_cache"
+
+# Check slot status
+node .claude/skills/dev-server/cli.mjs test-slots
+```
+
+3 test slots with isolated cargo target directories. No lock contention — agents can compile tests in parallel. Slots auto-release on completion or after 5 minute timeout.
+
 ## Rules
 
 1. **Use `start` (not `new`) by default.** It's idempotent — checks if something is running first.
@@ -122,6 +140,8 @@ Acquires E2E lock (only one run at a time — shared port 3100), runs the suite 
 | `reserve-port` | Reserve next available port | JSON |
 | `build [--target T] [--profile P]` | Coordinated cargo build | JSON |
 | `traces [id\|port] [--last N]` | Fetch recent query traces (default last=5) | JSON |
+| `test [filter] [--slot N]` | Run cargo test in isolated slot | JSON |
+| `test-slots` | Show test slot status | JSON |
 | `test-e2e [--port N]` | Coordinated E2E test run | JSON |
 | `dash` | TUI dashboard with live logs, metrics, and explain panel | Interactive |
 | `shutdown` | Kill all instances + daemon | JSON |
