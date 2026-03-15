@@ -157,3 +157,8 @@ required-features = ["pg-sync"]
 [[bin]]
 name = "rebuild_bench"
 path = "src/bin/rebuild_bench.rs"
+
+[[example]]
+name = "load_from_csv"
+path = "examples/load_from_csv.rs"
+required-features = ["pg-sync"]

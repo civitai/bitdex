@@ -2,9 +2,9 @@
 //!
 //! Usage:
 //!   cargo run --release --features pg-sync --example load_from_csv -- \
+//!     --data ./data --index rebuilt \
 //!     --stage-dir data/load_stage \
-//!     --config configs/civitai-index.json \
-//!     --data-dir data
+//!     --config configs/civitai-index.json
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ fn main() {
         arg_value(&args, "--config").unwrap_or_else(|| "configs/civitai-index.json".into()),
     );
     let data_dir = PathBuf::from(
-        arg_value(&args, "--data-dir").unwrap_or_else(|| "data".into()),
+        arg_value(&args, "--data").unwrap_or_else(|| "data".into()),
     );
 
     let index_def = IndexDefinition::from_file(&config_path).unwrap_or_else(|e| {
@@ -38,8 +38,11 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Server layout: {data_dir}/indexes/{name}/bitmaps, docs, config.json
-    let index_dir = data_dir.join("indexes").join(&index_def.name);
+    // --index overrides the output index name (defaults to the name in config.json)
+    let index_name = arg_value(&args, "--index").unwrap_or_else(|| index_def.name.clone());
+
+    // Server layout: {data}/indexes/{index}/bitmaps, docs, config.json
+    let index_dir = data_dir.join("indexes").join(&index_name);
     let bitmap_dir = index_dir.join("bitmaps");
     let docs_dir = index_dir.join("docs");
 
@@ -52,6 +55,7 @@ fn main() {
 
     eprintln!("Stage:   {}", stage_dir.display());
     eprintln!("Config:  {}", config_path.display());
+    eprintln!("Index:   {}", index_name);
     eprintln!("Output:  {}", index_dir.display());
 
     let mut engine_config = index_def.config.clone();
@@ -62,6 +66,8 @@ fn main() {
         eprintln!("Failed to create engine: {e}");
         std::process::exit(1);
     });
+
+    engine.set_docstore_defaults(&index_def.data_schema);
 
     let progress = Arc::new(LoadProgress::new());
 

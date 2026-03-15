@@ -33,6 +33,7 @@ const DEFAULT_CONFIG: &str = include_str!("../../bitdex.default.toml");
 struct Config {
     port: u16,
     data_dir: PathBuf,
+    index: Option<String>,
     rebuild: bool,
     default_query_format: Option<String>,
     log_level: String,
@@ -74,6 +75,7 @@ fn parse_config() -> Config {
     // --- First pass: parse all CLI flags ---
     let mut cli_port: Option<u16> = None;
     let mut cli_data_dir: Option<PathBuf> = None;
+    let mut cli_index: Option<String> = None;
     let mut cli_rebuild = false;
     let mut cli_config: Option<PathBuf> = None;
     let mut cli_default_query_format: Option<String> = None;
@@ -87,9 +89,13 @@ fn parse_config() -> Config {
                 i += 1;
                 cli_port = Some(cli_args[i].parse().expect("--port must be a number"));
             }
-            "--data-dir" => {
+            "--data-dir" | "--data" => {
                 i += 1;
                 cli_data_dir = Some(PathBuf::from(&cli_args[i]));
+            }
+            "--index" => {
+                i += 1;
+                cli_index = Some(cli_args[i].clone());
             }
             "--rebuild" => {
                 cli_rebuild = true;
@@ -127,7 +133,7 @@ fn parse_config() -> Config {
 
     // --- Config file ---
     // Only auto-generate bitdex.toml if no CLI args were passed at all
-    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some() || cli_log_level.is_some() || cli_enable_traces;
+    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_index.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some() || cli_log_level.is_some() || cli_enable_traces;
     let config_path = match &cli_config {
         Some(path) => path.clone(),
         None => {
@@ -184,7 +190,7 @@ fn parse_config() -> Config {
         enable_traces = true;
     }
 
-    Config { port, data_dir, rebuild, default_query_format, log_level, enable_traces }
+    Config { port, data_dir, index: cli_index, rebuild, default_query_format, log_level, enable_traces }
 }
 
 #[tokio::main]

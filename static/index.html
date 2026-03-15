@@ -254,19 +254,22 @@
       <label>Type</label>
       <select id="f-type">
         <option value="">Any</option>
-        <option value="1">Image</option>
-        <option value="2">Video</option>
-        <option value="3">Audio</option>
+        <option value="image">Image</option>
+        <option value="video">Video</option>
+        <option value="audio">Audio</option>
       </select>
     </div>
     <div class="field">
       <label>Base Model</label>
       <select id="f-baseModel">
         <option value="">Any</option>
-        <option value="2">SD 1.5</option>
-        <option value="11">SDXL 1.0</option>
-        <option value="20">Pony</option>
-        <option value="31">Flux.1 D</option>
+        <option value="SD 1.5">SD 1.5</option>
+        <option value="SD 2.1">SD 2.1</option>
+        <option value="SDXL 1.0">SDXL 1.0</option>
+        <option value="Pony">Pony</option>
+        <option value="Flux.1 D">Flux.1 D</option>
+        <option value="Flux.1 S">Flux.1 S</option>
+        <option value="Illustrious">Illustrious</option>
         <option value="40">Illustrious</option>
         <option value="41">NoobAI</option>
         <option value="30">Flux.1 S</option>
@@ -386,14 +389,30 @@
 // API base URL — default empty string means same origin.
 // Change this if the UI is served separately from the BitDex server.
 const API_URL = '';
-// Index name to query against
-const INDEX_NAME = 'civitai';
+// Index name — discovered from server on startup
+let INDEX_NAME = null;
 // Civitai image CDN base
 const IMG_BASE = 'https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA';
 
 // Build API path for this index
 function apiPath(suffix) {
   return `${API_URL}/api/indexes/${INDEX_NAME}${suffix}`;
+}
+
+// Discover the first available index from the server
+async function discoverIndex() {
+  try {
+    const res = await fetch(`${API_URL}/api/indexes`);
+    const data = await res.json();
+    if (data.indexes && data.indexes.length > 0) {
+      INDEX_NAME = data.indexes[0].name;
+      console.log(`Using index: ${INDEX_NAME}`);
+    } else {
+      console.error('No indexes found on server');
+    }
+  } catch (e) {
+    console.error('Failed to discover index:', e);
+  }
 }
 
 // State
@@ -441,10 +460,10 @@ function buildQuery(cursor) {
   }
 
   const type_ = document.getElementById('f-type').value;
-  if (type_) filters.push({ Eq: ['type', { Integer: parseInt(type_) }] });
+  if (type_) filters.push({ Eq: ['type', { String: type_ }] });
 
   const baseModel = document.getElementById('f-baseModel').value;
-  if (baseModel) filters.push({ Eq: ['baseModel', { Integer: parseInt(baseModel) }] });
+  if (baseModel) filters.push({ Eq: ['baseModel', { String: baseModel }] });
 
   // Integer list fields
   for (const field of ['tagIds', 'modelVersionIds', 'toolIds', 'techniqueIds']) {
@@ -791,7 +810,11 @@ document.addEventListener('keydown', (e) => {
 });
 
 // Init
-fetchStats();
+// Discover index, then fetch stats and load initial images
+(async () => {
+  await discoverIndex();
+  if (INDEX_NAME) fetchStats();
+})();
 attachListeners();
 setupInfiniteScroll();
 setTimeout(() => onFilterChange(), 100);

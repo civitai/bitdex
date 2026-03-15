@@ -33,6 +33,11 @@ pub struct BitmapFs {
 }
 
 impl BitmapFs {
+    /// Get the root directory of this bitmap store.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Create a new bitmap store rooted at the given directory.
     /// Creates the directory structure if it doesn't exist.
     pub fn new(root: &Path) -> Result<Self> {

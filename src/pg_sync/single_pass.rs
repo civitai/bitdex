@@ -26,6 +26,8 @@ use roaring::RoaringBitmap;
 
 use crate::bitmap_fs::BitmapFs;
 use crate::concurrent_engine::ConcurrentEngine;
+use crate::dictionary::FieldDictionary;
+use crate::docstore::PackedValue;
 
 use super::bulk_loader::BulkLoadStats;
 use super::config::IndexDefinition;
@@ -88,6 +90,13 @@ pub fn run_single_pass_v2(
     // No enter_loading_mode — we write directly to BitmapFs, not through the engine.
     // Loading mode would trigger a snapshot save on exit that overwrites our bitmaps.
 
+    // FieldDictionaries for LowCardinalityString fields — declared at function scope
+    // so they can be persisted after all CSVs are processed.
+    let type_dict = FieldDictionary::new();
+    let availability_dict = FieldDictionary::new();
+    let blocked_for_dict = FieldDictionary::new();
+    let base_model_dict = FieldDictionary::new();
+
     progress.set_phase(1);
     eprintln!("\n=== Single-Pass V2: CSV → bitmaps + docstore (no scratch shards) ===");
 
@@ -143,6 +152,9 @@ pub fn run_single_pass_v2(
             &progress,
             &post_map,
             schema,
+            &type_dict,
+            &availability_dict,
+            &blocked_for_dict,
             &filter_set,
             &sort_bits,
             &filter_names,
@@ -235,6 +247,7 @@ pub fn run_single_pass_v2(
             &filter_set,
             &mv_map,
             &model_map,
+            &base_model_dict,
         )?;
         eprintln!(
             "  Resources: {} rows in {:.1}s",
@@ -356,6 +369,30 @@ pub fn run_single_pass_v2(
     // No exit_loading_mode needed (would trigger snapshot save overwriting our bitmaps).
     // ===================================================================
     progress.set_phase(3);
+
+    // Persist LowCardinalityString dictionaries so the server can resolve string→key at query time
+    {
+        let dict_dir = bitmap_fs.root().join("dictionaries");
+        std::fs::create_dir_all(&dict_dir).ok();
+        let dicts: Vec<(&str, &FieldDictionary)> = vec![
+            ("type", &type_dict),
+            ("availability", &availability_dict),
+            ("blockedFor", &blocked_for_dict),
+            ("baseModel", &base_model_dict),
+        ];
+        for (name, dict) in &dicts {
+            let snap = dict.snapshot();
+            if snap.forward.is_empty() {
+                continue;
+            }
+            let path = dict_dir.join(format!("{name}.dict"));
+            if let Err(e) = crate::dictionary::save_dictionary(&snap, &path) {
+                eprintln!("WARNING: failed to save dictionary for '{name}': {e}");
+            } else {
+                eprintln!("  Saved dictionary '{name}': {} entries", snap.forward.len());
+            }
+        }
+    }
 
     progress.set_phase(6);
     let elapsed = wall_start.elapsed();
@@ -543,7 +580,7 @@ fn process_multi_value_csv(
                         let val = value_id as u64;
                         bitmaps.entry(val).or_insert_with(RoaringBitmap::new).insert(slot);
                         if let Some(fidx) = field_idx {
-                            let value = rmp_serde::to_vec(&(value_id as i64)).unwrap_or_default();
+                            let value = rmp_serde::to_vec(&PackedValue::I(value_id as i64)).unwrap_or_default();
                             bulk_writer.append_tuple_raw(slot, fidx, &value);
                         }
                         count += 1;
@@ -582,6 +619,9 @@ fn process_images_csv(
     progress: &Arc<LoadProgress>,
     post_map: &HashMap<i64, (Option<i64>, String, Option<i64>)>,
     schema: &crate::config::DataSchema,
+    type_dict: &FieldDictionary,
+    availability_dict: &FieldDictionary,
+    blocked_for_dict: &FieldDictionary,
     filter_set: &HashSet<String>,
     sort_bits: &HashMap<String, u8>,
     filter_names: &[String],
@@ -679,7 +719,7 @@ fn process_images_csv(
                     let slot = row.id as u32;
 
                     alive.insert(slot);
-                    build_image_filter_bitmaps(&row, slot, filter_set, schema, &mut filter_maps);
+                    build_image_filter_bitmaps(&row, slot, filter_set, &type_dict, &availability_dict, &blocked_for_dict, &mut filter_maps);
                     build_image_sort_bitmaps(&row, slot, sort_bits, &mut sort_maps);
                     append_image_docstore_tuples(&row, slot, bulk_writer);
 
@@ -738,7 +778,9 @@ fn build_image_filter_bitmaps(
     row: &super::copy_queries::CopyImageRow,
     slot: u32,
     filter_set: &HashSet<String>,
-    schema: &crate::config::DataSchema,
+    type_dict: &FieldDictionary,
+    availability_dict: &FieldDictionary,
+    blocked_for_dict: &FieldDictionary,
     filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
 ) {
     if filter_set.contains("nsfwLevel") {
@@ -748,15 +790,15 @@ fn build_image_filter_bitmaps(
         insert_filter(filter_maps, "userId", row.user_id as u64, slot);
     }
     if filter_set.contains("type") {
-        let key = resolve_type_key(&row.image_type, schema);
+        let key = type_dict.get_or_insert(&row.image_type) as u64;
         insert_filter(filter_maps, "type", key, slot);
     }
     if filter_set.contains("availability") {
-        let key = resolve_availability_key(&row.availability, schema);
+        let key = availability_dict.get_or_insert(&row.availability) as u64;
         insert_filter(filter_maps, "availability", key, slot);
     }
     if filter_set.contains("blockedFor") && row.blocked_for.is_some() {
-        let key = resolve_blocked_for_key(schema);
+        let key = blocked_for_dict.get_or_insert(row.blocked_for.as_deref().unwrap()) as u64;
         insert_filter(filter_maps, "blockedFor", key, slot);
     }
     if filter_set.contains("postId") {
@@ -849,50 +891,66 @@ fn append_image_docstore_tuples(
 ) {
     let field_idx = bulk_writer.field_to_idx();
 
-    // Helper macro to reduce boilerplate
-    macro_rules! append_field {
+    // Helper macros wrapping values in PackedValue for correct V2 docstore encoding
+    macro_rules! append_int {
         ($name:expr, $value:expr) => {
             if let Some(&fidx) = field_idx.get($name) {
-                let value = rmp_serde::to_vec(&$value).unwrap_or_default();
+                let value = rmp_serde::to_vec(&PackedValue::I($value as i64)).unwrap_or_default();
+                bulk_writer.append_tuple_raw(slot, fidx, &value);
+            }
+        };
+    }
+    macro_rules! append_str {
+        ($name:expr, $value:expr) => {
+            if let Some(&fidx) = field_idx.get($name) {
+                let value = rmp_serde::to_vec(&PackedValue::S($value.to_string())).unwrap_or_default();
+                bulk_writer.append_tuple_raw(slot, fidx, &value);
+            }
+        };
+    }
+    macro_rules! append_bool {
+        ($name:expr, $value:expr) => {
+            if let Some(&fidx) = field_idx.get($name) {
+                let value = rmp_serde::to_vec(&PackedValue::B($value)).unwrap_or_default();
                 bulk_writer.append_tuple_raw(slot, fidx, &value);
             }
         };
     }
 
-    append_field!("id", (row.id as i64));
-    append_field!("nsfwLevel", (row.nsfw_level as i64));
-    append_field!("userId", (row.user_id as i64));
-    append_field!("type", row.image_type.as_str());
-    append_field!("postId", (row.post_id.unwrap_or(0) as i64));
-    append_field!("postedToId", (row.posted_to_id.unwrap_or(0) as i64));
-    append_field!("availability", row.availability.as_str());
-    append_field!("hasMeta", row.has_meta());
-    append_field!("onSite", row.on_site());
-    append_field!("poi", row.poi());
-    append_field!("minor", row.minor());
+    append_int!("id", row.id);
+    append_int!("nsfwLevel", row.nsfw_level);
+    append_int!("userId", row.user_id);
+    append_str!("type", row.image_type);
+    append_int!("postId", row.post_id.unwrap_or(0));
+    append_int!("postedToId", row.posted_to_id.unwrap_or(0));
+    append_str!("availability", row.availability);
+    append_bool!("hasMeta", row.has_meta());
+    append_bool!("onSite", row.on_site());
+    append_bool!("poi", row.poi());
+    append_bool!("minor", row.minor());
 
     // Sort fields
     let sort_at = row.sort_at_secs() as i64;
-    append_field!("sortAt", sort_at);
-    append_field!("sortAtUnix", (sort_at * 1000));
+    append_int!("sortAt", sort_at);
+    append_int!("sortAtUnix", sort_at * 1000);
     let published_at_ms = row.published_at_secs.unwrap_or(0) * 1000;
-    append_field!("publishedAtUnix", published_at_ms);
+    append_int!("publishedAtUnix", published_at_ms);
 
     // isPublished
     let published = row.published_at_secs.unwrap_or(0) > 0;
-    append_field!("isPublished", published);
+    append_bool!("isPublished", published);
 
     // Blocked
     if let Some(ref bf) = row.blocked_for {
-        append_field!("blockedFor", bf.as_str());
+        append_str!("blockedFor", bf);
     }
 
     // URL and hash
     if let Some(ref url) = row.url {
-        append_field!("url", url.as_str());
+        append_str!("url", url);
     }
     if let Some(ref hash) = row.hash {
-        append_field!("hash", hash.as_str());
+        append_str!("hash", hash);
     }
 }
 
@@ -911,6 +969,7 @@ fn process_resources_csv(
     filter_set: &HashSet<String>,
     mv_map: &HashMap<i64, (Option<String>, i64)>,
     model_map: &HashMap<i64, (bool, String)>,
+    base_model_dict: &FieldDictionary,
 ) -> Result<ResourceCsvResult, String> {
     let file = std::fs::File::open(stage_dir.join("resources.csv"))
         .map_err(|e| format!("open resources.csv: {e}"))?;
@@ -958,7 +1017,7 @@ fn process_resources_csv(
                             .insert(slot);
                     }
                     if let Some(fidx) = mv_field_idx {
-                        let value = rmp_serde::to_vec(&(row.model_version_id as i64)).unwrap_or_default();
+                        let value = rmp_serde::to_vec(&PackedValue::I(row.model_version_id as i64)).unwrap_or_default();
                         bulk_writer.append_tuple_raw(slot, fidx, &value);
                     }
 
@@ -966,12 +1025,10 @@ fn process_resources_csv(
                         if let Some((poi, model_type)) = model_map.get(model_id) {
                             if model_type == "Checkpoint" {
                                 if let Some(ref bm_str) = mv_base_model {
-                                    let key = resolve_base_model_key_str(bm_str, schema);
-                                    if key > 0 {
-                                        insert_filter(&mut filter_maps, "baseModel", key, slot);
-                                    }
+                                    let key = base_model_dict.get_or_insert(bm_str) as u64;
+                                    insert_filter(&mut filter_maps, "baseModel", key, slot);
                                     if let Some(fidx) = base_model_field_idx {
-                                        let value = rmp_serde::to_vec(&bm_str.as_str()).unwrap_or_default();
+                                        let value = rmp_serde::to_vec(&PackedValue::S(bm_str.clone())).unwrap_or_default();
                                         bulk_writer.append_tuple_raw(slot, fidx, &value);
                                     }
                                 }
@@ -1085,15 +1142,15 @@ fn process_metrics_csv(
 
                     // Docstore tuples
                     if let Some(fidx) = reaction_field_idx {
-                        let value = rmp_serde::to_vec(&(reaction as i64)).unwrap_or_default();
+                        let value = rmp_serde::to_vec(&PackedValue::I(reaction as i64)).unwrap_or_default();
                         bulk_writer.append_tuple_raw(slot, fidx, &value);
                     }
                     if let Some(fidx) = comment_field_idx {
-                        let value = rmp_serde::to_vec(&(comment as i64)).unwrap_or_default();
+                        let value = rmp_serde::to_vec(&PackedValue::I(comment as i64)).unwrap_or_default();
                         bulk_writer.append_tuple_raw(slot, fidx, &value);
                     }
                     if let Some(fidx) = collected_field_idx {
-                        let value = rmp_serde::to_vec(&(collected as i64)).unwrap_or_default();
+                        let value = rmp_serde::to_vec(&PackedValue::I(collected as i64)).unwrap_or_default();
                         bulk_writer.append_tuple_raw(slot, fidx, &value);
                     }
 

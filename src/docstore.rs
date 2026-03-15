@@ -1290,6 +1290,11 @@ pub struct BulkWriter {
 }
 
 impl BulkWriter {
+    /// Get the field name → index mapping.
+    pub fn field_to_idx(&self) -> &HashMap<String, u16> {
+        &self.field_to_idx
+    }
+
     /// Write pre-encoded docs to shard files. Pure I/O — no CPU-bound encoding.
     /// Docs are already msgpack bytes from the parse stage.
     pub fn write_batch_encoded(&self, encoded: Vec<(u32, Vec<u8>)>) {

@@ -17,6 +17,7 @@ use roaring::RoaringBitmap;
 use sqlx::PgPool;
 
 use crate::config::DataSchema;
+use crate::dictionary::FieldDictionary;
 use crate::loader::BitmapAccum;
 
 use super::copy_queries::{
@@ -274,7 +275,10 @@ pub(crate) fn build_image_bitmaps(
     row: &CopyImageRow,
     slot: u32,
     sort_at: u64,
-    schema: &DataSchema,
+    _schema: &DataSchema,
+    type_dict: &FieldDictionary,
+    availability_dict: &FieldDictionary,
+    blocked_for_dict: &FieldDictionary,
     filter_set: &HashSet<String>,
     sort_bits: &HashMap<String, u8>,
     filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
@@ -286,16 +290,16 @@ pub(crate) fn build_image_bitmaps(
     if filter_set.contains("nsfwLevel") { insert_filter(filter_maps, "nsfwLevel", row.nsfw_level as u64, slot); }
     if filter_set.contains("userId") { insert_filter(filter_maps, "userId", row.user_id as u64, slot); }
     if filter_set.contains("type") {
-        let key = lookup_string_map(&resolve_string_map(schema, "type"), &row.image_type);
+        let key = type_dict.get_or_insert(&row.image_type) as u64;
         insert_filter(filter_maps, "type", key, slot);
     }
     if filter_set.contains("availability") {
-        let key = lookup_string_map(&resolve_string_map(schema, "availability"), &row.availability);
+        let key = availability_dict.get_or_insert(&row.availability) as u64;
         insert_filter(filter_maps, "availability", key, slot);
     }
     if filter_set.contains("blockedFor") {
         if let Some(ref bf) = row.blocked_for {
-            let key = lookup_string_map(&resolve_string_map(schema, "blockedFor"), bf);
+            let key = blocked_for_dict.get_or_insert(bf) as u64;
             insert_filter(filter_maps, "blockedFor", key, slot);
         }
     }

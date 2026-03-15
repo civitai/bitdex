@@ -546,6 +546,9 @@ pub async fn run_bulk_load_copy(
     // Build images bitmaps + store compact scalars (reads images.csv, enriches from post_map)
     eprintln!("Building images...");
     let img_start = Instant::now();
+    let type_dict = crate::dictionary::FieldDictionary::new();
+    let availability_dict = crate::dictionary::FieldDictionary::new();
+    let blocked_for_dict = crate::dictionary::FieldDictionary::new();
     let mut image_accum = BitmapAccum::new(&filter_names, &sort_configs);
     let img_file = std::io::BufReader::with_capacity(
         4 * 1024 * 1024,
@@ -602,6 +605,7 @@ pub async fn run_bulk_load_copy(
         // Build filter/sort bitmaps directly (same logic as copy_streams)
         copy_streams::build_image_bitmaps(
             &row, slot, sort_at, schema,
+            &type_dict, &availability_dict, &blocked_for_dict,
             &filter_set, &sort_bits,
             &mut image_accum.filter_maps, &mut image_accum.sort_maps,
         );
