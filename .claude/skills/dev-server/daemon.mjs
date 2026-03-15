@@ -293,6 +293,7 @@ async function startInstance({ port, dataDir, worktree, binary, name } = {}) {
     '--port', String(resolvedPort),
     '--data-dir', resolvedDataDir,
     '--log-level', 'debug',
+    '--enable-traces',
   ], {
     cwd: wt,
     stdio: ['ignore', 'pipe', 'pipe'],
