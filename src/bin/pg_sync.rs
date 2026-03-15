@@ -225,7 +225,8 @@ async fn main() {
                     std::process::exit(1);
                 });
 
-            engine.enter_loading_mode();
+            // No enter_loading_mode — single_pass writes directly to BitmapFs.
+            // Loading mode would trigger a snapshot save on exit that overwrites our bitmaps.
 
             // Set up progress tracking + HTTP endpoint
             let load_progress = Arc::new(LoadProgress::new());
@@ -281,17 +282,8 @@ async fn main() {
                 let _ = tx.send(());
             }
 
-            // Use save_unload variant to avoid the staging.clone() RSS spike.
-            // Plain exit_loading_mode() doubles memory via Arc refcount bump;
-            // save_unload saves directly from staging then drops bitmaps.
-            eprintln!("Exiting loading mode (save + unload to avoid RSS spike)...");
-            engine
-                .exit_loading_mode_and_save_unload()
-                .unwrap_or_else(|e| {
-                    eprintln!("exit_loading_mode_and_save_unload failed: {e}");
-                    // Fall back to plain exit if save_unload fails
-                    engine.exit_loading_mode();
-                });
+            // No exit_loading_mode needed — single_pass wrote everything to BitmapFs directly.
+            // The process exits after this; the server will restore from disk on next start.
 
             eprintln!(
                 "Bulk load complete: {} records in {:.1}s ({:.0}/s)",
