@@ -53,7 +53,8 @@ const DOC_VERSION_MARKER: u8 = 0x00;
 
 /// Stale tuple percentage threshold for triggering reader-driven compaction.
 /// When stale_count * 100 / total_count exceeds this, a compaction is enqueued.
-const COMPACT_THRESHOLD_PCT: u64 = 30;
+/// Default compaction threshold (percentage). Overridden by Config.compact_threshold_pct.
+const DEFAULT_COMPACT_THRESHOLD_PCT: u64 = 30;
 
 /// A stored document containing all field values.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -85,9 +86,13 @@ pub struct DocStore {
     /// Lazily opened on first append to each shard.
     v2_writers: Arc<DashMap<u32, parking_lot::Mutex<BufWriter<std::fs::File>>>>,
     /// Channel for sending (shard_id, raw_data) to a background compaction worker.
-    /// Set via `set_compact_channel()`. When a reader detects >COMPACT_THRESHOLD_PCT
-    /// stale tuples in a shard, it fire-and-forgets the buffer here.
+    /// Set via `set_compact_channel()`. When a reader detects stale tuples
+    /// exceeding compact_threshold_pct, it fire-and-forgets the buffer here.
     compact_tx: Option<crossbeam_channel::Sender<(u32, Vec<u8>)>>,
+    /// Compaction threshold: percentage of stale tuples that triggers compaction.
+    /// 0 = disabled (no staleness tracking, no compaction worker).
+    /// Default: 30.
+    compact_threshold_pct: u64,
 }
 
 impl DocStore {
@@ -102,6 +107,12 @@ impl DocStore {
 
         let historical_defaults = Self::load_schema_history(path);
 
+        // Clean up orphaned .bin.tmp files from interrupted compactions
+        let shards_dir = path.join("shards");
+        if shards_dir.exists() {
+            Self::cleanup_tmp_files(&shards_dir);
+        }
+
         Ok(Self {
             root: path.to_path_buf(),
             field_to_idx,
@@ -113,6 +124,7 @@ impl DocStore {
             historical_defaults,
             v2_writers: Arc::new(DashMap::new()),
             compact_tx: None,
+            compact_threshold_pct: DEFAULT_COMPACT_THRESHOLD_PCT,
         })
     }
 
@@ -129,6 +141,7 @@ impl DocStore {
             historical_defaults: HashMap::new(),
             v2_writers: Arc::new(DashMap::new()),
             compact_tx: None,
+            compact_threshold_pct: DEFAULT_COMPACT_THRESHOLD_PCT,
         })
     }
 
@@ -147,6 +160,21 @@ impl DocStore {
     /// Shared handle to per-shard V2 writers (DashMap, safe without full DocStore lock).
     pub fn v2_writers_handle(&self) -> Arc<DashMap<u32, parking_lot::Mutex<BufWriter<std::fs::File>>>> {
         Arc::clone(&self.v2_writers)
+    }
+
+    /// Recursively remove orphaned `.bin.tmp` files from a directory tree.
+    /// These are left behind by interrupted compactions (atomic rename failed).
+    fn cleanup_tmp_files(dir: &Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    Self::cleanup_tmp_files(&p);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
     }
 
     // ---- Shard path helpers ----
@@ -917,38 +945,62 @@ impl DocStore {
         Ok(tuples)
     }
 
-    /// Read a single document from V2 shard data.
-    /// Scans tuples LIFO: newest (slot, field) wins.
+    /// Read a single document from V2 shard data — zero-copy scan.
+    ///
+    /// Forward pass builds a lightweight offset index (no value allocations).
+    /// Reverse pass does LIFO dedup and only deserializes values for the target
+    /// slot's fields (~3-20 values instead of all 5-15K tuples in the shard).
+    ///
     /// Returns (doc, total_tuples, unique_tuples) for staleness calculation.
-    /// When compact_tx is None, skips the per-shard staleness counting entirely
-    /// to keep reads at ~4 us (no HashSet allocation overhead).
+    /// When compact_tx is None, skips staleness counting entirely.
     fn get_v2_from_data(&self, data: &[u8], slot_id: u32) -> Result<(Option<StoredDoc>, u64, u64)> {
-        let tuples = Self::parse_v2_tuples(data)?;
-        let total_tuples = tuples.len() as u64;
+        if data.len() < V2_HEADER_SIZE {
+            return Ok((None, 0, 0));
+        }
+
+        // Forward scan: build offset index — (slot, field_idx, value_offset, value_len).
+        // Zero allocations for tuple values — just byte positions.
+        let mut offsets: Vec<(u32, u16, usize, usize)> = Vec::new();
+        let mut pos = V2_HEADER_SIZE;
+        while pos + 8 <= data.len() {
+            let slot = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            let field_idx = u16::from_le_bytes([data[pos + 4], data[pos + 5]]);
+            let value_len = u16::from_le_bytes([data[pos + 6], data[pos + 7]]) as usize;
+            pos += 8;
+            if pos + value_len > data.len() {
+                break; // truncated tuple
+            }
+            offsets.push((slot, field_idx, pos, value_len));
+            pos += value_len;
+        }
+
+        let total_tuples = offsets.len() as u64;
 
         // Only count shard-wide staleness when a compaction worker exists.
-        let track_staleness = self.compact_tx.is_some();
+        let track_staleness = self.compact_tx.is_some() && self.compact_threshold_pct > 0;
         let mut seen_all: Option<std::collections::HashSet<(u32, u16)>> = if track_staleness {
             Some(std::collections::HashSet::new())
         } else {
             None
         };
 
-        // Walk backwards — newest entry for each field wins for target slot.
+        // Reverse scan: LIFO dedup. Only deserialize values for the target slot.
         let mut fields: HashMap<u16, PackedValue> = HashMap::new();
-        for (s, field_idx, value_bytes) in tuples.iter().rev() {
+        for &(slot, field_idx, value_offset, value_len) in offsets.iter().rev() {
             if let Some(ref mut sa) = seen_all {
-                sa.insert((*s, *field_idx));
+                sa.insert((slot, field_idx));
             }
-            if *s != slot_id {
+            if slot != slot_id {
                 continue;
             }
-            if fields.contains_key(field_idx) {
+            if fields.contains_key(&field_idx) {
                 continue; // already have a newer value
             }
-            let pv: PackedValue = rmp_serde::from_slice(&value_bytes)
+            // Only deserialize the target slot's fields — ~3-20 values, not 5-15K
+            let value_bytes = &data[value_offset..value_offset + value_len];
+            let pv: PackedValue = rmp_serde::from_slice(value_bytes)
                 .map_err(|e| BitdexError::DocStore(format!("v2 decode field {field_idx}: {e}")))?;
-            fields.insert(*field_idx, pv);
+            fields.insert(field_idx, pv);
         }
         let unique_tuples = seen_all.map_or(total_tuples, |sa| sa.len() as u64);
 
@@ -969,11 +1021,11 @@ impl DocStore {
 
     /// Try to enqueue a shard for background compaction if staleness exceeds threshold.
     fn maybe_enqueue_compact(&self, shard_id: u32, data: Vec<u8>, total: u64, unique: u64) {
-        if total == 0 || unique == total {
-            return; // nothing stale
+        if self.compact_threshold_pct == 0 || total == 0 || unique == total {
+            return;
         }
         let stale = total - unique;
-        if stale * 100 / total > COMPACT_THRESHOLD_PCT {
+        if stale * 100 / total > self.compact_threshold_pct {
             if let Some(ref tx) = self.compact_tx {
                 // Fire-and-forget: if the channel is full, skip this compaction.
                 let _ = tx.try_send((shard_id, data));
@@ -1084,6 +1136,11 @@ impl DocStore {
     /// the shard buffer over this channel.
     pub fn set_compact_channel(&mut self, tx: crossbeam_channel::Sender<(u32, Vec<u8>)>) {
         self.compact_tx = Some(tx);
+    }
+
+    /// Set the compaction threshold percentage. 0 = disabled.
+    pub fn set_compact_threshold(&mut self, pct: u64) {
+        self.compact_threshold_pct = pct;
     }
 
     /// Prepare for bulk loading: ensure field dictionary contains all field names,
@@ -2530,7 +2587,7 @@ mod tests {
 
         // stale = 3 - 1 = 2, pct = 2*100/3 = 66 > 30 → would trigger compaction
         let stale = total - unique;
-        assert!(stale * 100 / total > COMPACT_THRESHOLD_PCT);
+        assert!(stale * 100 / total > DEFAULT_COMPACT_THRESHOLD_PCT);
     }
 
     #[test]

@@ -594,23 +594,22 @@ impl ConcurrentEngine {
         let (doc_tx, doc_rx): (Sender<(u32, StoredDoc)>, Receiver<(u32, StoredDoc)>) =
             crossbeam_channel::bounded(config.channel_capacity);
 
-        // Compaction channel: readers fire-and-forget stale shard buffers here.
-        // Bounded(32) provides backpressure — if the worker is behind, shards are skipped.
-        let (compact_tx, compact_rx): (Sender<(u32, Vec<u8>)>, Receiver<(u32, Vec<u8>)>) =
-            crossbeam_channel::bounded(32);
-        docstore.set_compact_channel(compact_tx.clone());
+        // Compaction channel + worker: only created when threshold > 0.
+        // When threshold is 0, no staleness tracking on reads, no worker thread.
+        docstore.set_compact_threshold(config.compact_threshold_pct);
+        let (compact_tx, compact_handle) = if config.compact_threshold_pct > 0 {
+            let (tx, compact_rx): (Sender<(u32, Vec<u8>)>, Receiver<(u32, Vec<u8>)>) =
+                crossbeam_channel::bounded(32);
+            docstore.set_compact_channel(tx.clone());
 
-        // Extract root and v2_writers BEFORE wrapping docstore in Mutex.
-        // The compaction worker uses these directly — no full DocStore lock needed.
-        let compact_root = docstore.root().to_path_buf();
-        let compact_v2_writers = docstore.v2_writers_handle();
+            // Extract root and v2_writers BEFORE wrapping docstore in Mutex.
+            // The compaction worker uses these directly — no full DocStore lock needed.
+            let compact_root = docstore.root().to_path_buf();
+            let compact_v2_writers = docstore.v2_writers_handle();
 
-        let docstore = Arc::new(parking_lot::Mutex::new(docstore));
-
-        // Spawn compaction worker thread. Uses the standalone compact_shard_from_buffer
-        // with pre-extracted root/v2_writers — never holds the DocStore mutex during I/O.
-        let compact_handle = {
-            thread::spawn(move || {
+            // Spawn compaction worker thread. Uses the standalone compact_shard_from_buffer
+            // with pre-extracted root/v2_writers — never holds the DocStore mutex during I/O.
+            let handle = thread::spawn(move || {
                 while let Ok((shard_id, data)) = compact_rx.recv() {
                     let start = std::time::Instant::now();
                     if let Err(e) = crate::docstore::compact_shard_from_buffer(
@@ -625,8 +624,13 @@ impl ConcurrentEngine {
                         // Metrics are recorded by the server layer if available
                     }
                 }
-            })
+            });
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
         };
+
+        let docstore = Arc::new(parking_lot::Mutex::new(docstore));
 
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
@@ -1801,8 +1805,8 @@ impl ConcurrentEngine {
             boundstore_bytes_read,
             boundstore_entries_restored,
             boundstore_entries_skipped,
-            compact_tx: Some(compact_tx),
-            compact_handle: Some(compact_handle),
+            compact_tx,
+            compact_handle,
         })
     }
 
