@@ -242,6 +242,11 @@ pub struct ConcurrentEngine {
     boundstore_entries_restored: Arc<AtomicU64>,
     /// Cumulative entries skipped (tombstoned + orphan) during shard load.
     boundstore_entries_skipped: Arc<AtomicU64>,
+    /// Compaction channel sender — held here so we can drop it in shutdown()
+    /// to signal the compact worker to exit.
+    compact_tx: Option<Sender<(u32, Vec<u8>)>>,
+    /// Background compaction worker thread handle.
+    compact_handle: Option<JoinHandle<()>>,
 }
 
 impl ConcurrentEngine {
@@ -259,7 +264,7 @@ impl ConcurrentEngine {
         Self::build(config, docstore)
     }
 
-    fn build(config: Config, docstore: DocStore) -> Result<Self> {
+    fn build(config: Config, mut docstore: DocStore) -> Result<Self> {
         let mut filters = crate::filter::FilterIndex::new();
         let mut sorts = crate::sort::SortIndex::new();
 
@@ -595,6 +600,42 @@ impl ConcurrentEngine {
         // Docstore write channel — bounded for backpressure
         let (doc_tx, doc_rx): (Sender<(u32, StoredDoc)>, Receiver<(u32, StoredDoc)>) =
             crossbeam_channel::bounded(config.channel_capacity);
+
+        // Compaction channel + worker: only created when threshold > 0.
+        // When threshold is 0, no staleness tracking on reads, no worker thread.
+        docstore.set_compact_threshold(config.compact_threshold_pct);
+        let (compact_tx, compact_handle) = if config.compact_threshold_pct > 0 {
+            let (tx, compact_rx): (Sender<(u32, Vec<u8>)>, Receiver<(u32, Vec<u8>)>) =
+                crossbeam_channel::bounded(32);
+            docstore.set_compact_channel(tx.clone());
+
+            // Extract root and v2_writers BEFORE wrapping docstore in Mutex.
+            // The compaction worker uses these directly — no full DocStore lock needed.
+            let compact_root = docstore.root().to_path_buf();
+            let compact_v2_writers = docstore.v2_writers_handle();
+
+            // Spawn compaction worker thread. Uses the standalone compact_shard_from_buffer
+            // with pre-extracted root/v2_writers — never holds the DocStore mutex during I/O.
+            let handle = thread::spawn(move || {
+                while let Ok((shard_id, data)) = compact_rx.recv() {
+                    let start = std::time::Instant::now();
+                    if let Err(e) = crate::docstore::compact_shard_from_buffer(
+                        shard_id,
+                        &data,
+                        &compact_root,
+                        &compact_v2_writers,
+                    ) {
+                        eprintln!("Compaction worker: shard {shard_id} failed: {e}");
+                    } else {
+                        let _elapsed = start.elapsed();
+                        // Metrics are recorded by the server layer if available
+                    }
+                }
+            });
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
 
         let docstore = Arc::new(parking_lot::Mutex::new(docstore));
 
@@ -1819,6 +1860,8 @@ impl ConcurrentEngine {
             boundstore_bytes_read,
             boundstore_entries_restored,
             boundstore_entries_skipped,
+            compact_tx,
+            compact_handle,
         })
     }
 
@@ -5777,13 +5820,19 @@ impl ConcurrentEngine {
         Ok(removed)
     }
 
-    /// Shutdown the flush and merge threads gracefully.
+    /// Shutdown the flush, merge, and compaction threads gracefully.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.flush_handle.take() {
             handle.join().ok();
         }
         if let Some(handle) = self.merge_handle.take() {
+            handle.join().ok();
+        }
+        // Drop the compact_tx sender to signal the compact worker to exit,
+        // then join it. Must drop before join to avoid deadlock.
+        drop(self.compact_tx.take());
+        if let Some(handle) = self.compact_handle.take() {
             handle.join().ok();
         }
     }
@@ -6839,7 +6888,7 @@ mod tests {
     #[test]
     fn test_put_bulk_persists_to_docstore() {
         // Verify that put_bulk() persists docs so subsequent put() upserts can diff correctly.
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
 
         let docs: Vec<(u32, Document)> = vec![
             (1, make_doc(vec![
@@ -6888,6 +6937,8 @@ mod tests {
             None, 10,
         ).unwrap();
         assert_eq!(result.ids, vec![1]);
+
+        engine.shutdown();
     }
 
     #[test]
@@ -8105,5 +8156,56 @@ mod tests {
 
             engine.shutdown();
         }
+    }
+
+    #[test]
+    fn test_compaction_worker_e2e() {
+        use crate::docstore::{DocStore, PackedValue};
+
+        // Use an on-disk docstore so V2 tuples and compaction can run.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut engine = ConcurrentEngine::new_with_path(test_config(), &docs_dir).unwrap();
+
+        // Write V2 tuples directly to the docstore to create stale data.
+        // Use field_idx=0 — the field won't resolve to a name, but that's fine
+        // for testing compaction (which operates on raw tuples).
+        let field_idx: u16 = 0;
+        {
+            let ds = engine.docstore.lock();
+
+            // Write 10 versions of the same (slot=0, field=0) tuple — 90% stale
+            for v in 0..10i64 {
+                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
+                ds.append_tuple(0, field_idx, &packed).unwrap();
+            }
+            // Close buffered writers so data is fully on disk
+            ds.v2_writers_handle().clear();
+        }
+
+        // Record shard file size before compaction
+        let shard_id = DocStore::shard_id(0);
+        let shard_path = DocStore::shard_path(&docs_dir, shard_id);
+        let size_before = std::fs::metadata(&shard_path).unwrap().len();
+
+        // Read via get_v2 — this triggers compaction enqueue (>30% stale).
+        // The doc may come back empty (no field name in dict), but the read
+        // still scans all tuples and detects staleness.
+        {
+            let ds = engine.docstore.lock();
+            let _doc = ds.get_v2(0).unwrap();
+        }
+
+        // Wait for the background compaction worker to process the shard
+        thread::sleep(Duration::from_millis(100));
+
+        // Verify shard file shrank — proving the compaction worker ran
+        let size_after = std::fs::metadata(&shard_path).unwrap().len();
+        assert!(
+            size_after < size_before,
+            "compacted shard ({size_after}) should be smaller than original ({size_before})"
+        );
+
+        engine.shutdown();
     }
 }
