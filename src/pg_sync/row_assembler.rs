@@ -87,10 +87,12 @@ pub fn assemble_document(image: &ImageRow, enrichment: &EnrichmentData) -> Value
 
     // Compute timestamp milliseconds for doc-only fields
     let sort_at_unix_ms = image.sort_at.map(|dt| dt.timestamp_millis()).unwrap_or(0);
-    let published_at_unix_ms = image
+    // publishedAtUnix must be null (not 0) when unpublished — the exists_boolean
+    // mapping sets isPublished=true for any non-null value including 0.
+    let published_at_unix_ms: Option<i64> = image
         .published_at
         .map(|dt| dt.timestamp_millis())
-        .unwrap_or(0);
+        .filter(|&ms| ms > 0);
     let existed_at_unix_ms = image
         .created_at
         .map(|dt| dt.timestamp_millis())
@@ -132,11 +134,10 @@ pub fn assemble_document(image: &ImageRow, enrichment: &EnrichmentData) -> Value
         .and_then(|r| r.base_model.clone())
         .unwrap_or_default();
 
-    // Metrics (may be empty if not enriched yet)
+    // Metrics: only include when enriched from ClickHouse. Omitting them
+    // prevents the outbox poller from zeroing out bulk-loaded metrics.
+    // The metrics_poller handles metric updates separately.
     let metrics = enrichment.metrics.get(&id);
-    let reaction_count = metrics.map_or(0, |m| m.reaction_count);
-    let comment_count = metrics.map_or(0, |m| m.comment_count);
-    let collected_count = metrics.map_or(0, |m| m.collected_count);
 
     let mut doc = json!({
         "id": id,
@@ -154,9 +155,6 @@ pub fn assemble_document(image: &ImageRow, enrichment: &EnrichmentData) -> Value
         "modelVersionIdsManual": model_version_ids_manual,
         "toolIds": tool_ids,
         "techniqueIds": technique_ids,
-        "reactionCount": reaction_count,
-        "commentCount": comment_count,
-        "collectedCount": collected_count,
         "sortAt": sort_at_secs,
         "sortAtUnix": sort_at_unix_ms,
         "publishedAtUnix": published_at_unix_ms,
@@ -164,6 +162,15 @@ pub fn assemble_document(image: &ImageRow, enrichment: &EnrichmentData) -> Value
         "url": image.url.as_deref(),
         "hash": image.hash.as_deref(),
     });
+
+    // Only include metrics when we have real data from ClickHouse
+    if let Some(m) = metrics {
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("reactionCount".into(), json!(m.reaction_count));
+            obj.insert("commentCount".into(), json!(m.comment_count));
+            obj.insert("collectedCount".into(), json!(m.collected_count));
+        }
+    }
 
     // Exists-boolean fields: only set when true
     if let Some(obj) = doc.as_object_mut() {
