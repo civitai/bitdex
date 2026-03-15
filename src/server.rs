@@ -1407,7 +1407,13 @@ async fn handle_query(
                         Ok(Some(stored)) => {
                             format_document(&stored, &schema, &reverse_maps, &include_docs, &schema_registry)
                         }
-                        _ => serde_json::json!({ "id": id }),
+                        Ok(None) => {
+                            serde_json::json!({ "id": id })
+                        }
+                        Err(e) => {
+                            tracing::warn!("doc read error for slot {}: {e}", id);
+                            serde_json::json!({ "id": id })
+                        }
                     });
                 }
                 Some(docs)
