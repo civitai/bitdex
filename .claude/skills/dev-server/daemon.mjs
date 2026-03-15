@@ -242,6 +242,7 @@ async function waitForHealthAndUpdate(instance, port, dataDir, id) {
             indexName: instance.dataset,
             recordCount: instance.recordCount,
             ownedBy: id,
+            skipDiskSize: true,
           });
         }
       }
@@ -674,7 +675,7 @@ function releaseE2eLock() {
 async function pollInstanceStats(instance) {
   if (instance.status !== 'running' || !instance.dataset) return;
   try {
-    const res = await fetch(`http://127.0.0.1:${instance.port}/api/indexes/${instance.dataset}/stats`);
+    const res = await fetch(`http://127.0.0.1:${instance.port}/api/indexes/${instance.dataset}/stats`, { signal: AbortSignal.timeout(5000) });
     if (res.ok) {
       const stats = await res.json();
       instance.stats = {

@@ -61,7 +61,15 @@ Builds run through the daemon, not directly via cargo:
 - `event: status` — full status JSON, sent on connect + every heartbeat (10s)
 - `event: log` — individual log entry with `instanceId`, sent instantly as logs arrive
 
-The TUI connects via SSE instead of polling. Logs appear in real-time.
+The TUI connects via SSE instead of polling. Logs appear in real-time. Render is throttled to ~10fps via a dirty flag + timer to prevent input lag under high event load. During text input mode, only the input line is redrawn.
+
+Agents can consume the SSE stream programmatically via the `follow` command:
+
+```bash
+node .claude/skills/dev-server/cli.mjs follow              # All events as JSON lines
+node .claude/skills/dev-server/cli.mjs follow --type log    # Logs only
+node .claude/skills/dev-server/cli.mjs follow srv-3001      # Filter by instance
+```
 
 ### HTTP Endpoints
 

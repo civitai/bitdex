@@ -26,8 +26,11 @@
 import { spawn, execSync } from 'node:child_process';
 import { resolve, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { appendFileSync } from 'node:fs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const DEBUG_LOG = resolve(__dirname, 'debug.log');
+function dbg(msg) { try { appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {} }
 const DAEMON_SCRIPT = resolve(__dirname, 'daemon.mjs');
 const PROJECT_ROOT = resolve(__dirname, '..', '..', '..');
 const DAEMON_URL = 'http://127.0.0.1:9851';
@@ -499,9 +502,9 @@ const LOG_FORMATTERS = [
     match: /^Restored index '([^']+)' from disk \((\d+) records\)$/,
     format: (m, w) => `${GRN}✓${R} Restored ${WHT}${m[1]}${R} — ${CYN}${(parseInt(m[2])/1e6).toFixed(1)}M${R} records`,
   },
-  // Server listening: "BitDex server listening on http://..."
+  // Server listening: "BitDex server listening on http://..." (may be truncated)
   {
-    match: /^BitDex server listening on (.+)$/,
+    match: /^BitDex server listening on (.+)/,
     format: (m, w) => `${GRN}✓${R} Listening on ${CYN}${m[1]}${R}`,
   },
   // Existence set: "Existence set for 'modelVersionIds': 477324 keys"
@@ -509,16 +512,44 @@ const LOG_FORMATTERS = [
     match: /^Existence set for '([^']+)':\s*(\d+)\s*keys$/,
     format: (m, w) => `${DIM}existence${R} ${BLU}${m[1]}${R} ${DIM}${parseInt(m[2]).toLocaleString()} keys${R}`,
   },
+  // Eager-loaded filter/sort: "Eager-loaded filter 'baseModel': 981 values in 109.7ms"
+  {
+    match: /^Eager-loaded\s+(filter|sort)\s+'([^']+)':\s*(\d+)\s*(values|layers)\s+in\s+(.+)$/,
+    format: (m, w) => `${DIM}eager${R} ${BLU}${m[2]}${R} ${DIM}(${m[1]})${R} ${m[3]} ${m[4]} ${DIM}in${R} ${CYN}${m[5]}${R}`,
+  },
+  // Eager loading complete: "Eager loading complete: 8 fields in 1567.2ms"
+  {
+    match: /^Eager loading complete:\s*(.+)$/,
+    format: (m, w) => `${GRN}✓${R} Eager load complete: ${CYN}${m[1]}${R}`,
+  },
+  // BoundStore: "BoundStore: loaded meta.bin (4 entries, 2 tombstones, next_id=9)"
+  {
+    match: /^BoundStore:\s*(.+)$/,
+    format: (m, w) => `${DIM}cache${R} ${m[1]}`,
+  },
 ];
 
 function formatLogBody(body, maxW) {
-  // Truncate plain text FIRST, then apply formatting — this keeps ANSI sequences intact
-  const truncated = body.length > maxW ? body.slice(0, maxW) : body;
+  // Match on full body first, then truncate the formatted result
   for (const fmt of LOG_FORMATTERS) {
-    const m = truncated.match(fmt.match);
-    if (m) return fmt.format(m, maxW);
+    const m = body.match(fmt.match);
+    if (m) {
+      const formatted = fmt.format(m, maxW);
+      // Truncate by visible length (strip ANSI for counting)
+      const vis = formatted.replace(/\x1b\[[0-9;]*m/g, '');
+      if (vis.length > maxW) {
+        // Find the cut point accounting for ANSI codes
+        let visLen = 0, i = 0;
+        while (i < formatted.length && visLen < maxW) {
+          if (formatted[i] === '\x1b') { while (i < formatted.length && formatted[i] !== 'm') i++; i++; }
+          else { visLen++; i++; }
+        }
+        return formatted.slice(0, i) + R;
+      }
+      return formatted;
+    }
   }
-  return truncated;
+  return body.length > maxW ? body.slice(0, maxW) : body;
 }
 
 function trunc(str, n) {
@@ -555,8 +586,24 @@ async function cmdDashboard() {
   let explainTraces = [];   // array of fetched traces
   let explainIdx = 0;       // current index in explainTraces
   let explainMode = false;  // when true, logs are paused and arrow keys navigate traces
+  let renderDirty = false;  // SSE events set this; timer reads+clears it
 
-  function flash(msg) { actionMsg = msg; setTimeout(() => { actionMsg = ''; }, 4000); }
+  function flash(msg) { actionMsg = msg; renderDirty = true; setTimeout(() => { actionMsg = ''; renderDirty = true; }, 4000); }
+
+  // Throttled render: ~4fps max. During inputMode, skip full renders entirely.
+  let rendering = false;
+  const renderTimer = setInterval(() => {
+    if (!renderDirty || !lastStatus || rendering) return;
+    renderDirty = false;
+    if (inputMode) {
+      // Only redraw the input prompt line — no full screen render
+      write(`\x1b[${rows};1H` + CLR_LINE + `  ${inputMode.prompt}${inputMode.buffer}█`);
+      return;
+    }
+    rendering = true;
+    render(lastStatus);
+    rendering = false;
+  }, 250);
 
   function render(status) {
     const buf = [];
@@ -729,12 +776,16 @@ async function cmdDashboard() {
       buf.push(CLR_LINE + `  ${DIM}↑↓${R} scroll  ${DIM}1-9${R} select  ${B}i${R}${DIM}nfo${R}  ${B}e${R}${DIM}xplain${R}  ${B}b${R}${DIM}uild${R}  ${B}n${R}${DIM}ew${R}  ${B}s${R}${DIM}top${R}  ${B}r${R}${DIM}estart${R}  ${B}k${R}${DIM}ill${R}  ${B}K${R}${DIM}ill force${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
     }
 
+    // Single buffered write — cork/uncork to minimize terminal I/O
+    if (process.stdout.cork) process.stdout.cork();
     write(buf.join(''));
+    if (process.stdout.uncork) process.stdout.uncork();
   }
 
   // Keyboard handler
   process.stdin.on('data', async (key) => {
     if (!running) return;
+    dbg(`KEY: ${JSON.stringify(key)} at ${Date.now()}`);
 
     // Input mode: collecting a text value (e.g. data-dir path)
     if (inputMode) {
@@ -761,6 +812,8 @@ async function cmdDashboard() {
         inputMode.buffer += key;
       }
       actionMsg = `${inputMode.prompt}${inputMode.buffer}█`;
+      // Immediately draw the input line — don't wait for render timer
+      write(`\x1b[${rows};1H` + CLR_LINE + `  ${actionMsg}`);
       return;
     }
 
@@ -804,6 +857,8 @@ async function cmdDashboard() {
 
     if (key === 'q' || key === '\x03') {
       running = false;
+      clearInterval(renderTimer);
+      try { sseAbort.abort(); } catch {}
       write(CUR_SHOW + ALT_OFF);
       process.stdin.setRawMode(false);
       process.exit(0);
@@ -928,38 +983,55 @@ async function cmdDashboard() {
 
   // SSE event stream — replaces polling loop
   let lastStatus = null;
+  let sseAbort = new AbortController();
 
   async function connectSSE() {
     try {
-      const res = await fetch(`${DAEMON_URL}/events`);
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
+      // Use http.get instead of fetch — fetch's stream reader can starve stdin on Windows
+      const http = await import('node:http');
+      await new Promise((resolve, reject) => {
+        const req = http.get(`${DAEMON_URL}/events`, (res) => {
+          let buffer = '';
+          res.setEncoding('utf8');
 
-      while (running) {
-        const { done, value } = await reader.read();
-        if (done) break;
+          res.on('data', (chunk) => {
+            if (!running) return;
+            buffer += chunk;
+            const events = buffer.split('\n\n');
+            buffer = events.pop();
 
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split('\n\n');
-        buffer = events.pop(); // keep incomplete event
+            for (const raw of events) {
+              if (!raw.trim()) continue;
+              let eventType = 'message';
+              let data = '';
+              for (const line of raw.split('\n')) {
+                if (line.startsWith('event: ')) eventType = line.slice(7);
+                else if (line.startsWith('data: ')) data = line.slice(6);
+              }
+              if (!data) continue;
 
-        for (const raw of events) {
-          if (!raw.trim()) continue;
-          let eventType = 'message';
-          let data = '';
-          for (const line of raw.split('\n')) {
-            if (line.startsWith('event: ')) eventType = line.slice(7);
-            else if (line.startsWith('data: ')) data = line.slice(6);
-          }
-          if (!data) continue;
-
-          try {
-            const parsed = JSON.parse(data);
+              try {
+                const parsed = JSON.parse(data);
 
             if (eventType === 'status') {
               lastStatus = parsed;
-              if (!explainMode) render(lastStatus);
+              // Backfill logs on first status event if log panel is empty (fire-and-forget)
+              if (logLines.length === 0 && parsed.instances?.length > 0) {
+                const target = selectedInstance || parsed.instances[0]?.id;
+                if (target) {
+                  const logRows = Math.max(10, rows - 15);
+                  daemonFetch(`/instances/${target}/logs?tail=${logRows}`).then(resp => {
+                    const backfill = resp.logs || resp;
+                    if (Array.isArray(backfill) && backfill.length > 0) {
+                      logLines = backfill;
+                      logCursor = backfill[backfill.length - 1].index;
+                      lastLogTarget = target;
+                      renderDirty = true;
+                    }
+                  }).catch(() => {});
+                }
+              }
+              if (!explainMode) renderDirty = true;
             } else if (eventType === 'log') {
               // Log event from daemon — add to logLines if it's our target instance
               const logTarget = selectedInstance || (lastStatus?.instances?.[0]?.id) || null;
@@ -967,17 +1039,25 @@ async function cmdDashboard() {
                 logLines.push(parsed);
                 logCursor = parsed.index;
                 if (logLines.length > 500) logLines = logLines.slice(-300);
-                if (lastStatus) render(lastStatus);
+                renderDirty = true;
               }
             }
           } catch { /* malformed event */ }
         }
-      }
+          });
+
+          res.on('end', () => { resolve(); });
+          res.on('error', (e) => { reject(e); });
+        });
+
+        req.on('error', (e) => { reject(e); });
+        sseAbort.signal.addEventListener('abort', () => { req.destroy(); resolve(); });
+      });
     } catch {
-      // SSE connection failed — fall back to single render with error
-      write(HOME + CLR_LINE + `${RED}Daemon not responding — reconnecting...${R}` + CLR_BELOW);
-      await sleep(2000);
-      if (running) connectSSE(); // auto-reconnect
+      if (!running) return;
+      write(HOME + CLR_LINE + `${YLW} Daemon not responding — reconnecting...${R}` + CLR_BELOW);
+      await sleep(1000);
+      if (running) connectSSE();
     }
   }
 
