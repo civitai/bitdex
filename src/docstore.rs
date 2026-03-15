@@ -512,6 +512,9 @@ impl DocStore {
 
     /// Read and decompress a shard file, returning (index_entries, decompressed_data).
     pub(crate) fn read_shard_file(data: &[u8]) -> Result<(Vec<(u32, u32, u32)>, Vec<u8>)> {
+        if Self::is_v2_shard(data) {
+            return Err(BitdexError::DocStore("cannot read V2 shard with V1 reader — use get_v2 instead".into()));
+        }
         let entries = Self::read_shard_index(data)?;
         let index_end = Self::data_section_offset(entries.len());
 
@@ -1176,6 +1179,12 @@ impl DocStore {
     /// the shard buffer over this channel.
     pub fn set_compact_channel(&mut self, tx: crossbeam_channel::Sender<(u32, Vec<u8>)>) {
         self.compact_tx = Some(tx);
+    }
+
+    /// Clear the compact channel sender. Called during engine shutdown so the
+    /// compact worker's recv() returns Err and the thread can exit.
+    pub fn clear_compact_channel(&mut self) {
+        self.compact_tx = None;
     }
 
     /// Set the compaction threshold percentage. 0 = disabled.

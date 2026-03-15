@@ -1495,7 +1495,7 @@ impl ConcurrentEngine {
                     let doc_count = doc_batch.len();
                     if doc_count > 0 {
                         if let Err(e) = docstore.lock().put_batch(&doc_batch) {
-                            panic!("docstore batch write failed: {e}");
+                            eprintln!("WARNING: docstore batch write failed (skipping {} docs): {e}", doc_batch.len());
                         }
                     }
 
@@ -6046,9 +6046,11 @@ impl ConcurrentEngine {
         if let Some(handle) = self.merge_handle.take() {
             handle.join().ok();
         }
-        // Drop the compact_tx sender to signal the compact worker to exit,
-        // then join it. Must drop before join to avoid deadlock.
+        // Drop ALL compact_tx senders to signal the compact worker to exit.
+        // The docstore also holds a clone — must clear it too or recv() never
+        // returns Err and the worker hangs forever.
         drop(self.compact_tx.take());
+        self.docstore.lock().clear_compact_channel();
         if let Some(handle) = self.compact_handle.take() {
             handle.join().ok();
         }
