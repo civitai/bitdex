@@ -242,6 +242,11 @@ pub struct ConcurrentEngine {
     boundstore_entries_restored: Arc<AtomicU64>,
     /// Cumulative entries skipped (tombstoned + orphan) during shard load.
     boundstore_entries_skipped: Arc<AtomicU64>,
+    /// Compaction channel sender — held here so we can drop it in shutdown()
+    /// to signal the compact worker to exit.
+    compact_tx: Option<Sender<(u32, Vec<u8>)>>,
+    /// Background compaction worker thread handle.
+    compact_handle: Option<JoinHandle<()>>,
 }
 
 impl ConcurrentEngine {
@@ -259,7 +264,7 @@ impl ConcurrentEngine {
         Self::build(config, docstore)
     }
 
-    fn build(config: Config, docstore: DocStore) -> Result<Self> {
+    fn build(config: Config, mut docstore: DocStore) -> Result<Self> {
         let mut filters = crate::filter::FilterIndex::new();
         let mut sorts = crate::sort::SortIndex::new();
 
@@ -589,7 +594,27 @@ impl ConcurrentEngine {
         let (doc_tx, doc_rx): (Sender<(u32, StoredDoc)>, Receiver<(u32, StoredDoc)>) =
             crossbeam_channel::bounded(config.channel_capacity);
 
+        // Compaction channel: readers fire-and-forget stale shard buffers here.
+        // Bounded(32) provides backpressure — if the worker is behind, shards are skipped.
+        let (compact_tx, compact_rx): (Sender<(u32, Vec<u8>)>, Receiver<(u32, Vec<u8>)>) =
+            crossbeam_channel::bounded(32);
+        docstore.set_compact_channel(compact_tx.clone());
+
         let docstore = Arc::new(parking_lot::Mutex::new(docstore));
+
+        // Spawn compaction worker thread. Loops on compact_rx, compacting each
+        // shard from the pre-loaded buffer. Exits when the sender is dropped.
+        let compact_handle = {
+            let docstore = Arc::clone(&docstore);
+            thread::spawn(move || {
+                while let Ok((shard_id, data)) = compact_rx.recv() {
+                    let ds = docstore.lock();
+                    if let Err(e) = ds.compact_shard_from_buffer(shard_id, &data) {
+                        eprintln!("Compaction worker: shard {shard_id} failed: {e}");
+                    }
+                }
+            })
+        };
 
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
@@ -1764,6 +1789,8 @@ impl ConcurrentEngine {
             boundstore_bytes_read,
             boundstore_entries_restored,
             boundstore_entries_skipped,
+            compact_tx: Some(compact_tx),
+            compact_handle: Some(compact_handle),
         })
     }
 
@@ -5720,13 +5747,19 @@ impl ConcurrentEngine {
         Ok(removed)
     }
 
-    /// Shutdown the flush and merge threads gracefully.
+    /// Shutdown the flush, merge, and compaction threads gracefully.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = self.flush_handle.take() {
             handle.join().ok();
         }
         if let Some(handle) = self.merge_handle.take() {
+            handle.join().ok();
+        }
+        // Drop the compact_tx sender to signal the compact worker to exit,
+        // then join it. Must drop before join to avoid deadlock.
+        drop(self.compact_tx.take());
+        if let Some(handle) = self.compact_handle.take() {
             handle.join().ok();
         }
     }

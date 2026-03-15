@@ -51,6 +51,10 @@ const V2_HEADER_SIZE: usize = 16;
 /// Chosen as 0x00 because msgpack arrays (our doc format) always start at 0x90+.
 const DOC_VERSION_MARKER: u8 = 0x00;
 
+/// Stale tuple percentage threshold for triggering reader-driven compaction.
+/// When stale_count * 100 / total_count exceeds this, a compaction is enqueued.
+const COMPACT_THRESHOLD_PCT: u64 = 30;
+
 /// A stored document containing all field values.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredDoc {
@@ -80,6 +84,10 @@ pub struct DocStore {
     /// Per-shard buffered writers for V2 append-only tuple format.
     /// Lazily opened on first append to each shard.
     v2_writers: Arc<DashMap<u32, parking_lot::Mutex<BufWriter<std::fs::File>>>>,
+    /// Channel for sending (shard_id, raw_data) to a background compaction worker.
+    /// Set via `set_compact_channel()`. When a reader detects >COMPACT_THRESHOLD_PCT
+    /// stale tuples in a shard, it fire-and-forgets the buffer here.
+    compact_tx: Option<crossbeam_channel::Sender<(u32, Vec<u8>)>>,
 }
 
 impl DocStore {
@@ -104,6 +112,7 @@ impl DocStore {
             schema_version: 1,
             historical_defaults,
             v2_writers: Arc::new(DashMap::new()),
+            compact_tx: None,
         })
     }
 
@@ -119,6 +128,7 @@ impl DocStore {
             schema_version: 1,
             historical_defaults: HashMap::new(),
             v2_writers: Arc::new(DashMap::new()),
+            compact_tx: None,
         })
     }
 
@@ -582,7 +592,10 @@ impl DocStore {
             Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
         };
         if Self::is_v2_shard(&data) {
-            self.get_v2_from_data(&data, id)
+            let shard_id = Self::shard_id(id);
+            let (doc, total, unique) = self.get_v2_from_data(&data, id)?;
+            self.maybe_enqueue_compact(shard_id, data, total, unique);
+            Ok(doc)
         } else {
             match Self::find_in_shard(&data, id)? {
                 Some(compressed) => Ok(Some(self.decode_doc(&compressed)?)),
@@ -894,23 +907,28 @@ impl DocStore {
 
     /// Read a single document from V2 shard data.
     /// Scans tuples LIFO: newest (slot, field) wins.
-    fn get_v2_from_data(&self, data: &[u8], slot_id: u32) -> Result<Option<StoredDoc>> {
+    /// Returns (doc, total_tuples, unique_tuples) for staleness calculation.
+    fn get_v2_from_data(&self, data: &[u8], slot_id: u32) -> Result<(Option<StoredDoc>, u64, u64)> {
         let tuples = Self::parse_v2_tuples(data)?;
-        // Walk backwards — newest entry for each field wins
+        let total_tuples = tuples.len() as u64;
+
+        // Walk backwards — newest entry for each (slot, field) wins.
+        // Count unique pairs across all slots for staleness detection.
+        let mut seen_all = std::collections::HashSet::new();
         let mut fields: HashMap<u16, PackedValue> = HashMap::new();
         for (s, field_idx, value_bytes) in tuples.iter().rev() {
-            if *s != slot_id {
+            let is_new = seen_all.insert((*s, *field_idx));
+            if *s != slot_id || !is_new {
                 continue;
-            }
-            if fields.contains_key(field_idx) {
-                continue; // already have a newer value
             }
             let pv: PackedValue = rmp_serde::from_slice(&value_bytes)
                 .map_err(|e| BitdexError::DocStore(format!("v2 decode field {field_idx}: {e}")))?;
             fields.insert(*field_idx, pv);
         }
+        let unique_tuples = seen_all.len() as u64;
+
         if fields.is_empty() {
-            return Ok(None);
+            return Ok((None, total_tuples, unique_tuples));
         }
         let mut doc_fields = HashMap::with_capacity(fields.len());
         for (idx, pv) in fields {
@@ -918,10 +936,24 @@ impl DocStore {
                 doc_fields.insert(name.clone(), unpack_field_value(pv));
             }
         }
-        Ok(Some(StoredDoc {
+        Ok((Some(StoredDoc {
             fields: doc_fields,
             schema_version: 0,
-        }))
+        }), total_tuples, unique_tuples))
+    }
+
+    /// Try to enqueue a shard for background compaction if staleness exceeds threshold.
+    fn maybe_enqueue_compact(&self, shard_id: u32, data: Vec<u8>, total: u64, unique: u64) {
+        if total == 0 || unique == total {
+            return; // nothing stale
+        }
+        let stale = total - unique;
+        if stale * 100 / total > COMPACT_THRESHOLD_PCT {
+            if let Some(ref tx) = self.compact_tx {
+                // Fire-and-forget: if the channel is full, skip this compaction.
+                let _ = tx.try_send((shard_id, data));
+            }
+        }
     }
 
     /// Get a stored document from a V2 shard by slot ID.
@@ -929,7 +961,8 @@ impl DocStore {
         if self.in_memory {
             return self.get(slot_id);
         }
-        let path = Self::shard_path(&self.root, Self::shard_id(slot_id));
+        let shard_id = Self::shard_id(slot_id);
+        let path = Self::shard_path(&self.root, shard_id);
         let data = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -938,7 +971,9 @@ impl DocStore {
         if !Self::is_v2_shard(&data) {
             return Err(BitdexError::DocStore("shard is not v2 format".into()));
         }
-        self.get_v2_from_data(&data, slot_id)
+        let (doc, total, unique) = self.get_v2_from_data(&data, slot_id)?;
+        self.maybe_enqueue_compact(shard_id, data, total, unique);
+        Ok(doc)
     }
 
     /// Get or create a buffered writer for a V2 shard.
@@ -1018,7 +1053,33 @@ impl DocStore {
             return Err(BitdexError::DocStore("compact_shard: not a v2 shard".into()));
         }
         let tuples = Self::parse_v2_tuples(&data)?;
+        Self::write_compacted_shard(&self.root, shard_id, tuples, &self.v2_writers)
+    }
 
+    /// Set the compaction channel. Called by ConcurrentEngine after spawning the
+    /// compaction worker thread. Readers that detect stale shards will fire-and-forget
+    /// the shard buffer over this channel.
+    pub fn set_compact_channel(&mut self, tx: crossbeam_channel::Sender<(u32, Vec<u8>)>) {
+        self.compact_tx = Some(tx);
+    }
+
+    /// Compact a V2 shard from a pre-loaded buffer. Skips the fs::read since the
+    /// reader already has the data. Shared dedup+write logic with compact_shard().
+    pub fn compact_shard_from_buffer(&self, shard_id: u32, data: &[u8]) -> Result<()> {
+        if !Self::is_v2_shard(data) {
+            return Err(BitdexError::DocStore("compact_shard_from_buffer: not a v2 shard".into()));
+        }
+        let tuples = Self::parse_v2_tuples(data)?;
+        Self::write_compacted_shard(&self.root, shard_id, tuples, &self.v2_writers)
+    }
+
+    /// Shared dedup+write logic used by both `compact_shard` and `compact_shard_from_buffer`.
+    fn write_compacted_shard(
+        root: &Path,
+        shard_id: u32,
+        tuples: Vec<(u32, u16, Vec<u8>)>,
+        v2_writers: &DashMap<u32, parking_lot::Mutex<BufWriter<std::fs::File>>>,
+    ) -> Result<()> {
         // Deduplicate: newest (last in file) wins per (slot, field)
         let mut seen = std::collections::HashSet::new();
         let mut deduped: Vec<(u32, u16, Vec<u8>)> = Vec::new();
@@ -1030,7 +1091,9 @@ impl DocStore {
         deduped.reverse(); // restore original order for stable output
 
         // Remove any existing buffered writer for this shard (we'll replace the file)
-        self.v2_writers.remove(&shard_id);
+        v2_writers.remove(&shard_id);
+
+        let path = Self::shard_path(root, shard_id);
 
         // Write clean shard via atomic tmp+rename
         let tmp = path.with_extension("bin.tmp");
@@ -1044,28 +1107,10 @@ impl DocStore {
             }
             w.flush()
                 .map_err(|e| BitdexError::DocStore(format!("flush v2 tmp: {e}")))?;
-            w.into_inner()
-                .map_err(|e| BitdexError::DocStore(format!("into_inner v2 tmp: {e}")))?
-                .sync_all()
-                .map_err(|e| BitdexError::DocStore(format!("fsync v2 tmp: {e}")))?;
+            // No fsync — compaction is best-effort, crash loses at most one re-compact
         }
         std::fs::rename(&tmp, &path)
             .map_err(|e| BitdexError::DocStore(format!("rename v2 shard: {e}")))?;
-
-        // Update num_tuples in the header
-        let num = deduped.len() as u32;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| BitdexError::DocStore(format!("open v2 for header update: {e}")))?;
-        use std::io::Seek;
-        let mut file = file;
-        file.seek(std::io::SeekFrom::Start(12))
-            .map_err(|e| BitdexError::DocStore(format!("seek v2 header: {e}")))?;
-        file.write_all(&num.to_le_bytes())
-            .map_err(|e| BitdexError::DocStore(format!("write v2 num_tuples: {e}")))?;
-        file.sync_all()
-            .map_err(|e| BitdexError::DocStore(format!("fsync v2 header: {e}")))?;
 
         Ok(())
     }
@@ -2375,6 +2420,169 @@ mod tests {
                 }
                 other => panic!("slot {slot} tags: {:?}", other),
             }
+        }
+    }
+
+    // ---- Janitor / reader-triggered compaction tests ----
+
+    #[test]
+    fn test_janitor_staleness_detection() {
+        // Write tuples with >30% staleness, verify get_v2_from_data returns correct counts.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("val");
+        store.save_field_dict().unwrap();
+        let val_idx = store.field_to_idx["val"];
+
+        // Write 3 versions of the same (slot=0, field=val) — 2 are stale
+        for v in 0..3i64 {
+            let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
+            store.append_tuple(0, val_idx, &packed).unwrap();
+        }
+        // Flush writers so data is on disk
+        store.v2_writers.clear();
+
+        let path = DocStore::shard_path(&store.root, DocStore::shard_id(0));
+        let data = std::fs::read(&path).unwrap();
+        let (doc, total, unique) = store.get_v2_from_data(&data, 0).unwrap();
+
+        // Should find the doc with newest value
+        assert!(doc.is_some());
+        match &doc.unwrap().fields["val"] {
+            FieldValue::Single(Value::Integer(2)) => {}
+            other => panic!("expected val=2, got: {:?}", other),
+        }
+
+        // 3 total tuples, 1 unique (slot=0, field=val)
+        assert_eq!(total, 3);
+        assert_eq!(unique, 1);
+
+        // stale = 3 - 1 = 2, pct = 2*100/3 = 66 > 30 → would trigger compaction
+        let stale = total - unique;
+        assert!(stale * 100 / total > COMPACT_THRESHOLD_PCT);
+    }
+
+    #[test]
+    fn test_janitor_no_trigger_when_clean() {
+        // Write unique tuples only — no staleness, should not trigger.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("a");
+        store.ensure_field_idx("b");
+        store.save_field_dict().unwrap();
+        let a_idx = store.field_to_idx["a"];
+        let b_idx = store.field_to_idx["b"];
+
+        let va = rmp_serde::to_vec(&PackedValue::I(1)).unwrap();
+        let vb = rmp_serde::to_vec(&PackedValue::I(2)).unwrap();
+        store.append_tuple(0, a_idx, &va).unwrap();
+        store.append_tuple(0, b_idx, &vb).unwrap();
+        store.v2_writers.clear();
+
+        let path = DocStore::shard_path(&store.root, DocStore::shard_id(0));
+        let data = std::fs::read(&path).unwrap();
+        let (_doc, total, unique) = store.get_v2_from_data(&data, 0).unwrap();
+
+        assert_eq!(total, 2);
+        assert_eq!(unique, 2);
+        // stale = 0, would NOT trigger
+        assert_eq!(total - unique, 0);
+    }
+
+    #[test]
+    fn test_janitor_compact_shard_from_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("val");
+        store.save_field_dict().unwrap();
+        let val_idx = store.field_to_idx["val"];
+
+        // Write 5 versions — only the last should survive compaction
+        for v in 0..5i64 {
+            let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
+            store.append_tuple(0, val_idx, &packed).unwrap();
+        }
+        store.v2_writers.clear();
+
+        let shard_id = DocStore::shard_id(0);
+        let path = DocStore::shard_path(&store.root, shard_id);
+        let size_before = std::fs::metadata(&path).unwrap().len();
+        let data = std::fs::read(&path).unwrap();
+
+        // Compact from buffer
+        store.compact_shard_from_buffer(shard_id, &data).unwrap();
+
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after < size_before,
+            "compacted ({size_after}) should be smaller than original ({size_before})"
+        );
+
+        // Verify newest value survived
+        let doc = store.get_v2(0).unwrap().unwrap();
+        match &doc.fields["val"] {
+            FieldValue::Single(Value::Integer(4)) => {}
+            other => panic!("expected val=4 after compaction, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_janitor_reader_triggered_compaction() {
+        // Integration test: set up compact channel, write stale tuples,
+        // read via get_v2 (triggers compaction), wait, verify shard compacted.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_idx("val");
+        store.save_field_dict().unwrap();
+        let val_idx = store.field_to_idx["val"];
+
+        // Set up compact channel with a worker thread
+        let (compact_tx, compact_rx) = crossbeam_channel::bounded::<(u32, Vec<u8>)>(32);
+        store.set_compact_channel(compact_tx);
+
+        // Write 10 versions of the same tuple — 90% stale
+        for v in 0..10i64 {
+            let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
+            store.append_tuple(0, val_idx, &packed).unwrap();
+        }
+        store.v2_writers.clear();
+
+        let shard_id = DocStore::shard_id(0);
+        let path = DocStore::shard_path(&store.root, shard_id);
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        // Reading triggers compaction enqueue
+        let doc = store.get_v2(0).unwrap().unwrap();
+        match &doc.fields["val"] {
+            FieldValue::Single(Value::Integer(9)) => {}
+            other => panic!("expected val=9, got: {:?}", other),
+        }
+
+        // Drain the compact channel and process manually
+        // (simulating what the background worker would do)
+        match compact_rx.try_recv() {
+            Ok((sid, data)) => {
+                assert_eq!(sid, shard_id);
+                store.compact_shard_from_buffer(sid, &data).unwrap();
+            }
+            Err(_) => panic!("expected compaction to be enqueued"),
+        }
+
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after < size_before,
+            "compacted ({size_after}) should be smaller than original ({size_before})"
+        );
+
+        // Verify data is still correct after compaction
+        let doc = store.get_v2(0).unwrap().unwrap();
+        match &doc.fields["val"] {
+            FieldValue::Single(Value::Integer(9)) => {}
+            other => panic!("expected val=9 after compaction, got: {:?}", other),
         }
     }
 }
