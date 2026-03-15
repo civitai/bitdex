@@ -85,8 +85,8 @@ pub fn run_single_pass_v2(
             .map_err(|e| format!("prepare_bulk_writer: {e}"))?,
     );
 
-    // Enter loading mode — skip snapshot publishing during bulk inserts
-    engine.enter_loading_mode();
+    // No enter_loading_mode — we write directly to BitmapFs, not through the engine.
+    // Loading mode would trigger a snapshot save on exit that overwrites our bitmaps.
 
     progress.set_phase(1);
     eprintln!("\n=== Single-Pass V2: CSV → bitmaps + docstore (no scratch shards) ===");
@@ -352,13 +352,10 @@ pub fn run_single_pass_v2(
     }
 
     // ===================================================================
-    // Finalize: exit loading mode
+    // Done — all bitmaps + docstore already written to disk via BitmapFs.
+    // No exit_loading_mode needed (would trigger snapshot save overwriting our bitmaps).
     // ===================================================================
     progress.set_phase(3);
-    eprintln!("\n=== Finalizing: exit loading mode ===");
-    let t = Instant::now();
-    engine.exit_loading_mode();
-    eprintln!("Loading mode exited in {:.1}s", t.elapsed().as_secs_f64());
 
     progress.set_phase(6);
     let elapsed = wall_start.elapsed();

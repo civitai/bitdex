@@ -77,6 +77,9 @@ fn main() {
                 stats.records_loaded as f64 / stats.elapsed.as_secs_f64()
             );
             eprintln!("Server: cargo run --release --features server --bin bitdex-server -- --port 3001 --data-dir {}", data_dir.display());
+            // Exit immediately — engine Drop triggers flush thread shutdown which
+            // can overwrite bitmaps we already saved to BitmapFs.
+            std::process::exit(0);
         }
         Err(e) => {
             eprintln!("Load failed: {e}");

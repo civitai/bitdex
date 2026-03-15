@@ -291,6 +291,9 @@ async fn main() {
                 stats.elapsed.as_secs_f64(),
                 stats.records_loaded as f64 / stats.elapsed.as_secs_f64()
             );
+            // Exit immediately — engine Drop triggers flush thread shutdown which
+            // overwrites bitmaps we already saved to BitmapFs.
+            std::process::exit(0);
         }
 
         Commands::Sync => {
