@@ -1005,8 +1005,12 @@ impl DocStore {
         Ok(())
     }
 
-    /// Compact a V2 shard: read all tuples, deduplicate (newest wins per slot+field),
-    /// write a clean shard via atomic tmp+rename.
+    /// Compact a V2 shard: single-pass zero-copy dedup.
+    ///
+    /// Read source into memory, scan forward to build a lightweight offset index,
+    /// reverse-iterate to identify winners (LIFO: newest per slot+field wins),
+    /// write winners directly from the source buffer to a new file. No per-tuple
+    /// allocations, no fsync (background janitor work — crash-safe via atomic rename).
     pub fn compact_shard(&self, shard_id: u32) -> Result<()> {
         let path = Self::shard_path(&self.root, shard_id);
         let data = match std::fs::read(&path) {
@@ -1014,58 +1018,74 @@ impl DocStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(BitdexError::DocStore(format!("read shard: {e}"))),
         };
-        if !Self::is_v2_shard(&data) {
+        if data.len() < V2_HEADER_SIZE || !Self::is_v2_shard(&data) {
             return Err(BitdexError::DocStore("compact_shard: not a v2 shard".into()));
         }
-        let tuples = Self::parse_v2_tuples(&data)?;
 
-        // Deduplicate: newest (last in file) wins per (slot, field)
+        // Forward scan: build offset index — (slot, field_idx, tuple_start, tuple_len)
+        // No data copying — just byte positions into the source buffer.
+        let mut offsets: Vec<(u32, u16, usize, usize)> = Vec::new();
+        let mut pos = V2_HEADER_SIZE;
+        while pos + 8 <= data.len() {
+            let slot = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            let field_idx = u16::from_le_bytes([data[pos + 4], data[pos + 5]]);
+            let value_len = u16::from_le_bytes([data[pos + 6], data[pos + 7]]) as usize;
+            let tuple_len = 8 + value_len;
+            if pos + tuple_len > data.len() {
+                break; // truncated tuple
+            }
+            offsets.push((slot, field_idx, pos, tuple_len));
+            pos += tuple_len;
+        }
+
+        // Reverse-iterate to find winners (LIFO dedup), collect their indices
         let mut seen = std::collections::HashSet::new();
-        let mut deduped: Vec<(u32, u16, Vec<u8>)> = Vec::new();
-        for (slot, field_idx, value) in tuples.into_iter().rev() {
-            if seen.insert((slot, field_idx)) {
-                deduped.push((slot, field_idx, value));
+        let mut winner_indices: Vec<usize> = Vec::new();
+        for (i, (slot, field_idx, _, _)) in offsets.iter().enumerate().rev() {
+            if seen.insert((*slot, *field_idx)) {
+                winner_indices.push(i);
             }
         }
-        deduped.reverse(); // restore original order for stable output
+        winner_indices.reverse(); // restore file order
 
-        // Remove any existing buffered writer for this shard (we'll replace the file)
+        // If nothing to compact, skip
+        if winner_indices.len() == offsets.len() {
+            return Ok(());
+        }
+
+        // Remove any existing buffered writer for this shard
         self.v2_writers.remove(&shard_id);
 
-        // Write clean shard via atomic tmp+rename
+        // Write clean shard: header with correct num_tuples + winning tuples
+        // directly from source buffer. No fsync — background janitor work.
         let tmp = path.with_extension("bin.tmp");
         {
             let file = std::fs::File::create(&tmp)
                 .map_err(|e| BitdexError::DocStore(format!("create v2 tmp: {e}")))?;
             let mut w = BufWriter::new(file);
-            Self::write_v2_header(&mut w)?;
-            for (slot, field_idx, value) in &deduped {
-                Self::write_v2_tuple(&mut w, *slot, *field_idx, value)?;
+            // Header with correct count upfront
+            w.write_all(&V2_MAGIC.to_le_bytes())
+                .map_err(|e| BitdexError::DocStore(format!("write v2 magic: {e}")))?;
+            w.write_all(&2u32.to_le_bytes())
+                .map_err(|e| BitdexError::DocStore(format!("write v2 version: {e}")))?;
+            w.write_all(&0u32.to_le_bytes())
+                .map_err(|e| BitdexError::DocStore(format!("write v2 flags: {e}")))?;
+            w.write_all(&(winner_indices.len() as u32).to_le_bytes())
+                .map_err(|e| BitdexError::DocStore(format!("write v2 num_tuples: {e}")))?;
+
+            // Write winning tuples — zero-copy slices from source buffer
+            for &idx in &winner_indices {
+                let (_, _, start, len) = offsets[idx];
+                w.write_all(&data[start..start + len])
+                    .map_err(|e| BitdexError::DocStore(format!("write v2 tuple: {e}")))?;
             }
             w.flush()
                 .map_err(|e| BitdexError::DocStore(format!("flush v2 tmp: {e}")))?;
-            w.into_inner()
-                .map_err(|e| BitdexError::DocStore(format!("into_inner v2 tmp: {e}")))?
-                .sync_all()
-                .map_err(|e| BitdexError::DocStore(format!("fsync v2 tmp: {e}")))?;
         }
+        // Atomic rename — on Windows, remove destination first
+        let _ = std::fs::remove_file(&path);
         std::fs::rename(&tmp, &path)
             .map_err(|e| BitdexError::DocStore(format!("rename v2 shard: {e}")))?;
-
-        // Update num_tuples in the header
-        let num = deduped.len() as u32;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .map_err(|e| BitdexError::DocStore(format!("open v2 for header update: {e}")))?;
-        use std::io::Seek;
-        let mut file = file;
-        file.seek(std::io::SeekFrom::Start(12))
-            .map_err(|e| BitdexError::DocStore(format!("seek v2 header: {e}")))?;
-        file.write_all(&num.to_le_bytes())
-            .map_err(|e| BitdexError::DocStore(format!("write v2 num_tuples: {e}")))?;
-        file.sync_all()
-            .map_err(|e| BitdexError::DocStore(format!("fsync v2 header: {e}")))?;
 
         Ok(())
     }

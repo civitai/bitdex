@@ -412,123 +412,106 @@ struct ResourceCsvResult {
 /// Returns HashMap<tag_id_u64, RoaringBitmap>.
 fn process_tags_csv(
     stage_dir: &Path,
-    bulk_writer: &Arc<crate::docstore::BulkWriter>,
+    _bulk_writer: &Arc<crate::docstore::BulkWriter>,
     progress: &Arc<LoadProgress>,
 ) -> Result<HashMap<u64, RoaringBitmap>, String> {
-    use std::io::Read;
+    // mmap the entire 63 GB file — zero-copy, OS handles paging.
+    // Split into N chunks (one per rayon thread), each builds a local
+    // Vec<RoaringBitmap> (direct index by tag_id, no hashing).
+    // One merge pass at the end: OR all Vecs together.
+    const MAX_TAG_ID: usize = 300_000; // tag IDs fit in 0..300K
 
-    let mut file = std::io::BufReader::with_capacity(
-        16 * 1024 * 1024,
-        std::fs::File::open(stage_dir.join("tags.csv"))
-            .map_err(|e| format!("open tags.csv: {e}"))?,
-    );
+    let file = std::fs::File::open(stage_dir.join("tags.csv"))
+        .map_err(|e| format!("open tags.csv: {e}"))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("mmap tags.csv: {e}"))?;
+    let data = &mmap[..];
+    let file_len = data.len();
+    eprintln!("  tags: mmap'd {} ({:.1} GB)", file_len, file_len as f64 / (1024.0 * 1024.0 * 1024.0));
 
-    // Collect all lines into blocks for rayon processing.
-    // For tags: each row is tiny (two ints), so we collect lines in large blocks.
-    let mut buf = vec![0u8; 8 * 1024 * 1024];
-    let mut leftover = Vec::<u8>::with_capacity(64);
+    // Split file into N equal-ish byte ranges, align to newlines.
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = file_len / num_threads;
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_threads);
+    let mut start = 0;
+    for i in 0..num_threads {
+        let mut end = if i == num_threads - 1 {
+            file_len
+        } else {
+            let tentative = start + chunk_size;
+            // Find next newline after tentative end
+            match data[tentative..].iter().position(|&b| b == b'\n') {
+                Some(offset) => tentative + offset + 1,
+                None => file_len,
+            }
+        };
+        if end > file_len { end = file_len; }
+        if start < end {
+            ranges.push((start, end));
+        }
+        start = end;
+    }
+
     let total = AtomicU64::new(0);
     let total_ref = &total;
 
-    // Build tag bitmaps with rayon fold+reduce on blocks.
-    // We accumulate lines into a block, then process the block in parallel.
-    let mut all_lines: Vec<Vec<u8>> = Vec::new();
-    let mut block_count = 0u64;
+    // Rayon parallel: each thread processes its byte range independently.
+    // Vec<RoaringBitmap> indexed by tag_id — direct index, no hashing.
+    let thread_results: Vec<Vec<RoaringBitmap>> = ranges
+        .par_iter()
+        .map(|&(range_start, range_end)| {
+            let chunk = &data[range_start..range_end];
+            let mut bitmaps: Vec<RoaringBitmap> = (0..MAX_TAG_ID)
+                .map(|_| RoaringBitmap::new())
+                .collect();
+            let mut count = 0u64;
+            let mut line_start = 0;
 
-    // Merged result: built incrementally from blocks
-    let mut merged: HashMap<u64, RoaringBitmap> = HashMap::new();
-
-    // Get tagIds field index for docstore tuples
-    let tag_field_idx = bulk_writer
-        .field_to_idx()
-        .get("tagIds")
-        .copied();
-
-    loop {
-        let bytes_read = file
-            .read(&mut buf)
-            .map_err(|e| format!("read tags.csv: {e}"))?;
-        if bytes_read == 0 {
-            // Process leftover
-            if !leftover.is_empty() {
-                all_lines.push(leftover.clone());
-                leftover.clear();
-            }
-            break;
-        }
-
-        // Work on leftover + new data
-        let work = if leftover.is_empty() {
-            &buf[..bytes_read]
-        } else {
-            leftover.extend_from_slice(&buf[..bytes_read]);
-            leftover.as_slice()
-        };
-
-        // Find last newline
-        let last_nl = match work.iter().rposition(|&b| b == b'\n') {
-            Some(pos) => pos,
-            None => {
-                if leftover.is_empty() {
-                    leftover = buf[..bytes_read].to_vec();
+            for i in 0..chunk.len() {
+                if chunk[i] == b'\n' {
+                    let line = &chunk[line_start..i];
+                    line_start = i + 1;
+                    if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                        continue;
+                    }
+                    if let Some((tag_id, image_id)) = parse_tag_line(line) {
+                        let tid = tag_id as usize;
+                        if tid < MAX_TAG_ID {
+                            bitmaps[tid].insert(image_id as u32);
+                        }
+                        count += 1;
+                    }
                 }
-                continue;
             }
-        };
-
-        // Save remainder
-        let new_leftover = if last_nl + 1 < work.len() {
-            work[last_nl + 1..].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        // Extract complete lines
-        let complete = &work[..last_nl + 1];
-        let mut start = 0;
-        for i in 0..complete.len() {
-            if complete[i] == b'\n' {
-                let line = &complete[start..i];
-                start = i + 1;
-                if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
-                    continue;
-                }
-                all_lines.push(line.to_vec());
-            }
-        }
-
-        leftover = new_leftover;
-
-        // When we have enough lines, process a block with rayon
-        if all_lines.len() >= BLOCK_SIZE * 8 {
-            let block = std::mem::take(&mut all_lines);
-            let block_result = process_tag_block(&block, tag_field_idx, bulk_writer);
-            merge_filter_bitmaps_single(&mut merged, block_result);
-            block_count += 1;
-            let processed = block.len() as u64;
-            total_ref.fetch_add(processed, Ordering::Relaxed);
+            total_ref.fetch_add(count, Ordering::Relaxed);
             let t = total_ref.load(Ordering::Relaxed);
-            progress.tag_rows.store(t, Ordering::Release);
-            if block_count % 10 == 0 {
-                eprintln!("  tags: {}M rows...", t / 1_000_000);
+            eprintln!("  tags: thread done, {}M total so far", t / 1_000_000);
+            bitmaps
+        })
+        .collect();
+
+    // Merge: OR all thread-local Vecs into the first one.
+    let mut merged_vec = thread_results.into_iter().reduce(|mut dst, src| {
+        for (i, bm) in src.into_iter().enumerate() {
+            if !bm.is_empty() {
+                dst[i] |= bm;
             }
         }
-    }
+        dst
+    }).unwrap_or_else(|| vec![]);
 
-    // Process remaining lines
-    if !all_lines.is_empty() {
-        let block = std::mem::take(&mut all_lines);
-        let processed = block.len() as u64;
-        let block_result = process_tag_block(&block, tag_field_idx, bulk_writer);
-        merge_filter_bitmaps_single(&mut merged, block_result);
-        total_ref.fetch_add(processed, Ordering::Relaxed);
+    // Convert Vec<RoaringBitmap> to HashMap<u64, RoaringBitmap> (only non-empty)
+    let mut result: HashMap<u64, RoaringBitmap> = HashMap::new();
+    for (i, bm) in merged_vec.drain(..).enumerate() {
+        if !bm.is_empty() {
+            result.insert(i as u64, bm);
+        }
     }
 
     let t = total.load(Ordering::Relaxed);
     progress.tag_rows.store(t, Ordering::Release);
-    eprintln!("  Tags total: {} rows", t);
-
-    Ok(merged)
+    eprintln!("  Tags total: {} rows, {} distinct tag IDs", t, result.len());
+    Ok(result)
 }
 
 /// Process a block of tag lines with rayon fold+reduce.
@@ -542,29 +525,18 @@ fn process_tag_block(
         .fold(
             || HashMap::<u64, RoaringBitmap>::new(),
             |mut accum, chunk| {
-                let mut tuples: Vec<(u32, u16, Vec<u8>)> = Vec::new();
                 for line in chunk {
                     if let Some((tag_id, image_id)) = parse_tag_line(line) {
                         let slot = image_id as u32;
                         let tag_val = tag_id as u64;
 
-                        // Build bitmap
+                        // Build bitmap only — docstore tag arrays are written
+                        // per-image during the images CSV pass (one tagIds tuple
+                        // per image, not 50 individual tuples per tag row).
                         accum
                             .entry(tag_val)
                             .or_insert_with(RoaringBitmap::new)
                             .insert(slot);
-
-                        // Append docstore tuple
-                        if let Some(fidx) = tag_field_idx {
-                            let value = rmp_serde::to_vec(&(tag_id as i64)).unwrap_or_default();
-                            tuples.push((slot, fidx, value));
-                        }
-                    }
-                }
-                // Batch write docstore tuples
-                if !tuples.is_empty() {
-                    for (slot, fidx, value) in &tuples {
-                        bulk_writer.append_tuple_raw(*slot, *fidx, value);
                     }
                 }
                 accum
