@@ -841,32 +841,23 @@ impl BitdexServer {
             eprintln!("Shutdown signal received, draining...");
         };
 
-        // Pre-listen: restore bound cache shards synchronously so the first
-        // query hits persisted cache (~337μs) instead of cold miss (~40ms).
-        // With v2 ucpack (persisted sorted_keys), sort fields aren't needed.
+        // Pre-listen: load eager fields + bound cache shards synchronously.
+        // The server won't accept traffic until all eager bitmaps are loaded
+        // and cache shards are restored. This prevents cold-start stampedes
+        // where queries arrive before bitmaps are in memory.
         {
             let engine_arc = shutdown_state.index.lock()
                 .as_ref()
                 .map(|s| Arc::clone(&s.engine));
             if let Some(ref engine) = engine_arc {
+                // Eager fields first (bitmaps needed for queries)
+                engine.preload_eager_fields();
+                // Bound cache shards (persisted cache entries)
                 engine.preload_bound_cache();
             }
         }
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-
-        // Post-listen: load eager bitmap fields in background so health checks
-        // pass immediately while bitmaps load from disk.
-        {
-            let engine_arc = shutdown_state.index.lock()
-                .as_ref()
-                .map(|s| Arc::clone(&s.engine));
-            if let Some(engine) = engine_arc {
-                tokio::task::spawn_blocking(move || {
-                    engine.preload_eager_fields();
-                });
-            }
-        }
 
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal)
