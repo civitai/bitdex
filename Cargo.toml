@@ -19,7 +19,7 @@ simd = ["roaring/simd"]
 
 [dependencies]
 # Bitmap indexes
-roaring = "0.10"
+roaring = { path = "../roaring-rs/roaring" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
