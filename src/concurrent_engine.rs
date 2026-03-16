@@ -678,30 +678,42 @@ impl ConcurrentEngine {
         // Reads only .fpack headers (no bitmap payloads) — fast even at 31K keys.
         let mut existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> = HashMap::new();
         if let Some(ref store) = bitmap_store {
-            for field_name in &lazy_value_fields {
-                match store.list_field_keys(field_name) {
-                    Ok(keys) => {
-                        let count = keys.len();
-                        if count > 0 {
-                            eprintln!(
-                                "Existence set for '{}': {} keys",
-                                field_name, count
-                            );
+            let fields: Vec<String> = lazy_value_fields.iter().cloned().collect();
+            if fields.len() > 1 {
+                // Parallel existence set loading
+                use rayon::prelude::*;
+                let results: Vec<(String, std::result::Result<HashSet<u64>, _>)> = fields
+                    .par_iter()
+                    .map(|name| (name.clone(), store.list_field_keys(name)))
+                    .collect();
+                for (field_name, result) in results {
+                    match result {
+                        Ok(keys) => {
+                            if !keys.is_empty() {
+                                eprintln!("Existence set for '{}': {} keys", field_name, keys.len());
+                            }
+                            existing_keys.insert(field_name, Arc::new(ArcSwap::from_pointee(keys)));
                         }
-                        existing_keys.insert(
-                            field_name.clone(),
-                            Arc::new(ArcSwap::from_pointee(keys)),
-                        );
+                        Err(e) => {
+                            eprintln!("Warning: failed to build existence set for '{}': {}", field_name, e);
+                            existing_keys.insert(field_name, Arc::new(ArcSwap::from_pointee(HashSet::new())));
+                        }
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: failed to build existence set for '{}': {}",
-                            field_name, e
-                        );
-                        existing_keys.insert(
-                            field_name.clone(),
-                            Arc::new(ArcSwap::from_pointee(HashSet::new())),
-                        );
+                }
+            } else {
+                // Single field: sequential
+                for field_name in &fields {
+                    match store.list_field_keys(field_name) {
+                        Ok(keys) => {
+                            if !keys.is_empty() {
+                                eprintln!("Existence set for '{}': {} keys", field_name, keys.len());
+                            }
+                            existing_keys.insert(field_name.clone(), Arc::new(ArcSwap::from_pointee(keys)));
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: failed to build existence set for '{}': {}", field_name, e);
+                            existing_keys.insert(field_name.clone(), Arc::new(ArcSwap::from_pointee(HashSet::new())));
+                        }
                     }
                 }
             }
@@ -4297,43 +4309,31 @@ impl ConcurrentEngine {
         use crate::query::{FilterClause, Value};
         let t0 = std::time::Instant::now();
 
-        // Sort fields first (needed for sort traversal on cache miss)
         let eager_sorts: Vec<&str> = self.config.sort_fields.iter()
             .filter(|sc| sc.eager_load)
             .map(|sc| sc.name.as_str())
             .collect();
-        let empty_clauses: Vec<FilterClause> = Vec::new();
-        for name in &eager_sorts {
-            let _ = self.ensure_fields_loaded(&empty_clauses, Some(name));
-        }
-        if !eager_sorts.is_empty() {
-            eprintln!(
-                "Preload: {} sort fields in {:.1}s",
-                eager_sorts.len(),
-                t0.elapsed().as_secs_f64(),
-            );
-        }
-
-        // Filter fields
-        let t2 = std::time::Instant::now();
         let eager_filters: Vec<&str> = self.config.filter_fields.iter()
             .filter(|fc| fc.eager_load)
             .map(|fc| fc.name.as_str())
             .collect();
-        if !eager_filters.is_empty() {
+
+        // Load all eager sort + filter fields in one parallel batch.
+        // ensure_fields_loaded parallelizes across all tasks internally.
+        if !eager_sorts.is_empty() || !eager_filters.is_empty() {
             let mut clauses: Vec<FilterClause> = Vec::new();
             for name in &eager_filters {
-                clauses.push(FilterClause::Eq(
-                    name.to_string(),
-                    Value::Integer(0),
-                ));
+                clauses.push(FilterClause::Eq(name.to_string(), Value::Integer(0)));
             }
-            let _ = self.ensure_fields_loaded(&clauses, None);
-            eprintln!(
-                "Preload: {} filter fields in {:.1}s",
-                eager_filters.len(),
-                t2.elapsed().as_secs_f64(),
-            );
+            // Load with first sort field, then remaining sorts individually
+            // (ensure_fields_loaded takes one optional sort field at a time)
+            let first_sort = eager_sorts.first().copied();
+            let _ = self.ensure_fields_loaded(&clauses, first_sort);
+            // Load remaining sort fields
+            let empty: Vec<FilterClause> = Vec::new();
+            for name in eager_sorts.iter().skip(1) {
+                let _ = self.ensure_fields_loaded(&empty, Some(name));
+            }
         }
 
         let total_eager = eager_sorts.len() + eager_filters.len();
