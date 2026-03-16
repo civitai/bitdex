@@ -2382,6 +2382,81 @@ impl ConcurrentEngine {
         result
     }
 
+    /// SYNC filter values for a slot on a filter_only multi-value field.
+    ///
+    /// Replaces all filter bitmap memberships for the given slot on the named field.
+    /// Scans loaded bitmaps to find old values, diffs against new values, and sends
+    /// targeted FilterInsert/FilterRemove ops. No docstore involvement.
+    ///
+    /// Used by the outbox poller for filter_only fields like collectionIds where
+    /// the membership data comes from a separate table (CollectionItem), not the
+    /// image document.
+    pub fn sync_filter_values(&self, slot: u32, field_name: &str, new_values: &[u64]) -> Result<()> {
+        self.in_flight.mark_in_flight(slot);
+
+        let result = (|| -> Result<()> {
+            // Verify slot is alive
+            {
+                let snap = self.snapshot();
+                if !snap.slots.is_alive(slot) {
+                    return Err(crate::error::BitdexError::SlotNotFound(slot));
+                }
+            }
+
+            // Find old values by scanning loaded bitmaps for this field
+            let old_values: Vec<u64> = {
+                let snap = self.snapshot();
+                match snap.filters.get_field(field_name) {
+                    Some(field) => field
+                        .bitmap_keys()
+                        .filter(|&&v| {
+                            field.get(v).map_or(false, |bm| bm.contains(slot))
+                        })
+                        .copied()
+                        .collect(),
+                    None => Vec::new(),
+                }
+            };
+
+            let new_set: std::collections::HashSet<u64> = new_values.iter().copied().collect();
+            let old_set: std::collections::HashSet<u64> = old_values.iter().copied().collect();
+
+            let arc_name = self.field_registry.get(field_name);
+            let mut ops = Vec::new();
+
+            // Remove slot from bitmaps for values no longer present
+            for &val in old_set.difference(&new_set) {
+                ops.push(MutationOp::FilterRemove {
+                    field: arc_name.clone(),
+                    value: val,
+                    slots: vec![slot],
+                });
+            }
+
+            // Insert slot into bitmaps for newly added values
+            for &val in new_set.difference(&old_set) {
+                ops.push(MutationOp::FilterInsert {
+                    field: arc_name.clone(),
+                    value: val,
+                    slots: vec![slot],
+                });
+            }
+
+            if !ops.is_empty() {
+                self.sender.send_batch(ops).map_err(|_| {
+                    crate::error::BitdexError::CapacityExceeded(
+                        "coalescer channel disconnected".to_string(),
+                    )
+                })?;
+            }
+
+            Ok(())
+        })();
+
+        self.in_flight.clear_in_flight(slot);
+        result
+    }
+
     /// Execute a query from individual filter/sort/limit components.
     pub fn query(
         &self,
@@ -8640,6 +8715,115 @@ mod tests {
             size_after < size_before,
             "compacted shard ({size_after}) should be smaller than original ({size_before})"
         );
+
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_sync_filter_values_add_and_remove() {
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert a doc with tagIds [100, 200]
+        engine
+            .put(
+                1,
+                &make_doc(vec![(
+                    "tagIds",
+                    FieldValue::Multi(vec![Value::Integer(100), Value::Integer(200)]),
+                )]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // Verify initial state
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(100))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        // Sync to [200, 300] — removes 100, keeps 200, adds 300
+        engine.sync_filter_values(1, "tagIds", &[200, 300]).unwrap();
+
+        // Wait for mutations to flush
+        thread::sleep(Duration::from_millis(50));
+
+        // Tag 100 should no longer match
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(100))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.total_matched, 0);
+
+        // Tag 200 should still match
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(200))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        // Tag 300 should now match
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(300))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_sync_filter_values_clear_all() {
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        engine
+            .put(
+                1,
+                &make_doc(vec![(
+                    "tagIds",
+                    FieldValue::Multi(vec![Value::Integer(10), Value::Integer(20)]),
+                )]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // Sync to empty — removes all values
+        engine.sync_filter_values(1, "tagIds", &[]).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(10))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.total_matched, 0);
+
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_sync_filter_values_slot_not_found() {
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Sync on non-existent slot should error
+        let result = engine.sync_filter_values(999, "tagIds", &[100]);
+        assert!(result.is_err());
 
         engine.shutdown();
     }

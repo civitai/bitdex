@@ -21,7 +21,8 @@
       { "name": "modelVersionIds", "field_type": "multi_value" },
       { "name": "modelVersionIdsManual", "field_type": "multi_value" },
       { "name": "toolIds", "field_type": "multi_value" },
-      { "name": "techniqueIds", "field_type": "multi_value" }
+      { "name": "techniqueIds", "field_type": "multi_value" },
+      { "name": "collectionIds", "field_type": "multi_value" }
     ],
     "sort_fields": [
       { "name": "reactionCount", "bits": 32, "eager_load": true },
@@ -70,6 +71,7 @@
       { "source": "modelVersionIdsManual", "target": "modelVersionIdsManual", "value_type": "integer_array", "default": [] },
       { "source": "toolIds", "target": "toolIds", "value_type": "integer_array", "default": [] },
       { "source": "techniqueIds", "target": "techniqueIds", "value_type": "integer_array", "default": [] },
+      { "source": "collectionIds", "target": "collectionIds", "value_type": "integer_array", "filter_only": true, "default": [] },
       { "source": "reactionCount", "target": "reactionCount", "value_type": "integer", "default": 0 },
       { "source": "sortAtUnix", "target": "sortAt", "value_type": "integer", "fallback": "sortAt", "ms_to_seconds": true },
       { "source": "commentCount", "target": "commentCount", "value_type": "integer", "default": 0 },

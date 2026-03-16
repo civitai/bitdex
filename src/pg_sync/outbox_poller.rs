@@ -185,11 +185,12 @@ async fn fetch_and_push_upserts(
 
     let image_ids: Vec<i64> = images.iter().map(|r| r.id).collect();
 
-    let (tags, tools, techniques, resources) = tokio::try_join!(
+    let (tags, tools, techniques, resources, collections) = tokio::try_join!(
         queries::fetch_tags(pool, &image_ids),
         queries::fetch_tools(pool, &image_ids),
         queries::fetch_techniques(pool, &image_ids),
         queries::fetch_resources(pool, &image_ids),
+        queries::fetch_collections(pool, &image_ids),
     )
     .map_err(|e| format!("enrichment queries: {e}"))?;
 
@@ -203,6 +204,24 @@ async fn fetch_and_push_upserts(
     client
         .patch_batch(&docs, Some((cursor_name, cursor_value)))
         .await?;
+
+    // Sync collectionIds via filter-sync (filter_only field — not in docs).
+    // Always call filter-sync for all images in the batch, even when enrichment
+    // returns zero collections. This ensures images removed from ALL collections
+    // get their bitmap memberships cleared (values: []).
+    {
+        let mut coll_map: HashMap<i64, Vec<i64>> = HashMap::new();
+        // Seed with all image_ids so images with no ACCEPTED collections get empty arrays
+        for &id in &image_ids {
+            coll_map.entry(id).or_default();
+        }
+        for c in &collections {
+            coll_map.entry(c.image_id).or_default().push(c.collection_id);
+        }
+        let mut entries: Vec<(i64, Vec<i64>)> = coll_map.into_iter().collect();
+        entries.sort_by_key(|(id, _)| *id); // Deterministic ordering for debugging
+        client.filter_sync("collectionIds", &entries).await?;
+    }
 
     Ok(count)
 }

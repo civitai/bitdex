@@ -564,6 +564,11 @@ pub struct FieldMapping {
     /// If true, this field is stored in docstore only (not bitmap-indexed).
     #[serde(default)]
     pub doc_only: bool,
+    /// If true, this field is bitmap-indexed only (not stored in docstore).
+    /// Inverse of `doc_only`. Use for fields populated by separate data sources
+    /// (e.g., collectionIds from CollectionItem table) rather than inline document fields.
+    #[serde(default)]
+    pub filter_only: bool,
     /// If true, divide millisecond timestamp by 1000 to get seconds, then store as u32.
     /// Use for fields like sortAtUnix/publishedAtUnix that are in milliseconds.
     #[serde(default)]
@@ -617,6 +622,14 @@ impl DataSchema {
             return Err(BitdexError::Config(
                 "data_schema.schema_version must be >= 1".to_string(),
             ));
+        }
+        for mapping in &self.fields {
+            if mapping.doc_only && mapping.filter_only {
+                return Err(BitdexError::Config(format!(
+                    "Field '{}' cannot be both doc_only and filter_only",
+                    mapping.target,
+                )));
+            }
         }
         Ok(())
     }

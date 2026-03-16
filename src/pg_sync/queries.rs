@@ -63,6 +63,35 @@ CREATE OR REPLACE TRIGGER bitdex_resource_trg AFTER INSERT OR DELETE ON "ImageRe
   FOR EACH ROW EXECUTE FUNCTION bitdex_image_notify();
 ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_resource_trg;
 
+-- CollectionItem changes (nullable imageId — only fire for image collections)
+-- Fires on INSERT, DELETE, and UPDATE (status changes like REVIEW→ACCEPTED).
+-- imageId and collectionId are immutable on CollectionItem rows — only status changes.
+CREATE OR REPLACE FUNCTION bitdex_collection_notify() RETURNS trigger AS $$
+DECLARE
+  _image_id BIGINT;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    _image_id := OLD."imageId";
+  ELSIF TG_OP = 'UPDATE' THEN
+    -- Only fire when accepted-ness changes (REVIEW→ACCEPTED or ACCEPTED→REJECTED)
+    IF (OLD.status = 'ACCEPTED') = (NEW.status = 'ACCEPTED') THEN
+      RETURN NEW;
+    END IF;
+    _image_id := NEW."imageId";
+  ELSE
+    _image_id := NEW."imageId";
+  END IF;
+  -- Only fire for image collections (imageId is nullable)
+  IF _image_id IS NOT NULL THEN
+    INSERT INTO "BitdexOutbox" (entity_type, entity_id, event) VALUES ('Image', _image_id, 'UPSERT');
+  END IF;
+  RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE TRIGGER bitdex_collection_trg AFTER INSERT OR UPDATE OR DELETE ON "CollectionItem"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_collection_notify();
+ALTER TABLE "CollectionItem" ENABLE ALWAYS TRIGGER bitdex_collection_trg;
+
 -- Post changes
 CREATE OR REPLACE FUNCTION bitdex_post_notify() RETURNS trigger AS $$
 BEGIN
@@ -243,8 +272,8 @@ async fn check_triggers_exist(pool: &PgPool) -> Result<bool, sqlx::Error> {
     )
     .fetch_one(pool)
     .await?;
-    // We expect 8 triggers: image, tags, tool, technique, resource, post, mv, model
-    Ok(row.0 >= 8)
+    // We expect 9 triggers: image, tags, tool, technique, resource, collection, post, mv, model
+    Ok(row.0 >= 9)
 }
 
 /// Get the max image ID for range-based bulk loading.
@@ -349,6 +378,29 @@ pub async fn fetch_resources(
         JOIN "Model" m ON mv."modelId" = m.id
         WHERE ir."imageId" = ANY($1)
         GROUP BY ir."imageId""#,
+    )
+    .bind(image_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Row type for CollectionItem enrichment.
+#[derive(Debug, FromRow)]
+pub struct CollectionItemRow {
+    #[sqlx(rename = "imageId")]
+    pub image_id: i64,
+    #[sqlx(rename = "collectionId")]
+    pub collection_id: i64,
+}
+
+/// Fetch accepted collection memberships for a batch of image IDs.
+pub async fn fetch_collections(
+    pool: &PgPool,
+    image_ids: &[i64],
+) -> Result<Vec<CollectionItemRow>, sqlx::Error> {
+    sqlx::query_as::<_, CollectionItemRow>(
+        r#"SELECT "imageId", "collectionId" FROM "CollectionItem"
+        WHERE "imageId" = ANY($1) AND status = 'ACCEPTED'"#,
     )
     .bind(image_ids)
     .fetch_all(pool)
@@ -551,6 +603,45 @@ pub async fn fetch_resources_by_range(
         JOIN "Model" m ON mv."modelId" = m.id
         WHERE ir."imageId" >= $1 AND ir."imageId" < $2
         GROUP BY ir."imageId""#,
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await
+}
+
+/// Row type for streaming collection items ordered by collectionId.
+#[derive(Debug, FromRow)]
+pub struct StreamCollectionRow {
+    #[sqlx(rename = "collectionId")]
+    pub collection_id: i64,
+    #[sqlx(rename = "imageId")]
+    pub image_id: i64,
+}
+
+/// Get max collection ID for range iteration.
+pub async fn get_max_collection_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        r#"SELECT COALESCE(MAX("collectionId")::int8, 0) FROM "CollectionItem" WHERE "imageId" IS NOT NULL"#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Fetch collection items by collectionId range, ordered by collectionId then imageId.
+/// Filters on imageId IS NOT NULL (image collections only) and status = 'ACCEPTED'.
+pub async fn fetch_collections_by_range(
+    pool: &PgPool,
+    start: i64,
+    end: i64,
+) -> Result<Vec<StreamCollectionRow>, sqlx::Error> {
+    sqlx::query_as::<_, StreamCollectionRow>(
+        r#"SELECT "collectionId", "imageId" FROM "CollectionItem"
+        WHERE "collectionId" >= $1 AND "collectionId" < $2
+          AND "imageId" IS NOT NULL
+          AND status = 'ACCEPTED'
+        ORDER BY "collectionId", "imageId""#,
     )
     .bind(start)
     .bind(end)
