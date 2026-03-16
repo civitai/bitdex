@@ -125,6 +125,23 @@ All test data goes under `.test-data/` in the project root (gitignored). **Never
 
 ### Benchmarks & Performance
 
-- Run `/microbench` for throwaway performance experiments (use the scratch crate, not `tests/`)
-- Run `/perf` for memory measurement baselines and methodology
-- Benchmark suite must run on every PR — >10% regression gets flagged
+**Benchmark-driven development is a design principle for this project.** Every performance improvement must:
+
+1. **Prove it's better.** Write a benchmark (microbench in `scratch/` for isolated operations, or an E2E script in `tools/` for system-level improvements) that measures before and after. The benchmark must be reproducible and included in the PR.
+
+2. **Not regress existing benchmarks.** Run all existing benchmarks and verify they maintain their performance level. A new optimization that speeds up cold misses but slows down cache hits is not acceptable without explicit tradeoff discussion.
+
+3. **Document the numbers.** Commit messages and PR descriptions must include concrete measurements: "userId lazy load: 2.5s → 732ms (3.4x)". Not "faster" or "improved" — actual numbers.
+
+**Available benchmark tools:**
+
+- `/microbench` — throwaway experiments in the `scratch/` crate (isolated, fast iteration)
+- `/perf` — memory measurement baselines and methodology
+- `tools/bench-warm-endpoint.mjs` — cache warming effectiveness (cold miss vs warmed hit)
+- `tools/test-cache-persistence.mjs` — cache persistence across restarts
+- `cargo run --release --bin bitdex-benchmark` — full benchmark suite (insert, query, contention)
+- `cargo run --release --features loadtest --bin bitdex-loadtest` — HTTP load testing with real traffic patterns
+
+**Benchmark suite must run on every PR — >10% regression gets flagged.**
+
+**When adding a new optimization:** Write the benchmark first (or at least concurrently), run it before your change to establish a baseline, then run it after to prove the improvement. Include both numbers in the commit message.
