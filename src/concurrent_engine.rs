@@ -4242,11 +4242,13 @@ impl ConcurrentEngine {
     /// `reconstruct_value()` for sorted-key rebuilding. Bound caches load
     /// next so cached sorts are warm before any queries arrive. Filter
     /// fields (the bulk of memory) load last.
-    pub fn preload_all_fields(&self) {
+    /// Load eager sort and filter fields in the background.
+    /// Called after the server starts listening so health checks pass immediately.
+    pub fn preload_eager_fields(&self) {
         use crate::query::{FilterClause, Value};
         let t0 = std::time::Instant::now();
 
-        // Phase 1: Load eager sort fields only
+        // Sort fields first (needed for sort traversal on cache miss)
         let eager_sorts: Vec<&str> = self.config.sort_fields.iter()
             .filter(|sc| sc.eager_load)
             .map(|sc| sc.name.as_str())
@@ -4255,21 +4257,15 @@ impl ConcurrentEngine {
         for name in &eager_sorts {
             let _ = self.ensure_fields_loaded(&empty_clauses, Some(name));
         }
-        let sort_elapsed = t0.elapsed();
         if !eager_sorts.is_empty() {
             eprintln!(
-                "Preload phase 1: {} sort fields in {:.1}s",
+                "Preload: {} sort fields in {:.1}s",
                 eager_sorts.len(),
-                sort_elapsed.as_secs_f64(),
+                t0.elapsed().as_secs_f64(),
             );
         }
 
-        // Phase 2: Load bound cache shards (requires sort fields from phase 1)
-        if self.config.cache.preload_bounds {
-            self.preload_bound_cache();
-        }
-
-        // Phase 3: Load eager filter fields only
+        // Filter fields
         let t2 = std::time::Instant::now();
         let eager_filters: Vec<&str> = self.config.filter_fields.iter()
             .filter(|fc| fc.eager_load)
@@ -4285,7 +4281,7 @@ impl ConcurrentEngine {
             }
             let _ = self.ensure_fields_loaded(&clauses, None);
             eprintln!(
-                "Preload phase 3: {} filter fields in {:.1}s",
+                "Preload: {} filter fields in {:.1}s",
                 eager_filters.len(),
                 t2.elapsed().as_secs_f64(),
             );
@@ -4294,7 +4290,7 @@ impl ConcurrentEngine {
         let total_eager = eager_sorts.len() + eager_filters.len();
         if total_eager > 0 {
             eprintln!(
-                "Background preload complete: {} sort + {} filter fields in {:.1}s",
+                "Preload complete: {} sort + {} filter fields in {:.1}s",
                 eager_sorts.len(),
                 eager_filters.len(),
                 t0.elapsed().as_secs_f64(),
