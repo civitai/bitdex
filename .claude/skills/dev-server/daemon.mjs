@@ -592,7 +592,7 @@ async function restartInstancesAfterBuild(target) {
   }
 }
 
-async function requestBuild({ target, profile, holder }) {
+async function requestBuild({ target, profile, holder, cwd }) {
   const tgt = target || 'bitdex-server';
 
   // If a build is already running, kill it and restart
@@ -621,11 +621,12 @@ async function requestBuild({ target, profile, holder }) {
   buildLock.logBuffer = [];
 
 
+  const buildCwd = cwd || PROJECT_ROOT;
   const cargoArgs = buildCargoArgs(tgt, profile);
-  pushBuildLog('daemon', `Building: cargo ${cargoArgs.join(' ')}`);
+  pushBuildLog('daemon', `Building: cargo ${cargoArgs.join(' ')} (cwd: ${buildCwd})`);
 
   const proc = spawn('cargo', cargoArgs, {
-    cwd: PROJECT_ROOT,
+    cwd: buildCwd,
     shell: IS_WIN,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -752,7 +753,7 @@ function acquireTestSlot({ holder, slot }) {
   return { slot: target.id, targetDir: target.targetDir };
 }
 
-function runTestInSlot(slotId, { command, filter, holder }) {
+function runTestInSlot(slotId, { command, filter, holder, cwd }) {
   const idx = parseInt(slotId, 10) - 1;
   if (idx < 0 || idx >= testSlots.length) return { error: `Invalid slot ${slotId}` };
   const slot = testSlots[idx];
@@ -770,10 +771,11 @@ function runTestInSlot(slotId, { command, filter, holder }) {
     cmdStr = `cargo test${filter ? ' -- ' + filter : ''}`;
   }
 
+  const testCwd = cwd || PROJECT_ROOT;
   mkdirSync(slot.targetDir, { recursive: true });
 
   const proc = spawn('cargo', args, {
-    cwd: PROJECT_ROOT,
+    cwd: testCwd,
     shell: IS_WIN,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1274,7 +1276,7 @@ async function handleRequest(req, res) {
       const body = await parseBody(req);
       const acq = acquireTestSlot({ holder: body.holder, slot: body.slot });
       if (acq.error) return json(res, 409, acq);
-      const result = runTestInSlot(acq.slot, { command: body.command, filter: body.filter, holder: body.holder });
+      const result = runTestInSlot(acq.slot, { command: body.command, filter: body.filter, holder: body.holder, cwd: body.cwd });
       if (result.error) return json(res, 500, result);
       return json(res, 200, result);
     }

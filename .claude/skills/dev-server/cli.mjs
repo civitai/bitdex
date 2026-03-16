@@ -292,7 +292,7 @@ async function cmdBuild() {
   // Request build via daemon (it runs cargo and captures output)
   const result = await daemonFetch('/build/run', {
     method: 'POST',
-    body: { target, profile, holder: worktree },
+    body: { target, profile, holder: worktree, cwd: worktree },
   });
 
   if (result.action === 'building') {
@@ -396,7 +396,7 @@ async function cmdTest() {
   console.error('Requesting test slot...');
   const result = await daemonFetch('/test/run', {
     method: 'POST',
-    body: { filter: resolvedFilter, slot: slot ? parseInt(slot, 10) : undefined, holder },
+    body: { filter: resolvedFilter, slot: slot ? parseInt(slot, 10) : undefined, holder, cwd: holder },
   });
 
   if (result.error) {
