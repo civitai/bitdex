@@ -1952,6 +1952,7 @@ impl ConcurrentEngine {
                                 if let Some(entry) = uc.get_mut(&ukey) {
                                     entry.expand(&sorted_slots, value_fn);
                                     entry.set_prefetching(false);
+                                    uc.record_extension();
                                     tracing::debug!(
                                         "Prefetch: expanded {} {:?} by {} slots",
                                         ukey.sort_field, ukey.direction, sorted_slots.len(),
@@ -3021,8 +3022,10 @@ impl ConcurrentEngine {
                                 let mut uc = self.unified_cache.lock();
                                 if let Some(entry) = uc.lookup(&ukey) {
                                     entry.expand(&sorted_slots, value_fn);
+                                    uc.record_extension();
                                 }
                             }
+                            self.unified_cache.lock().record_wall_hit();
                             // Re-query from expanded entry (now has radix)
                             let expanded_data = {
                                 let mut uc = self.unified_cache.lock();
@@ -3087,6 +3090,7 @@ impl ConcurrentEngine {
                                         let threshold = self.unified_cache.lock().config().prefetch_threshold;
                                         if keys.len() > 0 && pos as f64 / keys.len() as f64 >= threshold {
                                             let _ = tx.try_send(ukey.clone());
+                                            self.unified_cache.lock().record_prefetch();
                                         }
                                     }
                                 }
@@ -3099,6 +3103,7 @@ impl ConcurrentEngine {
                     }
 
                     // Expansion needed — fall through to slow path with pre-fetched cache data.
+                    self.unified_cache.lock().record_wall_hit();
                     return self.execute_query_slow_path(
                         query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix,
                         Some((ukey, unified_bm, has_more, min_val, capacity, cached_total)),
@@ -3313,8 +3318,10 @@ impl ConcurrentEngine {
                                 let mut uc = self.unified_cache.lock();
                                 if let Some(entry) = uc.lookup(&ukey) {
                                     entry.expand(&sorted_slots, value_fn);
+                                    uc.record_extension();
                                 }
                             }
+                            self.unified_cache.lock().record_wall_hit();
                             let expanded_data = {
                                 let mut uc = self.unified_cache.lock();
                                 uc.lookup(&ukey).map(|e| {
@@ -3378,6 +3385,7 @@ impl ConcurrentEngine {
                                         let threshold = self.unified_cache.lock().config().prefetch_threshold;
                                         if keys.len() > 0 && pos as f64 / keys.len() as f64 >= threshold {
                                             let _ = tx.try_send(ukey.clone());
+                                            self.unified_cache.lock().record_prefetch();
                                         }
                                     }
                                 }
@@ -3389,6 +3397,7 @@ impl ConcurrentEngine {
                     }
 
                     // Expansion needed — fall through to slow path
+                    self.unified_cache.lock().record_wall_hit();
                     return self.execute_query_slow_path_traced(
                         query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix,
                         Some((ukey, unified_bm, has_more, min_val, capacity, cached_total)),
@@ -3502,6 +3511,7 @@ impl ConcurrentEngine {
                         let mut uc = self.unified_cache.lock();
                         if let Some(entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
+                            uc.record_extension();
                         }
                     }
 
@@ -3675,6 +3685,7 @@ impl ConcurrentEngine {
                         let mut uc = self.unified_cache.lock();
                         if let Some(entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
+                            uc.record_extension();
                         }
                     }
                     true
@@ -3842,6 +3853,7 @@ impl ConcurrentEngine {
                         let mut uc = self.unified_cache.lock();
                         if let Some(entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
+                            uc.record_extension();
                         }
                     }
 
@@ -4034,6 +4046,7 @@ impl ConcurrentEngine {
                         let mut uc = self.unified_cache.lock();
                         if let Some(entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
+                            uc.record_extension();
                         }
                     }
                     true

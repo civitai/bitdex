@@ -2434,6 +2434,21 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.cache_invalidations_total
                 .with_label_values(&[name])
                 .set(uc.invalidations as i64);
+            m.cache_entries_initial
+                .with_label_values(&[name])
+                .set(uc.entries_initial as i64);
+            m.cache_entries_expanded
+                .with_label_values(&[name])
+                .set(uc.entries_expanded as i64);
+            m.cache_extensions_total
+                .with_label_values(&[name])
+                .set(uc.extensions as i64);
+            m.cache_wall_hits_total
+                .with_label_values(&[name])
+                .set(uc.wall_hits as i64);
+            m.cache_prefetch_total
+                .with_label_values(&[name])
+                .set(uc.prefetches as i64);
 
             // Per-field bitmap memory gauges
             let (slot_bytes, _filter_bytes, _sort_bytes, _ce, _cb, filter_details, sort_details) =

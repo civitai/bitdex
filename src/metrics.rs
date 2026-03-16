@@ -35,6 +35,11 @@ pub struct Metrics {
     pub cache_invalidations_total: IntGaugeVec,
     pub cache_entries: IntGaugeVec,
     pub cache_bytes: IntGaugeVec,
+    pub cache_entries_initial: IntGaugeVec,
+    pub cache_entries_expanded: IntGaugeVec,
+    pub cache_extensions_total: IntGaugeVec,
+    pub cache_wall_hits_total: IntGaugeVec,
+    pub cache_prefetch_total: IntGaugeVec,
     // -- Bitmap memory --
     pub filter_bitmap_bytes: IntGaugeVec,
     pub filter_bitmap_count: IntGaugeVec,
@@ -179,6 +184,36 @@ impl Metrics {
 
         let cache_bytes = IntGaugeVec::new(
             Opts::new("bitdex_cache_bytes", "Unified cache memory bytes"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_entries_initial = IntGaugeVec::new(
+            Opts::new("bitdex_cache_entries_initial", "Cache entries at initial capacity (sorted vec)"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_entries_expanded = IntGaugeVec::new(
+            Opts::new("bitdex_cache_entries_expanded", "Cache entries at expanded capacity (radix)"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_extensions_total = IntGaugeVec::new(
+            Opts::new("bitdex_cache_extensions_total", "Cumulative cache entry expansions from initial to expanded"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_wall_hits_total = IntGaugeVec::new(
+            Opts::new("bitdex_cache_wall_hits_total", "Cumulative cache wall hits (cursor past cached entries)"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_prefetch_total = IntGaugeVec::new(
+            Opts::new("bitdex_cache_prefetch_total", "Cumulative prefetch triggers for background expansion"),
             &["index"],
         )
         .unwrap();
@@ -357,6 +392,11 @@ impl Metrics {
         registry.register(Box::new(cache_invalidations_total.clone())).unwrap();
         registry.register(Box::new(cache_entries.clone())).unwrap();
         registry.register(Box::new(cache_bytes.clone())).unwrap();
+        registry.register(Box::new(cache_entries_initial.clone())).unwrap();
+        registry.register(Box::new(cache_entries_expanded.clone())).unwrap();
+        registry.register(Box::new(cache_extensions_total.clone())).unwrap();
+        registry.register(Box::new(cache_wall_hits_total.clone())).unwrap();
+        registry.register(Box::new(cache_prefetch_total.clone())).unwrap();
         registry
             .register(Box::new(filter_bitmap_bytes.clone()))
             .unwrap();
@@ -420,6 +460,11 @@ impl Metrics {
             cache_invalidations_total,
             cache_entries,
             cache_bytes,
+            cache_entries_initial,
+            cache_entries_expanded,
+            cache_extensions_total,
+            cache_wall_hits_total,
+            cache_prefetch_total,
             filter_bitmap_bytes,
             filter_bitmap_count,
             sort_bitmap_bytes,

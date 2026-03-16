@@ -520,6 +520,13 @@ pub struct UnifiedCacheStats {
     pub pending_shard_count: usize,
     pub dirty_shard_count: usize,
     pub meta_dirty: bool,
+    // Capacity tier counts
+    pub entries_initial: usize,
+    pub entries_expanded: usize,
+    // Event counters
+    pub extensions: u64,
+    pub wall_hits: u64,
+    pub prefetches: u64,
 }
 
 /// Per-entry diagnostic detail.
@@ -567,6 +574,12 @@ pub struct UnifiedCache {
     /// Persisted total_matched values keyed by entry ID, populated from meta.bin on startup.
     /// Consumed during shard restore to get the real total instead of bitmap cardinality.
     meta_total_matched: HashMap<CacheEntryId, u64>,
+    /// Cumulative count of entry expansions from initial to expanded capacity.
+    extensions: u64,
+    /// Cumulative count of cache wall hits (cursor past cached entries, triggering slow path).
+    wall_hits: u64,
+    /// Cumulative count of prefetch triggers (background expansion requests).
+    prefetches: u64,
 }
 
 impl UnifiedCache {
@@ -590,6 +603,9 @@ impl UnifiedCache {
             persistence_enabled: false,
             meta_has_more: HashMap::new(),
             meta_total_matched: HashMap::new(),
+            extensions: 0,
+            wall_hits: 0,
+            prefetches: 0,
         }
     }
 
@@ -805,6 +821,17 @@ impl UnifiedCache {
 
     /// Return a stats snapshot.
     pub fn stats(&self) -> UnifiedCacheStats {
+        // Count entries by capacity tier
+        let mut entries_initial = 0usize;
+        let mut entries_expanded = 0usize;
+        for entry in self.entries.values() {
+            if entry.capacity >= entry.max_capacity {
+                entries_expanded += 1;
+            } else {
+                entries_initial += 1;
+            }
+        }
+
         UnifiedCacheStats {
             entries: self.entries.len(),
             hits: self.hits,
@@ -821,6 +848,11 @@ impl UnifiedCache {
             pending_shard_count: self.pending_shards.len(),
             dirty_shard_count: self.shard_dirty.len(),
             meta_dirty: self.meta_dirty,
+            entries_initial,
+            entries_expanded,
+            extensions: self.extensions,
+            wall_hits: self.wall_hits,
+            prefetches: self.prefetches,
         }
     }
 
@@ -849,6 +881,21 @@ impl UnifiedCache {
     /// Record a cache entry update (called by flush thread during maintenance).
     pub fn record_update(&mut self) {
         self.updates += 1;
+    }
+
+    /// Record a cache entry expansion from initial to expanded capacity.
+    pub fn record_extension(&mut self) {
+        self.extensions += 1;
+    }
+
+    /// Record a cache wall hit (cursor went past cached entries, triggering expansion/slow path).
+    pub fn record_wall_hit(&mut self) {
+        self.wall_hits += 1;
+    }
+
+    /// Record a prefetch trigger (background expansion request sent).
+    pub fn record_prefetch(&mut self) {
+        self.prefetches += 1;
     }
 
     /// Get the cache config.
