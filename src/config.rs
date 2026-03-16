@@ -370,6 +370,10 @@ pub struct CacheConfig {
     /// Set to 0.0 or 1.0 to disable prefetching.
     #[serde(default = "default_prefetch_threshold")]
     pub prefetch_threshold: f64,
+    /// Preload all bound cache shards at startup instead of lazy-loading on first query.
+    /// Eliminates cold-start latency for cached sorts. Default: true.
+    #[serde(default = "default_preload_bounds")]
+    pub preload_bounds: bool,
 }
 
 fn default_cache_max_entries() -> usize {
@@ -390,6 +394,9 @@ fn default_bound_max_count() -> usize {
 fn default_prefetch_threshold() -> f64 {
     0.95
 }
+fn default_preload_bounds() -> bool {
+    true
+}
 
 impl Default for CacheConfig {
     fn default() -> Self {
@@ -400,6 +407,7 @@ impl Default for CacheConfig {
             bound_max_size: default_bound_max_size(),
             bound_max_count: default_bound_max_count(),
             prefetch_threshold: default_prefetch_threshold(),
+            preload_bounds: default_preload_bounds(),
         }
     }
 }

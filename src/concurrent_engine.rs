@@ -4265,6 +4265,28 @@ impl ConcurrentEngine {
         );
     }
 
+    /// Pre-load all bound cache shards from disk.
+    /// Called after `preload_all_fields()` so sort fields are available for value reconstruction.
+    pub fn preload_bound_cache(&self) {
+        use crate::query::SortDirection;
+        if self.bound_store.is_none() {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let mut loaded = 0usize;
+        for sc in &self.config.sort_fields {
+            for dir in &[SortDirection::Desc, SortDirection::Asc] {
+                self.ensure_cache_shard_loaded(&sc.name, *dir);
+                loaded += 1;
+            }
+        }
+        eprintln!(
+            "Bound cache preload complete: {} shards in {:.1}s",
+            loaded,
+            t0.elapsed().as_secs_f64(),
+        );
+    }
+
     /// Flush loop stats: (publish_count, cumulative_duration_nanos, last_duration_nanos).
     pub fn flush_stats(&self) -> (u64, u64, u64) {
         (
