@@ -38,6 +38,7 @@ struct Config {
     default_query_format: Option<String>,
     log_level: String,
     enable_traces: bool,
+    admin_token: Option<String>,
 }
 
 /// Get the directory containing the current executable.
@@ -130,6 +131,7 @@ fn parse_config() -> Config {
     let mut default_query_format: Option<String> = None;
     let mut log_level = "warn".to_string();
     let mut enable_traces = false;
+    let mut admin_token: Option<String> = None;
 
     // --- Config file ---
     // Only auto-generate bitdex.toml if no CLI args were passed at all
@@ -168,6 +170,9 @@ fn parse_config() -> Config {
         if let Some(v) = table.get("enable_traces").and_then(|v| v.as_bool()) {
             enable_traces = v;
         }
+        if let Some(v) = table.get("admin_token").and_then(|v| v.as_str()) {
+            admin_token = Some(v.to_string());
+        }
     }
 
     // --- CLI flags override everything ---
@@ -190,7 +195,14 @@ fn parse_config() -> Config {
         enable_traces = true;
     }
 
-    Config { port, data_dir, index: cli_index, rebuild, default_query_format, log_level, enable_traces }
+    // Env var overrides TOML for admin token (safer for deployments)
+    if let Ok(v) = std::env::var("BITDEX_ADMIN_TOKEN") {
+        if !v.is_empty() {
+            admin_token = Some(v);
+        }
+    }
+
+    Config { port, data_dir, index: cli_index, rebuild, default_query_format, log_level, enable_traces, admin_token }
 }
 
 #[tokio::main]
@@ -239,5 +251,6 @@ async fn main() {
     if let Some(fmt) = config.default_query_format {
         server = server.with_default_query_format(fmt);
     }
+    server = server.with_admin_token(config.admin_token);
     server.serve(addr).await.expect("Server failed");
 }

@@ -6,6 +6,46 @@ All endpoints accept and return JSON. Content-Type: `application/json`.
 
 ---
 
+## Authentication
+
+Admin endpoints (anything that mutates state) require a Bearer token. Public endpoints (queries, stats, health) are open.
+
+**Configuration** (in priority order):
+1. `BITDEX_ADMIN_TOKEN` environment variable (recommended for deployments)
+2. `admin_token` in `bitdex.toml`
+3. Neither set → admin endpoints return `403 Forbidden` (fail-safe)
+
+**Usage:**
+```
+Authorization: Bearer <your-admin-token>
+```
+
+**Internal requests** (no `X-Forwarded-For` header) bypass auth — this allows sidecars and localhost access without a token. External requests through a reverse proxy always have `X-Forwarded-For` and must authenticate.
+
+### Admin endpoints (token required)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/indexes` | Create index |
+| DELETE | `/api/indexes/{name}` | Delete index |
+| PATCH | `/api/indexes/{name}/config` | Patch config (eager_load, cache) |
+| POST | `/api/indexes/{name}/load` | Bulk load NDJSON |
+| POST | `/api/indexes/{name}/documents` | Batch insert |
+| DELETE | `/api/indexes/{name}/documents` | Delete by ID |
+| POST | `/api/indexes/{name}/documents/upsert` | Upsert |
+| DELETE | `/api/indexes/{name}/cache` | Clear cache |
+| DELETE | `/api/indexes/{name}/cache/persistent` | Purge persistent cache |
+| POST | `/api/indexes/{name}/warm` | Warm cache |
+| POST | `/api/indexes/{name}/rebuild` | Rebuild bitmaps |
+| POST/DELETE | `/api/indexes/{name}/fields` | Add/remove fields |
+| POST | `/api/indexes/{name}/snapshot` | Save snapshot |
+
+### Public endpoints (no auth)
+
+Health, queries, stats, traces, tasks, cursors, metrics, formats, UI.
+
+---
+
 ## Server CLI
 
 ```bash

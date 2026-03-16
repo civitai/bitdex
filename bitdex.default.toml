@@ -36,3 +36,8 @@ data_dir = "data"
 # Records clause-level timing, cardinality cascade, cache hits, and sort metrics
 # Useful for development and debugging; disable in production to avoid disk I/O
 # enable_traces = false
+
+# Admin token for gating mutating endpoints (config patch, cache clear, snapshot, etc.)
+# If not set, admin endpoints return 403 Forbidden (fail-safe).
+# BITDEX_ADMIN_TOKEN env var overrides this value (recommended for deployments).
+# admin_token = "your-secret-token-here"

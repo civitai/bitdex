@@ -129,6 +129,11 @@ const SUITES = [
     file: 'tests/e2e/e2e-query-formats.mjs',
     description: 'Pluggable query formats (equivalence, ?format= param, compact/meilisearch, error handling)',
   },
+  {
+    name: 'remote-dash',
+    file: 'tests/e2e/e2e-remote-dash.mjs',
+    description: 'Remote dashboard endpoints (health, index discovery, stats, config patch, cache clear, traces)',
+  },
 ];
 
 // Suites that manage their own server lifecycle (not auto-run)

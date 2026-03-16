@@ -273,9 +273,60 @@ struct AppState {
     metrics: Metrics,
     parser_registry: crate::parser::registry::ParserRegistry,
     enable_traces: bool,
+    admin_token: Option<String>,
 }
 
 type SharedState = Arc<AppState>;
+
+/// Middleware: require admin token for mutating endpoints.
+/// If no token is configured, all admin endpoints return 403 for external requests.
+/// Requests without X-Forwarded-For are treated as internal (sidecar/localhost) and
+/// allowed without auth. External requests (via ingress) always have X-Forwarded-For.
+/// Token is checked via `Authorization: Bearer <token>` header.
+async fn require_admin(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+
+    // No X-Forwarded-For = internal request (sidecar, localhost dev) — allow without auth.
+    // Traefik/any reverse proxy always sets X-Forwarded-For for external requests.
+    let is_external = req.headers().contains_key("x-forwarded-for");
+    if !is_external {
+        return next.run(req).await;
+    }
+
+    match &state.admin_token {
+        None => {
+            // No token configured — admin endpoints are disabled for external requests
+            (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({
+                "error": "Admin endpoints are disabled. Set BITDEX_ADMIN_TOKEN env var or admin_token in config to enable."
+            }))).into_response()
+        }
+        Some(expected) => {
+            let auth = req.headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match auth {
+                Some(token) if token == expected.as_str() => {
+                    next.run(req).await
+                }
+                Some(_) => {
+                    (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({
+                        "error": "Invalid admin token"
+                    }))).into_response()
+                }
+                None => {
+                    (StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({
+                        "error": "Authorization header required: Bearer <admin_token>"
+                    }))).into_response()
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // API request/response types
@@ -652,11 +703,12 @@ pub struct BitdexServer {
     rebuild: bool,
     default_query_format: Option<String>,
     enable_traces: bool,
+    admin_token: Option<String>,
 }
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, rebuild: false, default_query_format: None, enable_traces: false }
+        Self { data_dir, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None }
     }
 
     /// Enable rebuild mode: on startup, delete existing bitmap indexes and
@@ -679,6 +731,13 @@ impl BitdexServer {
         self
     }
 
+    /// Set admin token for gating mutating endpoints.
+    /// If None, admin endpoints are disabled (403).
+    pub fn with_admin_token(mut self, token: Option<String>) -> Self {
+        self.admin_token = token;
+        self
+    }
+
     /// Start the HTTP server. Blocks until the server shuts down.
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
         // Ensure data directory exists
@@ -689,12 +748,21 @@ impl BitdexServer {
             registry.set_default(fmt.clone());
         }
 
+        // Admin token: env var takes precedence, then TOML config
+        let admin_token = self.admin_token.clone();
+        if admin_token.is_some() {
+            eprintln!("Admin endpoints: enabled (token configured)");
+        } else {
+            eprintln!("Admin endpoints: disabled (set BITDEX_ADMIN_TOKEN to enable)");
+        }
+
         let state = Arc::new(AppState {
             data_dir: self.data_dir.clone(),
             index: Mutex::new(None),
             metrics: Metrics::new(),
             parser_registry: registry,
             enable_traces: self.enable_traces,
+            admin_token,
         });
 
         // Try to restore an existing index from disk
@@ -712,43 +780,46 @@ impl BitdexServer {
 
         let shutdown_state = Arc::clone(&state);
 
-        let app = Router::new()
-            // Index management
+        // Admin routes — require Bearer token (or disabled if no token configured)
+        let admin_routes = Router::new()
             .route("/api/indexes", post(handle_create_index))
-            .route("/api/indexes", get(handle_list_indexes))
-            .route("/api/indexes/{name}", get(handle_get_index))
             .route("/api/indexes/{name}", delete(handle_delete_index))
             .route("/api/indexes/{name}/config", patch(handle_patch_config))
-            // Data loading
             .route("/api/indexes/{name}/load", post(handle_load))
-            // Legacy /load/status removed — use /tasks or /tasks/{id} instead
-            // Query & documents
-            .route("/api/indexes/{name}/query", post(handle_query))
-            .route("/api/indexes/{name}/document", post(handle_document))
             .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
-            .route("/api/indexes/{name}/traces", get(handle_traces))
-            .route("/api/indexes/{name}/stats", get(handle_stats))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/cache/persistent", delete(handle_purge_cache))
             .route("/api/indexes/{name}/warm", post(handle_warm_cache))
             .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
             .route("/api/indexes/{name}/fields", post(handle_add_fields).delete(handle_remove_fields))
-            .route("/api/indexes/{name}/tasks", get(handle_list_tasks))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
+            .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
+            .with_state(Arc::clone(&state));
+
+        // Public routes — no auth required
+        let public_routes = Router::new()
+            .route("/api/indexes", get(handle_list_indexes))
+            .route("/api/indexes/{name}", get(handle_get_index))
+            .route("/api/indexes/{name}/query", post(handle_query))
+            .route("/api/indexes/{name}/document", post(handle_document))
+            .route("/api/indexes/{name}/traces", get(handle_traces))
+            .route("/api/indexes/{name}/stats", get(handle_stats))
+            .route("/api/indexes/{name}/tasks", get(handle_list_tasks))
             .route("/api/tasks/{task_id}", get(handle_get_task))
-            // Cursors
             .route("/api/indexes/{name}/cursors", get(handle_list_cursors))
             .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
-            // Utility
             .route("/api/health", get(handle_health))
             .route("/api/formats", get(handle_list_formats))
             .route("/metrics", get(handle_metrics))
-            // Serve static UI
             .route("/", get(handle_ui))
+            .with_state(Arc::clone(&state));
+
+        let app = Router::new()
+            .merge(admin_routes)
+            .merge(public_routes)
             .layer(CorsLayer::permissive())
-            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)) // 64MB for bulk upserts
-            .with_state(state);
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)); // 64MB for bulk upserts
 
         eprintln!("BitDex server listening on http://{}", addr);
 

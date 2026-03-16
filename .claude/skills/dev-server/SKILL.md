@@ -144,6 +144,7 @@ node .claude/skills/dev-server/cli.mjs test-slots
 | `test-slots` | Show test slot status | JSON |
 | `test-e2e [--port N]` | Coordinated E2E test run | JSON |
 | `dash` | TUI dashboard with live logs, metrics, and explain panel | Interactive |
+| `dash --remote <host:port>` | Remote TUI — stats, config, traces, cache control | Interactive |
 | `shutdown` | Kill all instances + daemon | JSON |
 
 ## Build Targets
@@ -168,6 +169,28 @@ Live terminal dashboard with instance status, Prometheus metrics, log streaming,
 | `s` | Toggle stats panel (Prometheus metrics) |
 | `j/k` | Scroll logs |
 | `q` | Quit |
+
+## Remote Dashboard
+
+```bash
+node .claude/skills/dev-server/cli.mjs dash --remote 127.0.0.1:3001
+# or: just dev-remote 127.0.0.1:3001
+```
+
+Connects directly to any BitDex server — local, remote, or production via kubectl port-forward. No daemon needed. Polls stats every 2s.
+
+| Key | Action |
+|-----|--------|
+| `e` | Explain panel — browse query traces with clause detail |
+| `c` | Config panel — view/toggle eager_load per field (Enter to toggle) |
+| `C` | Clear in-memory cache (in config mode) |
+| `P` | Purge persistent cache (in config mode) |
+| `W` | Warm cache (in config mode) |
+| `S` | Save bitmap snapshot (in config mode) |
+| `r` | Force refresh stats + traces |
+| `q` | Quit |
+
+For non-interactive remote operations (agents), use the **bitdex skill** (`/bitdex`) which has `stats`, `cache-clear`, `warm`, `snapshot`, and config commands with `BITDEX_URL` targeting.
 
 ## How It Works
 

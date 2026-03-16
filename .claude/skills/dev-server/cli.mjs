@@ -37,6 +37,38 @@ const DAEMON_SCRIPT = resolve(__dirname, 'daemon.mjs');
 const PROJECT_ROOT = resolve(__dirname, '..', '..', '..');
 const DAEMON_URL = 'http://127.0.0.1:9851';
 
+// HTTP JSON helper — uses node:http instead of fetch to avoid Windows IPv6 issues
+async function _httpJson(url, { method = 'GET', headers = {}, body, signal } = {}) {
+  const http = await import('node:http');
+  const urlObj = new URL(url);
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname: urlObj.hostname,
+      port: urlObj.port,
+      path: urlObj.pathname + urlObj.search,
+      method,
+      headers: { ...headers },
+      timeout: 5000,
+    };
+    if (body && typeof body === 'string') {
+      opts.headers['Content-Length'] = Buffer.byteLength(body);
+    }
+    const req = http.request(opts, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => data += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch { resolve({ _raw: data, _status: res.statusCode }); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    if (body && typeof body === 'string') req.write(body);
+    req.end();
+  });
+}
+
 // ─── Argument Parsing ───────────────────────────────────────────
 
 function getArg(name, defaultVal) {
@@ -1278,6 +1310,401 @@ async function cmdDashboard() {
   connectSSE();
 }
 
+// ─── Remote Dashboard ───────────────────────────────────────────
+
+async function cmdRemoteDashboard() {
+  const remote = getArg('--remote');
+  if (!remote) {
+    console.error('Usage: dash --remote <host:port> [--token <admin_token>]');
+    process.exit(1);
+  }
+  const baseUrl = remote.startsWith('http') ? remote : `http://${remote}`;
+  const adminToken = getArg('--token') || process.env.BITDEX_ADMIN_TOKEN || null;
+
+  if (!process.stdin.isTTY) {
+    console.error('Dashboard requires a TTY');
+    process.exit(1);
+  }
+
+  let cols = process.stdout.columns || 100;
+  let rows = process.stdout.rows || 30;
+  process.stdout.on('resize', () => {
+    cols = process.stdout.columns || 100;
+    rows = process.stdout.rows || 30;
+  });
+
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.setEncoding('utf8');
+  write(ALT_ON + CUR_HIDE);
+
+  let running = true;
+  let actionMsg = '';
+  let indexName = null;
+  let stats = null;
+  let health = null;
+  let configData = null; // full index definition with config
+  let traces = [];
+  let explainIdx = 0;
+  let explainMode = false;
+  let configMode = false;  // 'c' toggles config panel
+  let configCursor = 0;    // selected row in config panel
+  let configItems = [];    // [{name, type, eager_load, kind}]
+  let renderDirty = true;
+  let rendering = false;
+  let lastPollTime = 0;
+
+  function flash(msg) { actionMsg = msg; renderDirty = true; setTimeout(() => { actionMsg = ''; renderDirty = true; }, 4000); }
+
+  // Use http module instead of fetch — Node 22 undici fails on 127.0.0.1 on Windows
+  async function remoteFetch(path, opts = {}) {
+    return _httpJson(`${baseUrl}${path}`, opts);
+  }
+  // Admin fetch — includes Bearer token if configured
+  async function adminFetch(path, opts = {}) {
+    if (adminToken) {
+      opts.headers = { ...opts.headers, 'Authorization': `Bearer ${adminToken}` };
+    }
+    return _httpJson(`${baseUrl}${path}`, opts);
+  }
+
+  // Discover index name
+  async function discoverIndex() {
+    try {
+      const data = await remoteFetch('/api/indexes');
+      // Response may be [{name:...}] or {indexes:[...]} or ["name"]
+      const list = Array.isArray(data) ? data : (data.indexes || []);
+      if (list.length > 0) {
+        indexName = list[0].name || list[0];
+      }
+    } catch { /* will retry */ }
+  }
+
+  // Fetch stats + config
+  async function pollData() {
+    const now = Date.now();
+    if (now - lastPollTime < 1500) return;
+    lastPollTime = now;
+    try {
+      const h = await _httpJson(`${baseUrl}/api/health`);
+      health = h._raw === 'ok' ? { status: 'ok' } : (h.status ? h : null);
+    } catch { health = null; }
+
+    if (!indexName) {
+      await discoverIndex();
+      if (!indexName) return;
+    }
+
+    try {
+      stats = await remoteFetch(`/api/indexes/${indexName}/stats`);
+    } catch { /* keep old stats */ }
+
+    try {
+      const idx = await remoteFetch(`/api/indexes/${indexName}`);
+      configData = idx;
+      // Build config items list
+      const items = [];
+      const fc = idx.config?.filter_fields || idx.definition?.config?.filter_fields || [];
+      for (const f of fc) {
+        items.push({ name: f.name, kind: 'filter', type: f.field_type || 'single', eager_load: !!f.eager_load });
+      }
+      const sc = idx.config?.sort_fields || idx.definition?.config?.sort_fields || [];
+      for (const f of sc) {
+        items.push({ name: f.name, kind: 'sort', type: `${f.source_type || 'u32'}/${f.bits || 32}`, eager_load: !!f.eager_load });
+      }
+      configItems = items;
+    } catch { /* keep old config */ }
+  }
+
+  async function fetchTraces() {
+    if (!indexName) return;
+    try {
+      const data = await remoteFetch(`/api/indexes/${indexName}/traces?last=50`);
+      const t = data.traces || data;
+      if (Array.isArray(t) && t.length > 0) {
+        traces = t;
+        explainIdx = t.length - 1;
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  function render() {
+    const buf = [];
+    buf.push(HOME);
+
+    // ── Header
+    const healthTag = health ? `${GRN}connected${R}` : `${RED}disconnected${R}`;
+    const hdr = ` BitDex Remote ${DIM}│${R} ${baseUrl} ${DIM}│${R} ${healthTag} ${DIM}│${R} ${indexName || '(discovering...)'}`;
+    buf.push(CLR_LINE + B + CYN + hdr + R + '\n');
+    buf.push(CLR_LINE + DIM + '─'.repeat(cols) + R + '\n');
+
+    // ── Stats
+    const hw = Math.floor(cols / 2);
+    buf.push(CLR_LINE + B + ' Stats' + R + ' '.repeat(Math.max(0, hw - 7)) + B + 'Cache' + R + '\n');
+
+    const stL = [];
+    const ckL = [];
+    if (stats) {
+      // Raw stats from server use _bytes fields; daemon pre-transforms to _mb
+      const filterMb = stats.filter_bitmap_mb || (stats.filter_bitmap_bytes ? (stats.filter_bitmap_bytes / 1048576).toFixed(1) : '?');
+      const sortMb = stats.sort_bitmap_mb || (stats.sort_bitmap_bytes ? (stats.sort_bitmap_bytes / 1048576).toFixed(1) : '?');
+      const totalMb = stats.total_bitmap_mb || (filterMb !== '?' && sortMb !== '?' ? (parseFloat(filterMb) + parseFloat(sortMb)).toFixed(1) : '?');
+      const cacheEntries = stats.cache_entries ?? stats.unified_cache_entries ?? 0;
+      const cacheBytes = stats.cache_bytes ?? stats.unified_cache_bytes ?? 0;
+      const cacheHits = stats.cache_hits ?? stats.unified_cache_hits ?? 0;
+      const cacheMisses = stats.cache_misses ?? stats.unified_cache_misses ?? 0;
+      const hitRate = stats.cache_hit_rate || (cacheHits + cacheMisses > 0 ? `${((cacheHits / (cacheHits + cacheMisses)) * 100).toFixed(1)}%` : '—');
+      stL.push(`  Records: ${CYN}${fmtCount(stats.alive_count)}${R}  ${DIM}slots:${R} ${fmtCount(stats.slot_count)}  ${DIM}flush:${R} ${stats.flush_cycle ?? '—'}`);
+      stL.push(`  Bitmaps: ${CYN}${totalMb}${R} MB ${DIM}(filter ${filterMb} + sort ${sortMb})${R}`);
+      ckL.push(`  Entries: ${CYN}${cacheEntries}${R} ${DIM}(${fmtBytes(cacheBytes)})${R}`);
+      ckL.push(`  Hit rate: ${CYN}${hitRate}${R} ${DIM}(${cacheHits} hits, ${cacheMisses} misses)${R}`);
+    } else {
+      stL.push(`  ${DIM}(connecting...)${R}`);
+      ckL.push(`  ${DIM}—${R}`);
+    }
+    for (let i = 0; i < Math.max(stL.length, ckL.length); i++) {
+      const sl = stL[i] || '';
+      const cl = ckL[i] || '';
+      const sv = stripAnsi(sl);
+      buf.push(CLR_LINE + sl + ' '.repeat(Math.max(0, hw - sv.length)) + cl + '\n');
+    }
+    buf.push(CLR_LINE + DIM + '─'.repeat(cols) + R + '\n');
+
+    // ── Config panel or Explain panel
+    const HEADER_ROWS = 6;
+    const FOOTER_ROWS = 2;
+    const bodyRows = Math.max(1, rows - HEADER_ROWS - FOOTER_ROWS);
+
+    if (configMode) {
+      // Config panel: list fields with eager_load toggle
+      buf.push(CLR_LINE + B + ' Config' + R + `  ${DIM}↑↓ select  Enter toggle  c close${R}` + '\n');
+      buf.push(CLR_LINE + `  ${DIM}${pad('Field', 24)}${pad('Kind', 8)}${pad('Type', 16)}${pad('Eager', 8)}${R}` + '\n');
+      const visibleItems = configItems.slice(0, bodyRows - 3);
+      for (let i = 0; i < visibleItems.length; i++) {
+        const item = visibleItems[i];
+        const sel = i === configCursor ? `${B}▸ ` : '  ';
+        const eager = item.eager_load ? `${GRN}yes${R}` : `${DIM}no${R}`;
+        buf.push(CLR_LINE + `${sel}${BLU}${pad(item.name, 23)}${R} ${pad(item.kind, 8)}${DIM}${pad(item.type, 16)}${R}${eager}` + '\n');
+      }
+      // Fill remaining
+      for (let i = visibleItems.length; i < bodyRows - 3; i++) {
+        buf.push(CLR_LINE + '\n');
+      }
+      // Cache controls
+      buf.push(CLR_LINE + DIM + '─'.repeat(cols) + R + '\n');
+      buf.push(CLR_LINE + `  ${B}C${R}${DIM}lear cache${R}  ${B}P${R}${DIM}urge persistent${R}  ${B}W${R}${DIM}arm cache${R}  ${B}S${R}${DIM}napshot${R}` + '\n');
+    } else if (explainMode && traces.length > 0) {
+      // Explain panel
+      const t = traces[explainIdx];
+      const navLabel = `trace ${explainIdx + 1}/${traces.length}`;
+      buf.push(CLR_LINE + `${DIM}── explain ${navLabel} (←→ navigate, e close) ──${R}` + '\n');
+      const cacheTag = t.cache_hit ? `${GRN}CACHE HIT${R}` : `${YLW}MISS${R}`;
+      buf.push(CLR_LINE + `  ${B}${t.index || indexName}${R}  ${cacheTag}  total=${CYN}${fmtTime(t.total_us)}${R}  plan=${DIM}${fmtTime(t.plan_us)}${R}  filter=${DIM}${fmtTime(t.filter_us)}${R}  sort=${DIM}${fmtTime(t.sort_us)}${R}  results=${WHT}${t.result_count}${R}` + '\n');
+      if (t.clauses && t.clauses.length > 0) {
+        buf.push(CLR_LINE + `  ${DIM}${pad('#', 3)}${pad('field', 18)}${pad('op', 10)}${pad('card', 12)}${pad('acc', 12)}${pad('delta', 8)}${pad('eval', 10)}${pad('and', 10)}${pad('mode', 8)}${R}` + '\n');
+        for (const c of t.clauses.slice(0, bodyRows - 6)) {
+          const delta = c.acc_before > 0 ? `${((1 - c.acc_after / c.acc_before) * 100).toFixed(0)}%` : '—';
+          const dc = delta !== '—' && parseInt(delta) > 50 ? GRN : (delta !== '—' && parseInt(delta) > 10 ? YLW : '');
+          buf.push(CLR_LINE + `  ${pad(String(c.ord), 3)}${BLU}${pad(trunc(c.field, 16), 18)}${R}${pad(c.op, 10)}${pad(fmtCount(c.card), 12)}${pad(fmtCount(c.acc_after), 12)}${dc}${pad(delta, 8)}${R}${DIM}${pad(fmtTime(c.eval_us), 10)}${pad(fmtTime(c.and_us), 10)}${R}${pad(c.mode, 8)}` + '\n');
+        }
+      }
+      if (t.sort) {
+        buf.push(CLR_LINE + `  ${DIM}sort:${R} ${BLU}${t.sort.field}${R} ${YLW}${t.sort.dir}${R}  in=${fmtCount(t.sort.input)} out=${fmtCount(t.sort.output)}  ${DIM}${fmtTime(t.sort.time_us)}${R}` + '\n');
+      }
+      // Fill remaining
+      const usedRows = 2 + (t.clauses ? Math.min(t.clauses.length, bodyRows - 6) + 1 : 0) + (t.sort ? 1 : 0);
+      for (let i = usedRows; i < bodyRows; i++) {
+        buf.push(CLR_LINE + '\n');
+      }
+    } else {
+      // Default: show field summary + recent trace summary
+      buf.push(CLR_LINE + B + ' Fields' + R + '\n');
+      const eagerFilters = configItems.filter(i => i.kind === 'filter' && i.eager_load);
+      const lazyFilters = configItems.filter(i => i.kind === 'filter' && !i.eager_load);
+      const eagerSorts = configItems.filter(i => i.kind === 'sort' && i.eager_load);
+      const lazySorts = configItems.filter(i => i.kind === 'sort' && !i.eager_load);
+      buf.push(CLR_LINE + `  ${DIM}Filter:${R} ${GRN}${eagerFilters.length}${R} eager, ${DIM}${lazyFilters.length} lazy${R}  ${DIM}Sort:${R} ${GRN}${eagerSorts.length}${R} eager, ${DIM}${lazySorts.length} lazy${R}` + '\n');
+
+      // Recent traces summary
+      buf.push(CLR_LINE + '\n');
+      buf.push(CLR_LINE + B + ' Recent Traces' + R + `  ${DIM}(press e for detail)${R}` + '\n');
+      if (traces.length === 0) {
+        buf.push(CLR_LINE + `  ${DIM}(none — press e to fetch)${R}` + '\n');
+      } else {
+        buf.push(CLR_LINE + `  ${DIM}${pad('#', 4)}${pad('results', 10)}${pad('total', 10)}${pad('filter', 10)}${pad('sort', 10)}${pad('cache', 7)}${R}` + '\n');
+        const recent = traces.slice(-Math.min(traces.length, bodyRows - 8));
+        for (let i = 0; i < recent.length; i++) {
+          const t = recent[i];
+          const cache = t.cache_hit ? `${GRN}hit${R}` : `${DIM}miss${R}`;
+          buf.push(CLR_LINE + `  ${DIM}${pad(String(i + 1), 4)}${R}${pad(fmtCount(t.result_count), 10)}${CYN}${pad(fmtTime(t.total_us), 10)}${R}${pad(fmtTime(t.filter_us), 10)}${pad(fmtTime(t.sort_us), 10)}${cache}` + '\n');
+        }
+      }
+      // Fill remaining
+      const usedRows = 5 + Math.min(traces.length, bodyRows - 8) + (traces.length > 0 ? 1 : 0);
+      for (let i = usedRows; i < bodyRows; i++) {
+        buf.push(CLR_LINE + '\n');
+      }
+    }
+
+    // ── Footer
+    buf.push(CLR_LINE + DIM + '─'.repeat(cols) + R + '\n');
+    if (actionMsg) {
+      buf.push(CLR_LINE + ` ${YLW}${actionMsg}${R}` + CLR_BELOW);
+    } else {
+      buf.push(CLR_LINE + `  ${B}e${R}${DIM}xplain${R}  ${B}c${R}${DIM}onfig${R}  ${B}r${R}${DIM}efresh${R}  ${B}q${R}${DIM}uit${R}` + CLR_BELOW);
+    }
+
+    if (process.stdout.cork) process.stdout.cork();
+    write(buf.join(''));
+    if (process.stdout.uncork) process.stdout.uncork();
+  }
+
+  // Render timer
+  const renderTimer = setInterval(() => {
+    if (!renderDirty || rendering) return;
+    renderDirty = false;
+    rendering = true;
+    render();
+    rendering = false;
+  }, 250);
+
+  // Poll timer
+  const pollTimer = setInterval(async () => {
+    await pollData();
+    renderDirty = true;
+  }, 2000);
+
+  // Initial data fetch
+  await pollData();
+  await fetchTraces();
+  renderDirty = true;
+
+  // Keyboard handler
+  process.stdin.on('data', async (key) => {
+    if (!running) return;
+
+    if (configMode) {
+      if (key === 'c' || key === '\x1b') {
+        configMode = false;
+        renderDirty = true;
+        return;
+      }
+      if (key === '\x1b[A') { // Up
+        configCursor = Math.max(0, configCursor - 1);
+        renderDirty = true;
+        return;
+      }
+      if (key === '\x1b[B') { // Down
+        configCursor = Math.min(configItems.length - 1, configCursor + 1);
+        renderDirty = true;
+        return;
+      }
+      if (key === '\r' || key === '\n') { // Toggle eager_load
+        const item = configItems[configCursor];
+        if (!item || !indexName) return;
+        const newVal = !item.eager_load;
+        const patchKey = item.kind === 'filter' ? 'filter_fields' : 'sort_fields';
+        const body = { [patchKey]: { [item.name]: { eager_load: newVal } } };
+        try {
+          flash(`${item.name}: eager_load → ${newVal}...`);
+          await adminFetch(`/api/indexes/${indexName}/config`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          item.eager_load = newVal;
+          flash(`${item.name}: eager_load = ${newVal}`);
+        } catch (e) {
+          flash(`Error: ${e.message}`);
+        }
+        renderDirty = true;
+        return;
+      }
+      // Cache actions in config mode
+      if (key === 'C' && indexName) {
+        flash('Clearing cache...');
+        try { await adminFetch(`/api/indexes/${indexName}/cache`, { method: 'DELETE' }); flash('Cache cleared'); } catch (e) { flash(`Error: ${e.message}`); }
+        return;
+      }
+      if (key === 'P' && indexName) {
+        flash('Purging persistent cache...');
+        try { await remoteFetch(`/api/indexes/${indexName}/cache/persistent`, { method: 'DELETE' }); flash('Persistent cache purged'); } catch (e) { flash(`Error: ${e.message}`); }
+        return;
+      }
+      if (key === 'W' && indexName) {
+        flash('Warming cache...');
+        try { await adminFetch(`/api/indexes/${indexName}/warm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); flash('Cache warm started'); } catch (e) { flash(`Error: ${e.message}`); }
+        return;
+      }
+      if (key === 'S' && indexName) {
+        flash('Saving snapshot...');
+        try { await adminFetch(`/api/indexes/${indexName}/snapshot`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); flash('Snapshot saved'); } catch (e) { flash(`Error: ${e.message}`); }
+        return;
+      }
+      return;
+    }
+
+    if (explainMode) {
+      if (key === '\x1b[D' || key === '\x1b[A') {
+        explainIdx = Math.max(0, explainIdx - 1);
+        renderDirty = true;
+        return;
+      }
+      if (key === '\x1b[C' || key === '\x1b[B') {
+        explainIdx = Math.min(traces.length - 1, explainIdx + 1);
+        renderDirty = true;
+        return;
+      }
+      if (key === 'e' || key === '\x1b') {
+        explainMode = false;
+        renderDirty = true;
+        return;
+      }
+      return;
+    }
+
+    // Ignore multi-byte escapes
+    if (key.length > 1 && key[0] === '\x1b') return;
+
+    if (key === 'q' || key === '\x03') {
+      running = false;
+      clearInterval(renderTimer);
+      clearInterval(pollTimer);
+      write(CUR_SHOW + ALT_OFF);
+      process.stdin.setRawMode(false);
+      process.exit(0);
+    }
+
+    if (key === 'e') {
+      if (traces.length === 0) {
+        flash('Fetching traces...');
+        const ok = await fetchTraces();
+        if (!ok) { flash('No traces available'); return; }
+      }
+      explainMode = true;
+      flash(`Explain: ${traces.length} traces`);
+      renderDirty = true;
+    }
+
+    if (key === 'c') {
+      configMode = true;
+      configCursor = 0;
+      renderDirty = true;
+    }
+
+    if (key === 'r') {
+      flash('Refreshing...');
+      lastPollTime = 0;
+      await pollData();
+      await fetchTraces();
+      renderDirty = true;
+      flash('Refreshed');
+    }
+  });
+}
+
 // ─── Traces ─────────────────────────────────────────────────────
 
 async function resolveRunningInstance() {
@@ -1362,6 +1789,11 @@ Status messages go to stderr.`);
 async function main() {
   if (command === 'help') return cmdHelp();
 
+  // Remote dashboard bypasses daemon entirely — connects directly to a BitDex server
+  if ((command === 'dash' || command === 'dashboard') && hasFlag('--remote')) {
+    return cmdRemoteDashboard();
+  }
+
   if (!await ensureDaemon()) {
     console.log(JSON.stringify({ error: 'Could not connect to daemon' }));
     process.exit(1);
@@ -1380,7 +1812,9 @@ async function main() {
     case 'test': return cmdTest();
     case 'test-slots': return cmdTestSlots();
     case 'test-e2e': return cmdTestE2e();
-    case 'dash': case 'dashboard': return cmdDashboard();
+    case 'dash': case 'dashboard':
+      if (hasFlag('--remote')) return cmdRemoteDashboard();
+      return cmdDashboard();
     case 'restart': return cmdRestart();
     case 'force-kill': return cmdForceKill();
     case 'shutdown': return cmdShutdown();

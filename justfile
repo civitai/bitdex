@@ -187,6 +187,10 @@ dev-new *ARGS:
 dev-dash:
     node {{_cli}} dash
 
+# Open the remote TUI dashboard (connects directly to a BitDex server)
+dev-remote HOST_PORT:
+    node {{_cli}} dash --remote {{HOST_PORT}}
+
 # Show status of all managed instances, datasets, and locks
 dev-status:
     node {{_cli}} status
