@@ -44,25 +44,27 @@ pub fn process_collection_items_csv(
         file_len as f64 / (1024.0 * 1024.0)
     );
 
-    // Split into rayon chunks
+    // Split into rayon chunks (handle small files gracefully)
     let num_threads = rayon::current_num_threads();
     let chunk_size = file_len / num_threads.max(1);
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_threads);
-    let mut start = 0;
-    for i in 0..num_threads {
-        let end = if i == num_threads - 1 {
-            file_len
-        } else {
-            let tentative = start + chunk_size;
-            match data[tentative..].iter().position(|&b| b == b'\n') {
-                Some(offset) => tentative + offset + 1,
-                None => file_len,
+    if file_len > 0 {
+        let mut start = 0;
+        for i in 0..num_threads {
+            let end = if i == num_threads - 1 {
+                file_len
+            } else {
+                let tentative = (start + chunk_size).min(file_len);
+                match data[tentative..].iter().position(|&b| b == b'\n') {
+                    Some(offset) => tentative + offset + 1,
+                    None => file_len,
+                }
+            };
+            if start < end {
+                ranges.push((start, end));
             }
-        };
-        if start < end {
-            ranges.push((start, end));
+            start = end;
         }
-        start = end;
     }
 
     let total = AtomicU64::new(0);
@@ -239,7 +241,7 @@ pub async fn auto_backfill(
                 let bitmaps = process_collection_items_csv(stage_dir)?;
 
                 // Step 3: Save to BitmapFs
-                let bitmap_fs = BitmapFs::new(bitmap_path);
+                let bitmap_fs = BitmapFs::new(bitmap_path).map_err(|e| format!("BitmapFs::new: {e}"))?;
                 let bytes = save_collection_bitmaps(&bitmap_fs, &bitmaps)?;
                 eprintln!(
                     "  Saved collectionIds: {} values ({:.1} MB)",
@@ -264,4 +266,256 @@ pub async fn auto_backfill(
         eprintln!("Auto-backfill: field '{field_name}' complete");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write test CSV data to a temp dir and return the path.
+    fn write_test_csv(dir: &std::path::Path, content: &str) {
+        let path = dir.join("collection_items.csv");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        // Write .done marker so backfill doesn't try to download
+        std::fs::write(dir.join("collection_items.csv.done"), b"ok").unwrap();
+    }
+
+    #[test]
+    fn test_parse_collection_line_valid() {
+        assert_eq!(parse_collection_line(b"100,42"), Ok((100, 42)));
+        assert_eq!(parse_collection_line(b"1,1"), Ok((1, 1)));
+        assert_eq!(parse_collection_line(b"15722970,107000000"), Ok((15722970, 107000000)));
+    }
+
+    #[test]
+    fn test_parse_collection_line_with_cr() {
+        assert_eq!(parse_collection_line(b"100,42\r"), Ok((100, 42)));
+    }
+
+    #[test]
+    fn test_parse_collection_line_negative_collection_id() {
+        assert!(parse_collection_line(b"-1,42").is_err());
+    }
+
+    #[test]
+    fn test_parse_collection_line_negative_image_id() {
+        assert!(parse_collection_line(b"100,-5").is_err());
+    }
+
+    #[test]
+    fn test_parse_collection_line_image_id_overflow() {
+        // u32::MAX + 1 = 4294967296
+        assert!(parse_collection_line(b"100,4294967296").is_err());
+    }
+
+    #[test]
+    fn test_parse_collection_line_image_id_at_u32_max() {
+        // u32::MAX = 4294967295 — should be accepted
+        assert_eq!(
+            parse_collection_line(b"100,4294967295"),
+            Ok((100, 4294967295))
+        );
+    }
+
+    #[test]
+    fn test_parse_collection_line_no_comma() {
+        assert!(parse_collection_line(b"12345").is_err());
+    }
+
+    #[test]
+    fn test_parse_collection_line_empty() {
+        assert!(parse_collection_line(b"").is_err());
+    }
+
+    #[test]
+    fn test_parse_collection_line_non_numeric() {
+        assert!(parse_collection_line(b"abc,def").is_err());
+    }
+
+    #[test]
+    fn test_process_csv_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        // 3 collections, 5 memberships
+        write_test_csv(dir.path(), "100,1\n100,2\n100,3\n200,2\n200,4\n300,1\n");
+
+        let bitmaps = process_collection_items_csv(dir.path()).unwrap();
+
+        assert_eq!(bitmaps.len(), 3);
+        assert!(bitmaps[&100].contains(1));
+        assert!(bitmaps[&100].contains(2));
+        assert!(bitmaps[&100].contains(3));
+        assert_eq!(bitmaps[&100].len(), 3);
+
+        assert!(bitmaps[&200].contains(2));
+        assert!(bitmaps[&200].contains(4));
+        assert_eq!(bitmaps[&200].len(), 2);
+
+        assert!(bitmaps[&300].contains(1));
+        assert_eq!(bitmaps[&300].len(), 1);
+    }
+
+    #[test]
+    fn test_process_csv_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_csv(dir.path(), "");
+
+        let bitmaps = process_collection_items_csv(dir.path()).unwrap();
+        assert!(bitmaps.is_empty());
+    }
+
+    #[test]
+    fn test_process_csv_single_row() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_csv(dir.path(), "42,99\n");
+
+        let bitmaps = process_collection_items_csv(dir.path()).unwrap();
+        assert_eq!(bitmaps.len(), 1);
+        assert!(bitmaps[&42].contains(99));
+    }
+
+    #[test]
+    fn test_process_csv_duplicate_rows_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Same membership repeated — bitmap should have it once
+        write_test_csv(dir.path(), "100,1\n100,1\n100,1\n");
+
+        let bitmaps = process_collection_items_csv(dir.path()).unwrap();
+        assert_eq!(bitmaps[&100].len(), 1);
+        assert!(bitmaps[&100].contains(1));
+    }
+
+    #[test]
+    fn test_process_csv_malformed_row_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_csv(dir.path(), "100,1\nbadline\n200,2\n");
+
+        let result = process_collection_items_csv(dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("malformed"));
+    }
+
+    #[test]
+    fn test_process_csv_negative_id_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_csv(dir.path(), "100,1\n-5,2\n");
+
+        let result = process_collection_items_csv(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_csv_image_id_overflow_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_csv(dir.path(), "100,1\n200,4294967296\n");
+
+        let result = process_collection_items_csv(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_csv_with_cr_lf() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_csv(dir.path(), "100,1\r\n200,2\r\n");
+
+        let bitmaps = process_collection_items_csv(dir.path()).unwrap();
+        assert_eq!(bitmaps.len(), 2);
+        assert!(bitmaps[&100].contains(1));
+        assert!(bitmaps[&200].contains(2));
+    }
+
+    #[test]
+    fn test_process_csv_large_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        // Large but valid IDs
+        write_test_csv(dir.path(), "15722970,107000000\n");
+
+        let bitmaps = process_collection_items_csv(dir.path()).unwrap();
+        assert!(bitmaps[&15722970].contains(107000000));
+    }
+
+    #[test]
+    fn test_save_and_load_bitmaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_dir = dir.path().join("bitmaps");
+        std::fs::create_dir_all(&bitmap_dir).unwrap();
+        let bitmap_fs = BitmapFs::new(&bitmap_dir).unwrap();
+
+        // Build test bitmaps
+        let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
+        let mut bm1 = RoaringBitmap::new();
+        bm1.insert(1);
+        bm1.insert(2);
+        bm1.insert(3);
+        bitmaps.insert(100, bm1);
+
+        let mut bm2 = RoaringBitmap::new();
+        bm2.insert(2);
+        bm2.insert(4);
+        bitmaps.insert(200, bm2);
+
+        // Save to BitmapFs
+        let bytes = save_collection_bitmaps(&bitmap_fs, &bitmaps).unwrap();
+        assert!(bytes > 0);
+
+        // Verify we can list keys (existence set)
+        let keys = bitmap_fs.list_field_keys("collectionIds").unwrap();
+        assert!(keys.contains(&100));
+        assert!(keys.contains(&200));
+        assert_eq!(keys.len(), 2);
+
+        // Verify we can load the full field
+        let loaded = bitmap_fs.load_field("collectionIds").unwrap();
+        assert_eq!(loaded[&100].len(), 3);
+        assert!(loaded[&100].contains(1));
+        assert!(loaded[&100].contains(2));
+        assert!(loaded[&100].contains(3));
+        assert_eq!(loaded[&200].len(), 2);
+        assert!(loaded[&200].contains(2));
+        assert!(loaded[&200].contains(4));
+    }
+
+    #[test]
+    fn test_end_to_end_csv_to_bitmapfs() {
+        // Full pipeline: CSV → parse → bitmaps → BitmapFs → verify
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        let bitmaps_dir = dir.path().join("bitmaps");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&bitmaps_dir).unwrap();
+
+        // Write a realistic CSV
+        let csv = "1,100\n1,200\n1,300\n2,100\n2,400\n3,200\n3,300\n3,500\n";
+        write_test_csv(&stage, csv);
+
+        // Process
+        let bitmaps = process_collection_items_csv(&stage).unwrap();
+        assert_eq!(bitmaps.len(), 3, "3 distinct collectionIds");
+
+        // Save
+        let bitmap_fs = BitmapFs::new(&bitmaps_dir).unwrap();
+        save_collection_bitmaps(&bitmap_fs, &bitmaps).unwrap();
+
+        // Verify from disk
+        let keys = bitmap_fs.list_field_keys("collectionIds").unwrap();
+        assert_eq!(keys.len(), 3);
+
+        let loaded = bitmap_fs.load_field("collectionIds").unwrap();
+        // Collection 1 has images 100, 200, 300
+        assert_eq!(loaded[&1].len(), 3);
+        // Collection 2 has images 100, 400
+        assert_eq!(loaded[&2].len(), 2);
+        // Collection 3 has images 200, 300, 500
+        assert_eq!(loaded[&3].len(), 3);
+    }
+
+    #[test]
+    fn test_missing_csv_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // No CSV file written
+        let result = process_collection_items_csv(dir.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
 }

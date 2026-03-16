@@ -5,6 +5,7 @@
 //! - `sync`: Outbox poller + ClickHouse metrics poller (steady-state)
 //! - `setup`: Create BitdexOutbox table/triggers only
 
+pub mod backfill;
 pub mod bitdex_client;
 pub mod bulk_loader;
 pub mod config;
