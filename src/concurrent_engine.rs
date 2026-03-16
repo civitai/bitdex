@@ -482,7 +482,9 @@ impl ConcurrentEngine {
             }
         }
 
-        let mut uc = UnifiedCache::new(UnifiedCacheConfig::default());
+        let mut uc_config = UnifiedCacheConfig::default();
+        uc_config.max_maintenance_work = config.cache.max_maintenance_work;
+        let mut uc = UnifiedCache::new(uc_config);
 
         // Initialize BoundStore for unified cache persistence
         let bound_store = if let Some(ref store) = bitmap_store {
@@ -4687,6 +4689,11 @@ impl ConcurrentEngine {
     /// Return per-entry cache details for diagnostics.
     pub fn unified_cache_entry_details(&self) -> Vec<crate::unified_cache::UnifiedEntryDetail> {
         self.unified_cache.lock().entry_details()
+    }
+
+    /// Update the max_maintenance_work budget on the live unified cache.
+    pub fn set_max_maintenance_work(&self, v: usize) {
+        self.unified_cache.lock().config_mut().max_maintenance_work = v;
     }
 
     /// Clear unified cache entries and reset counters (RAM only).

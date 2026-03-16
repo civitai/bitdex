@@ -357,6 +357,11 @@ pub struct CacheConfig {
     /// Eliminates cold-start latency for cached sorts. Default: true.
     #[serde(default = "default_preload_bounds")]
     pub preload_bounds: bool,
+    /// Maximum maintenance work per flush (affected_entries x changed_slots).
+    /// When exceeded, affected entries are marked for rebuild instead of
+    /// per-slot evaluation. Default 500_000.
+    #[serde(default = "default_max_maintenance_work")]
+    pub max_maintenance_work: usize,
 }
 
 fn default_cache_max_entries() -> usize {
@@ -380,6 +385,9 @@ fn default_prefetch_threshold() -> f64 {
 fn default_preload_bounds() -> bool {
     true
 }
+fn default_max_maintenance_work() -> usize {
+    500_000
+}
 
 impl Default for CacheConfig {
     fn default() -> Self {
@@ -391,6 +399,7 @@ impl Default for CacheConfig {
             bound_max_count: default_bound_max_count(),
             prefetch_threshold: default_prefetch_threshold(),
             preload_bounds: default_preload_bounds(),
+            max_maintenance_work: default_max_maintenance_work(),
         }
     }
 }
