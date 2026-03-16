@@ -639,6 +639,38 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::Or(clauses) => {
                 let mut result = RoaringBitmap::new();
                 for clause in clauses {
+                    // Use fused_cow for Eq/In sub-clauses to avoid cloning
+                    // large bitmaps (e.g. isPublished=true at 100M bits).
+                    // Falls back to evaluate_clause for complex sub-clauses.
+                    match clause {
+                        FilterClause::Eq(field, value) if field != "id" => {
+                            if let Some(ff) = self.filters.get_field(field) {
+                                if let Some(key) = self.resolve_value_key(field, value) {
+                                    if let Some(vb) = ff.get_versioned(key) {
+                                        result |= vb.fused_cow().as_ref();
+                                        continue;
+                                    }
+                                }
+                                // Value not found — contributes nothing to OR
+                                continue;
+                            }
+                            // Field not found — fall through to evaluate_clause
+                        }
+                        FilterClause::In(field, values) if field != "id" => {
+                            if let Some(ff) = self.filters.get_field(field) {
+                                for v in values {
+                                    if let Some(key) = self.resolve_value_key(field, v) {
+                                        if let Some(vb) = ff.get_versioned(key) {
+                                            result |= vb.fused_cow().as_ref();
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                    // Fallback for NotEq, Not, nested Or/And, etc.
                     let bitmap = self.evaluate_clause(clause)?;
                     result |= &bitmap;
                 }
