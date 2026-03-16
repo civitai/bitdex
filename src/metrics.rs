@@ -22,6 +22,9 @@ pub struct Metrics {
     // -- Query performance --
     pub query_total: IntCounterVec,
     pub query_duration_seconds: HistogramVec,
+    pub query_filter_seconds: HistogramVec,
+    pub query_sort_seconds: HistogramVec,
+    pub query_docs_seconds: HistogramVec,
 
     // -- Cache --
     pub cache_hits_total: IntGaugeVec,
@@ -114,6 +117,23 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+
+        let phase_buckets = vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
+        let query_filter_seconds = HistogramVec::new(
+            HistogramOpts::new("bitdex_query_filter_seconds", "Bitmap filter evaluation time")
+                .buckets(phase_buckets.clone()),
+            &["index"],
+        ).unwrap();
+        let query_sort_seconds = HistogramVec::new(
+            HistogramOpts::new("bitdex_query_sort_seconds", "Bitmap sort traversal time")
+                .buckets(phase_buckets.clone()),
+            &["index"],
+        ).unwrap();
+        let query_docs_seconds = HistogramVec::new(
+            HistogramOpts::new("bitdex_query_docs_seconds", "Document fetch from disk time")
+                .buckets(phase_buckets),
+            &["index"],
+        ).unwrap();
 
         let cache_hits_total = IntGaugeVec::new(
             Opts::new("bitdex_cache_hits_total", "Unified cache cumulative hits"),
@@ -322,6 +342,9 @@ impl Metrics {
         registry
             .register(Box::new(query_duration_seconds.clone()))
             .unwrap();
+        registry.register(Box::new(query_filter_seconds.clone())).unwrap();
+        registry.register(Box::new(query_sort_seconds.clone())).unwrap();
+        registry.register(Box::new(query_docs_seconds.clone())).unwrap();
         registry
             .register(Box::new(cache_hits_total.clone()))
             .unwrap();
@@ -386,6 +409,9 @@ impl Metrics {
             delete_total,
             query_total,
             query_duration_seconds,
+            query_filter_seconds,
+            query_sort_seconds,
+            query_docs_seconds,
             cache_hits_total,
             cache_misses_total,
             cache_inserts_total,
