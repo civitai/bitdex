@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BitdexError, Result};
-use crate::filter::FilterFieldType;
+pub use crate::filter::FilterFieldType;
 
 /// Top-level Bitdex V2 configuration.
 ///
@@ -610,6 +610,7 @@ impl FieldMapping {
         json: &'a serde_json::Value,
     ) -> Option<(&'a serde_json::Value, bool)> {
         if let Some(v) = json.get(&self.source).filter(|v| !v.is_null()) {
+            // Primary source has a non-null value
             Some((v, self.should_convert_ms()))
         } else if let Some(v) = self
             .fallback
@@ -617,8 +618,14 @@ impl FieldMapping {
             .and_then(|fb| json.get(fb))
             .filter(|v| !v.is_null())
         {
+            // Fallback has a non-null value
             Some((v, false))
+        } else if json.get(&self.source).is_some() {
+            // Primary source is explicitly null (no fallback or fallback also null).
+            // Return the null so callers can write defaults to the docstore.
+            Some((json.get(&self.source).unwrap(), self.should_convert_ms()))
         } else {
+            // Source field not present at all
             None
         }
     }
