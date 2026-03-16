@@ -39,6 +39,36 @@ const PORT_RESERVATION_TTL = 60_000; // 60 seconds
 const IS_WIN = process.platform === 'win32';
 const EXE = IS_WIN ? '.exe' : '';
 
+// ─── Tool Detection ─────────────────────────────────────────
+// Detect sccache and cargo-nextest at startup for build optimization.
+
+let HAS_SCCACHE = false;
+let HAS_NEXTEST = false;
+
+function detectTools() {
+  try {
+    execSync('sccache --version', { stdio: 'ignore', windowsHide: true, timeout: 5000 });
+    HAS_SCCACHE = true;
+  } catch { /* not installed */ }
+
+  try {
+    execSync('cargo nextest --version', { stdio: 'ignore', windowsHide: true, timeout: 5000 });
+    HAS_NEXTEST = true;
+  } catch { /* not installed */ }
+
+  if (HAS_SCCACHE) console.log('  sccache: enabled (shared compilation cache)');
+  else console.log('  sccache: not found (install with: cargo install sccache)');
+
+  if (HAS_NEXTEST) console.log('  nextest: enabled (parallel test runner)');
+  else console.log('  nextest: not found (install with: cargo install cargo-nextest)');
+}
+
+function cargoEnv(extra = {}) {
+  const env = { ...process.env, ...extra };
+  if (HAS_SCCACHE) env.RUSTC_WRAPPER = 'sccache';
+  return env;
+}
+
 // ─── State ───────────────────────────────────────────────────────
 
 let instances = new Map();    // instanceId → instance object
@@ -599,7 +629,7 @@ async function requestBuild({ target, profile, holder }) {
     shell: IS_WIN,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env },
+    env: cargoEnv(),
   });
 
   buildLock.process = proc;
@@ -727,9 +757,18 @@ function runTestInSlot(slotId, { command, filter, holder }) {
   if (idx < 0 || idx >= testSlots.length) return { error: `Invalid slot ${slotId}` };
   const slot = testSlots[idx];
 
-  const filterArgs = filter ? ['--', filter] : [];
-  const args = ['test', ...filterArgs];
-  const cmdStr = `cargo test${filter ? ' -- ' + filter : ''}`;
+  let args, cmdStr;
+  if (HAS_NEXTEST) {
+    // nextest: parallel test execution, per-test process isolation
+    const filterArgs = filter ? ['-E', `test(${filter})`] : [];
+    args = ['nextest', 'run', ...filterArgs];
+    cmdStr = `cargo nextest run${filter ? " -E 'test(" + filter + ")'" : ''}`;
+  } else {
+    // fallback: standard cargo test
+    const filterArgs = filter ? ['--', filter] : [];
+    args = ['test', ...filterArgs];
+    cmdStr = `cargo test${filter ? ' -- ' + filter : ''}`;
+  }
 
   mkdirSync(slot.targetDir, { recursive: true });
 
@@ -738,7 +777,7 @@ function runTestInSlot(slotId, { command, filter, holder }) {
     shell: IS_WIN,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, CARGO_TARGET_DIR: slot.targetDir },
+    env: cargoEnv({ CARGO_TARGET_DIR: slot.targetDir }),
   });
 
   slot.process = proc;
@@ -1029,6 +1068,8 @@ function getStatus() {
       port: DAEMON_PORT,
       startedAt: daemonStartedAt,
       uptime_s: Math.round((Date.now() - new Date(daemonStartedAt).getTime()) / 1000),
+      sccache: HAS_SCCACHE,
+      nextest: HAS_NEXTEST,
     },
     instances: [...instances.values()].map(serializeInstance),
     datasets: [...datasets.values()],
@@ -1292,9 +1333,8 @@ async function handleRequest(req, res) {
 // ─── Startup ────────────────────────────────────────────────────
 
 async function main() {
-  // Scan for existing datasets on disk
-  // Dataset scanning removed — was blocking event loop on large data dirs.
-  // Datasets are discovered when instances start and report their index stats.
+  // Detect build optimization tools
+  detectTools();
 
   const server = http.createServer(handleRequest);
 
