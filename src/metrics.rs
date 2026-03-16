@@ -6,7 +6,8 @@
 //! on each scrape (collect-on-scrape pattern).
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 /// All BitDex Prometheus metrics.
@@ -62,6 +63,11 @@ pub struct Metrics {
     pub compaction_total: IntCounterVec,
     pub compaction_duration_seconds: HistogramVec,
     pub compaction_skipped_total: IntCounterVec,
+
+    // -- Query concurrency --
+    pub queries_in_flight: IntGauge,
+    pub queries_in_flight_peak: IntGauge,
+    pub queries_rejected_total: IntCounter,
 
     // -- BoundStore (cache persistence) --
     pub boundstore_meta_entries: IntGaugeVec,
@@ -326,6 +332,17 @@ impl Metrics {
         )
         .unwrap();
 
+        // Query concurrency metrics
+        let queries_in_flight = IntGauge::new(
+            "bitdex_queries_in_flight", "Queries currently executing",
+        ).unwrap();
+        let queries_in_flight_peak = IntGauge::new(
+            "bitdex_queries_in_flight_peak", "Peak concurrent queries since startup",
+        ).unwrap();
+        let queries_rejected_total = IntCounter::new(
+            "bitdex_queries_rejected_total", "Queries rejected by backpressure",
+        ).unwrap();
+
         // BoundStore metrics
         let boundstore_meta_entries = IntGaugeVec::new(
             Opts::new("bitdex_boundstore_meta_entries", "Cache entries registered in meta-index"),
@@ -430,6 +447,9 @@ impl Metrics {
         registry.register(Box::new(compaction_total.clone())).unwrap();
         registry.register(Box::new(compaction_duration_seconds.clone())).unwrap();
         registry.register(Box::new(compaction_skipped_total.clone())).unwrap();
+        registry.register(Box::new(queries_in_flight.clone())).unwrap();
+        registry.register(Box::new(queries_in_flight_peak.clone())).unwrap();
+        registry.register(Box::new(queries_rejected_total.clone())).unwrap();
         registry.register(Box::new(boundstore_meta_entries.clone())).unwrap();
         registry.register(Box::new(boundstore_tombstones.clone())).unwrap();
         registry.register(Box::new(boundstore_pending_shards.clone())).unwrap();
@@ -478,6 +498,9 @@ impl Metrics {
             compaction_total,
             compaction_duration_seconds,
             compaction_skipped_total,
+            queries_in_flight,
+            queries_in_flight_peak,
+            queries_rejected_total,
             boundstore_meta_entries,
             boundstore_tombstones,
             boundstore_pending_shards,
