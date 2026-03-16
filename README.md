@@ -1,5 +1,7 @@
 # BitDex
 
+[Grafana Dashboard](https://grafana-new.civitai.com/d/bitdex) | [Production](https://bitdex.civitai.com/api/indexes) | [Smoke Tests](docs/guide/smoke-tests.md) | [API Guide](docs/guide/api.md)
+
 A purpose-built, in-memory bitmap index engine. Takes filter predicates + sort parameters, returns an ordered list of integer IDs. Bitmaps all the way down.
 
 **In:** Filter clauses + sort field + direction + limit
