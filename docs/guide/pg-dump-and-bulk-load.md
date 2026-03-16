@@ -101,6 +101,7 @@ The bulk loader expects CSVs at `/data/indexes/civitai/load_stage/` on the BitDe
 | tools.csv | 4.1M | 50 MB | ImageTool |
 | model_versions.csv | 1.0M | 24 MB | ModelVersion enrichment |
 | models.csv | 822K | 12 MB | Model enrichment |
+| collection_items.csv | 157M | ~2 GB | CollectionItem (auto-backfilled by pg-sync sync) |
 | metrics.csv | 91M | 1.3 GB | ClickHouse metrics (fetched separately) |
 | cursor.txt | 1 | 11 B | Outbox cursor high-water mark |
 
@@ -270,6 +271,59 @@ The dump and load logic lives in these files:
 | `src/pg_sync/single_pass.rs` | Single-pass V2 CSV loader (mmap'd files, no PG needed) |
 | `src/pg_sync/config.rs` | PgSyncConfig with `DATABASE_URL` env var support |
 | `src/bin/pg_sync.rs` | Binary entry point (`bitdex-pg-sync load`) |
+
+---
+
+## Auto-Backfill for New Fields
+
+When adding a new `filter_only` field (like `collectionIds`), you do **not** need to re-run the full bulk load. The pg-sync `sync` command auto-detects fields that need backfilling and handles them before entering the poll loop.
+
+### How it works
+
+On `pg-sync sync` startup:
+
+1. Scans the data schema for `filter_only: true` fields
+2. Checks for a `backfill-{field}` cursor in BitDex
+3. If missing: downloads the CSV from PG via COPY, builds bitmaps (mmap + rayon), writes to BitmapFs, reloads the engine's existence set
+4. Sets the backfill cursor so future startups skip it
+5. Starts the outbox poller
+
+The backfill uses the same pattern as the single-pass bulk loader (tags, tools, etc.) — COPY stream to CSV, mmap, rayon parallel parse, bitmap accumulator, atomic fpack writes to BitmapFs. No HTTP round-trips. Order-independent.
+
+### Manual backfill
+
+To manually backfill a specific field:
+
+```bash
+bitdex-pg-sync backfill --field collectionIds --config sync.toml
+```
+
+This downloads the CSV and builds bitmaps without starting the sync loop. Useful for testing or re-backfilling after a schema change.
+
+### Adding a new filter_only field
+
+1. Add the field to `deploy/configs/civitai-index.json` (filter_fields + data_schema with `filter_only: true`)
+2. Add a COPY query in `src/pg_sync/copy_queries.rs`
+3. Add a CSV processor in `src/pg_sync/backfill.rs` (follow the `process_collection_items_csv` pattern)
+4. Add a download entry in `src/pg_sync/bulk_loader.rs` (TABLES + COPY match arm)
+5. Add the backfill handler in `backfill::auto_backfill()`
+6. Deploy — the sync sidecar auto-detects and backfills on startup
+
+### Current limitation
+
+The auto-backfill **blocks sync startup**. No outbox events are processed until the backfill completes. For collectionIds (~157M rows), this takes a few minutes. See `docs/design/non-blocking-backfill.md` for the planned improvement.
+
+### Migration direction
+
+The system is evolving toward making `pg-sync sync` the sole entry point:
+
+| Phase | What runs | Status |
+|-------|-----------|--------|
+| **Current** | `pg-sync load` for initial setup, `pg-sync sync` for steady-state + filter_only backfill | Production |
+| **Next** | `pg-sync sync` auto-detects ALL missing fields (not just filter_only) and backfills from PG | Planned |
+| **Future** | No separate `load` command — `sync` handles everything from cold start | Design phase |
+
+The goal: deploy BitDex with an empty data directory, start `pg-sync sync`, and it builds everything automatically.
 
 ---
 
