@@ -151,6 +151,66 @@ GET /api/indexes/{name}
 
 ---
 
+### Update Config (Partial)
+
+```
+PATCH /api/indexes/{name}/config
+```
+
+Applies a partial config update to a running index. Only fields present in the request body are changed; all others remain untouched. Persists the updated config to disk and returns the full config.
+
+**Request body** (all fields optional):
+
+```json
+{
+  "filter_fields": {
+    "hasMeta": { "eager_load": true },
+    "tagIds": { "eager_load": false }
+  },
+  "sort_fields": {
+    "reactionCount": { "eager_load": true }
+  },
+  "cache": {
+    "max_entries": 20000,
+    "decay_rate": 0.9,
+    "bound_target_size": 5000,
+    "bound_max_size": 15000,
+    "bound_max_count": 200,
+    "prefetch_threshold": 0.8
+  }
+}
+```
+
+| Section | Field | Type | Description |
+|---------|-------|------|-------------|
+| `filter_fields.{name}` | `eager_load` | bool | Load this field's bitmaps eagerly on startup |
+| `sort_fields.{name}` | `eager_load` | bool | Load this field's bitmaps eagerly on startup |
+| `cache` | `max_entries` | integer | Maximum cached entries |
+| `cache` | `decay_rate` | float | Exponential decay rate for hit stats, (0.0, 1.0] |
+| `cache` | `bound_target_size` | integer | Target slots per bound cache entry |
+| `cache` | `bound_max_size` | integer | Max slots before triggering rebuild |
+| `cache` | `bound_max_count` | integer | Max bound entries before LRU eviction |
+| `cache` | `prefetch_threshold` | float | Fraction consumed before background expansion, [0.0, 1.0] |
+
+**Hot-reload behavior:**
+- `eager_load` changes from `false` to `true` trigger immediate background loading of those fields. No restart required.
+- `eager_load` changes from `true` to `false` take effect on next restart (loaded fields remain in memory).
+- `cache` setting changes are persisted but take effect on next restart (the in-memory cache config is set at build time).
+
+**Response:** `200 OK`
+
+```json
+{
+  "config": { /* full updated Config object */ }
+}
+```
+
+**Errors:**
+- `400` — Unknown field name or invalid value (e.g., `decay_rate` out of range)
+- `404` — Index not found
+
+---
+
 ### Delete Index
 
 ```

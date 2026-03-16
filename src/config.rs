@@ -1399,4 +1399,67 @@ ms_to_seconds = true
         let schema = DataSchema::default();
         assert!(schema.validate().is_ok());
     }
+
+    #[test]
+    fn test_config_patch_roundtrip() {
+        // Build a config with known filter/sort fields
+        let mut config = Config {
+            filter_fields: vec![
+                FilterFieldConfig {
+                    name: "nsfwLevel".to_string(),
+                    field_type: crate::filter::FilterFieldType::SingleValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false,
+                },
+                FilterFieldConfig {
+                    name: "tagIds".to_string(),
+                    field_type: crate::filter::FilterFieldType::MultiValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: true,
+                },
+            ],
+            sort_fields: vec![SortFieldConfig {
+                name: "reactionCount".to_string(),
+                source_type: "uint32".to_string(),
+                encoding: "linear".to_string(),
+                bits: 32,
+                eager_load: false,
+            }],
+            cache: CacheConfig {
+                max_entries: 5_000,
+                ..CacheConfig::default()
+            },
+            ..Config::default()
+        };
+
+        // Simulate a partial patch: flip eager_load on nsfwLevel, update cache
+        for fc in config.filter_fields.iter_mut() {
+            if fc.name == "nsfwLevel" {
+                fc.eager_load = true;
+            }
+        }
+        for sc in config.sort_fields.iter_mut() {
+            if sc.name == "reactionCount" {
+                sc.eager_load = true;
+            }
+        }
+        config.cache.max_entries = 20_000;
+        config.cache.bound_target_size = 5_000;
+
+        // Serialize to JSON and deserialize back
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        let restored: Config = serde_json::from_str(&json).unwrap();
+
+        // Verify the patched values survived roundtrip
+        assert!(restored.filter_fields.iter().find(|f| f.name == "nsfwLevel").unwrap().eager_load);
+        assert!(restored.filter_fields.iter().find(|f| f.name == "tagIds").unwrap().eager_load);
+        assert!(restored.sort_fields[0].eager_load);
+        assert_eq!(restored.cache.max_entries, 20_000);
+        assert_eq!(restored.cache.bound_target_size, 5_000);
+        // Ensure other defaults are preserved
+        assert_eq!(restored.cache.decay_rate, CacheConfig::default().decay_rate);
+        assert!(restored.validate().is_ok());
+    }
 }
