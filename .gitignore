@@ -13,6 +13,7 @@ server_stdout.log
 .claude/worktrees/
 .claude/skills/dev-server/state/
 .claude/skills/dev-server/debug.log
+.claude/skills/dev-server/.env
 .claude/scheduled_tasks.lock
 .test-data/
 tools/perf-reports.jsonl

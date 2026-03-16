@@ -274,6 +274,7 @@ struct AppState {
     parser_registry: crate::parser::registry::ParserRegistry,
     enable_traces: bool,
     admin_token: Option<String>,
+    trace_buffer: crate::query_metrics::TraceBuffer,
 }
 
 type SharedState = Arc<AppState>;
@@ -763,6 +764,7 @@ impl BitdexServer {
             parser_registry: registry,
             enable_traces: self.enable_traces,
             admin_token,
+            trace_buffer: crate::query_metrics::TraceBuffer::default(),
         });
 
         // Try to restore an existing index from disk
@@ -1777,10 +1779,7 @@ async fn handle_query(
 
             // Write trace to JSONL in background (non-blocking), if enabled
             if state.enable_traces {
-                let data_dir = state.data_dir.clone();
-                std::thread::spawn(move || {
-                    crate::query_metrics::write_trace(&data_dir, &trace);
-                });
+                state.trace_buffer.push(trace.clone());
             }
 
             let mut response = serde_json::json!({
@@ -1841,7 +1840,7 @@ async fn handle_traces(
         }
     }
 
-    let traces = crate::query_metrics::read_traces(&state.data_dir, params.last);
+    let traces = state.trace_buffer.last_n(params.last);
     Json(serde_json::json!({ "traces": traces })).into_response()
 }
 

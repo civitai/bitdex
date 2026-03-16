@@ -88,6 +88,7 @@ cargo run --release --features server --bin bitdex-server -- --port 3001 --data-
 | Command | Description |
 |---------|-------------|
 | `stats` | Index stats (counts, cache, memory) |
+| `traces [--last N]` | Recent query traces (clause timing, cache hits) |
 | `cache-clear` | Clear the unified cache |
 | `warm --body JSON_OR_FILE` | Pre-populate cache with specified queries |
 | `snapshot` | Save bitmap snapshot to disk (blocks) |

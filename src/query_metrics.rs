@@ -1,12 +1,11 @@
-//! Query trace collection and JSONL persistence.
+//! Query trace collection with in-memory ring buffer.
 //!
 //! `QueryTraceCollector` is threaded through query execution to record per-clause
-//! timing, cardinalities, and sort metrics. After execution, the trace is serialized
-//! to a JSONL file for later retrieval via the `/traces` endpoint.
+//! timing, cardinalities, and sort metrics. Traces are stored in a bounded in-memory
+//! ring buffer (`TraceBuffer`) — no disk I/O. Retrieved via the `/traces` endpoint.
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -112,38 +111,52 @@ impl QueryTraceCollector {
 }
 
 // ---------------------------------------------------------------------------
-// JSONL writer
+// In-memory ring buffer (bounded, no disk I/O)
 // ---------------------------------------------------------------------------
 
-pub fn write_trace(data_dir: &Path, trace: &QueryTrace) {
-    let path = data_dir.join("traces.jsonl");
-    let res = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        serde_json::to_writer(&mut file, trace)?;
-        file.write_all(b"\n")?;
-        Ok(())
-    })();
-    if let Err(e) = res {
-        tracing::warn!("Failed to write query trace: {e}");
+const DEFAULT_CAPACITY: usize = 1000;
+
+pub struct TraceBuffer {
+    buf: Mutex<VecDeque<QueryTrace>>,
+    capacity: usize,
+}
+
+impl TraceBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buf: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+        }
+    }
+
+    pub fn push(&self, trace: QueryTrace) {
+        let mut buf = self.buf.lock().unwrap();
+        if buf.len() >= self.capacity {
+            buf.pop_front();
+        }
+        buf.push_back(trace);
+    }
+
+    pub fn last_n(&self, n: usize) -> Vec<QueryTrace> {
+        let buf = self.buf.lock().unwrap();
+        let skip = buf.len().saturating_sub(n);
+        buf.iter().skip(skip).cloned().collect()
     }
 }
 
-/// Read the last N traces from the JSONL file.
-pub fn read_traces(data_dir: &Path, last: usize) -> Vec<QueryTrace> {
-    let path = data_dir.join("traces.jsonl");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let lines: Vec<&str> = content.lines().collect();
-    let start = lines.len().saturating_sub(last);
-    lines[start..]
-        .iter()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+impl Default for TraceBuffer {
+    fn default() -> Self {
+        Self::new(DEFAULT_CAPACITY)
+    }
+}
+
+// Keep legacy function signatures for compatibility during migration
+// (delete these once all callers use TraceBuffer directly)
+
+/// Read the last N traces — legacy adapter, reads from nothing now.
+/// Use `TraceBuffer::last_n()` instead.
+pub fn read_traces(_data_dir: &std::path::Path, _last: usize) -> Vec<QueryTrace> {
+    Vec::new() // no-op — callers should use TraceBuffer
 }
 
 // ---------------------------------------------------------------------------

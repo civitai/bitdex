@@ -7,10 +7,32 @@
  * All output is JSON for easy parsing by agents.
  */
 
+import { readFileSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// Load .env from dev-server skill dir (shared token config)
+try {
+  const __d = dirname(fileURLToPath(import.meta.url));
+  const envPath = resolve(__d, '..', 'dev-server', '.env');
+  const envFile = readFileSync(envPath, 'utf8');
+  for (const line of envFile.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq > 0) {
+      const key = trimmed.slice(0, eq).trim();
+      const val = trimmed.slice(eq + 1).trim();
+      if (!process.env[key]) process.env[key] = val;
+    }
+  }
+} catch { /* no .env, that's fine */ }
+
 const BASE_URL = process.env.BITDEX_URL || 'http://localhost:3001';
 const DEFAULT_INDEX = process.env.BITDEX_INDEX || null;
 const BITDEX_DIR = process.env.BITDEX_DIR || 'C:\\Dev\\Repos\\open-source\\bitdex-v2';
 const DATA_DIR = process.env.BITDEX_DATA_DIR || './data';
+const ADMIN_TOKEN = process.env.BITDEX_ADMIN_TOKEN || null;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -25,12 +47,13 @@ function json(obj) {
   console.log(JSON.stringify(obj, null, 2));
 }
 
-async function req(method, path, body = null) {
+async function req(method, path, body = null, { admin = false } = {}) {
   const url = `${BASE_URL}${path}`;
-  const opts = {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-  };
+  const headers = { 'Content-Type': 'application/json' };
+  if (admin && ADMIN_TOKEN) {
+    headers['Authorization'] = `Bearer ${ADMIN_TOKEN}`;
+  }
+  const opts = { method, headers };
   if (body !== null) opts.body = JSON.stringify(body);
 
   let res;
@@ -220,7 +243,7 @@ commands['index-delete'] = {
   usage: 'index-delete --index NAME',
   async run(flags) {
     const idx = await resolveIndex(flags.index);
-    json(await req('DELETE', `/api/indexes/${idx}`));
+    json(await req('DELETE', `/api/indexes/${idx}`, null, { admin: true }));
   },
 };
 
@@ -349,7 +372,7 @@ commands.upsert = {
 
     if (!Array.isArray(documents)) documents = [documents];
 
-    json(await req('POST', `/api/indexes/${idx}/documents/upsert`, { documents }));
+    json(await req('POST', `/api/indexes/${idx}/documents/upsert`, { documents }, { admin: true }));
   },
 };
 
@@ -361,7 +384,7 @@ commands.delete = {
     if (!flags.ids) die('--ids required (comma-separated)');
 
     const ids = flags.ids.split(',').map(Number);
-    json(await req('DELETE', `/api/indexes/${idx}/documents`, { ids }));
+    json(await req('DELETE', `/api/indexes/${idx}/documents`, { ids }, { admin: true }));
   },
 };
 
@@ -376,12 +399,22 @@ commands.stats = {
   },
 };
 
+commands.traces = {
+  help: 'Get recent query traces (requires --enable-traces on server)',
+  usage: 'traces [--last N] [--index NAME]',
+  async run(flags) {
+    const idx = await resolveIndex(flags.index);
+    const last = flags.last || 10;
+    json(await req('GET', `/api/indexes/${idx}/traces?last=${last}`));
+  },
+};
+
 commands['cache-clear'] = {
   help: 'Clear the unified cache',
   usage: 'cache-clear [--index NAME]',
   async run(flags) {
     const idx = await resolveIndex(flags.index);
-    json(await req('DELETE', `/api/indexes/${idx}/cache`));
+    json(await req('DELETE', `/api/indexes/${idx}/cache`, null, { admin: true }));
   },
 };
 
@@ -400,7 +433,7 @@ commands.warm = {
       body = JSON.parse(readFileSync(flags.body, 'utf8'));
     }
 
-    json(await req('POST', `/api/indexes/${idx}/warm`, body));
+    json(await req('POST', `/api/indexes/${idx}/warm`, body, { admin: true }));
   },
 };
 
@@ -409,7 +442,7 @@ commands.snapshot = {
   usage: 'snapshot [--index NAME]',
   async run(flags) {
     const idx = await resolveIndex(flags.index);
-    json(await req('POST', `/api/indexes/${idx}/snapshot`));
+    json(await req('POST', `/api/indexes/${idx}/snapshot`, null, { admin: true }));
   },
 };
 
@@ -423,7 +456,7 @@ commands.rebuild = {
     if (flags['filter-fields']) body.filter_fields = flags['filter-fields'].split(',');
     body.save_snapshot = !flags['no-save'];
 
-    const data = await req('POST', `/api/indexes/${idx}/rebuild`, body);
+    const data = await req('POST', `/api/indexes/${idx}/rebuild`, body, { admin: true });
 
     if (flags.follow) {
       json({ ...data, note: 'Polling task progress...' });
@@ -444,7 +477,7 @@ commands['fields-add'] = {
     const body = JSON.parse(flags.body);
     if (flags['no-save']) body.save_snapshot = false;
 
-    const data = await req('POST', `/api/indexes/${idx}/fields`, body);
+    const data = await req('POST', `/api/indexes/${idx}/fields`, body, { admin: true });
 
     if (flags.follow) {
       json({ ...data, note: 'Polling task progress...' });
@@ -465,7 +498,7 @@ commands['fields-remove'] = {
     const body = JSON.parse(flags.body);
     if (flags['no-save']) body.save_snapshot = false;
 
-    json(await req('DELETE', `/api/indexes/${idx}/fields`, body));
+    json(await req('DELETE', `/api/indexes/${idx}/fields`, body, { admin: true }));
   },
 };
 

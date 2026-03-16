@@ -28,9 +28,24 @@
 import { spawn, execSync } from 'node:child_process';
 import { resolve, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// Load .env from skill directory (key=value, no quotes needed)
+try {
+  const envFile = readFileSync(resolve(__dirname, '.env'), 'utf8');
+  for (const line of envFile.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq > 0) {
+      const key = trimmed.slice(0, eq).trim();
+      const val = trimmed.slice(eq + 1).trim();
+      if (!process.env[key]) process.env[key] = val; // env vars take precedence
+    }
+  }
+} catch { /* no .env file, that's fine */ }
 const DEBUG_LOG = resolve(__dirname, 'debug.log');
 function dbg(msg) { /* debug logging disabled — appendFileSync was causing input lag */ }
 const DAEMON_SCRIPT = resolve(__dirname, 'daemon.mjs');
