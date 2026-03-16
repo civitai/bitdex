@@ -73,8 +73,8 @@ BEGIN
   IF TG_OP = 'DELETE' THEN
     _image_id := OLD."imageId";
   ELSIF TG_OP = 'UPDATE' THEN
-    -- Only fire on status changes (imageId/collectionId are immutable)
-    IF OLD.status = NEW.status THEN
+    -- Only fire when accepted-ness changes (REVIEW→ACCEPTED or ACCEPTED→REJECTED)
+    IF (OLD.status = 'ACCEPTED') = (NEW.status = 'ACCEPTED') THEN
       RETURN NEW;
     END IF;
     _image_id := NEW."imageId";

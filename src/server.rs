@@ -2105,11 +2105,14 @@ async fn handle_filter_sync(
                     f.name == req.field
                         && matches!(f.field_type, crate::config::FilterFieldType::MultiValue)
                 });
-                if !is_multi_value {
+                let is_filter_only = idx.definition.data_schema.fields.iter().any(|f| {
+                    f.target == req.field && f.filter_only
+                });
+                if !is_multi_value || !is_filter_only {
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(serde_json::json!({
-                            "error": format!("Field '{}' is not a multi_value filter field", req.field)
+                            "error": format!("Field '{}' is not a filter_only multi_value field", req.field)
                         })),
                     ).into_response();
                 }
@@ -2138,8 +2141,14 @@ async fn handle_filter_sync(
 
     if errors.is_empty() {
         Json(serde_json::json!({"synced": synced})).into_response()
+    } else if synced == 0 {
+        // Total failure — no documents synced
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"synced": 0, "errors": errors})),
+        ).into_response()
     } else {
-        // Return 207 Multi-Status so clients can distinguish partial failure
+        // Partial failure
         (
             StatusCode::MULTI_STATUS,
             Json(serde_json::json!({"synced": synced, "errors": errors})),
