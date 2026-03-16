@@ -25,17 +25,8 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
-use roaring::bitmap::frozen::FrozenRoaringBitmap;
 
 use crate::error::{BitdexError, Result};
-
-/// Magic bytes for frozen-format pack files.
-/// Standard fpack: first 4 bytes are u32 num_entries (always > 0, never starts with FRZN).
-/// Frozen fpack: starts with b"FRZN" magic, then u32 num_entries.
-const FROZEN_MAGIC: [u8; 4] = *b"FRZN";
-
-/// 32-byte alignment required by the frozen format.
-const FROZEN_ALIGNMENT: usize = 32;
 
 /// Filesystem-based bitmap store.
 pub struct BitmapFs {
@@ -226,145 +217,6 @@ impl BitmapFs {
         Ok(result)
     }
 
-    // ---- Frozen pack file I/O ----
-    //
-    // Frozen fpack format:
-    // [b"FRZN" magic][u32 num_entries]
-    // [index: N × (u64 value, u32 offset, u32 length)]
-    // [padding to 32-byte alignment]
-    // [packed frozen-format roaring bitmaps]
-    //
-    // Each bitmap's data starts at a 32-byte aligned offset within the file.
-    // This enables mmap + FrozenRoaringBitmap::view() for zero-copy parsing.
-
-    fn frozen_filter_pack_path(&self, field: &str, bucket: u8) -> PathBuf {
-        self.root
-            .join("filter")
-            .join(field)
-            .join(format!("{:02x}.frozenpack", bucket))
-    }
-
-    /// Write a frozen-format filter pack file.
-    fn write_frozen_pack_file(path: &Path, entries: &[(u64, &RoaringBitmap)]) -> Result<()> {
-        // Serialize all bitmaps in frozen format
-        let mut serialized: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
-        for &(value, bm) in entries {
-            let size = bm.frozen_serialized_size();
-            // Allocate with padding for 32-byte alignment
-            let padded_size = (size + FROZEN_ALIGNMENT - 1) & !(FROZEN_ALIGNMENT - 1);
-            let mut buf = vec![0u8; padded_size];
-            bm.serialize_frozen_into(&mut buf[..size])
-                .map_err(|e| BitdexError::DocStore(format!("frozen serialize: {e}")))?;
-            serialized.push((value, buf));
-        }
-
-        let num_entries = serialized.len() as u32;
-        // Header: 4 (magic) + 4 (count) + N * 16 (index)
-        let raw_header_size = 8 + serialized.len() * 16;
-        // Pad header to 32-byte alignment so bitmap data starts aligned
-        let header_size = (raw_header_size + FROZEN_ALIGNMENT - 1) & !(FROZEN_ALIGNMENT - 1);
-        let data_size: usize = serialized.iter().map(|(_, d)| d.len()).sum();
-        let mut buf = vec![0u8; header_size + data_size];
-
-        // Magic
-        buf[..4].copy_from_slice(&FROZEN_MAGIC);
-        // Entry count
-        buf[4..8].copy_from_slice(&num_entries.to_le_bytes());
-
-        // Index entries
-        let mut data_offset: u32 = 0;
-        for (i, (value, data)) in serialized.iter().enumerate() {
-            let idx = 8 + i * 16;
-            buf[idx..idx + 8].copy_from_slice(&value.to_le_bytes());
-            buf[idx + 8..idx + 12].copy_from_slice(&data_offset.to_le_bytes());
-            buf[idx + 12..idx + 16].copy_from_slice(&(data.len() as u32).to_le_bytes());
-            data_offset += data.len() as u32;
-        }
-
-        // Copy bitmap data after the padded header
-        let mut write_offset = header_size;
-        for (_, data) in &serialized {
-            buf[write_offset..write_offset + data.len()].copy_from_slice(data);
-            write_offset += data.len();
-        }
-
-        Self::write_bytes_atomic(path, &buf)
-    }
-
-    /// Read entries from a frozen-format pack file.
-    /// Uses mmap for zero-copy access, then converts each bitmap to owned via to_owned().
-    fn read_frozen_pack_file(data: &[u8]) -> Result<Vec<(u64, RoaringBitmap)>> {
-        if data.len() < 8 {
-            return Err(BitdexError::DocStore("frozen pack header truncated".into()));
-        }
-
-        // Verify magic
-        if data[..4] != FROZEN_MAGIC {
-            return Err(BitdexError::DocStore("not a frozen pack file".into()));
-        }
-
-        let num_entries = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-        let raw_header_size = 8 + num_entries * 16;
-        let header_size = (raw_header_size + FROZEN_ALIGNMENT - 1) & !(FROZEN_ALIGNMENT - 1);
-
-        if data.len() < header_size {
-            return Err(BitdexError::DocStore("frozen pack index truncated".into()));
-        }
-
-        let mut result = Vec::with_capacity(num_entries);
-
-        for i in 0..num_entries {
-            let idx = 8 + i * 16;
-            let value = u64::from_le_bytes(data[idx..idx + 8].try_into().unwrap());
-            let offset = u32::from_le_bytes(data[idx + 8..idx + 12].try_into().unwrap()) as usize;
-            let length = u32::from_le_bytes(data[idx + 12..idx + 16].try_into().unwrap()) as usize;
-
-            let start = header_size + offset;
-            let end = start + length;
-            if end > data.len() {
-                return Err(BitdexError::DocStore("frozen bitmap data truncated".into()));
-            }
-
-            let bm_data = &data[start..end];
-
-            // Find the actual frozen data size (strip trailing padding zeros)
-            // The frozen format has its size encoded internally via the header
-            let frozen = FrozenRoaringBitmap::view(bm_data)
-                .map_err(|e| BitdexError::DocStore(format!("frozen view: {e}")))?;
-            result.push((value, frozen.to_owned()));
-        }
-
-        Ok(result)
-    }
-
-    /// Check if data starts with the frozen magic bytes.
-    fn is_frozen_format(data: &[u8]) -> bool {
-        data.len() >= 4 && data[..4] == FROZEN_MAGIC
-    }
-
-    /// Read a pack file, auto-detecting standard vs frozen format.
-    fn read_pack_file_auto(data: &[u8]) -> Result<Vec<(u64, RoaringBitmap)>> {
-        if Self::is_frozen_format(data) {
-            Self::read_frozen_pack_file(data)
-        } else {
-            Self::read_pack_file(data)
-        }
-    }
-
-    /// Write a frozen filter bucket.
-    pub fn write_frozen_filter_bucket(
-        &self,
-        field: &str,
-        bucket: u8,
-        entries: &[(u64, &RoaringBitmap)],
-    ) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let path = self.frozen_filter_pack_path(field, bucket);
-        Self::write_frozen_pack_file(&path, entries)
-    }
-
     /// Load specific values from a field's bucket pack files.
     /// Groups requested values by bucket, reads only the needed pack files,
     /// and deserializes only the matching entries. Values not present on disk
@@ -387,48 +239,56 @@ impl BitmapFs {
         let mut result = HashMap::with_capacity(values.len());
 
         for (bucket, wanted) in &by_bucket {
-            // Try frozenpack first, fall back to fpack
-            let frozen_path = self.frozen_filter_pack_path(field_name, *bucket);
-            let standard_path = self.filter_pack_path(field_name, *bucket);
-            let (data, is_frozen) = match std::fs::read(&frozen_path) {
-                Ok(d) => (d, true),
-                Err(_) => match std::fs::read(&standard_path) {
-                    Ok(d) => (d, false),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(BitdexError::DocStore(format!("read pack file: {e}"))),
-                },
+            let path = self.filter_pack_path(field_name, *bucket);
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(BitdexError::DocStore(format!("read pack file: {e}"))),
             };
 
-            let min_header = if is_frozen { 8 } else { 4 };
-            if data.len() < min_header {
+            if data.len() < 4 {
                 return Err(BitdexError::DocStore("filter pack header truncated".into()));
             }
 
-            let (num_entries, index_start, data_start) = if is_frozen {
-                let n = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-                let raw_header = 8 + n * 16;
-                let padded_header = (raw_header + FROZEN_ALIGNMENT - 1) & !(FROZEN_ALIGNMENT - 1);
-                (n, 8, padded_header)
-            } else {
-                let n = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-                (n, 4, 4 + n * 16)
-            };
-
-            if data.len() < data_start {
+            let num_entries =
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            let header_size = 4 + num_entries * 16;
+            if data.len() < header_size {
                 return Err(BitdexError::DocStore("filter pack index truncated".into()));
             }
 
+            let data_start = header_size;
+
             // Scan the index for matching values only
             for i in 0..num_entries {
-                let idx = index_start + i * 16;
-                let value = u64::from_le_bytes(data[idx..idx + 8].try_into().unwrap());
+                let idx = 4 + i * 16;
+                let value = u64::from_le_bytes([
+                    data[idx],
+                    data[idx + 1],
+                    data[idx + 2],
+                    data[idx + 3],
+                    data[idx + 4],
+                    data[idx + 5],
+                    data[idx + 6],
+                    data[idx + 7],
+                ]);
 
                 if !wanted.contains(&value) {
                     continue;
                 }
 
-                let offset = u32::from_le_bytes(data[idx + 8..idx + 12].try_into().unwrap()) as usize;
-                let length = u32::from_le_bytes(data[idx + 12..idx + 16].try_into().unwrap()) as usize;
+                let offset = u32::from_le_bytes([
+                    data[idx + 8],
+                    data[idx + 9],
+                    data[idx + 10],
+                    data[idx + 11],
+                ]) as usize;
+                let length = u32::from_le_bytes([
+                    data[idx + 12],
+                    data[idx + 13],
+                    data[idx + 14],
+                    data[idx + 15],
+                ]) as usize;
 
                 let start = data_start + offset;
                 let end = start + length;
@@ -438,15 +298,9 @@ impl BitmapFs {
                     ));
                 }
 
-                let bm = if is_frozen {
-                    let frozen = FrozenRoaringBitmap::view(&data[start..end])
-                        .map_err(|e| BitdexError::DocStore(format!("frozen view: {e}")))?;
-                    frozen.to_owned()
-                } else {
-                    RoaringBitmap::deserialize_from(&data[start..end]).map_err(|e| {
-                        BitdexError::DocStore(format!("filter bitmap deserialize: {e}"))
-                    })?
-                };
+                let bm = RoaringBitmap::deserialize_from(&data[start..end]).map_err(|e| {
+                    BitdexError::DocStore(format!("filter bitmap deserialize: {e}"))
+                })?;
                 result.insert(value, bm);
             }
         }
@@ -456,9 +310,7 @@ impl BitmapFs {
 
     /// Load all bitmaps for a single field by reading all bucket pack files.
     ///
-    /// Supports both standard `.fpack` and frozen `.frozenpack` formats.
-    /// Auto-detects format by checking the magic bytes in each file.
-    /// For fields with multiple pack files (high-cardinality fields like userId),
+    /// For fields with multiple fpack files (high-cardinality fields like userId),
     /// uses rayon parallel iteration for ~3x speedup. Single-file fields use
     /// sequential loading to avoid rayon overhead.
     pub fn load_field(&self, field_name: &str) -> Result<HashMap<u64, RoaringBitmap>> {
@@ -467,14 +319,15 @@ impl BitmapFs {
             return Ok(HashMap::new());
         }
 
-        // Collect pack file paths (both .fpack and .frozenpack)
+        // Collect fpack file paths
         let fpack_files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(|e| BitdexError::DocStore(format!("read filter dir: {e}")))?
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some("fpack") | Some("frozenpack") => Some(path),
-                    _ => None,
+                if path.extension().map_or(true, |ext| ext != "fpack") {
+                    None
+                } else {
+                    Some(path)
                 }
             })
             .collect();
@@ -487,7 +340,7 @@ impl BitmapFs {
         if fpack_files.len() == 1 {
             let data = std::fs::read(&fpack_files[0])
                 .map_err(|e| BitdexError::DocStore(format!("read pack file: {e}")))?;
-            let entries = Self::read_pack_file_auto(&data)?;
+            let entries = Self::read_pack_file(&data)?;
             let mut result = HashMap::with_capacity(entries.len());
             for (value, bm) in entries {
                 result.insert(value, bm);
@@ -529,61 +382,40 @@ impl BitmapFs {
             return Ok(HashSet::new());
         }
 
-        // Collect pack file paths (both .fpack and .frozenpack)
+        // Collect fpack paths
         let fpack_files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map_err(|e| BitdexError::DocStore(format!("read filter dir: {e}")))?
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some("fpack") | Some("frozenpack") => Some(path),
-                    _ => None,
+                if path.extension().map_or(true, |ext| ext != "fpack") {
+                    None
+                } else {
+                    Some(path)
                 }
             })
             .collect();
 
-        /// Extract keys from a pack file by reading only the header.
-        /// Auto-detects standard vs frozen format (frozen has 4-byte magic prefix).
+        /// Extract keys from a single fpack file by reading only the header.
         fn extract_keys(path: &Path) -> std::result::Result<Vec<u64>, BitdexError> {
             use std::io::Read;
             let mut file = std::fs::File::open(path)
                 .map_err(|e| BitdexError::DocStore(format!("open pack file: {e}")))?;
 
-            // Read first 8 bytes to detect format
-            let mut header_buf = [0u8; 8];
-            if file.read_exact(&mut header_buf).is_err() {
+            // Read just the entry count (4 bytes)
+            let mut count_buf = [0u8; 4];
+            if file.read_exact(&mut count_buf).is_err() {
                 return Ok(Vec::new());
             }
-
-            let (num_entries, index_offset) = if &header_buf[..4] == b"FRZN" {
-                // Frozen format: magic + u32 count
-                (u32::from_le_bytes(header_buf[4..8].try_into().unwrap()) as usize, 8)
-            } else {
-                // Standard format: u32 count (first 4 bytes)
-                (u32::from_le_bytes(header_buf[..4].try_into().unwrap()) as usize, 4)
-            };
-
+            let num_entries = u32::from_le_bytes(count_buf) as usize;
             if num_entries == 0 {
                 return Ok(Vec::new());
             }
 
-            // Read the header index (16 bytes per entry), only need value_id (first 8 bytes each).
-            // For standard format, we over-read by 4 bytes (file cursor at 8, index starts at 4).
-            // For frozen format, cursor is already at the index start (8).
+            // Read just the header index (16 bytes per entry), only need value_id (first 8 bytes each)
             let header_bytes = num_entries * 16;
             let mut header = vec![0u8; header_bytes];
-            if index_offset == 4 {
-                // Standard format: we already read 4 bytes past the count.
-                // Those 4 bytes are the start of the first index entry.
-                header[..4].copy_from_slice(&header_buf[4..8]);
-                if header_bytes > 4 {
-                    file.read_exact(&mut header[4..])
-                        .map_err(|e| BitdexError::DocStore(format!("read pack header: {e}")))?;
-                }
-            } else {
-                // Frozen format: cursor at 8, index starts at 8
-                file.read_exact(&mut header)
-                    .map_err(|e| BitdexError::DocStore(format!("read pack header: {e}")))?;
-            }
+            file.read_exact(&mut header)
+                .map_err(|e| BitdexError::DocStore(format!("read pack header: {e}")))?;
 
             let mut keys = Vec::with_capacity(num_entries);
             for i in 0..num_entries {
