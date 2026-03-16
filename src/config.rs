@@ -163,7 +163,6 @@ impl Config {
 
         match ext {
             "toml" => Self::from_toml(&content),
-            "yaml" | "yml" => Self::from_yaml(&content),
             other => Err(BitdexError::Config(format!(
                 "unsupported config file format: '{other}'"
             ))),
@@ -174,22 +173,6 @@ impl Config {
     pub fn from_toml(toml_str: &str) -> Result<Self> {
         let config: Config =
             toml::from_str(toml_str).map_err(|e| BitdexError::Config(format!("TOML parse error: {e}")))?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// Load configuration from a YAML string.
-    pub fn from_yaml(yaml: &str) -> Result<Self> {
-        let config: Config =
-            serde_yaml::from_str(yaml).map_err(|e| BitdexError::Config(e.to_string()))?;
-        config.validate()?;
-        Ok(config)
-    }
-
-    /// Load configuration from a JSON string.
-    pub fn from_json(json: &str) -> Result<Self> {
-        let config: Config =
-            serde_json::from_str(json).map_err(|e| BitdexError::Config(e.to_string()))?;
         config.validate()?;
         Ok(config)
     }
@@ -743,56 +726,6 @@ bits = 32
     }
 
     #[test]
-    fn test_yaml_parsing() {
-        let yaml = r#"
-max_page_size: 50
-filter_fields:
-  - name: nsfwLevel
-    field_type: single_value
-  - name: tagIds
-    field_type: multi_value
-  - name: onSite
-    field_type: boolean
-sort_fields:
-  - name: reactionCount
-    source_type: uint32
-    encoding: linear
-    bits: 32
-  - name: sortAt
-    source_type: uint32
-    bits: 32
-"#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert_eq!(config.max_page_size, 50);
-        assert_eq!(config.filter_fields.len(), 3);
-        assert_eq!(config.sort_fields.len(), 2);
-        assert_eq!(config.filter_fields[0].name, "nsfwLevel");
-        assert_eq!(
-            config.filter_fields[0].field_type,
-            FilterFieldType::SingleValue
-        );
-        assert_eq!(config.filter_fields[1].field_type, FilterFieldType::MultiValue);
-        assert_eq!(config.filter_fields[2].field_type, FilterFieldType::Boolean);
-        assert_eq!(config.sort_fields[0].bits, 32);
-    }
-
-    #[test]
-    fn test_json_parsing() {
-        let json = r#"{
-            "max_page_size": 200,
-            "filter_fields": [
-                {"name": "userId", "field_type": "single_value"}
-            ],
-            "sort_fields": [
-                {"name": "id", "source_type": "uint32", "bits": 32}
-            ]
-        }"#;
-        let config = Config::from_json(json).unwrap();
-        assert_eq!(config.max_page_size, 200);
-        assert_eq!(config.filter_fields.len(), 1);
-    }
-
-    #[test]
     fn test_from_file_toml() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -809,24 +742,6 @@ max_entries = 999
         let config = Config::from_file(&path).unwrap();
         assert_eq!(config.max_page_size, 42);
         assert_eq!(config.cache.max_entries, 999);
-    }
-
-    #[test]
-    fn test_from_file_yaml() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        std::fs::write(
-            &path,
-            r#"
-max_page_size: 77
-cache:
-  decay_rate: 0.8
-"#,
-        )
-        .unwrap();
-        let config = Config::from_file(&path).unwrap();
-        assert_eq!(config.max_page_size, 77);
-        assert_eq!(config.cache.decay_rate, 0.8);
     }
 
     #[test]
@@ -1042,59 +957,8 @@ bits = 32
     }
 
     #[test]
-    fn test_civitai_config_yaml() {
-        let yaml = r#"
-max_page_size: 100
-autovac_interval_secs: 3600
-merge_interval_ms: 5000
-prometheus_port: 9090
-
-filter_fields:
-  - name: nsfwLevel
-    field_type: single_value
-  - name: tagIds
-    field_type: multi_value
-  - name: userId
-    field_type: single_value
-  - name: modelVersionIds
-    field_type: multi_value
-  - name: onSite
-    field_type: boolean
-  - name: hasMeta
-    field_type: boolean
-  - name: type
-    field_type: single_value
-
-sort_fields:
-  - name: reactionCount
-    source_type: uint32
-    bits: 32
-  - name: sortAt
-    source_type: uint32
-    bits: 32
-  - name: commentCount
-    source_type: uint32
-    bits: 32
-  - name: collectedCount
-    source_type: uint32
-    bits: 32
-  - name: id
-    source_type: uint32
-    bits: 32
-"#;
-        let config = Config::from_yaml(yaml).unwrap();
-        assert_eq!(config.filter_fields.len(), 7);
-        assert_eq!(config.sort_fields.len(), 5);
-    }
-
-    #[test]
     fn test_invalid_toml() {
         assert!(Config::from_toml("{{{{not valid").is_err());
-    }
-
-    #[test]
-    fn test_invalid_yaml() {
-        assert!(Config::from_yaml(":\n  :\n    :invalid:").is_err());
     }
 
     #[test]
@@ -1198,34 +1062,6 @@ source_field = "scheduledAt"
         let da = config.deferred_alive.as_ref().unwrap();
         assert_eq!(da.source_field, "scheduledAt");
         assert!(!da.ms_to_seconds);
-    }
-
-    #[test]
-    fn test_field_behaviors_yaml_parsing() {
-        let yaml = r#"
-filter_fields:
-  - name: scheduledAt
-    field_type: single_value
-    behaviors:
-      range_buckets:
-        - name: "24h"
-          duration_secs: 86400
-          refresh_interval_secs: 60
-        - name: "30d"
-          duration_secs: 2592000
-          refresh_interval_secs: 3600
-deferred_alive:
-  source_field: scheduledAt
-  ms_to_seconds: true
-"#;
-        let config = Config::from_yaml(yaml).unwrap();
-        let behaviors = config.filter_fields[0].behaviors.as_ref().unwrap();
-        assert_eq!(behaviors.range_buckets.len(), 2);
-        assert_eq!(behaviors.range_buckets[1].name, "30d");
-        assert_eq!(behaviors.range_buckets[1].duration_secs, 2592000);
-        let da = config.deferred_alive.as_ref().unwrap();
-        assert_eq!(da.source_field, "scheduledAt");
-        assert!(da.ms_to_seconds);
     }
 
     #[test]

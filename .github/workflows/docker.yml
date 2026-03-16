@@ -44,9 +44,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile
+          file: deploy/docker/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=dockerfile-${{ hashFiles('docker/Dockerfile') }}
-          cache-to: type=gha,mode=max,scope=dockerfile-${{ hashFiles('docker/Dockerfile') }}
+          cache-from: type=gha,scope=dockerfile-${{ hashFiles('deploy/docker/Dockerfile') }}
+          cache-to: type=gha,mode=max,scope=dockerfile-${{ hashFiles('deploy/docker/Dockerfile') }}

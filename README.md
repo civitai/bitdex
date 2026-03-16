@@ -107,10 +107,10 @@ Production and SIMD Docker images are in the `docker/` directory.
 
 ```bash
 # Production image (stable Rust, fat LTO, target-cpu=znver5)
-docker build -t bitdex:latest -f docker/Dockerfile .
+docker build -t bitdex:latest -f deploy/docker/Dockerfile .
 
 # SIMD image (pinned nightly, roaring portable_simd)
-docker build -t bitdex:simd -f docker/Dockerfile.simd .
+docker build -t bitdex:simd -f deploy/docker/Dockerfile.simd .
 
 # Run
 docker run -p 3000:3000 -v bitdex-data:/data bitdex:latest
