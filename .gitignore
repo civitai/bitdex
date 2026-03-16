@@ -1,4 +1,5 @@
 /target
+/target-test*/
 /.browser
 /data/
 /data-*/
@@ -11,7 +12,10 @@ server_stderr.log
 server_stdout.log
 .claude/worktrees/
 .claude/skills/dev-server/state/
+.claude/skills/dev-server/debug.log
+.claude/scheduled_tasks.lock
 .test-data/
+tools/perf-reports.jsonl
 
 # Benchmark and test results — keep only latest per-suite, ignore timestamped history
 docs/test-results/e2e-2*.json
