@@ -41,7 +41,7 @@ pub struct UnifiedCacheConfig {
     /// Maximum maintenance work per flush (affected_entries × changed_slots).
     /// When exceeded, affected entries are marked for rebuild instead of
     /// per-slot evaluation. Prevents positive feedback loops under burst writes.
-    /// Default 50_000 (~5ms of maintenance work).
+    /// Default 500_000.
     pub max_maintenance_work: usize,
     /// Prefetch threshold: trigger background expansion when the user has consumed
     /// this fraction of the cached entries (default 0.95 = 95% consumed, 5% remaining).
@@ -57,7 +57,7 @@ impl Default for UnifiedCacheConfig {
             initial_capacity: 4_000,
             max_capacity: 64_000,
             min_filter_size: 0,
-            max_maintenance_work: 50_000,
+            max_maintenance_work: 500_000,
             prefetch_threshold: 0.95,
         }
     }
@@ -901,6 +901,11 @@ impl UnifiedCache {
     /// Get the cache config.
     pub fn config(&self) -> &UnifiedCacheConfig {
         &self.config
+    }
+
+    /// Get mutable access to the cache config.
+    pub fn config_mut(&mut self) -> &mut UnifiedCacheConfig {
+        &mut self.config
     }
 
     /// Iterate all entries mutably (for flush thread maintenance).
