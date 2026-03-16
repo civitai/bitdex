@@ -1124,6 +1124,8 @@ impl ConcurrentEngine {
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
                             FlushCommand::ForcePublish { done } => {
+                                let fp_start = std::time::Instant::now();
+                                let t_drain = std::time::Instant::now();
                                 // Drain lazy load channel — query threads may have
                                 // loaded data from disk and need it published.
                                 while let Ok(load) = lazy_rx.try_recv() {
@@ -1146,9 +1148,11 @@ impl ConcurrentEngine {
                                         }
                                     }
                                 }
+                                let drain_elapsed = t_drain.elapsed();
                                 // Drain any remaining mutations from the channel
                                 // before publishing — they may not have been picked
                                 // up by the regular prepare() at the top of the loop.
+                                let t_flush = std::time::Instant::now();
                                 let extra = coalescer.flush(
                                     &mut staging.slots,
                                     &mut staging.filters,
@@ -1157,13 +1161,35 @@ impl ConcurrentEngine {
                                 if extra > 0 {
                                     staging_dirty = true;
                                 }
-                                // Compact diffs before publishing
-                                for (_name, field) in staging.filters.fields_mut() {
-                                    field.merge_dirty();
+                                let flush_elapsed = t_flush.elapsed();
+                                // Compact diffs before publishing — only needed if
+                                // mutations were drained. Lazy loads insert clean base
+                                // bitmaps with no diffs, so merge_dirty is a no-op.
+                                // Skipping saves ~65ms by avoiding fields_mut() which
+                                // touches every Arc<FilterField>.
+                                let t_merge = std::time::Instant::now();
+                                if extra > 0 {
+                                    for (_name, field) in staging.filters.fields_mut() {
+                                        field.merge_dirty();
+                                    }
                                 }
+                                let merge_elapsed = t_merge.elapsed();
+                                let t_cache = std::time::Instant::now();
                                 flush_unified_cache.lock().clear();
+                                let cache_elapsed = t_cache.elapsed();
+                                let t_clone = std::time::Instant::now();
                                 inner.store(Arc::new(staging.clone()));
+                                let clone_elapsed = t_clone.elapsed();
                                 staging_dirty = false;
+                                tracing::debug!(
+                                    "ForcePublish: drain={:.1}ms flush={:.1}ms merge={:.1}ms cache={:.1}ms clone={:.1}ms total={:.1}ms",
+                                    drain_elapsed.as_secs_f64() * 1000.0,
+                                    flush_elapsed.as_secs_f64() * 1000.0,
+                                    merge_elapsed.as_secs_f64() * 1000.0,
+                                    cache_elapsed.as_secs_f64() * 1000.0,
+                                    clone_elapsed.as_secs_f64() * 1000.0,
+                                    fp_start.elapsed().as_secs_f64() * 1000.0,
+                                );
                                 // Signal caller that publish is complete
                                 let _ = done.send(());
                             }
