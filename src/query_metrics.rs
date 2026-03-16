@@ -318,18 +318,17 @@ mod tests {
     }
 
     #[test]
-    fn test_write_and_read_traces() {
-        let dir = std::env::temp_dir().join(format!("bitdex-trace-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn test_trace_ring_buffer() {
+        let buf = super::TraceBuffer::new(3); // capacity 3
 
-        let trace = QueryTrace {
-            ts: "2026-03-14T00:00:00.000Z".into(),
+        let make_trace = |n: u64| QueryTrace {
+            ts: format!("2026-03-14T00:00:0{n}.000Z"),
             index: "test".into(),
-            total_us: 1000,
-            plan_us: 50,
-            filter_us: 800,
-            sort_us: 150,
-            result_count: 42,
+            total_us: n * 100,
+            plan_us: 0,
+            filter_us: 0,
+            sort_us: 0,
+            result_count: n,
             docs_us: 0,
             docs_count: 0,
             cache_hit: false,
@@ -337,16 +336,21 @@ mod tests {
             sort: None,
         };
 
-        write_trace(&dir, &trace);
-        write_trace(&dir, &trace);
+        buf.push(make_trace(1));
+        buf.push(make_trace(2));
+        assert_eq!(buf.last_n(10).len(), 2);
 
-        let traces = read_traces(&dir, 10);
-        assert_eq!(traces.len(), 2);
-        assert_eq!(traces[0].result_count, 42);
+        buf.push(make_trace(3));
+        buf.push(make_trace(4)); // overwrites slot 0
+        let recent = buf.last_n(10);
+        assert_eq!(recent.len(), 3);
+        // Oldest first (VecDeque order), newest last
+        assert_eq!(recent[0].result_count, 2);
+        assert_eq!(recent[2].result_count, 4);
 
-        let traces = read_traces(&dir, 1);
-        assert_eq!(traces.len(), 1);
-
-        std::fs::remove_dir_all(&dir).ok();
+        // Limit
+        let limited = buf.last_n(1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].result_count, 4);
     }
 }

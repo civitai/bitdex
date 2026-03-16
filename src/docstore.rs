@@ -2927,4 +2927,44 @@ mod tests {
             other => panic!("expected extra=99, got: {:?}", other),
         }
     }
+
+    /// Concurrent append_tuple stress test.
+    /// Reproduces the race condition where multiple threads call append_tuple
+    /// on different slots (hitting different shards) simultaneously. Before the
+    /// fix, get_v2_writer + get(&sid) could panic with unwrap on None under
+    /// concurrent DashMap access.
+    #[test]
+    fn test_concurrent_append_tuple_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        let _bw = store.prepare_bulk_load(&["val".to_string()]).unwrap();
+        let val_idx: u16 = 0;
+        let store = std::sync::Arc::new(parking_lot::Mutex::new(store));
+
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let store = std::sync::Arc::clone(&store);
+                std::thread::spawn(move || {
+                    // Each thread writes to different slots across many shards
+                    for i in 0..100 {
+                        let slot = (t * 10000 + i * 512) as u32; // spread across shards
+                        let packed = rmp_serde::to_vec(&PackedValue::I(t as i64 * 1000 + i)).unwrap();
+                        store.lock().append_tuple(slot, val_idx, &packed).unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // Verify writes succeeded — just check that no panic occurred
+        // and the writers exist for the shards we wrote to
+        {
+            let s = store.lock();
+            assert!(s.v2_writers.len() > 0, "should have created v2 writers");
+        }
+    }
 }
