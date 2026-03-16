@@ -788,6 +788,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/load", post(handle_load))
             .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
+            .route("/api/indexes/{name}/documents/patch", patch(handle_patch_documents))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/cache/persistent", delete(handle_purge_cache))
             .route("/api/indexes/{name}/warm", post(handle_warm_cache))
@@ -1991,6 +1992,87 @@ async fn handle_upsert(
         (
             StatusCode::OK,
             Json(serde_json::json!({"upserted": upserted, "errors": errors})),
+        ).into_response()
+    }
+}
+
+/// PATCH /api/indexes/{name}/documents/patch
+///
+/// Partial update: merges only provided fields into existing documents.
+/// Fields absent from the payload are left untouched in bitmaps and docstore.
+/// Slots that are not alive return an error (use upsert for initial creation).
+async fn handle_patch_documents(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<UpsertRequest>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let (schema, has_lcs) = {
+        let guard = state.index.lock();
+        let idx = guard.as_ref().unwrap();
+        let has_lcs = idx.definition.data_schema.fields.iter().any(|f| f.value_type == FieldValueType::LowCardinalityString);
+        (idx.definition.data_schema.clone(), has_lcs)
+    };
+
+    let mut patched = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, doc_json) in req.documents.iter().enumerate() {
+        let dicts = if has_lcs { Some(engine.dictionaries()) } else { None };
+        match loader::json_to_document_with_dicts(doc_json, &schema, dicts) {
+            Ok((slot, doc)) => {
+                match engine.patch_document(slot, &doc) {
+                    Ok(()) => patched += 1,
+                    Err(crate::error::BitdexError::SlotNotFound(_)) => {
+                        errors.push(format!("doc[{}] id={}: not alive (use upsert for new docs)", i, slot));
+                    }
+                    Err(e) => {
+                        errors.push(format!("doc[{}] id={}: {}", i, slot, e));
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!("doc[{}]: {}", i, e));
+            }
+        }
+    }
+
+    if let Some(cursor) = req.cursor {
+        engine.set_cursor(cursor.name, cursor.value);
+    }
+
+    if has_lcs && patched > 0 {
+        if let Err(e) = engine.persist_dirty_dictionaries() {
+            eprintln!("warning: failed to persist LCS dictionaries: {}", e);
+        }
+        let mut guard = state.index.lock();
+        if let Some(ref mut idx) = *guard {
+            let dicts = engine.dictionaries();
+            let reverse_maps = build_reverse_string_maps_with_dicts(&idx.definition.data_schema, Some(dicts));
+            idx.reverse_maps = Arc::new(reverse_maps);
+        }
+    }
+
+    state.metrics.upsert_total.with_label_values(&[&name]).inc_by(patched);
+
+    if errors.is_empty() {
+        Json(serde_json::json!({"patched": patched})).into_response()
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"patched": patched, "errors": errors})),
         ).into_response()
     }
 }

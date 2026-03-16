@@ -122,8 +122,9 @@ async fn poll_metrics_and_push(
     let docs = assemble_batch(&images, &enrichment);
     let count = docs.len();
 
+    // Use PATCH for metrics updates — preserves fields not included in this update.
     if !docs.is_empty() {
-        bitdex_client.upsert_batch(&docs, None).await?;
+        bitdex_client.patch_batch(&docs, None).await?;
     }
 
     Ok(count)

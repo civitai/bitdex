@@ -310,6 +310,115 @@ pub fn diff_document(
     ops
 }
 
+/// Pure diff for partial update (PATCH): like diff_document upsert path,
+/// but ONLY processes fields present in new_doc. Missing fields are skipped
+/// entirely — they are NOT treated as deletions. This is the key difference
+/// from diff_document which treats missing fields as "change to None."
+pub fn diff_document_partial(
+    slot: u32,
+    old_doc: Option<&StoredDoc>,
+    new_doc: &Document,
+    config: &Config,
+    registry: &FieldRegistry,
+) -> Vec<MutationOp> {
+    let mut ops = Vec::new();
+    let empty_fields = HashMap::new();
+    let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
+
+    for filter_config in &config.filter_fields {
+        let field_name = &filter_config.name;
+        // PATCH semantics: skip fields not in the new doc
+        let new_val = match new_doc.fields.get(field_name) {
+            Some(v) => Some(v),
+            None => continue,
+        };
+        let old_val = old_fields.get(field_name);
+
+        if field_values_equal(old_val, new_val) {
+            continue;
+        }
+
+        let arc_name = registry.get(field_name);
+        if let Some(old) = old_val {
+            collect_filter_remove_ops(&mut ops, &arc_name, slot, old);
+        }
+        if let Some(new) = new_val {
+            collect_filter_insert_ops(&mut ops, &arc_name, slot, new);
+        }
+    }
+
+    for sort_config in &config.sort_fields {
+        let field_name = &sort_config.name;
+        // PATCH semantics: skip fields not in the new doc
+        let new_val = match new_doc.fields.get(field_name) {
+            Some(v) => Some(v),
+            None => continue,
+        };
+        let old_val = old_fields.get(field_name);
+
+        if field_values_equal(old_val, new_val) {
+            continue;
+        }
+
+        let old_sort = old_val.and_then(|v| match v {
+            FieldValue::Single(val) => value_to_sort_u32(val),
+            _ => None,
+        });
+        let new_sort = new_val.and_then(|v| match v {
+            FieldValue::Single(val) => value_to_sort_u32(val),
+            _ => None,
+        });
+
+        let arc_name = registry.get(field_name);
+        let num_bits = sort_config.bits as usize;
+        match (old_sort, new_sort) {
+            (Some(old_s), Some(new_s)) => {
+                let diff = old_s ^ new_s;
+                for bit in 0..num_bits {
+                    if (diff >> bit) & 1 == 1 {
+                        if (new_s >> bit) & 1 == 1 {
+                            ops.push(MutationOp::SortSet {
+                                field: arc_name.clone(),
+                                bit_layer: bit,
+                                slots: vec![slot],
+                            });
+                        } else {
+                            ops.push(MutationOp::SortClear {
+                                field: arc_name.clone(),
+                                bit_layer: bit,
+                                slots: vec![slot],
+                            });
+                        }
+                    }
+                }
+            }
+            (Some(_), None) => {
+                for bit in 0..num_bits {
+                    ops.push(MutationOp::SortClear {
+                        field: arc_name.clone(),
+                        bit_layer: bit,
+                        slots: vec![slot],
+                    });
+                }
+            }
+            (None, Some(new_s)) => {
+                for bit in 0..num_bits {
+                    if (new_s >> bit) & 1 == 1 {
+                        ops.push(MutationOp::SortSet {
+                            field: arc_name.clone(),
+                            bit_layer: bit,
+                            slots: vec![slot],
+                        });
+                    }
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    ops
+}
+
 /// Pure diff for PATCH: given old/new field values, returns MutationOps.
 pub fn diff_patch(
     slot: u32,

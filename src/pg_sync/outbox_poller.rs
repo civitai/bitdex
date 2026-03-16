@@ -197,8 +197,11 @@ async fn fetch_and_push_upserts(
     let docs = assemble_batch(&images, &enrichment);
     let count = docs.len();
 
+    // Use PATCH (partial update) instead of PUT (full replace) so that
+    // fields not present in the outbox doc (e.g. ClickHouse metrics) are
+    // preserved rather than zeroed out by schema defaults.
     client
-        .upsert_batch(&docs, Some((cursor_name, cursor_value)))
+        .patch_batch(&docs, Some((cursor_name, cursor_value)))
         .await?;
 
     Ok(count)

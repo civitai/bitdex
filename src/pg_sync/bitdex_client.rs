@@ -95,6 +95,33 @@ impl BitdexClient {
         Ok(())
     }
 
+    /// Patch a batch of documents (partial update), optionally advancing a named cursor.
+    /// Only provided fields are updated; missing fields are preserved.
+    pub async fn patch_batch(
+        &self,
+        docs: &[Value],
+        cursor: Option<(&str, &str)>,
+    ) -> Result<(), String> {
+        let url = format!("{}/documents/patch", self.base_url);
+        let mut body = serde_json::json!({ "documents": docs });
+        if let Some((name, value)) = cursor {
+            body["cursor"] = serde_json::json!({ "name": name, "value": value });
+        }
+        let resp = self.client
+            .patch(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("patch request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("patch returned {status}: {body}"));
+        }
+        Ok(())
+    }
+
     /// Delete a batch of documents by ID, optionally advancing a named cursor.
     pub async fn delete_batch(
         &self,

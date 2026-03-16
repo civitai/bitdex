@@ -2238,7 +2238,9 @@ impl ConcurrentEngine {
         result
     }
 
-    /// PATCH(id, partial_fields) -- merge only provided fields.
+    /// PATCH(id, partial_fields) -- merge only provided fields into existing doc.
+    /// Uses diff_document_partial which skips fields not present in the new doc.
+    /// Also merges provided fields into the stored document.
     pub fn patch(&self, id: u32, patch: &PatchPayload) -> Result<()> {
         self.in_flight.mark_in_flight(id);
 
@@ -2256,6 +2258,62 @@ impl ConcurrentEngine {
             self.sender.send_batch(ops).map_err(|_| {
                 crate::error::BitdexError::CapacityExceeded(
                     "coalescer channel disconnected".to_string(),
+                )
+            })?;
+
+            Ok(())
+        })();
+
+        self.in_flight.clear_in_flight(id);
+        result
+    }
+
+    /// PATCH with a Document — partial update using diff_document_partial.
+    /// Only fields present in the doc are diffed and updated. Missing fields
+    /// are left untouched in both bitmaps and docstore.
+    pub fn patch_document(&self, id: u32, doc: &Document) -> Result<()> {
+        self.in_flight.mark_in_flight(id);
+
+        let result = (|| -> Result<()> {
+            // Verify alive
+            {
+                let snap = self.snapshot();
+                if !snap.slots.is_alive(id) {
+                    return Err(crate::error::BitdexError::SlotNotFound(id));
+                }
+            }
+
+            // Read old doc for diffing
+            let old_doc = self.docstore.lock().get(id)?;
+
+            // Compute partial diff — only fields present in doc are processed
+            let ops = crate::mutation::diff_document_partial(
+                id, old_doc.as_ref(), doc, &self.config, &self.field_registry,
+            );
+
+            // Send bitmap mutations
+            if !ops.is_empty() {
+                self.sender.send_batch(ops).map_err(|_| {
+                    crate::error::BitdexError::CapacityExceeded(
+                        "coalescer channel disconnected".to_string(),
+                    )
+                })?;
+            }
+
+            // Merge provided fields into stored doc (preserve existing fields)
+            let mut merged_fields = old_doc
+                .map(|d| d.fields)
+                .unwrap_or_default();
+            for (k, v) in &doc.fields {
+                merged_fields.insert(k.clone(), v.clone());
+            }
+            let stored = StoredDoc {
+                fields: merged_fields,
+                schema_version: 0,
+            };
+            self.doc_tx.send((id, stored)).map_err(|_| {
+                crate::error::BitdexError::CapacityExceeded(
+                    "docstore channel disconnected".to_string(),
                 )
             })?;
 
