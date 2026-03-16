@@ -1129,7 +1129,8 @@ impl DocStore {
     pub fn append_tuple(&self, slot: u32, field_idx: u16, value: &[u8]) -> Result<()> {
         let sid = Self::shard_id(slot);
         self.get_v2_writer(sid)?;
-        let entry = self.v2_writers.get(&sid).unwrap();
+        let entry = self.v2_writers.get(&sid)
+            .ok_or_else(|| BitdexError::DocStore(format!("v2 writer missing for shard {sid} after init")))?;
         let mut w = entry.lock();
         Self::write_v2_tuple(&mut *w, slot, field_idx, value)?;
         w.flush()
