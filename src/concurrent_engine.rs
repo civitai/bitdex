@@ -4236,37 +4236,59 @@ impl ConcurrentEngine {
     /// Pre-load all pending filter and sort fields from disk.
     /// Call from a background thread after server startup so lazy-loading
     /// doesn't block request threads or health checks.
+    ///
+    /// Load order: sort fields → bound caches → filter fields.
+    /// Sort fields must load first because bound cache restoration needs
+    /// `reconstruct_value()` for sorted-key rebuilding. Bound caches load
+    /// next so cached sorts are warm before any queries arrive. Filter
+    /// fields (the bulk of memory) load last.
     pub fn preload_all_fields(&self) {
         use crate::query::{FilterClause, Value};
         let t0 = std::time::Instant::now();
 
-        // Build synthetic filter clauses that touch every filter field
+        // Phase 1: Load sort fields (needed for bound cache value reconstruction)
+        let empty_clauses: Vec<FilterClause> = Vec::new();
+        for sc in &self.config.sort_fields {
+            let _ = self.ensure_fields_loaded(&empty_clauses, Some(&sc.name));
+        }
+        let sort_elapsed = t0.elapsed();
+        eprintln!(
+            "Preload phase 1: {} sort fields in {:.1}s",
+            self.config.sort_fields.len(),
+            sort_elapsed.as_secs_f64(),
+        );
+
+        // Phase 2: Load bound cache shards (requires sort fields from phase 1)
+        if self.config.cache.preload_bounds {
+            self.preload_bound_cache();
+        }
+
+        // Phase 3: Load filter fields
+        let t2 = std::time::Instant::now();
         let mut clauses: Vec<FilterClause> = Vec::new();
         for fc in &self.config.filter_fields {
-            // Eq with a dummy value triggers loading for the field
             clauses.push(FilterClause::Eq(
                 fc.name.clone(),
                 Value::Integer(0),
             ));
         }
-
-        // Load all sort fields by iterating through each one
-        for sc in &self.config.sort_fields {
-            let _ = self.ensure_fields_loaded(&clauses, Some(&sc.name));
-        }
-        // One more call with no sort to load any remaining filters
         let _ = self.ensure_fields_loaded(&clauses, None);
+        eprintln!(
+            "Preload phase 3: {} filter fields in {:.1}s",
+            self.config.filter_fields.len(),
+            t2.elapsed().as_secs_f64(),
+        );
 
         eprintln!(
-            "Background preload complete: {} filter + {} sort fields in {:.1}s",
-            self.config.filter_fields.len(),
+            "Background preload complete: {} sort + {} filter fields in {:.1}s",
             self.config.sort_fields.len(),
+            self.config.filter_fields.len(),
             t0.elapsed().as_secs_f64(),
         );
     }
 
     /// Pre-load all bound cache shards from disk.
-    /// Called after `preload_all_fields()` so sort fields are available for value reconstruction.
+    /// Iterates every sort field × both directions.
     pub fn preload_bound_cache(&self) {
         use crate::query::SortDirection;
         if self.bound_store.is_none() {
@@ -4281,7 +4303,7 @@ impl ConcurrentEngine {
             }
         }
         eprintln!(
-            "Bound cache preload complete: {} shards in {:.1}s",
+            "Preload phase 2: {} bound cache shards in {:.1}s",
             loaded,
             t0.elapsed().as_secs_f64(),
         );

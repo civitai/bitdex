@@ -738,10 +738,6 @@ impl BitdexServer {
             if let Some(engine) = engine_arc {
                 tokio::task::spawn_blocking(move || {
                     engine.preload_all_fields();
-                    // Preload bound cache shards after bitmaps are loaded
-                    if engine.config().cache.preload_bounds {
-                        engine.preload_bound_cache();
-                    }
                 });
             }
         }
