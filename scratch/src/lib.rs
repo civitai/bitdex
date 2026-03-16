@@ -1173,3 +1173,458 @@ mod bench_sort_opt {
             .join(", ")
     }
 }
+
+// ============================================================================
+// Lazy bitmap loading benchmarks
+// ============================================================================
+#[cfg(test)]
+mod bench_lazy_load {
+    use memmap2::Mmap;
+    use rayon::prelude::*;
+    use roaring::RoaringBitmap;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+
+    const BITMAP_ROOT: &str = "C:/Dev/Repos/open-source/bitdex-v2/data/indexes/civitai/bitmaps";
+
+    fn filter_dir(field: &str) -> PathBuf {
+        Path::new(BITMAP_ROOT).join("filter").join(field)
+    }
+
+    fn list_fpack_files(field: &str) -> Vec<PathBuf> {
+        let dir = filter_dir(field);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                if p.extension().map_or(true, |ext| ext != "fpack") {
+                    None
+                } else {
+                    Some(p)
+                }
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    // ---------- Baseline: sequential load (mirrors current bitmap_fs.rs) ----------
+
+    fn parse_fpack(data: &[u8]) -> Vec<(u64, RoaringBitmap)> {
+        let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let header_size = 4 + num_entries * 16;
+        let data_start = header_size;
+        let mut result = Vec::with_capacity(num_entries);
+        for i in 0..num_entries {
+            let idx = 4 + i * 16;
+            let value = u64::from_le_bytes(data[idx..idx + 8].try_into().unwrap());
+            let offset = u32::from_le_bytes(data[idx + 8..idx + 12].try_into().unwrap()) as usize;
+            let length = u32::from_le_bytes(data[idx + 12..idx + 16].try_into().unwrap()) as usize;
+            let start = data_start + offset;
+            let end = start + length;
+            let bm = RoaringBitmap::deserialize_from(&data[start..end])
+                .expect("deserialize failed");
+            result.push((value, bm));
+        }
+        result
+    }
+
+    /// Baseline: sequential fs::read + sequential deserialize
+    fn load_field_baseline(files: &[PathBuf]) -> HashMap<u64, RoaringBitmap> {
+        let mut result = HashMap::new();
+        for path in files {
+            let data = std::fs::read(path).expect("read");
+            for (value, bm) in parse_fpack(&data) {
+                result.insert(value, bm);
+            }
+        }
+        result
+    }
+
+    /// Opt A: parallel file reading + deserialization (rayon par_iter over files)
+    fn load_field_parallel_files(files: &[PathBuf]) -> HashMap<u64, RoaringBitmap> {
+        let chunks: Vec<Vec<(u64, RoaringBitmap)>> = files
+            .par_iter()
+            .map(|path| {
+                let data = std::fs::read(path).expect("read");
+                parse_fpack(&data)
+            })
+            .collect();
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut result = HashMap::with_capacity(total);
+        for chunk in chunks {
+            for (value, bm) in chunk {
+                result.insert(value, bm);
+            }
+        }
+        result
+    }
+
+    /// Opt B: parallel files + parallel deserialization within each file
+    fn parse_fpack_parallel(data: &[u8]) -> Vec<(u64, RoaringBitmap)> {
+        let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let header_size = 4 + num_entries * 16;
+        let data_start = header_size;
+
+        // Parse headers first (cheap)
+        let headers: Vec<(u64, usize, usize)> = (0..num_entries)
+            .map(|i| {
+                let idx = 4 + i * 16;
+                let value = u64::from_le_bytes(data[idx..idx + 8].try_into().unwrap());
+                let offset =
+                    u32::from_le_bytes(data[idx + 8..idx + 12].try_into().unwrap()) as usize;
+                let length =
+                    u32::from_le_bytes(data[idx + 12..idx + 16].try_into().unwrap()) as usize;
+                (value, data_start + offset, data_start + offset + length)
+            })
+            .collect();
+
+        // Parallel deserialize
+        headers
+            .par_iter()
+            .map(|&(value, start, end)| {
+                let bm = RoaringBitmap::deserialize_from(&data[start..end])
+                    .expect("deserialize failed");
+                (value, bm)
+            })
+            .collect()
+    }
+
+    fn load_field_parallel_all(files: &[PathBuf]) -> HashMap<u64, RoaringBitmap> {
+        let chunks: Vec<Vec<(u64, RoaringBitmap)>> = files
+            .par_iter()
+            .map(|path| {
+                let data = std::fs::read(path).expect("read");
+                parse_fpack_parallel(&data)
+            })
+            .collect();
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut result = HashMap::with_capacity(total);
+        for chunk in chunks {
+            for (value, bm) in chunk {
+                result.insert(value, bm);
+            }
+        }
+        result
+    }
+
+    /// Opt C: mmap + parallel files
+    fn load_field_mmap_parallel(files: &[PathBuf]) -> HashMap<u64, RoaringBitmap> {
+        let chunks: Vec<Vec<(u64, RoaringBitmap)>> = files
+            .par_iter()
+            .map(|path| {
+                let file = std::fs::File::open(path).expect("open");
+                let mmap = unsafe { Mmap::map(&file).expect("mmap") };
+                parse_fpack(&mmap)
+            })
+            .collect();
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut result = HashMap::with_capacity(total);
+        for chunk in chunks {
+            for (value, bm) in chunk {
+                result.insert(value, bm);
+            }
+        }
+        result
+    }
+
+    /// Opt D: mmap + parallel files + parallel deserialization
+    fn load_field_mmap_parallel_all(files: &[PathBuf]) -> HashMap<u64, RoaringBitmap> {
+        let chunks: Vec<Vec<(u64, RoaringBitmap)>> = files
+            .par_iter()
+            .map(|path| {
+                let file = std::fs::File::open(path).expect("open");
+                let mmap = unsafe { Mmap::map(&file).expect("mmap") };
+                parse_fpack_parallel(&mmap)
+            })
+            .collect();
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut result = HashMap::with_capacity(total);
+        for chunk in chunks {
+            for (value, bm) in chunk {
+                result.insert(value, bm);
+            }
+        }
+        result
+    }
+
+    /// Opt E: parallel files with fold+reduce to build HashMap in parallel
+    fn load_field_parallel_fold(files: &[PathBuf]) -> HashMap<u64, RoaringBitmap> {
+        files
+            .par_iter()
+            .flat_map_iter(|path| {
+                let data = std::fs::read(path).expect("read");
+                parse_fpack(&data).into_iter()
+            })
+            .fold(HashMap::new, |mut map, (value, bm)| {
+                map.insert(value, bm);
+                map
+            })
+            .reduce(HashMap::new, |mut a, b| {
+                a.extend(b);
+                a
+            })
+    }
+
+    fn bench_fn<F: FnMut() -> HashMap<u64, RoaringBitmap>>(
+        name: &str,
+        iters: usize,
+        mut f: F,
+    ) -> f64 {
+        // Warmup (1 iter)
+        let warmup = f();
+        let count = warmup.len();
+        drop(warmup);
+
+        let mut timings = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let start = Instant::now();
+            let result = f();
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(result.len(), count, "value count mismatch");
+            std::hint::black_box(&result);
+            drop(result);
+            timings.push(elapsed);
+        }
+        timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = timings[timings.len() / 2];
+        let min = timings[0];
+        let max = timings[timings.len() - 1];
+        println!(
+            "  {:<35} median={:>8.1}ms  min={:>8.1}ms  max={:>8.1}ms  ({} values)  [{}]",
+            name,
+            median,
+            min,
+            max,
+            count,
+            timings
+                .iter()
+                .map(|t| format!("{:.1}", t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        median
+    }
+
+    // ---- Breakdown benchmark: I/O vs deserialization ----
+
+    fn bench_io_vs_deser(field: &str, files: &[PathBuf]) {
+        println!("\n  --- I/O vs Deserialization breakdown for {} ---", field);
+
+        // Measure pure I/O (read all files, don't deserialize)
+        let start = Instant::now();
+        let mut total_bytes = 0usize;
+        let mut total_entries = 0usize;
+        let file_data: Vec<Vec<u8>> = files
+            .iter()
+            .map(|p| {
+                let d = std::fs::read(p).expect("read");
+                total_bytes += d.len();
+                let n = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as usize;
+                total_entries += n;
+                d
+            })
+            .collect();
+        let io_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "    I/O only (sequential): {:.1}ms for {} files, {:.1} MB, {} entries",
+            io_ms,
+            files.len(),
+            total_bytes as f64 / 1048576.0,
+            total_entries
+        );
+
+        // Measure pure deserialization (data already in memory)
+        let start = Instant::now();
+        let mut deser_count = 0usize;
+        for data in &file_data {
+            let entries = parse_fpack(data);
+            deser_count += entries.len();
+            std::hint::black_box(&entries);
+        }
+        let deser_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "    Deserialization only (sequential): {:.1}ms for {} bitmaps",
+            deser_ms, deser_count
+        );
+
+        // Parallel I/O
+        let start = Instant::now();
+        let _: Vec<Vec<u8>> = files
+            .par_iter()
+            .map(|p| std::fs::read(p).expect("read"))
+            .collect();
+        let par_io_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!("    I/O only (parallel): {:.1}ms", par_io_ms);
+
+        // Parallel deserialization (data already in memory)
+        let start = Instant::now();
+        let _: Vec<Vec<(u64, RoaringBitmap)>> =
+            file_data.par_iter().map(|d| parse_fpack(d)).collect();
+        let par_deser_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "    Deserialization only (parallel): {:.1}ms",
+            par_deser_ms
+        );
+
+        // HashMap insertion cost
+        let parsed: Vec<Vec<(u64, RoaringBitmap)>> =
+            file_data.iter().map(|d| parse_fpack(d)).collect();
+        let total: usize = parsed.iter().map(|c| c.len()).sum();
+        let start = Instant::now();
+        let mut map = HashMap::with_capacity(total);
+        for chunk in parsed {
+            for (v, bm) in chunk {
+                map.insert(v, bm);
+            }
+        }
+        let insert_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "    HashMap insert only: {:.1}ms for {} entries",
+            insert_ms, total
+        );
+        drop(map);
+
+        println!(
+            "    Summary: I/O={:.0}% deser={:.0}% insert={:.0}%",
+            io_ms / (io_ms + deser_ms + insert_ms) * 100.0,
+            deser_ms / (io_ms + deser_ms + insert_ms) * 100.0,
+            insert_ms / (io_ms + deser_ms + insert_ms) * 100.0,
+        );
+    }
+
+    #[test]
+    fn bench_lazy_load_userId() {
+        println!(
+            "\n=== Lazy Load Benchmark: userId (749K values, 256 fpack files, ~289 MB) ===\n"
+        );
+
+        let files = list_fpack_files("userId");
+        println!("  Files: {}", files.len());
+
+        // Breakdown first
+        bench_io_vs_deser("userId", &files);
+
+        println!("\n  --- Full load strategies ---\n");
+        let iters = 3;
+
+        let baseline = bench_fn("baseline (sequential)", iters, || {
+            load_field_baseline(&files)
+        });
+        let par_files = bench_fn("parallel files", iters, || {
+            load_field_parallel_files(&files)
+        });
+        let par_all = bench_fn("parallel files+deser", iters, || {
+            load_field_parallel_all(&files)
+        });
+        let mmap_par = bench_fn("mmap + parallel files", iters, || {
+            load_field_mmap_parallel(&files)
+        });
+        let mmap_par_all = bench_fn("mmap + parallel files+deser", iters, || {
+            load_field_mmap_parallel_all(&files)
+        });
+        let par_fold = bench_fn("parallel fold", iters, || {
+            load_field_parallel_fold(&files)
+        });
+
+        println!(
+            "\n  --- Speedups vs baseline ({:.1}ms) ---\n",
+            baseline
+        );
+        println!(
+            "    parallel files:          {:.2}x",
+            baseline / par_files
+        );
+        println!(
+            "    parallel files+deser:    {:.2}x",
+            baseline / par_all
+        );
+        println!(
+            "    mmap + parallel:         {:.2}x",
+            baseline / mmap_par
+        );
+        println!(
+            "    mmap + parallel+deser:   {:.2}x",
+            baseline / mmap_par_all
+        );
+        println!(
+            "    parallel fold:           {:.2}x",
+            baseline / par_fold
+        );
+
+        println!("\n=== Done ===\n");
+    }
+
+    #[test]
+    fn bench_lazy_load_postedToId() {
+        println!(
+            "\n=== Lazy Load Benchmark: postedToId (928K values, ~87 MB) ===\n"
+        );
+        let files = list_fpack_files("postedToId");
+        println!("  Files: {}", files.len());
+        bench_io_vs_deser("postedToId", &files);
+
+        println!("\n  --- Full load strategies ---\n");
+        let iters = 3;
+
+        let baseline = bench_fn("baseline (sequential)", iters, || {
+            load_field_baseline(&files)
+        });
+        let par_files = bench_fn("parallel files", iters, || {
+            load_field_parallel_files(&files)
+        });
+        let mmap_par = bench_fn("mmap + parallel files", iters, || {
+            load_field_mmap_parallel(&files)
+        });
+
+        println!(
+            "\n  --- Speedups vs baseline ({:.1}ms) ---\n",
+            baseline
+        );
+        println!(
+            "    parallel files:   {:.2}x",
+            baseline / par_files
+        );
+        println!(
+            "    mmap + parallel:  {:.2}x",
+            baseline / mmap_par
+        );
+    }
+
+    #[test]
+    fn bench_lazy_load_nsfwLevel() {
+        println!(
+            "\n=== Lazy Load Benchmark: nsfwLevel (7 values, ~72 MB) ===\n"
+        );
+        let files = list_fpack_files("nsfwLevel");
+        println!("  Files: {}", files.len());
+        bench_io_vs_deser("nsfwLevel", &files);
+
+        println!("\n  --- Full load strategies ---\n");
+        let iters = 5;
+
+        let baseline = bench_fn("baseline (sequential)", iters, || {
+            load_field_baseline(&files)
+        });
+        let par_files = bench_fn("parallel files", iters, || {
+            load_field_parallel_files(&files)
+        });
+        let mmap_par = bench_fn("mmap + parallel files", iters, || {
+            load_field_mmap_parallel(&files)
+        });
+
+        println!(
+            "\n  --- Speedups vs baseline ({:.1}ms) ---\n",
+            baseline
+        );
+        println!(
+            "    parallel files:   {:.2}x",
+            baseline / par_files
+        );
+        println!(
+            "    mmap + parallel:  {:.2}x",
+            baseline / mmap_par
+        );
+    }
+}
