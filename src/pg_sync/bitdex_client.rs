@@ -148,6 +148,43 @@ impl BitdexClient {
         Ok(())
     }
 
+    /// Sync filter values for a filter_only multi-value field.
+    /// Replaces all bitmap memberships for the given slots on the named field.
+    pub async fn filter_sync(
+        &self,
+        field: &str,
+        entries: &[(i64, Vec<i64>)],
+    ) -> Result<(), String> {
+        let url = format!("{}/documents/filter-sync", self.base_url);
+        let documents: Vec<Value> = entries
+            .iter()
+            .map(|(id, values)| {
+                serde_json::json!({
+                    "id": *id as u32,
+                    "values": values.iter().map(|v| *v as u64).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "field": field,
+            "documents": documents,
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("filter_sync request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("filter_sync returned {status}: {body}"));
+        }
+        Ok(())
+    }
+
     /// Read a named cursor from BitDex. Returns None if the cursor doesn't exist.
     pub async fn get_cursor(&self, cursor_name: &str) -> Result<Option<String>, String> {
         let url = format!("{}/cursors/{}", self.base_url, cursor_name);

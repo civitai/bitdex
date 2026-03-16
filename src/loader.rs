@@ -721,6 +721,10 @@ fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDo
     }
 
     for mapping in &schema.fields {
+        if mapping.filter_only {
+            continue;
+        }
+
         let (raw, apply_ms) = match mapping.resolve_raw(json) {
             Some(pair) => pair,
             None => {
@@ -782,6 +786,11 @@ pub fn json_to_document_with_dicts(
     );
 
     for mapping in &schema.fields {
+        // filter_only fields are bitmap-indexed only — skip docstore storage
+        if mapping.filter_only {
+            continue;
+        }
+
         let (raw, apply_ms) = match mapping.resolve_raw(json) {
             Some(pair) => pair,
             None => {
@@ -907,6 +916,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -937,6 +947,7 @@ mod tests {
                 fallback: Some("secondary".into()),
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -967,6 +978,7 @@ mod tests {
                 fallback: None,
                 string_map: Some(map),
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -997,6 +1009,7 @@ mod tests {
                 fallback: None,
                 string_map: Some(map),
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false, // default
@@ -1038,6 +1051,7 @@ mod tests {
                 fallback: None,
                 string_map: Some(map),
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: true,
@@ -1075,6 +1089,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1101,6 +1116,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1131,6 +1147,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: true,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1162,6 +1179,7 @@ mod tests {
                 fallback: Some("sortAt".into()),
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: true,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1222,6 +1240,7 @@ mod tests {
                 fallback: Some("sortAt".into()),
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: true,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1272,6 +1291,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: true,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1300,6 +1320,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1323,6 +1344,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1346,6 +1368,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1379,6 +1402,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1433,6 +1457,7 @@ mod tests {
                 fallback: None,
                 string_map: None,
                 doc_only: false,
+                filter_only: false,
                 ms_to_seconds: false,
                 truncate_u32: false,
                 case_sensitive: false,
@@ -1474,6 +1499,7 @@ mod tests {
             fallback: None,
             string_map: None,
             doc_only: false,
+            filter_only: false,
             ms_to_seconds: false,
             truncate_u32: false,
             case_sensitive: false,
@@ -1635,5 +1661,120 @@ mod checkpoint_tests {
         assert_eq!(loaded.alive.len(), 0);
         assert!(loaded.filter_maps.get("field1").unwrap().is_empty());
         assert!(loaded.sort_maps.get("sort1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_filter_only_excluded_from_document() {
+        // filter_only fields should be bitmap-indexed but NOT stored in the Document
+        let schema = DataSchema {
+            id_field: "id".into(),
+            schema_version: 1,
+            fields: vec![
+                FieldMapping {
+                    source: "tagIds".into(),
+                    target: "tagIds".into(),
+                    value_type: FieldValueType::IntegerArray,
+                    fallback: None,
+                    string_map: None,
+                    doc_only: false,
+                    filter_only: false,
+                    ms_to_seconds: false,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: None,
+                },
+                FieldMapping {
+                    source: "collectionIds".into(),
+                    target: "collectionIds".into(),
+                    value_type: FieldValueType::IntegerArray,
+                    fallback: None,
+                    string_map: None,
+                    doc_only: false,
+                    filter_only: true,
+                    ms_to_seconds: false,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: None,
+                },
+            ],
+        };
+
+        let json = serde_json::json!({
+            "id": 42,
+            "tagIds": [10, 20],
+            "collectionIds": [100, 200]
+        });
+
+        // Document should have tagIds but NOT collectionIds
+        let (slot, doc) = json_to_document(&json, &schema).unwrap();
+        assert_eq!(slot, 42);
+        assert!(doc.fields.contains_key("tagIds"), "tagIds should be in Document");
+        assert!(!doc.fields.contains_key("collectionIds"), "filter_only field should be excluded from Document");
+
+        // StoredDoc should also exclude filter_only fields
+        let stored = json_to_stored_doc(&json, &schema);
+        assert!(stored.fields.contains_key("tagIds"));
+        assert!(!stored.fields.contains_key("collectionIds"));
+    }
+
+    #[test]
+    fn test_filter_only_still_indexed_in_bitmaps() {
+        // filter_only fields should still be bitmap-indexed
+        let schema = DataSchema {
+            id_field: "id".into(),
+            schema_version: 1,
+            fields: vec![FieldMapping {
+                source: "collectionIds".into(),
+                target: "collectionIds".into(),
+                value_type: FieldValueType::IntegerArray,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                filter_only: true,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+            }],
+        };
+
+        let json = serde_json::json!({
+            "id": 42,
+            "collectionIds": [100, 200]
+        });
+
+        let filter_set: HashSet<String> = ["collectionIds".to_string()].into();
+        let sort_bits: HashMap<String, u8> = HashMap::new();
+        let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
+        filter_maps.insert("collectionIds".to_string(), HashMap::new());
+        let mut sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>> = HashMap::new();
+
+        extract_bitmaps(&json, &schema, &filter_set, &sort_bits, 42, &mut filter_maps, &mut sort_maps);
+
+        let coll_map = filter_maps.get("collectionIds").unwrap();
+        assert!(coll_map.get(&100).unwrap().contains(42), "slot 42 should be in bitmap for collectionId 100");
+        assert!(coll_map.get(&200).unwrap().contains(42), "slot 42 should be in bitmap for collectionId 200");
+    }
+
+    #[test]
+    fn test_filter_only_and_doc_only_mutually_exclusive() {
+        let schema = DataSchema {
+            id_field: "id".into(),
+            schema_version: 1,
+            fields: vec![FieldMapping {
+                source: "x".into(),
+                target: "x".into(),
+                value_type: FieldValueType::Integer,
+                fallback: None,
+                string_map: None,
+                doc_only: true,
+                filter_only: true,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+            }],
+        };
+        assert!(schema.validate().is_err(), "doc_only + filter_only should fail validation");
     }
 }

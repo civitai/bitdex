@@ -646,6 +646,24 @@ struct AddFieldsRequest {
     skip_validation: bool,
 }
 
+/// Sync filter values for a filter_only multi-value field.
+/// Replaces all bitmap memberships for the given slots on the named field.
+#[derive(Deserialize)]
+struct FilterSyncRequest {
+    /// The filter field name (must be a multi_value field).
+    field: String,
+    /// List of (slot, values) pairs to sync.
+    documents: Vec<FilterSyncEntry>,
+}
+
+#[derive(Deserialize)]
+struct FilterSyncEntry {
+    /// The document/slot ID.
+    id: u32,
+    /// The complete set of values this slot should have for the field.
+    values: Vec<u64>,
+}
+
 #[derive(Deserialize)]
 struct RemoveFieldsRequest {
     #[serde(default)]
@@ -791,6 +809,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
             .route("/api/indexes/{name}/documents/patch", patch(handle_patch_documents))
+            .route("/api/indexes/{name}/documents/filter-sync", post(handle_filter_sync))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/cache/persistent", delete(handle_purge_cache))
             .route("/api/indexes/{name}/warm", post(handle_warm_cache))
@@ -2063,6 +2082,51 @@ async fn handle_patch_documents(
         (
             StatusCode::OK,
             Json(serde_json::json!({"patched": patched, "errors": errors})),
+        ).into_response()
+    }
+}
+
+/// Sync filter values for a filter_only multi-value field.
+///
+/// Accepts a batch of (slot, values) pairs and replaces all bitmap memberships
+/// for each slot on the named field. Used by the outbox poller for fields like
+/// collectionIds where membership comes from a separate table.
+async fn handle_filter_sync(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<FilterSyncRequest>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let mut synced = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, entry) in req.documents.iter().enumerate() {
+        match engine.sync_filter_values(entry.id, &req.field, &entry.values) {
+            Ok(()) => synced += 1,
+            Err(e) => errors.push(format!("doc[{}] id={}: {}", i, entry.id, e)),
+        }
+    }
+
+    state.metrics.upsert_total.with_label_values(&[&name]).inc_by(synced);
+
+    if errors.is_empty() {
+        Json(serde_json::json!({"synced": synced})).into_response()
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"synced": synced, "errors": errors})),
         ).into_response()
     }
 }
