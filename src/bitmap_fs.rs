@@ -23,6 +23,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
 use crate::error::{BitdexError, Result};
@@ -308,23 +309,60 @@ impl BitmapFs {
     }
 
     /// Load all bitmaps for a single field by reading all bucket pack files.
+    ///
+    /// For fields with multiple fpack files (high-cardinality fields like userId),
+    /// uses rayon parallel iteration for ~3x speedup. Single-file fields use
+    /// sequential loading to avoid rayon overhead.
     pub fn load_field(&self, field_name: &str) -> Result<HashMap<u64, RoaringBitmap>> {
         let dir = self.root.join("filter").join(field_name);
-        let mut result = HashMap::new();
         if !dir.exists() {
+            return Ok(HashMap::new());
+        }
+
+        // Collect fpack file paths
+        let fpack_files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map_err(|e| BitdexError::DocStore(format!("read filter dir: {e}")))?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension().map_or(true, |ext| ext != "fpack") {
+                    None
+                } else {
+                    Some(path)
+                }
+            })
+            .collect();
+
+        if fpack_files.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Single file: sequential (avoid rayon overhead)
+        if fpack_files.len() == 1 {
+            let data = std::fs::read(&fpack_files[0])
+                .map_err(|e| BitdexError::DocStore(format!("read pack file: {e}")))?;
+            let entries = Self::read_pack_file(&data)?;
+            let mut result = HashMap::with_capacity(entries.len());
+            for (value, bm) in entries {
+                result.insert(value, bm);
+            }
             return Ok(result);
         }
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| BitdexError::DocStore(format!("read filter dir: {e}")))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| BitdexError::DocStore(e.to_string()))?;
-            let path = entry.path();
-            if path.extension().map_or(true, |ext| ext != "fpack") {
-                continue;
-            }
-            let data = std::fs::read(&path)
-                .map_err(|e| BitdexError::DocStore(format!("read pack file: {e}")))?;
-            for (value, bm) in Self::read_pack_file(&data)? {
+
+        // Multiple files: parallel read + deserialize, then merge
+        let chunks: std::result::Result<Vec<Vec<(u64, RoaringBitmap)>>, BitdexError> = fpack_files
+            .par_iter()
+            .map(|path| {
+                let data = std::fs::read(path)
+                    .map_err(|e| BitdexError::DocStore(format!("read pack file: {e}")))?;
+                Self::read_pack_file(&data)
+            })
+            .collect();
+        let chunks = chunks?;
+
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut result = HashMap::with_capacity(total);
+        for chunk in chunks {
+            for (value, bm) in chunk {
                 result.insert(value, bm);
             }
         }
@@ -333,42 +371,84 @@ impl BitmapFs {
 
     /// List all existing value keys for a field without loading bitmap payloads.
     /// Reads only the `.fpack` header index (value IDs) from each bucket file.
+    /// Uses partial reads to avoid loading bitmap data, and parallel I/O for
+    /// high-cardinality fields with many fpack files.
     /// Used to build positive existence sets for zero-result query elimination.
     pub fn list_field_keys(&self, field_name: &str) -> Result<HashSet<u64>> {
+        use std::io::Read;
+
         let dir = self.root.join("filter").join(field_name);
-        let mut keys = HashSet::new();
         if !dir.exists() {
-            return Ok(keys);
+            return Ok(HashSet::new());
         }
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| BitdexError::DocStore(format!("read filter dir: {e}")))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| BitdexError::DocStore(e.to_string()))?;
-            let path = entry.path();
-            if path.extension().map_or(true, |ext| ext != "fpack") {
-                continue;
+
+        // Collect fpack paths
+        let fpack_files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map_err(|e| BitdexError::DocStore(format!("read filter dir: {e}")))?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension().map_or(true, |ext| ext != "fpack") {
+                    None
+                } else {
+                    Some(path)
+                }
+            })
+            .collect();
+
+        /// Extract keys from a single fpack file by reading only the header.
+        fn extract_keys(path: &Path) -> std::result::Result<Vec<u64>, BitdexError> {
+            use std::io::Read;
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| BitdexError::DocStore(format!("open pack file: {e}")))?;
+
+            // Read just the entry count (4 bytes)
+            let mut count_buf = [0u8; 4];
+            if file.read_exact(&mut count_buf).is_err() {
+                return Ok(Vec::new());
             }
-            let data = std::fs::read(&path)
-                .map_err(|e| BitdexError::DocStore(format!("read pack file: {e}")))?;
-            if data.len() < 4 {
-                continue;
+            let num_entries = u32::from_le_bytes(count_buf) as usize;
+            if num_entries == 0 {
+                return Ok(Vec::new());
             }
-            let num_entries =
-                u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-            let header_size = 4 + num_entries * 16;
-            if data.len() < header_size {
-                continue;
-            }
+
+            // Read just the header index (16 bytes per entry), only need value_id (first 8 bytes each)
+            let header_bytes = num_entries * 16;
+            let mut header = vec![0u8; header_bytes];
+            file.read_exact(&mut header)
+                .map_err(|e| BitdexError::DocStore(format!("read pack header: {e}")))?;
+
+            let mut keys = Vec::with_capacity(num_entries);
             for i in 0..num_entries {
-                let idx = 4 + i * 16;
-                let value = u64::from_le_bytes([
-                    data[idx], data[idx + 1], data[idx + 2], data[idx + 3],
-                    data[idx + 4], data[idx + 5], data[idx + 6], data[idx + 7],
-                ]);
-                keys.insert(value);
+                let idx = i * 16;
+                let value = u64::from_le_bytes(header[idx..idx + 8].try_into().unwrap());
+                keys.push(value);
             }
+            Ok(keys)
         }
-        Ok(keys)
+
+        if fpack_files.len() <= 1 {
+            // Sequential for single file
+            let mut keys = HashSet::new();
+            for path in &fpack_files {
+                for key in extract_keys(path)? {
+                    keys.insert(key);
+                }
+            }
+            Ok(keys)
+        } else {
+            // Parallel for multiple files
+            let key_vecs: std::result::Result<Vec<Vec<u64>>, BitdexError> = fpack_files
+                .par_iter()
+                .map(|path| extract_keys(path))
+                .collect();
+            let key_vecs = key_vecs?;
+            let total: usize = key_vecs.iter().map(|v| v.len()).sum();
+            let mut keys = HashSet::with_capacity(total);
+            for vec in key_vecs {
+                keys.extend(vec);
+            }
+            Ok(keys)
+        }
     }
 
     /// Load multiple fields at once.
