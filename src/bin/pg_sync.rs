@@ -310,9 +310,14 @@ async fn main() {
             let bitdex_client = BitdexClient::with_index(bitdex_url, Some(&index_def.name));
             let bitmap_path = index_storage_dir.join(&sync_config.bitmap_subdir);
 
-            eprintln!("Waiting for BitDex to be healthy...");
+            eprintln!("Waiting for BitDex to be healthy (timeout: 5m)...");
+            let health_deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             loop {
                 if bitdex_client.is_healthy().await { break; }
+                if std::time::Instant::now() > health_deadline {
+                    eprintln!("BitDex health check timed out after 5 minutes");
+                    std::process::exit(1);
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
 

@@ -67,6 +67,8 @@ pub fn process_collection_items_csv(
 
     let total = AtomicU64::new(0);
     let total_ref = &total;
+    let errors = AtomicU64::new(0);
+    let errors_ref = &errors;
 
     // Each thread builds its own HashMap<u64, RoaringBitmap>
     let thread_results: Vec<HashMap<u64, RoaringBitmap>> = ranges
@@ -84,12 +86,18 @@ pub fn process_collection_items_csv(
                     if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
                         continue;
                     }
-                    if let Some((collection_id, image_id)) = parse_collection_line(line) {
-                        bitmaps
-                            .entry(collection_id as u64)
-                            .or_insert_with(RoaringBitmap::new)
-                            .insert(image_id as u32);
-                        count += 1;
+                    match parse_collection_line(line) {
+                        Ok((collection_id, image_id)) => {
+                            bitmaps
+                                .entry(collection_id as u64)
+                                .or_insert_with(RoaringBitmap::new)
+                                .insert(image_id as u32);
+                            count += 1;
+                        }
+                        Err(_) => {
+                            // Count parse errors — we'll fail if any exist
+                            errors_ref.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -97,6 +105,15 @@ pub fn process_collection_items_csv(
             bitmaps
         })
         .collect();
+
+    // Fail if any rows couldn't be parsed
+    let error_count = errors.load(Ordering::Relaxed);
+    if error_count > 0 {
+        return Err(format!(
+            "collection_items.csv: {} malformed rows (refusing to continue with incomplete data)",
+            error_count,
+        ));
+    }
 
     // Merge thread-local HashMaps
     let mut merged: HashMap<u64, RoaringBitmap> = HashMap::new();
@@ -117,16 +134,20 @@ pub fn process_collection_items_csv(
 }
 
 /// Parse a single CSV line: "collectionId,imageId\r?\n"
-fn parse_collection_line(line: &[u8]) -> Option<(i64, i64)> {
+/// Validates ranges: collectionId >= 0, 0 <= imageId <= u32::MAX.
+fn parse_collection_line(line: &[u8]) -> Result<(i64, i64), ()> {
     let line = if line.last() == Some(&b'\r') {
         &line[..line.len() - 1]
     } else {
         line
     };
-    let comma = line.iter().position(|&b| b == b',')?;
-    let collection_id = fast_parse_i64(&line[..comma])?;
-    let image_id = fast_parse_i64(&line[comma + 1..])?;
-    Some((collection_id, image_id))
+    let comma = line.iter().position(|&b| b == b',').ok_or(())?;
+    let collection_id = fast_parse_i64(&line[..comma]).ok_or(())?;
+    let image_id = fast_parse_i64(&line[comma + 1..]).ok_or(())?;
+    if collection_id < 0 || image_id < 0 || image_id > u32::MAX as i64 {
+        return Err(());
+    }
+    Ok((collection_id, image_id))
 }
 
 /// Fast ASCII integer parser (no allocation).
@@ -226,11 +247,10 @@ pub async fn auto_backfill(
                     bytes as f64 / (1024.0 * 1024.0)
                 );
 
-                // Step 4: Signal engine to reload existence set
-                if let Err(e) = client.reload_field("collectionIds").await {
-                    eprintln!("  WARNING: failed to signal engine reload: {e}");
-                    eprintln!("  Bitmaps are saved to disk — they'll be picked up on next restart");
-                }
+                // Step 4: Signal engine to reload existence set (fatal if fails)
+                client.reload_field("collectionIds").await.map_err(|e| {
+                    format!("Failed to reload existence set for collectionIds: {e}. Bitmaps are saved to disk but engine hasn't picked them up.")
+                })?;
             }
             other => {
                 return Err(format!("No backfill handler for field '{other}'"));
