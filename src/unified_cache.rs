@@ -507,6 +507,10 @@ pub struct UnifiedCacheStats {
     pub entries: usize,
     pub hits: u64,
     pub misses: u64,
+    pub inserts: u64,
+    pub updates: u64,
+    pub evictions: u64,
+    pub invalidations: u64,
     pub memory_bytes: usize,
     pub meta_index_entries: usize,
     pub meta_index_bytes: usize,
@@ -539,6 +543,10 @@ pub struct UnifiedCache {
     config: UnifiedCacheConfig,
     hits: u64,
     misses: u64,
+    inserts: u64,
+    updates: u64,
+    evictions: u64,
+    invalidations: u64,
     /// Running total of entry memory (bitmap + sorted_keys + radix bytes).
     total_bytes: usize,
 
@@ -570,6 +578,10 @@ impl UnifiedCache {
             config,
             hits: 0,
             misses: 0,
+            inserts: 0,
+            updates: 0,
+            evictions: 0,
+            invalidations: 0,
             total_bytes: 0,
             pending_shards: HashSet::new(),
             loading_shards: HashSet::new(),
@@ -657,6 +669,7 @@ impl UnifiedCache {
         self.total_bytes += new_bytes;
         self.meta_id_to_key.insert(meta_id, key.clone());
         self.entries.insert(key, entry);
+        self.inserts += 1;
         meta_id
     }
 
@@ -727,6 +740,7 @@ impl UnifiedCache {
             );
             self.total_bytes = self.total_bytes.saturating_sub(evicted.memory_bytes());
             self.meta_id_to_key.remove(&evicted.meta_id);
+            self.evictions += 1;
             if !self.persistence_enabled {
                 // Without persistence, deregister fully (original behavior)
                 self.meta.deregister(evicted.meta_id);
@@ -795,6 +809,10 @@ impl UnifiedCache {
             entries: self.entries.len(),
             hits: self.hits,
             misses: self.misses,
+            inserts: self.inserts,
+            updates: self.updates,
+            evictions: self.evictions,
+            invalidations: self.invalidations,
             memory_bytes: self.total_memory_bytes(),
             meta_index_entries: self.meta.entry_count(),
             meta_index_bytes: self.meta.memory_bytes(),
@@ -826,6 +844,11 @@ impl UnifiedCache {
     pub fn reset_counters(&mut self) {
         self.hits = 0;
         self.misses = 0;
+    }
+
+    /// Record a cache entry update (called by flush thread during maintenance).
+    pub fn record_update(&mut self) {
+        self.updates += 1;
     }
 
     /// Get the cache config.
@@ -1329,11 +1352,14 @@ impl UnifiedCache {
     /// Marks matching entries for rebuild. Used when fine-grained maintenance
     /// isn't possible (e.g., compound clauses).
     pub fn invalidate_filter_field(&mut self, field: &str) {
+        let mut count = 0u64;
         for (key, entry) in self.entries.iter_mut() {
             if key.filter_clauses.iter().any(|c| c.field == field) {
                 entry.mark_for_rebuild();
+                count += 1;
             }
         }
+        self.invalidations += count;
     }
 
     // ── Time Bucket Diff Integration (Phase 4) ─────────────────────────────

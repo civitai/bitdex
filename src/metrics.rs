@@ -26,6 +26,10 @@ pub struct Metrics {
     // -- Cache --
     pub cache_hits_total: IntGaugeVec,
     pub cache_misses_total: IntGaugeVec,
+    pub cache_inserts_total: IntGaugeVec,
+    pub cache_updates_total: IntGaugeVec,
+    pub cache_evictions_total: IntGaugeVec,
+    pub cache_invalidations_total: IntGaugeVec,
     pub cache_entries: IntGaugeVec,
     pub cache_bytes: IntGaugeVec,
     // -- Bitmap memory --
@@ -119,6 +123,30 @@ impl Metrics {
 
         let cache_misses_total = IntGaugeVec::new(
             Opts::new("bitdex_cache_misses_total", "Unified cache cumulative misses"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_inserts_total = IntGaugeVec::new(
+            Opts::new("bitdex_cache_inserts_total", "Cache entries created"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_updates_total = IntGaugeVec::new(
+            Opts::new("bitdex_cache_updates_total", "Cache entries updated by maintenance"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_evictions_total = IntGaugeVec::new(
+            Opts::new("bitdex_cache_evictions_total", "Cache entries evicted by LRU"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_invalidations_total = IntGaugeVec::new(
+            Opts::new("bitdex_cache_invalidations_total", "Cache entries invalidated by field changes"),
             &["index"],
         )
         .unwrap();
@@ -300,6 +328,10 @@ impl Metrics {
         registry
             .register(Box::new(cache_misses_total.clone()))
             .unwrap();
+        registry.register(Box::new(cache_inserts_total.clone())).unwrap();
+        registry.register(Box::new(cache_updates_total.clone())).unwrap();
+        registry.register(Box::new(cache_evictions_total.clone())).unwrap();
+        registry.register(Box::new(cache_invalidations_total.clone())).unwrap();
         registry.register(Box::new(cache_entries.clone())).unwrap();
         registry.register(Box::new(cache_bytes.clone())).unwrap();
         registry
@@ -356,6 +388,10 @@ impl Metrics {
             query_duration_seconds,
             cache_hits_total,
             cache_misses_total,
+            cache_inserts_total,
+            cache_updates_total,
+            cache_evictions_total,
+            cache_invalidations_total,
             cache_entries,
             cache_bytes,
             filter_bitmap_bytes,
