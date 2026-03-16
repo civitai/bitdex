@@ -2,10 +2,10 @@
   "name": "civitai",
   "config": {
     "filter_fields": [
-      { "name": "nsfwLevel", "field_type": "single_value" },
-      { "name": "userId", "field_type": "single_value" },
-      { "name": "type", "field_type": "single_value" },
-      { "name": "baseModel", "field_type": "single_value" },
+      { "name": "nsfwLevel", "field_type": "single_value", "eager_load": true },
+      { "name": "userId", "field_type": "single_value", "eager_load": true },
+      { "name": "type", "field_type": "single_value", "eager_load": true },
+      { "name": "baseModel", "field_type": "single_value", "eager_load": true },
       { "name": "availability", "field_type": "single_value" },
       { "name": "postId", "field_type": "single_value" },
       { "name": "postedToId", "field_type": "single_value" },
@@ -14,7 +14,7 @@
       { "name": "onSite", "field_type": "boolean" },
       { "name": "poi", "field_type": "boolean" },
       { "name": "minor", "field_type": "boolean" },
-      { "name": "isPublished", "field_type": "boolean" },
+      { "name": "isPublished", "field_type": "boolean", "eager_load": true },
       { "name": "isRemix", "field_type": "boolean" },
       { "name": "blockedFor", "field_type": "single_value" },
       { "name": "tagIds", "field_type": "multi_value" },
@@ -24,10 +24,10 @@
       { "name": "techniqueIds", "field_type": "multi_value" }
     ],
     "sort_fields": [
-      { "name": "reactionCount", "bits": 32 },
-      { "name": "sortAt", "bits": 32 },
-      { "name": "commentCount", "bits": 32 },
-      { "name": "collectedCount", "bits": 32 },
+      { "name": "reactionCount", "bits": 32, "eager_load": true },
+      { "name": "sortAt", "bits": 32, "eager_load": true },
+      { "name": "commentCount", "bits": 32, "eager_load": true },
+      { "name": "collectedCount", "bits": 32, "eager_load": true },
       { "name": "publishedAt", "bits": 32 },
       { "name": "id", "bits": 32 }
     ],

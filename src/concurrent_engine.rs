@@ -4246,45 +4246,60 @@ impl ConcurrentEngine {
         use crate::query::{FilterClause, Value};
         let t0 = std::time::Instant::now();
 
-        // Phase 1: Load sort fields (needed for bound cache value reconstruction)
+        // Phase 1: Load eager sort fields only
+        let eager_sorts: Vec<&str> = self.config.sort_fields.iter()
+            .filter(|sc| sc.eager_load)
+            .map(|sc| sc.name.as_str())
+            .collect();
         let empty_clauses: Vec<FilterClause> = Vec::new();
-        for sc in &self.config.sort_fields {
-            let _ = self.ensure_fields_loaded(&empty_clauses, Some(&sc.name));
+        for name in &eager_sorts {
+            let _ = self.ensure_fields_loaded(&empty_clauses, Some(name));
         }
         let sort_elapsed = t0.elapsed();
-        eprintln!(
-            "Preload phase 1: {} sort fields in {:.1}s",
-            self.config.sort_fields.len(),
-            sort_elapsed.as_secs_f64(),
-        );
+        if !eager_sorts.is_empty() {
+            eprintln!(
+                "Preload phase 1: {} sort fields in {:.1}s",
+                eager_sorts.len(),
+                sort_elapsed.as_secs_f64(),
+            );
+        }
 
         // Phase 2: Load bound cache shards (requires sort fields from phase 1)
         if self.config.cache.preload_bounds {
             self.preload_bound_cache();
         }
 
-        // Phase 3: Load filter fields
+        // Phase 3: Load eager filter fields only
         let t2 = std::time::Instant::now();
-        let mut clauses: Vec<FilterClause> = Vec::new();
-        for fc in &self.config.filter_fields {
-            clauses.push(FilterClause::Eq(
-                fc.name.clone(),
-                Value::Integer(0),
-            ));
+        let eager_filters: Vec<&str> = self.config.filter_fields.iter()
+            .filter(|fc| fc.eager_load)
+            .map(|fc| fc.name.as_str())
+            .collect();
+        if !eager_filters.is_empty() {
+            let mut clauses: Vec<FilterClause> = Vec::new();
+            for name in &eager_filters {
+                clauses.push(FilterClause::Eq(
+                    name.to_string(),
+                    Value::Integer(0),
+                ));
+            }
+            let _ = self.ensure_fields_loaded(&clauses, None);
+            eprintln!(
+                "Preload phase 3: {} filter fields in {:.1}s",
+                eager_filters.len(),
+                t2.elapsed().as_secs_f64(),
+            );
         }
-        let _ = self.ensure_fields_loaded(&clauses, None);
-        eprintln!(
-            "Preload phase 3: {} filter fields in {:.1}s",
-            self.config.filter_fields.len(),
-            t2.elapsed().as_secs_f64(),
-        );
 
-        eprintln!(
-            "Background preload complete: {} sort + {} filter fields in {:.1}s",
-            self.config.sort_fields.len(),
-            self.config.filter_fields.len(),
-            t0.elapsed().as_secs_f64(),
-        );
+        let total_eager = eager_sorts.len() + eager_filters.len();
+        if total_eager > 0 {
+            eprintln!(
+                "Background preload complete: {} sort + {} filter fields in {:.1}s",
+                eager_sorts.len(),
+                eager_filters.len(),
+                t0.elapsed().as_secs_f64(),
+            );
+        }
     }
 
     /// Pre-load all bound cache shards from disk.
