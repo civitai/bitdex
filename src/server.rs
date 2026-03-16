@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -275,6 +275,10 @@ struct AppState {
     enable_traces: bool,
     admin_token: Option<String>,
     trace_buffer: crate::query_metrics::TraceBuffer,
+    /// Number of queries currently executing (incremented on entry, decremented on exit).
+    queries_in_flight: AtomicI64,
+    /// Concurrency limit for queries. 0 = unlimited (no backpressure).
+    max_query_concurrency: AtomicU32,
 }
 
 type SharedState = Arc<AppState>;
@@ -669,6 +673,9 @@ struct ConfigPatch {
     sort_fields: Option<HashMap<String, SortFieldPatch>>,
     #[serde(default)]
     cache: Option<CachePatch>,
+    /// Update the query concurrency limit. 0 = unlimited (no backpressure).
+    #[serde(default)]
+    max_query_concurrency: Option<u32>,
 }
 
 /// Patchable fields for a filter field.
@@ -705,11 +712,12 @@ pub struct BitdexServer {
     default_query_format: Option<String>,
     enable_traces: bool,
     admin_token: Option<String>,
+    max_query_concurrency: u32,
 }
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None }
+        Self { data_dir, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0 }
     }
 
     /// Enable rebuild mode: on startup, delete existing bitmap indexes and
@@ -739,6 +747,14 @@ impl BitdexServer {
         self
     }
 
+    /// Set the maximum number of concurrent queries. 0 = unlimited (default).
+    /// When the limit is reached, new queries receive 503 Service Unavailable.
+    /// The limit can be adjusted at runtime via PATCH /config.
+    pub fn with_max_query_concurrency(mut self, max: u32) -> Self {
+        self.max_query_concurrency = max;
+        self
+    }
+
     /// Start the HTTP server. Blocks until the server shuts down.
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
         // Ensure data directory exists
@@ -765,6 +781,8 @@ impl BitdexServer {
             enable_traces: self.enable_traces,
             admin_token,
             trace_buffer: crate::query_metrics::TraceBuffer::default(),
+            queries_in_flight: AtomicI64::new(0),
+            max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
         });
 
         // Try to restore an existing index from disk
@@ -1404,6 +1422,12 @@ async fn handle_patch_config(
                     }
                 }
 
+                // Apply max_query_concurrency (server-wide, not persisted with index config)
+                if let Some(v) = patch.max_query_concurrency {
+                    state.max_query_concurrency.store(v, Ordering::Relaxed);
+                    eprintln!("Config patch: max_query_concurrency set to {v}");
+                }
+
                 // Persist updated config.json
                 let index_dir = state.data_dir.join("indexes").join(&name);
                 let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
@@ -1637,12 +1661,51 @@ struct QueryParams {
     skip_cache: Option<bool>,
 }
 
+/// RAII guard that decrements the in-flight query counter on drop.
+struct QueryInflightGuard<'a> {
+    counter: &'a AtomicI64,
+    gauge: &'a prometheus::IntGauge,
+}
+
+impl Drop for QueryInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.gauge.dec();
+    }
+}
+
 async fn handle_query(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
     AxumQuery(params): AxumQuery<QueryParams>,
     body: Bytes,
 ) -> impl IntoResponse {
+    // -- Backpressure: track in-flight queries and enforce concurrency limit --
+    let in_flight = state.queries_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+    state.metrics.queries_in_flight.inc();
+    let _inflight_guard = QueryInflightGuard {
+        counter: &state.queries_in_flight,
+        gauge: &state.metrics.queries_in_flight,
+    };
+
+    // Update peak if current exceeds it
+    if in_flight > state.metrics.queries_in_flight_peak.get() {
+        state.metrics.queries_in_flight_peak.set(in_flight);
+    }
+
+    let max = state.max_query_concurrency.load(Ordering::Relaxed);
+    if max > 0 && in_flight > max as i64 {
+        state.metrics.queries_rejected_total.inc();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "server overloaded",
+                "queries_in_flight": in_flight,
+                "max_concurrency": max
+            })),
+        ).into_response();
+    }
+
     // Resolve effective format: explicit ?format= overrides, otherwise use registry default
     let effective_format = params
         .format
@@ -2182,6 +2245,10 @@ async fn handle_stats(
         "unified_cache_bytes_read": engine.boundstore_bytes_read(),
         "unified_cache_entry_details": entries,
         "eviction": eviction,
+        "queries_in_flight": state.queries_in_flight.load(Ordering::Relaxed),
+        "queries_in_flight_peak": state.metrics.queries_in_flight_peak.get(),
+        "queries_rejected": state.metrics.queries_rejected_total.get(),
+        "max_query_concurrency": state.max_query_concurrency.load(Ordering::Relaxed),
     })).into_response()
 }
 

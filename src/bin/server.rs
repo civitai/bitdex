@@ -11,11 +11,12 @@
 //!   bitdex-server [OPTIONS]
 //!
 //! Options:
-//!   --port <N>              HTTP port (default: 3000)
-//!   --data-dir <PATH>       Data directory for index storage (default: data/ next to exe)
-//!   --rebuild               Rebuild bitmap indexes from docstore on startup
-//!   --config <PATH>         Path to config file (default: bitdex.toml next to exe)
-//!   --default-format <FMT>  Default query format: bitdex, compact, meilisearch (default: bitdex)
+//!   --port <N>                    HTTP port (default: 3000)
+//!   --data-dir <PATH>             Data directory for index storage (default: data/ next to exe)
+//!   --rebuild                     Rebuild bitmap indexes from docstore on startup
+//!   --config <PATH>               Path to config file (default: bitdex.toml next to exe)
+//!   --default-format <FMT>        Default query format: bitdex, compact, meilisearch (default: bitdex)
+//!   --max-query-concurrency <N>   Max concurrent queries; 0 = unlimited (default: 0)
 
 #[global_allocator]
 static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
@@ -39,6 +40,7 @@ struct Config {
     log_level: String,
     enable_traces: bool,
     admin_token: Option<String>,
+    max_query_concurrency: u32,
 }
 
 /// Get the directory containing the current executable.
@@ -82,6 +84,7 @@ fn parse_config() -> Config {
     let mut cli_default_query_format: Option<String> = None;
     let mut cli_log_level: Option<String> = None;
     let mut cli_enable_traces = false;
+    let mut cli_max_query_concurrency: Option<u32> = None;
 
     let mut i = 1;
     while i < cli_args.len() {
@@ -116,6 +119,10 @@ fn parse_config() -> Config {
             "--enable-traces" => {
                 cli_enable_traces = true;
             }
+            "--max-query-concurrency" => {
+                i += 1;
+                cli_max_query_concurrency = Some(cli_args[i].parse().expect("--max-query-concurrency must be a number"));
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -132,10 +139,11 @@ fn parse_config() -> Config {
     let mut log_level = "warn".to_string();
     let mut enable_traces = false;
     let mut admin_token: Option<String> = None;
+    let mut max_query_concurrency: u32 = 0;
 
     // --- Config file ---
     // Only auto-generate bitdex.toml if no CLI args were passed at all
-    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_index.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some() || cli_log_level.is_some() || cli_enable_traces;
+    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_index.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some() || cli_log_level.is_some() || cli_enable_traces || cli_max_query_concurrency.is_some();
     let config_path = match &cli_config {
         Some(path) => path.clone(),
         None => {
@@ -173,6 +181,9 @@ fn parse_config() -> Config {
         if let Some(v) = table.get("admin_token").and_then(|v| v.as_str()) {
             admin_token = Some(v.to_string());
         }
+        if let Some(v) = table.get("max_query_concurrency").and_then(|v| v.as_integer()) {
+            max_query_concurrency = v as u32;
+        }
     }
 
     // --- CLI flags override everything ---
@@ -194,6 +205,9 @@ fn parse_config() -> Config {
     if cli_enable_traces {
         enable_traces = true;
     }
+    if let Some(v) = cli_max_query_concurrency {
+        max_query_concurrency = v;
+    }
 
     // Env var overrides TOML for admin token (safer for deployments)
     if let Ok(v) = std::env::var("BITDEX_ADMIN_TOKEN") {
@@ -202,7 +216,7 @@ fn parse_config() -> Config {
         }
     }
 
-    Config { port, data_dir, index: cli_index, rebuild, default_query_format, log_level, enable_traces, admin_token }
+    Config { port, data_dir, index: cli_index, rebuild, default_query_format, log_level, enable_traces, admin_token, max_query_concurrency }
 }
 
 #[tokio::main]
@@ -252,5 +266,9 @@ async fn main() {
         server = server.with_default_query_format(fmt);
     }
     server = server.with_admin_token(config.admin_token);
+    if config.max_query_concurrency > 0 {
+        eprintln!("  max-query-concurrency: {}", config.max_query_concurrency);
+        server = server.with_max_query_concurrency(config.max_query_concurrency);
+    }
     server.serve(addr).await.expect("Server failed");
 }
