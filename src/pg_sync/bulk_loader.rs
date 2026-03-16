@@ -294,7 +294,20 @@ const TABLES: &[TableDownload] = &[
     TableDownload { name: "resources", file: "resources.csv" },
     TableDownload { name: "model_versions", file: "model_versions.csv" },
     TableDownload { name: "models", file: "models.csv" },
+    TableDownload { name: "collection_items", file: "collection_items.csv" },
 ];
+
+/// Download a single named table from PG to a CSV file.
+/// Public wrapper for use by backfill module.
+pub async fn download_single_table(
+    pool: &PgPool,
+    stage_dir: &std::path::Path,
+    name: &'static str,
+    file: &'static str,
+) -> Result<u64, String> {
+    let table = TableDownload { name, file };
+    download_table(pool, stage_dir, &table).await
+}
 
 /// Download a single table from PG to a CSV file on the PVC.
 /// Returns the number of bytes written.
@@ -327,6 +340,7 @@ async fn download_table(
         "resources" => copy_queries::copy_resources(pool).await,
         "model_versions" => copy_queries::copy_model_versions(pool).await,
         "models" => copy_queries::copy_models(pool).await,
+        "collection_items" => copy_queries::copy_collection_items(pool).await,
         _ => return Err(format!("unknown table: {}", table.name)),
     }.map_err(|e| format!("{}: COPY start failed: {e}", table.name))?;
 

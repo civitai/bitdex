@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
+use bitdex_v2::pg_sync::backfill;
 use bitdex_v2::pg_sync::bitdex_client::BitdexClient;
 use bitdex_v2::pg_sync::bulk_loader;
 use bitdex_v2::pg_sync::config::{IndexDefinition, PgSyncConfig};
@@ -45,6 +46,13 @@ enum Commands {
     Setup,
     /// Validate config, paths, and CSV availability without loading.
     Validate,
+    /// Backfill a filter_only field via COPY CSV → BitmapFs.
+    /// Runs while the BitDex server is live — no downtime needed.
+    Backfill {
+        /// The field name to backfill (e.g., "collectionIds").
+        #[arg(long)]
+        field: String,
+    },
 }
 
 #[tokio::main]
@@ -297,11 +305,75 @@ async fn main() {
             );
         }
 
+        Commands::Backfill { field } => {
+            let bitdex_url = sync_config.bitdex_url.as_deref().unwrap_or("http://localhost:3000");
+            let bitdex_client = BitdexClient::with_index(bitdex_url, Some(&index_def.name));
+            let bitmap_path = index_storage_dir.join(&sync_config.bitmap_subdir);
+
+            eprintln!("Waiting for BitDex to be healthy (timeout: 5m)...");
+            let health_deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if bitdex_client.is_healthy().await { break; }
+                if std::time::Instant::now() > health_deadline {
+                    eprintln!("BitDex health check timed out after 5 minutes");
+                    std::process::exit(1);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+
+            eprintln!("Backfilling field '{field}'...");
+            backfill::auto_backfill(
+                &pool,
+                &bitdex_client,
+                &[field],
+                &stage_dir,
+                &bitmap_path,
+            ).await.unwrap_or_else(|e| {
+                eprintln!("Backfill failed: {e}");
+                std::process::exit(1);
+            });
+            eprintln!("Backfill complete.");
+        }
+
         Commands::Sync => {
             let bitdex_url = sync_config.bitdex_url.as_deref().unwrap_or("http://localhost:3000");
             let bitdex_client = BitdexClient::with_index(bitdex_url, Some(&index_def.name));
+            let bitmap_path = index_storage_dir.join(&sync_config.bitmap_subdir);
 
             eprintln!("Starting sync (bitdex={bitdex_url})...");
+
+            // Auto-backfill filter_only fields before entering sync loop.
+            // Fails hard if backfill cannot complete — sync must not start
+            // with incomplete baseline data.
+            let filter_only_fields: Vec<String> = index_def
+                .data_schema
+                .fields
+                .iter()
+                .filter(|f| f.filter_only)
+                .map(|f| f.target.clone())
+                .collect();
+            if !filter_only_fields.is_empty() {
+                eprintln!("Checking filter_only fields for backfill: {:?}", filter_only_fields);
+
+                // Wait for BitDex health before backfill check
+                eprintln!("Waiting for BitDex to be healthy...");
+                loop {
+                    if bitdex_client.is_healthy().await { break; }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+
+                backfill::auto_backfill(
+                    &pool,
+                    &bitdex_client,
+                    &filter_only_fields,
+                    &stage_dir,
+                    &bitmap_path,
+                ).await.unwrap_or_else(|e| {
+                    eprintln!("Auto-backfill failed: {e}");
+                    eprintln!("Cannot start sync with incomplete baseline data.");
+                    std::process::exit(1);
+                });
+            }
 
             // Run outbox poller and metrics poller concurrently
             let cursor_name = format!("pg-sync-{}", sync_config.replica_id);

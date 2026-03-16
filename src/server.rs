@@ -837,6 +837,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/warm", post(handle_warm_cache))
             .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
             .route("/api/indexes/{name}/fields", post(handle_add_fields).delete(handle_remove_fields))
+            .route("/api/indexes/{name}/fields/{field}/reload", post(handle_reload_field))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
             .with_state(Arc::clone(&state));
@@ -2768,6 +2769,33 @@ async fn handle_add_fields(
 // ---------------------------------------------------------------------------
 // Handlers: Remove Fields
 // ---------------------------------------------------------------------------
+
+/// Reload a field's existence set from BitmapFs after external bulk writes.
+async fn handle_reload_field(
+    State(state): State<SharedState>,
+    AxumPath((name, field)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    match engine.reload_existence_set(&field) {
+        Ok(()) => Json(serde_json::json!({"reloaded": field})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ).into_response(),
+    }
+}
 
 async fn handle_remove_fields(
     State(state): State<SharedState>,
