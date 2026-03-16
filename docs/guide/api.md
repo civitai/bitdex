@@ -704,6 +704,66 @@ Order: disk first, then RAM (prevents stale shard loads during purge).
 
 ---
 
+### Warm Cache
+
+```
+POST /api/indexes/{name}/warm
+```
+
+Pre-populate the unified cache with specified queries. Each query runs with `limit=1` to trigger cache seeding without returning large result sets. Queries run sequentially to avoid contention on the cache lock.
+
+**Request body:**
+
+```json
+{
+  "queries": [
+    {
+      "filters": [{"In": ["nsfwLevel", [{"Integer": 1}, {"Integer": 2}]]}, {"Eq": ["isPublished", {"Bool": true}]}],
+      "sort": {"field": "reactionCount", "direction": "Desc"}
+    },
+    {
+      "filters": [{"Eq": ["nsfwLevel", {"Integer": 1}]}],
+      "sort": {"field": "commentCount", "direction": "Desc"}
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `queries` | array | Array of query specs, each with `filters` and `sort` |
+| `queries[].filters` | array | Filter clauses (same format as query endpoint) |
+| `queries[].sort` | object | Sort specification: `{ "field": "...", "direction": "Asc" | "Desc" }` |
+
+**Response:** `200 OK`
+
+```json
+{
+  "warmed": 2,
+  "already_cached": 1,
+  "results": [
+    {"query_index": 0, "status": "warmed", "elapsed_us": 42000, "matched": 26606818},
+    {"query_index": 1, "status": "already_cached", "elapsed_us": 15, "matched": 21559590},
+    {"query_index": 2, "status": "warmed", "elapsed_us": 38000, "matched": 47029478}
+  ]
+}
+```
+
+Each result entry reports:
+
+| Field | Description |
+|-------|-------------|
+| `query_index` | Index of the query in the request array |
+| `status` | `"warmed"` (cache miss, now seeded), `"already_cached"` (cache hit), or `"error: ..."` |
+| `elapsed_us` | Microseconds taken for this query |
+| `matched` | Total documents matching the filter predicates |
+
+**Errors:**
+- `400` — Empty queries array
+- `404` — Index not found
+
+---
+
 ### Save Snapshot
 
 ```

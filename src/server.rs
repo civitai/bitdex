@@ -731,6 +731,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/stats", get(handle_stats))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/cache/persistent", delete(handle_purge_cache))
+            .route("/api/indexes/{name}/warm", post(handle_warm_cache))
             .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
             .route("/api/indexes/{name}/fields", post(handle_add_fields).delete(handle_remove_fields))
             .route("/api/indexes/{name}/tasks", get(handle_list_tasks))
@@ -2084,6 +2085,112 @@ async fn handle_purge_cache(
             Json(serde_json::json!({"error": format!("purge failed: {e}")})),
         ).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Warm Cache
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct WarmQuerySpec {
+    filters: Vec<crate::query::FilterClause>,
+    sort: crate::query::SortClause,
+}
+
+#[derive(Deserialize)]
+struct WarmRequest {
+    queries: Vec<WarmQuerySpec>,
+}
+
+#[derive(Serialize)]
+struct WarmResultEntry {
+    query_index: usize,
+    status: String,
+    elapsed_us: u64,
+    matched: u64,
+}
+
+#[derive(Serialize)]
+struct WarmResponse {
+    warmed: usize,
+    already_cached: usize,
+    results: Vec<WarmResultEntry>,
+}
+
+/// POST /api/indexes/{name}/warm — pre-populate the unified cache with specified queries.
+async fn handle_warm_cache(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<WarmRequest>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    if req.queries.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "queries array must not be empty"})),
+        ).into_response();
+    }
+
+    let mut results = Vec::with_capacity(req.queries.len());
+    let mut warmed = 0usize;
+    let mut already_cached = 0usize;
+
+    for (i, spec) in req.queries.iter().enumerate() {
+        let query = BitdexQuery {
+            filters: spec.filters.clone(),
+            sort: Some(spec.sort.clone()),
+            limit: 1,
+            cursor: None,
+            offset: None,
+        };
+
+        let start = Instant::now();
+        match engine.execute_query_traced(&query, &name) {
+            Ok((result, trace)) => {
+                let elapsed_us = start.elapsed().as_micros() as u64;
+                let status = if trace.cache_hit {
+                    already_cached += 1;
+                    "already_cached"
+                } else {
+                    warmed += 1;
+                    "warmed"
+                };
+                results.push(WarmResultEntry {
+                    query_index: i,
+                    status: status.to_string(),
+                    elapsed_us,
+                    matched: result.total_matched,
+                });
+            }
+            Err(e) => {
+                let elapsed_us = start.elapsed().as_micros() as u64;
+                results.push(WarmResultEntry {
+                    query_index: i,
+                    status: format!("error: {e}"),
+                    elapsed_us,
+                    matched: 0,
+                });
+            }
+        }
+    }
+
+    Json(WarmResponse {
+        warmed,
+        already_cached,
+        results,
+    }).into_response()
 }
 
 // ---------------------------------------------------------------------------
