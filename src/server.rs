@@ -1442,6 +1442,17 @@ async fn handle_query(
             trace.docs_us = docs_us;
             trace.docs_count = docs_count;
 
+            // Observe query phase histograms
+            m.query_filter_seconds
+                .with_label_values(&[&name])
+                .observe(trace.filter_us as f64 / 1_000_000.0);
+            m.query_sort_seconds
+                .with_label_values(&[&name])
+                .observe(trace.sort_us as f64 / 1_000_000.0);
+            m.query_docs_seconds
+                .with_label_values(&[&name])
+                .observe(docs_us as f64 / 1_000_000.0);
+
             let cache_tag = if trace.cache_hit { " cache" } else { "" };
             let docs_tag = if docs_count > 0 { format!("  docs={}μs({})", docs_us, docs_count) } else { String::new() };
             tracing::info!(
