@@ -1085,6 +1085,14 @@ mod tests {
                 op in prop_oneof![Just("="), Just("!="), Just(">"), Just(">="), Just("<"), Just("<=")],
                 val in any::<i32>(),
             ) {
+                // Skip reserved words that can't be used as field names
+                let reserved = ["in", "IN", "In", "or", "OR", "Or", "and", "AND", "And",
+                                "not", "NOT", "Not", "to", "TO", "To", "IS", "is", "Is",
+                                "NULL", "null", "Null", "EMPTY", "empty", "Empty",
+                                "EXISTS", "exists", "Exists"];
+                if reserved.contains(&field.as_str()) {
+                    return Ok(());
+                }
                 let filter = format!("{field} {op} {val}");
                 let json = format!(r#"{{"filter": "{filter}"}}"#);
                 let result = MeilisearchQueryParser.parse(json.as_bytes());
