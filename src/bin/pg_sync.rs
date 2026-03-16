@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
+use bitdex_v2::pg_sync::backfill;
 use bitdex_v2::pg_sync::bitdex_client::BitdexClient;
 use bitdex_v2::pg_sync::bulk_loader;
 use bitdex_v2::pg_sync::config::{IndexDefinition, PgSyncConfig};
@@ -45,6 +46,13 @@ enum Commands {
     Setup,
     /// Validate config, paths, and CSV availability without loading.
     Validate,
+    /// Backfill a filter_only field from PG (e.g., collectionIds).
+    /// Runs while the BitDex server is live — no downtime needed.
+    Backfill {
+        /// The field name to backfill (e.g., "collectionIds").
+        #[arg(long)]
+        field: String,
+    },
 }
 
 #[tokio::main]
@@ -297,11 +305,72 @@ async fn main() {
             );
         }
 
+        Commands::Backfill { field } => {
+            let bitdex_url = sync_config.bitdex_url.as_deref().unwrap_or("http://localhost:3000");
+            let bitdex_client = BitdexClient::with_index(bitdex_url, Some(&index_def.name));
+
+            eprintln!("Waiting for BitDex to be healthy...");
+            loop {
+                if bitdex_client.is_healthy().await { break; }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+
+            eprintln!("Backfilling field '{field}'...");
+            match field.as_str() {
+                "collectionIds" => {
+                    let count = backfill::backfill_collection_ids(
+                        &pool, &bitdex_client, sync_config.outbox_batch_limit as usize,
+                    ).await.unwrap_or_else(|e| {
+                        eprintln!("Backfill failed: {e}");
+                        std::process::exit(1);
+                    });
+                    backfill::mark_backfilled(&bitdex_client, &field).await.unwrap_or_else(|e| {
+                        eprintln!("Failed to mark backfill cursor: {e}");
+                    });
+                    eprintln!("Backfill complete: {count} images synced");
+                }
+                other => {
+                    eprintln!("No backfill handler for field '{other}'");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Commands::Sync => {
             let bitdex_url = sync_config.bitdex_url.as_deref().unwrap_or("http://localhost:3000");
             let bitdex_client = BitdexClient::with_index(bitdex_url, Some(&index_def.name));
 
             eprintln!("Starting sync (bitdex={bitdex_url})...");
+
+            // Auto-backfill filter_only fields before entering sync loop.
+            // Detects fields that haven't been backfilled yet via cursor check.
+            let filter_only_fields: Vec<String> = index_def
+                .data_schema
+                .fields
+                .iter()
+                .filter(|f| f.filter_only)
+                .map(|f| f.target.clone())
+                .collect();
+            if !filter_only_fields.is_empty() {
+                eprintln!("Checking filter_only fields for backfill: {:?}", filter_only_fields);
+
+                // Wait for BitDex health before backfill check
+                eprintln!("Waiting for BitDex to be healthy...");
+                loop {
+                    if bitdex_client.is_healthy().await { break; }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+
+                if let Err(e) = backfill::auto_backfill(
+                    &pool,
+                    &bitdex_client,
+                    &filter_only_fields,
+                    sync_config.outbox_batch_limit as usize,
+                ).await {
+                    eprintln!("Auto-backfill failed: {e}");
+                    eprintln!("Continuing with sync — backfill can be retried manually");
+                }
+            }
 
             // Run outbox poller and metrics poller concurrently
             let cursor_name = format!("pg-sync-{}", sync_config.replica_id);
