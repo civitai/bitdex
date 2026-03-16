@@ -114,6 +114,18 @@ pub async fn copy_model_versions(
     .await
 }
 
+/// Stream CollectionItem via COPY CSV (accepted image collections only).
+///
+/// Columns (2): collectionId, imageId
+pub async fn copy_collection_items(
+    pool: &PgPool,
+) -> Result<BoxStream<'static, Result<Bytes, sqlx::Error>>, sqlx::Error> {
+    pool.copy_out_raw(
+        r#"COPY (SELECT "collectionId", "imageId" FROM "CollectionItem" WHERE "imageId" IS NOT NULL AND status = 'ACCEPTED') TO STDOUT WITH (FORMAT csv)"#,
+    )
+    .await
+}
+
 /// Stream Model table via COPY CSV for enrichment.
 ///
 /// Columns (3): id, poi, type

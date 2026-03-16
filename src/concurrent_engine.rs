@@ -2459,6 +2459,31 @@ impl ConcurrentEngine {
         result
     }
 
+    /// Reload a field's positive existence set from BitmapFs.
+    ///
+    /// Called after external bulk writes to BitmapFs (e.g., backfill) so that
+    /// lazy per-value loading picks up the new data. The existence set is stored
+    /// behind an ArcSwap so the update is atomic and lock-free.
+    pub fn reload_existence_set(&self, field_name: &str) -> Result<()> {
+        let keys_arc = self.existing_keys.get(field_name).ok_or_else(|| {
+            crate::error::BitdexError::Config(format!(
+                "Field '{}' not found in existence keys (not a lazy-value field)",
+                field_name,
+            ))
+        })?;
+
+        let store = self.bitmap_store.as_ref().ok_or_else(|| {
+            crate::error::BitdexError::Config("No bitmap store configured".to_string())
+        })?;
+
+        let new_keys = store.list_field_keys(field_name)?;
+        let count = new_keys.len();
+        keys_arc.store(Arc::new(new_keys));
+
+        eprintln!("Reloaded existence set for '{}': {} keys", field_name, count);
+        Ok(())
+    }
+
     /// Execute a query from individual filter/sort/limit components.
     pub fn query(
         &self,

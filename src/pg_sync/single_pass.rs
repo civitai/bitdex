@@ -1279,7 +1279,7 @@ fn insert_sort_bits(
 }
 
 /// Save a single filter field's bitmaps to BitmapFs using write_filter_bucket.
-fn save_filter_field_to_disk(
+pub fn save_filter_field_to_disk(
     fs: &BitmapFs,
     field_name: &str,
     values: &HashMap<u64, RoaringBitmap>,
