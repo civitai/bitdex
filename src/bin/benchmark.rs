@@ -1731,6 +1731,7 @@ fn main() {
                 limit: page_size,
                 cursor: cursor.clone(),
                 offset: None,
+                skip_cache: false,
             };
 
             let start = Instant::now();

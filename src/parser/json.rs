@@ -54,6 +54,7 @@ impl QueryParser for JsonQueryParser {
             limit,
             cursor,
             offset: raw.offset,
+            skip_cache: raw.skip_cache,
         })
     }
 
@@ -69,6 +70,8 @@ struct RawQuery {
     limit: Option<usize>,
     cursor: Option<JsonValue>,
     offset: Option<usize>,
+    #[serde(default)]
+    skip_cache: bool,
 }
 
 fn parse_filter_node(value: &JsonValue, depth: usize) -> Result<FilterClause, ParseError> {

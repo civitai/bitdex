@@ -354,6 +354,7 @@ proptest! {
                 limit: page_size,
                 cursor,
                 offset: None,
+                skip_cache: false,
             };
             let result = engine.execute_query(&query).unwrap();
             if result.ids.is_empty() {

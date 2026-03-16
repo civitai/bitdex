@@ -85,12 +85,19 @@ impl QueryParser for CompactQueryParser {
             None => None,
         };
 
+        // Parse skip_cache (debugging flag)
+        let skip_cache = obj
+            .get("skip_cache")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         Ok(BitdexQuery {
             filters,
             sort,
             limit,
             cursor,
             offset,
+            skip_cache,
         })
     }
 

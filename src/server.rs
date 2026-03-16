@@ -1568,6 +1568,8 @@ struct QueryRequest {
 struct QueryParams {
     /// Query format: "bitdex" (default), "compact", "meilisearch"
     format: Option<String>,
+    /// Bypass the unified cache entirely (for debugging).
+    skip_cache: Option<bool>,
 }
 
 async fn handle_query(
@@ -1631,6 +1633,12 @@ async fn handle_query(
             }
         }
     };
+
+    // Merge ?skip_cache=true query param into the parsed query
+    let mut query = query;
+    if params.skip_cache.unwrap_or(false) {
+        query.skip_cache = true;
+    }
 
     tracing::info!("[{name}] {query}");
     let start = Instant::now();
@@ -2154,6 +2162,7 @@ async fn handle_warm_cache(
             limit: 1,
             cursor: None,
             offset: None,
+            skip_cache: false,
         };
 
         let start = Instant::now();

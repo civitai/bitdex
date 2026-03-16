@@ -122,12 +122,19 @@ impl QueryParser for MeilisearchQueryParser {
             (offset, limit)
         };
 
+        // Parse skip_cache (debugging flag)
+        let skip_cache = obj
+            .get("skip_cache")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         Ok(BitdexQuery {
             filters,
             sort,
             limit,
             cursor: None, // Meilisearch uses offset pagination, not cursor
             offset,
+            skip_cache,
         })
     }
 

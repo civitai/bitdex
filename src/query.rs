@@ -16,6 +16,11 @@ pub struct BitdexQuery {
     /// When both cursor and offset are set, cursor takes precedence.
     #[serde(default)]
     pub offset: Option<usize>,
+    /// When true, bypass the unified cache entirely (no lookup, no insert).
+    /// Useful for debugging to isolate whether cache maintenance is injecting
+    /// incorrect data vs the underlying bitmaps being wrong.
+    #[serde(default)]
+    pub skip_cache: bool,
 }
 
 /// A filter clause representing a predicate on indexed data.
@@ -520,6 +525,7 @@ mod tests {
                 slot_id: 42,
             }),
             offset: None,
+            skip_cache: false,
         };
         let json = serde_json::to_string(&query).unwrap();
         let roundtrip: BitdexQuery = serde_json::from_str(&json).unwrap();

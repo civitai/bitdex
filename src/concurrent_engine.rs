@@ -2917,6 +2917,14 @@ impl ConcurrentEngine {
             &query.filters[..]
         };
 
+        // ── skip_cache bypass: go straight to slow path without cache ──
+        if query.skip_cache {
+            tracing::info!("skip_cache=true: bypassing unified cache");
+            return self.execute_query_slow_path(
+                query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix, None,
+            );
+        }
+
         // ── Fast path: unified cache hit without expansion ──
         // Try cache lookup BEFORE computing filters. If we hit, we can skip
         // the expensive filter bitmap computation entirely (~2ms saved at 105M).
@@ -3210,6 +3218,15 @@ impl ConcurrentEngine {
             &query.filters[..]
         };
 
+        // ── skip_cache bypass: go straight to slow path without cache ──
+        if query.skip_cache {
+            tracing::info!("skip_cache=true: bypassing unified cache (traced)");
+            return self.execute_query_slow_path_traced(
+                query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix, None,
+                collector,
+            );
+        }
+
         // ── Fast path: unified cache hit without expansion ──
         if let Some(sort_clause) = query.sort.as_ref() {
             if let Some(clauses) = cache::canonicalize(effective_filters) {
@@ -3439,7 +3456,10 @@ impl ConcurrentEngine {
 
         // If we have pre-fetched cache data (expansion case), use it.
         // Otherwise, do a fresh cache lookup (miss case).
-        let (unified_key, unified_hit) = if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
+        // skip_cache=true forces (None, None) to bypass all cache operations.
+        let (unified_key, unified_hit) = if query.skip_cache {
+            (None, None)
+        } else if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
             (Some(ukey), Some((bm, has_more, min_val, cap)))
         } else if let Some(sort_clause) = query.sort.as_ref() {
             let mut uc = self.unified_cache.lock();
@@ -3780,7 +3800,10 @@ impl ConcurrentEngine {
 
         // If we have pre-fetched cache data (expansion case), use it.
         // Otherwise, do a fresh cache lookup (miss case).
-        let (unified_key, unified_hit) = if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
+        // skip_cache=true forces (None, None) to bypass all cache operations.
+        let (unified_key, unified_hit) = if query.skip_cache {
+            (None, None)
+        } else if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
             (Some(ukey), Some((bm, has_more, min_val, cap)))
         } else if let Some(sort_clause) = query.sort.as_ref() {
             let mut uc = self.unified_cache.lock();
@@ -6478,6 +6501,7 @@ mod tests {
             limit: 50,
             cursor: None,
             offset: None,
+            skip_cache: false,
         };
 
         let result = engine.execute_query(&query).unwrap();
@@ -8419,6 +8443,7 @@ mod tests {
                     limit: 5,
                     cursor: None,
                     offset: None,
+                    skip_cache: false,
                 };
                 let result = engine.execute_query(&bq).unwrap();
                 result_ids = result.ids.clone();
@@ -8470,6 +8495,7 @@ mod tests {
                     limit: 5,
                     cursor: None,
                     offset: None,
+                    skip_cache: false,
                 };
                 let result = engine.execute_query(&bq).unwrap();
 

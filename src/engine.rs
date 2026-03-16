@@ -589,6 +589,7 @@ mod tests {
             limit: 50,
             cursor: None,
             offset: None,
+            skip_cache: false,
         };
 
         let result = engine.execute_query(&query).unwrap();
@@ -619,6 +620,7 @@ mod tests {
             limit: 2,
             cursor: None,
             offset: None,
+            skip_cache: false,
         };
         let r1 = engine.execute_query(&q1).unwrap();
         assert_eq!(r1.ids, vec![5, 4]);
@@ -630,6 +632,7 @@ mod tests {
             limit: 2,
             cursor: None,
             offset: Some(2),
+            skip_cache: false,
         };
         let r2 = engine.execute_query(&q2).unwrap();
         assert_eq!(r2.ids, vec![3, 2]);
@@ -641,6 +644,7 @@ mod tests {
             limit: 2,
             cursor: None,
             offset: Some(4),
+            skip_cache: false,
         };
         let r3 = engine.execute_query(&q3).unwrap();
         assert_eq!(r3.ids, vec![1]);
@@ -652,6 +656,7 @@ mod tests {
             limit: 2,
             cursor: None,
             offset: Some(10),
+            skip_cache: false,
         };
         let r4 = engine.execute_query(&q4).unwrap();
         assert!(r4.ids.is_empty());

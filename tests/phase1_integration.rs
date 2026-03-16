@@ -878,6 +878,7 @@ fn cursor_pagination_no_gaps_no_duplicates_desc() {
             limit: page_size,
             cursor: cursor.clone(),
             offset: None,
+            skip_cache: false,
         };
 
         let result = engine.execute_query(&query).unwrap();
@@ -967,6 +968,7 @@ fn cursor_pagination_no_gaps_no_duplicates_asc() {
             limit: page_size,
             cursor: cursor.clone(),
             offset: None,
+            skip_cache: false,
         };
 
         let result = engine.execute_query(&query).unwrap();
@@ -1034,6 +1036,7 @@ fn cursor_page2_starts_where_page1_ended() {
         limit: 5,
         cursor: Some(cursor.clone()),
         offset: None,
+        skip_cache: false,
     };
     let page2 = engine.execute_query(&page2_query).unwrap();
 
