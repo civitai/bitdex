@@ -277,6 +277,8 @@ struct AppState {
     trace_buffer: crate::query_metrics::TraceBuffer,
     /// Number of queries currently executing (incremented on entry, decremented on exit).
     queries_in_flight: AtomicI64,
+    /// Peak concurrent queries since startup (updated atomically via fetch_max).
+    queries_in_flight_peak: AtomicI64,
     /// Concurrency limit for queries. 0 = unlimited (no backpressure).
     max_query_concurrency: AtomicU32,
 }
@@ -782,6 +784,7 @@ impl BitdexServer {
             admin_token,
             trace_buffer: crate::query_metrics::TraceBuffer::default(),
             queries_in_flight: AtomicI64::new(0),
+            queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
         });
 
@@ -1688,16 +1691,15 @@ async fn handle_query(
         gauge: &state.metrics.queries_in_flight,
     };
 
-    // Update peak if current exceeds it
-    if in_flight > state.metrics.queries_in_flight_peak.get() {
-        state.metrics.queries_in_flight_peak.set(in_flight);
-    }
+    // Update peak atomically (no TOCTOU race)
+    state.queries_in_flight_peak.fetch_max(in_flight, Ordering::Relaxed);
 
     let max = state.max_query_concurrency.load(Ordering::Relaxed);
     if max > 0 && in_flight > max as i64 {
         state.metrics.queries_rejected_total.inc();
         return (
             StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "1")],
             Json(serde_json::json!({
                 "error": "server overloaded",
                 "queries_in_flight": in_flight,
@@ -2246,7 +2248,7 @@ async fn handle_stats(
         "unified_cache_entry_details": entries,
         "eviction": eviction,
         "queries_in_flight": state.queries_in_flight.load(Ordering::Relaxed),
-        "queries_in_flight_peak": state.metrics.queries_in_flight_peak.get(),
+        "queries_in_flight_peak": state.queries_in_flight_peak.load(Ordering::Relaxed),
         "queries_rejected": state.metrics.queries_rejected_total.get(),
         "max_query_concurrency": state.max_query_concurrency.load(Ordering::Relaxed),
     })).into_response()
@@ -3055,6 +3057,10 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                     .set(resident as i64);
             }
 
+            // Sync peak from atomic to Prometheus gauge
+            m.queries_in_flight_peak
+                .set(state.queries_in_flight_peak.load(Ordering::Relaxed));
+
             // BoundStore stats
             m.boundstore_meta_entries
                 .with_label_values(&[name])
@@ -3100,4 +3106,70 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
 
 async fn handle_ui() -> impl IntoResponse {
     Html(include_str!("../static/index.html"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inflight_guard_decrements_on_drop() {
+        let counter = AtomicI64::new(0);
+        let registry = prometheus::Registry::new();
+        let gauge = prometheus::IntGauge::new("test_in_flight", "test").unwrap();
+        registry.register(Box::new(gauge.clone())).unwrap();
+
+        // Simulate incrementing like handle_query does
+        counter.fetch_add(1, Ordering::Relaxed);
+        gauge.inc();
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(gauge.get(), 1);
+
+        {
+            let _guard = QueryInflightGuard {
+                counter: &counter,
+                gauge: &gauge,
+            };
+            // Guard is alive, counter should still be 1
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        }
+        // Guard dropped, counter should be back to 0
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(gauge.get(), 0);
+    }
+
+    #[test]
+    fn peak_tracking_is_monotonic() {
+        let peak = AtomicI64::new(0);
+
+        // Simulate concurrent updates — fetch_max ensures monotonicity
+        peak.fetch_max(5, Ordering::Relaxed);
+        assert_eq!(peak.load(Ordering::Relaxed), 5);
+
+        // Lower value should not decrease peak
+        peak.fetch_max(3, Ordering::Relaxed);
+        assert_eq!(peak.load(Ordering::Relaxed), 5);
+
+        // Higher value should increase peak
+        peak.fetch_max(12, Ordering::Relaxed);
+        assert_eq!(peak.load(Ordering::Relaxed), 12);
+
+        // Equal value is a no-op
+        peak.fetch_max(12, Ordering::Relaxed);
+        assert_eq!(peak.load(Ordering::Relaxed), 12);
+    }
+
+    #[test]
+    fn peak_tracking_no_toctou_regression() {
+        // Simulate the old TOCTOU bug: thread A reads peak=5, thread B sets peak=12,
+        // thread A sets peak=10 (lowering it). With fetch_max this cannot happen.
+        let peak = AtomicI64::new(5);
+
+        // Thread B sets 12
+        peak.fetch_max(12, Ordering::Relaxed);
+        // Thread A tries to set 10 (should be a no-op)
+        peak.fetch_max(10, Ordering::Relaxed);
+
+        assert_eq!(peak.load(Ordering::Relaxed), 12);
+    }
 }
