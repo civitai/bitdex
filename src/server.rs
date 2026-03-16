@@ -14,7 +14,7 @@ use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
-use axum::routing::{get, post, delete};
+use axum::routing::{get, patch, post, delete};
 use axum::Router;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -605,6 +605,44 @@ struct RemoveFieldsRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Config patch types
+// ---------------------------------------------------------------------------
+
+/// Partial config update — only fields present are changed.
+#[derive(Deserialize)]
+struct ConfigPatch {
+    #[serde(default)]
+    filter_fields: Option<HashMap<String, FilterFieldPatch>>,
+    #[serde(default)]
+    sort_fields: Option<HashMap<String, SortFieldPatch>>,
+    #[serde(default)]
+    cache: Option<CachePatch>,
+}
+
+/// Patchable fields for a filter field.
+#[derive(Deserialize)]
+struct FilterFieldPatch {
+    eager_load: Option<bool>,
+}
+
+/// Patchable fields for a sort field.
+#[derive(Deserialize)]
+struct SortFieldPatch {
+    eager_load: Option<bool>,
+}
+
+/// Patchable fields for cache config.
+#[derive(Deserialize)]
+struct CachePatch {
+    max_entries: Option<usize>,
+    decay_rate: Option<f64>,
+    bound_target_size: Option<usize>,
+    bound_max_size: Option<usize>,
+    bound_max_count: Option<usize>,
+    prefetch_threshold: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
 // Public server entry point
 // ---------------------------------------------------------------------------
 
@@ -680,6 +718,7 @@ impl BitdexServer {
             .route("/api/indexes", get(handle_list_indexes))
             .route("/api/indexes/{name}", get(handle_get_index))
             .route("/api/indexes/{name}", delete(handle_delete_index))
+            .route("/api/indexes/{name}/config", patch(handle_patch_config))
             // Data loading
             .route("/api/indexes/{name}/load", post(handle_load))
             // Legacy /load/status removed — use /tasks or /tasks/{id} instead
@@ -1166,6 +1205,189 @@ async fn handle_get_index(
             Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
         ).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Config Patch
+// ---------------------------------------------------------------------------
+
+async fn handle_patch_config(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(patch): Json<ConfigPatch>,
+) -> impl IntoResponse {
+    let (engine, updated_config) = {
+        let mut guard = state.index.lock();
+        match guard.as_mut() {
+            Some(idx) if idx.definition.name == name => {
+                // Validate filter field names
+                if let Some(ref filter_patches) = patch.filter_fields {
+                    for fname in filter_patches.keys() {
+                        if !idx.definition.config.filter_fields.iter().any(|f| &f.name == fname) {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": format!("Unknown filter field: '{}'", fname)
+                                })),
+                            ).into_response();
+                        }
+                    }
+                }
+
+                // Validate sort field names
+                if let Some(ref sort_patches) = patch.sort_fields {
+                    for sname in sort_patches.keys() {
+                        if !idx.definition.config.sort_fields.iter().any(|f| &f.name == sname) {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": format!("Unknown sort field: '{}'", sname)
+                                })),
+                            ).into_response();
+                        }
+                    }
+                }
+
+                // Validate cache patch values
+                if let Some(ref cache_patch) = patch.cache {
+                    if let Some(dr) = cache_patch.decay_rate {
+                        if dr <= 0.0 || dr > 1.0 {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "cache.decay_rate must be in (0.0, 1.0]"
+                                })),
+                            ).into_response();
+                        }
+                    }
+                    if let Some(pt) = cache_patch.prefetch_threshold {
+                        if !(0.0..=1.0).contains(&pt) {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "cache.prefetch_threshold must be in [0.0, 1.0]"
+                                })),
+                            ).into_response();
+                        }
+                    }
+                }
+
+                // Apply filter field patches
+                let mut newly_eager_filters: Vec<String> = Vec::new();
+                if let Some(ref filter_patches) = patch.filter_fields {
+                    for fc in idx.definition.config.filter_fields.iter_mut() {
+                        if let Some(fp) = filter_patches.get(&fc.name) {
+                            if let Some(eager) = fp.eager_load {
+                                let was_eager = fc.eager_load;
+                                fc.eager_load = eager;
+                                if eager && !was_eager {
+                                    newly_eager_filters.push(fc.name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Apply sort field patches
+                let mut newly_eager_sorts: Vec<String> = Vec::new();
+                if let Some(ref sort_patches) = patch.sort_fields {
+                    for sc in idx.definition.config.sort_fields.iter_mut() {
+                        if let Some(sp) = sort_patches.get(&sc.name) {
+                            if let Some(eager) = sp.eager_load {
+                                let was_eager = sc.eager_load;
+                                sc.eager_load = eager;
+                                if eager && !was_eager {
+                                    newly_eager_sorts.push(sc.name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Apply cache patches
+                if let Some(ref cache_patch) = patch.cache {
+                    if let Some(v) = cache_patch.max_entries {
+                        idx.definition.config.cache.max_entries = v;
+                    }
+                    if let Some(v) = cache_patch.decay_rate {
+                        idx.definition.config.cache.decay_rate = v;
+                    }
+                    if let Some(v) = cache_patch.bound_target_size {
+                        idx.definition.config.cache.bound_target_size = v;
+                    }
+                    if let Some(v) = cache_patch.bound_max_size {
+                        idx.definition.config.cache.bound_max_size = v;
+                    }
+                    if let Some(v) = cache_patch.bound_max_count {
+                        idx.definition.config.cache.bound_max_count = v;
+                    }
+                    if let Some(v) = cache_patch.prefetch_threshold {
+                        idx.definition.config.cache.prefetch_threshold = v;
+                    }
+                }
+
+                // Persist updated config.json
+                let index_dir = state.data_dir.join("indexes").join(&name);
+                let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
+                if let Err(e) = std::fs::write(index_dir.join("config.json"), &config_json) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!("Failed to persist config: {e}")
+                        })),
+                    ).into_response();
+                }
+
+                let engine = Arc::clone(&idx.engine);
+                let config = idx.definition.config.clone();
+
+                // Trigger eager loading for newly-eager fields
+                if !newly_eager_filters.is_empty() || !newly_eager_sorts.is_empty() {
+                    let engine_clone = Arc::clone(&engine);
+                    tokio::task::spawn_blocking(move || {
+                        use crate::query::{FilterClause, Value};
+
+                        // Build synthetic filter clauses for newly-eager filter fields
+                        let clauses: Vec<FilterClause> = newly_eager_filters
+                            .iter()
+                            .map(|name| FilterClause::Eq(name.clone(), Value::Integer(0)))
+                            .collect();
+
+                        // Load each newly-eager sort field
+                        for sname in &newly_eager_sorts {
+                            let _ = engine_clone.ensure_fields_loaded(&clauses, Some(sname));
+                        }
+                        // Load remaining filter-only fields
+                        if !clauses.is_empty() {
+                            let _ = engine_clone.ensure_fields_loaded(&clauses, None);
+                        }
+
+                        eprintln!(
+                            "Config patch: loaded {} eager filter + {} eager sort fields",
+                            newly_eager_filters.len(),
+                            newly_eager_sorts.len(),
+                        );
+                    });
+                }
+
+                (engine, config)
+            }
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("Index '{}' not found", name)
+                    })),
+                ).into_response();
+            }
+        }
+    };
+
+    // Return the full updated config
+    let _ = engine; // engine kept in scope for spawned task
+    Json(serde_json::json!({
+        "config": updated_config,
+    })).into_response()
 }
 
 async fn handle_delete_index(

@@ -2345,7 +2345,7 @@ impl ConcurrentEngine {
     /// - **Per-value loading** for high-cardinality multi_value fields (e.g. tagIds)
     ///
     /// Fast path: if no loads are pending and no lazy value fields exist, just returns.
-    fn ensure_fields_loaded(
+    pub fn ensure_fields_loaded(
         &self,
         filters: &[FilterClause],
         sort_field: Option<&str>,
