@@ -196,11 +196,12 @@ function pushLog(instanceId, level, message) {
   return entry;
 }
 
-function getLogs(instanceId, { since = 0, tail = 100 } = {}) {
+function getLogs(instanceId, { since = 0, before = 0, tail = 100 } = {}) {
   const buf = logBuffers.get(instanceId);
   if (!buf) return [];
   let lines = buf.lines;
-  if (since > 0) lines = lines.filter(l => l.index > since);
+  if (before > 0) lines = lines.filter(l => l.index < before);
+  else if (since > 0) lines = lines.filter(l => l.index > since);
   if (tail > 0) lines = lines.slice(-tail);
   return lines;
 }
@@ -1131,6 +1132,7 @@ async function handleRequest(req, res) {
     if (method === 'GET' && logMatch) {
       const logs = getLogs(logMatch[1], {
         since: parseInt(query.since || '0', 10),
+        before: parseInt(query.before || '0', 10),
         tail: parseInt(query.tail || '100', 10),
       });
       return json(res, 200, { logs });

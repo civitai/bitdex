@@ -32,7 +32,7 @@ import { appendFileSync } from 'node:fs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const DEBUG_LOG = resolve(__dirname, 'debug.log');
-function dbg(msg) { try { appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {} }
+function dbg(msg) { /* debug logging disabled — appendFileSync was causing input lag */ }
 const DAEMON_SCRIPT = resolve(__dirname, 'daemon.mjs');
 const PROJECT_ROOT = resolve(__dirname, '..', '..', '..');
 const DAEMON_URL = 'http://127.0.0.1:9851';
@@ -681,7 +681,7 @@ async function cmdDashboard() {
   process.stdin.setRawMode(true);
   process.stdin.resume();
   process.stdin.setEncoding('utf8');
-  write(ALT_ON + CUR_HIDE);
+  write(ALT_ON + CUR_HIDE + '\x1b[?1000h' + '\x1b[?1006h'); // enable mouse tracking (SGR mode)
 
   let selectedInstance = null;
   let logLines = [];
@@ -697,8 +697,55 @@ async function cmdDashboard() {
   let explainIdx = 0;       // current index in explainTraces
   let explainMode = false;  // when true, logs are paused and arrow keys navigate traces
   let renderDirty = false;  // SSE events set this; timer reads+clears it
+  let fetchingOlderLogs = false; // prevent concurrent fetches
+  let oldestLogIndex = Infinity; // lowest log index we have in buffer
+  let noMoreOlderLogs = false;   // true when daemon has no older logs
 
   function flash(msg) { actionMsg = msg; renderDirty = true; setTimeout(() => { actionMsg = ''; renderDirty = true; }, 4000); }
+
+  // Fetch older logs when scrolling near top of buffer
+  async function fetchOlderLogs() {
+    if (fetchingOlderLogs || noMoreOlderLogs || logLines.length === 0) return;
+    const logTarget = selectedInstance || (lastStatus?.instances?.[0]?.id);
+    if (!logTarget) return;
+    fetchingOlderLogs = true;
+    try {
+      // Ask for logs before our oldest, tail=100 to get a good chunk
+      const beforeIdx = logLines[0]?.index || 0;
+      const resp = await daemonFetch(`/instances/${logTarget}/logs?tail=100&before=${beforeIdx}`);
+      const older = resp.logs || resp;
+      if (Array.isArray(older) && older.length > 0) {
+        // Filter out any we already have and prepend
+        const existing = new Set(logLines.map(l => l.index));
+        const fresh = older.filter(l => !existing.has(l.index));
+        if (fresh.length > 0) {
+          logLines = [...fresh, ...logLines];
+          // Adjust scroll so the view stays in place
+          logScroll += fresh.length;
+          oldestLogIndex = logLines[0].index;
+          renderDirty = true;
+        } else {
+          noMoreOlderLogs = true;
+        }
+      } else {
+        noMoreOlderLogs = true;
+      }
+    } catch { /* daemon unavailable */ }
+    fetchingOlderLogs = false;
+  }
+
+  // Immediate render for user-initiated actions (scroll, key presses)
+  function renderNow() {
+    if (!lastStatus || rendering) return;
+    renderDirty = false;
+    if (inputMode) {
+      write(`\x1b[${rows};1H` + CLR_LINE + `  ${inputMode.prompt}${inputMode.buffer}█`);
+      return;
+    }
+    rendering = true;
+    render(lastStatus);
+    rendering = false;
+  }
 
   // Throttled render: ~4fps max. During inputMode, skip full renders entirely.
   let rendering = false;
@@ -836,9 +883,12 @@ async function cmdDashboard() {
     const FOOTER_ROWS = 2;
     const explainHeight = explainRows.length;
     const logAreaRows = Math.max(1, rows - HEADER_ROWS - FOOTER_ROWS - explainHeight);
+    // Clamp scroll: stop when first line reaches top of visible area
+    const maxScroll = Math.max(0, logLines.length - logAreaRows);
+    if (logScroll > maxScroll) logScroll = maxScroll;
     const endIdx = logLines.length - logScroll;
-    const startIdx = Math.max(0, endIdx - logAreaRows);
-    const visible = logLines.slice(startIdx, endIdx);
+    const startIdx = endIdx - logAreaRows;
+    const visible = logLines.slice(Math.max(0, startIdx), endIdx);
 
     // Build visual lines from log entries
     const visualLines = [];
@@ -953,27 +1003,62 @@ async function cmdDashboard() {
       }
     }
     if (key === '\x1b[A') { // Up arrow (log scroll)
-      logScroll = Math.min(logScroll + 3, Math.max(0, logLines.length - 5));
+      logScroll = Math.min(logScroll + 1, Math.max(0, logLines.length));
+      // Fetch more logs when within 15 lines of buffer start
+      if (logLines.length - logScroll < 15) fetchOlderLogs();
+      renderDirty = true; renderNow();
       return;
     }
     if (key === '\x1b[B') { // Down arrow (log scroll)
-      logScroll = Math.max(0, logScroll - 3);
+      logScroll = Math.max(0, logScroll - 1);
+      renderDirty = true; renderNow();
       return;
     }
     if (key === '\x1b[5~') { // Page Up
-      logScroll = Math.min(logScroll + 20, Math.max(0, logLines.length - 5));
+      logScroll = Math.min(logScroll + 20, Math.max(0, logLines.length));
+      if (logLines.length - logScroll < 15) fetchOlderLogs();
+      renderDirty = true; renderNow();
       return;
     }
     if (key === '\x1b[6~') { // Page Down
       logScroll = Math.max(0, logScroll - 20);
+      renderDirty = true; renderNow();
       return;
     }
     if (key === '\x1b[F' || key === '\x1b[4~') { // End key
       logScroll = 0;
+      renderDirty = true; renderNow();
       return;
     }
     if (key === '\x1b[H' || key === '\x1b[1~') { // Home key
-      logScroll = Math.max(0, logLines.length - 5);
+      logScroll = Math.max(0, logLines.length);
+      renderDirty = true; renderNow();
+      return;
+    }
+    // Mouse wheel: SGR mode (\x1b[<65;x;yM = scroll up, \x1b[<64;x;yM = scroll down)
+    const mouseMatch = key.match(/\x1b\[<(\d+);\d+;\d+[Mm]/);
+    if (mouseMatch) {
+      const btn = parseInt(mouseMatch[1], 10);
+      if (btn === 65) { // scroll up
+        logScroll = Math.min(logScroll + 3, Math.max(0, logLines.length));
+        if (logLines.length - logScroll < 15) fetchOlderLogs();
+        renderDirty = true; renderNow();
+      } else if (btn === 64) { // scroll down
+        logScroll = Math.max(0, logScroll - 3);
+        renderDirty = true; renderNow();
+      }
+      return;
+    }
+    // Legacy mouse wheel (\x1b[Ma = scroll up, \x1b[M` = scroll down)
+    if (key.length === 6 && key.startsWith('\x1b[M')) {
+      const btn = key.charCodeAt(3);
+      if (btn === 97) { // scroll up
+        logScroll = Math.min(logScroll + 3, Math.max(0, logLines.length));
+        renderDirty = true; renderNow();
+      } else if (btn === 96) { // scroll down
+        logScroll = Math.max(0, logScroll - 3);
+        renderDirty = true; renderNow();
+      }
       return;
     }
     // Ignore other multi-byte escape sequences
@@ -983,7 +1068,7 @@ async function cmdDashboard() {
       running = false;
       clearInterval(renderTimer);
       try { sseAbort.abort(); } catch {}
-      write(CUR_SHOW + ALT_OFF);
+      write('\x1b[?1006l' + '\x1b[?1000l' + CUR_SHOW + ALT_OFF); // disable mouse tracking
       process.stdin.setRawMode(false);
       process.exit(0);
     }
@@ -1149,8 +1234,7 @@ async function cmdDashboard() {
               if (logLines.length === 0 && parsed.instances?.length > 0) {
                 const target = selectedInstance || parsed.instances[0]?.id;
                 if (target) {
-                  const logRows = Math.max(10, rows - 15);
-                  daemonFetch(`/instances/${target}/logs?tail=${logRows}`).then(resp => {
+                  daemonFetch(`/instances/${target}/logs?tail=200`).then(resp => {
                     const backfill = resp.logs || resp;
                     if (Array.isArray(backfill) && backfill.length > 0) {
                       logLines = backfill;
