@@ -2096,10 +2096,25 @@ async fn handle_filter_sync(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<FilterSyncRequest>,
 ) -> impl IntoResponse {
+    // Validate field exists and is a multi_value filter field
     let engine = {
         let guard = state.index.lock();
         match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            Some(idx) if idx.definition.name == name => {
+                let is_multi_value = idx.definition.config.filter_fields.iter().any(|f| {
+                    f.name == req.field
+                        && matches!(f.field_type, crate::config::FilterFieldType::MultiValue)
+                });
+                if !is_multi_value {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("Field '{}' is not a multi_value filter field", req.field)
+                        })),
+                    ).into_response();
+                }
+                Arc::clone(&idx.engine)
+            }
             _ => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -2124,8 +2139,9 @@ async fn handle_filter_sync(
     if errors.is_empty() {
         Json(serde_json::json!({"synced": synced})).into_response()
     } else {
+        // Return 207 Multi-Status so clients can distinguish partial failure
         (
-            StatusCode::OK,
+            StatusCode::MULTI_STATUS,
             Json(serde_json::json!({"synced": synced, "errors": errors})),
         ).into_response()
     }

@@ -177,11 +177,30 @@ impl BitdexClient {
             .await
             .map_err(|e| format!("filter_sync request failed: {e}"))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("filter_sync returned {status}: {body}"));
+        let status = resp.status();
+        let resp_body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("filter_sync response parse failed: {e}"))?;
+
+        // Check for HTTP errors
+        if status.is_server_error() || status.is_client_error() {
+            return Err(format!("filter_sync returned {status}: {resp_body}"));
         }
+
+        // Check for partial failures (207 Multi-Status)
+        if let Some(errors) = resp_body.get("errors") {
+            if let Some(arr) = errors.as_array() {
+                if !arr.is_empty() {
+                    return Err(format!(
+                        "filter_sync partial failure: {} errors: {}",
+                        arr.len(),
+                        resp_body,
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 

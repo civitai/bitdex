@@ -64,7 +64,8 @@ CREATE OR REPLACE TRIGGER bitdex_resource_trg AFTER INSERT OR DELETE ON "ImageRe
 ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_resource_trg;
 
 -- CollectionItem changes (nullable imageId — only fire for image collections)
--- Fires on INSERT, DELETE, and UPDATE (status changes like PENDING→ACCEPTED).
+-- Fires on INSERT, DELETE, and UPDATE (status changes like REVIEW→ACCEPTED).
+-- imageId and collectionId are immutable on CollectionItem rows — only status changes.
 CREATE OR REPLACE FUNCTION bitdex_collection_notify() RETURNS trigger AS $$
 DECLARE
   _image_id BIGINT;
@@ -72,7 +73,7 @@ BEGIN
   IF TG_OP = 'DELETE' THEN
     _image_id := OLD."imageId";
   ELSIF TG_OP = 'UPDATE' THEN
-    -- Only fire on status changes (covers PENDING→ACCEPTED and ACCEPTED→REJECTED)
+    -- Only fire on status changes (imageId/collectionId are immutable)
     IF OLD.status = NEW.status THEN
       RETURN NEW;
     END IF;
