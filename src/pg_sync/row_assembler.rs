@@ -82,10 +82,13 @@ impl EnrichmentData {
 pub fn assemble_document(image: &ImageRow, enrichment: &EnrichmentData) -> Value {
     let id = image.id;
 
-    // Compute sortAt as unix epoch seconds
-    let sort_at_secs = image.sort_at.map(|dt| dt.timestamp()).unwrap_or(0);
-
-    // Compute timestamp milliseconds for doc-only fields
+    // Timestamps emitted in milliseconds to match schema source names.
+    // The schema's ms_to_seconds flag handles conversion to seconds for sort layers.
+    //
+    // Schema source mappings:
+    //   "sortAtUnix"       -> target "sortAt"       (ms_to_seconds: true, fallback: "sortAt")
+    //   "publishedAtUnix"  -> target "publishedAt"   (ms_to_seconds: true)
+    //   "publishedAtUnix"  -> target "isPublished"   (exists_boolean)
     let sort_at_unix_ms = image.sort_at.map(|dt| dt.timestamp_millis()).unwrap_or(0);
     // publishedAtUnix must be null (not 0) when unpublished — the exists_boolean
     // mapping sets isPublished=true for any non-null value including 0.
@@ -93,10 +96,6 @@ pub fn assemble_document(image: &ImageRow, enrichment: &EnrichmentData) -> Value
         .published_at
         .map(|dt| dt.timestamp_millis())
         .filter(|&ms| ms > 0);
-    let existed_at_unix_ms = image
-        .created_at
-        .map(|dt| dt.timestamp_millis())
-        .unwrap_or(0);
 
     // hasMeta: meta is not null, not JSON null, and not hidden
     let has_meta = match &image.meta {
@@ -158,10 +157,13 @@ pub fn assemble_document(image: &ImageRow, enrichment: &EnrichmentData) -> Value
         "modelVersionIdsManual": model_version_ids_manual,
         "toolIds": tool_ids,
         "techniqueIds": technique_ids,
-        "sortAt": sort_at_secs,
+        // Source name "sortAtUnix" matches schema primary source (ms_to_seconds converts to u32 seconds).
+        // Previously also emitted "sortAt" (seconds) which is the schema fallback — removed to avoid
+        // redundancy and potential confusion when both are present.
         "sortAtUnix": sort_at_unix_ms,
+        // Source name "publishedAtUnix" drives both the "publishedAt" sort field (ms_to_seconds)
+        // and the "isPublished" exists_boolean filter.
         "publishedAtUnix": published_at_unix_ms,
-        "existedAtUnix": existed_at_unix_ms,
         "url": image.url.as_deref(),
         "hash": image.hash.as_deref(),
     });

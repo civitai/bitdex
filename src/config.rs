@@ -660,6 +660,11 @@ impl DataSchema {
         Ok(())
     }
 
+    /// Look up a field mapping by its source name.
+    pub fn field_by_source(&self, source: &str) -> Option<&FieldMapping> {
+        self.fields.iter().find(|m| m.source == source)
+    }
+
     /// Normalize string_map keys to lowercase for case-insensitive MappedString fields.
     /// Call once after deserialization, before use in loader/docstore/server.
     pub fn normalize_string_maps(&mut self) {

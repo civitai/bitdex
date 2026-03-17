@@ -198,6 +198,66 @@ impl CopyImageRow {
         ];
         vals.into_iter().max().unwrap_or(0) as u64
     }
+
+    /// Materialize all image-row fields as a JSON object keyed by DataSchema source names.
+    ///
+    /// Computed fields are included:
+    /// - `hasMeta`: derived from flags (hasPrompt && !hideMeta)
+    /// - `onSite`: derived from flags (madeOnSite)
+    /// - `poi`: derived from flags (bit4, image-level only)
+    /// - `minor`: derived from flags (bit3)
+    /// - `sortAt`: max(publishedAt, scannedAt, createdAt) in seconds
+    /// - `isPublished`: true if publishedAt > 0
+    ///
+    /// Timestamp fields that the schema expects in ms (`sortAtUnix`, `publishedAtUnix`)
+    /// are emitted in milliseconds so `map_field` with `ms_to_seconds` works correctly.
+    /// The seconds-based values are also emitted as fallbacks (`sortAt`, `publishedAt`).
+    pub fn to_json_value(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::with_capacity(20);
+
+        map.insert("id".into(), serde_json::Value::from(self.id));
+        map.insert("nsfwLevel".into(), serde_json::Value::from(self.nsfw_level));
+        map.insert("userId".into(), serde_json::Value::from(self.user_id));
+        map.insert("type".into(), serde_json::Value::from(self.image_type.as_str()));
+        map.insert("postId".into(), serde_json::Value::from(self.post_id.unwrap_or(0)));
+        map.insert("postedToId".into(), serde_json::Value::from(self.posted_to_id.unwrap_or(0)));
+        map.insert("availability".into(), serde_json::Value::from(self.availability.as_str()));
+
+        // Computed boolean fields from flags
+        map.insert("hasMeta".into(), serde_json::Value::from(self.has_meta()));
+        map.insert("onSite".into(), serde_json::Value::from(self.on_site()));
+        map.insert("poi".into(), serde_json::Value::from(self.poi()));
+        map.insert("minor".into(), serde_json::Value::from(self.minor()));
+
+        // Timestamp fields: emit ms versions for schema ms_to_seconds conversion,
+        // plus seconds versions as fallbacks.
+        let sort_at_secs = self.sort_at_secs();
+        map.insert("sortAtUnix".into(), serde_json::Value::from(sort_at_secs * 1000));
+        map.insert("sortAt".into(), serde_json::Value::from(sort_at_secs));
+
+        let pub_secs = self.published_at_secs.unwrap_or(0);
+        if pub_secs > 0 {
+            map.insert("publishedAtUnix".into(), serde_json::Value::from(pub_secs * 1000));
+        } else {
+            map.insert("publishedAtUnix".into(), serde_json::Value::Null);
+        }
+        map.insert("publishedAt".into(), serde_json::Value::from(pub_secs));
+
+        // blockedFor — only include when non-null
+        if let Some(ref bf) = self.blocked_for {
+            map.insert("blockedFor".into(), serde_json::Value::from(bf.as_str()));
+        }
+
+        // doc-only string fields — only include when non-null
+        if let Some(ref url) = self.url {
+            map.insert("url".into(), serde_json::Value::from(url.as_str()));
+        }
+        if let Some(ref hash) = self.hash {
+            map.insert("hash".into(), serde_json::Value::from(hash.as_str()));
+        }
+
+        serde_json::Value::Object(map)
+    }
 }
 
 /// Post row for enrichment — keyed by Post.id, joined to Image via postId.

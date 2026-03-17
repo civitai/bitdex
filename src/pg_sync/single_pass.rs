@@ -26,8 +26,11 @@ use roaring::RoaringBitmap;
 
 use crate::bitmap_fs::BitmapFs;
 use crate::concurrent_engine::ConcurrentEngine;
+use crate::config::FieldValueType;
 use crate::dictionary::FieldDictionary;
 use crate::docstore::PackedValue;
+use crate::mutation::FieldValue;
+use crate::query::Value;
 
 use super::bulk_loader::BulkLoadStats;
 use super::config::IndexDefinition;
@@ -162,15 +165,18 @@ pub fn run_single_pass_v2(
         );
 
         let t = Instant::now();
+        let dict_map: HashMap<String, &FieldDictionary> = [
+            ("type".to_string(), &type_dict as &FieldDictionary),
+            ("availability".to_string(), &availability_dict as &FieldDictionary),
+            ("blockedFor".to_string(), &blocked_for_dict as &FieldDictionary),
+        ].into_iter().collect();
         let img_result = process_images_csv(
             stage_dir,
             &bulk_writer,
             &progress,
             &post_map,
             schema,
-            &type_dict,
-            &availability_dict,
-            &blocked_for_dict,
+            &dict_map,
             &filter_set,
             &sort_bits,
             &filter_names,
@@ -672,9 +678,7 @@ fn process_images_csv(
     progress: &Arc<LoadProgress>,
     post_map: &HashMap<i64, (Option<i64>, String, Option<i64>)>,
     schema: &crate::config::DataSchema,
-    type_dict: &FieldDictionary,
-    availability_dict: &FieldDictionary,
-    blocked_for_dict: &FieldDictionary,
+    dictionaries: &HashMap<String, &FieldDictionary>,
     filter_set: &HashSet<String>,
     sort_bits: &HashMap<String, u8>,
     filter_names: &[String],
@@ -772,9 +776,102 @@ fn process_images_csv(
                     let slot = row.id as u32;
 
                     alive.insert(slot);
-                    build_image_filter_bitmaps(&row, slot, filter_set, &type_dict, &availability_dict, &blocked_for_dict, &mut filter_maps);
-                    build_image_sort_bitmaps(&row, slot, sort_bits, &mut sort_maps);
-                    append_image_docstore_tuples(&row, slot, bulk_writer);
+
+                    // Schema-driven field processing: iterate over schema mappings,
+                    // convert via field_mapper, and insert into filter/sort bitmaps + docstore.
+                    let json = row.to_json_value();
+                    let field_idx = bulk_writer.field_to_idx();
+
+                    // Write the id to docstore (not in schema fields but always needed)
+                    if let Some(&fidx) = field_idx.get("id") {
+                        let value = rmp_serde::to_vec(&PackedValue::I(row.id)).unwrap_or_default();
+                        bulk_writer.append_tuple_raw(slot, fidx, &value);
+                    }
+
+                    for mapping in &schema.fields {
+                        let is_filter = filter_set.contains(&mapping.target);
+                        let s_bits = sort_bits.get(&mapping.target).copied();
+
+                        // Skip fields not relevant to the image CSV (multi-value, metrics, etc.)
+                        // If the source isn't in our JSON, there's nothing to process.
+                        let raw_opt = mapping.resolve_raw(&json);
+
+                        match raw_opt {
+                            Some((raw, apply_ms)) if !raw.is_null() => {
+                                let dict = dictionaries.get(&mapping.target).copied();
+                                if let Some(fv) = crate::field_mapper::map_field(raw, mapping, apply_ms, dict) {
+                                    // Filter bitmap insertion
+                                    if is_filter && !mapping.doc_only {
+                                        match &fv {
+                                            FieldValue::Single(Value::Integer(n)) => {
+                                                insert_filter(&mut filter_maps, &mapping.target, *n as u64, slot);
+                                            }
+                                            FieldValue::Single(Value::Bool(b)) => {
+                                                insert_filter(&mut filter_maps, &mapping.target, if *b { 1 } else { 0 }, slot);
+                                            }
+                                            FieldValue::Single(Value::Float(f)) => {
+                                                insert_filter(&mut filter_maps, &mapping.target, *f as u64, slot);
+                                            }
+                                            FieldValue::Single(Value::String(_)) => {
+                                                // String filter fields should use LowCardinalityString or MappedString;
+                                                // plain String fields are typically doc_only.
+                                            }
+                                            FieldValue::Multi(_) => {
+                                                // Multi-value fields (tagIds, etc.) are handled by separate CSV processors.
+                                            }
+                                        }
+                                    }
+
+                                    // Sort bitmap insertion (bit-layer decomposition)
+                                    if let Some(bits) = s_bits {
+                                        if !mapping.doc_only {
+                                            if let FieldValue::Single(Value::Integer(n)) = &fv {
+                                                insert_sort_bits(&mut sort_maps, &mapping.target, *n as u32, bits, slot);
+                                            }
+                                        }
+                                    }
+
+                                    // Docstore tuple insertion
+                                    if !mapping.filter_only {
+                                        if let Some(&fidx) = field_idx.get(mapping.target.as_str()) {
+                                            let packed = match &fv {
+                                                FieldValue::Single(Value::Integer(n)) => {
+                                                    rmp_serde::to_vec(&PackedValue::I(*n)).ok()
+                                                }
+                                                FieldValue::Single(Value::Bool(b)) => {
+                                                    rmp_serde::to_vec(&PackedValue::B(*b)).ok()
+                                                }
+                                                FieldValue::Single(Value::String(s)) => {
+                                                    rmp_serde::to_vec(&PackedValue::S(s.clone())).ok()
+                                                }
+                                                FieldValue::Single(Value::Float(f)) => {
+                                                    rmp_serde::to_vec(&PackedValue::I(*f as i64)).ok()
+                                                }
+                                                FieldValue::Multi(_) => None, // Multi-value handled by separate CSV processors
+                                            };
+                                            if let Some(bytes) = packed {
+                                                bulk_writer.append_tuple_raw(slot, fidx, &bytes);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Source field absent or null.
+                                // ExistsBoolean: absent source → insert false (0) into filter bitmap.
+                                if is_filter && matches!(mapping.value_type, FieldValueType::ExistsBoolean) {
+                                    insert_filter(&mut filter_maps, &mapping.target, 0, slot);
+                                    // Also write false to docstore
+                                    if !mapping.filter_only {
+                                        if let Some(&fidx) = field_idx.get(mapping.target.as_str()) {
+                                            let bytes = rmp_serde::to_vec(&PackedValue::B(false)).unwrap_or_default();
+                                            bulk_writer.append_tuple_raw(slot, fidx, &bytes);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
@@ -824,186 +921,6 @@ fn process_images_csv(
         sort_maps: merged_sorts,
         alive: merged_alive,
     })
-}
-
-/// Build filter bitmaps for a single image row.
-fn build_image_filter_bitmaps(
-    row: &super::copy_queries::CopyImageRow,
-    slot: u32,
-    filter_set: &HashSet<String>,
-    type_dict: &FieldDictionary,
-    availability_dict: &FieldDictionary,
-    blocked_for_dict: &FieldDictionary,
-    filter_maps: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
-) {
-    if filter_set.contains("nsfwLevel") {
-        insert_filter(filter_maps, "nsfwLevel", row.nsfw_level as u64, slot);
-    }
-    if filter_set.contains("userId") {
-        insert_filter(filter_maps, "userId", row.user_id as u64, slot);
-    }
-    if filter_set.contains("type") {
-        let key = type_dict.get_or_insert(&row.image_type) as u64;
-        insert_filter(filter_maps, "type", key, slot);
-    }
-    if filter_set.contains("availability") {
-        let key = availability_dict.get_or_insert(&row.availability) as u64;
-        insert_filter(filter_maps, "availability", key, slot);
-    }
-    if filter_set.contains("blockedFor") && row.blocked_for.is_some() {
-        let key = blocked_for_dict.get_or_insert(row.blocked_for.as_deref().unwrap()) as u64;
-        insert_filter(filter_maps, "blockedFor", key, slot);
-    }
-    if filter_set.contains("postId") {
-        insert_filter(
-            filter_maps,
-            "postId",
-            row.post_id.unwrap_or(0) as u64,
-            slot,
-        );
-    }
-    if filter_set.contains("postedToId") {
-        insert_filter(
-            filter_maps,
-            "postedToId",
-            row.posted_to_id.unwrap_or(0) as u64,
-            slot,
-        );
-    }
-    if filter_set.contains("hasMeta") {
-        insert_filter(
-            filter_maps,
-            "hasMeta",
-            if row.has_meta() { 1 } else { 0 },
-            slot,
-        );
-    }
-    if filter_set.contains("onSite") {
-        insert_filter(
-            filter_maps,
-            "onSite",
-            if row.on_site() { 1 } else { 0 },
-            slot,
-        );
-    }
-    if filter_set.contains("poi") {
-        insert_filter(
-            filter_maps,
-            "poi",
-            if row.poi() { 1 } else { 0 },
-            slot,
-        );
-    }
-    if filter_set.contains("minor") {
-        insert_filter(
-            filter_maps,
-            "minor",
-            if row.minor() { 1 } else { 0 },
-            slot,
-        );
-    }
-    if filter_set.contains("isPublished") {
-        let published = row.published_at_secs.unwrap_or(0) > 0;
-        insert_filter(
-            filter_maps,
-            "isPublished",
-            if published { 1 } else { 0 },
-            slot,
-        );
-    }
-    if filter_set.contains("isRemix") {
-        insert_filter(filter_maps, "isRemix", 0, slot);
-    }
-}
-
-/// Build sort bitmaps for a single image row.
-fn build_image_sort_bitmaps(
-    row: &super::copy_queries::CopyImageRow,
-    slot: u32,
-    sort_bits: &HashMap<String, u8>,
-    sort_maps: &mut HashMap<String, HashMap<usize, RoaringBitmap>>,
-) {
-    if let Some(&bits) = sort_bits.get("sortAt") {
-        let sort_at = row.sort_at_secs() as u32;
-        insert_sort_bits(sort_maps, "sortAt", sort_at, bits, slot);
-    }
-    if let Some(&bits) = sort_bits.get("publishedAt") {
-        let pub_secs = row.published_at_secs.unwrap_or(0) as u32;
-        insert_sort_bits(sort_maps, "publishedAt", pub_secs, bits, slot);
-    }
-    if let Some(&bits) = sort_bits.get("id") {
-        insert_sort_bits(sort_maps, "id", slot, bits, slot);
-    }
-}
-
-/// Append docstore tuples for all image scalar fields.
-fn append_image_docstore_tuples(
-    row: &super::copy_queries::CopyImageRow,
-    slot: u32,
-    bulk_writer: &Arc<crate::docstore::BulkWriter>,
-) {
-    let field_idx = bulk_writer.field_to_idx();
-
-    // Helper macros wrapping values in PackedValue for correct V2 docstore encoding
-    macro_rules! append_int {
-        ($name:expr, $value:expr) => {
-            if let Some(&fidx) = field_idx.get($name) {
-                let value = rmp_serde::to_vec(&PackedValue::I($value as i64)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &value);
-            }
-        };
-    }
-    macro_rules! append_str {
-        ($name:expr, $value:expr) => {
-            if let Some(&fidx) = field_idx.get($name) {
-                let value = rmp_serde::to_vec(&PackedValue::S($value.to_string())).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &value);
-            }
-        };
-    }
-    macro_rules! append_bool {
-        ($name:expr, $value:expr) => {
-            if let Some(&fidx) = field_idx.get($name) {
-                let value = rmp_serde::to_vec(&PackedValue::B($value)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &value);
-            }
-        };
-    }
-
-    append_int!("id", row.id);
-    append_int!("nsfwLevel", row.nsfw_level);
-    append_int!("userId", row.user_id);
-    append_str!("type", row.image_type);
-    append_int!("postId", row.post_id.unwrap_or(0));
-    append_int!("postedToId", row.posted_to_id.unwrap_or(0));
-    append_str!("availability", row.availability);
-    append_bool!("hasMeta", row.has_meta());
-    append_bool!("onSite", row.on_site());
-    append_bool!("poi", row.poi());
-    append_bool!("minor", row.minor());
-
-    // Sort fields
-    let sort_at = row.sort_at_secs() as i64;
-    append_int!("sortAt", sort_at);
-    let published_at_secs = row.published_at_secs.unwrap_or(0);
-    append_int!("publishedAt", published_at_secs);
-
-    // isPublished
-    let published = row.published_at_secs.unwrap_or(0) > 0;
-    append_bool!("isPublished", published);
-
-    // Blocked
-    if let Some(ref bf) = row.blocked_for {
-        append_str!("blockedFor", bf);
-    }
-
-    // URL and hash
-    if let Some(ref url) = row.url {
-        append_str!("url", url);
-    }
-    if let Some(ref hash) = row.hash {
-        append_str!("hash", hash);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,62 +1286,6 @@ fn save_sort_field_to_disk(
     }
     fs.write_sort_layers(field_name, &layers)
         .map_err(|e| format!("write_sort_layers({field_name}): {e}"))
-}
-
-// ---------------------------------------------------------------------------
-// String map resolution helpers
-// ---------------------------------------------------------------------------
-
-fn resolve_type_key(image_type: &str, schema: &crate::config::DataSchema) -> u64 {
-    schema
-        .fields
-        .iter()
-        .find(|f| f.target == "type")
-        .and_then(|f| f.string_map.as_ref())
-        .and_then(|map| {
-            map.get(&image_type.to_lowercase())
-                .or_else(|| map.get(image_type))
-                .copied()
-        })
-        .unwrap_or(0) as u64
-}
-
-fn resolve_availability_key(availability: &str, schema: &crate::config::DataSchema) -> u64 {
-    schema
-        .fields
-        .iter()
-        .find(|f| f.target == "availability")
-        .and_then(|f| f.string_map.as_ref())
-        .and_then(|map| {
-            map.get(&availability.to_lowercase())
-                .or_else(|| map.get(availability))
-                .copied()
-        })
-        .unwrap_or(0) as u64
-}
-
-fn resolve_blocked_for_key(schema: &crate::config::DataSchema) -> u64 {
-    schema
-        .fields
-        .iter()
-        .find(|f| f.target == "blockedFor")
-        .and_then(|f| f.string_map.as_ref())
-        .and_then(|map| map.get("blocked").or_else(|| map.values().next()).copied())
-        .unwrap_or(1) as u64
-}
-
-fn resolve_base_model_key_str(base_model: &str, schema: &crate::config::DataSchema) -> u64 {
-    schema
-        .fields
-        .iter()
-        .find(|f| f.target == "baseModel")
-        .and_then(|f| f.string_map.as_ref())
-        .and_then(|map| {
-            map.get(&base_model.to_lowercase())
-                .or_else(|| map.get(base_model))
-                .copied()
-        })
-        .unwrap_or(0) as u64
 }
 
 // ---------------------------------------------------------------------------

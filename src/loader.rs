@@ -741,7 +741,7 @@ fn json_to_stored_doc(json: &serde_json::Value, schema: &DataSchema) -> StoredDo
             }
         };
 
-        if let Some(fv) = convert_field(raw, mapping, apply_ms) {
+        if let Some(fv) = crate::field_mapper::map_field(raw, mapping, apply_ms, None) {
             fields.insert(mapping.target.clone(), fv);
         }
     }
@@ -815,7 +815,7 @@ pub fn json_to_document_with_dicts(
                 _ => {
                     if let Some(ref dv) = mapping.default_value {
                         let dict = dictionaries.and_then(|d| d.get(&mapping.target));
-                        if let Some(fv) = convert_field_with_dict(dv, mapping, false, dict) {
+                        if let Some(fv) = crate::field_mapper::map_field(dv, mapping, false, dict) {
                             fields.insert(mapping.target.clone(), fv);
                         }
                     } else if !mapping.doc_only {
@@ -830,7 +830,7 @@ pub fn json_to_document_with_dicts(
         }
 
         let dict = dictionaries.and_then(|d| d.get(&mapping.target));
-        if let Some(fv) = convert_field_with_dict(raw, mapping, apply_ms, dict) {
+        if let Some(fv) = crate::field_mapper::map_field(raw, mapping, apply_ms, dict) {
             fields.insert(mapping.target.clone(), fv);
         }
     }
@@ -838,88 +838,6 @@ pub fn json_to_document_with_dicts(
     Ok((slot, Document { fields }))
 }
 
-/// Convert a raw serde_json Value field to a FieldValue.
-#[allow(dead_code)] // Used by test helpers
-fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping, ms_to_seconds: bool) -> Option<FieldValue> {
-    convert_field_with_dict(raw, mapping, ms_to_seconds, None)
-}
-
-/// Convert a raw serde_json Value field to a FieldValue, with optional dictionary.
-pub fn convert_field_with_dict(
-    raw: &serde_json::Value,
-    mapping: &FieldMapping,
-    ms_to_seconds: bool,
-    dictionary: Option<&FieldDictionary>,
-) -> Option<FieldValue> {
-    match mapping.value_type {
-        FieldValueType::Integer => {
-            let n = if let Some(n) = raw.as_i64() {
-                n
-            } else if let Some(n) = raw.as_u64() {
-                n as i64
-            } else if let Some(n) = raw.as_f64() {
-                n as i64
-            } else {
-                return None;
-            };
-            let n = if ms_to_seconds {
-                ((n / 1000) as u32) as i64
-            } else {
-                n
-            };
-            Some(FieldValue::Single(Value::Integer(n)))
-        }
-        FieldValueType::Boolean => {
-            let b = raw.as_bool()?;
-            Some(FieldValue::Single(Value::Bool(b)))
-        }
-        FieldValueType::String => {
-            let s = raw.as_str()?;
-            Some(FieldValue::Single(Value::String(s.to_string())))
-        }
-        FieldValueType::MappedString => {
-            let s = raw.as_str()?;
-            let map = mapping.string_map.as_ref()?;
-            let lookup = if mapping.case_sensitive {
-                std::borrow::Cow::Borrowed(s)
-            } else {
-                std::borrow::Cow::Owned(s.to_lowercase())
-            };
-            let n = map.get(lookup.as_ref()).copied().unwrap_or(0);
-            Some(FieldValue::Single(Value::Integer(n)))
-        }
-        FieldValueType::LowCardinalityString => {
-            let s = raw.as_str()?;
-            if let Some(dict) = dictionary {
-                let n = dict.get_or_insert(s);
-                Some(FieldValue::Single(Value::Integer(n)))
-            } else {
-                // Without a dictionary, store as 0 (unknown)
-                Some(FieldValue::Single(Value::Integer(0)))
-            }
-        }
-        FieldValueType::IntegerArray => {
-            let arr = raw.as_array()?;
-            if arr.is_empty() {
-                return None;
-            }
-            let values: Vec<Value> = arr
-                .iter()
-                .filter_map(|v| {
-                    v.as_i64()
-                        .or_else(|| v.as_u64().map(|n| n as i64))
-                        .map(Value::Integer)
-                })
-                .collect();
-            if values.is_empty() {
-                None
-            } else {
-                Some(FieldValue::Multi(values))
-            }
-        }
-        FieldValueType::ExistsBoolean => Some(FieldValue::Single(Value::Bool(true))),
-    }
-}
 
 fn memrchr_newline(data: &[u8]) -> Option<usize> {
     data.iter().rposition(|&b| b == b'\n')

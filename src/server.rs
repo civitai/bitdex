@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -349,6 +349,9 @@ struct CreateIndexRequest {
 #[derive(Deserialize)]
 struct LoadRequest {
     path: String,
+    /// Load format: "ndjson" (default) or "csv" (requires pg-sync feature).
+    #[serde(default = "default_load_format")]
+    format: String,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default = "default_threads")]
@@ -361,6 +364,10 @@ struct LoadRequest {
     max_writer_threads: usize,
     #[serde(default)]
     save_snapshot: bool,
+}
+
+fn default_load_format() -> String {
+    "ndjson".to_string()
 }
 
 fn default_threads() -> usize {
@@ -520,6 +527,8 @@ fn format_document(
         // Look up by target name first (outbox/PATCH path stores under target,
         // value already converted), then source name (bulk loader stores under
         // source, value is raw and may need ms_to_seconds conversion).
+        // DEPRECATED: the source-name fallback exists for docs written before the
+        // unified field mapper stored under target names. Remove after a full re-index.
         let (fv_opt, from_source) = if let Some(fv) = doc.fields.get(&mapping.target) {
             (Some(fv), false)
         } else if let Some(fv) = doc.fields.get(&mapping.source) {
@@ -1599,12 +1608,12 @@ async fn handle_load(
     AxumPath(name): AxumPath<String>,
     Json(req): Json<LoadRequest>,
 ) -> impl IntoResponse {
-    let (engine, schema, tasks) = {
+    let (engine, definition, tasks) = {
         let guard = state.index.lock();
         match guard.as_ref() {
             Some(idx) if idx.definition.name == name => (
                 Arc::clone(&idx.engine),
-                idx.definition.data_schema.clone(),
+                idx.definition.clone(),
                 Arc::clone(&idx.tasks),
             ),
             _ => {
@@ -1621,6 +1630,22 @@ async fn handle_load(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("File not found: {}", req.path)})),
+        ).into_response();
+    }
+
+    let format = req.format.clone();
+    if format != "ndjson" && format != "csv" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unsupported format '{}'. Use 'ndjson' or 'csv'.", format)})),
+        ).into_response();
+    }
+
+    #[cfg(not(feature = "pg-sync"))]
+    if format == "csv" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "CSV loading requires the 'pg-sync' feature"})),
         ).into_response();
     }
 
@@ -1643,52 +1668,21 @@ async fn handle_load(
     let docstore_batch_size = req.docstore_batch_size;
     let max_writer_threads = req.max_writer_threads;
     let save_snapshot = req.save_snapshot;
+    let schema = definition.data_schema.clone();
 
     // Spawn blocking loading task with TaskGuard for panic safety
     let tasks_clone = Arc::clone(&tasks);
     tokio::task::spawn_blocking(move || {
         let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
 
-        // Enter loading mode
-        engine.enter_loading_mode();
-
-        match loader::load_ndjson(&engine, &schema, &path, limit, threads, chunk_size, docstore_batch_size, max_writer_threads, progress.clone()) {
-            Ok(stats) => {
-                let alive;
-
-                if save_snapshot {
-                    // Combined exit-loading + save + unload: saves directly from
-                    // staging without an intermediate full publish, eliminating the
-                    // memory spike from staging.clone() at scale.
-                    guard.tasks.set_saving(task_id);
-
-                    let snap_start = Instant::now();
-                    if let Err(e) = engine.exit_loading_mode_and_save_unload() {
-                        eprintln!("Warning: failed to exit_loading_mode_and_save_unload: {e}");
-                    } else {
-                        eprintln!("exit_loading_mode_and_save_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
-                    }
-                    // Alive bitmap is always preserved during unload
-                    alive = engine.alive_count();
-                } else {
-                    // Just exit loading mode — no save needed
-                    engine.exit_loading_mode();
-                    alive = engine.alive_count();
-                }
-
-                eprintln!("Load complete: {} records alive", alive);
-
-                guard.tasks.set_complete(task_id, Some(serde_json::json!({
-                    "records_loaded": stats.records_loaded,
-                    "elapsed_secs": stats.elapsed.as_secs_f64(),
-                })));
-                guard.defuse();
-            }
-            Err(e) => {
-                engine.exit_loading_mode();
-                guard.tasks.set_error(task_id, e.to_string());
-                guard.defuse();
-            }
+        if format == "csv" {
+            handle_load_csv(&engine, &definition, &path, save_snapshot, task_id, &mut guard);
+        } else {
+            handle_load_ndjson(
+                &engine, &schema, &path, limit, threads, chunk_size,
+                docstore_batch_size, max_writer_threads, save_snapshot,
+                task_id, progress, &mut guard,
+            );
         }
     });
 
@@ -1696,6 +1690,124 @@ async fn handle_load(
         StatusCode::ACCEPTED,
         Json(serde_json::json!({"task_id": task_id})),
     ).into_response()
+}
+
+/// NDJSON load path — enters loading mode, calls loader::load_ndjson.
+fn handle_load_ndjson(
+    engine: &Arc<ConcurrentEngine>,
+    schema: &DataSchema,
+    path: &Path,
+    limit: Option<usize>,
+    threads: usize,
+    chunk_size: usize,
+    docstore_batch_size: usize,
+    max_writer_threads: usize,
+    save_snapshot: bool,
+    task_id: TaskId,
+    progress: Arc<AtomicU64>,
+    guard: &mut TaskGuard,
+) {
+    engine.enter_loading_mode();
+
+    match loader::load_ndjson(engine, schema, path, limit, threads, chunk_size, docstore_batch_size, max_writer_threads, progress) {
+        Ok(stats) => {
+            let alive;
+
+            if save_snapshot {
+                guard.tasks.set_saving(task_id);
+
+                let snap_start = Instant::now();
+                if let Err(e) = engine.exit_loading_mode_and_save_unload() {
+                    eprintln!("Warning: failed to exit_loading_mode_and_save_unload: {e}");
+                } else {
+                    eprintln!("exit_loading_mode_and_save_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
+                }
+                alive = engine.alive_count();
+            } else {
+                engine.exit_loading_mode();
+                alive = engine.alive_count();
+            }
+
+            eprintln!("Load complete: {} records alive", alive);
+
+            guard.tasks.set_complete(task_id, Some(serde_json::json!({
+                "records_loaded": stats.records_loaded,
+                "elapsed_secs": stats.elapsed.as_secs_f64(),
+            })));
+            guard.defuse();
+        }
+        Err(e) => {
+            engine.exit_loading_mode();
+            guard.tasks.set_error(task_id, e.to_string());
+            guard.defuse();
+        }
+    }
+}
+
+/// CSV load path — calls run_single_pass_v2 which writes directly to BitmapFs.
+#[cfg(feature = "pg-sync")]
+fn handle_load_csv(
+    engine: &Arc<ConcurrentEngine>,
+    definition: &IndexDefinition,
+    stage_dir: &Path,
+    save_snapshot: bool,
+    task_id: TaskId,
+    guard: &mut TaskGuard,
+) {
+    use crate::pg_sync::progress::LoadProgress;
+    use crate::pg_sync::single_pass::run_single_pass_v2;
+
+    // Build a pg_sync IndexDefinition from the server's IndexDefinition
+    let pg_index_def = crate::pg_sync::config::IndexDefinition {
+        name: definition.name.clone(),
+        config: definition.config.clone(),
+        data_schema: definition.data_schema.clone(),
+    };
+
+    let progress = Arc::new(LoadProgress::new());
+    eprintln!("Starting CSV bulk load from {}", stage_dir.display());
+
+    match run_single_pass_v2(engine, &pg_index_def, stage_dir, progress) {
+        Ok(stats) => {
+            if save_snapshot {
+                guard.tasks.set_saving(task_id);
+                // CSV path writes directly to BitmapFs — no loading mode needed.
+                // Reload existence sets so lazy loading picks up new data.
+                let config = engine.config();
+                for ff in &config.filter_fields {
+                    if ff.field_type == crate::config::FilterFieldType::MultiValue {
+                        let _ = engine.reload_existence_set(&ff.name);
+                    }
+                }
+            }
+
+            let alive = engine.alive_count();
+            eprintln!("CSV load complete: {} records, {} alive", stats.records_loaded, alive);
+
+            guard.tasks.set_complete(task_id, Some(serde_json::json!({
+                "records_loaded": stats.records_loaded,
+                "elapsed_secs": stats.elapsed.as_secs_f64(),
+            })));
+            guard.defuse();
+        }
+        Err(e) => {
+            guard.tasks.set_error(task_id, e);
+            guard.defuse();
+        }
+    }
+}
+
+#[cfg(not(feature = "pg-sync"))]
+fn handle_load_csv(
+    _engine: &Arc<ConcurrentEngine>,
+    _definition: &IndexDefinition,
+    _stage_dir: &Path,
+    _save_snapshot: bool,
+    task_id: TaskId,
+    guard: &mut TaskGuard,
+) {
+    guard.tasks.set_error(task_id, "CSV loading requires the 'pg-sync' feature".to_string());
+    guard.defuse();
 }
 
 // ---------------------------------------------------------------------------
