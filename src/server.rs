@@ -517,10 +517,16 @@ fn format_document(
             IncludeDocs::None => continue,
         }
 
-        // Look up by target name first (outbox/PATCH path), then source name
-        // (single_pass bulk loader writes tuples under source field names).
-        let fv_opt = doc.fields.get(&mapping.target)
-            .or_else(|| doc.fields.get(&mapping.source));
+        // Look up by target name first (outbox/PATCH path stores under target,
+        // value already converted), then source name (bulk loader stores under
+        // source, value is raw and may need ms_to_seconds conversion).
+        let (fv_opt, from_source) = if let Some(fv) = doc.fields.get(&mapping.target) {
+            (Some(fv), false)
+        } else if let Some(fv) = doc.fields.get(&mapping.source) {
+            (Some(fv), true)
+        } else {
+            (None, false)
+        };
 
         let value = if let Some(fv) = fv_opt {
             // Reverse-map MappedString / LowCardinalityString fields from integer back to string
@@ -535,8 +541,9 @@ fn format_document(
             } else {
                 field_value_to_json(fv)
             };
-            // Apply ms_to_seconds transformation if configured
-            if mapping.should_convert_ms() {
+            // Apply ms_to_seconds only when the value came from the source name
+            // (raw ms). Target-name values were already converted during encoding.
+            if from_source && mapping.should_convert_ms() {
                 if let serde_json::Value::Number(n) = &raw {
                     if let Some(ms) = n.as_i64() {
                         serde_json::json!(ms / 1000)
@@ -3395,17 +3402,18 @@ mod tests {
             default_value: None,
         }]);
 
-        // Doc has field under TARGET name (outbox path)
+        // Doc has field under TARGET name (outbox/PATCH path).
+        // Value is already in seconds (ms_to_seconds was applied during encoding).
         let doc = make_stored_doc(vec![
             ("id", FieldValue::Single(Value::Integer(42))),
-            ("publishedAt", FieldValue::Single(Value::Integer(1487255090000))),
+            ("publishedAt", FieldValue::Single(Value::Integer(1487255090))),
         ]);
 
         let result = format_document(
             &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
         );
 
-        // Target name lookup preferred, ms_to_seconds applied
+        // Target name: value already converted, no ms_to_seconds applied
         assert_eq!(result["publishedAt"], serde_json::json!(1487255090));
     }
 
