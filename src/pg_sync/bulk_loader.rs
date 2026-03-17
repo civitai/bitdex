@@ -1099,12 +1099,14 @@ fn scalars_to_json(
         "commentCount": 0i64,
         "collectedCount": 0i64,
         "sortAt": s.sort_at as i64,
-        "sortAtUnix": s.sort_at as i64 * 1000,
-        "publishedAtUnix": s.published_at_ms as i64,
-        "existedAtUnix": 0i64,
+        "publishedAt": (s.published_at_ms / 1000) as i64,
     });
 
     if let Some(obj) = doc.as_object_mut() {
+        // Exists-boolean: isPublished = publishedAt is non-zero (matches outbox row_assembler)
+        if s.published_at_ms > 0 {
+            obj.insert("isPublished".into(), serde_json::json!(true));
+        }
         if s.has_meta {
             obj.insert("hasMeta".into(), serde_json::json!(true));
         }

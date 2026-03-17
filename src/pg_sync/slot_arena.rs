@@ -841,13 +841,14 @@ fn slot_data_to_json(slot: &SlotData) -> serde_json::Value {
         "commentCount": slot.comment_count as i64,
         "collectedCount": slot.collected_count as i64,
         "sortAt": slot.sort_at as i64,
-        "sortAtUnix": slot.sort_at as i64 * 1000, // seconds → ms for doc field
-        "publishedAtUnix": slot.published_at_unix as i64,
-        "existedAtUnix": 0i64, // not tracked in slot — acceptable for bulk load
+        "publishedAt": (slot.published_at_unix / 1000) as i64,
     });
 
-    // Exists-boolean fields
     if let Some(obj) = doc.as_object_mut() {
+        // Exists-boolean: isPublished = publishedAt is non-zero (matches outbox row_assembler)
+        if slot.published_at_unix > 0 {
+            obj.insert("isPublished".into(), serde_json::json!(true));
+        }
         if slot.has_meta {
             obj.insert("hasMeta".into(), serde_json::json!(true));
         }
