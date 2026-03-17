@@ -14,7 +14,7 @@ use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
-use axum::routing::{get, patch, post, delete};
+use axum::routing::{get, patch, post, put, delete};
 use axum::Router;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -866,6 +866,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/fields", post(handle_add_fields).delete(handle_remove_fields))
             .route("/api/indexes/{name}/fields/{field}/reload", post(handle_reload_field))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
+            .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
             .with_state(Arc::clone(&state));
 
@@ -3061,6 +3062,48 @@ async fn handle_get_cursor(
             Json(serde_json::json!({"error": format!("Cursor '{}' not found", cursor_name)})),
         ).into_response(),
     }
+}
+
+async fn handle_set_cursor(
+    State(state): State<SharedState>,
+    AxumPath((name, cursor_name)): AxumPath<(String, String)>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let value = match req.get("value").and_then(|v| v.as_str()) {
+        Some(v) => v.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing 'value' field"})),
+            ).into_response();
+        }
+    };
+
+    engine.set_cursor(cursor_name.clone(), value.clone());
+
+    // Force persist to disk so the value survives restarts
+    if let Err(e) = engine.save_snapshot() {
+        eprintln!("Warning: cursor set but snapshot save failed: {e}");
+    }
+
+    Json(serde_json::json!({
+        "name": cursor_name,
+        "value": value,
+        "persisted": true,
+    })).into_response()
 }
 
 async fn handle_list_cursors(
