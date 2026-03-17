@@ -217,3 +217,144 @@ AFTER:
   format_document()                   — simplified
     just reads target names, no fallback, no conditional conversion
 ```
+
+---
+
+## Refined System
+
+```
+<bitdex-server>
+
+  <shared core>
+    <field_mapper>                                     ← ONE implementation
+      map_raw_to_target(source_name, raw_value, schema)
+        resolve source → target name
+        apply type conversion (ms_to_seconds, ExistsBoolean, MappedString, LCS)
+        return (target_name, FieldValue, filter_only, doc_only)
+
+    <ingester — generic over BitmapSink>               ← ALREADY EXISTS, now used everywhere
+      filter_insert(field, value, slot)
+      sort_set(field, bit_layer, slot)
+      alive_insert(slot)
+      doc_append(slot, field_idx, value)
+      flush()
+
+    <sinks>
+      AccumSink                                        ← bulk: collect into HashMap, no diff
+      CoalescerSink                                    ← online: send ops to flush thread
+
+    <BitmapFs>                                         ← unchanged
+      save_filter_field_to_disk
+      save_sort_field_to_disk
+      reload_existence_set
+
+  <endpoints>
+
+    <POST /load>                                       ← NEW (replaces pg-sync load binary)
+      parse LoadRequest (format, sources, columns)
+      spawn blocking task
+      for each source:
+        <source adapter>
+          csv_two_column(path, field)                   ← tags, tools, techniques, collections
+          csv_entity(path, enrichment_paths)             ← images + post/resource/model enrichment
+          csv_metrics(path)                              ← ClickHouse sort fields
+        <rayon workers>
+          mmap file, split into chunks
+          each worker:
+            parse line → raw fields                     ← source adapter does this
+            map_raw_to_target(raw, schema)              ← SHARED MAPPER
+            ingester.filter_insert / sort_set / alive   ← SHARED INGESTER w/ AccumSink
+            ingester.doc_append (unless filter_only)
+        <after rayon join>
+          save_filter_field_to_disk(AccumSink.maps)
+          save_sort_field_to_disk(AccumSink.sorts)
+          save alive bitmap
+          reload_existence_set
+      mark task complete
+
+    <POST /documents/upsert>                           ← simplified
+      parse JSON body
+      for each field in JSON:
+        map_raw_to_target(field, value, schema)         ← SHARED MAPPER
+      build Document (all target names, converted)
+      engine.put(slot, doc)
+        read old doc → diff → MutationOps              ← diff uses target names (match)
+        ingester w/ CoalescerSink                       ← SHARED INGESTER
+        write doc to DocStore
+
+    <PATCH /documents/patch>                           ← simplified
+      parse partial JSON body
+      for each provided field:
+        map_raw_to_target(field, value, schema)         ← SHARED MAPPER
+      engine.patch_document(slot, doc)
+        if not alive → put_inner (same as upsert)
+        read old doc → partial diff
+        ingester w/ CoalescerSink                       ← SHARED INGESTER
+        merge into stored doc
+
+    <POST /documents/filter-sync>                      ← unchanged
+      engine.sync_filter_values(slot, field, values)
+
+    <DELETE /documents>                                ← unchanged
+      engine.delete(slot)
+
+    <GET /query?include_docs=true>
+      format_document()                                ← SIMPLIFIED
+        for each schema.field:
+          doc.fields.get(mapping.target)                ← just target name, no fallback
+          field_value_to_json(fv)                       ← no ms_to_seconds, no from_source
+          or default_json_for_field(mapping)
+
+  <engine internals>                                   ← unchanged
+    <flush thread>
+      drain coalescer channel
+      apply mutations to staging
+      cache maintenance
+      ArcSwap publish
+    <lazy loading>
+      ensure_fields_loaded from BitmapFs
+    <DocStore V2>
+      append-only tuple logs
+
+
+<pg-sync sync — SIDECAR>                               ← simplified, sync-only
+  <outbox poller>
+    poll BitdexOutbox
+    deduplicate
+    fetch full doc from PG
+    assemble_document()                                ← USES SHARED MAPPER
+      for each PG row field:
+        map_raw_to_target(source, value, schema)        ← same mapper as everything else
+      build JSON with target names
+    PATCH to BitDex server                             ← flows through PATCH endpoint above
+    filter_sync for filter_only fields
+
+  <metrics poller>                                     ← unchanged
+    fetch from ClickHouse
+    PATCH sort values to server
+
+
+NO LONGER EXISTS:
+  ✗ pg-sync load binary
+  ✗ single_pass standalone entry point
+  ✗ Standalone K8s loader Job
+  ✗ Auto-backfill in pg-sync
+  ✗ Hardcoded field mapping in single_pass
+  ✗ Manual JSON assembly in row_assembler
+  ✗ format_document source-name fallback
+  ✗ format_document from_source conditional conversion
+```
+
+## Side-by-Side: Duplication Eliminated
+
+```
+                        BEFORE                          AFTER
+
+Field mapping:          4 implementations               1 (map_raw_to_target)
+Type conversion:        3 implementations               1 (inside map_raw_to_target)
+Bitmap insertion:       2 paths (direct + coalescer)    1 trait (Ingester<BitmapSink>)
+Doc serving:            complex (fallback + conditional) simple (read target, return)
+Loader entry points:    2 (CLI binary + HTTP NDJSON)    1 (POST /load)
+Processes that load:    2 (pg-sync load + server)       1 (server only)
+Field name source:      mixed (source + target)         target only (everywhere)
+```
