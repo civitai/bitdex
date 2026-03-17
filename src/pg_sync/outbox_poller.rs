@@ -216,7 +216,7 @@ async fn fetch_and_push_upserts(
             coll_map.entry(id).or_default();
         }
         for c in &collections {
-            coll_map.entry(c.image_id).or_default().push(c.collection_id);
+            coll_map.entry(c.image_id as i64).or_default().push(c.collection_id as i64);
         }
         let mut entries: Vec<(i64, Vec<i64>)> = coll_map.into_iter().collect();
         entries.sort_by_key(|(id, _)| *id); // Deterministic ordering for debugging

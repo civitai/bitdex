@@ -620,9 +620,9 @@ pub struct StreamCollectionRow {
 }
 
 /// Get max collection ID for range iteration.
-pub async fn get_max_collection_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
-        r#"SELECT COALESCE(MAX("collectionId")::int8, 0) FROM "CollectionItem" WHERE "imageId" IS NOT NULL"#,
+pub async fn get_max_collection_id(pool: &PgPool) -> Result<i32, sqlx::Error> {
+    let row: (i32,) = sqlx::query_as(
+        r#"SELECT COALESCE(MAX("collectionId"), 0) FROM "CollectionItem" WHERE "imageId" IS NOT NULL"#,
     )
     .fetch_one(pool)
     .await?;
@@ -633,8 +633,8 @@ pub async fn get_max_collection_id(pool: &PgPool) -> Result<i64, sqlx::Error> {
 /// Filters on imageId IS NOT NULL (image collections only) and status = 'ACCEPTED'.
 pub async fn fetch_collections_by_range(
     pool: &PgPool,
-    start: i64,
-    end: i64,
+    start: i32,
+    end: i32,
 ) -> Result<Vec<StreamCollectionRow>, sqlx::Error> {
     sqlx::query_as::<_, StreamCollectionRow>(
         r#"SELECT "collectionId", "imageId" FROM "CollectionItem"
