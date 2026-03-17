@@ -211,6 +211,16 @@ pub struct ConcurrentEngine {
     flush_duration_nanos: Arc<AtomicU64>,
     /// Flush loop stats: most recent flush duration in nanoseconds.
     flush_last_duration_nanos: Arc<AtomicU64>,
+    /// Flush phase timing: last apply_prepared duration in nanoseconds.
+    flush_apply_nanos: Arc<AtomicU64>,
+    /// Flush phase timing: last cache maintenance duration in nanoseconds.
+    flush_cache_nanos: Arc<AtomicU64>,
+    /// Flush phase timing: last staging.clone() + ArcSwap publish duration in nanoseconds.
+    flush_publish_nanos: Arc<AtomicU64>,
+    /// Flush phase timing: last time bucket maintenance duration in nanoseconds.
+    flush_timebucket_nanos: Arc<AtomicU64>,
+    /// Flush phase timing: last diff compaction duration in nanoseconds.
+    flush_compact_nanos: Arc<AtomicU64>,
     /// Named cursors: opaque key-value pairs persisted at checkpoint time.
     /// Callers (e.g. pg-sync sidecars) use these to track replication progress.
     cursors: Arc<parking_lot::Mutex<HashMap<String, String>>>,
@@ -743,6 +753,11 @@ impl ConcurrentEngine {
         let flush_publish_count = Arc::new(AtomicU64::new(0));
         let flush_duration_nanos = Arc::new(AtomicU64::new(0));
         let flush_last_duration_nanos = Arc::new(AtomicU64::new(0));
+        let flush_apply_nanos = Arc::new(AtomicU64::new(0));
+        let flush_cache_nanos = Arc::new(AtomicU64::new(0));
+        let flush_publish_nanos = Arc::new(AtomicU64::new(0));
+        let flush_timebucket_nanos = Arc::new(AtomicU64::new(0));
+        let flush_compact_nanos = Arc::new(AtomicU64::new(0));
 
         // BoundStore operational counters (defined before flush/merge threads)
         let boundstore_shard_loads = Arc::new(AtomicU64::new(0));
@@ -786,6 +801,11 @@ impl ConcurrentEngine {
                 flush_publish_count,
                 flush_duration_nanos,
                 flush_last_duration_nanos,
+                flush_apply_nanos,
+                flush_cache_nanos,
+                flush_publish_nanos,
+                flush_timebucket_nanos,
+                flush_compact_nanos,
                 cursors,
                 existing_keys,
                 eviction_stamps,
@@ -817,6 +837,11 @@ impl ConcurrentEngine {
             let flush_pub_count = Arc::clone(&flush_publish_count);
             let flush_dur_nanos = Arc::clone(&flush_duration_nanos);
             let flush_last_dur_nanos = Arc::clone(&flush_last_duration_nanos);
+            let flush_apply_ns = Arc::clone(&flush_apply_nanos);
+            let flush_cache_ns = Arc::clone(&flush_cache_nanos);
+            let flush_publish_ns = Arc::clone(&flush_publish_nanos);
+            let flush_timebucket_ns = Arc::clone(&flush_timebucket_nanos);
+            let flush_compact_ns = Arc::clone(&flush_compact_nanos);
             let flush_existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> =
                 existing_keys.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
             let flush_eviction_stamps = Arc::clone(&eviction_stamps);
@@ -893,11 +918,13 @@ impl ConcurrentEngine {
                     if bitmap_count > 0 {
                         staging_dirty = true;
                         flush_dirty_flag.store(true, Ordering::Release);
+                        let t_apply = Instant::now();
                         coalescer.apply_prepared(
                             &mut staging.slots,
                             &mut staging.filters,
                             &mut staging.sorts,
                         );
+                        flush_apply_ns.store(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                         // Persist deferred map when new deferred entries are added.
                         if coalescer.has_deferred_alive() {
@@ -930,6 +957,7 @@ impl ConcurrentEngine {
                         if !flush_loading_mode.load(Ordering::Relaxed) {
                             // Live maintenance for time buckets: add newly-alive slots to
                             // qualifying buckets, remove deleted slots from all buckets.
+                            let t_tb = Instant::now();
                             if let Some(ref tb_arc) = flush_time_buckets {
                                 let alive_inserts = coalescer.alive_inserts();
                                 let alive_removes = coalescer.alive_removes();
@@ -953,9 +981,11 @@ impl ConcurrentEngine {
                                     }
                                 }
                             }
+                            flush_timebucket_ns.store(t_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                             // Unified cache live maintenance.
                             // Runs after bitmap mutations are applied to staging.
+                            let t_cache = Instant::now();
                             {
                                 let mut uc = flush_unified_cache.lock();
                                 if !uc.is_empty() {
@@ -1028,21 +1058,26 @@ impl ConcurrentEngine {
                                     }
                                 }
                             }
+                            flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                             // Periodic filter diff compaction: merge dirty diffs into
                             // bases so apply_diff/fused don't accumulate unbounded diffs.
                             // Runs every COMPACTION_INTERVAL flush cycles (~5s).
                             // Sort diffs and alive are already merged eagerly in WriteBatch::apply().
+                            let t_compact = Instant::now();
                             if flush_cycle % COMPACTION_INTERVAL == 0 {
                                 for (_name, field) in staging.filters.fields_mut() {
                                     field.merge_dirty();
                                 }
                             }
+                            flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             flush_cycle += 1;
                             flush_cycle_clone.store(flush_cycle, Ordering::Relaxed);
 
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
+                            let t_publish = Instant::now();
                             inner.store(Arc::new(staging.clone()));
+                            flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             staging_dirty = false;
 
                             // Record flush stats for Prometheus
@@ -2051,6 +2086,11 @@ impl ConcurrentEngine {
             flush_publish_count,
             flush_duration_nanos,
             flush_last_duration_nanos,
+            flush_apply_nanos,
+            flush_cache_nanos,
+            flush_publish_nanos,
+            flush_timebucket_nanos,
+            flush_compact_nanos,
             cursors,
             existing_keys,
             eviction_stamps,
@@ -4544,6 +4584,17 @@ impl ConcurrentEngine {
             self.flush_publish_count.load(Ordering::Relaxed),
             self.flush_duration_nanos.load(Ordering::Relaxed),
             self.flush_last_duration_nanos.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Per-phase flush timing in nanoseconds: (apply, cache, publish, timebucket, compact).
+    pub fn flush_phase_stats(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.flush_apply_nanos.load(Ordering::Relaxed),
+            self.flush_cache_nanos.load(Ordering::Relaxed),
+            self.flush_publish_nanos.load(Ordering::Relaxed),
+            self.flush_timebucket_nanos.load(Ordering::Relaxed),
+            self.flush_compact_nanos.load(Ordering::Relaxed),
         )
     }
 

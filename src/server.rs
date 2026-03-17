@@ -3189,6 +3189,14 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(last_nanos as i64);
 
+            // Flush phase timing
+            let (apply_ns, cache_ns, publish_ns, tb_ns, compact_ns) = engine.flush_phase_stats();
+            m.flush_apply_nanos.with_label_values(&[name]).set(apply_ns as i64);
+            m.flush_cache_nanos.with_label_values(&[name]).set(cache_ns as i64);
+            m.flush_publish_nanos.with_label_values(&[name]).set(publish_ns as i64);
+            m.flush_timebucket_nanos.with_label_values(&[name]).set(tb_ns as i64);
+            m.flush_compact_nanos.with_label_values(&[name]).set(compact_ns as i64);
+
             // Pending fields (lazy loading)
             let pending = engine.pending_field_count();
             m.pending_fields

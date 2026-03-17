@@ -50,6 +50,12 @@ pub struct Metrics {
     // -- Write pipeline --
     pub flush_last_duration_seconds: IntGaugeVec,
     pub snapshot_publish_total: IntGaugeVec,
+    // -- Flush phase timing --
+    pub flush_apply_nanos: IntGaugeVec,
+    pub flush_cache_nanos: IntGaugeVec,
+    pub flush_publish_nanos: IntGaugeVec,
+    pub flush_timebucket_nanos: IntGaugeVec,
+    pub flush_compact_nanos: IntGaugeVec,
 
     // -- Tier 2: Lazy loading --
     pub lazy_load_duration_seconds: HistogramVec,
@@ -272,6 +278,32 @@ impl Metrics {
         )
         .unwrap();
 
+        let flush_apply_nanos = IntGaugeVec::new(
+            Opts::new("bitdex_flush_apply_nanos", "Last flush apply_prepared duration in nanoseconds"),
+            &["index"],
+        )
+        .unwrap();
+        let flush_cache_nanos = IntGaugeVec::new(
+            Opts::new("bitdex_flush_cache_nanos", "Last flush cache maintenance duration in nanoseconds"),
+            &["index"],
+        )
+        .unwrap();
+        let flush_publish_nanos = IntGaugeVec::new(
+            Opts::new("bitdex_flush_publish_nanos", "Last flush staging clone + ArcSwap publish duration in nanoseconds"),
+            &["index"],
+        )
+        .unwrap();
+        let flush_timebucket_nanos = IntGaugeVec::new(
+            Opts::new("bitdex_flush_timebucket_nanos", "Last flush time bucket maintenance duration in nanoseconds"),
+            &["index"],
+        )
+        .unwrap();
+        let flush_compact_nanos = IntGaugeVec::new(
+            Opts::new("bitdex_flush_compact_nanos", "Last flush diff compaction duration in nanoseconds"),
+            &["index"],
+        )
+        .unwrap();
+
         let lazy_load_buckets = vec![0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0];
         let lazy_load_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -432,6 +464,11 @@ impl Metrics {
         registry
             .register(Box::new(snapshot_publish_total.clone()))
             .unwrap();
+        registry.register(Box::new(flush_apply_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_cache_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_publish_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_timebucket_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_compact_nanos.clone())).unwrap();
         registry
             .register(Box::new(lazy_load_duration_seconds.clone()))
             .unwrap();
@@ -491,6 +528,11 @@ impl Metrics {
             slot_bitmap_bytes,
             flush_last_duration_seconds,
             snapshot_publish_total,
+            flush_apply_nanos,
+            flush_cache_nanos,
+            flush_publish_nanos,
+            flush_timebucket_nanos,
+            flush_compact_nanos,
             lazy_load_duration_seconds,
             pending_fields,
             eviction_total,
