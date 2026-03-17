@@ -8864,4 +8864,94 @@ mod tests {
 
         engine.shutdown();
     }
+
+    #[test]
+    fn test_patch_document_creates_new_slot() {
+        // PATCH on a non-existent slot should fall through to PUT,
+        // creating the document and setting bitmaps.
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        let doc = make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+            ("tagIds", FieldValue::Multi(vec![Value::Integer(42)])),
+        ]);
+
+        // Slot 999 doesn't exist — patch should create it via PUT fallback
+        engine.patch_document(999, &doc).unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // Verify the slot is alive and queryable
+        assert_eq!(engine.alive_count(), 1);
+
+        let result = engine
+            .query(
+                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![999]);
+
+        // Verify tag bitmap was set
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(42))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![999]);
+
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_patch_document_updates_existing_slot() {
+        // PATCH on an existing slot should still work as partial update.
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Create the slot first via PUT
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("tagIds", FieldValue::Multi(vec![Value::Integer(10)])),
+                ]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // PATCH only nsfwLevel — tagIds should be preserved
+        let patch = make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
+        ]);
+        engine.patch_document(1, &patch).unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+
+        // nsfwLevel should be updated
+        let result = engine
+            .query(
+                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(2))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        // tagIds should still be there (not wiped by PATCH)
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(10))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        engine.shutdown();
+    }
 }
