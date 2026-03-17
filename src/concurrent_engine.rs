@@ -8958,4 +8958,182 @@ mod tests {
 
         engine.shutdown();
     }
+
+    // --- Write path audit items 2.11, 2.15, 2.16, 2.17 ---
+
+    #[test]
+    fn test_delete_cleans_filter_and_sort_bits() {
+        // 2.11: DELETE should clear all filter/sort bitmap bits before clearing alive
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("tagIds", FieldValue::Multi(vec![Value::Integer(100), Value::Integer(200)])),
+                    ("reactionCount", FieldValue::Single(Value::Integer(42))),
+                ]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // Verify it's queryable before delete
+        let result = engine
+            .query(
+                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.total_matched, 1);
+
+        // Delete
+        engine.delete(1).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        // Verify alive is cleared
+        assert_eq!(engine.alive_count(), 0);
+
+        // Verify filter bitmaps are clean (no stale bits)
+        let result = engine
+            .query(
+                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.total_matched, 0, "nsfwLevel bitmap should be clean after delete");
+
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(100))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.total_matched, 0, "tagIds bitmap should be clean after delete");
+
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_multi_value_diff_add_and_remove() {
+        // 2.15: Upsert that changes multi-value field should add new values and remove old
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert with tagIds [100, 200]
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("tagIds", FieldValue::Multi(vec![Value::Integer(100), Value::Integer(200)])),
+                ]),
+            )
+            .unwrap();
+
+        wait_for_flush(&engine, 1, 500);
+
+        // Upsert with tagIds [200, 300] — should remove 100, keep 200, add 300
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("tagIds", FieldValue::Multi(vec![Value::Integer(200), Value::Integer(300)])),
+                ]),
+            )
+            .unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+
+        // Tag 100 should be gone
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(100))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.total_matched, 0, "tag 100 should be removed after upsert");
+
+        // Tag 200 should still be there
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(200))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        // Tag 300 should be added
+        let result = engine
+            .query(
+                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(300))],
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1]);
+
+        engine.shutdown();
+    }
+
+    #[test]
+    fn test_sort_bitmap_updates_on_value_change() {
+        // 2.16: Changing a sort field value should update sort layer bitmaps
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert two docs with different reactionCounts
+        engine
+            .put(1, &make_doc(vec![
+                ("reactionCount", FieldValue::Single(Value::Integer(10))),
+            ]))
+            .unwrap();
+        engine
+            .put(2, &make_doc(vec![
+                ("reactionCount", FieldValue::Single(Value::Integer(20))),
+            ]))
+            .unwrap();
+
+        wait_for_flush(&engine, 2, 500);
+
+        // Sort by reactionCount desc — doc 2 (20) should come first
+        let result = engine
+            .query(
+                &[],
+                Some(&SortClause {
+                    field: "reactionCount".to_string(),
+                    direction: SortDirection::Desc,
+                }),
+                2,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![2, 1]);
+
+        // Update doc 1 to have higher reactionCount
+        engine
+            .put(1, &make_doc(vec![
+                ("reactionCount", FieldValue::Single(Value::Integer(30))),
+            ]))
+            .unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+
+        // Now doc 1 (30) should come first
+        let result = engine
+            .query(
+                &[],
+                Some(&SortClause {
+                    field: "reactionCount".to_string(),
+                    direction: SortDirection::Desc,
+                }),
+                2,
+            )
+            .unwrap();
+        assert_eq!(result.ids, vec![1, 2]);
+
+        engine.shutdown();
+    }
 }
