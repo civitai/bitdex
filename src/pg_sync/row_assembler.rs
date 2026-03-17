@@ -149,6 +149,9 @@ pub fn assemble_document(image: &ImageRow, enrichment: &EnrichmentData) -> Value
         "baseModel": base_model,
         "availability": image.availability.as_deref().unwrap_or("Public"),
         "blockedFor": image.blocked_for.as_deref(),
+        // TODO: isRemix not implemented — remixOfId not available in current
+        // COPY query or outbox enrichment. Needs Image.remixOfId column added
+        // to the enrichment query. See pipeline audit #4, finding A6.
         "remixOfId": null,
         "tagIds": tag_ids,
         "modelVersionIds": model_version_ids,

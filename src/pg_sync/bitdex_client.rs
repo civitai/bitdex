@@ -159,6 +159,7 @@ impl BitdexClient {
         let documents: Vec<Value> = entries
             .iter()
             .map(|(id, values)| {
+                debug_assert!(*id >= 0 && *id <= u32::MAX as i64, "image ID {} exceeds u32 range", id);
                 serde_json::json!({
                     "id": *id as u32,
                     "values": values.iter().map(|v| *v as u64).collect::<Vec<_>>(),
