@@ -399,7 +399,7 @@ pub async fn fetch_collections(
     image_ids: &[i64],
 ) -> Result<Vec<CollectionItemRow>, sqlx::Error> {
     sqlx::query_as::<_, CollectionItemRow>(
-        r#"SELECT "imageId", "collectionId" FROM "CollectionItem"
+        r#"SELECT "imageId"::int8, "collectionId"::int8 FROM "CollectionItem"
         WHERE "imageId" = ANY($1) AND status = 'ACCEPTED'"#,
     )
     .bind(image_ids)
