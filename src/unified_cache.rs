@@ -1275,7 +1275,7 @@ impl UnifiedCache {
         for (i, key) in affected_keys.iter().enumerate() {
             // Check deadline every 64 entries to avoid clock overhead
             if let Some(deadline) = deadline {
-                if i % 64 == 0 && Instant::now() > deadline {
+                if i > 0 && i % 64 == 0 && Instant::now() > deadline {
                     // Mark remaining entries for rebuild
                     for remaining_key in &affected_keys[i..] {
                         if let Some(entry) = self.entries.get_mut(remaining_key) {
@@ -1379,7 +1379,7 @@ impl UnifiedCache {
         for (i, key) in affected_keys.iter().enumerate() {
             // Check deadline every 64 entries to avoid clock overhead
             if let Some(deadline) = deadline {
-                if i % 64 == 0 && Instant::now() > deadline {
+                if i > 0 && i % 64 == 0 && Instant::now() > deadline {
                     // Mark remaining entries for rebuild
                     for remaining_key in &affected_keys[i..] {
                         if let Some(entry) = self.entries.get_mut(remaining_key) {
