@@ -2191,53 +2191,55 @@ impl ConcurrentEngine {
     /// 7. Clear in-flight
     pub fn put(&self, id: u32, doc: &Document) -> Result<()> {
         self.in_flight.mark_in_flight(id);
-
-        let result = (|| -> Result<()> {
-            // Check alive status via lock-free snapshot
-            let (is_upsert, was_allocated) = {
-                let snap = self.snapshot();
-                let alive = snap.slots.is_alive(id);
-                let alloc = if !alive {
-                    snap.slots.was_ever_allocated(id)
-                } else {
-                    false
-                };
-                (alive, alloc)
-            };
-
-            // Read old doc from docstore if needed
-            let old_doc = if is_upsert || was_allocated {
-                self.docstore.lock().get(id)?
-            } else {
-                None
-            };
-
-            // Compute diff purely -> Vec<MutationOp>
-            let ops = diff_document(id, old_doc.as_ref(), doc, &self.config, is_upsert, &self.field_registry);
-
-            // Send ops to coalescer channel
-            self.sender.send_batch(ops).map_err(|_| {
-                crate::error::BitdexError::CapacityExceeded(
-                    "coalescer channel disconnected".to_string(),
-                )
-            })?;
-
-            // Enqueue doc write — flush thread will batch these
-            let stored = StoredDoc {
-                fields: doc.fields.clone(),
-                schema_version: 0,
-            };
-            self.doc_tx.send((id, stored)).map_err(|_| {
-                crate::error::BitdexError::CapacityExceeded(
-                    "docstore channel disconnected".to_string(),
-                )
-            })?;
-
-            Ok(())
-        })();
-
+        let result = self.put_inner(id, doc);
         self.in_flight.clear_in_flight(id);
         result
+    }
+
+    /// Inner PUT logic shared by put() and patch_document() (for new slots).
+    /// Caller must handle in_flight marking.
+    fn put_inner(&self, id: u32, doc: &Document) -> Result<()> {
+        // Check alive status via lock-free snapshot
+        let (is_upsert, was_allocated) = {
+            let snap = self.snapshot();
+            let alive = snap.slots.is_alive(id);
+            let alloc = if !alive {
+                snap.slots.was_ever_allocated(id)
+            } else {
+                false
+            };
+            (alive, alloc)
+        };
+
+        // Read old doc from docstore if needed
+        let old_doc = if is_upsert || was_allocated {
+            self.docstore.lock().get(id)?
+        } else {
+            None
+        };
+
+        // Compute diff purely -> Vec<MutationOp>
+        let ops = diff_document(id, old_doc.as_ref(), doc, &self.config, is_upsert, &self.field_registry);
+
+        // Send ops to coalescer channel
+        self.sender.send_batch(ops).map_err(|_| {
+            crate::error::BitdexError::CapacityExceeded(
+                "coalescer channel disconnected".to_string(),
+            )
+        })?;
+
+        // Enqueue doc write — flush thread will batch these
+        let stored = StoredDoc {
+            fields: doc.fields.clone(),
+            schema_version: 0,
+        };
+        self.doc_tx.send((id, stored)).map_err(|_| {
+            crate::error::BitdexError::CapacityExceeded(
+                "docstore channel disconnected".to_string(),
+            )
+        })?;
+
+        Ok(())
     }
 
     /// PATCH(id, partial_fields) -- merge only provided fields into existing doc.
@@ -2277,12 +2279,15 @@ impl ConcurrentEngine {
         self.in_flight.mark_in_flight(id);
 
         let result = (|| -> Result<()> {
-            // Verify alive
-            {
+            let is_alive = {
                 let snap = self.snapshot();
-                if !snap.slots.is_alive(id) {
-                    return Err(crate::error::BitdexError::SlotNotFound(id));
-                }
+                snap.slots.is_alive(id)
+            };
+
+            if !is_alive {
+                // Slot doesn't exist yet — fall through to full PUT semantics.
+                // This handles new records (e.g., images created after the bulk load).
+                return self.put_inner(id, doc);
             }
 
             // Read old doc for diffing
