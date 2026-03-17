@@ -3605,4 +3605,263 @@ mod tests {
         // collectionIds defaults to [] since it's filter_only and not in docstore
         assert_eq!(result["collectionIds"], serde_json::json!([]));
     }
+
+    // --- Audit items 1.10-1.18 ---
+
+    #[test]
+    fn test_format_document_mapped_string_reverse() {
+        // 1.10: MappedString should reverse-map integer → string
+        let mut string_map = HashMap::new();
+        string_map.insert("image".to_string(), 1i64);
+        string_map.insert("video".to_string(), 2i64);
+
+        let schema = make_schema(vec![FieldMapping {
+            source: "type".into(),
+            target: "type".into(),
+            value_type: FieldValueType::MappedString,
+            fallback: None,
+            string_map: Some(string_map),
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: None,
+        }]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("type", FieldValue::Single(Value::Integer(1))), // stored as int
+        ]);
+
+        // Build reverse maps: int → string
+        let mut reverse_maps: ReverseStringMaps = HashMap::new();
+        let mut type_rev = HashMap::new();
+        type_rev.insert(1i64, "image".to_string());
+        type_rev.insert(2i64, "video".to_string());
+        reverse_maps.insert("type".to_string(), type_rev);
+
+        let result = format_document(
+            &doc, &schema, &reverse_maps, &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["type"], serde_json::json!("image"));
+    }
+
+    #[test]
+    fn test_format_document_mapped_string_unknown_value() {
+        // MappedString with unknown integer → null (not raw integer)
+        let schema = make_schema(vec![FieldMapping {
+            source: "type".into(),
+            target: "type".into(),
+            value_type: FieldValueType::MappedString,
+            fallback: None,
+            string_map: Some([("image".to_string(), 1i64)].into_iter().collect()),
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: None,
+        }]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("type", FieldValue::Single(Value::Integer(999))), // unknown
+        ]);
+
+        let mut reverse_maps: ReverseStringMaps = HashMap::new();
+        reverse_maps.insert("type".to_string(), [(1i64, "image".to_string())].into_iter().collect());
+
+        let result = format_document(
+            &doc, &schema, &reverse_maps, &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert!(result["type"].is_null(), "Unknown MappedString should be null");
+    }
+
+    #[test]
+    fn test_format_document_exists_boolean_true() {
+        // 1.12: ExistsBoolean stored as true → returns true
+        let schema = make_schema(vec![FieldMapping {
+            source: "publishedAtUnix".into(),
+            target: "isPublished".into(),
+            value_type: FieldValueType::ExistsBoolean,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: None,
+        }]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("isPublished", FieldValue::Single(Value::Bool(true))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["isPublished"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_format_document_exists_boolean_missing_defaults_false() {
+        // ExistsBoolean not in doc → defaults to false
+        let schema = make_schema(vec![FieldMapping {
+            source: "publishedAtUnix".into(),
+            target: "isPublished".into(),
+            value_type: FieldValueType::ExistsBoolean,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: None,
+        }]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["isPublished"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_format_document_string_doc_only() {
+        // 1.13: String doc_only field (url, hash)
+        let schema = make_schema(vec![FieldMapping {
+            source: "url".into(),
+            target: "url".into(),
+            value_type: FieldValueType::String,
+            fallback: None,
+            string_map: None,
+            doc_only: true,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: None,
+        }]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("url", FieldValue::Single(Value::String("https://example.com/img.jpg".into()))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["url"], serde_json::json!("https://example.com/img.jpg"));
+    }
+
+    #[test]
+    fn test_format_document_field_selection() {
+        // 1.14: IncludeDocs::Fields only returns selected fields
+        let schema = make_schema(vec![
+            FieldMapping {
+                source: "nsfwLevel".into(),
+                target: "nsfwLevel".into(),
+                value_type: FieldValueType::Integer,
+                fallback: None, string_map: None, doc_only: false, filter_only: false,
+                ms_to_seconds: false, truncate_u32: false, case_sensitive: false,
+                default_value: None,
+            },
+            FieldMapping {
+                source: "userId".into(),
+                target: "userId".into(),
+                value_type: FieldValueType::Integer,
+                fallback: None, string_map: None, doc_only: false, filter_only: false,
+                ms_to_seconds: false, truncate_u32: false, case_sensitive: false,
+                default_value: None,
+            },
+        ]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("nsfwLevel", FieldValue::Single(Value::Integer(4))),
+            ("userId", FieldValue::Single(Value::Integer(42))),
+        ]);
+
+        let selection = IncludeDocs::Fields(vec!["nsfwLevel".to_string()]);
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &selection, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["nsfwLevel"], serde_json::json!(4));
+        assert!(result.get("userId").is_none(), "userId should be excluded by field selection");
+        // id is always included
+        assert_eq!(result["id"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn test_format_document_schema_version_historical_defaults() {
+        // 1.15: Doc with older schema version uses historical defaults
+        let schema = make_schema(vec![FieldMapping {
+            source: "newField".into(),
+            target: "newField".into(),
+            value_type: FieldValueType::Integer,
+            fallback: None, string_map: None, doc_only: false, filter_only: false,
+            ms_to_seconds: false, truncate_u32: false, case_sensitive: false,
+            default_value: Some(serde_json::json!(99)), // current default
+        }]);
+
+        // Doc encoded with schema version 1 (current is also 1, but let's test version 2)
+        let mut doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+        ]);
+        doc.schema_version = 2; // different from schema version 1
+
+        // Historical defaults for version 2
+        let mut registry: SchemaRegistry = HashMap::new();
+        let mut v2_defaults = HashMap::new();
+        v2_defaults.insert("newField".to_string(), serde_json::json!(42));
+        registry.insert(2, v2_defaults);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &registry,
+        );
+
+        // Should use historical default (42) not current default (99)
+        assert_eq!(result["newField"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn test_format_document_truncate_u32_legacy_alias() {
+        // 1.18: truncate_u32 is a legacy alias for ms_to_seconds
+        let schema = make_schema(vec![FieldMapping {
+            source: "oldTimestampMs".into(),
+            target: "oldTimestamp".into(),
+            value_type: FieldValueType::Integer,
+            fallback: None, string_map: None, doc_only: false, filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: true, // legacy alias
+            case_sensitive: false,
+            default_value: None,
+        }]);
+
+        // Doc has field under source name (raw ms)
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("oldTimestampMs", FieldValue::Single(Value::Integer(1487255090000))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        // truncate_u32 should behave like ms_to_seconds
+        assert_eq!(result["oldTimestamp"], serde_json::json!(1487255090));
+    }
 }
