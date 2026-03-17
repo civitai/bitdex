@@ -391,6 +391,72 @@
       "type": "row"
     },
     {
+      "title": "Process RSS",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 140,
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "peak" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }, { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "bitdex_process_rss_bytes",
+          "legendFormat": "rss",
+          "refId": "A"
+        },
+        {
+          "expr": "bitdex_process_rss_peak_bytes",
+          "legendFormat": "peak",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "RSS vs Tracked Bitmap Memory",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 141,
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "bars", "fillOpacity": 50, "stacking": { "mode": "normal" } }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "untracked" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "bitmaps" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "sum(bitdex_filter_bitmap_bytes) + sum(bitdex_sort_bitmap_bytes) + sum(bitdex_slot_bitmap_bytes) + sum(bitdex_cache_bytes)",
+          "legendFormat": "bitmaps",
+          "refId": "A"
+        },
+        {
+          "expr": "bitdex_process_rss_bytes - (sum(bitdex_filter_bitmap_bytes) + sum(bitdex_sort_bitmap_bytes) + sum(bitdex_slot_bitmap_bytes) + sum(bitdex_cache_bytes))",
+          "legendFormat": "untracked",
+          "refId": "B"
+        }
+      ]
+    },
+    {
       "title": "Filter Bitmap Memory by Field",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
@@ -548,6 +614,254 @@
           "legendFormat": "cache",
           "instant": true,
           "refId": "D"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
+      "id": 110,
+      "title": "Query Phase Breakdown",
+      "type": "row"
+    },
+    {
+      "title": "Query Filter Time (p50/p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 49 },
+      "id": 111,
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p95" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p50" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(bitdex_query_filter_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(bitdex_query_filter_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Query Sort Time (p50/p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 49 },
+      "id": 112,
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p95" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p50" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(bitdex_query_sort_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(bitdex_query_sort_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Query Doc Fetch Time (p50/p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 49 },
+      "id": 113,
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p95" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p50" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(bitdex_query_docs_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(bitdex_query_docs_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "id": 120,
+      "title": "Backpressure",
+      "type": "row"
+    },
+    {
+      "title": "Queries In Flight",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
+      "id": 121,
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "bitdex_queries_in_flight{index=~\"$index\"}",
+          "legendFormat": "in flight",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Peak Concurrent Queries",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 58 },
+      "id": 122,
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 100 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "bitdex_queries_in_flight_peak{index=~\"$index\"}",
+          "legendFormat": "{{index}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Queries Rejected",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 58 },
+      "id": 123,
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "targets": [
+        {
+          "expr": "bitdex_queries_rejected_total{index=~\"$index\"}",
+          "legendFormat": "{{index}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
+      "id": 130,
+      "title": "Flush Phase Breakdown",
+      "type": "row"
+    },
+    {
+      "title": "Flush Phase Timing",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 67 },
+      "id": 131,
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "lineWidth": 1,
+            "stacking": { "mode": "normal", "group": "A" }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "bitdex_flush_apply_nanos{index=~\"$index\"} / 1e6",
+          "legendFormat": "Apply mutations",
+          "refId": "A"
+        },
+        {
+          "expr": "bitdex_flush_cache_nanos{index=~\"$index\"} / 1e6",
+          "legendFormat": "Cache maintenance",
+          "refId": "B"
+        },
+        {
+          "expr": "bitdex_flush_publish_nanos{index=~\"$index\"} / 1e6",
+          "legendFormat": "Snapshot publish",
+          "refId": "C"
+        },
+        {
+          "expr": "bitdex_flush_timebucket_nanos{index=~\"$index\"} / 1e6",
+          "legendFormat": "Time buckets",
+          "refId": "D"
+        },
+        {
+          "expr": "bitdex_flush_compact_nanos{index=~\"$index\"} / 1e6",
+          "legendFormat": "Diff compaction",
+          "refId": "E"
         }
       ]
     }
