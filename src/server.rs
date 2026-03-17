@@ -746,6 +746,7 @@ struct CachePatch {
     bound_max_count: Option<usize>,
     prefetch_threshold: Option<f64>,
     max_maintenance_work: Option<usize>,
+    max_maintenance_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,6 +1474,10 @@ async fn handle_patch_config(
                     if let Some(v) = cache_patch.max_maintenance_work {
                         idx.definition.config.cache.max_maintenance_work = v;
                         idx.engine.set_max_maintenance_work(v);
+                    }
+                    if let Some(v) = cache_patch.max_maintenance_ms {
+                        idx.definition.config.cache.max_maintenance_ms = v;
+                        idx.engine.set_max_maintenance_ms(v);
                     }
                 }
 
