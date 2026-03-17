@@ -155,7 +155,11 @@ async fn poll_and_process(
         }
     }
 
-    // Step 5: Report cursor to Postgres for outbox cleanup
+    // Step 5: Report cursor to Postgres for outbox cleanup.
+    // Cursor is advanced AFTER mutations are sent to BitDex (not before).
+    // On crash between mutation and cursor write, events are re-processed
+    // on restart. This is safe: PATCH is idempotent, filter-sync diffs
+    // old vs new, and DELETE is a no-op on missing slots.
     queries::upsert_cursor(pool, cursor_name, max_id)
         .await
         .map_err(|e| format!("upsert_cursor: {e}"))?;
