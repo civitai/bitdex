@@ -48,6 +48,7 @@ pub async fn run_outbox_poller(
 
     let mut ticker = interval(Duration::from_secs(poll_interval_secs));
     let mut bitdex_was_down = false;
+    let mut was_paused = false;
 
     loop {
         ticker.tick().await;
@@ -64,6 +65,19 @@ pub async fn run_outbox_poller(
         if bitdex_was_down {
             eprintln!("Outbox: BitDex is back, resuming PG polling");
             bitdex_was_down = false;
+        }
+
+        // Pause gate: skip PG polling when sync is paused via server admin endpoint.
+        if client.is_sync_paused().await {
+            if !was_paused {
+                eprintln!("Outbox: sync paused by server, waiting for resume...");
+                was_paused = true;
+            }
+            continue;
+        }
+        if was_paused {
+            eprintln!("Outbox: sync resumed");
+            was_paused = false;
         }
 
         match poll_and_process(pool, client, batch_limit, cursor_name, &mut cursor).await {

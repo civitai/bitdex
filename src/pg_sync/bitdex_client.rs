@@ -69,6 +69,23 @@ impl BitdexClient {
         }
     }
 
+    /// Check if the BitDex server has paused pg-sync.
+    /// Returns true if GET /api/sync/status returns `{"paused": true}`, false otherwise.
+    /// On network errors or parse failures, returns false (let health check handle it).
+    pub async fn is_sync_paused(&self) -> bool {
+        let url = format!("{}/api/sync/status", self.server_root);
+        match self.client.get(&url).timeout(Duration::from_secs(3)).send().await {
+            Ok(resp) => {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    body.get("paused").and_then(|v| v.as_bool()).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Upsert a batch of documents, optionally advancing a named cursor.
     pub async fn upsert_batch(
         &self,

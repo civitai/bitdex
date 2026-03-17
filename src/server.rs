@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -281,6 +281,8 @@ struct AppState {
     queries_in_flight_peak: AtomicI64,
     /// Concurrency limit for queries. 0 = unlimited (no backpressure).
     max_query_concurrency: AtomicU32,
+    /// When true, pg-sync outbox poller should pause polling.
+    sync_paused: AtomicBool,
 }
 
 type SharedState = Arc<AppState>;
@@ -832,6 +834,7 @@ impl BitdexServer {
             queries_in_flight: AtomicI64::new(0),
             queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
+            sync_paused: AtomicBool::new(false),
         });
 
         // Try to restore an existing index from disk
@@ -867,6 +870,8 @@ impl BitdexServer {
             .route("/api/indexes/{name}/fields/{field}/reload", post(handle_reload_field))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
+            .route("/api/sync/pause", post(handle_sync_pause))
+            .route("/api/sync/resume", post(handle_sync_resume))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
             .with_state(Arc::clone(&state));
 
@@ -883,6 +888,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/cursors", get(handle_list_cursors))
             .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
             .route("/api/health", get(handle_health))
+            .route("/api/sync/status", get(handle_sync_status))
             .route("/api/formats", get(handle_list_formats))
             .route("/metrics", get(handle_metrics))
             .route("/", get(handle_ui))
@@ -3137,6 +3143,21 @@ async fn handle_list_cursors(
 
 async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+async fn handle_sync_pause(State(state): State<SharedState>) -> impl IntoResponse {
+    state.sync_paused.store(true, Ordering::Relaxed);
+    Json(serde_json::json!({ "status": "paused" }))
+}
+
+async fn handle_sync_resume(State(state): State<SharedState>) -> impl IntoResponse {
+    state.sync_paused.store(false, Ordering::Relaxed);
+    Json(serde_json::json!({ "status": "running" }))
+}
+
+async fn handle_sync_status(State(state): State<SharedState>) -> impl IntoResponse {
+    let paused = state.sync_paused.load(Ordering::Relaxed);
+    Json(serde_json::json!({ "paused": paused }))
 }
 
 async fn handle_list_formats(State(state): State<SharedState>) -> impl IntoResponse {
