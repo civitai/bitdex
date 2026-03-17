@@ -1675,4 +1675,173 @@ mod fixture_tests {
         }
         assert!(parsed >= 50, "Expected at least 50 parsed model_version rows, got {parsed}");
     }
+
+    // --- Audit items 3.11, 3.16, 3.20 ---
+
+    #[test]
+    fn test_images_fixture_all_11_fields_extractable() {
+        // 3.11: Verify all 11 image scalar fields can be extracted
+        // Columns: id, url, nsfwLevel, hash, flags, type, userId, blockedFor,
+        //          scannedAtSecs, createdAtSecs, postId
+        let data = std::fs::read(fixtures_dir().join("images.csv")).unwrap();
+        let mut full_rows = 0u64;
+
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+
+            // Smart CSV split that handles quoted fields
+            let fields = split_csv_line(line);
+            if fields.len() < 11 {
+                continue; // Skip lines with embedded commas in quoted fields
+            }
+
+            // Field 0: id (integer, required)
+            let id = parse_i64_fast(fields[0]);
+            assert!(id.is_some(), "id must be parseable");
+
+            // Field 2: nsfwLevel (integer)
+            if !fields[2].is_empty() {
+                let nsfw = parse_i64_fast(fields[2]);
+                assert!(nsfw.is_some(), "nsfwLevel must be integer: {:?}", std::str::from_utf8(fields[2]));
+            }
+
+            // Field 4: flags (integer)
+            if !fields[4].is_empty() {
+                let flags = parse_i64_fast(fields[4]);
+                assert!(flags.is_some(), "flags must be integer: {:?}", std::str::from_utf8(fields[4]));
+            }
+
+            // Field 6: userId (integer)
+            if !fields[6].is_empty() {
+                let uid = parse_i64_fast(fields[6]);
+                assert!(uid.is_some(), "userId must be integer: {:?}", std::str::from_utf8(fields[6]));
+            }
+
+            // Field 8: scannedAtSecs (integer, epoch seconds)
+            if !fields[8].is_empty() {
+                let ts = parse_i64_fast(fields[8]);
+                assert!(ts.is_some(), "scannedAtSecs must be integer");
+                if let Some(v) = ts {
+                    assert!(v > 1_000_000_000 && v < 2_000_000_000,
+                        "scannedAtSecs {} looks wrong (expected epoch seconds)", v);
+                }
+            }
+
+            // Field 9: createdAtSecs (integer, epoch seconds)
+            if !fields[9].is_empty() {
+                let ts = parse_i64_fast(fields[9]);
+                assert!(ts.is_some(), "createdAtSecs must be integer");
+            }
+
+            // Field 10: postId (integer)
+            let pid_bytes = fields[10].strip_suffix(&[b'\r']).unwrap_or(fields[10]);
+            if !pid_bytes.is_empty() {
+                let pid = parse_i64_fast(pid_bytes);
+                assert!(pid.is_some(), "postId must be integer: {:?}", std::str::from_utf8(pid_bytes));
+            }
+
+            full_rows += 1;
+        }
+
+        assert!(full_rows >= 50, "Expected at least 50 fully parseable image rows, got {full_rows}");
+        eprintln!("images fixture: {full_rows} rows with all 11 fields parsed");
+    }
+
+    #[test]
+    fn test_images_fixture_timestamps_are_seconds_not_ms() {
+        // 3.16: Verify timestamps from COPY are in seconds, not milliseconds
+        let data = std::fs::read(fixtures_dir().join("images.csv")).unwrap();
+
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            let fields = split_csv_line(line);
+            if fields.len() < 11 { continue; }
+
+            // scannedAtSecs (field 8) should be epoch seconds (10 digits), not ms (13 digits)
+            if !fields[8].is_empty() {
+                if let Some(v) = parse_i64_fast(fields[8]) {
+                    assert!(v < 10_000_000_000,
+                        "scannedAtSecs {} looks like milliseconds, not seconds", v);
+                }
+            }
+
+            // createdAtSecs (field 9) same check
+            if !fields[9].is_empty() {
+                if let Some(v) = parse_i64_fast(fields[9]) {
+                    assert!(v < 10_000_000_000,
+                        "createdAtSecs {} looks like milliseconds, not seconds", v);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_posts_fixture_timestamps_are_seconds() {
+        // Posts publishedAtSecs should also be epoch seconds
+        let data = std::fs::read(fixtures_dir().join("posts.csv")).unwrap();
+
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            let fields: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            if fields.len() < 2 { continue; }
+
+            // Field 1: publishedAtSecs
+            if !fields[1].is_empty() {
+                if let Some(v) = parse_i64_fast(fields[1]) {
+                    assert!(v < 10_000_000_000,
+                        "Post publishedAtSecs {} looks like milliseconds", v);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_images_fixture_csv_split_handles_all_rows() {
+        // 3.20: Verify the CSV splitter handles all rows (including quoted fields)
+        let data = std::fs::read(fixtures_dir().join("images.csv")).unwrap();
+        let mut rows_with_11_fields = 0u64;
+        let mut total_rows = 0u64;
+
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            total_rows += 1;
+            let fields = split_csv_line(line);
+            if fields.len() >= 11 {
+                rows_with_11_fields += 1;
+            }
+        }
+
+        // All rows should have at least 11 fields when properly split
+        assert_eq!(rows_with_11_fields, total_rows,
+            "All {} rows should have 11+ fields with proper CSV splitting, but only {} did",
+            total_rows, rows_with_11_fields);
+    }
+
+    /// Split a CSV line handling quoted fields (simple implementation).
+    fn split_csv_line(line: &[u8]) -> Vec<&[u8]> {
+        let mut fields = Vec::new();
+        let mut start = 0;
+        let mut in_quotes = false;
+
+        for i in 0..line.len() {
+            match line[i] {
+                b'"' => in_quotes = !in_quotes,
+                b',' if !in_quotes => {
+                    fields.push(&line[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        fields.push(&line[start..]);
+        fields
+    }
 }
