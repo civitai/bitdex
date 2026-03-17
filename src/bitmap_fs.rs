@@ -1059,4 +1059,70 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all["my-cursor"], "12345");
     }
+
+    // --- Audit items 6.4, 6.9 ---
+
+    #[test]
+    fn test_list_field_keys_matches_written_values() {
+        // 6.4: Existence set (list_field_keys) should exactly match written values
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitmapFs::new(dir.path()).unwrap();
+
+        let mut bm1 = RoaringBitmap::new();
+        bm1.insert(1);
+        let mut bm2 = RoaringBitmap::new();
+        bm2.insert(2);
+        let mut bm3 = RoaringBitmap::new();
+        bm3.insert(3);
+
+        // Write values across multiple buckets
+        // Value 100 → bucket 0, value 300 → bucket 1, value 70000 → bucket 17
+        let entries: Vec<(u64, &RoaringBitmap)> = vec![(100, &bm1), (300, &bm2), (70000, &bm3)];
+
+        // Group by bucket and write
+        let mut by_bucket: std::collections::HashMap<u8, Vec<(u64, &RoaringBitmap)>> = std::collections::HashMap::new();
+        for &(val, bm) in &entries {
+            let bucket = ((val >> 8) & 0xFF) as u8;
+            by_bucket.entry(bucket).or_default().push((val, bm));
+        }
+        for (bucket, bucket_entries) in &by_bucket {
+            store.write_filter_bucket("testField", *bucket, bucket_entries).unwrap();
+        }
+
+        // list_field_keys should return exactly {100, 300, 70000}
+        let keys = store.list_field_keys("testField").unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&100));
+        assert!(keys.contains(&300));
+        assert!(keys.contains(&70000));
+    }
+
+    #[test]
+    fn test_list_field_keys_empty_field() {
+        // Nonexistent field should return empty set
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitmapFs::new(dir.path()).unwrap();
+
+        let keys = store.list_field_keys("nonexistent").unwrap();
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_existence_set_rejects_missing_values() {
+        // 6.9: Values NOT written should NOT appear in list_field_keys
+        let dir = tempfile::tempdir().unwrap();
+        let store = BitmapFs::new(dir.path()).unwrap();
+
+        let mut bm = RoaringBitmap::new();
+        bm.insert(1);
+
+        // Write only value 42
+        store.write_filter_bucket("field", 0, &[(42, &bm)]).unwrap();
+
+        let keys = store.list_field_keys("field").unwrap();
+        assert!(keys.contains(&42), "Written value should be in existence set");
+        assert!(!keys.contains(&43), "Unwritten value should NOT be in existence set");
+        assert!(!keys.contains(&0), "Zero should NOT be in existence set");
+        assert!(!keys.contains(&u64::MAX), "MAX should NOT be in existence set");
+    }
 }
