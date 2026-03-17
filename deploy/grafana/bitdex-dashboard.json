@@ -1,5 +1,7 @@
 {
-  "annotations": { "list": [] },
+  "annotations": {
+    "list": []
+  },
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -7,7 +9,12 @@
   "panels": [
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "id": 100,
       "title": "Query Performance",
       "type": "row"
@@ -15,20 +22,32 @@
     {
       "title": "QPS",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      },
       "id": 1,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
         },
         "overrides": []
       },
       "targets": [
         {
-          "expr": "rate(bitdex_query_total{index=~\"$index\"}[$__rate_interval])",
-          "legendFormat": "{{index}}",
+          "expr": "sum by (pod) (rate(bitdex_query_total{index=~\"$index\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -36,43 +55,88 @@
     {
       "title": "Query Latency (p50 / p95 / p99)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      },
       "id": 2,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineWidth": 2
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "p99" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "p99"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "p95" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "p95"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "p50" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "p50"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(bitdex_query_duration_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
-          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.50, sum by (le, pod) (rate(bitdex_query_duration_seconds_bucket{index=~\"$index\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{pod}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(bitdex_query_duration_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
-          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le, pod) (rate(bitdex_query_duration_seconds_bucket{index=~\"$index\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{pod}}",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(bitdex_query_duration_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
-          "legendFormat": "p99",
+          "expr": "histogram_quantile(0.99, sum by (le, pod) (rate(bitdex_query_duration_seconds_bucket{index=~\"$index\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{pod}}",
           "refId": "C"
         }
       ]
@@ -80,17 +144,29 @@
     {
       "title": "Query Latency Heatmap",
       "type": "heatmap",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
       "id": 3,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "options": {
         "calculate": false,
-        "yAxis": { "unit": "s" },
-        "color": { "scheme": "Oranges" }
+        "yAxis": {
+          "unit": "s"
+        },
+        "color": {
+          "scheme": "Oranges"
+        }
       },
       "targets": [
         {
-          "expr": "rate(bitdex_query_duration_seconds_bucket{index=~\"$index\"}[$__rate_interval])",
+          "expr": "sum by (pod) (rate(bitdex_query_duration_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
           "legendFormat": "{{le}}",
           "format": "heatmap",
           "refId": "A"
@@ -99,7 +175,12 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
       "id": 101,
       "title": "Cache",
       "type": "row"
@@ -107,31 +188,54 @@
     {
       "title": "Cache Hit Ratio",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 10
+      },
       "id": 4,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
           "min": 0,
           "max": 1,
-          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "lineWidth": 2
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": null },
-              { "color": "orange", "value": 0.5 },
-              { "color": "green", "value": 0.8 }
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.8
+              }
             ]
           },
-          "color": { "mode": "thresholds" }
+          "color": {
+            "mode": "thresholds"
+          }
         },
         "overrides": []
       },
       "targets": [
         {
           "expr": "bitdex_cache_hits_total{index=~\"$index\"} / clamp_min(bitdex_cache_hits_total{index=~\"$index\"} + bitdex_cache_misses_total{index=~\"$index\"}, 1)",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -139,16 +243,26 @@
     {
       "title": "Cache Entries",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 10 },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 10
+      },
       "id": 5,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "short" }
+        "defaults": {
+          "unit": "short"
+        }
       },
       "targets": [
         {
           "expr": "bitdex_cache_entries{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -156,16 +270,26 @@
     {
       "title": "Cache Memory",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 10 },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 10
+      },
       "id": 6,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "decbytes" }
+        "defaults": {
+          "unit": "decbytes"
+        }
       },
       "targets": [
         {
           "expr": "bitdex_cache_bytes{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -173,34 +297,68 @@
     {
       "title": "Cache Hits vs Misses",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 10
+      },
       "id": 7,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "hits" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "hits"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "misses" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "misses"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
       "targets": [
         {
           "expr": "bitdex_cache_hits_total{index=~\"$index\"}",
-          "legendFormat": "hits",
+          "legendFormat": "hits {{pod}}",
           "refId": "A"
         },
         {
           "expr": "bitdex_cache_misses_total{index=~\"$index\"}",
-          "legendFormat": "misses",
+          "legendFormat": "misses {{pod}}",
           "refId": "B"
         }
       ]
@@ -208,14 +366,26 @@
     {
       "title": "Hits (cumulative)",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 14 },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 14
+      },
       "id": 8,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "fieldConfig": { "defaults": { "unit": "short" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
       "targets": [
         {
           "expr": "bitdex_cache_hits_total{index=~\"$index\"}",
-          "legendFormat": "",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -223,21 +393,38 @@
     {
       "title": "Misses (cumulative)",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 14 },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 14
+      },
       "id": 9,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "fieldConfig": { "defaults": { "unit": "short" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
       "targets": [
         {
           "expr": "bitdex_cache_misses_total{index=~\"$index\"}",
-          "legendFormat": "",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
       "id": 102,
       "title": "Documents & Writes",
       "type": "row"
@@ -245,16 +432,26 @@
     {
       "title": "Alive Documents",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 19 },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 19
+      },
       "id": 10,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "short" }
+        "defaults": {
+          "unit": "short"
+        }
       },
       "targets": [
         {
           "expr": "bitdex_alive_documents{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -262,16 +459,26 @@
     {
       "title": "Slot High Water",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 19 },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 19
+      },
       "id": 11,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "short" }
+        "defaults": {
+          "unit": "short"
+        }
       },
       "targets": [
         {
           "expr": "bitdex_slot_high_water{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -279,24 +486,36 @@
     {
       "title": "Upsert Rate",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 19 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 19
+      },
       "id": 12,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
         },
         "overrides": []
       },
       "targets": [
         {
-          "expr": "rate(bitdex_upsert_total{index=~\"$index\"}[$__rate_interval])",
-          "legendFormat": "upserts/s",
+          "expr": "sum by (pod) (rate(bitdex_upsert_total{index=~\"$index\"}[$__rate_interval]))",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         },
         {
-          "expr": "rate(bitdex_delete_total{index=~\"$index\"}[$__rate_interval])",
+          "expr": "sum by (pod) (rate(bitdex_delete_total{index=~\"$index\"}[$__rate_interval]))",
           "legendFormat": "deletes/s",
           "refId": "B"
         }
@@ -305,14 +524,26 @@
     {
       "title": "Snapshot Publishes",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 19 },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 19
+      },
       "id": 13,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "fieldConfig": { "defaults": { "unit": "short" } },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
       "targets": [
         {
           "expr": "bitdex_snapshot_publish_total{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -320,16 +551,26 @@
     {
       "title": "Last Flush Duration",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 19 },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 19
+      },
       "id": 14,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "ns" }
+        "defaults": {
+          "unit": "ns"
+        }
       },
       "targets": [
         {
           "expr": "bitdex_flush_last_duration_nanos{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -337,27 +578,46 @@
     {
       "title": "Pending Fields (lazy load)",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 23 },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 23
+      },
       "id": 15,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 5 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
             ]
           },
-          "color": { "mode": "thresholds" }
+          "color": {
+            "mode": "thresholds"
+          }
         }
       },
       "targets": [
         {
           "expr": "bitdex_pending_fields{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -365,27 +625,44 @@
     {
       "title": "Flush Duration Over Time",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 23
+      },
       "id": 16,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "ns",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
         },
         "overrides": []
       },
       "targets": [
         {
           "expr": "bitdex_flush_last_duration_nanos{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
       "id": 103,
       "title": "Bitmap Memory",
       "type": "row"
@@ -393,18 +670,51 @@
     {
       "title": "Process RSS",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
       "id": 140,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "peak" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }, { "id": "custom.lineStyle", "value": { "dash": [10, 10], "fill": "dash" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "peak"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              }
+            ]
           }
         ]
       },
@@ -424,22 +734,58 @@
     {
       "title": "RSS vs Tracked Bitmap Memory",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
       "id": 141,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
-          "custom": { "drawStyle": "bars", "fillOpacity": 50, "stacking": { "mode": "normal" } }
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 50,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "untracked" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "untracked"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "bitmaps" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "bitmaps"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
@@ -459,16 +805,27 @@
     {
       "title": "Filter Bitmap Memory by Field",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
       "id": 20,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "decbytes",
           "custom": {
             "drawStyle": "bars",
             "fillOpacity": 80,
-            "stacking": { "mode": "normal", "group": "A" }
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -484,16 +841,27 @@
     {
       "title": "Sort Bitmap Memory by Field",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 32 },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 32
+      },
       "id": 21,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "decbytes",
           "custom": {
             "drawStyle": "bars",
             "fillOpacity": 80,
-            "stacking": { "mode": "normal", "group": "A" }
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -509,16 +877,26 @@
     {
       "title": "Slot Bitmap Memory",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 32 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 32
+      },
       "id": 22,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "decbytes" }
+        "defaults": {
+          "unit": "decbytes"
+        }
       },
       "targets": [
         {
           "expr": "bitdex_slot_bitmap_bytes{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -526,11 +904,21 @@
     {
       "title": "Total Bitmap Memory",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 36 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 36
+      },
       "id": 23,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "decbytes" }
+        "defaults": {
+          "unit": "decbytes"
+        }
       },
       "targets": [
         {
@@ -543,30 +931,63 @@
     {
       "title": "Filter Bitmap Counts by Field",
       "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
       "id": 24,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {},
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "Value" },
-            "properties": [{ "id": "displayName", "value": "Bitmap Count" }]
+            "matcher": {
+              "id": "byName",
+              "options": "Value"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Bitmap Count"
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "field" },
-            "properties": [{ "id": "displayName", "value": "Field" }]
+            "matcher": {
+              "id": "byName",
+              "options": "field"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Field"
+              }
+            ]
           }
         ]
       },
       "options": {
         "showHeader": true,
-        "sortBy": [{ "displayName": "Bitmap Count", "desc": true }]
+        "sortBy": [
+          {
+            "displayName": "Bitmap Count",
+            "desc": true
+          }
+        ]
       },
       "transformations": [
         {
           "id": "reduce",
-          "options": { "reducers": ["lastNotNull"] }
+          "options": {
+            "reducers": [
+              "lastNotNull"
+            ]
+          }
         }
       ],
       "targets": [
@@ -582,13 +1003,32 @@
     {
       "title": "Memory Breakdown (pie)",
       "type": "piechart",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
       "id": 25,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "options": {
-        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
         "pieType": "donut",
-        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] }
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        }
       },
       "targets": [
         {
@@ -619,7 +1059,12 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      },
       "id": 110,
       "title": "Query Phase Breakdown",
       "type": "row"
@@ -627,34 +1072,68 @@
     {
       "title": "Query Filter Time (p50/p95)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 49 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 49
+      },
       "id": 111,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "p95" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "p95"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "p50" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "p50"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(bitdex_query_filter_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
-          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.50, sum by (le, pod) (rate(bitdex_query_filter_seconds_bucket{index=~\"$index\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{pod}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(bitdex_query_filter_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
-          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le, pod) (rate(bitdex_query_filter_seconds_bucket{index=~\"$index\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{pod}}",
           "refId": "B"
         }
       ]
@@ -662,34 +1141,68 @@
     {
       "title": "Query Sort Time (p50/p95)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 49 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 49
+      },
       "id": 112,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "p95" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "p95"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "p50" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "p50"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(bitdex_query_sort_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
-          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.50, sum by (le, pod) (rate(bitdex_query_sort_seconds_bucket{index=~\"$index\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{pod}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(bitdex_query_sort_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
-          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le, pod) (rate(bitdex_query_sort_seconds_bucket{index=~\"$index\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{pod}}",
           "refId": "B"
         }
       ]
@@ -697,41 +1210,80 @@
     {
       "title": "Query Doc Fetch Time (p50/p95)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 49 },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 49
+      },
       "id": 113,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "p95" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "p95"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
           },
           {
-            "matcher": { "id": "byName", "options": "p50" },
-            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+            "matcher": {
+              "id": "byName",
+              "options": "p50"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(bitdex_query_docs_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
-          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.50, sum by (le, pod) (rate(bitdex_query_docs_seconds_bucket{index=~\"$index\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{pod}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(bitdex_query_docs_seconds_bucket{index=~\"$index\"}[$__rate_interval]))",
-          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by (le, pod) (rate(bitdex_query_docs_seconds_bucket{index=~\"$index\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{pod}}",
           "refId": "B"
         }
       ]
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 57
+      },
       "id": 120,
       "title": "Backpressure",
       "type": "row"
@@ -739,13 +1291,25 @@
     {
       "title": "Queries In Flight",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 58
+      },
       "id": 121,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 }
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2
+          }
         },
         "overrides": []
       },
@@ -760,27 +1324,46 @@
     {
       "title": "Peak Concurrent Queries",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 58 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 58
+      },
       "id": 122,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 50 },
-              { "color": "red", "value": 100 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
             ]
           },
-          "color": { "mode": "thresholds" }
+          "color": {
+            "mode": "thresholds"
+          }
         }
       },
       "targets": [
         {
           "expr": "bitdex_queries_in_flight_peak{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
@@ -788,33 +1371,54 @@
     {
       "title": "Queries Rejected",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 58 },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 58
+      },
       "id": 123,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "red", "value": 1 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
             ]
           },
-          "color": { "mode": "thresholds" }
+          "color": {
+            "mode": "thresholds"
+          }
         }
       },
       "targets": [
         {
           "expr": "bitdex_queries_rejected_total{index=~\"$index\"}",
-          "legendFormat": "{{index}}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ]
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 66
+      },
       "id": 130,
       "title": "Flush Phase Breakdown",
       "type": "row"
@@ -822,9 +1426,17 @@
     {
       "title": "Flush Phase Timing",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 67 },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 67
+      },
       "id": 131,
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "ms",
@@ -832,7 +1444,10 @@
             "drawStyle": "line",
             "fillOpacity": 30,
             "lineWidth": 1,
-            "stacking": { "mode": "normal", "group": "A" }
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -868,7 +1483,9 @@
   ],
   "refresh": "30s",
   "schemaVersion": 39,
-  "tags": ["bitdex"],
+  "tags": [
+    "bitdex"
+  ],
   "templating": {
     "list": [
       {
@@ -887,7 +1504,10 @@
       },
       {
         "current": {},
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
         "definition": "label_values(bitdex_alive_documents, index)",
         "hide": 0,
         "includeAll": true,
@@ -903,7 +1523,10 @@
       }
     ]
   },
-  "time": { "from": "now-1h", "to": "now" },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "browser",
   "title": "BitDex",
