@@ -613,11 +613,13 @@ fn process_multi_value_csv(
     let total = AtomicU64::new(0);
     let total_ref = &total;
 
-    let thread_results: Vec<HashMap<u64, RoaringBitmap>> = ranges
+    // Each thread builds filter bitmaps AND collects per-slot value lists for docstore.
+    let thread_results: Vec<(HashMap<u64, RoaringBitmap>, HashMap<u32, Vec<i64>>)> = ranges
         .par_iter()
         .map(|&(range_start, range_end)| {
             let chunk = &data[range_start..range_end];
             let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
+            let mut slot_values: HashMap<u32, Vec<i64>> = HashMap::new();
             let mut count = 0u64;
             let mut line_start = 0;
 
@@ -632,22 +634,37 @@ fn process_multi_value_csv(
                         let slot = image_id as u32;
                         let val = value_id as u64;
                         bitmaps.entry(val).or_insert_with(RoaringBitmap::new).insert(slot);
-                        if let Some(fidx) = field_idx {
-                            let value = rmp_serde::to_vec(&PackedValue::I(value_id as i64)).unwrap_or_default();
-                            bulk_writer.append_tuple_raw(slot, fidx, &value);
+                        if field_idx.is_some() {
+                            slot_values.entry(slot).or_default().push(value_id as i64);
                         }
                         count += 1;
                     }
                 }
             }
             total_ref.fetch_add(count, Ordering::Relaxed);
-            bitmaps
+            (bitmaps, slot_values)
         })
         .collect();
 
-    // Merge
+    // Write collected multi-value arrays to docstore (one PackedValue::Mi per slot)
+    if let Some(fidx) = field_idx {
+        // Merge per-slot values from all threads
+        let mut merged_values: HashMap<u32, Vec<i64>> = HashMap::new();
+        for (_, slot_values) in &thread_results {
+            for (&slot, values) in slot_values {
+                merged_values.entry(slot).or_default().extend(values);
+            }
+        }
+        for (slot, values) in &merged_values {
+            let packed = rmp_serde::to_vec(&PackedValue::Mi(values.clone())).unwrap_or_default();
+            bulk_writer.append_tuple_raw(*slot, fidx, &packed);
+        }
+        eprintln!("  {field_name}: wrote {} multi-value docstore tuples", merged_values.len());
+    }
+
+    // Merge filter bitmaps
     let mut merged: HashMap<u64, RoaringBitmap> = HashMap::new();
-    for bitmaps in thread_results {
+    for (bitmaps, _) in thread_results {
         for (val, bm) in bitmaps {
             merged.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
         }
@@ -1039,11 +1056,13 @@ fn process_resources_csv(
     let total = AtomicU64::new(0);
     let total_ref = &total;
 
-    let thread_results: Vec<HashMap<String, HashMap<u64, RoaringBitmap>>> = ranges
+    // Each thread builds filter bitmaps + collects modelVersionIds per slot for docstore.
+    let thread_results: Vec<(HashMap<String, HashMap<u64, RoaringBitmap>>, HashMap<u32, Vec<i64>>)> = ranges
         .par_iter()
         .map(|&(range_start, range_end)| {
             let chunk = &data[range_start..range_end];
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
+            let mut mv_slot_values: HashMap<u32, Vec<i64>> = HashMap::new();
             if has_mv { filter_maps.insert("modelVersionIds".into(), HashMap::new()); }
             if has_bm { filter_maps.insert("baseModel".into(), HashMap::new()); }
             if has_poi { filter_maps.insert("poi".into(), HashMap::new()); }
@@ -1068,9 +1087,8 @@ fn process_resources_csv(
                             .or_insert_with(RoaringBitmap::new)
                             .insert(slot);
                     }
-                    if let Some(fidx) = mv_field_idx {
-                        let value = rmp_serde::to_vec(&PackedValue::I(row.model_version_id as i64)).unwrap_or_default();
-                        bulk_writer.append_tuple_raw(slot, fidx, &value);
+                    if mv_field_idx.is_some() {
+                        mv_slot_values.entry(slot).or_default().push(row.model_version_id as i64);
                     }
 
                     if let Some((mv_base_model, model_id)) = mv_map.get(&row.model_version_id) {
@@ -1094,13 +1112,28 @@ fn process_resources_csv(
                 }
             }
             total_ref.fetch_add(count, Ordering::Relaxed);
-            filter_maps
+            (filter_maps, mv_slot_values)
         })
         .collect();
 
-    // Merge
+    // Write collected modelVersionIds arrays to docstore
+    if let Some(fidx) = mv_field_idx {
+        let mut merged_mv: HashMap<u32, Vec<i64>> = HashMap::new();
+        for (_, mv_vals) in &thread_results {
+            for (&slot, values) in mv_vals {
+                merged_mv.entry(slot).or_default().extend(values);
+            }
+        }
+        for (slot, values) in &merged_mv {
+            let packed = rmp_serde::to_vec(&PackedValue::Mi(values.clone())).unwrap_or_default();
+            bulk_writer.append_tuple_raw(*slot, fidx, &packed);
+        }
+        eprintln!("  modelVersionIds: wrote {} multi-value docstore tuples", merged_mv.len());
+    }
+
+    // Merge filter bitmaps
     let mut merged: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
-    for fm in thread_results {
+    for (fm, _) in thread_results {
         merge_filter_maps(&mut merged, fm);
     }
 
