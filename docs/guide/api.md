@@ -216,26 +216,71 @@ Applies a partial config update to a running index. Only fields present in the r
     "bound_target_size": 5000,
     "bound_max_size": 15000,
     "bound_max_count": 200,
-    "prefetch_threshold": 0.8
-  }
+    "prefetch_threshold": 0.8,
+    "max_maintenance_ms": 100,
+    "max_maintenance_work": 500000
+  },
+  "max_query_concurrency": 16
 }
 ```
+
+#### Filter & Sort Fields
 
 | Section | Field | Type | Description |
 |---------|-------|------|-------------|
 | `filter_fields.{name}` | `eager_load` | bool | Load this field's bitmaps eagerly on startup |
 | `sort_fields.{name}` | `eager_load` | bool | Load this field's bitmaps eagerly on startup |
-| `cache` | `max_entries` | integer | Maximum cached entries |
-| `cache` | `decay_rate` | float | Exponential decay rate for hit stats, (0.0, 1.0] |
-| `cache` | `bound_target_size` | integer | Target slots per bound cache entry |
-| `cache` | `bound_max_size` | integer | Max slots before triggering rebuild |
-| `cache` | `bound_max_count` | integer | Max bound entries before LRU eviction |
-| `cache` | `prefetch_threshold` | float | Fraction consumed before background expansion, [0.0, 1.0] |
+
+#### Cache Tuning
+
+Controls how the unified cache behaves — how many entries to keep, how aggressively to maintain them, and when to expand or evict.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_entries` | integer | 10000 | Maximum cached entries before LRU eviction kicks in |
+| `decay_rate` | float | 0.95 | Exponential decay rate for hit frequency stats. Lower = faster decay, (0.0, 1.0] |
+| `bound_target_size` | integer | 10000 | Target number of slots per bound cache entry. Controls the granularity of pre-filtered working sets |
+| `bound_max_size` | integer | 20000 | Max slots in a bound entry before it's flagged for rebuild (bloat control) |
+| `bound_max_count` | integer | 100 | Max bound entries before LRU eviction |
+| `prefetch_threshold` | float | 0.95 | When a query consumes this fraction of a cache entry's sorted_keys, trigger background expansion to the next tier. [0.0, 1.0] |
+| `max_maintenance_ms` | integer | 10 | Time budget (ms) for cache maintenance per flush cycle. The flush thread updates cache entries to reflect mutations (add/remove slots). When the deadline is exceeded, remaining entries are marked for rebuild on next query. Higher = more entries stay maintained. Set to 0 to fall back to count-based budget |
+| `max_maintenance_work` | integer | 500000 | Count-based fallback budget when `max_maintenance_ms` is 0. Number of slot-level operations per flush cycle |
+
+#### Backpressure
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_query_concurrency` | integer | 0 | Maximum concurrent queries. When exceeded, new queries receive 503 Service Unavailable. 0 = unlimited (no backpressure). Adjustable at runtime without restart |
 
 **Hot-reload behavior:**
 - `eager_load` changes from `false` to `true` trigger immediate background loading of those fields. No restart required.
 - `eager_load` changes from `true` to `false` take effect on next restart (loaded fields remain in memory).
-- `cache` setting changes are persisted but take effect on next restart (the in-memory cache config is set at build time).
+- `cache` settings take effect immediately on the running engine — no restart needed.
+- `max_query_concurrency` takes effect immediately via atomic store.
+
+**Operational examples:**
+
+```bash
+# Bump cache maintenance budget (more entries stay alive per flush)
+curl -X PATCH .../api/indexes/civitai/config \
+  -H 'Authorization: Bearer TOKEN' \
+  -d '{"cache": {"max_maintenance_ms": 100}}'
+
+# Enable backpressure at 16 concurrent queries
+curl -X PATCH .../api/indexes/civitai/config \
+  -H 'Authorization: Bearer TOKEN' \
+  -d '{"max_query_concurrency": 16}'
+
+# Disable backpressure
+curl -X PATCH .../api/indexes/civitai/config \
+  -H 'Authorization: Bearer TOKEN' \
+  -d '{"max_query_concurrency": 0}'
+
+# Eagerly load a field that was lazy
+curl -X PATCH .../api/indexes/civitai/config \
+  -H 'Authorization: Bearer TOKEN' \
+  -d '{"filter_fields": {"postId": {"eager_load": true}}}'
+```
 
 **Response:** `200 OK`
 
