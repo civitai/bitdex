@@ -3252,6 +3252,7 @@ async fn handle_ui() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{FieldMapping, FieldValueType, DataSchema};
 
     #[test]
     fn inflight_guard_decrements_on_drop() {
@@ -3312,5 +3313,288 @@ mod tests {
         peak.fetch_max(10, Ordering::Relaxed);
 
         assert_eq!(peak.load(Ordering::Relaxed), 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_document tests
+    // -----------------------------------------------------------------------
+
+    fn make_schema(fields: Vec<FieldMapping>) -> DataSchema {
+        DataSchema {
+            id_field: "id".to_string(),
+            schema_version: 1,
+            fields,
+        }
+    }
+
+    fn make_stored_doc(fields: Vec<(&str, FieldValue)>) -> StoredDoc {
+        StoredDoc {
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            schema_version: 0,
+        }
+    }
+
+    fn empty_reverse_maps() -> ReverseStringMaps {
+        HashMap::new()
+    }
+
+    fn empty_schema_registry() -> SchemaRegistry {
+        HashMap::new()
+    }
+
+    #[test]
+    fn test_format_document_source_ne_target() {
+        // When source ≠ target, format_document should look up by source name
+        // and return under target name.
+        let schema = make_schema(vec![FieldMapping {
+            source: "publishedAtUnix".into(),
+            target: "publishedAt".into(),
+            value_type: FieldValueType::Integer,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: true,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: None,
+        }]);
+
+        // Doc has field under SOURCE name (bulk loader path)
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(42))),
+            ("publishedAtUnix", FieldValue::Single(Value::Integer(1487255090000))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        // Should appear under TARGET name with ms_to_seconds applied
+        assert_eq!(result["publishedAt"], serde_json::json!(1487255090));
+    }
+
+    #[test]
+    fn test_format_document_target_name_lookup() {
+        // When doc has field under TARGET name (outbox/PATCH path),
+        // format_document should still find it.
+        let schema = make_schema(vec![FieldMapping {
+            source: "publishedAtUnix".into(),
+            target: "publishedAt".into(),
+            value_type: FieldValueType::Integer,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: true,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: None,
+        }]);
+
+        // Doc has field under TARGET name (outbox path)
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(42))),
+            ("publishedAt", FieldValue::Single(Value::Integer(1487255090000))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        // Target name lookup preferred, ms_to_seconds applied
+        assert_eq!(result["publishedAt"], serde_json::json!(1487255090));
+    }
+
+    #[test]
+    fn test_format_document_no_ms_conversion_when_not_configured() {
+        // Fields without ms_to_seconds should return raw value
+        let schema = make_schema(vec![FieldMapping {
+            source: "reactionCount".into(),
+            target: "reactionCount".into(),
+            value_type: FieldValueType::Integer,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: Some(serde_json::json!(0)),
+        }]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("reactionCount", FieldValue::Single(Value::Integer(42))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["reactionCount"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn test_format_document_missing_field_uses_default() {
+        // Missing fields should use schema default, not 0
+        let schema = make_schema(vec![FieldMapping {
+            source: "reactionCount".into(),
+            target: "reactionCount".into(),
+            value_type: FieldValueType::Integer,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: Some(serde_json::json!(0)),
+        }]);
+
+        // Doc has no reactionCount
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["reactionCount"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn test_format_document_missing_field_no_default_returns_type_zero() {
+        // Missing field with no explicit default → type-appropriate zero value
+        let schema = make_schema(vec![FieldMapping {
+            source: "sortAt".into(),
+            target: "sortAt".into(),
+            value_type: FieldValueType::Integer,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: None,
+        }]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["sortAt"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn test_format_document_boolean_field() {
+        let schema = make_schema(vec![FieldMapping {
+            source: "hasMeta".into(),
+            target: "hasMeta".into(),
+            value_type: FieldValueType::Boolean,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: Some(serde_json::json!(false)),
+        }]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("hasMeta", FieldValue::Single(Value::Bool(true))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["hasMeta"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_format_document_multi_value_array() {
+        let schema = make_schema(vec![FieldMapping {
+            source: "tagIds".into(),
+            target: "tagIds".into(),
+            value_type: FieldValueType::IntegerArray,
+            fallback: None,
+            string_map: None,
+            doc_only: false,
+            filter_only: false,
+            ms_to_seconds: false,
+            truncate_u32: false,
+            case_sensitive: false,
+            default_value: Some(serde_json::json!([])),
+        }]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("tagIds", FieldValue::Multi(vec![Value::Integer(10), Value::Integer(20)])),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["tagIds"], serde_json::json!([10, 20]));
+    }
+
+    #[test]
+    fn test_format_document_filter_only_excluded() {
+        // filter_only fields should not appear in document response
+        // (they're not stored in docstore, so they won't be found)
+        let schema = make_schema(vec![
+            FieldMapping {
+                source: "nsfwLevel".into(),
+                target: "nsfwLevel".into(),
+                value_type: FieldValueType::Integer,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                filter_only: false,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+            },
+            FieldMapping {
+                source: "collectionIds".into(),
+                target: "collectionIds".into(),
+                value_type: FieldValueType::IntegerArray,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                filter_only: true,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: Some(serde_json::json!([])),
+            },
+        ]);
+
+        let doc = make_stored_doc(vec![
+            ("id", FieldValue::Single(Value::Integer(1))),
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+        ]);
+
+        let result = format_document(
+            &doc, &schema, &empty_reverse_maps(), &IncludeDocs::All, &empty_schema_registry(),
+        );
+
+        assert_eq!(result["nsfwLevel"], serde_json::json!(1));
+        // collectionIds defaults to [] since it's filter_only and not in docstore
+        assert_eq!(result["collectionIds"], serde_json::json!([]));
     }
 }
