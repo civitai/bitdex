@@ -3148,8 +3148,38 @@ async fn handle_list_formats(State(state): State<SharedState>) -> impl IntoRespo
     }))
 }
 
+/// Read RSS from /proc/self/status (Linux). Returns bytes, or 0 on non-Linux.
+fn read_rss_bytes() -> i64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") {
+                    // Format: "VmRSS:    12345 kB"
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if let Ok(kb) = parts[1].parse::<i64>() {
+                            return kb * 1024; // kB → bytes
+                        }
+                    }
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    { 0 }
+}
+
 async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
     let m = &state.metrics;
+
+    // Process memory (collect-on-scrape, no index needed)
+    let rss = read_rss_bytes();
+    m.process_rss_bytes.set(rss);
+    if rss > m.process_rss_peak_bytes.get() {
+        m.process_rss_peak_bytes.set(rss);
+    }
 
     // Collect-on-scrape: refresh all gauges from current engine state.
     {

@@ -47,6 +47,10 @@ pub struct Metrics {
     pub sort_bitmap_bytes: IntGaugeVec,
     pub slot_bitmap_bytes: IntGaugeVec,
 
+    // -- Process memory --
+    pub process_rss_bytes: IntGauge,
+    pub process_rss_peak_bytes: IntGauge,
+
     // -- Write pipeline --
     pub flush_last_duration_seconds: IntGaugeVec,
     pub snapshot_publish_total: IntGaugeVec,
@@ -278,6 +282,14 @@ impl Metrics {
         )
         .unwrap();
 
+        // Process memory
+        let process_rss_bytes = IntGauge::new(
+            "bitdex_process_rss_bytes", "Process resident set size in bytes",
+        ).unwrap();
+        let process_rss_peak_bytes = IntGauge::new(
+            "bitdex_process_rss_peak_bytes", "Peak process RSS in bytes since startup",
+        ).unwrap();
+
         let flush_apply_nanos = IntGaugeVec::new(
             Opts::new("bitdex_flush_apply_nanos", "Last flush apply_prepared duration in nanoseconds"),
             &["index"],
@@ -464,6 +476,8 @@ impl Metrics {
         registry
             .register(Box::new(snapshot_publish_total.clone()))
             .unwrap();
+        registry.register(Box::new(process_rss_bytes.clone())).unwrap();
+        registry.register(Box::new(process_rss_peak_bytes.clone())).unwrap();
         registry.register(Box::new(flush_apply_nanos.clone())).unwrap();
         registry.register(Box::new(flush_cache_nanos.clone())).unwrap();
         registry.register(Box::new(flush_publish_nanos.clone())).unwrap();
@@ -528,6 +542,8 @@ impl Metrics {
             slot_bitmap_bytes,
             flush_last_duration_seconds,
             snapshot_publish_total,
+            process_rss_bytes,
+            process_rss_peak_bytes,
             flush_apply_nanos,
             flush_cache_nanos,
             flush_publish_nanos,
