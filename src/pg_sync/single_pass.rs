@@ -39,6 +39,18 @@ use super::progress::LoadProgress;
 
 const LOG_INTERVAL: u64 = 1_000_000;
 
+/// Check if a filter field already has data on disk (skip-if-loaded).
+/// Returns true if the field's BitmapFs directory has at least one fpack file.
+fn field_already_loaded(bitmap_fs: &BitmapFs, field_name: &str) -> bool {
+    match bitmap_fs.list_field_keys(field_name) {
+        Ok(keys) if !keys.is_empty() => {
+            eprintln!("  {field_name}: already loaded ({} values on disk), skipping", keys.len());
+            true
+        }
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -108,6 +120,9 @@ pub fn run_single_pass_v2(
     // ===================================================================
     {
         eprintln!("\n--- Step 1: Tags CSV (tagIds filter bitmaps + docstore tuples) ---");
+        if field_already_loaded(&bitmap_fs, "tagIds") {
+            // Already loaded — skip
+        } else {
         let t = Instant::now();
         let tag_bitmaps = process_tags_csv(stage_dir, &bulk_writer, &progress)?;
         let tag_count = tag_bitmaps.len();
@@ -128,6 +143,7 @@ pub fn run_single_pass_v2(
             t.elapsed().as_secs_f64()
         );
         // tag_map dropped here — memory freed
+        } // end if !field_already_loaded
     }
 
     // ===================================================================
@@ -282,6 +298,9 @@ pub fn run_single_pass_v2(
     // ===================================================================
     {
         eprintln!("\n--- Step 4: Tools CSV (toolIds filter bitmaps) ---");
+        if field_already_loaded(&bitmap_fs, "toolIds") {
+            // skip
+        } else {
         let t = Instant::now();
         let tool_bitmaps = process_multi_value_csv(
             stage_dir,
@@ -303,6 +322,7 @@ pub fn run_single_pass_v2(
             tool_count,
             saved as f64 / (1024.0 * 1024.0)
         );
+        } // end if !field_already_loaded
     }
 
     // ===================================================================
@@ -310,6 +330,9 @@ pub fn run_single_pass_v2(
     // ===================================================================
     {
         eprintln!("\n--- Step 5: Techniques CSV (techniqueIds filter bitmaps) ---");
+        if field_already_loaded(&bitmap_fs, "techniqueIds") {
+            // skip
+        } else {
         let t = Instant::now();
         let tech_bitmaps = process_multi_value_csv(
             stage_dir,
@@ -331,6 +354,7 @@ pub fn run_single_pass_v2(
             tech_count,
             saved as f64 / (1024.0 * 1024.0)
         );
+        } // end if !field_already_loaded
     }
 
     // ===================================================================
@@ -361,6 +385,35 @@ pub fn run_single_pass_v2(
                     eprintln!("  Saved sort {}: {} layers", field_name, bits);
                 }
             }
+        }
+    }
+
+    // ===================================================================
+    // Step 7: CollectionItems (filter_only — bitmap only, no docstore)
+    // ===================================================================
+    {
+        eprintln!("\n--- Step 7: CollectionItems CSV (collectionIds filter bitmaps) ---");
+        if field_already_loaded(&bitmap_fs, "collectionIds") {
+            // skip
+        } else if stage_dir.join("collection_items.csv").exists() {
+            let t = Instant::now();
+            // Reuse the backfill CSV processor (same mmap+rayon pattern)
+            let coll_bitmaps = crate::pg_sync::backfill::process_collection_items_csv(stage_dir)?;
+            let coll_count = coll_bitmaps.len();
+            eprintln!(
+                "  CollectionItems: {} distinct values in {:.1}s",
+                coll_count,
+                t.elapsed().as_secs_f64()
+            );
+
+            let saved = save_filter_field_to_disk(&bitmap_fs, "collectionIds", &coll_bitmaps)?;
+            eprintln!(
+                "  Saved collectionIds: {} values ({:.1} MB)",
+                coll_count,
+                saved as f64 / (1024.0 * 1024.0)
+            );
+        } else {
+            eprintln!("  collection_items.csv not found, skipping collectionIds");
         }
     }
 
