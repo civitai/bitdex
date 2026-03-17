@@ -9,19 +9,6 @@ use crate::dictionary::FieldDictionary;
 use crate::mutation::FieldValue;
 use crate::query::Value;
 
-/// Result of mapping a raw JSON value through a `FieldMapping`.
-#[derive(Debug, Clone)]
-pub struct MappedField {
-    /// The converted engine value.
-    pub value: FieldValue,
-    /// Target field name (from the mapping).
-    pub target: &'static str,
-    /// If true, this field is bitmap-indexed only (not stored in docstore).
-    pub filter_only: bool,
-    /// If true, this field is stored in docstore only (not bitmap-indexed).
-    pub doc_only: bool,
-}
-
 /// Convert a raw `serde_json::Value` to an engine `FieldValue` using the given field mapping.
 ///
 /// `apply_ms` controls whether ms→seconds conversion is applied (true when reading from
@@ -208,7 +195,8 @@ mod tests {
             value_type: FieldValueType::ExistsBoolean,
             ..int_mapping("x", "x")
         };
-        let v = map_field(&json!(null), &m, false, None).unwrap();
+        // ExistsBoolean always returns true regardless of input value
+        let v = map_field(&json!("anything"), &m, false, None).unwrap();
         assert!(matches!(v, FieldValue::Single(Value::Bool(true))));
     }
 
@@ -223,5 +211,45 @@ mod tests {
         let m = int_mapping("x", "x");
         let v = map_field(&json!(3.7), &m, false, None).unwrap();
         assert!(matches!(v, FieldValue::Single(Value::Integer(3))));
+    }
+
+    #[test]
+    fn test_zero_timestamp_ms_to_seconds() {
+        let m = int_mapping("x", "x");
+        let v = map_field(&json!(0), &m, true, None).unwrap();
+        assert!(matches!(v, FieldValue::Single(Value::Integer(0))));
+    }
+
+    #[test]
+    fn test_low_cardinality_string_with_dict() {
+        use crate::dictionary::FieldDictionary;
+        let dict = FieldDictionary::new();
+        let m = FieldMapping {
+            value_type: FieldValueType::LowCardinalityString,
+            ..int_mapping("x", "x")
+        };
+        let v = map_field(&json!("hello"), &m, false, Some(&dict)).unwrap();
+        if let FieldValue::Single(Value::Integer(n)) = v {
+            assert!(n > 0, "dictionary should assign a positive key");
+        } else {
+            panic!("expected integer");
+        }
+        // Same string should get the same key
+        let v2 = map_field(&json!("hello"), &m, false, Some(&dict)).unwrap();
+        assert_eq!(
+            format!("{:?}", v),
+            format!("{:?}", v2),
+        );
+    }
+
+    #[test]
+    fn test_low_cardinality_string_without_dict() {
+        let m = FieldMapping {
+            value_type: FieldValueType::LowCardinalityString,
+            ..int_mapping("x", "x")
+        };
+        let v = map_field(&json!("hello"), &m, false, None).unwrap();
+        // Without dict, defaults to 0
+        assert!(matches!(v, FieldValue::Single(Value::Integer(0))));
     }
 }
