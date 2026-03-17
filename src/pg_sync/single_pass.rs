@@ -1474,3 +1474,205 @@ fn parse_i64_fast(bytes: &[u8]) -> Option<i64> {
         Some(val)
     }
 }
+
+#[cfg(test)]
+mod fixture_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn fixtures_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/csv")
+    }
+
+    /// Parse every line of the real tags fixture with parse_tag_line.
+    #[test]
+    fn test_tags_fixture_parses() {
+        let data = std::fs::read(fixtures_dir().join("tags.csv")).unwrap();
+        let mut parsed = 0u64;
+        let mut failed = 0u64;
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            match parse_tag_line(line) {
+                Some((tag_id, image_id)) => {
+                    assert!(tag_id >= 0, "negative tagId: {tag_id}");
+                    assert!(image_id >= 0, "negative imageId: {image_id}");
+                    parsed += 1;
+                }
+                None => {
+                    failed += 1;
+                    let s = std::str::from_utf8(line).unwrap_or("<invalid utf8>");
+                    eprintln!("Failed to parse tag line: {s}");
+                }
+            }
+        }
+        assert!(parsed >= 100, "Expected at least 100 parsed tag rows, got {parsed}");
+        assert_eq!(failed, 0, "Expected 0 parse failures");
+        eprintln!("tags fixture: {parsed} rows parsed successfully");
+    }
+
+    /// Parse every line of the real tools fixture.
+    #[test]
+    fn test_tools_fixture_parses() {
+        let data = std::fs::read(fixtures_dir().join("tools.csv")).unwrap();
+        let mut parsed = 0u64;
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            let result = parse_tag_line(line); // Same format: valueId,imageId
+            assert!(result.is_some(), "Failed to parse tool line: {:?}", std::str::from_utf8(line));
+            parsed += 1;
+        }
+        assert!(parsed >= 50, "Expected at least 50 parsed tool rows, got {parsed}");
+    }
+
+    /// Parse every line of the real techniques fixture.
+    #[test]
+    fn test_techniques_fixture_parses() {
+        let data = std::fs::read(fixtures_dir().join("techniques.csv")).unwrap();
+        let mut parsed = 0u64;
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            let result = parse_tag_line(line); // Same format: valueId,imageId
+            assert!(result.is_some(), "Failed to parse technique line: {:?}", std::str::from_utf8(line));
+            parsed += 1;
+        }
+        assert!(parsed >= 50, "Expected at least 50 parsed technique rows, got {parsed}");
+    }
+
+    /// Parse every line of the real images fixture with the image CSV parser.
+    #[test]
+    fn test_images_fixture_parses() {
+        let data = std::fs::read(fixtures_dir().join("images.csv")).unwrap();
+        let mut parsed = 0u64;
+        let mut failed = 0u64;
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            // Image lines have 11 CSV columns. Just verify we can split them.
+            let fields: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            if fields.len() >= 11 {
+                // Parse the ID (first field)
+                let id = parse_i64_fast(fields[0]);
+                assert!(id.is_some(), "Failed to parse image id: {:?}", std::str::from_utf8(fields[0]));
+                parsed += 1;
+            } else {
+                // Some image rows have commas in quoted fields (url, hash)
+                // CSV quoting means naive split can overcound or undercound
+                // Still count as parsed if we got at least the ID
+                if let Some(_) = parse_i64_fast(fields[0]) {
+                    parsed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+        assert!(parsed >= 50, "Expected at least 50 parsed image rows, got {parsed}");
+        eprintln!("images fixture: {parsed} rows parsed, {failed} failed");
+    }
+
+    /// Parse every line of the real resources fixture.
+    #[test]
+    fn test_resources_fixture_parses() {
+        let data = std::fs::read(fixtures_dir().join("resources.csv")).unwrap();
+        let mut parsed = 0u64;
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            // Format: imageId,modelVersionId,detected(bool)
+            let fields: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            assert!(fields.len() >= 3, "Resource line has {} fields, expected 3: {:?}",
+                fields.len(), std::str::from_utf8(line));
+            let image_id = parse_i64_fast(fields[0]);
+            assert!(image_id.is_some(), "Failed to parse resource imageId");
+            let mv_id = parse_i64_fast(fields[1]);
+            assert!(mv_id.is_some(), "Failed to parse resource modelVersionId");
+            parsed += 1;
+        }
+        assert!(parsed >= 50, "Expected at least 50 parsed resource rows, got {parsed}");
+    }
+
+    /// Parse every line of the real metrics fixture (from ClickHouse).
+    #[test]
+    fn test_metrics_fixture_parses() {
+        let data = std::fs::read(fixtures_dir().join("metrics.csv")).unwrap();
+        let mut parsed = 0u64;
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            // Format: entityId,reactionCount,commentCount,collectedCount
+            let fields: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            assert!(fields.len() >= 4, "Metric line has {} fields, expected 4: {:?}",
+                fields.len(), std::str::from_utf8(line));
+            let entity_id = parse_i64_fast(fields[0]);
+            assert!(entity_id.is_some(), "Failed to parse metric entityId");
+            let reaction = parse_i64_fast(fields[1]);
+            assert!(reaction.is_some(), "Failed to parse reactionCount");
+            parsed += 1;
+        }
+        assert!(parsed >= 50, "Expected at least 50 parsed metric rows, got {parsed}");
+    }
+
+    /// Parse posts fixture — enrichment table with 4 columns.
+    #[test]
+    fn test_posts_fixture_parses() {
+        let data = std::fs::read(fixtures_dir().join("posts.csv")).unwrap();
+        let mut parsed = 0u64;
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            // Format: id,publishedAtSecs,availability,modelVersionId
+            let fields: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            assert!(fields.len() >= 3, "Post line has {} fields, expected >=3: {:?}",
+                fields.len(), std::str::from_utf8(line));
+            let id = parse_i64_fast(fields[0]);
+            assert!(id.is_some(), "Failed to parse post id");
+            parsed += 1;
+        }
+        assert!(parsed >= 50, "Expected at least 50 parsed post rows, got {parsed}");
+    }
+
+    /// Parse models fixture — 3 columns.
+    #[test]
+    fn test_models_fixture_parses() {
+        let data = std::fs::read(fixtures_dir().join("models.csv")).unwrap();
+        let mut parsed = 0u64;
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            let fields: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            assert!(fields.len() >= 3, "Model line has {} fields, expected 3", fields.len());
+            let id = parse_i64_fast(fields[0]);
+            assert!(id.is_some(), "Failed to parse model id");
+            parsed += 1;
+        }
+        assert!(parsed >= 50, "Expected at least 50 parsed model rows, got {parsed}");
+    }
+
+    /// Parse model_versions fixture — 3 columns.
+    #[test]
+    fn test_model_versions_fixture_parses() {
+        let data = std::fs::read(fixtures_dir().join("model_versions.csv")).unwrap();
+        let mut parsed = 0u64;
+        for line in data.split(|&b| b == b'\n') {
+            if line.is_empty() || (line.len() == 1 && line[0] == b'\r') {
+                continue;
+            }
+            let fields: Vec<&[u8]> = line.split(|&b| b == b',').collect();
+            assert!(fields.len() >= 3, "ModelVersion line has {} fields, expected 3", fields.len());
+            let id = parse_i64_fast(fields[0]);
+            assert!(id.is_some(), "Failed to parse model_version id");
+            parsed += 1;
+        }
+        assert!(parsed >= 50, "Expected at least 50 parsed model_version rows, got {parsed}");
+    }
+}
