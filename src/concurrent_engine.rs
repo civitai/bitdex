@@ -5058,35 +5058,64 @@ impl ConcurrentEngine {
         }
 
         // Filter fields — stream one bucket at a time to minimize memory overhead.
-        // Lazy-value fields (multi_value with per-value loading) are only skipped
-        // if they have no loaded bitmaps. If they have data (from inserts or lazy
-        // loads), save whatever is currently in memory so evict-then-reload works.
+        // Lazy-value fields require merge-on-save: read existing disk data per bucket,
+        // OR with in-memory mutations, write merged result. This prevents overwriting
+        // bulk-loaded fpack data with partial in-memory state.
         for (name, field) in snap.filters.fields() {
             if skip_filters.contains(name) {
                 continue;
             }
-            if skip_lazy_values.contains(name) && field.bitmap_count() == 0 {
+            let is_lazy = skip_lazy_values.contains(name);
+            if is_lazy && field.bitmap_count() == 0 {
+                // No in-memory data at all — nothing to merge, skip.
                 continue;
             }
             let t0 = std::time::Instant::now();
             let num_values = field.bitmap_count();
-            // Group entries by bucket (256 buckets max)
+            // Group in-memory entries by bucket (256 buckets max)
             let mut by_bucket: HashMap<u8, Vec<(u64, Cow<'_, RoaringBitmap>)>> = HashMap::new();
             for (&value, vb) in field.iter_versioned() {
                 let bucket = (value >> 8) as u8;
                 by_bucket.entry(bucket).or_default().push((value, vb.fused_cow()));
             }
             let num_buckets = by_bucket.len();
-            // Write one bucket at a time
-            for (bucket, entries) in by_bucket {
-                let refs: Vec<(u64, &RoaringBitmap)> = entries
-                    .iter()
-                    .map(|(v, c)| (*v, c.as_ref()))
-                    .collect();
-                store.write_filter_bucket(name, bucket, &refs)?;
+
+            if is_lazy {
+                // Merge-on-save: for each bucket with in-memory entries, read the
+                // existing fpack from disk, merge in-memory data on top, write back.
+                // Buckets with no in-memory changes are left untouched on disk.
+                for (bucket, mem_entries) in by_bucket {
+                    // Read existing disk entries for this bucket
+                    let disk_entries = store.read_filter_bucket(name, bucket)
+                        .unwrap_or_default();
+
+                    // Build merged map: start with disk, overlay memory
+                    let mut merged: HashMap<u64, RoaringBitmap> = disk_entries.into_iter().collect();
+                    for (value, cow_bm) in &mem_entries {
+                        let entry = merged.entry(*value).or_insert_with(RoaringBitmap::new);
+                        *entry |= cow_bm.as_ref();
+                    }
+
+                    // Write merged result
+                    let refs: Vec<(u64, &RoaringBitmap)> = merged.iter()
+                        .map(|(v, bm)| (*v, bm))
+                        .collect();
+                    store.write_filter_bucket(name, bucket, &refs)?;
+                }
+            } else {
+                // Non-lazy fields: write in-memory state directly (fully loaded)
+                for (bucket, entries) in by_bucket {
+                    let refs: Vec<(u64, &RoaringBitmap)> = entries
+                        .iter()
+                        .map(|(v, c)| (*v, c.as_ref()))
+                        .collect();
+                    store.write_filter_bucket(name, bucket, &refs)?;
+                }
             }
-            eprintln!("  save: filter {} ({} values, {} buckets) in {:.1}ms",
-                name, num_values, num_buckets, t0.elapsed().as_secs_f64() * 1000.0);
+            eprintln!("  save: filter {} ({} values, {} buckets{}) in {:.1}ms",
+                name, num_values, num_buckets,
+                if is_lazy { ", merged" } else { "" },
+                t0.elapsed().as_secs_f64() * 1000.0);
         }
 
         eprintln!("  save: total write {:.1}s", save_start.elapsed().as_secs_f64());
@@ -7717,7 +7746,7 @@ mod tests {
 
         // Phase 2: Create a NEW engine from the same config+paths and verify restoration
         {
-            let engine =
+            let mut engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
 
             // Verify alive count restored
@@ -7860,14 +7889,14 @@ mod tests {
 
         // Save snapshot of empty engine
         {
-            let engine =
+            let mut engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
             engine.save_snapshot().unwrap();
         }
 
         // Restore from empty snapshot
         {
-            let engine =
+            let mut engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
             assert_eq!(engine.alive_count(), 0, "empty snapshot should restore to 0 alive");
             assert_eq!(engine.slot_counter(), 0, "empty snapshot should restore counter to 0");
@@ -7910,7 +7939,7 @@ mod tests {
 
         // Restore and verify
         {
-            let engine =
+            let mut engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
 
             assert_eq!(engine.alive_count(), 2, "should have 2 alive after delete");
@@ -7974,7 +8003,7 @@ mod tests {
 
         // Restore and verify sort order is preserved
         {
-            let engine =
+            let mut engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
 
             let sort = SortClause {
@@ -8629,7 +8658,7 @@ mod tests {
         // Restore — nsfwLevel and reactionCount should be eagerly loaded (not pending).
         // onSite should still be pending (lazy).
         {
-            let engine =
+            let mut engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
 
             // nsfwLevel should NOT be in pending_filter_loads (eagerly loaded)
@@ -9192,5 +9221,187 @@ mod tests {
         assert_eq!(result.ids, vec![1, 2]);
 
         engine.shutdown();
+    }
+
+    /// Reproduce the collectionIds snapshot-overwrite bug:
+    /// Bulk-loaded fpack data on disk gets overwritten by snapshot save
+    /// when the engine has only partial (lazy-loaded) data in memory.
+    #[test]
+    fn test_snapshot_save_preserves_bulk_loaded_lazy_value_field() {
+        use crate::bitmap_fs::BitmapFs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+
+        // Config with collectionIds as a multi_value field (goes into lazy_value_fields)
+        let config = Config {
+            filter_fields: vec![
+                FilterFieldConfig {
+                    name: "nsfwLevel".to_string(),
+                    field_type: FilterFieldType::SingleValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false,
+                },
+                FilterFieldConfig {
+                    name: "collectionIds".to_string(),
+                    field_type: FilterFieldType::MultiValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false,
+                },
+            ],
+            sort_fields: vec![SortFieldConfig {
+                name: "reactionCount".to_string(),
+                source_type: "uint32".to_string(),
+                encoding: "linear".to_string(),
+                bits: 32,
+                eager_load: false,
+            }],
+            max_page_size: 100,
+            flush_interval_us: 50,
+            channel_capacity: 10_000,
+            storage: crate::config::StorageConfig {
+                bitmap_path: Some(bitmap_path.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Phase 1: Create engine, insert some docs to establish alive bitmap
+        {
+            let mut engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            // Insert 100 docs (slots 1-100) so alive bitmap is populated
+            for i in 1..=100u32 {
+                engine
+                    .put(
+                        i,
+                        &make_doc(vec![
+                            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                            ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
+                        ]),
+                    )
+                    .unwrap();
+            }
+
+            wait_for_flush(&engine, 100, 1000);
+            engine.save_snapshot().unwrap();
+            engine.shutdown();
+        }
+
+        // Phase 2: Simulate bulk load — write collectionIds fpack files to disk
+        // This is what the bulk loader does: writes directly to BitmapFs
+        {
+            let bitmap_fs = BitmapFs::new(&bitmap_path).unwrap();
+            let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
+
+            // Collection 42: contains slots 1-50
+            let mut bm42 = RoaringBitmap::new();
+            for i in 1..=50u32 { bm42.insert(i); }
+            bitmaps.insert(42, bm42);
+
+            // Collection 99: contains slots 51-100
+            let mut bm99 = RoaringBitmap::new();
+            for i in 51..=100u32 { bm99.insert(i); }
+            bitmaps.insert(99, bm99);
+
+            // Collection 7: contains slots 1-100 (all docs)
+            let mut bm7 = RoaringBitmap::new();
+            for i in 1..=100u32 { bm7.insert(i); }
+            bitmaps.insert(7, bm7);
+
+            // Write directly to BitmapFs (same as save_filter_field_to_disk)
+            bitmap_fs.write_batch(
+                &bitmaps.iter()
+                    .map(|(k, v)| ("collectionIds", *k, v))
+                    .collect::<Vec<_>>()
+            ).unwrap();
+
+            // Verify the fpack data is correct
+            let loaded = bitmap_fs.load_field("collectionIds").unwrap();
+            assert_eq!(loaded.len(), 3, "should have 3 collections on disk");
+            assert_eq!(loaded[&42].len(), 50);
+            assert_eq!(loaded[&99].len(), 50);
+            assert_eq!(loaded[&7].len(), 100);
+        }
+
+        // Phase 3: Start engine from disk (lazy loads collectionIds)
+        // Then simulate sync adding a few entries via sync_filter_values
+        {
+            let mut engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+            assert_eq!(engine.alive_count(), 100);
+
+            // Verify lazy load works — query collection 42 before any mutations
+            let result = engine
+                .query(
+                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(42)])],
+                    None,
+                    100,
+                )
+                .unwrap();
+            assert_eq!(
+                result.total_matched, 50,
+                "BUG PRECONDITION: collection 42 should have 50 results from disk"
+            );
+
+            // Simulate sync: add slot 1 to collection 42 (already there)
+            // and slot 1 to a NEW collection 999
+            engine
+                .sync_filter_values(1, "collectionIds", &[42, 999])
+                .unwrap();
+            wait_for_flush(&engine, 100, 1000);
+
+            // Trigger snapshot save — this is where the bug happens
+            engine.save_snapshot().unwrap();
+            engine.shutdown();
+        }
+
+        // Phase 4: Restart engine and verify bulk-loaded data survived
+        {
+            let mut engine =
+                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+            // Collection 42: should still have 50 results
+            let r = engine
+                .query(
+                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(42)])],
+                    None, 100,
+                ).unwrap();
+            assert_eq!(r.total_matched, 50,
+                "SNAPSHOT OVERWRITE BUG: collection 42 lost data! Got {} expected 50", r.total_matched);
+
+            // Collection 99: should still have 50 results (never touched by sync)
+            let r = engine
+                .query(
+                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(99)])],
+                    None, 100,
+                ).unwrap();
+            assert_eq!(r.total_matched, 50,
+                "SNAPSHOT OVERWRITE BUG: collection 99 lost data! Got {} expected 50", r.total_matched);
+
+            // Collection 7: should still have 100 results
+            let r = engine
+                .query(
+                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(7)])],
+                    None, 100,
+                ).unwrap();
+            assert_eq!(r.total_matched, 100,
+                "SNAPSHOT OVERWRITE BUG: collection 7 lost data! Got {} expected 100", r.total_matched);
+
+            // Collection 999: should have 1 result (from sync mutation)
+            let r = engine
+                .query(
+                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(999)])],
+                    None, 100,
+                ).unwrap();
+            assert_eq!(r.total_matched, 1,
+                "Sync mutation lost: collection 999 should have 1 result, got {}", r.total_matched);
+
+            engine.shutdown();
+        }
     }
 }

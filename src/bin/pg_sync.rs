@@ -38,7 +38,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Create BitdexOutbox table/triggers + bulk load from PG + save snapshot.
-    Load,
+    Load {
+        /// Override the cursor value instead of using the current outbox head.
+        /// Use when reloading from CSVs dumped at an earlier point in time.
+        /// Also reads from load_stage/cursor.txt if that file exists and this flag is not set.
+        #[arg(long)]
+        cursor_override: Option<i64>,
+    },
     /// Run outbox poller + ClickHouse metrics poller (steady-state sync).
     Sync,
     /// Create BitdexOutbox table/triggers only (no data load).
@@ -164,7 +170,7 @@ async fn main() {
             eprintln!("Setup complete.");
         }
 
-        Commands::Load => {
+        Commands::Load { cursor_override } => {
             // Ensure outbox table, triggers, and cursor table exist
             queries::run_setup(&pool)
                 .await
@@ -207,19 +213,43 @@ async fn main() {
                 }
             }
 
-            // Snapshot the current outbox head BEFORE bulk load.
-            // This becomes the cursor's starting point — anything that changes
-            // during bulk load will be in the outbox after this ID and will be
-            // picked up when the sidecar starts polling.
+            // Determine the cursor value: CLI override > cursor.txt > current outbox head.
             let cursor_name = format!("pg-sync-{}", sync_config.replica_id);
-            let outbox_head = queries::get_max_outbox_id(&pool)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to get max outbox ID: {e}");
-                    std::process::exit(1);
-                });
+            let outbox_head = if let Some(val) = cursor_override {
+                eprintln!("Using cursor override: {val}");
+                val
+            } else {
+                // Check for cursor.txt in load_stage (written during CSV dump)
+                let cursor_file = index_storage_dir.join("load_stage").join("cursor.txt");
+                if cursor_file.exists() {
+                    match std::fs::read_to_string(&cursor_file) {
+                        Ok(s) => match s.trim().parse::<i64>() {
+                            Ok(val) => {
+                                eprintln!("Using cursor from {}: {val}", cursor_file.display());
+                                val
+                            }
+                            Err(e) => {
+                                eprintln!("Invalid cursor.txt content '{}': {e}", s.trim());
+                                std::process::exit(1);
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Failed to read {}: {e}", cursor_file.display());
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    // Fallback: snapshot current outbox head
+                    queries::get_max_outbox_id(&pool)
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to get max outbox ID: {e}");
+                            std::process::exit(1);
+                        })
+                }
+            };
             engine.set_cursor(cursor_name.clone(), outbox_head.to_string());
-            eprintln!("Seeded cursor '{cursor_name}' at outbox head {outbox_head}");
+            eprintln!("Seeded cursor '{cursor_name}' at {outbox_head}");
 
             // Also register in PG so outbox cleanup knows about this replica
             queries::upsert_cursor(&pool, &cursor_name, outbox_head)
