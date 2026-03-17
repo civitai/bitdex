@@ -49,7 +49,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 ### Document Store
 
 - Custom sharded filesystem store (`src/docstore.rs`) keyed by slot ID
-- Documents grouped into shard files (512 docs/shard), zstd-compressed msgpack with per-field dictionary encoding
+- **DocStore V2 (production):** append-only tuple logs, no compression, LIFO scan for reads (2.6x faster than V1). Field dictionary encoding for low-cardinality strings.
 - Hex-nested directory structure keeps each dir under ~1000 files at 105M+ scale
 - On PUT upsert: read old doc from disk, diff old vs new, update only changed bitmaps
 - On fresh insert (slot not alive): write doc to disk, set bitmaps directly — no diff needed
@@ -89,6 +89,8 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 Run `/architecture` for the full guide — design docs, learnings, known gaps, and expectations for updating docs when changing architecture.
 
 Key guides: `docs/guide/api.md` (HTTP API), `docs/guide/query-formats.md` (query syntax), `docs/guide/config-schema.md` (config), `docs/guide/testing.md` (tests), `docs/guide/bitdex-civitai-schema.md` (Civitai fields).
+
+**New to the project?** Read `docs/HANDOFF.md` for operational context, common pitfalls, and what agents get wrong.
 
 ---
 
