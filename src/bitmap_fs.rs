@@ -463,6 +463,17 @@ impl BitmapFs {
         Ok(result)
     }
 
+    /// Read all entries from a single filter bucket fpack file.
+    /// Returns an empty Vec if the file doesn't exist.
+    pub fn read_filter_bucket(&self, field: &str, bucket: u8) -> Result<Vec<(u64, RoaringBitmap)>> {
+        let path = self.filter_pack_path(field, bucket);
+        match std::fs::read(&path) {
+            Ok(data) => Self::read_pack_file(&data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(BitdexError::DocStore(format!("read filter bucket: {e}"))),
+        }
+    }
+
     /// Write multiple filter bitmap entries, grouped by field + hex bucket.
     /// Write a single filter bucket directly (used by streaming save).
     pub fn write_filter_bucket(&self, field: &str, bucket: u8, entries: &[(u64, &RoaringBitmap)]) -> Result<()> {
