@@ -517,9 +517,14 @@ fn format_document(
             IncludeDocs::None => continue,
         }
 
-        let value = if let Some(fv) = doc.fields.get(&mapping.target) {
+        // Look up by target name first (outbox/PATCH path), then source name
+        // (single_pass bulk loader writes tuples under source field names).
+        let fv_opt = doc.fields.get(&mapping.target)
+            .or_else(|| doc.fields.get(&mapping.source));
+
+        let value = if let Some(fv) = fv_opt {
             // Reverse-map MappedString / LowCardinalityString fields from integer back to string
-            if mapping.value_type == FieldValueType::MappedString
+            let raw = if mapping.value_type == FieldValueType::MappedString
                 || mapping.value_type == FieldValueType::LowCardinalityString
             {
                 if let Some(rev) = reverse_maps.get(&mapping.target) {
@@ -529,6 +534,20 @@ fn format_document(
                 }
             } else {
                 field_value_to_json(fv)
+            };
+            // Apply ms_to_seconds transformation if configured
+            if mapping.should_convert_ms() {
+                if let serde_json::Value::Number(n) = &raw {
+                    if let Some(ms) = n.as_i64() {
+                        serde_json::json!(ms / 1000)
+                    } else {
+                        raw
+                    }
+                } else {
+                    raw
+                }
+            } else {
+                raw
             }
         } else if let Some(hist) = historical_defaults {
             // Doc encoded with an older schema — use that version's defaults
