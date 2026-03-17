@@ -484,6 +484,7 @@ impl ConcurrentEngine {
 
         let mut uc_config = UnifiedCacheConfig::default();
         uc_config.max_maintenance_work = config.cache.max_maintenance_work;
+        uc_config.max_maintenance_ms = config.cache.max_maintenance_ms;
         let mut uc = UnifiedCache::new(uc_config);
 
         // Initialize BoundStore for unified cache persistence
@@ -4728,6 +4729,11 @@ impl ConcurrentEngine {
     /// Update the max_maintenance_work budget on the live unified cache.
     pub fn set_max_maintenance_work(&self, v: usize) {
         self.unified_cache.lock().config_mut().max_maintenance_work = v;
+    }
+
+    /// Update the max_maintenance_ms time budget on the live unified cache.
+    pub fn set_max_maintenance_ms(&self, v: u64) {
+        self.unified_cache.lock().config_mut().max_maintenance_ms = v;
     }
 
     /// Clear unified cache entries and reset counters (RAM only).

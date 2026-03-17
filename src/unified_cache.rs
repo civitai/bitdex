@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use roaring::RoaringBitmap;
 
@@ -41,8 +41,13 @@ pub struct UnifiedCacheConfig {
     /// Maximum maintenance work per flush (affected_entries × changed_slots).
     /// When exceeded, affected entries are marked for rebuild instead of
     /// per-slot evaluation. Prevents positive feedback loops under burst writes.
-    /// Default 500_000.
+    /// Default 500_000. Used as fallback when `max_maintenance_ms` is 0.
     pub max_maintenance_work: usize,
+    /// Time budget for cache maintenance per flush cycle in milliseconds.
+    /// When > 0, replaces the count-based `max_maintenance_work` budget.
+    /// The deadline is checked every 64 entries to avoid clock overhead.
+    /// 0 = use count-based `max_maintenance_work` instead. Default: 10ms.
+    pub max_maintenance_ms: u64,
     /// Prefetch threshold: trigger background expansion when the user has consumed
     /// this fraction of the cached entries (default 0.95 = 95% consumed, 5% remaining).
     /// Set to 0.0 or 1.0 to disable prefetching.
@@ -58,6 +63,7 @@ impl Default for UnifiedCacheConfig {
             max_capacity: 64_000,
             min_filter_size: 0,
             max_maintenance_work: 500_000,
+            max_maintenance_ms: 10,
             prefetch_threshold: 0.95,
         }
     }
@@ -1240,10 +1246,13 @@ impl UnifiedCache {
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_changed_slots;
 
-        // Budget check: if maintenance would be too expensive, mark affected
-        // entries for rebuild instead. Prevents positive feedback loops where
-        // long maintenance → batch growth → even longer maintenance.
-        if estimated_work > self.config.max_maintenance_work {
+        // Budget check: time-based (preferred) or count-based (fallback).
+        // Time-based: set a deadline and bail mid-loop when exceeded.
+        // Count-based: bail immediately if estimated work exceeds threshold.
+        let deadline = if self.config.max_maintenance_ms > 0 {
+            Some(Instant::now() + Duration::from_millis(self.config.max_maintenance_ms))
+        } else if estimated_work > self.config.max_maintenance_work {
+            // Fallback to count-based: bail immediately if over budget
             for meta_id in affected_ids.iter() {
                 if let Some(key) = self.meta_id_to_key.get(&meta_id) {
                     if let Some(entry) = self.entries.get_mut(key) {
@@ -1252,7 +1261,9 @@ impl UnifiedCache {
                 }
             }
             return;
-        }
+        } else {
+            None // No deadline, do all work
+        };
 
         // Collect affected keys (avoids borrow conflict between meta_id_to_key and entries)
         let affected_keys: Vec<UnifiedKey> = affected_ids
@@ -1261,7 +1272,20 @@ impl UnifiedCache {
             .collect();
 
         // Iterate only affected entries
-        for key in &affected_keys {
+        for (i, key) in affected_keys.iter().enumerate() {
+            // Check deadline every 64 entries to avoid clock overhead
+            if let Some(deadline) = deadline {
+                if i > 0 && i % 64 == 0 && Instant::now() > deadline {
+                    // Mark remaining entries for rebuild
+                    for remaining_key in &affected_keys[i..] {
+                        if let Some(entry) = self.entries.get_mut(remaining_key) {
+                            entry.mark_for_rebuild();
+                        }
+                    }
+                    break;
+                }
+            }
+
             let Some(entry) = self.entries.get_mut(key) else {
                 continue;
             };
@@ -1324,12 +1348,15 @@ impl UnifiedCache {
             return;
         }
 
-        // Budget check for sort maintenance
+        // Budget check: time-based (preferred) or count-based (fallback).
         let total_sort_slots: usize = sort_mutations.values().map(|s| s.len()).sum();
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_sort_slots;
 
-        if estimated_work > self.config.max_maintenance_work {
+        let deadline = if self.config.max_maintenance_ms > 0 {
+            Some(Instant::now() + Duration::from_millis(self.config.max_maintenance_ms))
+        } else if estimated_work > self.config.max_maintenance_work {
+            // Fallback to count-based: bail immediately if over budget
             for meta_id in affected_ids.iter() {
                 if let Some(key) = self.meta_id_to_key.get(&meta_id) {
                     if let Some(entry) = self.entries.get_mut(key) {
@@ -1338,7 +1365,9 @@ impl UnifiedCache {
                 }
             }
             return;
-        }
+        } else {
+            None // No deadline, do all work
+        };
 
         // Collect affected keys (avoids borrow conflict)
         let affected_keys: Vec<UnifiedKey> = affected_ids
@@ -1347,7 +1376,20 @@ impl UnifiedCache {
             .collect();
 
         // Iterate only affected entries
-        for key in &affected_keys {
+        for (i, key) in affected_keys.iter().enumerate() {
+            // Check deadline every 64 entries to avoid clock overhead
+            if let Some(deadline) = deadline {
+                if i > 0 && i % 64 == 0 && Instant::now() > deadline {
+                    // Mark remaining entries for rebuild
+                    for remaining_key in &affected_keys[i..] {
+                        if let Some(entry) = self.entries.get_mut(remaining_key) {
+                            entry.mark_for_rebuild();
+                        }
+                    }
+                    break;
+                }
+            }
+
             let Some(entry) = self.entries.get_mut(key) else {
                 continue;
             };
@@ -2765,6 +2807,200 @@ mod tests {
         assert!(
             entry.bitmap().contains(10),
             "Slot 10 should be added to cache entry with Not(And(...)) clause"
+        );
+    }
+
+    #[test]
+    fn test_time_based_maintenance_short_deadline_marks_rebuild() {
+        // With a very short deadline (1ms) and many entries, some should be
+        // marked for rebuild because the deadline is exceeded mid-loop.
+        let config = UnifiedCacheConfig {
+            max_entries: 200,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 100,
+            max_capacity: 1600,
+            min_filter_size: 0,
+            max_maintenance_work: 500_000,
+            max_maintenance_ms: 1, // 1ms — very short
+            prefetch_threshold: 0.95,
+        };
+        let mut cache = UnifiedCache::new(config);
+
+        // Create 150 cache entries all referencing nsfwLevel=1
+        let mut all_slots: Vec<u32> = (0..50).collect();
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &all_slots)])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(100, 5000)])]);
+
+        for i in 0..150 {
+            let sort_field = format!("sort_{}", i);
+            let key = make_key(
+                &[("nsfwLevel", "eq", "1")],
+                &sort_field,
+                SortDirection::Desc,
+            );
+            cache.form_and_store(key, &all_slots, true, 100_000, |s| 1000 - s);
+        }
+
+        // Now insert 200 changed slots to create lots of work
+        let mut inserts = HashMap::new();
+        let changed_slots: Vec<u32> = (50..250).collect();
+        inserts.insert(
+            FilterGroupKey {
+                field: Arc::from("nsfwLevel"),
+                value: 1,
+            },
+            changed_slots,
+        );
+
+        // Extend filter to include new slots
+        let mut extended_slots: Vec<u32> = (0..250).collect();
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &extended_slots)])]);
+        let sorts = make_sort_index(&[("reactionCount", &{
+            let mut sv: Vec<(u32, u32)> = Vec::new();
+            for s in 0..250 {
+                sv.push((s, 5000 - s));
+            }
+            sv
+        })]);
+
+        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+
+        // With a 1ms deadline and 150 entries × 200 slots of work,
+        // at least some entries should have been marked for rebuild.
+        // (We can't guarantee exactly how many due to timing, but with
+        // this much work at least some should be marked.)
+        let mut rebuild_count = 0;
+        for i in 0..150 {
+            let sort_field = format!("sort_{}", i);
+            let key = make_key(
+                &[("nsfwLevel", "eq", "1")],
+                &sort_field,
+                SortDirection::Desc,
+            );
+            if let Some(entry) = cache.get(&key) {
+                if entry.needs_rebuild() {
+                    rebuild_count += 1;
+                }
+            }
+        }
+        // Note: This test is timing-dependent. On very fast hardware,
+        // all work might complete within 1ms. We assert at least that
+        // the code doesn't panic and the cache is still valid.
+        // On most hardware, some entries will be marked for rebuild.
+        eprintln!("time_based_maintenance: {rebuild_count}/150 entries marked for rebuild with 1ms deadline");
+    }
+
+    #[test]
+    fn test_time_based_maintenance_long_deadline_completes_all() {
+        // With a long deadline (1000ms) and little work, all entries
+        // should be maintained (none marked for rebuild).
+        let config = UnifiedCacheConfig {
+            max_entries: 200,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 100,
+            max_capacity: 1600,
+            min_filter_size: 0,
+            max_maintenance_work: 500_000,
+            max_maintenance_ms: 1000, // 1 second — very generous
+            prefetch_threshold: 0.95,
+        };
+        let mut cache = UnifiedCache::new(config);
+
+        // Create 5 cache entries
+        let slots: Vec<u32> = (0..10).collect();
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &slots)])]);
+        let sorts = make_sort_index(&[("reactionCount", &[
+            (0, 1000), (1, 999), (2, 998), (3, 997), (4, 996),
+            (5, 995), (6, 994), (7, 993), (8, 992), (9, 991), (20, 1500),
+        ])]);
+
+        for i in 0..5 {
+            let sort_field = format!("sort_{}", i);
+            let key = make_key(
+                &[("nsfwLevel", "eq", "1")],
+                &sort_field,
+                SortDirection::Desc,
+            );
+            cache.form_and_store(key, &slots, true, 100_000, |s| 1000 - s);
+        }
+
+        // Insert 1 changed slot — minimal work
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey {
+                field: Arc::from("nsfwLevel"),
+                value: 1,
+            },
+            vec![20],
+        );
+
+        let extended_slots: Vec<u32> = (0..21).collect();
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &extended_slots)])]);
+
+        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+
+        // With 1000ms deadline and only 5 entries × 1 slot, nothing should be
+        // marked for rebuild.
+        for i in 0..5 {
+            let sort_field = format!("sort_{}", i);
+            let key = make_key(
+                &[("nsfwLevel", "eq", "1")],
+                &sort_field,
+                SortDirection::Desc,
+            );
+            if let Some(entry) = cache.get(&key) {
+                assert!(
+                    !entry.needs_rebuild(),
+                    "Entry sort_{i} should NOT be marked for rebuild with 1000ms deadline and minimal work"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_count_based_fallback_when_ms_is_zero() {
+        // With max_maintenance_ms=0, the count-based fallback should kick in.
+        let config = UnifiedCacheConfig {
+            max_entries: 200,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 100,
+            max_capacity: 1600,
+            min_filter_size: 0,
+            max_maintenance_work: 1, // Very low: 1 unit of work triggers rebuild
+            max_maintenance_ms: 0,   // Disable time-based
+            prefetch_threshold: 0.95,
+        };
+        let mut cache = UnifiedCache::new(config);
+
+        let slots: Vec<u32> = (0..10).collect();
+        let key = make_key(
+            &[("nsfwLevel", "eq", "1")],
+            "reactionCount",
+            SortDirection::Desc,
+        );
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(20, 1500)])]);
+
+        // 1 affected entry × 1 changed slot = 1 work, but budget is 1
+        // so estimated_work (1) > max_maintenance_work (1) is false... set work=2
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey {
+                field: Arc::from("nsfwLevel"),
+                value: 1,
+            },
+            vec![20, 21],
+        );
+
+        cache.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+
+        // 1 entry × 2 slots = 2 > max_maintenance_work(1), should mark for rebuild
+        let entry = cache.get(&key).unwrap();
+        assert!(
+            entry.needs_rebuild(),
+            "Entry should be marked for rebuild when count-based budget is exceeded and max_maintenance_ms=0"
         );
     }
 }

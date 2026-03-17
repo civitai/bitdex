@@ -360,8 +360,14 @@ pub struct CacheConfig {
     /// Maximum maintenance work per flush (affected_entries x changed_slots).
     /// When exceeded, affected entries are marked for rebuild instead of
     /// per-slot evaluation. Default 500_000.
+    /// Used as fallback when `max_maintenance_ms` is 0.
     #[serde(default = "default_max_maintenance_work")]
     pub max_maintenance_work: usize,
+    /// Time budget for cache maintenance per flush cycle in milliseconds.
+    /// When > 0, replaces the count-based `max_maintenance_work` budget.
+    /// 0 = use count-based `max_maintenance_work` instead. Default: 10ms.
+    #[serde(default = "default_max_maintenance_ms")]
+    pub max_maintenance_ms: u64,
 }
 
 fn default_cache_max_entries() -> usize {
@@ -388,6 +394,9 @@ fn default_preload_bounds() -> bool {
 fn default_max_maintenance_work() -> usize {
     500_000
 }
+fn default_max_maintenance_ms() -> u64 {
+    10
+}
 
 impl Default for CacheConfig {
     fn default() -> Self {
@@ -400,6 +409,7 @@ impl Default for CacheConfig {
             prefetch_threshold: default_prefetch_threshold(),
             preload_bounds: default_preload_bounds(),
             max_maintenance_work: default_max_maintenance_work(),
+            max_maintenance_ms: default_max_maintenance_ms(),
         }
     }
 }
