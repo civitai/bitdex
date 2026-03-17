@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -272,7 +272,7 @@ struct AppState {
     index: Mutex<Option<IndexState>>,
     metrics: Metrics,
     parser_registry: crate::parser::registry::ParserRegistry,
-    enable_traces: bool,
+    enable_traces: AtomicBool,
     admin_token: Option<String>,
     trace_buffer: crate::query_metrics::TraceBuffer,
     /// Number of queries currently executing (incremented on entry, decremented on exit).
@@ -722,6 +722,9 @@ struct ConfigPatch {
     /// Update the query concurrency limit. 0 = unlimited (no backpressure).
     #[serde(default)]
     max_query_concurrency: Option<u32>,
+    /// Toggle query trace collection on/off without restart.
+    #[serde(default)]
+    enable_traces: Option<bool>,
 }
 
 /// Patchable fields for a filter field.
@@ -826,7 +829,7 @@ impl BitdexServer {
             index: Mutex::new(None),
             metrics: Metrics::new(),
             parser_registry: registry,
-            enable_traces: self.enable_traces,
+            enable_traces: AtomicBool::new(self.enable_traces),
             admin_token,
             trace_buffer: crate::query_metrics::TraceBuffer::default(),
             queries_in_flight: AtomicI64::new(0),
@@ -1488,6 +1491,12 @@ async fn handle_patch_config(
                     eprintln!("Config patch: max_query_concurrency set to {v}");
                 }
 
+                // Toggle trace collection (server-wide, not persisted with index config)
+                if let Some(v) = patch.enable_traces {
+                    state.enable_traces.store(v, Ordering::Relaxed);
+                    eprintln!("Config patch: enable_traces set to {v}");
+                }
+
                 // Persist updated config.json
                 let index_dir = state.data_dir.join("indexes").join(&name);
                 let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
@@ -1891,7 +1900,7 @@ async fn handle_query(
             );
 
             // Write trace to JSONL in background (non-blocking), if enabled
-            if state.enable_traces {
+            if state.enable_traces.load(Ordering::Relaxed) {
                 state.trace_buffer.push(trace.clone());
             }
 
@@ -2378,6 +2387,7 @@ async fn handle_stats(
         "queries_in_flight_peak": state.queries_in_flight_peak.load(Ordering::Relaxed),
         "queries_rejected": state.metrics.queries_rejected_total.get(),
         "max_query_concurrency": state.max_query_concurrency.load(Ordering::Relaxed),
+        "enable_traces": state.enable_traces.load(Ordering::Relaxed),
     })).into_response()
 }
 

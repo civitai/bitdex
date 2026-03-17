@@ -28,7 +28,7 @@ Authorization: Bearer <your-admin-token>
 |--------|----------|-------------|
 | POST | `/api/indexes` | Create index |
 | DELETE | `/api/indexes/{name}` | Delete index |
-| PATCH | `/api/indexes/{name}/config` | Patch config (eager_load, cache) |
+| PATCH | `/api/indexes/{name}/config` | Patch config (eager_load, cache, traces, backpressure) |
 | POST | `/api/indexes/{name}/load` | Bulk load NDJSON |
 | POST | `/api/indexes/{name}/documents` | Batch insert |
 | DELETE | `/api/indexes/{name}/documents` | Delete by ID |
@@ -220,7 +220,8 @@ Applies a partial config update to a running index. Only fields present in the r
     "max_maintenance_ms": 100,
     "max_maintenance_work": 500000
   },
-  "max_query_concurrency": 16
+  "max_query_concurrency": 16,
+  "enable_traces": true
 }
 ```
 
@@ -246,6 +247,12 @@ Controls how the unified cache behaves — how many entries to keep, how aggress
 | `max_maintenance_ms` | integer | 10 | Time budget (ms) for cache maintenance per flush cycle. The flush thread updates cache entries to reflect mutations (add/remove slots). When the deadline is exceeded, remaining entries are marked for rebuild on next query. Higher = more entries stay maintained. Set to 0 to fall back to count-based budget |
 | `max_maintenance_work` | integer | 500000 | Count-based fallback budget when `max_maintenance_ms` is 0. Number of slot-level operations per flush cycle |
 
+#### Tracing
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable_traces` | bool | false | Toggle query trace collection on/off. Traces are stored in an in-memory ring buffer (1000 entries, ~1MB). Readable via `GET /api/indexes/{name}/traces`. Overhead is ~1-2us per query when enabled |
+
 #### Backpressure
 
 | Field | Type | Default | Description |
@@ -257,6 +264,7 @@ Controls how the unified cache behaves — how many entries to keep, how aggress
 - `eager_load` changes from `true` to `false` take effect on next restart (loaded fields remain in memory).
 - `cache` settings take effect immediately on the running engine — no restart needed.
 - `max_query_concurrency` takes effect immediately via atomic store.
+- `enable_traces` takes effect immediately via atomic store.
 
 **Operational examples:**
 
@@ -280,6 +288,16 @@ curl -X PATCH .../api/indexes/civitai/config \
 curl -X PATCH .../api/indexes/civitai/config \
   -H 'Authorization: Bearer TOKEN' \
   -d '{"filter_fields": {"postId": {"eager_load": true}}}'
+
+# Enable query tracing
+curl -X PATCH .../api/indexes/civitai/config \
+  -H 'Authorization: Bearer TOKEN' \
+  -d '{"enable_traces": true}'
+
+# Disable query tracing
+curl -X PATCH .../api/indexes/civitai/config \
+  -H 'Authorization: Bearer TOKEN' \
+  -d '{"enable_traces": false}'
 ```
 
 **Response:** `200 OK`
