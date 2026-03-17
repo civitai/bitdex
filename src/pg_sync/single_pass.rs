@@ -932,9 +932,8 @@ fn append_image_docstore_tuples(
     // Sort fields
     let sort_at = row.sort_at_secs() as i64;
     append_int!("sortAt", sort_at);
-    append_int!("sortAtUnix", sort_at * 1000);
-    let published_at_ms = row.published_at_secs.unwrap_or(0) * 1000;
-    append_int!("publishedAtUnix", published_at_ms);
+    let published_at_secs = row.published_at_secs.unwrap_or(0);
+    append_int!("publishedAt", published_at_secs);
 
     // isPublished
     let published = row.published_at_secs.unwrap_or(0) > 0;
