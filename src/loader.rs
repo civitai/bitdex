@@ -804,6 +804,31 @@ pub fn json_to_document_with_dicts(
             }
         };
 
+        // Null source values: write explicit defaults so the V2 docstore
+        // LIFO scan doesn't find stale old values. For fields without a
+        // default, null is a schema violation → return error.
+        if raw.is_null() {
+            match mapping.value_type {
+                FieldValueType::ExistsBoolean => {
+                    fields.insert(mapping.target.clone(), FieldValue::Single(Value::Bool(false)));
+                }
+                _ => {
+                    if let Some(ref dv) = mapping.default_value {
+                        let dict = dictionaries.and_then(|d| d.get(&mapping.target));
+                        if let Some(fv) = convert_field_with_dict(dv, mapping, false, dict) {
+                            fields.insert(mapping.target.clone(), fv);
+                        }
+                    } else if !mapping.doc_only {
+                        return Err(format!(
+                            "field '{}' (source '{}') is null but has no default",
+                            mapping.target, mapping.source
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+
         let dict = dictionaries.and_then(|d| d.get(&mapping.target));
         if let Some(fv) = convert_field_with_dict(raw, mapping, apply_ms, dict) {
             fields.insert(mapping.target.clone(), fv);

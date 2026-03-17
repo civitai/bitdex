@@ -2174,7 +2174,7 @@ async fn handle_filter_sync(
             Some(idx) if idx.definition.name == name => {
                 let is_multi_value = idx.definition.config.filter_fields.iter().any(|f| {
                     f.name == req.field
-                        && matches!(f.field_type, crate::config::FilterFieldType::MultiValue)
+                        && matches!(f.field_type, crate::filter::FilterFieldType::MultiValue)
                 });
                 let is_filter_only = idx.definition.data_schema.fields.iter().any(|f| {
                     f.target == req.field && f.filter_only
