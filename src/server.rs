@@ -2334,7 +2334,11 @@ async fn handle_stats(
         }
     };
 
-    let (slot_bytes, filter_bytes, sort_bytes, _, _, _, _) = engine.bitmap_memory_report();
+    // Run expensive bitmap traversal on a blocking thread to avoid starving the async runtime
+    let engine2 = Arc::clone(&engine);
+    let (slot_bytes, filter_bytes, sort_bytes) = tokio::task::spawn_blocking(move || {
+        engine2.bitmap_memory_totals()
+    }).await.unwrap_or((0, 0, 0));
     let uc = engine.unified_cache_stats();
     let entries: Vec<serde_json::Value> = engine.unified_cache_entry_details().into_iter().map(|e| {
         serde_json::json!({

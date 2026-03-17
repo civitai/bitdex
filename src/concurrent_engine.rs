@@ -1224,8 +1224,14 @@ impl ConcurrentEngine {
                                     }
                                 }
                                 let merge_elapsed = t_merge.elapsed();
+                                // NOTE: Do NOT clear the unified cache here. ForcePublish
+                                // is used by lazy loading (ensure_fields_loaded) to publish
+                                // newly loaded bitmaps. Lazy loads don't invalidate existing
+                                // cache entries — they only add new data. Clearing here was
+                                // nuking the entire cache on every lazy load, causing 0% hit
+                                // rate in production. Cache invalidation is handled by the
+                                // normal flush path's targeted maintenance.
                                 let t_cache = std::time::Instant::now();
-                                flush_unified_cache.lock().clear();
                                 let cache_elapsed = t_cache.elapsed();
                                 let t_clone = std::time::Instant::now();
                                 inner.store(Arc::new(staging.clone()));
@@ -4715,6 +4721,15 @@ impl ConcurrentEngine {
     ///          filter_details, sort_details)
     /// where all sizes are serialized bitmap bytes — no allocator or redb overhead.
     #[allow(clippy::type_complexity)]
+    /// Lightweight memory totals — skips per-field detail for fast stats endpoint.
+    pub fn bitmap_memory_totals(&self) -> (usize, usize, usize) {
+        let snap = self.snapshot();
+        let slot_bytes = snap.slots.bitmap_bytes();
+        let filter_bytes = snap.filters.bitmap_bytes();
+        let sort_bytes = snap.sorts.bitmap_bytes();
+        (slot_bytes, filter_bytes, sort_bytes)
+    }
+
     pub fn bitmap_memory_report(
         &self,
     ) -> (usize, usize, usize, usize, usize, Vec<(String, usize, usize)>, Vec<(String, usize)>) {
