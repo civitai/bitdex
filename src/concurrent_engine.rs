@@ -334,11 +334,11 @@ impl ConcurrentEngine {
                 // Fields with no saved bitmaps don't need lazy loading.
                 if counter_val > 0 {
                     for fc in &config.filter_fields {
-                        if fc.field_type == FilterFieldType::MultiValue {
-                            // High-cardinality: per-value lazy loading
+                        if fc.field_type == FilterFieldType::MultiValue && !fc.eager_load {
+                            // High-cardinality without eager_load: per-value lazy loading
                             lazy_value_fields.insert(fc.name.clone());
                         } else {
-                            // Low-cardinality (single_value, boolean): full-field loading
+                            // Low-cardinality, boolean, or eager_load multi_value: full-field loading
                             pending_filter_loads.insert(fc.name.clone());
                         }
                     }
@@ -734,9 +734,9 @@ impl ConcurrentEngine {
 
         // Eviction-enabled fields must always be in lazy_value_fields so that
         // ensure_fields_loaded() can reload values after eviction, even when the
-        // engine wasn't restored from disk.
+        // engine wasn't restored from disk. Skip if eager_load — user wants everything in memory.
         for fc in &config.filter_fields {
-            if fc.eviction.is_some() && fc.field_type == FilterFieldType::MultiValue {
+            if fc.eviction.is_some() && fc.field_type == FilterFieldType::MultiValue && !fc.eager_load {
                 lazy_value_fields.insert(fc.name.clone());
                 // Ensure existence set exists (empty if no bitmap store)
                 existing_keys.entry(fc.name.clone()).or_insert_with(|| {
