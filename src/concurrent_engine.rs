@@ -2402,11 +2402,15 @@ impl ConcurrentEngine {
         self.in_flight.mark_in_flight(slot);
 
         let result = (|| -> Result<()> {
-            // Verify slot is alive
+            // Skip if slot is not alive — the image hasn't been inserted yet.
+            // The next outbox event for this image will trigger a PATCH (which
+            // now falls through to PUT), and that will handle the full insert.
+            // Setting filter bitmaps before the slot is alive would be pointless
+            // since queries require alive status.
             {
                 let snap = self.snapshot();
                 if !snap.slots.is_alive(slot) {
-                    return Err(crate::error::BitdexError::SlotNotFound(slot));
+                    return Ok(());
                 }
             }
 
@@ -8855,12 +8859,12 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_filter_values_slot_not_found() {
+    fn test_sync_filter_values_slot_not_alive_skips() {
         let mut engine = ConcurrentEngine::new(test_config()).unwrap();
 
-        // Sync on non-existent slot should error
+        // Sync on non-existent slot should skip silently (not error)
         let result = engine.sync_filter_values(999, "tagIds", &[100]);
-        assert!(result.is_err());
+        assert!(result.is_ok(), "sync_filter_values should skip non-alive slots");
 
         engine.shutdown();
     }
