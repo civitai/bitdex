@@ -195,6 +195,11 @@ pub struct ConcurrentEngine {
     flush_handle: Option<JoinHandle<()>>,
     merge_handle: Option<JoinHandle<()>>,
     bitmap_store: Option<Arc<BitmapFs>>,
+    /// ShardStore instances (constructed alongside bitmap_store during migration).
+    alive_store: Option<Arc<crate::shard_store_bitmap::AliveBitmapStore>>,
+    filter_store: Option<Arc<crate::shard_store_bitmap::FilterBitmapStore>>,
+    sort_store: Option<Arc<crate::shard_store_bitmap::SortBitmapStore>>,
+    meta_store: Option<Arc<crate::shard_store_meta::MetaStore>>,
     loading_mode: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
     time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
@@ -316,6 +321,27 @@ impl ConcurrentEngine {
             Some(Arc::new(BitmapFs::new(path)?))
         } else {
             None
+        };
+
+        // Construct ShardStore instances alongside BitmapFs (migration: both exist during swap)
+        let (alive_store, filter_store, sort_store, meta_store) = if let Some(ref path) = config.storage.bitmap_path {
+            let ss_root = path.join("shardstore");
+            use crate::error::BitdexError;
+            (
+                Some(Arc::new(crate::shard_store_bitmap::AliveBitmapStore::new(
+                    ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
+                ).map_err(|e| BitdexError::DocStore(format!("alive store init: {e}")))?)),
+                Some(Arc::new(crate::shard_store_bitmap::FilterBitmapStore::new(
+                    ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
+                ).map_err(|e| BitdexError::DocStore(format!("filter store init: {e}")))?)),
+                Some(Arc::new(crate::shard_store_bitmap::SortBitmapStore::new(
+                    ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
+                ).map_err(|e| BitdexError::DocStore(format!("sort store init: {e}")))?)),
+                Some(Arc::new(crate::shard_store_meta::MetaStore::new(ss_root)
+                    .map_err(|e| BitdexError::DocStore(format!("meta store init: {e}")))?)),
+            )
+        } else {
+            (None, None, None, None)
         };
 
         // Track which fields need lazy loading from disk.
@@ -826,6 +852,10 @@ impl ConcurrentEngine {
                 flush_handle: None,
                 merge_handle: None,
                 bitmap_store,
+                alive_store: alive_store.clone(),
+                filter_store: filter_store.clone(),
+                sort_store: sort_store.clone(),
+                meta_store: meta_store.clone(),
                 loading_mode,
                 dirty_since_snapshot: dirty_flag,
                 time_buckets,
@@ -2121,6 +2151,10 @@ impl ConcurrentEngine {
             flush_handle: Some(flush_handle),
             merge_handle: Some(merge_handle),
             bitmap_store,
+            alive_store,
+            filter_store,
+            sort_store,
+            meta_store,
             loading_mode,
             dirty_since_snapshot: Arc::clone(&dirty_flag),
             time_buckets,
