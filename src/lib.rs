@@ -18,6 +18,7 @@ pub mod parser;
 pub mod planner;
 pub mod query;
 pub mod query_metrics;
+pub mod field_handler;
 pub mod radix_sort;
 pub mod shard_store;
 pub mod shard_store_bitmap;
