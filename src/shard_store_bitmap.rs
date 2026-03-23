@@ -191,12 +191,13 @@ pub struct FilterShardKey {
     pub value: u64,
 }
 
-/// Maps (field, value) to hex-bucketed filter bitmap files.
+/// Maps (field, value) to per-value filter bitmap files within hex-bucketed directories.
 ///
-/// Layout: `{gen_root}/filter/{field}/{xx}.shard`
-/// where xx = (value >> 8) & 0xFF.
+/// Layout: `{gen_root}/filter/{field}/{xx}/{value}.shard`
+/// where xx = (value >> 8) & 0xFF (bucket directory), value = decimal u64.
 ///
-/// This matches the existing BitmapFs .fpack directory structure.
+/// Each value gets its own shard file (one bitmap per file). The hex bucket
+/// directory keeps each directory under ~1000 files for high-cardinality fields.
 pub struct FieldValueBucketShard;
 
 impl ShardingStrategy for FieldValueBucketShard {
@@ -207,7 +208,8 @@ impl ShardingStrategy for FieldValueBucketShard {
         gen_root
             .join("filter")
             .join(&key.field)
-            .join(format!("{:02x}.shard", bucket))
+            .join(format!("{:02x}", bucket))
+            .join(format!("{}.shard", key.value))
     }
 
     fn list_shards(&self, gen_root: &Path) -> io::Result<Vec<FilterShardKey>> {
@@ -224,18 +226,25 @@ impl ShardingStrategy for FieldValueBucketShard {
                 continue;
             }
             let field_name = field_entry.file_name().to_string_lossy().into_owned();
-            for shard_entry in std::fs::read_dir(field_entry.path())? {
-                let shard_entry = shard_entry?;
-                let name = shard_entry.file_name().to_string_lossy().into_owned();
-                if let Some(hex_str) = name.strip_suffix(".shard") {
-                    if let Ok(bucket) = u8::from_str_radix(hex_str, 16) {
-                        // We can't recover the exact value from the bucket,
-                        // but we can return a representative key for enumeration.
-                        // The bucket represents values where (value >> 8) & 0xFF == bucket.
-                        keys.push(FilterShardKey {
-                            field: field_name.clone(),
-                            value: (bucket as u64) << 8,
-                        });
+
+            // Iterate bucket directories
+            for bucket_entry in std::fs::read_dir(field_entry.path())? {
+                let bucket_entry = bucket_entry?;
+                if !bucket_entry.file_type()?.is_dir() {
+                    continue;
+                }
+
+                // Iterate value files within bucket
+                for value_entry in std::fs::read_dir(bucket_entry.path())? {
+                    let value_entry = value_entry?;
+                    let name = value_entry.file_name().to_string_lossy().into_owned();
+                    if let Some(val_str) = name.strip_suffix(".shard") {
+                        if let Ok(value) = val_str.parse::<u64>() {
+                            keys.push(FilterShardKey {
+                                field: field_name.clone(),
+                                value,
+                            });
+                        }
                     }
                 }
             }
@@ -334,6 +343,23 @@ impl ShardingStrategy for SingletonShard {
 /// ShardStore for filter bitmaps (one bitmap per field+value).
 pub type FilterBitmapStore = crate::shard_store::ShardStore<BitmapSnapshotCodec, BitmapOpCodec, FieldValueBucketShard>;
 
+impl FilterBitmapStore {
+    /// List all known values for a field across all generations.
+    ///
+    /// This is the existence set — used to eliminate disk I/O for queries
+    /// on nonexistent values (<22μs check vs 30-50ms disk read).
+    ///
+    /// Only reads directory listings, not bitmap data.
+    pub fn existence_set(&self, field: &str) -> io::Result<std::collections::HashSet<u64>> {
+        let all_shards = self.list_all_shards()?;
+        Ok(all_shards
+            .into_iter()
+            .filter(|k| k.field == field)
+            .map(|k| k.value)
+            .collect())
+    }
+}
+
 /// ShardStore for sort layer bitmaps (one bitmap per field+bit_position).
 pub type SortBitmapStore = crate::shard_store::ShardStore<BitmapSnapshotCodec, BitmapOpCodec, SortLayerShard>;
 
@@ -426,9 +452,9 @@ mod tests {
     fn test_filter_shard_path() {
         let shard = FieldValueBucketShard;
         let key = FilterShardKey { field: "tagIds".into(), value: 0x0142 };
-        // bucket = (0x0142 >> 8) & 0xFF = 0x01
+        // bucket = (0x0142 >> 8) & 0xFF = 0x01, value = 322 decimal
         let path = shard.shard_path(&key, Path::new("/data/gen_000"));
-        assert_eq!(path, PathBuf::from("/data/gen_000/filter/tagIds/01.shard"));
+        assert_eq!(path, PathBuf::from("/data/gen_000/filter/tagIds/01/322.shard"));
     }
 
     #[test]
@@ -536,5 +562,70 @@ mod tests {
         let result = store.read(&key).unwrap().unwrap();
         assert_eq!(result.len(), 4);
         assert!(!result.contains(3));
+    }
+
+    #[test]
+    fn test_existence_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+
+        // Write bitmaps for 3 values of nsfwLevel
+        for value in [1u64, 2, 4] {
+            let key = FilterShardKey { field: "nsfwLevel".into(), value };
+            let mut bm = RoaringBitmap::new();
+            bm.insert(value as u32);
+            store.write_snapshot(&key, &bm).unwrap();
+        }
+
+        // Write 2 values of userId
+        for value in [100u64, 200] {
+            let key = FilterShardKey { field: "userId".into(), value };
+            let mut bm = RoaringBitmap::new();
+            bm.insert(value as u32);
+            store.write_snapshot(&key, &bm).unwrap();
+        }
+
+        // Existence set for nsfwLevel should have 3 values
+        let nsfw_set = store.existence_set("nsfwLevel").unwrap();
+        assert_eq!(nsfw_set.len(), 3);
+        assert!(nsfw_set.contains(&1));
+        assert!(nsfw_set.contains(&2));
+        assert!(nsfw_set.contains(&4));
+        assert!(!nsfw_set.contains(&3));
+
+        // Existence set for userId should have 2 values
+        let user_set = store.existence_set("userId").unwrap();
+        assert_eq!(user_set.len(), 2);
+
+        // Nonexistent field → empty set
+        let empty_set = store.existence_set("nonexistent").unwrap();
+        assert!(empty_set.is_empty());
+    }
+
+    #[test]
+    fn test_per_value_sharding_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+
+        // Two values that would collide under bucket-only sharding:
+        // value 0x0100 and 0x0142 both have bucket = 0x01
+        let key1 = FilterShardKey { field: "tags".into(), value: 0x0100 };
+        let key2 = FilterShardKey { field: "tags".into(), value: 0x0142 };
+
+        let mut bm1 = RoaringBitmap::new();
+        bm1.insert(1);
+        let mut bm2 = RoaringBitmap::new();
+        bm2.insert(2);
+
+        store.write_snapshot(&key1, &bm1).unwrap();
+        store.write_snapshot(&key2, &bm2).unwrap();
+
+        // Both should be independently readable
+        let r1 = store.read(&key1).unwrap().unwrap();
+        let r2 = store.read(&key2).unwrap().unwrap();
+        assert!(r1.contains(1));
+        assert!(!r1.contains(2));
+        assert!(r2.contains(2));
+        assert!(!r2.contains(1));
     }
 }
