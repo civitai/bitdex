@@ -947,6 +947,9 @@ impl BitdexServer {
             .route("/debug/capture/start", post(handle_capture_start))
             .route("/debug/capture/stop", post(handle_capture_stop))
             .route("/debug/capture/status", get(handle_capture_status))
+            .route("/debug/snapshot/{session_id}/package", post(handle_package_snapshot))
+            .route("/debug/snapshot/{session_id}/status", get(handle_package_status))
+            .route("/debug/snapshot/{session_id}/download", get(handle_package_download))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
             .with_state(Arc::clone(&state));
 
@@ -3210,6 +3213,89 @@ async fn handle_capture_status(
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
     Json(serde_json::json!(state.capture.status()))
+}
+
+/// POST /debug/snapshot/{session_id}/package — Start packaging a captured session.
+async fn handle_package_snapshot(
+    State(state): State<SharedState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let (session_dir, pkg_state) = match state.capture.start_package(&session_id) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response();
+        }
+    };
+
+    // Spawn blocking task for tar.zst creation
+    let pkg_state_clone = pkg_state.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::capture::create_package(&session_dir, &pkg_state_clone) {
+            *pkg_state_clone.lock().unwrap() = crate::capture::PackageState::Failed { error: e };
+        }
+    });
+
+    Json(serde_json::json!({
+        "status": "packaging",
+        "session_id": session_id,
+    })).into_response()
+}
+
+/// GET /debug/snapshot/{session_id}/status — Get packaging progress.
+async fn handle_package_status(
+    State(state): State<SharedState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.capture.package_state(&session_id) {
+        Some(pkg_state) => Json(serde_json::json!({
+            "session_id": session_id,
+            "package": pkg_state,
+        })).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("no package for session '{session_id}'")})),
+        ).into_response(),
+    }
+}
+
+/// GET /debug/snapshot/{session_id}/download — Stream the packaged tar.zst.
+async fn handle_package_download(
+    State(state): State<SharedState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let path = match state.capture.package_path(&session_id) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "package not ready or not found"})),
+            ).into_response();
+        }
+    };
+
+    // Stream the file
+    match tokio::fs::File::open(&path).await {
+        Ok(file) => {
+            let stream = tokio_util::io::ReaderStream::new(file);
+            let body = axum::body::Body::from_stream(stream);
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("snapshot.tar.zst");
+            axum::response::Response::builder()
+                .header("content-type", "application/zstd")
+                .header("content-disposition", format!("attachment; filename=\"{filename}\""))
+                .body(body)
+                .unwrap()
+                .into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("open package file: {e}")})),
+            ).into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -142,6 +142,8 @@ pub struct CaptureManager {
     base_dir: PathBuf,
     /// Active caplog writer (only Some when recording).
     caplog: Mutex<Option<CaplogWriter>>,
+    /// Package states keyed by session_id.
+    packages: Mutex<std::collections::HashMap<String, SharedPackageState>>,
 }
 
 impl CaptureManager {
@@ -153,6 +155,7 @@ impl CaptureManager {
             requests_counter: AtomicU64::new(0),
             base_dir,
             caplog: Mutex::new(None),
+            packages: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -298,11 +301,164 @@ impl CaptureManager {
         guard.as_ref().map(|s| s.session_dir.clone())
     }
 
+    /// Start packaging a session. Returns the shared state for status polling.
+    /// The caller should spawn a blocking task that calls `create_package()`.
+    pub fn start_package(&self, session_id: &str) -> Result<(PathBuf, SharedPackageState), CaptureError> {
+        // Find the session dir
+        let session_dir = self.base_dir.join(session_id);
+        if !session_dir.is_dir() {
+            return Err(CaptureError::Io(format!("session dir not found: {}", session_dir.display())));
+        }
+
+        // Check if already packaging
+        let mut packages = self.packages.lock();
+        if let Some(existing) = packages.get(session_id) {
+            let state = existing.lock().unwrap();
+            match &*state {
+                PackageState::Compressing => return Err(CaptureError::Io("packaging already in progress".into())),
+                PackageState::Ready { .. } => return Err(CaptureError::Io("package already exists".into())),
+                _ => {}
+            }
+        }
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(PackageState::Pending));
+        packages.insert(session_id.to_string(), state.clone());
+        Ok((session_dir, state))
+    }
+
+    /// Get the package state for a session.
+    pub fn package_state(&self, session_id: &str) -> Option<PackageState> {
+        let packages = self.packages.lock();
+        packages.get(session_id).map(|s| s.lock().unwrap().clone())
+    }
+
+    /// Get the path to a completed package file.
+    pub fn package_path(&self, session_id: &str) -> Option<PathBuf> {
+        let packages = self.packages.lock();
+        if let Some(state) = packages.get(session_id) {
+            if let PackageState::Ready { ref path, .. } = *state.lock().unwrap() {
+                return Some(PathBuf::from(path));
+            }
+        }
+        None
+    }
+
     /// Reset to idle state, discarding the current session reference.
     pub fn reset(&self) {
         let mut guard = self.session.lock();
         *guard = None;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot packaging: tar.zst creation from captured session
+// ---------------------------------------------------------------------------
+
+/// Package creation state.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageState {
+    /// Not yet started.
+    Pending,
+    /// Compressing session data into tar.zst.
+    Compressing,
+    /// Package ready for download.
+    Ready {
+        path: String,
+        size_bytes: u64,
+    },
+    /// Packaging failed.
+    Failed {
+        error: String,
+    },
+}
+
+/// Shared package status, updated by the background task.
+pub type SharedPackageState = std::sync::Arc<std::sync::Mutex<PackageState>>;
+
+/// Create a tar.zst package from a capture session directory.
+/// Runs synchronously — call from a blocking task or spawn_blocking.
+///
+/// Walks the session directory and adds all files to a zstd-compressed tar archive.
+/// Output: `{session_dir}.snapshot.tar.zst`
+pub fn create_package(session_dir: &Path, state: &SharedPackageState) -> Result<PathBuf, String> {
+    // Update state: compressing
+    *state.lock().unwrap() = PackageState::Compressing;
+
+    // Write manifest.json
+    let manifest = serde_json::json!({
+        "session_id": session_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
+        "packaged_at": format_system_time(SystemTime::now()),
+        "files": list_session_files(session_dir),
+    });
+    let manifest_path = session_dir.join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default())
+        .map_err(|e| format!("write manifest: {e}"))?;
+
+    // Create tar.zst
+    let output_path = session_dir.with_extension("snapshot.tar.zst");
+    let file = std::fs::File::create(&output_path)
+        .map_err(|e| format!("create tar.zst: {e}"))?;
+    let zstd_encoder = zstd::Encoder::new(file, 3)
+        .map_err(|e| format!("zstd encoder: {e}"))?;
+    let mut tar_builder = tar::Builder::new(zstd_encoder);
+
+    // Walk session dir and add all files
+    let session_name = session_dir.file_name().and_then(|n| n.to_str()).unwrap_or("session");
+    for entry in walkdir(session_dir).map_err(|e| format!("walk session dir: {e}"))? {
+        let rel_path = entry.strip_prefix(session_dir)
+            .map_err(|e| format!("strip prefix: {e}"))?;
+        let archive_path = PathBuf::from(session_name).join(rel_path);
+        tar_builder.append_path_with_name(&entry, &archive_path)
+            .map_err(|e| format!("tar append {}: {e}", entry.display()))?;
+    }
+
+    let zstd_encoder = tar_builder.into_inner()
+        .map_err(|e| format!("tar finalize: {e}"))?;
+    zstd_encoder.finish()
+        .map_err(|e| format!("zstd finish: {e}"))?;
+
+    // Get output size
+    let size_bytes = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Update state: ready
+    *state.lock().unwrap() = PackageState::Ready {
+        path: output_path.display().to_string(),
+        size_bytes,
+    };
+
+    Ok(output_path)
+}
+
+/// Recursively list all files in a directory (non-recursive into subdirs for now).
+fn walkdir(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let mut files = Vec::new();
+    if !dir.is_dir() {
+        return Ok(files);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            files.push(path);
+        } else if path.is_dir() {
+            files.extend(walkdir(&path)?);
+        }
+    }
+    files.sort(); // Deterministic order
+    Ok(files)
+}
+
+/// List filenames in a session dir (for manifest).
+fn list_session_files(dir: &Path) -> Vec<String> {
+    walkdir(dir)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| p.strip_prefix(dir).ok())
+        .map(|p| p.display().to_string())
+        .collect()
 }
 
 /// Serializable capture status for the HTTP response.
