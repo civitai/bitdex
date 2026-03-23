@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -186,6 +186,8 @@ pub struct ConcurrentEngine {
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
     docstore: Arc<parking_lot::Mutex<DocStore>>,
+    /// Docstore root path, cached to avoid locking docstore just to read the path.
+    docstore_root: Arc<PathBuf>,
     config: Arc<Config>,
     field_registry: FieldRegistry,
     in_flight: InFlightTracker,
@@ -698,6 +700,7 @@ impl ConcurrentEngine {
             (None, None)
         };
 
+        let docstore_root = Arc::new(docstore.path().to_path_buf());
         let docstore = Arc::new(parking_lot::Mutex::new(docstore));
 
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
@@ -815,6 +818,7 @@ impl ConcurrentEngine {
                 sender,
                 doc_tx,
                 docstore,
+                docstore_root: Arc::clone(&docstore_root),
                 config,
                 field_registry,
                 in_flight: InFlightTracker::new(),
@@ -2109,6 +2113,7 @@ impl ConcurrentEngine {
             sender,
             doc_tx,
             docstore,
+            docstore_root,
             config,
             field_registry,
             in_flight: InFlightTracker::new(),
@@ -5792,7 +5797,7 @@ impl ConcurrentEngine {
             filter_names.len(), sort_names.len());
 
         // Open a read-only DocStore for parallel reads
-        let ds_path = self.docstore.lock().path().to_path_buf();
+        let ds_path = self.docstore_root.as_ref().clone();
         let reader = DocStore::open(&ds_path)
             .map_err(|e| crate::error::BitdexError::DocStore(
                 format!("open reader docstore: {e}")))?;
@@ -6102,7 +6107,7 @@ impl ConcurrentEngine {
 
         // Parallel shard-based iteration using rayon fold+reduce.
         // Open a second read-only DocStore (no mutex) for parallel reads.
-        let ds_path = self.docstore.lock().path().to_path_buf();
+        let ds_path = self.docstore_root.as_ref().clone();
         let reader = DocStore::open(&ds_path)
             .map_err(|e| crate::error::BitdexError::DocStore(
                 format!("open reader docstore: {e}")))?;
@@ -6343,7 +6348,7 @@ impl ConcurrentEngine {
         eprintln!("add_fields: {} alive slots to scan", total_alive);
 
         // Open read-only docstore for parallel reads
-        let ds_path = self.docstore.lock().path().to_path_buf();
+        let ds_path = self.docstore_root.as_ref().clone();
         let reader = DocStore::open(&ds_path)
             .map_err(|e| crate::error::BitdexError::DocStore(
                 format!("open reader docstore: {e}")))?;
@@ -6500,7 +6505,7 @@ impl ConcurrentEngine {
     /// Validate that field names exist in the docstore by checking one shard.
     /// Returns Ok(()) if all fields are found, or Err with the missing field names.
     pub fn validate_fields_in_docstore(&self, field_names: &[&str]) -> Result<Vec<String>> {
-        let ds_path = self.docstore.lock().path().to_path_buf();
+        let ds_path = self.docstore_root.as_ref().clone();
         let reader = DocStore::open(&ds_path)
             .map_err(|e| crate::error::BitdexError::DocStore(
                 format!("open reader docstore: {e}")))?;
