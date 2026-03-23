@@ -374,6 +374,11 @@ impl MutationSender {
         self.tx.send(op)
     }
 
+    /// Approximate number of pending ops in the channel (for metrics).
+    pub fn pending_count(&self) -> usize {
+        self.tx.len()
+    }
+
     /// Submit multiple mutations. Blocks per-op if the channel is full.
     pub fn send_batch(
         &self,

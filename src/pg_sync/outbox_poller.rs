@@ -24,6 +24,7 @@ pub async fn run_outbox_poller(
     poll_interval_secs: u64,
     batch_limit: i64,
     cursor_name: &str,
+    replica_id: Option<&str>,
 ) -> Result<(), String> {
     // Wait for BitDex to be healthy before reading the cursor.
     // On K8s, the sidecar may start before the main container is ready.
@@ -66,10 +67,16 @@ pub async fn run_outbox_poller(
             bitdex_was_down = false;
         }
 
+        let cycle_start = std::time::Instant::now();
         match poll_and_process(pool, client, batch_limit, cursor_name, &mut cursor).await {
             Ok(processed) => {
+                let cycle_secs = cycle_start.elapsed().as_secs_f64();
                 if processed > 0 {
-                    eprintln!("Outbox: processed {processed} changes (cursor={})", cursor);
+                    eprintln!("Outbox: processed {processed} changes (cursor={}, cycle={:.3}s)", cursor, cycle_secs);
+                }
+                // Report metrics to the BitDex server (fire-and-forget)
+                if let Some(rid) = replica_id {
+                    client.report_pgsync_metrics(rid, cycle_secs, processed as u64, cursor).await;
                 }
             }
             Err(e) => {

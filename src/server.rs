@@ -887,6 +887,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
             .route("/api/health", get(handle_health))
             .route("/api/formats", get(handle_list_formats))
+            .route("/api/internal/pgsync-metrics", post(handle_pgsync_metrics))
             .route("/metrics", get(handle_metrics))
             .route("/", get(handle_ui))
             .with_state(Arc::clone(&state));
@@ -1852,10 +1853,16 @@ async fn handle_query(
 
             // Fetch documents (timed separately for trace)
             let doc_start = Instant::now();
+            let docstore_hist = &m.docstore_read_seconds;
             let documents = if !include_docs.is_none() {
                 let mut docs = Vec::with_capacity(result.ids.len());
+                m.docstore_concurrent_reads.inc();
                 for &id in &result.ids {
+                    let read_start = Instant::now();
                     let doc = engine.get_document(id as u32);
+                    docstore_hist
+                        .with_label_values(&[&name])
+                        .observe(read_start.elapsed().as_secs_f64());
                     docs.push(match doc {
                         Ok(Some(stored)) => {
                             format_document(&stored, &schema, &reverse_maps, &include_docs, &schema_registry)
@@ -1869,6 +1876,7 @@ async fn handle_query(
                         }
                     });
                 }
+                m.docstore_concurrent_reads.dec();
                 Some(docs)
             } else {
                 None
@@ -3028,9 +3036,12 @@ async fn handle_save_snapshot(
     } else {
         engine.save_snapshot()
     };
+    let elapsed = t0.elapsed().as_secs_f64();
+    state.metrics.save_snapshot_seconds
+        .with_label_values(&[&name])
+        .observe(elapsed);
     match result {
         Ok(()) => {
-            let elapsed = t0.elapsed().as_secs_f64();
             Json(serde_json::json!({
                 "status": if query.unload { "saved_and_unloaded" } else { "saved" },
                 "elapsed_secs": elapsed,
@@ -3340,6 +3351,9 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.boundstore_bytes_read
                 .with_label_values(&[name])
                 .set(engine.boundstore_bytes_read() as i64);
+
+            // Phase 2.5: Flush queue depth
+            m.flush_queue_depth.set(engine.flush_queue_depth() as i64);
         }
     }
 
@@ -3350,6 +3364,32 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
         )],
         m.gather(),
     )
+}
+
+/// Internal endpoint for pg-sync sidecar to report metrics.
+/// POST /api/internal/pgsync-metrics { replica, cycle_seconds, rows_fetched, cursor_position }
+async fn handle_pgsync_metrics(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let m = &state.metrics;
+    let replica = body["replica"].as_str().unwrap_or("unknown");
+    if let Some(cycle_secs) = body["cycle_seconds"].as_f64() {
+        m.pgsync_cycle_seconds
+            .with_label_values(&[replica])
+            .observe(cycle_secs);
+    }
+    if let Some(rows) = body["rows_fetched"].as_u64() {
+        m.pgsync_rows_fetched_total
+            .with_label_values(&[replica])
+            .inc_by(rows);
+    }
+    if let Some(cursor) = body["cursor_position"].as_i64() {
+        m.pgsync_cursor_position
+            .with_label_values(&[replica])
+            .set(cursor);
+    }
+    StatusCode::NO_CONTENT
 }
 
 async fn handle_ui() -> impl IntoResponse {

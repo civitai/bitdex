@@ -342,6 +342,7 @@ async fn main() {
                 sync_config.poll_interval_secs,
                 sync_config.outbox_batch_limit,
                 &cursor_name,
+                Some(sync_config.replica_id.as_str()),
             );
 
             if let Some(ref ch_url) = sync_config.clickhouse_url {
