@@ -107,6 +107,11 @@ const OP_ENTRY_OVERHEAD: usize = 8;
 /// magic(4) + version(4) + ops_section_offset(8) + snapshot_len(4) = 20.
 const HEADER_OPS_COUNT_OFFSET: u64 = 20;
 
+/// Default janitor compaction threshold: compact when ops_count exceeds this.
+/// Based on Ollie's microbench results: knee at 500-1000 ops, <2x overhead
+/// below 500, linear scaling above 1000. 500 is the sweet spot.
+pub const DEFAULT_COMPACT_THRESHOLD: u32 = 500;
+
 // ---------------------------------------------------------------------------
 // Shard file header
 // ---------------------------------------------------------------------------
@@ -658,6 +663,12 @@ where
             Some(count) => Ok(count > threshold),
             None => Ok(false),
         }
+    }
+
+    /// Check if a shard needs compaction using the default threshold (500 ops).
+    /// Based on microbench results: knee at 500 ops, <2x overhead below that.
+    pub fn needs_compaction(&self, key: &Sh::Key) -> io::Result<bool> {
+        self.should_compact(key, DEFAULT_COMPACT_THRESHOLD)
     }
 
     /// Compact a shard in-place in the current generation.
