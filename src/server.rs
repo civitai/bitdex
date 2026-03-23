@@ -3163,7 +3163,28 @@ async fn handle_capture_start(
                 }
             }
 
-            tracing::info!("Capture started: session={}", status.session_id.as_deref().unwrap_or("?"));
+            tracing::info!("Capture started: session={}, auto_stop={}s", status.session_id.as_deref().unwrap_or("?"), req.duration_seconds);
+
+            // Spawn auto-stop timer
+            let duration = req.duration_seconds;
+            let auto_stop_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(duration)).await;
+                if auto_stop_state.capture.is_recording() {
+                    tracing::info!("Capture auto-stopping after {duration}s");
+                    if let Ok(status) = auto_stop_state.capture.stop() {
+                        // Scrape metrics at auto-stop
+                        let metrics_text = auto_stop_state.metrics.gather();
+                        if let Some(dir) = auto_stop_state.capture.session_dir() {
+                            let path = dir.join("metrics_stop.prom");
+                            let _ = std::fs::write(&path, &metrics_text);
+                            auto_stop_state.capture.set_metrics_stop_path(path);
+                        }
+                        tracing::info!("Capture auto-stopped: requests={}", status.requests_recorded);
+                    }
+                }
+            });
+
             Json(serde_json::json!(status)).into_response()
         }
         Err(e) => {
