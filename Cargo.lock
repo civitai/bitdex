@@ -205,7 +205,7 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitdex-v2"
-version = "1.0.62"
+version = "1.0.63"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2152,12 +2152,14 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "scratch"
 version = "0.0.0"
 dependencies = [
+ "bitdex-v2",
  "dashmap",
  "memmap2",
  "parking_lot",
  "rand 0.8.5",
  "rayon",
  "roaring",
+ "tempfile",
 ]
 
 [[package]]
