@@ -719,6 +719,92 @@ where
     }
 
     // -----------------------------------------------------------------------
+    // Bulk write path
+    // -----------------------------------------------------------------------
+
+    /// Write multiple snapshots in parallel using rayon.
+    ///
+    /// Groups keys by shard path, writes each shard file independently.
+    /// Used during initial data loading for maximum throughput.
+    /// The caller is responsible for ensuring no concurrent writes to the
+    /// same shard (same invariant as append_op).
+    #[cfg(feature = "rayon")]
+    pub fn write_snapshots_parallel(
+        &self,
+        entries: Vec<(Sh::Key, S::Snapshot)>,
+    ) -> io::Result<()> {
+        use rayon::prelude::*;
+
+        entries.into_par_iter().try_for_each(|(key, snapshot)| {
+            self.write_snapshot(&key, &snapshot)
+        })?;
+
+        Ok(())
+    }
+
+    /// Write multiple snapshots sequentially.
+    ///
+    /// Non-rayon fallback for bulk writes. Same semantics as
+    /// write_snapshots_parallel but single-threaded.
+    pub fn write_snapshots_batch(
+        &self,
+        entries: &[(Sh::Key, S::Snapshot)],
+    ) -> io::Result<()> {
+        for (key, snapshot) in entries {
+            self.write_snapshot(key, snapshot)?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming save path
+    // -----------------------------------------------------------------------
+
+    /// Save a snapshot directly to a specific generation without going through
+    /// the current generation counter. Used by save_and_unload to write
+    /// directly from staging without cloning.
+    pub fn write_snapshot_to_gen(
+        &self,
+        key: &Sh::Key,
+        snapshot: &S::Snapshot,
+        gen: u64,
+    ) -> io::Result<()> {
+        let shard_path = self.shard_path_in_gen(key, gen);
+
+        let mut snapshot_bytes = Vec::new();
+        S::encode(snapshot, &mut snapshot_bytes);
+
+        let ops_offset = HEADER_SIZE as u64 + snapshot_bytes.len() as u64;
+        let header = ShardHeader {
+            version: SHARD_VERSION,
+            ops_section_offset: ops_offset,
+            snapshot_len: snapshot_bytes.len() as u32,
+            ops_count: 0,
+            flags: 0,
+        };
+
+        write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])?;
+        Ok(())
+    }
+
+    /// Create a new generation and return its number, without advancing the
+    /// current generation counter. Used for save_and_unload where we want
+    /// to write to a fresh generation directory without affecting the active
+    /// write path.
+    pub fn create_save_generation(&self) -> io::Result<u64> {
+        let save_gen = self.gen_counter.load(Ordering::Acquire) + 1;
+        fs::create_dir_all(self.gen_dir(save_gen))?;
+        Ok(save_gen)
+    }
+
+    /// Atomically advance the generation counter to a specific value.
+    /// Used after save_and_unload completes to make the saved generation
+    /// the current one.
+    pub fn advance_generation_to(&self, gen: u64) {
+        self.gen_counter.store(gen, Ordering::Release);
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -1254,5 +1340,57 @@ mod tests {
         let mut all = store.list_all_shards().unwrap();
         all.sort();
         assert_eq!(all, vec!["doc_a", "doc_b"]);
+    }
+
+    #[test]
+    fn test_write_snapshots_batch() {
+        let (_dir, store) = temp_store();
+
+        let entries: Vec<(String, TestSnapshot)> = (0..10).map(|i| {
+            let key = format!("doc_{}", i);
+            let snap = TestSnapshot {
+                values: [(format!("k{}", i), format!("v{}", i))].into_iter().collect(),
+            };
+            (key, snap)
+        }).collect();
+
+        store.write_snapshots_batch(&entries).unwrap();
+
+        for i in 0..10 {
+            let result = store.read(&format!("doc_{}", i)).unwrap().unwrap();
+            assert_eq!(result.values.get(&format!("k{}", i)).unwrap(), &format!("v{}", i));
+        }
+    }
+
+    #[test]
+    fn test_write_snapshot_to_gen() {
+        let (_dir, store) = temp_store();
+
+        // Write to gen 0 normally
+        store.write_snapshot(&"doc1".to_string(), &TestSnapshot {
+            values: [("v".into(), "gen0".into())].into_iter().collect(),
+        }).unwrap();
+
+        // Create save generation (gen 1) without advancing counter
+        let save_gen = store.create_save_generation().unwrap();
+        assert_eq!(save_gen, 1);
+        assert_eq!(store.current_generation(), 0); // counter not advanced
+
+        // Write directly to save generation
+        store.write_snapshot_to_gen(&"doc1".to_string(), &TestSnapshot {
+            values: [("v".into(), "saved".into())].into_iter().collect(),
+        }, save_gen).unwrap();
+
+        // Current generation still reads gen 0
+        let result = store.read(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(result.values.get("v").unwrap(), "gen0");
+
+        // Advance to save generation
+        store.advance_generation_to(save_gen);
+        assert_eq!(store.current_generation(), 1);
+
+        // Now reads find save generation
+        let result = store.read(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(result.values.get("v").unwrap(), "saved");
     }
 }
