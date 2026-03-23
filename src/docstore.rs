@@ -93,6 +93,8 @@ pub struct DocStore {
     /// 0 = disabled (no staleness tracking, no compaction worker).
     /// Default: 30.
     compact_threshold_pct: u64,
+    /// Counter incremented when a compaction is skipped due to channel backpressure.
+    compact_skipped: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl DocStore {
@@ -125,6 +127,7 @@ impl DocStore {
             v2_writers: Arc::new(DashMap::new()),
             compact_tx: None,
             compact_threshold_pct: DEFAULT_COMPACT_THRESHOLD_PCT,
+            compact_skipped: None,
         })
     }
 
@@ -142,6 +145,7 @@ impl DocStore {
             v2_writers: Arc::new(DashMap::new()),
             compact_tx: None,
             compact_threshold_pct: DEFAULT_COMPACT_THRESHOLD_PCT,
+            compact_skipped: None,
         })
     }
 
@@ -1071,7 +1075,11 @@ impl DocStore {
         if stale * 100 / total > self.compact_threshold_pct {
             if let Some(ref tx) = self.compact_tx {
                 // Fire-and-forget: if the channel is full, skip this compaction.
-                let _ = tx.try_send((shard_id, data));
+                if tx.try_send((shard_id, data)).is_err() {
+                    if let Some(ref counter) = self.compact_skipped {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
             }
         }
     }
@@ -1191,6 +1199,11 @@ impl DocStore {
     /// Set the compaction threshold percentage. 0 = disabled.
     pub fn set_compact_threshold(&mut self, pct: u64) {
         self.compact_threshold_pct = pct;
+    }
+
+    /// Set the atomic counter for tracking skipped compactions (channel full).
+    pub fn set_compact_skipped(&mut self, counter: Arc<std::sync::atomic::AtomicU64>) {
+        self.compact_skipped = Some(counter);
     }
 
     /// Prepare for bulk loading: ensure field dictionary contains all field names,

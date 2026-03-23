@@ -29,6 +29,17 @@ use crate::types::QueryResult;
 use crate::unified_cache::{UnifiedCache, UnifiedCacheConfig, UnifiedEntry, UnifiedKey};
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 
+/// Bridge for passing Prometheus metric handles from the server layer into
+/// the engine's background threads (compaction worker, lazy loading).
+/// Only available when compiled with the `server` feature.
+#[cfg(feature = "server")]
+pub struct MetricsBridge {
+    pub lazy_load_duration: prometheus::HistogramVec,
+    pub compaction_total: prometheus::IntCounterVec,
+    pub compaction_duration: prometheus::HistogramVec,
+    pub index_name: String,
+}
+
 /// Commands sent to the flush thread for state transitions that must
 /// go through the single writer. Keeps flush thread as sole ArcSwap writer.
 enum FlushCommand {
@@ -252,6 +263,11 @@ pub struct ConcurrentEngine {
     boundstore_entries_restored: Arc<AtomicU64>,
     /// Cumulative entries skipped (tombstoned + orphan) during shard load.
     boundstore_entries_skipped: Arc<AtomicU64>,
+    /// Metrics bridge: prometheus handles set by server layer, read by background threads.
+    #[cfg(feature = "server")]
+    metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
+    /// Compaction skip counter (incremented by DocStore when channel is full).
+    compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
     /// to signal the compact worker to exit.
     compact_tx: Option<Sender<(u32, Vec<u8>)>>,
@@ -626,6 +642,11 @@ impl ConcurrentEngine {
         let (doc_tx, doc_rx): (Sender<(u32, StoredDoc)>, Receiver<(u32, StoredDoc)>) =
             crossbeam_channel::bounded(config.channel_capacity);
 
+        // Compaction skip counter + metrics bridge (created before compact worker)
+        let compaction_skipped = Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "server")]
+        let metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> = Arc::new(ArcSwap::from_pointee(None));
+
         // Compaction channel + worker: only created when threshold > 0.
         // When threshold is 0, no staleness tracking on reads, no worker thread.
         docstore.set_compact_threshold(config.compact_threshold_pct);
@@ -633,11 +654,16 @@ impl ConcurrentEngine {
             let (tx, compact_rx): (Sender<(u32, Vec<u8>)>, Receiver<(u32, Vec<u8>)>) =
                 crossbeam_channel::bounded(32);
             docstore.set_compact_channel(tx.clone());
+            docstore.set_compact_skipped(Arc::clone(&compaction_skipped));
 
             // Extract root and v2_writers BEFORE wrapping docstore in Mutex.
             // The compaction worker uses these directly — no full DocStore lock needed.
             let compact_root = docstore.root().to_path_buf();
             let compact_v2_writers = docstore.v2_writers_handle();
+
+            // Clone metrics bridge for the compaction worker thread.
+            #[cfg(feature = "server")]
+            let compact_metrics = Arc::clone(&metrics_bridge);
 
             // Spawn compaction worker thread. Uses the standalone compact_shard_from_buffer
             // with pre-extracted root/v2_writers — never holds the DocStore mutex during I/O.
@@ -652,8 +678,18 @@ impl ConcurrentEngine {
                     ) {
                         eprintln!("Compaction worker: shard {shard_id} failed: {e}");
                     } else {
-                        let _elapsed = start.elapsed();
-                        // Metrics are recorded by the server layer if available
+                        let elapsed = start.elapsed();
+                        #[cfg(feature = "server")]
+                        {
+                            let guard = compact_metrics.load();
+                            if let Some(ref bridge) = **guard {
+                                bridge.compaction_total.with_label_values(&[&bridge.index_name]).inc();
+                                bridge.compaction_duration.with_label_values(&[&bridge.index_name])
+                                    .observe(elapsed.as_secs_f64());
+                            }
+                        }
+                        #[cfg(not(feature = "server"))]
+                        let _ = elapsed;
                     }
                 }
             });
@@ -819,6 +855,9 @@ impl ConcurrentEngine {
                 boundstore_bytes_read,
                 boundstore_entries_restored,
                 boundstore_entries_skipped,
+                #[cfg(feature = "server")]
+                metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
+                compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
                 prefetch_tx: None,
@@ -2110,6 +2149,9 @@ impl ConcurrentEngine {
             boundstore_bytes_read,
             boundstore_entries_restored,
             boundstore_entries_skipped,
+            #[cfg(feature = "server")]
+            metrics_bridge,
+            compaction_skipped,
             compact_tx,
             compact_handle,
             prefetch_tx,
@@ -2126,6 +2168,18 @@ impl ConcurrentEngine {
     /// Set the case-sensitive fields for string matching control.
     pub fn set_case_sensitive_fields(&mut self, fields: CaseSensitiveFields) {
         self.case_sensitive_fields = Some(Arc::new(fields));
+    }
+
+    /// Set the Prometheus metrics bridge. Called by the server layer after engine creation.
+    /// Background threads (compaction worker, lazy loading) will start recording metrics.
+    #[cfg(feature = "server")]
+    pub fn set_metrics_bridge(&self, bridge: MetricsBridge) {
+        self.metrics_bridge.store(Arc::new(Some(Arc::new(bridge))));
+    }
+
+    /// Get the cumulative count of compaction operations skipped due to channel backpressure.
+    pub fn compaction_skipped_count(&self) -> u64 {
+        self.compaction_skipped.load(Ordering::Relaxed)
     }
 
     /// Set the per-field dictionaries for LowCardinalityString fields.
@@ -2725,6 +2779,12 @@ impl ConcurrentEngine {
             }
         }
 
+        // Load metrics bridge once for all lazy-load timing observations.
+        #[cfg(feature = "server")]
+        let metrics_bridge_guard = self.metrics_bridge.load();
+        #[cfg(feature = "server")]
+        let metrics_opt: Option<Arc<MetricsBridge>> = (**metrics_bridge_guard).as_ref().map(|b| Arc::clone(b));
+
         // Count total parallel work items to decide whether parallelism is worthwhile.
         let total_tasks = needed_filters.len()
             + if needed_sort.is_some() { 1 } else { 0 }
@@ -2746,6 +2806,8 @@ impl ConcurrentEngine {
                     let store = store.clone();
                     let par_filters = &par_filters;
                     let par_error = &par_error;
+                    #[cfg(feature = "server")]
+                    let metrics_ref = &metrics_opt;
                     s.spawn(move || {
                         if par_error.lock().unwrap().is_some() { return; }
                         let t0 = std::time::Instant::now();
@@ -2756,6 +2818,12 @@ impl ConcurrentEngine {
                                     "Lazy-loaded filter '{}': {} values in {:.1}ms",
                                     name, count, t0.elapsed().as_secs_f64() * 1000.0
                                 );
+                                #[cfg(feature = "server")]
+                                if let Some(ref bridge) = metrics_ref {
+                                    bridge.lazy_load_duration
+                                        .with_label_values(&[&bridge.index_name, name])
+                                        .observe(t0.elapsed().as_secs_f64());
+                                }
                                 par_filters.lock().unwrap().push((name.clone(), bitmaps));
                             }
                             Err(e) => { *par_error.lock().unwrap() = Some(e); }
@@ -2769,6 +2837,8 @@ impl ConcurrentEngine {
                     let par_sort = &par_sort;
                     let par_error = &par_error;
                     let sort_name = sort_name.clone();
+                    #[cfg(feature = "server")]
+                    let metrics_ref = &metrics_opt;
                     s.spawn(move || {
                         if par_error.lock().unwrap().is_some() { return; }
                         let t0 = std::time::Instant::now();
@@ -2779,6 +2849,12 @@ impl ConcurrentEngine {
                                     "Lazy-loaded sort '{}': {} layers in {:.1}ms",
                                     sort_name, layer_count, t0.elapsed().as_secs_f64() * 1000.0
                                 );
+                                #[cfg(feature = "server")]
+                                if let Some(ref bridge) = metrics_ref {
+                                    bridge.lazy_load_duration
+                                        .with_label_values(&[&bridge.index_name, &sort_name])
+                                        .observe(t0.elapsed().as_secs_f64());
+                                }
                                 *par_sort.lock().unwrap() = Some((sort_name, layers));
                             }
                             Ok(None) => {}
@@ -2792,6 +2868,8 @@ impl ConcurrentEngine {
                     let store = store.clone();
                     let par_values = &par_values;
                     let par_error = &par_error;
+                    #[cfg(feature = "server")]
+                    let metrics_ref = &metrics_opt;
                     s.spawn(move || {
                         if par_error.lock().unwrap().is_some() { return; }
                         let t0 = std::time::Instant::now();
@@ -2802,6 +2880,12 @@ impl ConcurrentEngine {
                                     "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
                                     field_name, count, t0.elapsed().as_secs_f64() * 1000.0
                                 );
+                                #[cfg(feature = "server")]
+                                if let Some(ref bridge) = metrics_ref {
+                                    bridge.lazy_load_duration
+                                        .with_label_values(&[&bridge.index_name, field_name])
+                                        .observe(t0.elapsed().as_secs_f64());
+                                }
                                 par_values.lock().unwrap().push((field_name.clone(), loaded, missing.clone()));
                             }
                             Ok(_) => {}
@@ -2829,6 +2913,12 @@ impl ConcurrentEngine {
                     "Lazy-loaded filter '{}': {} values in {:.1}ms",
                     name, count, t0.elapsed().as_secs_f64() * 1000.0
                 );
+                #[cfg(feature = "server")]
+                if let Some(ref bridge) = metrics_opt {
+                    bridge.lazy_load_duration
+                        .with_label_values(&[&bridge.index_name, name])
+                        .observe(t0.elapsed().as_secs_f64());
+                }
                 loaded_filters.push((name.clone(), bitmaps));
             }
 
@@ -2840,6 +2930,12 @@ impl ConcurrentEngine {
                         "Lazy-loaded sort '{}': {} layers in {:.1}ms",
                         sort_name, layer_count, t0.elapsed().as_secs_f64() * 1000.0
                     );
+                    #[cfg(feature = "server")]
+                    if let Some(ref bridge) = metrics_opt {
+                        bridge.lazy_load_duration
+                            .with_label_values(&[&bridge.index_name, sort_name])
+                            .observe(t0.elapsed().as_secs_f64());
+                    }
                     loaded_sort = Some((sort_name.clone(), layers));
                 }
             }
@@ -2853,6 +2949,12 @@ impl ConcurrentEngine {
                         "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
                         field_name, count, t0.elapsed().as_secs_f64() * 1000.0
                     );
+                    #[cfg(feature = "server")]
+                    if let Some(ref bridge) = metrics_opt {
+                        bridge.lazy_load_duration
+                            .with_label_values(&[&bridge.index_name, field_name])
+                            .observe(t0.elapsed().as_secs_f64());
+                    }
                     loaded_values.push((field_name.clone(), loaded, missing.clone()));
                 }
             }

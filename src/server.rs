@@ -1015,6 +1015,14 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             engine.set_case_sensitive_fields(cs_fields);
         }
 
+        // Wire Prometheus metrics bridge into the engine's background threads.
+        engine.set_metrics_bridge(crate::concurrent_engine::MetricsBridge {
+            lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
+            compaction_total: state.metrics.compaction_total.clone(),
+            compaction_duration: state.metrics.compaction_duration_seconds.clone(),
+            index_name: def.name.clone(),
+        });
+
         let alive = engine.alive_count();
         eprintln!(
             "Restored index '{}' from disk ({} records)",
@@ -1306,6 +1314,14 @@ async fn handle_create_index(
     if !cs_fields.is_empty() {
         engine.set_case_sensitive_fields(cs_fields);
     }
+
+    // Wire Prometheus metrics bridge into the engine's background threads.
+    engine.set_metrics_bridge(crate::concurrent_engine::MetricsBridge {
+        lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
+        compaction_total: state.metrics.compaction_total.clone(),
+        compaction_duration: state.metrics.compaction_duration_seconds.clone(),
+        index_name: definition.name.clone(),
+    });
 
     let schema_registry = engine.build_schema_registry();
 
@@ -3315,6 +3331,11 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                     .with_label_values(&[name, &field])
                     .set(resident as i64);
             }
+
+            // Compaction skipped (scrape-time from atomic counter)
+            m.compaction_skipped_total
+                .with_label_values(&[name])
+                .set(engine.compaction_skipped_count() as i64);
 
             // Sync peak from atomic to Prometheus gauge
             m.queries_in_flight_peak
