@@ -281,6 +281,8 @@ struct AppState {
     queries_in_flight_peak: AtomicI64,
     /// Concurrency limit for queries. 0 = unlimited (no backpressure).
     max_query_concurrency: AtomicU32,
+    /// Snapshot capture session manager (Phase 2).
+    capture: crate::capture::CaptureManager,
 }
 
 type SharedState = Arc<AppState>;
@@ -333,6 +335,76 @@ async fn require_admin(
             }
         }
     }
+}
+
+/// Middleware: record requests/responses to the caplog when capture is active.
+///
+/// Fast path: if not recording, `is_recording()` is a single mutex check (~ns)
+/// and the middleware is a no-op passthrough. When recording, the request body
+/// is buffered, the response body is collected, and both are written to the caplog.
+async fn capture_traffic(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Fast path: skip if not recording
+    if !state.capture.is_recording() {
+        return next.run(req).await;
+    }
+
+    let arrived_at_ns = crate::capture::nanos_since_epoch();
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let query_string = req.uri().query().unwrap_or("").to_string();
+
+    // Skip recording the capture endpoints themselves and /metrics
+    if path.starts_with("/debug/capture") || path == "/metrics" {
+        return next.run(req).await;
+    }
+
+    // Buffer the request body so we can record it
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            // If body is too large or read fails, pass through without recording
+            // Reconstruct a minimal request
+            let req = axum::extract::Request::from_parts(parts, axum::body::Body::empty());
+            return next.run(req).await;
+        }
+    };
+    let req_body = body_bytes.to_vec();
+
+    // Reconstruct the request with the buffered body
+    let req = axum::extract::Request::from_parts(parts, axum::body::Body::from(body_bytes));
+
+    // Run the actual handler
+    let response = next.run(req).await;
+
+    // Capture the response
+    let response_status = response.status().as_u16();
+    let (resp_parts, resp_body) = response.into_parts();
+    let resp_bytes = axum::body::to_bytes(resp_body, 16 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let resp_body_vec = resp_bytes.to_vec();
+    let responded_at_ns = crate::capture::nanos_since_epoch();
+
+    // Write the entry to the caplog (fire-and-forget — don't slow down the response)
+    let entry = crate::capture::CaptureEntry {
+        arrived_at_ns,
+        method,
+        path,
+        query_string,
+        body: req_body,
+        response_status,
+        response_body: resp_body_vec,
+        responded_at_ns,
+    };
+    state.capture.write_entry(&entry);
+
+    // Reconstruct the response with the buffered body
+    axum::response::Response::from_parts(resp_parts, axum::body::Body::from(resp_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +907,7 @@ impl BitdexServer {
             queries_in_flight: AtomicI64::new(0),
             queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
+            capture: crate::capture::CaptureManager::new(&self.data_dir),
         });
 
         // Try to restore an existing index from disk
@@ -870,6 +943,13 @@ impl BitdexServer {
             .route("/api/indexes/{name}/fields/{field}/reload", post(handle_reload_field))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
+            // Capture endpoints (Phase 2)
+            .route("/debug/capture/start", post(handle_capture_start))
+            .route("/debug/capture/stop", post(handle_capture_stop))
+            .route("/debug/capture/status", get(handle_capture_status))
+            .route("/debug/snapshot/{session_id}/package", post(handle_package_snapshot))
+            .route("/debug/snapshot/{session_id}/status", get(handle_package_status))
+            .route("/debug/snapshot/{session_id}/download", get(handle_package_download))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
             .with_state(Arc::clone(&state));
 
@@ -895,6 +975,7 @@ impl BitdexServer {
         let app = Router::new()
             .merge(admin_routes)
             .merge(public_routes)
+            .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), capture_traffic))
             .layer(CorsLayer::permissive())
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)); // 64MB for bulk upserts
 
@@ -3067,6 +3148,188 @@ async fn handle_save_snapshot(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Snapshot save failed: {e}")})),
+            ).into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Capture (Phase 2 — snapshot capture system)
+// ---------------------------------------------------------------------------
+
+/// POST /debug/capture/start — Start a new capture session.
+async fn handle_capture_start(
+    State(state): State<SharedState>,
+    body: Option<Json<crate::capture::CaptureStartRequest>>,
+) -> impl IntoResponse {
+    let req = body
+        .map(|Json(r)| r)
+        .unwrap_or(crate::capture::CaptureStartRequest { duration_seconds: 300 });
+
+    match state.capture.start(&req) {
+        Ok(status) => {
+            // Scrape Prometheus metrics at capture start (Phase 2.4)
+            let metrics_text = state.metrics.gather();
+            if let Some(dir) = state.capture.session_dir() {
+                let path = dir.join("metrics_start.prom");
+                if let Err(e) = std::fs::write(&path, &metrics_text) {
+                    tracing::warn!("Failed to write metrics_start.prom: {e}");
+                } else {
+                    state.capture.set_metrics_start_path(path);
+                }
+            }
+
+            tracing::info!("Capture started: session={}, auto_stop={}s", status.session_id.as_deref().unwrap_or("?"), req.duration_seconds);
+
+            // Spawn auto-stop timer
+            let duration = req.duration_seconds;
+            let auto_stop_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(duration)).await;
+                if auto_stop_state.capture.is_recording() {
+                    tracing::info!("Capture auto-stopping after {duration}s");
+                    if let Ok(status) = auto_stop_state.capture.stop() {
+                        // Scrape metrics at auto-stop
+                        let metrics_text = auto_stop_state.metrics.gather();
+                        if let Some(dir) = auto_stop_state.capture.session_dir() {
+                            let path = dir.join("metrics_stop.prom");
+                            let _ = std::fs::write(&path, &metrics_text);
+                            auto_stop_state.capture.set_metrics_stop_path(path);
+                        }
+                        tracing::info!("Capture auto-stopped: requests={}", status.requests_recorded);
+                    }
+                }
+            });
+
+            Json(serde_json::json!(status)).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    }
+}
+
+/// POST /debug/capture/stop — Stop the current capture session.
+async fn handle_capture_stop(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    match state.capture.stop() {
+        Ok(status) => {
+            // Scrape Prometheus metrics at capture stop (Phase 2.4)
+            let metrics_text = state.metrics.gather();
+            if let Some(dir) = state.capture.session_dir() {
+                let path = dir.join("metrics_stop.prom");
+                if let Err(e) = std::fs::write(&path, &metrics_text) {
+                    tracing::warn!("Failed to write metrics_stop.prom: {e}");
+                } else {
+                    state.capture.set_metrics_stop_path(path);
+                }
+            }
+
+            tracing::info!(
+                "Capture stopped: session={}, requests={}",
+                status.session_id.as_deref().unwrap_or("?"),
+                status.requests_recorded,
+            );
+            Json(serde_json::json!(status)).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    }
+}
+
+/// GET /debug/capture/status — Get current capture status.
+async fn handle_capture_status(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    Json(serde_json::json!(state.capture.status()))
+}
+
+/// POST /debug/snapshot/{session_id}/package — Start packaging a captured session.
+async fn handle_package_snapshot(
+    State(state): State<SharedState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let (session_dir, pkg_state) = match state.capture.start_package(&session_id) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response();
+        }
+    };
+
+    // Spawn blocking task for tar.zst creation
+    let pkg_state_clone = pkg_state.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::capture::create_package(&session_dir, &pkg_state_clone) {
+            *pkg_state_clone.lock().unwrap() = crate::capture::PackageState::Failed { error: e };
+        }
+    });
+
+    Json(serde_json::json!({
+        "status": "packaging",
+        "session_id": session_id,
+    })).into_response()
+}
+
+/// GET /debug/snapshot/{session_id}/status — Get packaging progress.
+async fn handle_package_status(
+    State(state): State<SharedState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.capture.package_state(&session_id) {
+        Some(pkg_state) => Json(serde_json::json!({
+            "session_id": session_id,
+            "package": pkg_state,
+        })).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("no package for session '{session_id}'")})),
+        ).into_response(),
+    }
+}
+
+/// GET /debug/snapshot/{session_id}/download — Stream the packaged tar.zst.
+async fn handle_package_download(
+    State(state): State<SharedState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let path = match state.capture.package_path(&session_id) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "package not ready or not found"})),
+            ).into_response();
+        }
+    };
+
+    // Stream the file
+    match tokio::fs::File::open(&path).await {
+        Ok(file) => {
+            let stream = tokio_util::io::ReaderStream::new(file);
+            let body = axum::body::Body::from_stream(stream);
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("snapshot.tar.zst");
+            axum::response::Response::builder()
+                .header("content-type", "application/zstd")
+                .header("content-disposition", format!("attachment; filename=\"{filename}\""))
+                .body(body)
+                .unwrap()
+                .into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("open package file: {e}")})),
             ).into_response()
         }
     }
