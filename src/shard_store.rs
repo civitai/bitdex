@@ -103,6 +103,10 @@ const HEADER_SIZE: usize = 28;
 /// Per-op entry overhead: [4] length + [4] crc32 = 8 bytes wrapping each op.
 const OP_ENTRY_OVERHEAD: usize = 8;
 
+/// Byte offset of the ops_count field within the header.
+/// magic(4) + version(4) + ops_section_offset(8) + snapshot_len(4) = 20.
+const HEADER_OPS_COUNT_OFFSET: u64 = 20;
+
 // ---------------------------------------------------------------------------
 // Shard file header
 // ---------------------------------------------------------------------------
@@ -331,7 +335,7 @@ fn append_ops_to_shard(path: &Path, new_ops_bytes: &[u8], additional_count: u32)
 
     // Update ops_count in header
     header.ops_count += additional_count;
-    file.seek(SeekFrom::Start(20))?; // offset of ops_count in header
+    file.seek(SeekFrom::Start(HEADER_OPS_COUNT_OFFSET))?;
     file.write_all(&header.ops_count.to_le_bytes())?;
 
     file.sync_all()?;
@@ -477,6 +481,12 @@ where
     ///
     /// If no shard exists yet in the current generation, creates one with
     /// an empty snapshot section. The snapshot will be populated on compaction.
+    ///
+    /// # Concurrency
+    ///
+    /// This method is NOT thread-safe for concurrent writes to the same shard.
+    /// The caller must ensure single-writer access (e.g., flush thread only).
+    /// Concurrent reads are safe — readers use snapshot + ops from completed writes.
     pub fn append_op(&self, key: &Sh::Key, op: &O::Op) -> io::Result<()> {
         let gen = self.current_generation();
         let shard_path = self.shard_path_in_gen(key, gen);

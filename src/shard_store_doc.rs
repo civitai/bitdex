@@ -434,13 +434,17 @@ impl OpCodec for DocOpCodec {
     }
 }
 
-/// Basic equality check for PackedValue (used by Remove op).
+/// Recursive equality check for PackedValue (used by Remove op).
 fn packed_value_eq(a: &PackedValue, b: &PackedValue) -> bool {
     match (a, b) {
         (PackedValue::I(x), PackedValue::I(y)) => x == y,
         (PackedValue::F(x), PackedValue::F(y)) => x == y,
         (PackedValue::B(x), PackedValue::B(y)) => x == y,
         (PackedValue::S(x), PackedValue::S(y)) => x == y,
+        (PackedValue::Mi(x), PackedValue::Mi(y)) => x == y,
+        (PackedValue::Mm(x), PackedValue::Mm(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| packed_value_eq(a, b))
+        }
         _ => false,
     }
 }
