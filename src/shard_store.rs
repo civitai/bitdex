@@ -646,6 +646,79 @@ where
     }
 
     // -----------------------------------------------------------------------
+    // Janitor support
+    // -----------------------------------------------------------------------
+
+    /// Check if a shard needs compaction based on ops count threshold.
+    ///
+    /// Called by readers after scanning ops — zero overhead since the reader
+    /// already iterated the ops. Returns true if ops_count > threshold.
+    pub fn should_compact(&self, key: &Sh::Key, threshold: u32) -> io::Result<bool> {
+        match self.ops_count(key)? {
+            Some(count) => Ok(count > threshold),
+            None => Ok(false),
+        }
+    }
+
+    /// Compact a shard in-place in the current generation.
+    ///
+    /// Reads the full state (snapshot + ops), writes back as a fresh snapshot
+    /// with zero ops. This is the janitor's compaction path — called when
+    /// ops_count exceeds the threshold.
+    pub fn compact_current(&self, key: &Sh::Key) -> io::Result<()> {
+        self.compact_shard(key, self.current_generation())
+    }
+
+    /// List all shard keys in the current generation.
+    pub fn list_current_shards(&self) -> io::Result<Vec<Sh::Key>> {
+        let gen_dir = self.gen_dir(self.current_generation());
+        if gen_dir.exists() {
+            self.sharding.list_shards(&gen_dir)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// List all shard keys across all generations.
+    pub fn list_all_shards(&self) -> io::Result<Vec<Sh::Key>> {
+        let mut all_keys = std::collections::HashSet::new();
+        let current_gen = self.current_generation();
+        for gen in 0..=current_gen {
+            let gen_dir = self.gen_dir(gen);
+            if gen_dir.exists() {
+                for key in self.sharding.list_shards(&gen_dir)? {
+                    all_keys.insert(key);
+                }
+            }
+        }
+        Ok(all_keys.into_iter().collect())
+    }
+
+    /// Check if a shard exists in any generation.
+    pub fn shard_exists(&self, key: &Sh::Key) -> bool {
+        let current_gen = self.current_generation();
+        for gen in (0..=current_gen).rev() {
+            if self.shard_path_in_gen(key, gen).exists() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Read only the header of a shard in the current generation.
+    /// Useful for checking ops count without reading the full file.
+    pub fn read_header(&self, key: &Sh::Key) -> io::Result<Option<ShardHeader>> {
+        let shard_path = self.shard_path_in_gen(key, self.current_generation());
+        if !shard_path.exists() {
+            return Ok(None);
+        }
+        let mut file = File::open(&shard_path)?;
+        let mut buf = [0u8; HEADER_SIZE];
+        file.read_exact(&mut buf)?;
+        Ok(Some(ShardHeader::decode(&buf)?))
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -1061,5 +1134,125 @@ mod tests {
         // Read should still work (finds gen 1)
         let result = store.read(&"doc1".to_string()).unwrap().unwrap();
         assert_eq!(result.values.get("v").unwrap(), "gen1");
+    }
+
+    #[test]
+    fn test_should_compact() {
+        let (_dir, store) = temp_store();
+
+        // No shard → should not compact
+        assert!(!store.should_compact(&"doc1".to_string(), 5).unwrap());
+
+        // Add 3 ops
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "a".into(), value: "1".into()
+        }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "b".into(), value: "2".into()
+        }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "c".into(), value: "3".into()
+        }).unwrap();
+
+        // Threshold 5 → should NOT compact (3 <= 5)
+        assert!(!store.should_compact(&"doc1".to_string(), 5).unwrap());
+
+        // Threshold 2 → SHOULD compact (3 > 2)
+        assert!(store.should_compact(&"doc1".to_string(), 2).unwrap());
+    }
+
+    #[test]
+    fn test_compact_current() {
+        let (_dir, store) = temp_store();
+
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "x".into(), value: "42".into()
+        }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "y".into(), value: "99".into()
+        }).unwrap();
+
+        assert_eq!(store.ops_count(&"doc1".to_string()).unwrap(), Some(2));
+
+        store.compact_current(&"doc1".to_string()).unwrap();
+
+        assert_eq!(store.ops_count(&"doc1".to_string()).unwrap(), Some(0));
+        let result = store.read(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(result.values.get("x").unwrap(), "42");
+        assert_eq!(result.values.get("y").unwrap(), "99");
+    }
+
+    #[test]
+    fn test_list_current_shards() {
+        let (_dir, store) = temp_store();
+
+        store.write_snapshot(&"a".to_string(), &TestSnapshot {
+            values: HashMap::new(),
+        }).unwrap();
+        store.write_snapshot(&"b".to_string(), &TestSnapshot {
+            values: HashMap::new(),
+        }).unwrap();
+
+        let mut shards = store.list_current_shards().unwrap();
+        shards.sort();
+        assert_eq!(shards, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_shard_exists() {
+        let (_dir, store) = temp_store();
+
+        assert!(!store.shard_exists(&"doc1".to_string()));
+
+        store.write_snapshot(&"doc1".to_string(), &TestSnapshot {
+            values: HashMap::new(),
+        }).unwrap();
+
+        assert!(store.shard_exists(&"doc1".to_string()));
+    }
+
+    #[test]
+    fn test_read_header() {
+        let (_dir, store) = temp_store();
+
+        // No shard → None
+        assert!(store.read_header(&"doc1".to_string()).unwrap().is_none());
+
+        // Write snapshot + 2 ops
+        store.write_snapshot(&"doc1".to_string(), &TestSnapshot {
+            values: [("k".into(), "v".into())].into_iter().collect(),
+        }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "a".into(), value: "1".into()
+        }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "b".into(), value: "2".into()
+        }).unwrap();
+
+        let header = store.read_header(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(header.ops_count, 2);
+        assert!(header.snapshot_len > 0);
+    }
+
+    #[test]
+    fn test_list_all_shards_across_generations() {
+        let (_dir, store) = temp_store();
+
+        // Write to gen 0
+        store.write_snapshot(&"doc_a".to_string(), &TestSnapshot {
+            values: HashMap::new(),
+        }).unwrap();
+
+        // Pin → gen 1
+        store.pin_generation().unwrap();
+
+        // Write to gen 1 (different shard)
+        store.write_snapshot(&"doc_b".to_string(), &TestSnapshot {
+            values: HashMap::new(),
+        }).unwrap();
+
+        let mut all = store.list_all_shards().unwrap();
+        all.sort();
+        assert_eq!(all, vec!["doc_a", "doc_b"]);
     }
 }
