@@ -1590,7 +1590,7 @@ impl BulkWriter {
 // Compact value encoding
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub enum PackedValue {
     I(i64),
     F(f64),
