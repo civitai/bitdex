@@ -785,3 +785,335 @@ fn chrono_run_id() -> String {
         .unwrap();
     format!("run-{}", now.as_secs())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write CaptureEntry records to a file in caplog format:
+    /// [u32 LE length][rmp_serde msgpack bytes] per entry.
+    fn write_synthetic_caplog(
+        entries: &[CaptureEntry],
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for entry in entries {
+            let data = rmp_serde::to_vec(entry)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let len = data.len() as u32;
+            f.write_all(&len.to_le_bytes())?;
+            f.write_all(&data)?;
+        }
+        f.flush()?;
+        Ok(())
+    }
+
+    /// Generate a POST /api/indexes/civitai/query entry with a realistic JSON body.
+    fn make_query_entry(arrived_ns: u64, latency_us: u64) -> CaptureEntry {
+        let body = br#"{"filters":[{"eq":{"nsfwLevel":1}},{"eq":{"type":"image"}}],"sort":{"field":"reactionCount","direction":"desc"},"limit":100}"#;
+        let response_body = br#"{"hits":[1,2,3],"total":3}"#;
+        CaptureEntry {
+            arrived_at_ns: arrived_ns,
+            method: "POST".to_string(),
+            path: "/api/indexes/civitai/query".to_string(),
+            query_string: String::new(),
+            body: body.to_vec(),
+            response_status: 200,
+            response_body: response_body.to_vec(),
+            responded_at_ns: arrived_ns + latency_us * 1_000,
+        }
+    }
+
+    /// Generate a GET request entry at an arbitrary path.
+    fn make_get_entry(arrived_ns: u64, path: &str, latency_us: u64) -> CaptureEntry {
+        CaptureEntry {
+            arrived_at_ns: arrived_ns,
+            method: "GET".to_string(),
+            path: path.to_string(),
+            query_string: String::new(),
+            body: Vec::new(),
+            response_status: 200,
+            response_body: br#"{"status":"ok"}"#.to_vec(),
+            responded_at_ns: arrived_ns + latency_us * 1_000,
+        }
+    }
+
+    /// Generate a POST /api/indexes/civitai/documents/upsert entry.
+    fn make_upsert_entry(arrived_ns: u64, latency_us: u64) -> CaptureEntry {
+        let body = br#"[{"id":42,"nsfwLevel":1,"type":"image"}]"#;
+        CaptureEntry {
+            arrived_at_ns: arrived_ns,
+            method: "POST".to_string(),
+            path: "/api/indexes/civitai/documents/upsert".to_string(),
+            query_string: String::new(),
+            body: body.to_vec(),
+            response_status: 200,
+            response_body: br#"{"upserted":1}"#.to_vec(),
+            responded_at_ns: arrived_ns + latency_us * 1_000,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_empty_caplog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.caplog");
+        write_synthetic_caplog(&[], &path).unwrap();
+
+        let entries = read_caplog(&path).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_single_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.caplog");
+        let entry = make_query_entry(1_000_000_000, 500);
+        write_synthetic_caplog(&[entry.clone()], &path).unwrap();
+
+        let entries = read_caplog(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].arrived_at_ns, 1_000_000_000);
+        assert_eq!(entries[0].method, "POST");
+        assert_eq!(entries[0].path, "/api/indexes/civitai/query");
+        assert_eq!(entries[0].response_status, 200);
+        assert_eq!(entries[0].body, entry.body);
+        assert_eq!(entries[0].response_body, entry.response_body);
+        assert_eq!(
+            entries[0].responded_at_ns,
+            1_000_000_000 + 500 * 1_000
+        );
+    }
+
+    #[test]
+    fn test_parse_multiple_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.caplog");
+
+        let base_ns = 1_700_000_000_000_000_000u64; // ~2023 epoch ns
+        let entries_in: Vec<CaptureEntry> = (0..10)
+            .map(|i| make_query_entry(base_ns + i * 1_000_000, 100 + i * 10))
+            .collect();
+
+        write_synthetic_caplog(&entries_in, &path).unwrap();
+        let entries_out = read_caplog(&path).unwrap();
+
+        assert_eq!(entries_out.len(), 10);
+        for (i, (inp, out)) in entries_in.iter().zip(entries_out.iter()).enumerate() {
+            assert_eq!(inp.arrived_at_ns, out.arrived_at_ns, "mismatch at index {i}");
+            assert_eq!(inp.method, out.method, "method mismatch at index {i}");
+            assert_eq!(inp.body, out.body, "body mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn test_parse_preserves_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("order.caplog");
+
+        let base_ns = 1_700_000_000_000_000_000u64;
+        let entries_in: Vec<CaptureEntry> = (0..50)
+            .map(|i| make_query_entry(base_ns + i * 500_000, 200))
+            .collect();
+
+        write_synthetic_caplog(&entries_in, &path).unwrap();
+        let entries_out = read_caplog(&path).unwrap();
+
+        assert_eq!(entries_out.len(), 50);
+        // Verify order is preserved — read_caplog returns entries in file order
+        for (i, out) in entries_out.iter().enumerate() {
+            let expected_ns = base_ns + (i as u64) * 500_000;
+            assert_eq!(out.arrived_at_ns, expected_ns, "order broken at index {i}");
+        }
+    }
+
+    #[test]
+    fn test_parse_mixed_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.caplog");
+
+        let base_ns = 1_700_000_000_000_000_000u64;
+        let entries_in = vec![
+            make_query_entry(base_ns, 300),
+            make_get_entry(base_ns + 1_000_000, "/api/indexes/civitai/stats", 50),
+            make_upsert_entry(base_ns + 2_000_000, 1500),
+            make_get_entry(base_ns + 3_000_000, "/api/indexes/civitai/traces", 80),
+            make_query_entry(base_ns + 4_000_000, 250),
+        ];
+
+        write_synthetic_caplog(&entries_in, &path).unwrap();
+        let entries_out = read_caplog(&path).unwrap();
+
+        assert_eq!(entries_out.len(), 5);
+        assert_eq!(entries_out[0].method, "POST");
+        assert_eq!(entries_out[0].path, "/api/indexes/civitai/query");
+        assert_eq!(entries_out[1].method, "GET");
+        assert_eq!(entries_out[1].path, "/api/indexes/civitai/stats");
+        assert_eq!(entries_out[2].method, "POST");
+        assert_eq!(entries_out[2].path, "/api/indexes/civitai/documents/upsert");
+        assert_eq!(entries_out[3].method, "GET");
+        assert_eq!(entries_out[3].path, "/api/indexes/civitai/traces");
+        assert_eq!(entries_out[4].method, "POST");
+        assert_eq!(entries_out[4].path, "/api/indexes/civitai/query");
+    }
+
+    #[test]
+    fn test_parse_truncated_caplog_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.caplog");
+
+        // Write 5 valid entries, then truncate midway through a 6th
+        let base_ns = 1_700_000_000_000_000_000u64;
+        let entries_in: Vec<CaptureEntry> = (0..6)
+            .map(|i| make_query_entry(base_ns + i * 1_000_000, 100))
+            .collect();
+
+        // Write all 6 to get the full bytes, then truncate
+        let mut full_bytes = Vec::new();
+        for entry in &entries_in {
+            let data = rmp_serde::to_vec(entry).unwrap();
+            let len = data.len() as u32;
+            full_bytes.extend_from_slice(&len.to_le_bytes());
+            full_bytes.extend_from_slice(&data);
+        }
+
+        // Chop off last 10 bytes — this makes the 6th entry's payload incomplete
+        let truncated = &full_bytes[..full_bytes.len() - 10];
+        std::fs::write(&path, truncated).unwrap();
+
+        let entries_out = read_caplog(&path).unwrap();
+        // Should recover the first 5 entries and skip the truncated 6th
+        assert_eq!(entries_out.len(), 5);
+        for (i, out) in entries_out.iter().enumerate() {
+            assert_eq!(
+                out.arrived_at_ns,
+                base_ns + (i as u64) * 1_000_000,
+                "recovered entry {i} has wrong timestamp"
+            );
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_with_realistic_traffic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("realistic.caplog");
+
+        let base_ns = 1_711_000_000_000_000_000u64; // ~March 2024
+        let mut entries_in = Vec::with_capacity(100);
+        let mut rng_state = 42u64; // deterministic pseudo-random
+
+        // Simple LCG for deterministic test — avoids pulling in rand for cfg(test)
+        let mut next_u64 = || -> u64 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state
+        };
+
+        for i in 0u64..100 {
+            let arrived = base_ns + i * 10_000_000; // 10ms apart
+            let bucket = next_u64() % 100;
+            let entry = if bucket < 70 {
+                // 70% POST query
+                make_query_entry(arrived, 200 + (next_u64() % 5000))
+            } else if bucket < 80 {
+                // 10% GET stats
+                make_get_entry(arrived, "/api/indexes/civitai/stats", 20 + (next_u64() % 100))
+            } else if bucket < 90 {
+                // 10% POST upsert
+                make_upsert_entry(arrived, 500 + (next_u64() % 3000))
+            } else {
+                // 10% GET traces
+                make_get_entry(arrived, "/api/indexes/civitai/traces", 30 + (next_u64() % 200))
+            };
+            entries_in.push(entry);
+        }
+
+        write_synthetic_caplog(&entries_in, &path).unwrap();
+        let entries_out = read_caplog(&path).unwrap();
+
+        assert_eq!(entries_out.len(), 100);
+
+        // Verify every field round-trips exactly
+        for (i, (inp, out)) in entries_in.iter().zip(entries_out.iter()).enumerate() {
+            assert_eq!(inp.arrived_at_ns, out.arrived_at_ns, "arrived_at_ns mismatch at {i}");
+            assert_eq!(inp.method, out.method, "method mismatch at {i}");
+            assert_eq!(inp.path, out.path, "path mismatch at {i}");
+            assert_eq!(inp.query_string, out.query_string, "query_string mismatch at {i}");
+            assert_eq!(inp.body, out.body, "body mismatch at {i}");
+            assert_eq!(inp.response_status, out.response_status, "response_status mismatch at {i}");
+            assert_eq!(inp.response_body, out.response_body, "response_body mismatch at {i}");
+            assert_eq!(inp.responded_at_ns, out.responded_at_ns, "responded_at_ns mismatch at {i}");
+        }
+
+        // Verify traffic distribution is mixed (at least 2 methods, at least 2 paths)
+        let methods: std::collections::HashSet<&str> =
+            entries_out.iter().map(|e| e.method.as_str()).collect();
+        assert!(methods.contains("GET"), "expected GET requests in mix");
+        assert!(methods.contains("POST"), "expected POST requests in mix");
+
+        let paths: std::collections::HashSet<&str> =
+            entries_out.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.len() >= 3, "expected at least 3 distinct paths, got {}", paths.len());
+    }
+
+    #[test]
+    fn test_window_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("window.caplog");
+
+        // Generate entries spanning 60 seconds (one per second)
+        let base_ns = 1_711_000_000_000_000_000u64;
+        let ns_per_sec = 1_000_000_000u64;
+        let entries_in: Vec<CaptureEntry> = (0..60)
+            .map(|i| make_query_entry(base_ns + i * ns_per_sec, 100))
+            .collect();
+
+        write_synthetic_caplog(&entries_in, &path).unwrap();
+        let mut all_entries = read_caplog(&path).unwrap();
+        assert_eq!(all_entries.len(), 60);
+
+        // Sort by arrival time (as main() does before window filtering)
+        all_entries.sort_by_key(|e| e.arrived_at_ns);
+
+        // Apply window filter: 20s-30s (should include seconds 20..=30 → 11 entries)
+        let (start_s, end_s) = (20.0f64, 30.0f64);
+        let start_ns = base_ns + (start_s * 1_000_000_000.0) as u64;
+        let end_ns = base_ns + (end_s * 1_000_000_000.0) as u64;
+        let windowed: Vec<&CaptureEntry> = all_entries
+            .iter()
+            .filter(|e| e.arrived_at_ns >= start_ns && e.arrived_at_ns <= end_ns)
+            .collect();
+
+        assert_eq!(windowed.len(), 11, "window 20s-30s should include 11 entries (20,21,...,30)");
+
+        // Verify the timestamps are correct
+        for (j, entry) in windowed.iter().enumerate() {
+            let expected_second = 20 + j as u64;
+            let expected_ns = base_ns + expected_second * ns_per_sec;
+            assert_eq!(
+                entry.arrived_at_ns, expected_ns,
+                "window entry {j} should be at second {expected_second}"
+            );
+        }
+
+        // Verify entries outside the window are excluded
+        let before_window: Vec<&CaptureEntry> = all_entries
+            .iter()
+            .filter(|e| e.arrived_at_ns < start_ns)
+            .collect();
+        assert_eq!(before_window.len(), 20, "20 entries should be before the window");
+
+        let after_window: Vec<&CaptureEntry> = all_entries
+            .iter()
+            .filter(|e| e.arrived_at_ns > end_ns)
+            .collect();
+        assert_eq!(after_window.len(), 29, "29 entries should be after the window");
+    }
+}
