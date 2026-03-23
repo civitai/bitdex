@@ -1,6 +1,7 @@
 pub mod bitmap_fs;
 pub mod bound_store;
 pub mod cache;
+pub mod capture;
 pub mod concurrency;
 pub mod concurrent_engine;
 pub mod config;

@@ -281,6 +281,8 @@ struct AppState {
     queries_in_flight_peak: AtomicI64,
     /// Concurrency limit for queries. 0 = unlimited (no backpressure).
     max_query_concurrency: AtomicU32,
+    /// Snapshot capture session manager (Phase 2).
+    capture: crate::capture::CaptureManager,
 }
 
 type SharedState = Arc<AppState>;
@@ -835,6 +837,7 @@ impl BitdexServer {
             queries_in_flight: AtomicI64::new(0),
             queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
+            capture: crate::capture::CaptureManager::new(&self.data_dir),
         });
 
         // Try to restore an existing index from disk
@@ -870,6 +873,10 @@ impl BitdexServer {
             .route("/api/indexes/{name}/fields/{field}/reload", post(handle_reload_field))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
+            // Capture endpoints (Phase 2)
+            .route("/debug/capture/start", post(handle_capture_start))
+            .route("/debug/capture/stop", post(handle_capture_stop))
+            .route("/debug/capture/status", get(handle_capture_status))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
             .with_state(Arc::clone(&state));
 
@@ -3054,6 +3061,84 @@ async fn handle_save_snapshot(
             ).into_response()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Capture (Phase 2 — snapshot capture system)
+// ---------------------------------------------------------------------------
+
+/// POST /debug/capture/start — Start a new capture session.
+async fn handle_capture_start(
+    State(state): State<SharedState>,
+    body: Option<Json<crate::capture::CaptureStartRequest>>,
+) -> impl IntoResponse {
+    let req = body
+        .map(|Json(r)| r)
+        .unwrap_or(crate::capture::CaptureStartRequest { duration_seconds: 300 });
+
+    match state.capture.start(&req) {
+        Ok(status) => {
+            // Scrape Prometheus metrics at capture start (Phase 2.4)
+            let metrics_text = state.metrics.gather();
+            if let Some(dir) = state.capture.session_dir() {
+                let path = dir.join("metrics_start.prom");
+                if let Err(e) = std::fs::write(&path, &metrics_text) {
+                    tracing::warn!("Failed to write metrics_start.prom: {e}");
+                } else {
+                    state.capture.set_metrics_start_path(path);
+                }
+            }
+
+            tracing::info!("Capture started: session={}", status.session_id.as_deref().unwrap_or("?"));
+            Json(serde_json::json!(status)).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    }
+}
+
+/// POST /debug/capture/stop — Stop the current capture session.
+async fn handle_capture_stop(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    match state.capture.stop() {
+        Ok(status) => {
+            // Scrape Prometheus metrics at capture stop (Phase 2.4)
+            let metrics_text = state.metrics.gather();
+            if let Some(dir) = state.capture.session_dir() {
+                let path = dir.join("metrics_stop.prom");
+                if let Err(e) = std::fs::write(&path, &metrics_text) {
+                    tracing::warn!("Failed to write metrics_stop.prom: {e}");
+                } else {
+                    state.capture.set_metrics_stop_path(path);
+                }
+            }
+
+            tracing::info!(
+                "Capture stopped: session={}, requests={}",
+                status.session_id.as_deref().unwrap_or("?"),
+                status.requests_recorded,
+            );
+            Json(serde_json::json!(status)).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    }
+}
+
+/// GET /debug/capture/status — Get current capture status.
+async fn handle_capture_status(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    Json(serde_json::json!(state.capture.status()))
 }
 
 // ---------------------------------------------------------------------------
