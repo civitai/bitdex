@@ -20,6 +20,7 @@ pub mod query;
 pub mod query_metrics;
 pub mod radix_sort;
 pub mod shard_store;
+pub mod shard_store_doc;
 #[cfg(feature = "server")]
 pub mod metrics;
 #[cfg(feature = "server")]
