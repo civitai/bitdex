@@ -812,3 +812,150 @@ mod tests {
         assert_eq!(snap.docs[&100][0], (0, PackedValue::I(42)));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Proptest round-trip tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for generating arbitrary PackedValue instances.
+    fn arb_packed_value() -> impl Strategy<Value = PackedValue> {
+        prop_oneof![
+            any::<i64>().prop_map(PackedValue::I),
+            any::<f64>().prop_map(PackedValue::F),
+            any::<bool>().prop_map(PackedValue::B),
+            "[a-zA-Z0-9]{0,50}".prop_map(PackedValue::S),
+            proptest::collection::vec(any::<i64>(), 0..10).prop_map(PackedValue::Mi),
+        ]
+    }
+
+    /// Strategy for generating arbitrary DocOp instances.
+    fn arb_doc_op(max_slot: u32) -> impl Strategy<Value = DocOp> {
+        prop_oneof![
+            (0..max_slot, 0..16u16, arb_packed_value()).prop_map(|(slot, field, value)| {
+                DocOp::Set { slot, field, value }
+            }),
+            (0..max_slot, 0..16u16, any::<i64>()).prop_map(|(slot, field, v)| {
+                DocOp::Append { slot, field, value: PackedValue::I(v) }
+            }),
+            (0..max_slot).prop_map(|slot| DocOp::Delete { slot }),
+            (0..max_slot, proptest::collection::vec(
+                (0..16u16, arb_packed_value()), 1..5
+            )).prop_map(|(slot, fields)| {
+                DocOp::Create { slot, fields }
+            }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn packed_value_roundtrip(pv in arb_packed_value()) {
+            let mut buf = Vec::new();
+            encode_packed_value(&pv, &mut buf);
+            let mut pos = 0;
+            let decoded = decode_packed_value(&buf, &mut pos).unwrap();
+            // For floats, NaN != NaN, so skip NaN comparison
+            match (&pv, &decoded) {
+                (PackedValue::F(a), PackedValue::F(b)) => {
+                    if a.is_nan() {
+                        prop_assert!(b.is_nan());
+                    } else {
+                        prop_assert_eq!(a, b);
+                    }
+                }
+                _ => prop_assert_eq!(&pv, &decoded),
+            }
+        }
+
+        #[test]
+        fn doc_op_roundtrip(op in arb_doc_op(1000)) {
+            let mut buf = Vec::new();
+            DocOpCodec::encode_op(&op, &mut buf);
+            let decoded = DocOpCodec::decode_op(&buf).unwrap();
+            // Verify the op tag matches
+            match (&op, &decoded) {
+                (DocOp::Set { slot: s1, field: f1, .. }, DocOp::Set { slot: s2, field: f2, .. }) => {
+                    prop_assert_eq!(s1, s2);
+                    prop_assert_eq!(f1, f2);
+                }
+                (DocOp::Append { slot: s1, field: f1, .. }, DocOp::Append { slot: s2, field: f2, .. }) => {
+                    prop_assert_eq!(s1, s2);
+                    prop_assert_eq!(f1, f2);
+                }
+                (DocOp::Delete { slot: s1 }, DocOp::Delete { slot: s2 }) => {
+                    prop_assert_eq!(s1, s2);
+                }
+                (DocOp::Create { slot: s1, fields: f1 }, DocOp::Create { slot: s2, fields: f2 }) => {
+                    prop_assert_eq!(s1, s2);
+                    prop_assert_eq!(f1.len(), f2.len());
+                }
+                _ => prop_assert!(false, "op type mismatch"),
+            }
+        }
+
+        #[test]
+        fn doc_snapshot_roundtrip(
+            entries in proptest::collection::vec(
+                (0..10000u32, proptest::collection::vec(
+                    (0..16u16, arb_packed_value()), 0..5
+                )),
+                0..20
+            )
+        ) {
+            let mut snap = DocSnapshot::new();
+            for (slot, fields) in entries {
+                snap.docs.insert(slot, fields);
+            }
+
+            let mut buf = Vec::new();
+            DocSnapshotCodec::encode(&snap, &mut buf);
+            let decoded = DocSnapshotCodec::decode(&buf).unwrap();
+
+            prop_assert_eq!(snap.docs.len(), decoded.docs.len());
+            for (slot, fields) in &snap.docs {
+                prop_assert!(decoded.docs.contains_key(slot));
+                prop_assert_eq!(fields.len(), decoded.docs[slot].len());
+            }
+        }
+
+        /// Random ops applied then compacted = same state as applying ops to fresh snapshot.
+        #[test]
+        fn ops_compact_equals_fresh_build(
+            ops in proptest::collection::vec(arb_doc_op(100), 1..20)
+        ) {
+            // Build state by applying ops to empty snapshot
+            let mut expected = DocSnapshot::new();
+            for op in &ops {
+                DocOpCodec::apply(&mut expected, op);
+            }
+
+            // Build via ShardStore: append ops then compact
+            let dir = tempfile::tempdir().unwrap();
+            let store = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
+
+            let shard_key = 0u32; // all ops go to shard 0
+            for op in &ops {
+                store.append_op(&shard_key, op).unwrap();
+            }
+            store.compact_current(&shard_key).unwrap();
+
+            let compacted = store.read(&shard_key).unwrap().unwrap();
+
+            // Compare: same slots, same field counts
+            prop_assert_eq!(expected.docs.len(), compacted.docs.len());
+            for (slot, expected_fields) in &expected.docs {
+                prop_assert!(compacted.docs.contains_key(slot),
+                    "missing slot {} after compaction", slot);
+                prop_assert_eq!(
+                    expected_fields.len(),
+                    compacted.docs[slot].len(),
+                    "field count mismatch for slot {}", slot
+                );
+            }
+        }
+    }
+}
