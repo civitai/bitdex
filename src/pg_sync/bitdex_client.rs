@@ -219,6 +219,30 @@ impl BitdexClient {
         Ok(())
     }
 
+    /// Report pg-sync cycle metrics to the BitDex server for Prometheus exposition.
+    /// Fire-and-forget: errors are logged but don't affect the poller.
+    pub async fn report_pgsync_metrics(
+        &self,
+        replica_id: &str,
+        cycle_seconds: f64,
+        rows_fetched: u64,
+        cursor_position: i64,
+    ) {
+        let url = format!("{}/api/internal/pgsync-metrics", self.server_root);
+        let body = serde_json::json!({
+            "replica": replica_id,
+            "cycle_seconds": cycle_seconds,
+            "rows_fetched": rows_fetched,
+            "cursor_position": cursor_position,
+        });
+        let _ = self.client
+            .post(&url)
+            .json(&body)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await;
+    }
+
     pub async fn get_cursor(&self, cursor_name: &str) -> Result<Option<String>, String> {
         let url = format!("{}/cursors/{}", self.base_url, cursor_name);
         let resp = self.client

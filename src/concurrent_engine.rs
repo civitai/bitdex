@@ -4715,6 +4715,11 @@ impl ConcurrentEngine {
         0
     }
 
+    /// Approximate number of pending MutationOps in the write channel (for metrics).
+    pub fn flush_queue_depth(&self) -> usize {
+        self.sender.pending_count()
+    }
+
     /// Report bitmap memory usage broken down by component (lock-free snapshot).
     ///
     /// Returns (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes,

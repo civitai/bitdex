@@ -90,6 +90,25 @@ pub struct Metrics {
     pub boundstore_entries_restored: IntGaugeVec,
     pub boundstore_bytes_written: IntGaugeVec,
     pub boundstore_bytes_read: IntGaugeVec,
+
+    // -- Phase 2.5: DocStore I/O observability --
+    pub docstore_read_seconds: HistogramVec,
+    pub docstore_concurrent_reads: IntGauge,
+    pub save_snapshot_seconds: HistogramVec,
+    pub flush_queue_depth: IntGauge,
+
+    // -- Phase 2.5: Doc cache (stubs — wired when Phase 1 lands) --
+    pub doc_cache_hit_total: IntCounterVec,
+    pub doc_cache_miss_total: IntCounterVec,
+    pub doc_cache_backlog: IntGaugeVec,
+
+    // -- Phase 2.5: ShardStore ops (stub — wired when Phase 1 lands) --
+    pub shardstore_ops_count: IntGaugeVec,
+
+    // -- Phase 2.5: PG-Sync observability --
+    pub pgsync_cycle_seconds: HistogramVec,
+    pub pgsync_rows_fetched_total: IntCounterVec,
+    pub pgsync_cursor_position: IntGaugeVec,
 }
 
 impl Metrics {
@@ -429,6 +448,84 @@ impl Metrics {
             &["index"],
         ).unwrap();
 
+        // Phase 2.5: DocStore I/O observability
+        let docstore_read_buckets = vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0];
+        let docstore_read_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_docstore_read_seconds",
+                "Individual document read latency from disk",
+            )
+            .buckets(docstore_read_buckets),
+            &["index"],
+        )
+        .unwrap();
+        let docstore_concurrent_reads = IntGauge::new(
+            "bitdex_docstore_concurrent_reads",
+            "Number of concurrent docstore reads in progress",
+        )
+        .unwrap();
+        let save_snapshot_buckets = vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0];
+        let save_snapshot_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_save_snapshot_seconds",
+                "Bitmap snapshot save duration",
+            )
+            .buckets(save_snapshot_buckets),
+            &["index"],
+        )
+        .unwrap();
+        let flush_queue_depth = IntGauge::new(
+            "bitdex_flush_queue_depth",
+            "Pending MutationOps in the write coalescer channel",
+        )
+        .unwrap();
+
+        // Phase 2.5: Doc cache stubs (wired when Phase 1 task 1.10 lands)
+        let doc_cache_hit_total = IntCounterVec::new(
+            Opts::new("bitdex_doc_cache_hit_total", "Document cache hits"),
+            &["index"],
+        )
+        .unwrap();
+        let doc_cache_miss_total = IntCounterVec::new(
+            Opts::new("bitdex_doc_cache_miss_total", "Document cache misses"),
+            &["index"],
+        )
+        .unwrap();
+        let doc_cache_backlog = IntGaugeVec::new(
+            Opts::new("bitdex_doc_cache_backlog", "Document cache write-through channel backlog"),
+            &["index"],
+        )
+        .unwrap();
+
+        // Phase 2.5: ShardStore ops stub (wired when Phase 1 lands)
+        let shardstore_ops_count = IntGaugeVec::new(
+            Opts::new("bitdex_shardstore_ops_count", "Pending ops per shard store"),
+            &["index", "store"],
+        )
+        .unwrap();
+
+        // Phase 2.5: PG-Sync observability
+        let pgsync_cycle_buckets = vec![0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
+        let pgsync_cycle_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_pgsync_cycle_seconds",
+                "Outbox poller cycle duration",
+            )
+            .buckets(pgsync_cycle_buckets),
+            &["replica"],
+        )
+        .unwrap();
+        let pgsync_rows_fetched_total = IntCounterVec::new(
+            Opts::new("bitdex_pgsync_rows_fetched_total", "Total outbox rows fetched from Postgres"),
+            &["replica"],
+        )
+        .unwrap();
+        let pgsync_cursor_position = IntGaugeVec::new(
+            Opts::new("bitdex_pgsync_cursor_position", "Current outbox cursor position"),
+            &["replica"],
+        )
+        .unwrap();
+
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
         registry.register(Box::new(slot_high_water.clone())).unwrap();
@@ -511,6 +608,18 @@ impl Metrics {
         registry.register(Box::new(boundstore_entries_restored.clone())).unwrap();
         registry.register(Box::new(boundstore_bytes_written.clone())).unwrap();
         registry.register(Box::new(boundstore_bytes_read.clone())).unwrap();
+        // Phase 2.5
+        registry.register(Box::new(docstore_read_seconds.clone())).unwrap();
+        registry.register(Box::new(docstore_concurrent_reads.clone())).unwrap();
+        registry.register(Box::new(save_snapshot_seconds.clone())).unwrap();
+        registry.register(Box::new(flush_queue_depth.clone())).unwrap();
+        registry.register(Box::new(doc_cache_hit_total.clone())).unwrap();
+        registry.register(Box::new(doc_cache_miss_total.clone())).unwrap();
+        registry.register(Box::new(doc_cache_backlog.clone())).unwrap();
+        registry.register(Box::new(shardstore_ops_count.clone())).unwrap();
+        registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
+        registry.register(Box::new(pgsync_rows_fetched_total.clone())).unwrap();
+        registry.register(Box::new(pgsync_cursor_position.clone())).unwrap();
 
         Self {
             registry,
@@ -569,6 +678,18 @@ impl Metrics {
             boundstore_entries_restored,
             boundstore_bytes_written,
             boundstore_bytes_read,
+            // Phase 2.5
+            docstore_read_seconds,
+            docstore_concurrent_reads,
+            save_snapshot_seconds,
+            flush_queue_depth,
+            doc_cache_hit_total,
+            doc_cache_miss_total,
+            doc_cache_backlog,
+            shardstore_ops_count,
+            pgsync_cycle_seconds,
+            pgsync_rows_fetched_total,
+            pgsync_cursor_position,
         }
     }
 
