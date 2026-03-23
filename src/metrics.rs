@@ -72,7 +72,7 @@ pub struct Metrics {
     // -- Shard compaction --
     pub compaction_total: IntCounterVec,
     pub compaction_duration_seconds: HistogramVec,
-    pub compaction_skipped_total: IntCounterVec,
+    pub compaction_skipped_total: IntGaugeVec,
 
     // -- Query concurrency --
     pub queries_in_flight: IntGauge,
@@ -370,7 +370,7 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
-        let compaction_skipped_total = IntCounterVec::new(
+        let compaction_skipped_total = IntGaugeVec::new(
             Opts::new("bitdex_compaction_skipped_total", "Compactions skipped (channel full)"),
             &["index"],
         )
