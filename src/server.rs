@@ -337,6 +337,76 @@ async fn require_admin(
     }
 }
 
+/// Middleware: record requests/responses to the caplog when capture is active.
+///
+/// Fast path: if not recording, `is_recording()` is a single mutex check (~ns)
+/// and the middleware is a no-op passthrough. When recording, the request body
+/// is buffered, the response body is collected, and both are written to the caplog.
+async fn capture_traffic(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Fast path: skip if not recording
+    if !state.capture.is_recording() {
+        return next.run(req).await;
+    }
+
+    let arrived_at_ns = crate::capture::nanos_since_epoch();
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let query_string = req.uri().query().unwrap_or("").to_string();
+
+    // Skip recording the capture endpoints themselves and /metrics
+    if path.starts_with("/debug/capture") || path == "/metrics" {
+        return next.run(req).await;
+    }
+
+    // Buffer the request body so we can record it
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            // If body is too large or read fails, pass through without recording
+            // Reconstruct a minimal request
+            let req = axum::extract::Request::from_parts(parts, axum::body::Body::empty());
+            return next.run(req).await;
+        }
+    };
+    let req_body = body_bytes.to_vec();
+
+    // Reconstruct the request with the buffered body
+    let req = axum::extract::Request::from_parts(parts, axum::body::Body::from(body_bytes));
+
+    // Run the actual handler
+    let response = next.run(req).await;
+
+    // Capture the response
+    let response_status = response.status().as_u16();
+    let (resp_parts, resp_body) = response.into_parts();
+    let resp_bytes = axum::body::to_bytes(resp_body, 16 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let resp_body_vec = resp_bytes.to_vec();
+    let responded_at_ns = crate::capture::nanos_since_epoch();
+
+    // Write the entry to the caplog (fire-and-forget — don't slow down the response)
+    let entry = crate::capture::CaptureEntry {
+        arrived_at_ns,
+        method,
+        path,
+        query_string,
+        body: req_body,
+        response_status,
+        response_body: resp_body_vec,
+        responded_at_ns,
+    };
+    state.capture.write_entry(&entry);
+
+    // Reconstruct the response with the buffered body
+    axum::response::Response::from_parts(resp_parts, axum::body::Body::from(resp_bytes))
+}
+
 // ---------------------------------------------------------------------------
 // API request/response types
 // ---------------------------------------------------------------------------
@@ -902,6 +972,7 @@ impl BitdexServer {
         let app = Router::new()
             .merge(admin_routes)
             .merge(public_routes)
+            .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), capture_traffic))
             .layer(CorsLayer::permissive())
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)); // 64MB for bulk upserts
 

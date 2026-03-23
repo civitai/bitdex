@@ -17,6 +17,7 @@
 //!   (placeholder until Adam lands ShardStore — currently a no-op)
 //! - **Prometheus scrape**: Metrics snapshot saved at start and stop boundaries
 
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
@@ -72,6 +73,66 @@ pub struct CaptureSession {
     pub metrics_stop_path: Option<PathBuf>,
 }
 
+// ---------------------------------------------------------------------------
+// Caplog: append-only binary traffic log
+// ---------------------------------------------------------------------------
+
+/// A single recorded request/response pair.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CaptureEntry {
+    /// Nanosecond timestamp when the request arrived.
+    pub arrived_at_ns: u64,
+    /// HTTP method (GET, POST, etc.).
+    pub method: String,
+    /// Request path (e.g., /api/indexes/civitai/query).
+    pub path: String,
+    /// Query string (e.g., "format=compact&skip_cache=true").
+    pub query_string: String,
+    /// Request body (for POST/PATCH/PUT). Empty for GET/DELETE.
+    pub body: Vec<u8>,
+    /// HTTP response status code.
+    pub response_status: u16,
+    /// Response body bytes.
+    pub response_body: Vec<u8>,
+    /// Nanosecond timestamp when the response was sent.
+    pub responded_at_ns: u64,
+}
+
+/// Thread-safe append-only caplog writer. Writes msgpack-encoded CaptureEntry
+/// records to a file. Each record is length-prefixed: [u32 len][msgpack bytes].
+struct CaplogWriter {
+    writer: BufWriter<std::fs::File>,
+    entries_written: u64,
+}
+
+impl CaplogWriter {
+    fn new(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::File::create(path)?;
+        Ok(Self {
+            writer: BufWriter::with_capacity(64 * 1024, file),
+            entries_written: 0,
+        })
+    }
+
+    fn write_entry(&mut self, entry: &CaptureEntry) -> std::io::Result<()> {
+        let data = rmp_serde::to_vec(entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let len = data.len() as u32;
+        self.writer.write_all(&len.to_le_bytes())?;
+        self.writer.write_all(&data)?;
+        self.entries_written += 1;
+        // Flush every 100 entries to balance throughput and durability
+        if self.entries_written % 100 == 0 {
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
 /// Thread-safe capture manager. Holds at most one active session.
 pub struct CaptureManager {
     session: Mutex<Option<CaptureSession>>,
@@ -79,6 +140,8 @@ pub struct CaptureManager {
     requests_counter: AtomicU64,
     /// Base directory for capture data (e.g., /data/captures/).
     base_dir: PathBuf,
+    /// Active caplog writer (only Some when recording).
+    caplog: Mutex<Option<CaplogWriter>>,
 }
 
 impl CaptureManager {
@@ -89,6 +152,7 @@ impl CaptureManager {
             session: Mutex::new(None),
             requests_counter: AtomicU64::new(0),
             base_dir,
+            caplog: Mutex::new(None),
         }
     }
 
@@ -110,6 +174,12 @@ impl CaptureManager {
 
         // TODO: Gen pin hook — bump ShardStore generation counter here
         // once Adam's ShardStore lands. For now this is a no-op.
+
+        // Open caplog writer
+        let caplog_path = session_dir.join("traffic.caplog");
+        let writer = CaplogWriter::new(&caplog_path)
+            .map_err(|e| CaptureError::Io(format!("create caplog: {e}")))?;
+        *self.caplog.lock() = Some(writer);
 
         let session = CaptureSession {
             session_id: session_id.clone(),
@@ -138,6 +208,12 @@ impl CaptureManager {
         }
 
         // TODO: Gen pin hook — bump generation counter again to bracket the capture window.
+
+        // Flush and close caplog writer
+        if let Some(ref mut writer) = *self.caplog.lock() {
+            let _ = writer.flush();
+        }
+        *self.caplog.lock() = None;
 
         session.state = CaptureState::Stopped;
         session.stopped_at = Some(SystemTime::now());
@@ -173,6 +249,18 @@ impl CaptureManager {
     /// Increment the request counter (called by traffic middleware for each recorded request).
     pub fn record_request(&self) {
         self.requests_counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Write a capture entry to the caplog. Called by the traffic middleware.
+    /// Returns false if not recording or write failed (non-fatal).
+    pub fn write_entry(&self, entry: &CaptureEntry) -> bool {
+        if let Some(ref mut writer) = *self.caplog.lock() {
+            if writer.write_entry(entry).is_ok() {
+                self.requests_counter.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
     }
 
     /// Check if auto-stop duration has been exceeded. Returns true if capture should auto-stop.
@@ -291,6 +379,14 @@ fn format_system_time(t: SystemTime) -> String {
     let s = tod % 60;
     let (y, mo, d) = days_to_ymd(days);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
+}
+
+/// Current time as nanoseconds since epoch.
+pub fn nanos_since_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }
 
 fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
