@@ -357,7 +357,9 @@ impl ConcurrentEngine {
         // Multi-value fields use per-value lazy loading (never fully loaded).
         let mut lazy_value_fields: HashSet<String> = HashSet::new();
 
-        // Load alive bitmap and slot counter eagerly (small, always needed)
+        // Load alive bitmap and slot counter eagerly (small, always needed).
+        // Try ShardStore first; fall back to BitmapFs if ShardStore has no data
+        // (migration: first restart after ShardStore code deployed).
         let mut slots = crate::slot::SlotAllocator::new();
         if let Some(ref store) = alive_store {
             let alive = store.load_alive()
@@ -365,6 +367,31 @@ impl ConcurrentEngine {
             let counter = meta_store.as_ref()
                 .and_then(|ms| ms.load_slot_counter().ok())
                 .flatten();
+
+            // BitmapFs fallback: if ShardStore has no alive shard, check BitmapFs
+            let (alive, counter) = if alive.is_none() {
+                if let Some(ref bfs) = bitmap_store {
+                    let bfs_alive = bfs.load_alive()
+                        .map_err(|e| crate::error::BitdexError::DocStore(format!("bitmapfs fallback load alive: {e}")))?;
+                    if bfs_alive.is_some() {
+                        let bfs_counter = bfs.load_slot_counter()
+                            .map_err(|e| crate::error::BitdexError::DocStore(format!("bitmapfs fallback load slot_counter: {e}")))?;
+                        let count = bfs_alive.as_ref().map(|b| b.len()).unwrap_or(0);
+                        eprintln!(
+                            "ShardStore empty — migrating from BitmapFs ({} alive records, counter={:?})",
+                            count, bfs_counter,
+                        );
+                        (bfs_alive, bfs_counter.or(counter))
+                    } else {
+                        (alive, counter)
+                    }
+                } else {
+                    (alive, counter)
+                }
+            } else {
+                (alive, counter)
+            };
+
             if let Some(alive_bm) = alive {
                 let counter_val = counter.unwrap_or(0);
                 slots = crate::slot::SlotAllocator::from_state(
