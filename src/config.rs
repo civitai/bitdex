@@ -97,7 +97,7 @@ fn default_prometheus_port() -> u16 {
     9090
 }
 fn default_flush_interval_us() -> u64 {
-    100
+    50 // low-latency preset (was 100)
 }
 fn default_compact_threshold_pct() -> u64 {
     30
@@ -395,7 +395,7 @@ fn default_max_maintenance_work() -> usize {
     500_000
 }
 fn default_max_maintenance_ms() -> u64 {
-    10
+    5 // low-latency preset (was 10)
 }
 
 impl Default for CacheConfig {
