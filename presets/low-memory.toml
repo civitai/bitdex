@@ -1,0 +1,18 @@
+# Low memory preset — reduce memory footprint for constrained environments.
+# Target: smaller pods, dev servers, or memory-limited deployments.
+
+[metadata]
+name = "low-memory"
+description = "Reduced memory — 256MB unified, 512MB doc, 5K bound target"
+
+[cache]
+bound_target_size = 5000
+bound_max_size = 10000
+bound_max_count = 50
+max_entries = 5000
+
+[unified_cache]
+max_bytes = 268435456  # 256 MB
+
+[doc_cache]
+max_bytes = 536870912  # 512 MB

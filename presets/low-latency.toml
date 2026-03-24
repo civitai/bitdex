@@ -1,0 +1,18 @@
+# Low latency preset — minimize per-query latency.
+# Tighter flush cycles, lower compaction threshold, smaller maintenance budget.
+# WARNING: max_maintenance_ms must NOT exceed 10 (caused pod lockup at 100ms).
+
+flush_interval_us = 50
+merge_interval_ms = 2000
+
+[metadata]
+name = "low-latency"
+description = "Minimize query latency — 5ms maintenance, 50μs flush, 500 compact"
+
+[cache]
+max_maintenance_ms = 5
+max_maintenance_work = 250000
+preload_bounds = true
+
+[shard_store]
+compact_threshold = 500

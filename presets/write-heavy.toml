@@ -1,0 +1,18 @@
+# Write-heavy preset — optimize for upsert/mutation throughput.
+# Larger channel, longer merge intervals, higher compaction threshold.
+# Target: high pg-sync write volume, bulk update windows.
+
+flush_interval_us = 200
+merge_interval_ms = 10000
+channel_capacity = 200000
+
+[metadata]
+name = "write-heavy"
+description = "Optimize mutation throughput — larger buffers, less frequent persistence"
+
+[cache]
+max_maintenance_ms = 10
+max_maintenance_work = 1000000
+
+[shard_store]
+compact_threshold = 2000

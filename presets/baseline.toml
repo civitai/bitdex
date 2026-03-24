@@ -1,0 +1,6 @@
+# Baseline preset — current production defaults.
+# No overrides; serves as the comparison reference for replay sweeps.
+
+[metadata]
+name = "baseline"
+description = "Current production defaults — no overrides"
