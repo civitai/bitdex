@@ -1799,30 +1799,38 @@ impl ConcurrentEngine {
                                         }
                                     }
 
-                                    let _tb_elapsed = start.elapsed();
+                                    let tb_scan_elapsed = start.elapsed();
 
-                                    // Brief lock: capture old bitmaps, swap in new ones
-                                    let mut bucket_diffs: Vec<(String, RoaringBitmap, RoaringBitmap)> = Vec::new();
+                                    // Two-phase time bucket update to minimize lock hold time:
+                                    // Phase 1 (under lock): snapshot old bitmaps + swap in new ones.
+                                    // Only clone + swap, no diff computation.
+                                    let old_bitmaps: Vec<(String, RoaringBitmap, RoaringBitmap)>;
                                     {
                                         let mut tb = tb_arc.lock();
-                                        for (i, (bucket_name, _)) in rebuild_info.iter().enumerate() {
-                                            // Capture old bitmap for diff computation
+                                        old_bitmaps = rebuild_info.iter().enumerate().map(|(i, (bucket_name, _))| {
                                             let old_bm = tb.get_bucket(bucket_name)
                                                 .map(|b| RoaringBitmap::clone(b.bitmap()))
                                                 .unwrap_or_default();
-                                            let new_bm = &bitmaps[i];
-                                            let dropped = &old_bm - new_bm;
-                                            let added = new_bm - &old_bm;
-                                            if !dropped.is_empty() || !added.is_empty() {
-                                                bucket_diffs.push((bucket_name.clone(), dropped, added));
-                                            }
+                                            let new_bm = bitmaps[i].clone();
                                             tb.rebuild_bucket_from_bitmap(
                                                 bucket_name,
                                                 std::mem::take(&mut bitmaps[i]),
                                                 now_secs,
                                             );
+                                            (bucket_name.clone(), old_bm, new_bm)
+                                        }).collect();
+                                    }
+                                    // Phase 2 (no lock): compute diffs outside the Mutex.
+                                    let mut bucket_diffs: Vec<(String, RoaringBitmap, RoaringBitmap)> = Vec::new();
+                                    for (bucket_name, old_bm, new_bm) in &old_bitmaps {
+                                        let dropped = old_bm - new_bm;
+                                        let added = new_bm - old_bm;
+                                        if !dropped.is_empty() || !added.is_empty() {
+                                            bucket_diffs.push((bucket_name.clone(), dropped, added));
                                         }
                                     }
+                                    eprintln!("Time bucket rebuild: scan={:?} total={:?} diffs={}",
+                                        tb_scan_elapsed, start.elapsed(), bucket_diffs.len());
                                     // Mark dirty so merge thread persists time buckets
                                     flush_dirty_flag.store(true, Ordering::Release);
 
