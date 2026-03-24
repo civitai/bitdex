@@ -328,7 +328,31 @@ impl ConcurrentEngine {
             None
         };
 
-        // Construct ShardStore instances alongside BitmapFs (migration: both exist during swap)
+        // One-time migration: if BitmapFs data exists but ShardStore doesn't,
+        // migrate all bitmap data from BitmapFs → ShardStore format.
+        if let Some(ref path) = config.storage.bitmap_path {
+            use crate::shard_store_migrate::{has_bitmapfs_data, has_shardstore_data, migrate_bitmapfs_to_shardstore};
+            if has_bitmapfs_data(path) && !has_shardstore_data(path) {
+                let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
+                let sort_configs: Vec<(String, usize)> = config.sort_fields.iter()
+                    .map(|s| (s.name.clone(), s.bits as usize))
+                    .collect();
+                match migrate_bitmapfs_to_shardstore(path, &filter_names, &sort_configs) {
+                    Ok((alive, filters, sorts)) => {
+                        eprintln!(
+                            "Migration complete: {} alive records, {} filter fields, {} sort fields",
+                            alive, filters, sorts,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("WARNING: BitmapFs → ShardStore migration failed: {e}");
+                        eprintln!("Continuing with empty ShardStore — data will repopulate via pg-sync");
+                    }
+                }
+            }
+        }
+
+        // Construct ShardStore instances (will find migrated data if migration ran above)
         let (alive_store, filter_store, sort_store, meta_store) = if let Some(ref path) = config.storage.bitmap_path {
             let ss_root = path.join("shardstore");
             use crate::error::BitdexError;
