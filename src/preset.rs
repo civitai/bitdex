@@ -112,6 +112,20 @@ pub fn apply_preset(config: &mut Config, preset: &PresetOverlay) {
     if let Some(ref c) = preset.cache {
         apply_cache_overlay(&mut config.cache, c);
     }
+
+    // Unified cache overrides (applied to the same CacheConfig since they're now merged)
+    if let Some(ref uc) = preset.unified_cache {
+        if let Some(v) = uc.max_bytes { config.cache.max_bytes = v; }
+        if let Some(v) = uc.max_entries { config.cache.max_entries = v; }
+        if let Some(v) = uc.initial_capacity { config.cache.initial_capacity = v; }
+        if let Some(v) = uc.max_capacity { config.cache.max_capacity = v; }
+        if let Some(v) = uc.min_filter_size { config.cache.min_filter_size = v; }
+    }
+
+    // Doc cache overrides
+    if let Some(ref dc) = preset.doc_cache {
+        if let Some(v) = dc.max_bytes { config.doc_cache.max_bytes = v; }
+    }
 }
 
 fn apply_cache_overlay(cache: &mut CacheConfig, overlay: &CacheOverlay) {
