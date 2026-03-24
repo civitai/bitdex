@@ -1,5 +1,6 @@
 pub mod bitmap_fs;
 pub mod bound_store;
+pub mod bucket_diff_log;
 pub mod cache;
 pub mod capture;
 pub mod concurrency;

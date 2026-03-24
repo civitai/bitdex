@@ -209,6 +209,9 @@ pub struct ConcurrentEngine {
     loading_mode: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
     time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
+    /// Pending bucket diffs for lazy application on cache reads.
+    /// Flush thread stores new snapshots; query threads load for diff application.
+    pending_bucket_diffs: Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,
     /// Fields not yet loaded from disk (lazy loading on first query).
     pending_filter_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
     pending_sort_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
@@ -704,6 +707,34 @@ impl ConcurrentEngine {
             Arc::new(parking_lot::Mutex::new(tb))
         });
 
+        // Initialize pending bucket diffs (load from append-only log on disk)
+        let pending_bucket_diffs = {
+            let max_diffs = 100; // ~8 hours at 300s intervals
+            let mut pending = crate::bucket_diff_log::PendingBucketDiffs::new(max_diffs);
+
+            // Load persisted diffs from disk if storage is configured
+            if let Some(ref bp) = config.storage.bitmap_path {
+                let log_path = std::path::Path::new(bp).join("bucket_diffs.log");
+                if log_path.exists() {
+                    let log = crate::bucket_diff_log::BucketDiffLog::new(
+                        log_path, max_diffs, 0.3,
+                    );
+                    match log.read_retained() {
+                        Ok(diffs) if !diffs.is_empty() => {
+                            let count = diffs.len();
+                            pending = crate::bucket_diff_log::PendingBucketDiffs::from_diffs(diffs, max_diffs);
+                            eprintln!("Loaded {count} bucket diffs from disk (coverage: cutoff {} to {})",
+                                pending.oldest_cutoff(), pending.current_cutoff());
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Warning: failed to load bucket diffs: {e}"),
+                    }
+                }
+            }
+
+            Arc::new(ArcSwap::new(Arc::new(pending)))
+        };
+
         let inner_engine = InnerEngine {
             slots,
             filters,
@@ -925,6 +956,7 @@ impl ConcurrentEngine {
                 loading_mode,
                 dirty_since_snapshot: dirty_flag,
                 time_buckets,
+                pending_bucket_diffs: Arc::clone(&pending_bucket_diffs),
                 pending_filter_loads,
                 pending_sort_loads,
                 lazy_value_fields,
@@ -977,6 +1009,9 @@ impl ConcurrentEngine {
             let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
             let flush_time_buckets = time_buckets.as_ref().map(Arc::clone);
+            let flush_pending_diffs = Arc::clone(&pending_bucket_diffs);
+            let flush_diff_log_path = config.storage.bitmap_path.as_ref()
+                .map(|bp| std::path::Path::new(bp).join("bucket_diffs.log"));
             let flush_pub_count = Arc::clone(&flush_publish_count);
             let flush_dur_nanos = Arc::clone(&flush_duration_nanos);
             let flush_last_dur_nanos = Arc::clone(&flush_last_duration_nanos);
@@ -1747,12 +1782,10 @@ impl ConcurrentEngine {
                         inner.store(Arc::new(staging.clone()));
                     }
 
-                    // Periodic time bucket refresh: runs independently of mutations since
-                    // bucket validity is time-based (e.g., items age out of the 24h window).
-                    // Must run even at idle to keep buckets fresh after restore from disk.
-                    //
-                    // Lock strategy: brief lock to check what's due + get config, then release
-                    // lock while iterating 100M+ slots to build bitmaps, then brief lock to swap.
+                    // Incremental time bucket refresh: instead of scanning 107M alive slots,
+                    // compute expired slots via narrow range query on the sort layers.
+                    // Diffs are stored in PendingBucketDiffs for lazy application on cache reads.
+                    // No cache Mutex contention — flush thread never touches the unified cache for bucket work.
                     if !is_loading {
                         if let Some(ref tb_arc) = flush_time_buckets {
                             let now_secs = std::time::SystemTime::now()
@@ -1760,8 +1793,8 @@ impl ConcurrentEngine {
                                 .unwrap_or_default()
                                 .as_secs();
 
-                            // Brief lock: check which buckets need refresh and get their durations
-                            let rebuild_info: Vec<(String, u64)> = {
+                            // Brief lock: check which buckets need refresh and get their config
+                            let refresh_info: Vec<(String, u64, u64, u64)> = {
                                 let tb = tb_arc.lock();
                                 let due = tb.refresh_due(now_secs);
                                 if due.is_empty() {
@@ -1769,84 +1802,108 @@ impl ConcurrentEngine {
                                 } else {
                                     due.iter()
                                         .filter_map(|name| {
-                                            tb.get_bucket(name).map(|b| (name.to_string(), b.duration_secs))
+                                            tb.get_bucket(name).map(|b| (
+                                                name.to_string(),
+                                                b.duration_secs,
+                                                b.refresh_interval_secs,
+                                                b.last_cutoff(),
+                                            ))
                                         })
                                         .collect()
                                 }
                             }; // lock released
 
-                            if !rebuild_info.is_empty() {
+                            if !refresh_info.is_empty() {
                                 let tb_lock = tb_arc.lock();
                                 let sort_field_name = tb_lock.sort_field_name().to_string();
-                                let field_name = tb_lock.field_name().to_string();
-                                drop(tb_lock); // release before heavy work
+                                drop(tb_lock);
 
                                 if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
-                                    let alive = staging.slots.alive_bitmap();
                                     let start = std::time::Instant::now();
 
-                                    // Single pass: compute cutoffs, build all bitmaps simultaneously
-                                    let cutoffs: Vec<u64> = rebuild_info.iter()
-                                        .map(|(_, dur)| now_secs.saturating_sub(*dur))
-                                        .collect();
-                                    let mut bitmaps: Vec<roaring::RoaringBitmap> = (0..rebuild_info.len())
-                                        .map(|_| roaring::RoaringBitmap::new())
-                                        .collect();
+                                    for (bucket_name, duration_secs, refresh_interval, old_cutoff) in &refresh_info {
+                                        let new_cutoff = crate::bucket_diff_log::snap_cutoff(
+                                            now_secs.saturating_sub(*duration_secs),
+                                            *refresh_interval,
+                                        );
 
-                                    for slot in alive.iter() {
-                                        let ts = sort_field.reconstruct_value(slot) as u64;
-                                        if ts <= now_secs {
-                                            for (i, cutoff) in cutoffs.iter().enumerate() {
-                                                if ts >= *cutoff {
-                                                    bitmaps[i].insert(slot);
-                                                }
+                                        if new_cutoff <= *old_cutoff {
+                                            // No new expired slots since last cutoff
+                                            // Still mark as refreshed so needs_refresh returns false
+                                            let mut tb = tb_arc.lock();
+                                            if let Some(bucket) = tb.get_bucket_mut(bucket_name) {
+                                                bucket.subtract_expired(&RoaringBitmap::new(), new_cutoff);
+                                            }
+                                            continue;
+                                        }
+
+                                        // Find expired slots: those in the bucket bitmap with
+                                        // sort value in [old_cutoff, new_cutoff)
+                                        let bucket_bm = {
+                                            let tb = tb_arc.lock();
+                                            tb.get_bucket(bucket_name)
+                                                .map(|b| RoaringBitmap::clone(b.bitmap()))
+                                                .unwrap_or_default()
+                                        };
+
+                                        let old_cutoff_u32 = *old_cutoff as u32;
+                                        let new_cutoff_u32 = new_cutoff as u32;
+                                        let mut expired = RoaringBitmap::new();
+                                        for slot in bucket_bm.iter() {
+                                            let val = sort_field.reconstruct_value(slot);
+                                            if val >= old_cutoff_u32 && val < new_cutoff_u32 {
+                                                expired.insert(slot);
                                             }
                                         }
-                                    }
 
-                                    let tb_scan_elapsed = start.elapsed();
+                                        let expired_count = expired.len();
 
-                                    // Two-phase time bucket update to minimize lock hold time:
-                                    // Phase 1 (under lock): snapshot old bitmaps + swap in new ones.
-                                    // Only clone + swap, no diff computation.
-                                    let old_bitmaps: Vec<(String, RoaringBitmap, RoaringBitmap)>;
-                                    {
-                                        let mut tb = tb_arc.lock();
-                                        old_bitmaps = rebuild_info.iter().enumerate().map(|(i, (bucket_name, _))| {
-                                            let old_bm = tb.get_bucket(bucket_name)
-                                                .map(|b| RoaringBitmap::clone(b.bitmap()))
-                                                .unwrap_or_default();
-                                            let new_bm = bitmaps[i].clone();
-                                            tb.rebuild_bucket_from_bitmap(
-                                                bucket_name,
-                                                std::mem::take(&mut bitmaps[i]),
-                                                now_secs,
-                                            );
-                                            (bucket_name.clone(), old_bm, new_bm)
-                                        }).collect();
-                                    }
-                                    // Phase 2 (no lock): compute diffs outside the Mutex.
-                                    let mut bucket_diffs: Vec<(String, RoaringBitmap, RoaringBitmap)> = Vec::new();
-                                    for (bucket_name, old_bm, new_bm) in &old_bitmaps {
-                                        let dropped = old_bm - new_bm;
-                                        let added = new_bm - old_bm;
-                                        if !dropped.is_empty() || !added.is_empty() {
-                                            bucket_diffs.push((bucket_name.clone(), dropped, added));
+                                        // Brief lock: subtract expired from bucket bitmap
+                                        {
+                                            let mut tb = tb_arc.lock();
+                                            if let Some(bucket) = tb.get_bucket_mut(bucket_name) {
+                                                bucket.subtract_expired(&expired, new_cutoff);
+                                            }
                                         }
+
+                                        // Store diff for lazy cache application (no cache Mutex!)
+                                        let diff = crate::bucket_diff_log::BucketDiff {
+                                            cutoff_before: *old_cutoff,
+                                            cutoff_after: new_cutoff,
+                                            expired: Arc::new(expired),
+                                        };
+
+                                        // Append to on-disk log
+                                        if let Some(ref log_path) = flush_diff_log_path {
+                                            let log = crate::bucket_diff_log::BucketDiffLog::new(
+                                                log_path.clone(), 100, 0.3,
+                                            );
+                                            if let Err(e) = log.append(&diff) {
+                                                eprintln!("Warning: failed to append bucket diff to log: {e}");
+                                            }
+                                            // Periodic compaction
+                                            if let Err(e) = log.compact_if_needed() {
+                                                eprintln!("Warning: bucket diff log compaction failed: {e}");
+                                            }
+                                        }
+
+                                        // Update in-memory pending diffs (ArcSwap store)
+                                        {
+                                            let old_pending = flush_pending_diffs.load();
+                                            let mut new_pending = crate::bucket_diff_log::PendingBucketDiffs::from_diffs(
+                                                old_pending.diffs().to_vec(),
+                                                100,
+                                            );
+                                            new_pending.push(diff);
+                                            flush_pending_diffs.store(Arc::new(new_pending));
+                                        }
+
+                                        eprintln!("Time bucket '{}' incremental refresh: expired={} cutoff {}→{} in {:?}",
+                                            bucket_name, expired_count, old_cutoff, new_cutoff, start.elapsed());
                                     }
-                                    eprintln!("Time bucket rebuild: scan={:?} total={:?} diffs={}",
-                                        tb_scan_elapsed, start.elapsed(), bucket_diffs.len());
+
                                     // Mark dirty so merge thread persists time buckets
                                     flush_dirty_flag.store(true, Ordering::Release);
-
-                                    // Skip O(n) cache iteration for bucket changes.
-                                    // maintain_bucket_changes() iterates ALL cache entries
-                                    // under the unified cache Mutex, blocking every query
-                                    // for seconds at 200K+ entries. Instead, let stale
-                                    // bucket entries serve slightly outdated results until
-                                    // naturally evicted or replaced by new queries.
-                                    // TODO: Replace with generational invalidation (PR #62).
-                                    let _ = &bucket_diffs; // suppress unused warning
                                 } else {
                                     eprintln!("Time bucket: sort field '{}' not found in staging", sort_field_name);
                                 }
@@ -2371,6 +2428,7 @@ impl ConcurrentEngine {
             loading_mode,
             dirty_since_snapshot: Arc::clone(&dirty_flag),
             time_buckets,
+            pending_bucket_diffs,
             pending_filter_loads,
             pending_sort_loads,
             lazy_value_fields,

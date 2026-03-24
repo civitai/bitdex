@@ -142,6 +142,11 @@ pub struct UnifiedEntry {
     radix: Option<Arc<RadixSortIndex>>,
     /// Sort direction for this entry (needed for radix iteration order).
     direction: SortDirection,
+    /// Snapped bucket cutoff this entry was last valid at (unix seconds).
+    /// 0 if this entry doesn't use time buckets.
+    bucket_cutoff: u64,
+    /// Whether this entry's filter clauses include a time bucket clause.
+    uses_bucket: bool,
 }
 
 impl UnifiedEntry {
@@ -198,6 +203,8 @@ impl UnifiedEntry {
             sorted_keys,
             radix: None, // No radix at initial capacity — sorted vec is faster
             direction,
+            bucket_cutoff: 0, // Set by caller via set_bucket_cutoff() after creation
+            uses_bucket: false, // Set by caller via set_uses_bucket() after creation
         }
     }
 
@@ -266,6 +273,8 @@ impl UnifiedEntry {
             sorted_keys,
             radix: None,
             direction,
+            bucket_cutoff: 0, // Set by caller after restore
+            uses_bucket: false, // Set by caller after restore
         }
     }
 
@@ -287,6 +296,43 @@ impl UnifiedEntry {
 
     pub fn max_capacity(&self) -> usize {
         self.max_capacity
+    }
+
+    /// The snapped bucket cutoff this entry was last valid at.
+    pub fn bucket_cutoff(&self) -> u64 {
+        self.bucket_cutoff
+    }
+
+    /// Set the bucket cutoff (called when creating or updating an entry).
+    pub fn set_bucket_cutoff(&mut self, cutoff: u64) {
+        self.bucket_cutoff = cutoff;
+    }
+
+    /// Whether this entry uses a time bucket clause.
+    pub fn uses_bucket(&self) -> bool {
+        self.uses_bucket
+    }
+
+    /// Mark this entry as using a time bucket clause.
+    pub fn set_uses_bucket(&mut self, uses: bool) {
+        self.uses_bucket = uses;
+    }
+
+    /// Apply pending bucket diffs: subtract expired slots from the bitmap
+    /// and update the bucket_cutoff to current.
+    pub fn apply_bucket_diff(&mut self, expired: &RoaringBitmap, new_cutoff: u64) {
+        if !expired.is_empty() {
+            let bm = Arc::make_mut(&mut self.bitmap);
+            *bm -= expired;
+            // Also remove from radix if expanded
+            if let Some(ref mut radix) = self.radix {
+                let r = Arc::make_mut(radix);
+                for slot in expired.iter() {
+                    r.remove_blind(slot);
+                }
+            }
+        }
+        self.bucket_cutoff = new_cutoff;
     }
 
     pub fn has_more(&self) -> bool {
