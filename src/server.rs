@@ -3633,6 +3633,7 @@ fn read_rss_bytes() -> i64 {
 }
 
 async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
+    let metrics_start = std::time::Instant::now();
     let m = &state.metrics;
 
     // Process memory (collect-on-scrape, no index needed)
@@ -3658,7 +3659,9 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .set(engine.slot_counter() as i64);
 
             // Cache gauges
+            let t0 = std::time::Instant::now();
             let uc = engine.unified_cache_stats();
+            let t_cache_stats = t0.elapsed();
             m.cache_entries
                 .with_label_values(&[name])
                 .set(uc.entries as i64);
@@ -3700,8 +3703,10 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .set(uc.prefetches as i64);
 
             // Per-field bitmap memory gauges
+            let t1 = std::time::Instant::now();
             let (slot_bytes, _filter_bytes, _sort_bytes, _ce, _cb, filter_details, sort_details) =
                 engine.bitmap_memory_report();
+            let t_bitmap_mem = t1.elapsed();
             m.slot_bitmap_bytes
                 .with_label_values(&[name])
                 .set(slot_bytes as i64);
@@ -3744,6 +3749,7 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .set(pending as i64);
 
             // Eviction stats
+            let t2 = std::time::Instant::now();
             for (field, total, resident) in engine.eviction_stats() {
                 m.eviction_total
                     .with_label_values(&[name, &field])
@@ -3752,6 +3758,8 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                     .with_label_values(&[name, &field])
                     .set(resident as i64);
             }
+
+            let t_eviction = t2.elapsed();
 
             // Compaction skipped (scrape-time from atomic counter)
             m.compaction_skipped_total
@@ -3763,7 +3771,7 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .set(state.queries_in_flight_peak.load(Ordering::Relaxed));
 
             // BoundStore stats
-            m.boundstore_meta_entries
+            let t3 = std::time::Instant::now();
                 .with_label_values(&[name])
                 .set(uc.meta_index_entries as i64);
             m.boundstore_tombstones
@@ -3794,25 +3802,36 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(engine.boundstore_bytes_read() as i64);
 
+            let t_boundstore = t3.elapsed();
+
             // Phase 2.5: Flush queue depth
             m.flush_queue_depth.set(engine.flush_queue_depth() as i64);
 
             // Doc cache stats (synced from DocCache atomic counters)
+            let t4 = std::time::Instant::now();
             let (dc_hits, dc_misses, dc_entries, dc_bytes, dc_evictions) = engine.doc_cache_stats();
+            let t_doc_cache = t4.elapsed();
             m.doc_cache_hit_total.with_label_values(&[name]).set(dc_hits as i64);
             m.doc_cache_miss_total.with_label_values(&[name]).set(dc_misses as i64);
             m.doc_cache_entries.with_label_values(&[name]).set(dc_entries as i64);
             m.doc_cache_bytes.with_label_values(&[name]).set(dc_bytes as i64);
             m.doc_cache_evictions_total.with_label_values(&[name]).set(dc_evictions as i64);
+
+            eprintln!("[metrics-timing] cache_stats={:?} bitmap_mem={:?} eviction={:?} boundstore={:?} doc_cache={:?} total={:?}",
+                t_cache_stats, t_bitmap_mem, t_eviction, t_boundstore, t_doc_cache, metrics_start.elapsed());
         }
     }
+
+    let t_gather = std::time::Instant::now();
+    let output = m.gather();
+    eprintln!("[metrics-timing] gather={:?} grand_total={:?}", t_gather.elapsed(), metrics_start.elapsed());
 
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        m.gather(),
+        output,
     )
 }
 
