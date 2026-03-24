@@ -1751,6 +1751,7 @@ impl ConcurrentEngine {
             let merge_filter_store = filter_store.clone();
             let merge_sort_store = sort_store.clone();
             let merge_meta_store = meta_store.clone();
+            let merge_config = Arc::clone(&config);
             let merge_dirty_flag = Arc::clone(&dirty_flag);
             let sort_field_configs: Vec<crate::config::SortFieldConfig> =
                 config.sort_fields.clone();
@@ -1774,64 +1775,22 @@ impl ConcurrentEngine {
                     if let (Some(ref as_), Some(ref fs_), Some(ref ss_), Some(ref ms_)) =
                         (&merge_alive_store, &merge_filter_store, &merge_sort_store, &merge_meta_store)
                     {
-                        let snap = merge_inner.load_full();
-                        let mut compacted = (*snap).clone();
-
-                        // Only persist fields that are (a) loaded and (b) dirty.
+                        // Use write_inner_to_store which reads through Arc refs (zero copy)
+                        // instead of the old (*snap).clone() which deep-clones all FilterField
+                        // HashMaps (3-4s at 107M records with tagIds 31K entries).
                         let pending_s = merge_pending_sorts.lock().clone();
                         let pending_f = merge_pending_filters.lock().clone();
                         let lazy_v = merge_lazy_values.lock().clone();
 
-                        // Write alive + slot counter + deferred map
-                        let alive = compacted.slots.alive_bitmap().clone();
-                        if let Err(e) = as_.write_alive(&alive) {
-                            eprintln!("merge thread: alive write failed: {e}");
-                        }
-                        if let Err(e) = ms_.write_slot_counter(compacted.slots.slot_counter()) {
-                            eprintln!("merge thread: slot_counter write failed: {e}");
-                        }
-                        if compacted.slots.deferred_count() > 0 {
-                            if let Err(e) = ms_.write_deferred_alive(compacted.slots.deferred_map()) {
-                                eprintln!("merge thread: deferred_alive write failed: {e}");
-                            }
-                        }
-
-                        // Write sort layers — compact diffs first
-                        for sc in &sort_field_configs {
-                            if pending_s.contains(&sc.name) { continue; }
-                            if let Some(sf) = compacted.sorts.get_field_mut(&sc.name) {
-                                sf.merge_dirty();
-                                let bases: Vec<RoaringBitmap> = sf
-                                    .layer_bases()
-                                    .iter()
-                                    .map(|b| (*b).clone())
-                                    .collect();
-                                let layer_refs: Vec<&RoaringBitmap> = bases.iter().collect();
-                                if let Err(e) = ss_.write_sort_layers(&sc.name, &layer_refs) {
-                                    eprintln!("merge thread: sort write failed for {}: {e}", sc.name);
-                                }
-                            }
-                        }
-
-                        // Write filter buckets — compact diffs, group by bucket
-                        for (name, field) in compacted.filters.fields_mut() {
-                            if pending_f.contains(name) || lazy_v.contains(name) { continue; }
-                            field.merge_dirty();
-                            // Group by bucket
-                            let mut by_bucket: HashMap<u8, Vec<(u64, RoaringBitmap)>> = HashMap::new();
-                            for (&value, vb) in field.iter_versioned() {
-                                let bucket = (value >> 8) as u8;
-                                by_bucket.entry(bucket).or_default()
-                                    .push((value, vb.base().as_ref().clone()));
-                            }
-                            for (bucket, entries) in by_bucket {
-                                let refs: Vec<(u64, &RoaringBitmap)> = entries.iter()
-                                    .map(|(v, bm)| (*v, bm))
-                                    .collect();
-                                if let Err(e) = fs_.write_filter_bucket(name, bucket, &refs) {
-                                    eprintln!("merge thread: filter write failed for {name}/{bucket:02x}: {e}");
-                                }
-                            }
+                        if let Err(e) = ConcurrentEngine::write_snapshot_to_store(
+                            as_, fs_, ss_, ms_,
+                            &merge_inner,
+                            &merge_config,
+                            &pending_s,
+                            &pending_f,
+                            &lazy_v,
+                        ) {
+                            eprintln!("merge thread: snapshot write failed: {e}");
                         }
 
                         // Persist time bucket bitmaps

@@ -2,20 +2,35 @@
 
 > Evolve the append-only tuple log (V2) into a generation-aware operations log with in-memory document caching. Generations enable point-in-time snapshots without copying. Op-log format enables incremental bitmap persistence (append deltas instead of rewriting full bitmaps).
 
-**Status**: PROPOSED
+**Status**: PARTIALLY IMPLEMENTED (ShardStore Phase 1 complete, 2026-03-24)
 **Builds on**: DocStore V2 (`docs/design/docstore-v2-bittuple-log.md`)
 **Enables**: Snapshot system (`docs/design/snapshot-system.md`), incremental bitmap persistence
 
+### Implementation Status
+
+| Feature | Status | Implementation |
+|---------|--------|---------------|
+| Unified ShardStore framework | DONE | `src/shard_store.rs` — generic with SnapshotCodec, OpCodec, ShardingStrategy traits |
+| Bitmap persistence via ShardStore | DONE | `src/shard_store_bitmap.rs` — AliveBitmapStore, FilterBitmapStore, SortBitmapStore |
+| Document codecs | DONE | `src/shard_store_doc.rs` — DocSnapshotCodec, DocOpCodec, SlotHexShard |
+| MetaStore | DONE | `src/shard_store_meta.rs` — slot_counter, deferred_alive, time_buckets, cursors |
+| ConcurrentEngine wiring | DONE | All BitmapFs I/O replaced with ShardStore (PR #28). Note: uses full snapshot writes, not ops-log appends. |
+| Generation pinning | DONE | `pin_generation()` wired into capture start/stop (PR #29) |
+| In-memory document caching | DONE | `src/doc_cache.rs` — DashMap, cache-on-read, write-through, LRU (PR #32) |
+| DocStore V2→ShardStore migration | DONE | `src/shard_store_migrate.rs` — reads V2 BDX2 shards |
+| V2 migration (field handler) | DONE | `src/field_handler.rs` — pluggable field type registry |
+| Incremental bitmap ops log | NOT STARTED | Merge thread still writes full snapshots; ops append deferred |
+
 ---
 
-## Problem
+## Original Problem (historical)
 
-DocStore V2 is fast (21us/doc reads, 512MB/s writes) but has gaps:
+DocStore V2 is fast (21us/doc reads, 512MB/s writes) but had gaps:
 
-1. **No in-memory caching** — Every read hits disk. Different request patterns = different shard reads = unique disk I/O per request. Hypothesis: this is a major contributor to the 6-second production stalls.
-2. **No point-in-time snapshots** — Can't freeze state without stopping writes. Needed for the snapshot/benchmark system.
-3. **Full bitmap rewrites** — BitmapFs saves rewrite entire roaring bitmaps to disk. At 105M records, this is ~7GB of bitmap data per save. Could instead append deltas.
-4. **No schema awareness** — V2 tuples are raw (slot, field_idx, value). No knowledge of field types, no ability to express operations like "append to multi-value" vs "replace scalar."
+1. ~~**No in-memory caching**~~ — **FIXED** by DocCache (`src/doc_cache.rs`). DashMap cache-on-read drops repeat reads from 16ms to <1μs.
+2. ~~**No point-in-time snapshots**~~ — **FIXED** by ShardStore generation model. `pin_generation()` freezes state at capture boundaries.
+3. **Full bitmap rewrites** — Merge thread still writes full snapshots via `write_snapshot_to_store()`. Incremental ops append is deferred.
+4. ~~**No schema awareness**~~ — **FIXED** by FieldHandler trait (`src/field_handler.rs`). DocOp enum has typed operations (Set, Append, Remove, Delete, Create).
 
 ---
 
