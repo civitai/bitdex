@@ -113,7 +113,7 @@ const HEADER_OPS_COUNT_OFFSET: u64 = 20;
 /// Based on Ollie's final microbench results: 2x read overhead at 1,000 ops
 /// is acceptable. Configurable per-field: tagIds tolerates 50K+, low-cardinality
 /// fields like nsfwLevel should compact at ~5K.
-pub const DEFAULT_COMPACT_THRESHOLD: u32 = 1_000;
+pub const DEFAULT_COMPACT_THRESHOLD: u32 = 500; // low-latency preset (was 1_000)
 
 // ---------------------------------------------------------------------------
 // Shard file header
