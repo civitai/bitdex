@@ -142,6 +142,10 @@ pub struct UnifiedEntry {
     radix: Option<Arc<RadixSortIndex>>,
     /// Sort direction for this entry (needed for radix iteration order).
     direction: SortDirection,
+    /// Time bucket generation at the time this entry was formed.
+    /// If the current TB generation is higher, the entry is stale (bucket bitmap changed).
+    /// Default 0 means "no time bucket context" — never stale-checked.
+    tb_generation: u64,
 }
 
 impl UnifiedEntry {
@@ -198,6 +202,7 @@ impl UnifiedEntry {
             sorted_keys,
             radix: None, // No radix at initial capacity — sorted vec is faster
             direction,
+            tb_generation: 0,
         }
     }
 
@@ -266,6 +271,7 @@ impl UnifiedEntry {
             sorted_keys,
             radix: None,
             direction,
+            tb_generation: 0, // Restored entries get current generation at lookup time
         }
     }
 
@@ -307,6 +313,16 @@ impl UnifiedEntry {
 
     pub fn meta_id(&self) -> CacheEntryId {
         self.meta_id
+    }
+
+    /// Time bucket generation when this entry was formed.
+    pub fn tb_generation(&self) -> u64 {
+        self.tb_generation
+    }
+
+    /// Set the time bucket generation on this entry.
+    pub fn set_tb_generation(&mut self, gen: u64) {
+        self.tb_generation = gen;
     }
 
     pub fn touch(&mut self) {
@@ -557,6 +573,9 @@ pub struct UnifiedCacheStats {
     pub extensions: u64,
     pub wall_hits: u64,
     pub prefetches: u64,
+    // Time bucket generation
+    pub tb_generation: u64,
+    pub tb_stale_misses: u64,
 }
 
 /// Per-entry diagnostic detail.
@@ -610,6 +629,12 @@ pub struct UnifiedCache {
     wall_hits: u64,
     /// Cumulative count of prefetch triggers (background expansion requests).
     prefetches: u64,
+    /// Current time bucket generation. Updated by the flush thread after bucket rebuilds.
+    /// Cache entries with `tb_generation < current_tb_generation` AND bucket clauses
+    /// are treated as stale misses, replacing the O(n) `maintain_bucket_changes()` iteration.
+    current_tb_generation: u64,
+    /// Count of stale entries detected by generation check (for metrics).
+    tb_stale_misses: u64,
 }
 
 impl UnifiedCache {
@@ -636,7 +661,26 @@ impl UnifiedCache {
             extensions: 0,
             wall_hits: 0,
             prefetches: 0,
+            current_tb_generation: 0,
+            tb_stale_misses: 0,
         }
+    }
+
+    /// Update the current time bucket generation. Called by the flush thread
+    /// after bucket rebuilds. Entries formed at an older generation will be
+    /// treated as stale misses on next `lookup()`.
+    pub fn set_tb_generation(&mut self, gen: u64) {
+        self.current_tb_generation = gen;
+    }
+
+    /// Returns the current time bucket generation stored on the cache.
+    pub fn tb_generation(&self) -> u64 {
+        self.current_tb_generation
+    }
+
+    /// Returns the count of cache misses caused by TB generation staleness.
+    pub fn tb_stale_misses(&self) -> u64 {
+        self.tb_stale_misses
     }
 
     /// Store persisted has_more flags from meta.bin, keyed by entry ID.
@@ -663,12 +707,28 @@ impl UnifiedCache {
 
     /// Look up a cache entry by key. Returns None on miss.
     /// Increments hit/miss counters.
+    ///
+    /// Entries are stale if:
+    /// - `needs_rebuild` is set (alive/filter change), or
+    /// - The entry has a bucket clause AND its `tb_generation` is older than the
+    ///   current time bucket generation (bucket bitmap changed since formation).
     pub fn lookup(&mut self, key: &UnifiedKey) -> Option<&mut UnifiedEntry> {
         if let Some(entry) = self.entries.get_mut(key) {
             if entry.needs_rebuild {
                 // Entry is stale (alive/filter change) — treat as miss.
                 // The caller will do a full traversal and re-form the entry.
                 self.misses += 1;
+                return None;
+            }
+            // Generational staleness: if the entry was formed before the latest
+            // time bucket rebuild AND it references a bucket clause, treat as miss.
+            // Entries with tb_generation == 0 and no bucket clauses are unaffected.
+            if entry.tb_generation > 0
+                && entry.tb_generation < self.current_tb_generation
+                && key.filter_clauses.iter().any(|c| c.op == "bucket")
+            {
+                self.misses += 1;
+                self.tb_stale_misses += 1;
                 return None;
             }
             self.hits += 1;
@@ -744,7 +804,7 @@ impl UnifiedCache {
         );
 
         let direction = key.direction;
-        let entry = UnifiedEntry::new(
+        let mut entry = UnifiedEntry::new(
             sorted_slots,
             self.config.initial_capacity,
             self.config.max_capacity,
@@ -754,6 +814,13 @@ impl UnifiedCache {
             direction,
             value_fn,
         );
+
+        // Tag entry with current TB generation so staleness can be detected.
+        // Only entries with bucket clauses are checked, but we tag all entries
+        // unconditionally (cheap: one u64 write).
+        if self.current_tb_generation > 0 {
+            entry.set_tb_generation(self.current_tb_generation);
+        }
 
         self.store(key, entry)
     }
@@ -943,6 +1010,8 @@ impl UnifiedCache {
             extensions: self.extensions,
             wall_hits: self.wall_hits,
             prefetches: self.prefetches,
+            tb_generation: self.current_tb_generation,
+            tb_stale_misses: self.tb_stale_misses,
         }
     }
 
@@ -3571,5 +3640,118 @@ mod tests {
 
         assert_eq!(single_has_10, two_has_10, "Two-phase should produce same result as single-phase");
         assert!(two_has_10, "Both should have slot 10");
+    }
+
+    // --- Generational time bucket cache invalidation tests ---
+
+    #[test]
+    fn test_tb_generation_stale_bucket_entry_is_miss() {
+        let mut cache = UnifiedCache::new(make_config());
+
+        // Entry with a bucket clause
+        let key = UnifiedKey {
+            filter_clauses: vec![
+                CanonicalClause {
+                    field: "sortAt".to_string(),
+                    op: "bucket".to_string(),
+                    value_repr: "7d".to_string(),
+                },
+                CanonicalClause {
+                    field: "nsfwLevel".to_string(),
+                    op: "eq".to_string(),
+                    value_repr: "1".to_string(),
+                },
+            ],
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+        };
+
+        // Set TB generation to 5 before forming the entry
+        cache.set_tb_generation(5);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        // Entry is tagged with gen=5, cache is at gen=5 → lookup should hit
+        assert!(cache.lookup(&key).is_some(), "entry at same generation should be a hit");
+
+        // Bump TB generation to 6 → entry is now stale
+        cache.set_tb_generation(6);
+        assert!(cache.lookup(&key).is_none(), "entry at older generation should be a miss");
+        assert_eq!(cache.tb_stale_misses(), 1);
+    }
+
+    #[test]
+    fn test_tb_generation_non_bucket_entry_unaffected() {
+        let mut cache = UnifiedCache::new(make_config());
+
+        // Entry WITHOUT a bucket clause
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+
+        cache.set_tb_generation(5);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        // Bump TB generation — entry without bucket clause should still hit
+        cache.set_tb_generation(10);
+        assert!(cache.lookup(&key).is_some(), "non-bucket entry should be unaffected by TB generation bump");
+        assert_eq!(cache.tb_stale_misses(), 0);
+    }
+
+    #[test]
+    fn test_tb_generation_zero_entry_unaffected() {
+        let mut cache = UnifiedCache::new(make_config());
+
+        // Entry with bucket clause but formed at generation 0 (before any TB was configured)
+        let key = UnifiedKey {
+            filter_clauses: vec![
+                CanonicalClause {
+                    field: "sortAt".to_string(),
+                    op: "bucket".to_string(),
+                    value_repr: "7d".to_string(),
+                },
+            ],
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+        };
+
+        // TB generation is 0 when entry is formed → entry gets tb_generation=0
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        // Bump TB generation → entry with tb_generation=0 should NOT be stale-checked
+        cache.set_tb_generation(3);
+        assert!(cache.lookup(&key).is_some(), "entry formed at gen=0 should not be stale-checked");
+    }
+
+    #[test]
+    fn test_tb_generation_reformed_entry_gets_current_gen() {
+        let mut cache = UnifiedCache::new(make_config());
+
+        let key = UnifiedKey {
+            filter_clauses: vec![
+                CanonicalClause {
+                    field: "sortAt".to_string(),
+                    op: "bucket".to_string(),
+                    value_repr: "7d".to_string(),
+                },
+            ],
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+        };
+
+        // Form at gen=5
+        cache.set_tb_generation(5);
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        // Bump to gen=7, entry is now stale
+        cache.set_tb_generation(7);
+        assert!(cache.lookup(&key).is_none(), "should be stale");
+
+        // Re-form the entry at gen=7
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        // Should hit now since entry is at current generation
+        assert!(cache.lookup(&key).is_some(), "reformed entry should be at current generation");
     }
 }

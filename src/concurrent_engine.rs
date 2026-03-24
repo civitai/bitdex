@@ -1773,7 +1773,7 @@ impl ConcurrentEngine {
                             if !rebuild_info.is_empty() {
                                 let tb_lock = tb_arc.lock();
                                 let sort_field_name = tb_lock.sort_field_name().to_string();
-                                let field_name = tb_lock.field_name().to_string();
+                                let _field_name = tb_lock.field_name().to_string();
                                 drop(tb_lock); // release before heavy work
 
                                 if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
@@ -1834,21 +1834,15 @@ impl ConcurrentEngine {
                                     // Mark dirty so merge thread persists time buckets
                                     flush_dirty_flag.store(true, Ordering::Release);
 
-                                    // Push bucket diffs to unified cache
+                                    // Generational invalidation: read the new TB generation
+                                    // (already bumped by rebuild_bucket_from_bitmap) and push
+                                    // it to the cache. Entries formed at an older generation
+                                    // will be treated as stale misses on next lookup — O(1)
+                                    // instead of the O(n) maintain_bucket_changes() iteration.
                                     if !bucket_diffs.is_empty() {
+                                        let tb_gen = tb_arc.lock().generation();
                                         let mut uc = flush_unified_cache.lock();
-                                        if !uc.is_empty() {
-                                            for (bucket_name, dropped, added) in &bucket_diffs {
-                                                uc.maintain_bucket_changes(
-                                                    &field_name,
-                                                    bucket_name,
-                                                    dropped,
-                                                    added,
-                                                    &staging.filters,
-                                                    &staging.sorts,
-                                                );
-                                            }
-                                        }
+                                        uc.set_tb_generation(tb_gen);
                                     }
                                 } else {
                                     eprintln!("Time bucket: sort field '{}' not found in staging", sort_field_name);

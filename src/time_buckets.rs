@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use roaring::RoaringBitmap;
 
@@ -66,6 +67,10 @@ pub struct TimeBucketManager {
     buckets: HashMap<String, TimeBucket>,
     /// Bucket names sorted by duration (shortest first) for snapping.
     sorted_names: Vec<String>,
+    /// Monotonically increasing generation counter. Bumped on every bucket rebuild.
+    /// Cache entries tagged with an older generation are treated as stale misses,
+    /// replacing the O(n) `maintain_bucket_changes()` iteration.
+    generation: AtomicU64,
 }
 
 impl TimeBucketManager {
@@ -103,6 +108,7 @@ impl TimeBucketManager {
             sort_field_name,
             buckets,
             sorted_names,
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -172,6 +178,8 @@ impl TimeBucketManager {
 
     /// Swap in a pre-built bitmap for a bucket. Used by the lock-free rebuild path
     /// where the bitmap is computed outside the lock, then swapped in briefly.
+    /// Bumps the generation counter so cache entries tagged with the old generation
+    /// are treated as stale misses on the next lookup.
     pub fn rebuild_bucket_from_bitmap(
         &mut self,
         bucket_name: &str,
@@ -181,7 +189,18 @@ impl TimeBucketManager {
         if let Some(bucket) = self.buckets.get_mut(bucket_name) {
             bucket.bitmap = Arc::new(bitmap);
             bucket.last_refreshed = now;
+            self.generation.fetch_add(1, Ordering::Release);
         }
+    }
+
+    /// Returns the current generation counter.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Increment the generation counter and return the new value.
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::Release) + 1
     }
 
     /// Given a duration from a range filter (e.g., now - filter_value), find the closest bucket
@@ -487,5 +506,42 @@ mod tests {
         ]);
         // Should not panic.
         mgr.rebuild_bucket("nonexistent", std::iter::empty(), 1_700_000_000);
+    }
+
+    #[test]
+    fn test_generation_starts_at_zero() {
+        let mgr = make_manager(vec![("24h", 86400, 300)]);
+        assert_eq!(mgr.generation(), 0);
+    }
+
+    #[test]
+    fn test_generation_bumped_on_rebuild_from_bitmap() {
+        let mut mgr = make_manager(vec![
+            ("24h", 86400, 300),
+            ("7d", 604800, 3600),
+        ]);
+        assert_eq!(mgr.generation(), 0);
+
+        // Each rebuild_bucket_from_bitmap bumps generation
+        mgr.rebuild_bucket_from_bitmap("24h", RoaringBitmap::new(), 1_700_000_000);
+        assert_eq!(mgr.generation(), 1);
+
+        mgr.rebuild_bucket_from_bitmap("7d", RoaringBitmap::new(), 1_700_000_000);
+        assert_eq!(mgr.generation(), 2);
+    }
+
+    #[test]
+    fn test_bump_generation_returns_new_value() {
+        let mgr = make_manager(vec![("24h", 86400, 300)]);
+        assert_eq!(mgr.bump_generation(), 1);
+        assert_eq!(mgr.bump_generation(), 2);
+        assert_eq!(mgr.generation(), 2);
+    }
+
+    #[test]
+    fn test_rebuild_unknown_bucket_does_not_bump_generation() {
+        let mut mgr = make_manager(vec![("24h", 86400, 300)]);
+        mgr.rebuild_bucket_from_bitmap("nonexistent", RoaringBitmap::new(), 1_700_000_000);
+        assert_eq!(mgr.generation(), 0, "unknown bucket should not bump generation");
     }
 }
