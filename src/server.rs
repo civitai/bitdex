@@ -3299,10 +3299,17 @@ async fn handle_capture_status(
     Json(serde_json::json!(state.capture.status()))
 }
 
-/// POST /debug/snapshot/{session_id}/package — Start packaging a captured session.
+#[derive(Deserialize)]
+struct PackageParams {
+    mode: Option<crate::capture::PackageMode>,
+}
+
+/// POST /debug/snapshot/{session_id}/package?mode=metrics_only|bitmaps|full
+/// Start packaging a captured session.
 async fn handle_package_snapshot(
     State(state): State<SharedState>,
     AxumPath(session_id): AxumPath<String>,
+    query: axum::extract::Query<PackageParams>,
 ) -> impl IntoResponse {
     let (session_dir, pkg_state) = match state.capture.start_package(&session_id) {
         Ok(v) => v,
@@ -3314,10 +3321,13 @@ async fn handle_package_snapshot(
         }
     };
 
+    let mode = query.mode.unwrap_or_default();
+    let data_dir = state.data_dir.clone();
+
     // Spawn blocking task for tar.zst creation
     let pkg_state_clone = pkg_state.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = crate::capture::create_package(&session_dir, &pkg_state_clone) {
+        if let Err(e) = crate::capture::create_package(&session_dir, &data_dir, mode, &pkg_state_clone) {
             *pkg_state_clone.lock().unwrap() = crate::capture::PackageState::Failed { error: e };
         }
     });
@@ -3325,6 +3335,7 @@ async fn handle_package_snapshot(
     Json(serde_json::json!({
         "status": "packaging",
         "session_id": session_id,
+        "mode": format!("{:?}", mode),
     })).into_response()
 }
 
