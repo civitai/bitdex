@@ -353,7 +353,19 @@ impl CaptureManager {
     /// Get the package state for a session.
     pub fn package_state(&self, session_id: &str) -> Option<PackageState> {
         let packages = self.packages.lock();
-        packages.get(session_id).map(|s| s.lock().unwrap().clone())
+        if let Some(s) = packages.get(session_id) {
+            return Some(s.lock().unwrap().clone());
+        }
+        // Fall back to checking disk (survives restarts).
+        let tar_path = self.base_dir.join(format!("{session_id}.snapshot.tar.zst"));
+        if tar_path.exists() {
+            let size = std::fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
+            return Some(PackageState::Ready {
+                path: tar_path.to_string_lossy().into_owned(),
+                size_bytes: size,
+            });
+        }
+        None
     }
 
     /// Get the path to a completed package file.
@@ -363,6 +375,11 @@ impl CaptureManager {
             if let PackageState::Ready { ref path, .. } = *state.lock().unwrap() {
                 return Some(PathBuf::from(path));
             }
+        }
+        // Fall back to checking disk (survives restarts).
+        let tar_path = self.base_dir.join(format!("{session_id}.snapshot.tar.zst"));
+        if tar_path.exists() {
+            return Some(tar_path);
         }
         None
     }
