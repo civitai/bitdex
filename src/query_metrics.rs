@@ -26,6 +26,7 @@ pub struct QueryTrace {
     pub sort_us: u64,
     pub result_count: u64,
     pub cache_hit: bool,
+    pub lazy_load_us: u64,
     pub docs_us: u64,
     pub docs_count: u64,
     pub clauses: Vec<ClauseTrace>,
@@ -62,6 +63,7 @@ pub struct SortTrace {
 pub struct QueryTraceCollector {
     start: Instant,
     pub plan_us: u64,
+    pub lazy_load_us: u64,
     pub filter_us: u64,
     pub sort_us: u64,
     pub cache_hit: bool,
@@ -74,6 +76,7 @@ impl QueryTraceCollector {
         Self {
             start: Instant::now(),
             plan_us: 0,
+            lazy_load_us: 0,
             filter_us: 0,
             sort_us: 0,
             cache_hit: false,
@@ -102,6 +105,7 @@ impl QueryTraceCollector {
             sort_us: self.sort_us,
             result_count,
             cache_hit: self.cache_hit,
+            lazy_load_us: self.lazy_load_us,
             docs_us: 0,
             docs_count: 0,
             clauses: self.clauses,
