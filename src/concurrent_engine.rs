@@ -5457,6 +5457,28 @@ impl ConcurrentEngine {
         self.bitmap_store.as_ref()
     }
 
+    /// Pin ShardStore generations across alive, filter, and sort stores.
+    ///
+    /// Bumps the generation counter on all three stores so that new writes go
+    /// to Gen N+1 while Gen N preserves the pre-pin state. Returns the frozen
+    /// generation number. Used by capture start/stop to bracket a time window.
+    ///
+    /// Returns None if no shard stores are configured.
+    pub fn pin_shard_generations(&self) -> Result<Option<u64>> {
+        let (alive_s, filter_s, sort_s) = match (&self.alive_store, &self.filter_store, &self.sort_store) {
+            (Some(a), Some(f), Some(s)) => (a, f, s),
+            _ => return Ok(None),
+        };
+        let gen_alive = alive_s.pin_generation()
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("pin alive gen: {e}")))?;
+        let gen_filter = filter_s.pin_generation()
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("pin filter gen: {e}")))?;
+        let gen_sort = sort_s.pin_generation()
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("pin sort gen: {e}")))?;
+        eprintln!("Pinned shard generations: alive={gen_alive}, filter={gen_filter}, sort={gen_sort}");
+        Ok(Some(gen_alive))
+    }
+
     /// Get a reference to the in-flight tracker.
     pub fn in_flight(&self) -> &InFlightTracker {
         &self.in_flight
