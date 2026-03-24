@@ -2033,7 +2033,12 @@ async fn handle_query(
                 response["documents"] = serde_json::json!(docs);
             }
 
-            Json(response).into_response()
+            let mut resp = Json(response).into_response();
+            resp.headers_mut().insert(
+                "X-BitDex-Duration-Us",
+                axum::http::HeaderValue::from_str(&elapsed_us.to_string()).unwrap(),
+            );
+            resp
         }
         Err(e) => {
             let elapsed_us = start.elapsed().as_micros() as u64;
