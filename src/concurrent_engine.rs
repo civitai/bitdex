@@ -1882,6 +1882,19 @@ impl ConcurrentEngine {
                             }
                         }
 
+                        // Persist slot counter + deferred alive (critical metadata)
+                        {
+                            let snap = merge_inner.load();
+                            if let Err(e) = ms_.write_slot_counter(snap.slots.slot_counter()) {
+                                eprintln!("merge thread: slot_counter write failed: {e}");
+                            }
+                            if snap.slots.deferred_count() > 0 {
+                                if let Err(e) = ms_.write_deferred_alive(snap.slots.deferred_map()) {
+                                    eprintln!("merge thread: deferred_alive write failed: {e}");
+                                }
+                            }
+                        }
+
                         // Persist time bucket bitmaps (MetaStore, unchanged)
                         if let Some(ref tb_arc) = merge_time_buckets {
                             let tb = tb_arc.lock();
