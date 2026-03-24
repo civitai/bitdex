@@ -1847,9 +1847,12 @@ impl ConcurrentEngine {
                     }
                     let doc_count = doc_batch.len();
                     if doc_count > 0 {
-                        // Write-through: populate doc cache before disk write
+                        // Conditional write-through: only update docs already
+                        // in cache (queried by users). New docs from pg-sync go
+                        // straight to disk without filling the cache with cold
+                        // entries that trigger eviction under load.
                         if let Some(ref cache) = flush_doc_cache {
-                            cache.insert_batch(&doc_batch);
+                            cache.update_batch_if_cached(&doc_batch);
                         }
                         if let Err(e) = docstore.lock().put_batch(&doc_batch) {
                             eprintln!("WARNING: docstore batch write failed (skipping {} docs): {e}", doc_batch.len());
