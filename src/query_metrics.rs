@@ -338,6 +338,7 @@ mod tests {
             cache_hit: false,
             clauses: vec![],
             sort: None,
+            lazy_load_us: 0,
         };
 
         buf.push(make_trace(1));

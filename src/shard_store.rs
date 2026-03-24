@@ -1,3 +1,4 @@
+#![allow(unexpected_cfgs)]
 //! ShardStore — Unified storage engine for BitDex.
 //!
 //! Replaces DocStore V2 and BitmapFs with a single generic system that supports:
@@ -101,6 +102,7 @@ const SHARD_VERSION: u32 = 1;
 const HEADER_SIZE: usize = 28;
 
 /// Per-op entry overhead: [4] length + [4] crc32 = 8 bytes wrapping each op.
+#[allow(dead_code)]
 const OP_ENTRY_OVERHEAD: usize = 8;
 
 /// Byte offset of the ops_count field within the header.

@@ -79,6 +79,7 @@ impl BitmapAccum {
     ///   [sort_count:u64]
     ///   for each sort: [name_len:u64][name_bytes][bit_count:u64]
     ///     for each bit: [bit:u64][bitmap_len:u64][bitmap_bytes]
+    #[allow(dead_code)]
     pub(crate) fn save_checkpoint(&self, path: &std::path::Path) -> std::io::Result<()> {
         let mut buf = Vec::with_capacity(64 * 1024 * 1024);
 
@@ -130,6 +131,7 @@ impl BitmapAccum {
     }
 
     /// Load an accumulator from a checkpoint file.
+    #[allow(dead_code)]
     pub(crate) fn load_checkpoint(path: &std::path::Path) -> std::io::Result<Self> {
         let data = std::fs::read(path)?;
         let mut pos = 0;

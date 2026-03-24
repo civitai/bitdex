@@ -133,7 +133,8 @@ pub struct AccumSink<'a> {
 }
 
 impl<'a> AccumSink<'a> {
-    pub fn new(accum: &'a mut BitmapAccum) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn new(accum: &'a mut BitmapAccum) -> Self {
         Self { accum }
     }
 }

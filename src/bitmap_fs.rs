@@ -375,8 +375,6 @@ impl BitmapFs {
     /// high-cardinality fields with many fpack files.
     /// Used to build positive existence sets for zero-result query elimination.
     pub fn list_field_keys(&self, field_name: &str) -> Result<HashSet<u64>> {
-        use std::io::Read;
-
         let dir = self.root.join("filter").join(field_name);
         if !dir.exists() {
             return Ok(HashSet::new());
