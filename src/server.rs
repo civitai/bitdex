@@ -273,6 +273,8 @@ struct AppState {
     metrics: Metrics,
     parser_registry: crate::parser::registry::ParserRegistry,
     enable_traces: AtomicBool,
+    /// Minimum query latency (microseconds) to record a trace. 0 = record all.
+    trace_min_us: AtomicU64,
     admin_token: Option<String>,
     trace_buffer: crate::query_metrics::TraceBuffer,
     /// Number of queries currently executing (incremented on entry, decremented on exit).
@@ -797,6 +799,9 @@ struct ConfigPatch {
     /// Toggle query trace collection on/off without restart.
     #[serde(default)]
     enable_traces: Option<bool>,
+    /// Minimum query latency (microseconds) to record a trace. 0 = record all.
+    #[serde(default)]
+    trace_min_us: Option<u64>,
 }
 
 /// Patchable fields for a filter field.
@@ -902,6 +907,7 @@ impl BitdexServer {
             metrics: Metrics::new(),
             parser_registry: registry,
             enable_traces: AtomicBool::new(self.enable_traces),
+            trace_min_us: AtomicU64::new(0),
             admin_token,
             trace_buffer: crate::query_metrics::TraceBuffer::default(),
             queries_in_flight: AtomicI64::new(0),
@@ -1594,6 +1600,10 @@ async fn handle_patch_config(
                     state.enable_traces.store(v, Ordering::Relaxed);
                     eprintln!("Config patch: enable_traces set to {v}");
                 }
+                if let Some(v) = patch.trace_min_us {
+                    state.trace_min_us.store(v, Ordering::Relaxed);
+                    eprintln!("Config patch: trace_min_us set to {v}μs");
+                }
 
                 // Persist updated config.json
                 let index_dir = state.data_dir.join("indexes").join(&name);
@@ -2004,9 +2014,13 @@ async fn handle_query(
                 result.total_matched, trace.plan_us, trace.filter_us, trace.sort_us
             );
 
-            // Write trace to JSONL in background (non-blocking), if enabled
+            // Write trace to ring buffer if enabled and above latency threshold.
+            // trace_min_us=0 means record all; trace_min_us=100000 means only >100ms.
             if state.enable_traces.load(Ordering::Relaxed) {
-                state.trace_buffer.push(trace.clone());
+                let min_us = state.trace_min_us.load(Ordering::Relaxed);
+                if min_us == 0 || trace.total_us >= min_us {
+                    state.trace_buffer.push(trace.clone());
+                }
             }
 
             let mut response = serde_json::json!({
