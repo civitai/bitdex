@@ -354,9 +354,12 @@ impl ConcurrentEngine {
 
         // Load alive bitmap and slot counter eagerly (small, always needed)
         let mut slots = crate::slot::SlotAllocator::new();
-        if let Some(ref store) = bitmap_store {
-            let alive = store.load_alive()?;
-            let counter = store.load_slot_counter()?;
+        if let Some(ref store) = alive_store {
+            let alive = store.load_alive()
+                .map_err(|e| crate::error::BitdexError::DocStore(format!("load alive: {e}")))?;
+            let counter = meta_store.as_ref()
+                .and_then(|ms| ms.load_slot_counter().ok())
+                .flatten();
             if let Some(alive_bm) = alive {
                 let counter_val = counter.unwrap_or(0);
                 slots = crate::slot::SlotAllocator::from_state(
@@ -366,11 +369,13 @@ impl ConcurrentEngine {
                 );
 
                 // Restore deferred alive map if persisted.
-                if let Some(deferred) = store.load_deferred_alive()? {
-                    if !deferred.is_empty() {
-                        let total: usize = deferred.values().map(|v| v.len()).sum();
-                        eprintln!("Restored {} deferred alive slots ({} timestamps)", total, deferred.len());
-                        slots.set_deferred(deferred);
+                if let Some(ref ms) = meta_store {
+                    if let Ok(Some(deferred)) = ms.load_deferred_alive() {
+                        if !deferred.is_empty() {
+                            let total: usize = deferred.values().map(|v| v.len()).sum();
+                            eprintln!("Restored {} deferred alive slots ({} timestamps)", total, deferred.len());
+                            slots.set_deferred(deferred);
+                        }
                     }
                 }
 
@@ -393,8 +398,8 @@ impl ConcurrentEngine {
                     for sc in &config.sort_fields {
                         if tb_sort_field.as_deref() == Some(&sc.name) {
                             // Eagerly load the sort field used by time buckets
-                            if let Some(ref store) = bitmap_store {
-                                if let Ok(Some(layers)) = store.load_sort_layers(&sc.name, sc.bits as usize) {
+                            if let Some(ref ss) = sort_store {
+                                if let Ok(Some(layers)) = ss.load_sort_layers(&sc.name, sc.bits as usize) {
                                     if !layers.is_empty() {
                                         sorts.add_field(sc.clone());
                                         if let Some(field) = sorts.get_field_mut(&sc.name) {
@@ -412,9 +417,9 @@ impl ConcurrentEngine {
             }
         }
         // Eager-load fields marked with `eager_load: true` in config.
-        // These are loaded in parallel from BitmapFs and applied to the
+        // These are loaded in parallel from ShardStore and applied to the
         // filters/sorts before constructing the InnerEngine.
-        if let Some(ref store) = bitmap_store {
+        if filter_store.is_some() || sort_store.is_some() {
             let eager_filter_names: Vec<String> = config.filter_fields.iter()
                 .filter(|fc| fc.eager_load && fc.field_type != FilterFieldType::MultiValue)
                 .filter(|fc| pending_filter_loads.contains(&fc.name))
@@ -438,11 +443,11 @@ impl ConcurrentEngine {
 
                     std::thread::scope(|s| {
                         for name in &eager_filter_names {
-                            let store = store.clone();
+                            let fs = filter_store.as_ref().unwrap().clone();
                             let results = &eager_filter_results;
                             s.spawn(move || {
                                 let ft0 = std::time::Instant::now();
-                                match store.load_field(name) {
+                                match fs.load_field(name) {
                                     Ok(bitmaps) => {
                                         let count = bitmaps.len();
                                         eprintln!(
@@ -456,13 +461,13 @@ impl ConcurrentEngine {
                             });
                         }
                         for (name, bits) in &eager_sort_configs {
-                            let store = store.clone();
+                            let ss = sort_store.as_ref().unwrap().clone();
                             let results = &eager_sort_results;
                             let name = name.clone();
                             let bits = *bits;
                             s.spawn(move || {
                                 let st0 = std::time::Instant::now();
-                                match store.load_sort_layers(&name, bits) {
+                                match ss.load_sort_layers(&name, bits) {
                                     Ok(Some(layers)) if !layers.is_empty() => {
                                         let layer_count = layers.len();
                                         eprintln!(
@@ -492,39 +497,43 @@ impl ConcurrentEngine {
                     }
                 } else {
                     // Single eager field — load serially (no thread overhead)
-                    for name in &eager_filter_names {
-                        let ft0 = std::time::Instant::now();
-                        match store.load_field(name) {
-                            Ok(bitmaps) => {
-                                let count = bitmaps.len();
-                                eprintln!(
-                                    "Eager-loaded filter '{}': {} values in {:.1}ms",
-                                    name, count, ft0.elapsed().as_secs_f64() * 1000.0
-                                );
-                                if let Some(field) = filters.get_field_mut(name) {
-                                    field.load_field_complete(bitmaps);
+                    if let Some(ref fs) = filter_store {
+                        for name in &eager_filter_names {
+                            let ft0 = std::time::Instant::now();
+                            match fs.load_field(name) {
+                                Ok(bitmaps) => {
+                                    let count = bitmaps.len();
+                                    eprintln!(
+                                        "Eager-loaded filter '{}': {} values in {:.1}ms",
+                                        name, count, ft0.elapsed().as_secs_f64() * 1000.0
+                                    );
+                                    if let Some(field) = filters.get_field_mut(name) {
+                                        field.load_field_complete(bitmaps);
+                                    }
+                                    pending_filter_loads.remove(name);
                                 }
-                                pending_filter_loads.remove(name);
+                                Err(e) => eprintln!("Warning: eager load failed for filter '{}': {}", name, e),
                             }
-                            Err(e) => eprintln!("Warning: eager load failed for filter '{}': {}", name, e),
                         }
                     }
-                    for (name, bits) in &eager_sort_configs {
-                        let st0 = std::time::Instant::now();
-                        match store.load_sort_layers(name, *bits) {
-                            Ok(Some(layers)) if !layers.is_empty() => {
-                                let layer_count = layers.len();
-                                eprintln!(
-                                    "Eager-loaded sort '{}': {} layers in {:.1}ms",
-                                    name, layer_count, st0.elapsed().as_secs_f64() * 1000.0
-                                );
-                                if let Some(field) = sorts.get_field_mut(name) {
-                                    field.load_layers(layers);
+                    if let Some(ref ss) = sort_store {
+                        for (name, bits) in &eager_sort_configs {
+                            let st0 = std::time::Instant::now();
+                            match ss.load_sort_layers(name, *bits) {
+                                Ok(Some(layers)) if !layers.is_empty() => {
+                                    let layer_count = layers.len();
+                                    eprintln!(
+                                        "Eager-loaded sort '{}': {} layers in {:.1}ms",
+                                        name, layer_count, st0.elapsed().as_secs_f64() * 1000.0
+                                    );
+                                    if let Some(field) = sorts.get_field_mut(name) {
+                                        field.load_layers(layers);
+                                    }
+                                    pending_sort_loads.remove(name);
                                 }
-                                pending_sort_loads.remove(name);
+                                Ok(_) => {}
+                                Err(e) => eprintln!("Warning: eager load failed for sort '{}': {}", name, e),
                             }
-                            Ok(_) => {}
-                            Err(e) => eprintln!("Warning: eager load failed for sort '{}': {}", name, e),
                         }
                     }
                 }
@@ -542,8 +551,8 @@ impl ConcurrentEngine {
         let mut uc = UnifiedCache::new(uc_config);
 
         // Initialize BoundStore for unified cache persistence
-        let bound_store = if let Some(ref store) = bitmap_store {
-            let bounds_path = store.root_path().join("bounds");
+        let bound_store = if let Some(ref path) = config.storage.bitmap_path {
+            let bounds_path = path.join("shardstore").join("bounds");
             match crate::bound_store::BoundStore::new(&bounds_path) {
                 Ok(bs) => {
                     // Load meta.bin: populate meta-index, record pending shards
@@ -633,8 +642,8 @@ impl ConcurrentEngine {
             );
 
             // Restore persisted time bucket bitmaps from disk
-            if let Some(ref store) = bitmap_store {
-                match store.load_time_buckets() {
+            if let Some(ref ms) = meta_store {
+                match ms.load_time_buckets() {
                     Ok(persisted) if !persisted.is_empty() => {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -734,8 +743,8 @@ impl ConcurrentEngine {
         let dirty_flag = Arc::new(AtomicBool::new(false));
 
         // Load named cursors from disk (if any exist).
-        let initial_cursors = if let Some(ref store) = bitmap_store {
-            store.load_all_cursors().unwrap_or_default()
+        let initial_cursors = if let Some(ref ms) = meta_store {
+            ms.load_all_cursors().unwrap_or_default()
         } else {
             HashMap::new()
         };
@@ -753,16 +762,16 @@ impl ConcurrentEngine {
         let pending_sort_loads = Arc::new(parking_lot::Mutex::new(pending_sort_loads));
 
         // Build positive existence sets for per-value lazy loading fields.
-        // Reads only .fpack headers (no bitmap payloads) — fast even at 31K keys.
+        // Reads bucket snapshots to discover all value IDs — fast even at 31K keys.
         let mut existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> = HashMap::new();
-        if let Some(ref store) = bitmap_store {
+        if let Some(ref fs) = filter_store {
             let fields: Vec<String> = lazy_value_fields.iter().cloned().collect();
             if fields.len() > 1 {
                 // Parallel existence set loading
                 use rayon::prelude::*;
                 let results: Vec<(String, std::result::Result<HashSet<u64>, _>)> = fields
                     .par_iter()
-                    .map(|name| (name.clone(), store.list_field_keys(name)))
+                    .map(|name| (name.clone(), fs.existence_set(name)))
                     .collect();
                 for (field_name, result) in results {
                     match result {
@@ -781,7 +790,7 @@ impl ConcurrentEngine {
             } else {
                 // Single field: sequential
                 for field_name in &fields {
-                    match store.list_field_keys(field_name) {
+                    match fs.existence_set(field_name) {
                         Ok(keys) => {
                             if !keys.is_empty() {
                                 eprintln!("Existence set for '{}': {} keys", field_name, keys.len());
@@ -922,6 +931,10 @@ impl ConcurrentEngine {
             let flush_eviction_total = Arc::clone(&eviction_total);
             let flush_cycle_clone = Arc::clone(&flush_cycle);
             let flush_bitmap_store = bitmap_store.clone();
+            let flush_alive_store = alive_store.clone();
+            let flush_filter_store = filter_store.clone();
+            let flush_sort_store = sort_store.clone();
+            let flush_meta_store = meta_store.clone();
             let flush_config = Arc::clone(&config);
             let flush_field_registry = field_registry.clone();
             let eviction_sweep_interval = config.eviction_sweep_interval;
@@ -1002,8 +1015,8 @@ impl ConcurrentEngine {
 
                         // Persist deferred map when new deferred entries are added.
                         if coalescer.has_deferred_alive() {
-                            if let Some(ref store) = flush_bitmap_store {
-                                if let Err(e) = store.write_deferred_alive(staging.slots.deferred_map()) {
+                            if let Some(ref ms) = flush_meta_store {
+                                if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
                                     eprintln!("Warning: failed to persist deferred alive map: {e}");
                                 }
                             }
@@ -1222,8 +1235,8 @@ impl ConcurrentEngine {
                             // Persist the deferred map AFTER activation so the activated
                             // entries are already removed. On crash before persist, the
                             // old map is re-read and those slots get re-activated (idempotent).
-                            if let Some(ref store) = flush_bitmap_store {
-                                if let Err(e) = store.write_deferred_alive(staging.slots.deferred_map()) {
+                            if let Some(ref ms) = flush_meta_store {
+                                if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
                                     eprintln!("Warning: failed to persist deferred alive map: {e}");
                                 }
                             }
@@ -1373,9 +1386,14 @@ impl ConcurrentEngine {
                                 loading_mode.store(false, Ordering::Release);
 
                                 // 2. Save from the published snapshot — no clone, just a borrow
-                                if let Some(ref store) = flush_bitmap_store {
+                                if let (Some(ref as_), Some(ref fs_), Some(ref ss_), Some(ref ms_)) =
+                                    (&flush_alive_store, &flush_filter_store, &flush_sort_store, &flush_meta_store)
+                                {
                                     let save_result = ConcurrentEngine::write_inner_to_store(
-                                        store,
+                                        as_,
+                                        fs_,
+                                        ss_,
+                                        ms_,
                                         &published,
                                         &flush_config,
                                         &skip_sorts,
@@ -1389,14 +1407,14 @@ impl ConcurrentEngine {
 
                                     // Persist cursors
                                     for (name, value) in &cursors {
-                                        if let Err(e) = store.write_cursor(name, value) {
+                                        if let Err(e) = ms_.write_cursor(name, value) {
                                             eprintln!("Warning: failed to persist cursor '{}': {}", name, e);
                                         }
                                     }
 
                                     // Persist dictionaries
                                     if !dictionaries.is_empty() {
-                                        let dict_dir = store.root_path().join("dictionaries");
+                                        let dict_dir = ms_.root().join("dictionaries");
                                         for (name, dict) in dictionaries.iter() {
                                             let snap = dict.snapshot();
                                             let path = dict_dir.join(format!("{}.dict", name));
@@ -1697,6 +1715,10 @@ impl ConcurrentEngine {
             let merge_inner = Arc::clone(&inner);
             let merge_interval_ms = config.merge_interval_ms;
             let merge_bitmap_store = bitmap_store.clone();
+            let merge_alive_store = alive_store.clone();
+            let merge_filter_store = filter_store.clone();
+            let merge_sort_store = sort_store.clone();
+            let merge_meta_store = meta_store.clone();
             let merge_dirty_flag = Arc::clone(&dirty_flag);
             let sort_field_configs: Vec<crate::config::SortFieldConfig> =
                 config.sort_fields.clone();
@@ -1717,44 +1739,34 @@ impl ConcurrentEngine {
                     // Only write if bitmaps have changed since last snapshot.
                     let needs_write = merge_dirty_flag.swap(false, Ordering::AcqRel);
                     if needs_write {
-                    if let Some(ref store) = merge_bitmap_store {
+                    if let (Some(ref as_), Some(ref fs_), Some(ref ss_), Some(ref ms_)) =
+                        (&merge_alive_store, &merge_filter_store, &merge_sort_store, &merge_meta_store)
+                    {
                         let snap = merge_inner.load_full();
                         let mut compacted = (*snap).clone();
 
                         // Only persist fields that are (a) loaded and (b) dirty.
-                        // Pending lazy-load fields are empty placeholders — writing
-                        // them would overwrite real data on disk. Clean fields don't
-                        // need rewriting.
                         let pending_s = merge_pending_sorts.lock().clone();
                         let pending_f = merge_pending_filters.lock().clone();
                         let lazy_v = merge_lazy_values.lock().clone();
 
-                        // Collect filter bitmap entries — all loaded fields.
-                        // Note: we don't check has_dirty() per-field because the flush
-                        // thread's periodic compaction (merge_dirty) clears per-field
-                        // dirty flags before the merge thread runs, creating a race.
-                        // The dirty_flag AtomicBool gates the write at the top level.
-                        let mut filter_entries: Vec<(String, u64, RoaringBitmap)> = Vec::new();
-                        for (name, field) in compacted.filters.fields_mut() {
-                            if pending_f.contains(name) || lazy_v.contains(name) {
-                                continue;
-                            }
-                            field.merge_dirty();
-                            for (&value, vb) in field.iter_versioned() {
-                                filter_entries.push((
-                                    name.clone(),
-                                    value,
-                                    vb.base().as_ref().clone(),
-                                ));
+                        // Write alive + slot counter + deferred map
+                        let alive = compacted.slots.alive_bitmap().clone();
+                        if let Err(e) = as_.write_alive(&alive) {
+                            eprintln!("merge thread: alive write failed: {e}");
+                        }
+                        if let Err(e) = ms_.write_slot_counter(compacted.slots.slot_counter()) {
+                            eprintln!("merge thread: slot_counter write failed: {e}");
+                        }
+                        if compacted.slots.deferred_count() > 0 {
+                            if let Err(e) = ms_.write_deferred_alive(compacted.slots.deferred_map()) {
+                                eprintln!("merge thread: deferred_alive write failed: {e}");
                             }
                         }
 
-                        // Collect sort layer bases — all loaded fields
-                        let mut sort_data: Vec<(String, Vec<RoaringBitmap>)> = Vec::new();
+                        // Write sort layers — compact diffs first
                         for sc in &sort_field_configs {
-                            if pending_s.contains(&sc.name) {
-                                continue;
-                            }
+                            if pending_s.contains(&sc.name) { continue; }
                             if let Some(sf) = compacted.sorts.get_field_mut(&sc.name) {
                                 sf.merge_dirty();
                                 let bases: Vec<RoaringBitmap> = sf
@@ -1762,54 +1774,51 @@ impl ConcurrentEngine {
                                     .iter()
                                     .map(|b| (*b).clone())
                                     .collect();
-                                sort_data.push((sc.name.clone(), bases));
+                                let layer_refs: Vec<&RoaringBitmap> = bases.iter().collect();
+                                if let Err(e) = ss_.write_sort_layers(&sc.name, &layer_refs) {
+                                    eprintln!("merge thread: sort write failed for {}: {e}", sc.name);
+                                }
                             }
                         }
 
-                        let filter_refs: Vec<(&str, u64, &RoaringBitmap)> = filter_entries
-                            .iter()
-                            .map(|(f, v, b)| (f.as_str(), *v, b))
-                            .collect();
-                        let alive = compacted.slots.alive_bitmap().clone();
-                        let slot_counter = compacted.slots.slot_counter();
-
-                        let sort_owned_refs: Vec<(String, Vec<&RoaringBitmap>)> = sort_data
-                            .iter()
-                            .map(|(name, layers)| {
-                                (name.clone(), layers.iter().collect::<Vec<&RoaringBitmap>>())
-                            })
-                            .collect();
-                        let sort_slice_refs: Vec<(&str, &[&RoaringBitmap])> = sort_owned_refs
-                            .iter()
-                            .map(|(name, refs)| (name.as_str(), refs.as_slice()))
-                            .collect();
-
-                        if let Err(e) = store.write_full_snapshot(
-                            &filter_refs,
-                            &alive,
-                            &sort_slice_refs,
-                            slot_counter,
-                        ) {
-                            eprintln!("merge thread: bitmap snapshot write failed: {e}");
+                        // Write filter buckets — compact diffs, group by bucket
+                        for (name, field) in compacted.filters.fields_mut() {
+                            if pending_f.contains(name) || lazy_v.contains(name) { continue; }
+                            field.merge_dirty();
+                            // Group by bucket
+                            let mut by_bucket: HashMap<u8, Vec<(u64, RoaringBitmap)>> = HashMap::new();
+                            for (&value, vb) in field.iter_versioned() {
+                                let bucket = (value >> 8) as u8;
+                                by_bucket.entry(bucket).or_default()
+                                    .push((value, vb.base().as_ref().clone()));
+                            }
+                            for (bucket, entries) in by_bucket {
+                                let refs: Vec<(u64, &RoaringBitmap)> = entries.iter()
+                                    .map(|(v, bm)| (*v, bm))
+                                    .collect();
+                                if let Err(e) = fs_.write_filter_bucket(name, bucket, &refs) {
+                                    eprintln!("merge thread: filter write failed for {name}/{bucket:02x}: {e}");
+                                }
+                            }
                         }
 
-                        // Persist time bucket bitmaps alongside filter/sort data
+                        // Persist time bucket bitmaps
                         if let Some(ref tb_arc) = merge_time_buckets {
                             let tb = tb_arc.lock();
                             for (name, bitmap) in tb.all_buckets() {
                                 if !bitmap.is_empty() {
-                                    if let Err(e) = store.write_time_bucket(name, bitmap) {
+                                    if let Err(e) = ms_.write_time_bucket(name, bitmap) {
                                         eprintln!("merge thread: time bucket write failed: {e}");
                                     }
                                 }
                             }
                         }
 
-                        // Persist named cursors alongside bitmap data
+                        // Persist named cursors
                         {
                             let cursor_snapshot = merge_cursors.lock().clone();
                             for (name, value) in &cursor_snapshot {
-                                if let Err(e) = store.write_cursor(name, value) {
+                                if let Err(e) = ms_.write_cursor(name, value) {
                                     eprintln!("merge thread: cursor write failed for {name}: {e}");
                                 }
                             }
@@ -2259,11 +2268,11 @@ impl ConcurrentEngine {
         if self.dictionaries.is_empty() {
             return Ok(());
         }
-        let store = match self.bitmap_store.as_ref() {
+        let ms = match self.meta_store.as_ref() {
             Some(s) => s,
             None => return Ok(()), // no persistence configured
         };
-        let dict_dir = store.root_path().join("dictionaries");
+        let dict_dir = ms.root().join("dictionaries");
         for (name, dict) in self.dictionaries.iter() {
             if dict.is_dirty() {
                 let snap = dict.snapshot();
@@ -2621,11 +2630,12 @@ impl ConcurrentEngine {
             ))
         })?;
 
-        let store = self.bitmap_store.as_ref().ok_or_else(|| {
-            crate::error::BitdexError::Config("No bitmap store configured".to_string())
+        let fs = self.filter_store.as_ref().ok_or_else(|| {
+            crate::error::BitdexError::Config("No filter store configured".to_string())
         })?;
 
-        let new_keys = store.list_field_keys(field_name)?;
+        let new_keys = fs.existence_set(field_name)
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("existence set: {e}")))?;
         let count = new_keys.len();
         keys_arc.store(Arc::new(new_keys));
 
@@ -2761,10 +2771,10 @@ impl ConcurrentEngine {
             return Ok(());
         }
 
-        // Load from BitmapFs
-        let store = match self.bitmap_store.as_ref() {
-            Some(s) => s,
-            None => return Ok(()), // no store, nothing to load
+        // Load from ShardStore (filter and sort stores for lazy loading)
+        let (lazy_filter_store, lazy_sort_store) = match (&self.filter_store, &self.sort_store) {
+            (Some(fs), Some(ss)) => (fs, ss),
+            _ => return Ok(()), // no store, nothing to load
         };
 
         // Do all expensive disk I/O in parallel, collecting loaded data.
@@ -2842,7 +2852,7 @@ impl ConcurrentEngine {
             std::thread::scope(|s| {
                 // Spawn filter field loaders
                 for name in &needed_filters {
-                    let store = store.clone();
+                    let fs = lazy_filter_store.clone();
                     let par_filters = &par_filters;
                     let par_error = &par_error;
                     #[cfg(feature = "server")]
@@ -2850,7 +2860,7 @@ impl ConcurrentEngine {
                     s.spawn(move || {
                         if par_error.lock().unwrap().is_some() { return; }
                         let t0 = std::time::Instant::now();
-                        match store.load_field(name) {
+                        match fs.load_field(name) {
                             Ok(bitmaps) => {
                                 let count = bitmaps.len();
                                 eprintln!(
@@ -2865,14 +2875,14 @@ impl ConcurrentEngine {
                                 }
                                 par_filters.lock().unwrap().push((name.clone(), bitmaps));
                             }
-                            Err(e) => { *par_error.lock().unwrap() = Some(e); }
+                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::DocStore(format!("lazy load filter: {e}"))); }
                         }
                     });
                 }
 
                 // Spawn sort field loader
                 if let (Some(sort_name), Some(bits)) = (&needed_sort, sort_bits) {
-                    let store = store.clone();
+                    let ss = lazy_sort_store.clone();
                     let par_sort = &par_sort;
                     let par_error = &par_error;
                     let sort_name = sort_name.clone();
@@ -2881,7 +2891,7 @@ impl ConcurrentEngine {
                     s.spawn(move || {
                         if par_error.lock().unwrap().is_some() { return; }
                         let t0 = std::time::Instant::now();
-                        match store.load_sort_layers(&sort_name, bits) {
+                        match ss.load_sort_layers(&sort_name, bits) {
                             Ok(Some(layers)) => {
                                 let layer_count = layers.len();
                                 eprintln!(
@@ -2897,14 +2907,14 @@ impl ConcurrentEngine {
                                 *par_sort.lock().unwrap() = Some((sort_name, layers));
                             }
                             Ok(None) => {}
-                            Err(e) => { *par_error.lock().unwrap() = Some(e); }
+                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::DocStore(format!("lazy load sort: {e}"))); }
                         }
                     });
                 }
 
                 // Spawn per-value loaders
                 for (field_name, missing) in &value_load_tasks {
-                    let store = store.clone();
+                    let fs = lazy_filter_store.clone();
                     let par_values = &par_values;
                     let par_error = &par_error;
                     #[cfg(feature = "server")]
@@ -2912,7 +2922,7 @@ impl ConcurrentEngine {
                     s.spawn(move || {
                         if par_error.lock().unwrap().is_some() { return; }
                         let t0 = std::time::Instant::now();
-                        match store.load_field_values(field_name, missing) {
+                        match fs.load_field_values(field_name, missing) {
                             Ok(loaded) if !loaded.is_empty() => {
                                 let count = loaded.len();
                                 eprintln!(
@@ -2928,7 +2938,7 @@ impl ConcurrentEngine {
                                 par_values.lock().unwrap().push((field_name.clone(), loaded, missing.clone()));
                             }
                             Ok(_) => {}
-                            Err(e) => { *par_error.lock().unwrap() = Some(e); }
+                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::DocStore(format!("lazy load values: {e}"))); }
                         }
                     });
                 }
@@ -2946,7 +2956,8 @@ impl ConcurrentEngine {
             // --- Serial path: single task, no threading overhead ---
             for name in &needed_filters {
                 let t0 = std::time::Instant::now();
-                let bitmaps = store.load_field(name)?;
+                let bitmaps = lazy_filter_store.load_field(name)
+                    .map_err(|e| crate::error::BitdexError::DocStore(format!("lazy load filter: {e}")))?;
                 let count = bitmaps.len();
                 eprintln!(
                     "Lazy-loaded filter '{}': {} values in {:.1}ms",
@@ -2963,7 +2974,9 @@ impl ConcurrentEngine {
 
             if let (Some(sort_name), Some(bits)) = (&needed_sort, sort_bits) {
                 let t0 = std::time::Instant::now();
-                if let Some(layers) = store.load_sort_layers(sort_name, bits)? {
+                let layers_opt = lazy_sort_store.load_sort_layers(sort_name, bits)
+                    .map_err(|e| crate::error::BitdexError::DocStore(format!("lazy load sort: {e}")))?;
+                if let Some(layers) = layers_opt {
                     let layer_count = layers.len();
                     eprintln!(
                         "Lazy-loaded sort '{}': {} layers in {:.1}ms",
@@ -2981,7 +2994,8 @@ impl ConcurrentEngine {
 
             for (field_name, missing) in &value_load_tasks {
                 let t0 = std::time::Instant::now();
-                let loaded = store.load_field_values(field_name, missing)?;
+                let loaded = lazy_filter_store.load_field_values(field_name, missing)
+                    .map_err(|e| crate::error::BitdexError::DocStore(format!("lazy load values: {e}")))?;
                 if !loaded.is_empty() {
                     let count = loaded.len();
                     eprintln!(
@@ -5031,12 +5045,8 @@ impl ConcurrentEngine {
         // force-publish (was_loading && !is_loading) overwrites the loader's
         // published data before the save command reads it.
 
-        let store = self.bitmap_store.as_ref().ok_or_else(|| {
-            crate::error::BitdexError::Config(
-                "no bitmap_path configured; cannot save_and_unload".to_string(),
-            )
-        })?;
-        let _ = store; // Just validating it exists; flush thread has its own Arc
+        // Validate stores exist; flush thread has its own clones
+        let _ = self.require_stores("exit_loading_mode_and_save_unload")?;
 
         let skip_sorts = self.pending_sort_loads.lock().clone();
         let skip_filters = self.pending_filter_loads.lock().clone();
@@ -5099,11 +5109,28 @@ impl ConcurrentEngine {
         }
     }
 
-    /// Save a full snapshot of the current published state to the configured BitmapStore.
+    /// Borrow all four ShardStore components, returning an error if any is missing.
+    fn require_stores(&self, caller: &str) -> Result<(
+        &crate::shard_store_bitmap::AliveBitmapStore,
+        &crate::shard_store_bitmap::FilterBitmapStore,
+        &crate::shard_store_bitmap::SortBitmapStore,
+        &crate::shard_store_meta::MetaStore,
+    )> {
+        let msg = |which: &str| crate::error::BitdexError::Config(
+            format!("no bitmap_path configured; cannot {caller} (missing {which})")
+        );
+        Ok((
+            self.alive_store.as_ref().map(|a| a.as_ref()).ok_or_else(|| msg("alive_store"))?,
+            self.filter_store.as_ref().map(|a| a.as_ref()).ok_or_else(|| msg("filter_store"))?,
+            self.sort_store.as_ref().map(|a| a.as_ref()).ok_or_else(|| msg("sort_store"))?,
+            self.meta_store.as_ref().map(|a| a.as_ref()).ok_or_else(|| msg("meta_store"))?,
+        ))
+    }
+
+    /// Save a full snapshot of the current published state to ShardStore.
     ///
     /// Captures the current ArcSwap snapshot (what readers see) and writes all
-    /// filter bitmaps, alive bitmap, sort layer bitmaps, and slot counter in a
-    /// single atomic redb transaction via `write_full_snapshot()`.
+    /// filter bitmaps, alive bitmap, sort layer bitmaps, and slot counter.
     ///
     /// This is intended for persisting state after bulk loading is complete.
     /// For incremental persistence during normal operation, the merge thread
@@ -5111,44 +5138,51 @@ impl ConcurrentEngine {
     ///
     /// Returns an error if no bitmap_store is configured.
     pub fn save_snapshot(&self) -> Result<()> {
-        let store = self.bitmap_store.as_ref().ok_or_else(|| {
-            crate::error::BitdexError::Config(
-                "no bitmap_path configured; cannot save snapshot".to_string(),
-            )
-        })?;
+        let (alive_s, filter_s, sort_s, meta_s) = self.require_stores("save_snapshot")?;
         let skip_sorts = self.pending_sort_loads.lock().clone();
         let skip_filters = self.pending_filter_loads.lock().clone();
         let skip_lazy = self.lazy_value_fields.lock().clone();
-        Self::write_snapshot_to_store(store, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)?;
+        Self::write_snapshot_to_store(alive_s, filter_s, sort_s, meta_s, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)?;
 
         // Persist named cursors alongside bitmaps so they survive process restart.
-        // The merge thread also writes cursors periodically, but save_snapshot() is
-        // used by the bulk loader which exits immediately after saving.
         let cursor_snapshot = self.cursors.lock().clone();
         for (name, value) in &cursor_snapshot {
-            store.write_cursor(name, value)?;
+            meta_s.write_cursor(name, value)
+                .map_err(|e| crate::error::BitdexError::DocStore(format!("write cursor: {e}")))?;
         }
 
         // Save LowCardinalityString dictionaries alongside bitmaps.
         if !self.dictionaries.is_empty() {
-            let bitmap_path = store.root_path();
-            self.save_dictionaries(bitmap_path)?;
+            let dict_path = meta_s.root();
+            self.save_dictionaries(dict_path)?;
         }
 
         Ok(())
     }
 
-    /// Save a full snapshot of the current published state to a BitmapFs at a custom path.
+    /// Save a full snapshot of the current published state to a custom path.
     ///
-    /// Creates a new BitmapFs at the given path and writes the complete engine
-    /// state. Useful for benchmarks that want to save to a specific location,
-    /// or for creating point-in-time backups separate from the live store.
+    /// Creates new ShardStore instances at the given path and writes the complete
+    /// engine state. Useful for benchmarks or point-in-time backups.
     pub fn save_snapshot_to(&self, path: &Path) -> Result<()> {
-        let store = BitmapFs::new(path)?;
+        use crate::error::BitdexError;
+        let ss_root = path.join("shardstore");
+        let alive_s = crate::shard_store_bitmap::AliveBitmapStore::new(
+            ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
+        ).map_err(|e| BitdexError::DocStore(format!("alive store init: {e}")))?;
+        let filter_s = crate::shard_store_bitmap::FilterBitmapStore::new(
+            ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
+        ).map_err(|e| BitdexError::DocStore(format!("filter store init: {e}")))?;
+        let sort_s = crate::shard_store_bitmap::SortBitmapStore::new(
+            ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
+        ).map_err(|e| BitdexError::DocStore(format!("sort store init: {e}")))?;
+        let meta_s = crate::shard_store_meta::MetaStore::new(ss_root)
+            .map_err(|e| BitdexError::DocStore(format!("meta store init: {e}")))?;
+
         let skip_sorts = self.pending_sort_loads.lock().clone();
         let skip_filters = self.pending_filter_loads.lock().clone();
         let skip_lazy = self.lazy_value_fields.lock().clone();
-        Self::write_snapshot_to_store(&store, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)?;
+        Self::write_snapshot_to_store(&alive_s, &filter_s, &sort_s, &meta_s, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)?;
 
         // Save LowCardinalityString dictionaries alongside bitmaps.
         if !self.dictionaries.is_empty() {
@@ -5158,7 +5192,7 @@ impl ConcurrentEngine {
         Ok(())
     }
 
-    /// Internal: zero-copy snapshot serialization.
+    /// Internal: zero-copy snapshot serialization via ShardStore.
     ///
     /// Reads the published snapshot through Arc refs — no InnerEngine clone.
     /// Uses `fused_cow()` to borrow base bitmaps directly (zero copy when clean)
@@ -5168,7 +5202,10 @@ impl ConcurrentEngine {
     /// Skips fields that haven't been loaded yet (still pending lazy-load) to avoid
     /// overwriting real persisted data with empty placeholders.
     fn write_snapshot_to_store(
-        store: &BitmapFs,
+        alive_store: &crate::shard_store_bitmap::AliveBitmapStore,
+        filter_store: &crate::shard_store_bitmap::FilterBitmapStore,
+        sort_store: &crate::shard_store_bitmap::SortBitmapStore,
+        meta_store: &crate::shard_store_meta::MetaStore,
         inner: &ArcSwap<InnerEngine>,
         config: &Config,
         skip_sorts: &HashSet<String>,
@@ -5176,14 +5213,17 @@ impl ConcurrentEngine {
         skip_lazy_values: &HashSet<String>,
     ) -> Result<()> {
         let snap: Arc<InnerEngine> = inner.load_full();
-        Self::write_inner_to_store(store, &snap, config, skip_sorts, skip_filters, skip_lazy_values)
+        Self::write_inner_to_store(alive_store, filter_store, sort_store, meta_store, &snap, config, skip_sorts, skip_filters, skip_lazy_values)
     }
 
     /// Write bitmaps from an InnerEngine directly to the store.
     /// This is used by both the ArcSwap-based path and the flush thread's
     /// direct-from-staging path (which avoids the intermediate clone).
     fn write_inner_to_store(
-        store: &BitmapFs,
+        alive_store: &crate::shard_store_bitmap::AliveBitmapStore,
+        filter_store: &crate::shard_store_bitmap::FilterBitmapStore,
+        sort_store: &crate::shard_store_bitmap::SortBitmapStore,
+        meta_store: &crate::shard_store_meta::MetaStore,
         snap: &InnerEngine,
         config: &Config,
         skip_sorts: &HashSet<String>,
@@ -5196,10 +5236,13 @@ impl ConcurrentEngine {
 
         // Write alive bitmap + slot counter + deferred map first (critical metadata).
         let alive_cow = snap.slots.alive_fused_cow();
-        store.write_alive(&alive_cow)?;
-        store.write_slot_counter(snap.slots.slot_counter())?;
+        alive_store.write_alive(&alive_cow)
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("write alive: {e}")))?;
+        meta_store.write_slot_counter(snap.slots.slot_counter())
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("write slot_counter: {e}")))?;
         if snap.slots.deferred_count() > 0 {
-            store.write_deferred_alive(snap.slots.deferred_map())?;
+            meta_store.write_deferred_alive(snap.slots.deferred_map())
+                .map_err(|e| crate::error::BitdexError::DocStore(format!("write deferred: {e}")))?;
         }
 
         // Sort fields — one at a time, zero-copy via fused_cow.
@@ -5212,7 +5255,8 @@ impl ConcurrentEngine {
                 let fused_layers: Vec<Cow<'_, RoaringBitmap>> = sf.layer_bases_fused();
                 let layer_refs: Vec<&RoaringBitmap> =
                     fused_layers.iter().map(|c| c.as_ref()).collect();
-                store.write_sort_layers(&sc.name, &layer_refs)?;
+                sort_store.write_sort_layers(&sc.name, &layer_refs)
+                    .map_err(|e| crate::error::BitdexError::DocStore(format!("write sort {}: {e}", sc.name)))?;
                 eprintln!("  save: sort {} in {:.1}ms",
                     sc.name, t0.elapsed().as_secs_f64() * 1000.0);
             }
@@ -5221,7 +5265,7 @@ impl ConcurrentEngine {
         // Filter fields — stream one bucket at a time to minimize memory overhead.
         // Lazy-value fields require merge-on-save: read existing disk data per bucket,
         // OR with in-memory mutations, write merged result. This prevents overwriting
-        // bulk-loaded fpack data with partial in-memory state.
+        // bulk-loaded data with partial in-memory state.
         for (name, field) in snap.filters.fields() {
             if skip_filters.contains(name) {
                 continue;
@@ -5243,11 +5287,11 @@ impl ConcurrentEngine {
 
             if is_lazy {
                 // Merge-on-save: for each bucket with in-memory entries, read the
-                // existing fpack from disk, merge in-memory data on top, write back.
+                // existing data from disk, merge in-memory data on top, write back.
                 // Buckets with no in-memory changes are left untouched on disk.
                 for (bucket, mem_entries) in by_bucket {
                     // Read existing disk entries for this bucket
-                    let disk_entries = store.read_filter_bucket(name, bucket)
+                    let disk_entries = filter_store.read_filter_bucket(name, bucket)
                         .unwrap_or_default();
 
                     // Build merged map: start with disk, overlay memory
@@ -5261,7 +5305,8 @@ impl ConcurrentEngine {
                     let refs: Vec<(u64, &RoaringBitmap)> = merged.iter()
                         .map(|(v, bm)| (*v, bm))
                         .collect();
-                    store.write_filter_bucket(name, bucket, &refs)?;
+                    filter_store.write_filter_bucket(name, bucket, &refs)
+                        .map_err(|e| crate::error::BitdexError::DocStore(format!("write filter {name}/{bucket:02x}: {e}")))?;
                 }
             } else {
                 // Non-lazy fields: write in-memory state directly (fully loaded)
@@ -5270,7 +5315,8 @@ impl ConcurrentEngine {
                         .iter()
                         .map(|(v, c)| (*v, c.as_ref()))
                         .collect();
-                    store.write_filter_bucket(name, bucket, &refs)?;
+                    filter_store.write_filter_bucket(name, bucket, &refs)
+                        .map_err(|e| crate::error::BitdexError::DocStore(format!("write filter {name}/{bucket:02x}: {e}")))?;
                 }
             }
             eprintln!("  save: filter {} ({} values, {} buckets{}) in {:.1}ms",
@@ -5295,11 +5341,7 @@ impl ConcurrentEngine {
     /// mutations and applies them to the unloaded staging's diff layers before
     /// publishing.
     pub fn save_and_unload(&self) -> Result<()> {
-        let store = self.bitmap_store.as_ref().ok_or_else(|| {
-            crate::error::BitdexError::Config(
-                "no bitmap_path configured; cannot save_and_unload".to_string(),
-            )
-        })?;
+        let (alive_s, filter_s, sort_s, meta_s) = self.require_stores("save_and_unload")?;
 
         // Snapshot what's already pending — don't save or unload those.
         let skip_sorts = self.pending_sort_loads.lock().clone();
@@ -5308,7 +5350,10 @@ impl ConcurrentEngine {
 
         // Phase 1: Zero-copy write to disk.
         Self::write_snapshot_to_store(
-            store,
+            alive_s,
+            filter_s,
+            sort_s,
+            meta_s,
             &self.inner,
             &self.config,
             &skip_sorts,
@@ -8023,21 +8068,32 @@ mod tests {
         // Save to custom path
         engine.save_snapshot_to(&custom_bitmap_path).unwrap();
 
-        // Verify the file was created and contains the data
-        let store = crate::bitmap_fs::BitmapFs::new(&custom_bitmap_path).unwrap();
-        let alive = store.load_alive().unwrap().unwrap();
+        // Verify the file was created and contains the data (via ShardStore)
+        let ss_root = custom_bitmap_path.join("shardstore");
+        let alive_s = crate::shard_store_bitmap::AliveBitmapStore::new(
+            ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
+        ).unwrap();
+        let filter_s = crate::shard_store_bitmap::FilterBitmapStore::new(
+            ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
+        ).unwrap();
+        let sort_s = crate::shard_store_bitmap::SortBitmapStore::new(
+            ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
+        ).unwrap();
+        let meta_s = crate::shard_store_meta::MetaStore::new(ss_root).unwrap();
+
+        let alive = alive_s.load_alive().unwrap().unwrap();
         assert_eq!(alive.len(), 2, "alive bitmap should have 2 entries");
         assert!(alive.contains(1));
         assert!(alive.contains(2));
 
-        let counter = store.load_slot_counter().unwrap().unwrap();
+        let counter = meta_s.load_slot_counter().unwrap().unwrap();
         assert!(counter >= 3, "slot counter should be at least 3");
 
-        let nsfw = store.load_field("nsfwLevel").unwrap();
+        let nsfw = filter_s.load_field("nsfwLevel").unwrap();
         assert!(nsfw.contains_key(&5), "nsfwLevel=5 should exist");
         assert_eq!(nsfw[&5].len(), 2, "nsfwLevel=5 should have 2 entries");
 
-        let sort_layers = store.load_sort_layers("reactionCount", 32).unwrap();
+        let sort_layers = sort_s.load_sort_layers("reactionCount", 32).unwrap();
         assert!(sort_layers.is_some(), "sort layers should be persisted");
     }
 
@@ -8250,9 +8306,9 @@ mod tests {
         // Wait for merge thread to checkpoint (merge interval + margin)
         thread::sleep(Duration::from_millis(300));
 
-        // Verify cursor was written to disk
-        let store = BitmapFs::new(&bitmap_path).unwrap();
-        let on_disk = store.load_cursor("pg-sync-0").unwrap();
+        // Verify cursor was written to disk (via MetaStore)
+        let ms = crate::shard_store_meta::MetaStore::new(bitmap_path.join("shardstore")).unwrap();
+        let on_disk = ms.load_cursor("pg-sync-0").unwrap();
         assert_eq!(on_disk.unwrap(), "99999");
 
         drop(engine);
@@ -8914,7 +8970,7 @@ mod tests {
                 ));
 
                 // Verify files exist on disk
-                let bounds_dir = bitmap_path.join("bounds");
+                let bounds_dir = bitmap_path.join("shardstore").join("bounds");
                 assert!(bounds_dir.join("meta.bin").exists(), "meta.bin should exist");
 
                 engine.shutdown();
@@ -9453,10 +9509,13 @@ mod tests {
             engine.shutdown();
         }
 
-        // Phase 2: Simulate bulk load — write collectionIds fpack files to disk
-        // This is what the bulk loader does: writes directly to BitmapFs
+        // Phase 2: Simulate bulk load — write collectionIds to ShardStore
+        // This is what the bulk loader does: writes directly to FilterBitmapStore
         {
-            let bitmap_fs = BitmapFs::new(&bitmap_path).unwrap();
+            let fs = crate::shard_store_bitmap::FilterBitmapStore::new(
+                bitmap_path.join("shardstore").join("filter"),
+                crate::shard_store_bitmap::FieldValueBucketShard,
+            ).unwrap();
             let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
 
             // Collection 42: contains slots 1-50
@@ -9474,15 +9533,14 @@ mod tests {
             for i in 1..=100u32 { bm7.insert(i); }
             bitmaps.insert(7, bm7);
 
-            // Write directly to BitmapFs (same as save_filter_field_to_disk)
-            bitmap_fs.write_batch(
-                &bitmaps.iter()
-                    .map(|(k, v)| ("collectionIds", *k, v))
-                    .collect::<Vec<_>>()
-            ).unwrap();
+            // Write using FilterBitmapStore
+            let entries: Vec<(&str, u64, &RoaringBitmap)> = bitmaps.iter()
+                .map(|(k, v)| ("collectionIds", *k, v))
+                .collect();
+            fs.write_full_filter(&entries).unwrap();
 
-            // Verify the fpack data is correct
-            let loaded = bitmap_fs.load_field("collectionIds").unwrap();
+            // Verify the data is correct
+            let loaded = fs.load_field("collectionIds").unwrap();
             assert_eq!(loaded.len(), 3, "should have 3 collections on disk");
             assert_eq!(loaded[&42].len(), 50);
             assert_eq!(loaded[&99].len(), 50);
