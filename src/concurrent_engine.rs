@@ -1086,6 +1086,12 @@ impl ConcurrentEngine {
                             }
                         }
 
+                        // Yield CPU after apply to let tokio I/O threads deliver
+                        // pending HTTP responses. Without this, the flush thread
+                        // monopolizes CPU across apply+cache+publish (~20ms aggregate),
+                        // causing 1-4s response delivery delays under concurrent load.
+                        std::thread::yield_now();
+
                         // In loading mode, skip all maintenance and snapshot publishing.
                         // This avoids the expensive staging.clone() → Arc::make_mut clone
                         // cascade that dominates write cost at scale.
@@ -1233,6 +1239,9 @@ impl ConcurrentEngine {
 
                             flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+                            // Yield CPU after cache maintenance to let tokio deliver responses.
+                            std::thread::yield_now();
+
                             // Periodic filter diff compaction: merge dirty diffs into
                             // bases so apply_diff/fused don't accumulate unbounded diffs.
                             // Runs every COMPACTION_INTERVAL flush cycles (~5s).
@@ -1273,6 +1282,10 @@ impl ConcurrentEngine {
                             flush_pub_count.fetch_add(1, Ordering::Relaxed);
                             flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
                             flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
+
+                            // Yield after publish — snapshot is live, let tokio
+                            // deliver responses before we do ops-log disk I/O.
+                            std::thread::yield_now();
 
                             // ── Ops-log append (after publish) ─────────────
                             // Persist mutations as ops-log entries AFTER the
