@@ -204,8 +204,11 @@ struct ReplayResult {
     original_arrived_ns: u64,
     /// Original latency in microseconds.
     original_latency_us: u64,
-    /// Replay latency in microseconds.
+    /// Replay latency in microseconds (client-side: includes HTTP + thread pool overhead).
     replay_latency_us: u64,
+    /// Server-reported processing time in microseconds (from X-BitDex-Duration-Us header).
+    /// 0 if header not present (non-query endpoints or older server versions).
+    server_duration_us: u64,
     /// Whether HTTP status codes matched.
     status_match: bool,
     /// Original status code.
@@ -219,11 +222,12 @@ struct ReplayResult {
 }
 
 /// Fire a single HTTP request and measure latency.
+/// Returns (status, body, client_elapsed, server_duration_us).
 fn execute_request(
     agent: &ureq::Agent,
     base_url: &str,
     entry: &CaptureEntry,
-) -> Result<(u16, Vec<u8>, Duration), String> {
+) -> Result<(u16, Vec<u8>, Duration, u64), String> {
     let url = if entry.query_string.is_empty() {
         format!("{}{}", base_url, entry.path)
     } else {
@@ -259,14 +263,20 @@ fn execute_request(
     match result {
         Ok(resp) => {
             let status = resp.status();
+            let server_us = resp.header("X-BitDex-Duration-Us")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
             let mut body = Vec::new();
             resp.into_reader().read_to_end(&mut body).unwrap_or(0);
-            Ok((status, body, elapsed))
+            Ok((status, body, elapsed, server_us))
         }
         Err(ureq::Error::Status(code, resp)) => {
+            let server_us = resp.header("X-BitDex-Duration-Us")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
             let mut body = Vec::new();
             resp.into_reader().read_to_end(&mut body).unwrap_or(0);
-            Ok((code, body, elapsed))
+            Ok((code, body, elapsed, server_us))
         }
         Err(e) => Err(format!("Request failed: {e}")),
     }
@@ -483,7 +493,7 @@ fn fire_and_compare(
 
     let start = Instant::now();
     match execute_request(agent, base_url, entry) {
-        Ok((status, body, elapsed)) => {
+        Ok((status, body, elapsed, server_us)) => {
             let replay_latency_us = elapsed.as_micros() as u64;
             let status_match = status == entry.response_status;
             let result_match = body == entry.response_body;
@@ -493,6 +503,7 @@ fn fire_and_compare(
                 original_arrived_ns: entry.arrived_at_ns,
                 original_latency_us,
                 replay_latency_us,
+                server_duration_us: server_us,
                 status_match,
                 original_status: entry.response_status,
                 replay_status: status,
@@ -508,6 +519,7 @@ fn fire_and_compare(
                 original_arrived_ns: entry.arrived_at_ns,
                 original_latency_us,
                 replay_latency_us: elapsed_us,
+                server_duration_us: 0,
                 status_match: false,
                 original_status: entry.response_status,
                 replay_status: 0,
@@ -532,6 +544,7 @@ struct ReplaySummary {
     result_match_pct: f64,
     original_latency: LatencyStats,
     replay_latency: LatencyStats,
+    server_latency: LatencyStats,
     stalls: Vec<StallEvent>,
     wall_time_seconds: f64,
     effective_qps: f64,
@@ -569,8 +582,10 @@ fn compute_summary(
 
     let mut original_latencies: Vec<u64> = results.iter().map(|r| r.original_latency_us).collect();
     let mut replay_latencies: Vec<u64> = results.iter().map(|r| r.replay_latency_us).collect();
+    let mut server_latencies: Vec<u64> = results.iter().map(|r| r.server_duration_us).collect();
     original_latencies.sort_unstable();
     replay_latencies.sort_unstable();
+    server_latencies.sort_unstable();
 
     let stalls = detect_stalls(results, entries);
 
@@ -582,6 +597,7 @@ fn compute_summary(
         result_match_pct: if total > 0 { result_matches as f64 / total as f64 * 100.0 } else { 0.0 },
         original_latency: compute_latency_stats(&original_latencies),
         replay_latency: compute_latency_stats(&replay_latencies),
+        server_latency: compute_latency_stats(&server_latencies),
         stalls,
         wall_time_seconds: wall_time.as_secs_f64(),
         effective_qps: if wall_time.as_secs_f64() > 0.0 { total as f64 / wall_time.as_secs_f64() } else { 0.0 },
@@ -654,12 +670,14 @@ fn write_per_request_csv(results: &[ReplayResult], output_dir: &std::path::Path)
     let path = output_dir.join("per_request.csv");
     let mut writer = std::io::BufWriter::new(std::fs::File::create(&path)?);
     use std::io::Write;
-    writeln!(writer, "request_index,endpoint,original_us,replay_us,status_match,result_match,original_status,replay_status")?;
+    writeln!(writer, "request_index,endpoint,original_us,replay_us,server_us,client_overhead_us,status_match,result_match,original_status,replay_status")?;
     for r in results {
+        let overhead = r.replay_latency_us.saturating_sub(r.server_duration_us);
         writeln!(
             writer,
-            "{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{}",
             r.request_index, r.endpoint, r.original_latency_us, r.replay_latency_us,
+            r.server_duration_us, overhead,
             r.status_match, r.result_match, r.original_status, r.replay_status
         )?;
     }
@@ -818,6 +836,11 @@ fn main() {
     println!("  Replay latency:    p50={}μs  p95={}μs  p99={}μs  max={}μs",
         summary.replay_latency.p50_us, summary.replay_latency.p95_us,
         summary.replay_latency.p99_us, summary.replay_latency.max_us);
+    if summary.server_latency.max_us > 0 {
+        println!("  Server latency:    p50={}μs  p95={}μs  p99={}μs  max={}μs",
+            summary.server_latency.p50_us, summary.server_latency.p95_us,
+            summary.server_latency.p99_us, summary.server_latency.max_us);
+    }
 
     if !summary.stalls.is_empty() {
         println!("\n  Stall events (>1s gaps):");
