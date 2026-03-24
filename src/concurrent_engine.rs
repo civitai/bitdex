@@ -273,6 +273,8 @@ pub struct ConcurrentEngine {
     /// Metrics bridge: prometheus handles set by server layer, read by background threads.
     #[cfg(feature = "server")]
     metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
+    /// In-memory document cache (DashMap, cache-on-read, write-through, LRU eviction).
+    doc_cache: Option<Arc<crate::doc_cache::DocCache>>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
     compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
@@ -821,6 +823,15 @@ impl ConcurrentEngine {
 
         let lazy_value_fields = Arc::new(parking_lot::Mutex::new(lazy_value_fields));
 
+        // Document cache: DashMap-based in-memory cache for include_docs queries
+        let doc_cache: Option<Arc<crate::doc_cache::DocCache>> = if config.storage.bitmap_path.is_some() {
+            Some(Arc::new(crate::doc_cache::DocCache::new(
+                crate::doc_cache::DocCacheConfig::default(),
+            )))
+        } else {
+            None
+        };
+
         // Eviction state
         let eviction_stamps: Arc<DashMap<(Arc<str>, u64), AtomicU64>> = Arc::new(DashMap::new());
         let flush_cycle = Arc::new(AtomicU64::new(0));
@@ -900,6 +911,7 @@ impl ConcurrentEngine {
                 boundstore_entries_skipped,
                 #[cfg(feature = "server")]
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
+                doc_cache: doc_cache.clone(),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
@@ -931,6 +943,7 @@ impl ConcurrentEngine {
             let flush_eviction_total = Arc::clone(&eviction_total);
             let flush_cycle_clone = Arc::clone(&flush_cycle);
             let flush_bitmap_store = bitmap_store.clone();
+            let flush_doc_cache = doc_cache.clone();
             let flush_alive_store = alive_store.clone();
             let flush_filter_store = filter_store.clone();
             let flush_sort_store = sort_store.clone();
@@ -1682,6 +1695,10 @@ impl ConcurrentEngine {
                     }
                     let doc_count = doc_batch.len();
                     if doc_count > 0 {
+                        // Write-through: populate doc cache before disk write
+                        if let Some(ref cache) = flush_doc_cache {
+                            cache.insert_batch(&doc_batch);
+                        }
                         if let Err(e) = docstore.lock().put_batch(&doc_batch) {
                             eprintln!("WARNING: docstore batch write failed (skipping {} docs): {e}", doc_batch.len());
                         }
@@ -2214,6 +2231,7 @@ impl ConcurrentEngine {
             boundstore_entries_skipped,
             #[cfg(feature = "server")]
             metrics_bridge,
+            doc_cache: doc_cache.clone(),
             compaction_skipped,
             compact_tx,
             compact_handle,
@@ -4833,9 +4851,30 @@ impl ConcurrentEngine {
         self.cursors.lock().clone()
     }
 
-    /// Retrieve a stored document by slot ID from the docstore.
+    /// Retrieve a stored document by slot ID.
+    ///
+    /// Checks the in-memory doc cache first. On miss, reads from disk and
+    /// populates the cache for subsequent reads.
     pub fn get_document(&self, slot_id: u32) -> Result<Option<StoredDoc>> {
-        self.docstore.lock().get(slot_id)
+        // Fast path: cache hit (no lock, DashMap concurrent read)
+        if let Some(ref cache) = self.doc_cache {
+            if let Some(doc) = cache.get(slot_id) {
+                return Ok(Some(doc));
+            }
+        }
+
+        // Slow path: disk read + cache populate
+        let doc = self.docstore.lock().get(slot_id)?;
+
+        if let (Some(ref cache), Some(ref doc)) = (&self.doc_cache, &doc) {
+            cache.insert(slot_id, doc.clone());
+            // Check if eviction is needed (amortized, not every insert)
+            if cache.needs_eviction() {
+                cache.evict();
+            }
+        }
+
+        Ok(doc)
     }
 
     /// Compact the docstore, reclaiming space from old write transactions.
