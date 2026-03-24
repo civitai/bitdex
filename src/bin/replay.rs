@@ -684,6 +684,56 @@ fn write_per_request_csv(results: &[ReplayResult], output_dir: &std::path::Path)
     Ok(())
 }
 
+/// Validate that the target server has real data loaded.
+/// Returns (alive_count, bitmap_mb) on success, or error message on failure.
+fn validate_server_data(base_url: &str) -> Result<(u64, f64), String> {
+    // Try to find an index by listing indexes first
+    let list_url = format!("{}/api/indexes", base_url.trim_end_matches('/'));
+    let resp = ureq::get(&list_url).call()
+        .map_err(|e| format!("Failed to reach server: {e}"))?;
+    let mut body = String::new();
+    resp.into_reader().read_to_string(&mut body)
+        .map_err(|e| format!("Failed to read index list: {e}"))?;
+    let list: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse index list: {e}"))?;
+
+    let indexes = list["indexes"].as_array()
+        .ok_or("No indexes found on server")?;
+    if indexes.is_empty() {
+        return Err("No indexes loaded on server".to_string());
+    }
+
+    let index_name = indexes[0]["name"].as_str()
+        .ok_or("Index has no name field")?;
+
+    // Get stats for the first index
+    let stats_url = format!("{}/api/indexes/{}/stats", base_url.trim_end_matches('/'), index_name);
+    let resp = ureq::get(&stats_url).call()
+        .map_err(|e| format!("Failed to get stats: {e}"))?;
+    let mut body = String::new();
+    resp.into_reader().read_to_string(&mut body)
+        .map_err(|e| format!("Failed to read stats: {e}"))?;
+    let stats: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse stats: {e}"))?;
+
+    let alive = stats["alive_count"].as_u64().unwrap_or(0);
+    let filter_bytes = stats["filter_bitmap_bytes"].as_u64().unwrap_or(0);
+    let sort_bytes = stats["sort_bitmap_bytes"].as_u64().unwrap_or(0);
+    let bitmap_mb = (filter_bytes + sort_bytes) as f64 / (1024.0 * 1024.0);
+
+    if alive == 0 {
+        return Err(format!("Index '{}' has 0 alive documents — no data loaded", index_name));
+    }
+    if bitmap_mb < 1.0 {
+        return Err(format!(
+            "Index '{}' has {} alive docs but only {:.1} MB bitmaps — data may be incomplete",
+            index_name, alive, bitmap_mb
+        ));
+    }
+
+    Ok((alive, bitmap_mb))
+}
+
 /// Scrape Prometheus metrics endpoint.
 fn scrape_metrics(base_url: &str) -> Option<String> {
     let url = format!("{}/metrics", base_url.trim_end_matches('/'));
@@ -769,6 +819,21 @@ fn main() {
     cats.sort_by(|a, b| b.1.cmp(&a.1));
     for (endpoint, count) in cats.iter().take(10) {
         println!("    {count:>6} {endpoint}");
+    }
+    println!();
+
+    // Validate server has real data before running a benchmark
+    println!("Validating server data...");
+    match validate_server_data(&args.url) {
+        Ok((alive, bitmap_mb)) => {
+            println!("  Server OK: {} alive documents, {:.1} MB bitmaps", alive, bitmap_mb);
+        }
+        Err(e) => {
+            eprintln!("ERROR: Server validation failed: {e}");
+            eprintln!("The server may not have loaded data, or bitmap migration may be incomplete.");
+            eprintln!("Check /api/indexes/{{name}}/stats for alive_count and bitmap memory.");
+            std::process::exit(1);
+        }
     }
     println!();
 
