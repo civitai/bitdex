@@ -82,6 +82,8 @@ pub struct UnifiedCacheOverlay {
 #[derive(Debug, Deserialize, Default)]
 pub struct DocCacheOverlay {
     pub max_bytes: Option<u64>,
+    pub generation_interval_secs: Option<u64>,
+    pub max_generations: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -125,6 +127,8 @@ pub fn apply_preset(config: &mut Config, preset: &PresetOverlay) {
     // Doc cache overrides
     if let Some(ref dc) = preset.doc_cache {
         if let Some(v) = dc.max_bytes { config.doc_cache.max_bytes = v; }
+        if let Some(v) = dc.generation_interval_secs { config.doc_cache.generation_interval_secs = v; }
+        if let Some(v) = dc.max_generations { config.doc_cache.max_generations = v; }
     }
 }
 
