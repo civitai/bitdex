@@ -142,6 +142,8 @@ node .claude/skills/dev-server/cli.mjs test-slots
 | `traces [id\|port] [--last N]` | Fetch recent query traces (default last=5) | JSON |
 | `test [filter] [--slot N]` | Run cargo test in isolated slot | JSON |
 | `test-slots` | Show test slot status | JSON |
+| `replay --caplog <path> [opts]` | Run traffic replay in managed slot | JSON |
+| `replay-status` | Show replay slot status + summaries | JSON |
 | `test-e2e [--port N]` | Coordinated E2E test run | JSON |
 | `dash` | TUI dashboard with live logs, metrics, and explain panel | Interactive |
 | `dash --remote <host:port>` | Remote TUI — stats, config, traces, cache control | Interactive |

@@ -30,6 +30,8 @@ const HEARTBEAT_INTERVAL = 10_000;
 const BUILD_LOCK_TIMEOUT = 600_000;  // 10 minutes
 const E2E_LOCK_TIMEOUT = 300_000;    // 5 minutes
 const TEST_SLOT_COUNT = 3;
+const REPLAY_SLOT_COUNT = 3;
+const MAX_REPLAY_LOG_LINES = 1000;
 const TEST_SLOT_TIMEOUT = 300_000;   // 5 minutes
 const PORT_RANGE_START = 3001;
 const PORT_RANGE_END = 3099;
@@ -77,6 +79,7 @@ let buildLock = { holder: null, target: null, startedAt: null, pid: null, target
 let e2eLock = { holder: null, startedAt: null, pid: null };
 let portReservations = new Map(); // port → { reservedAt, reservedBy }
 let testSlots = Array.from({length: TEST_SLOT_COUNT}, (_, i) => ({ id: i + 1, holder: null, command: null, startedAt: null, pid: null, process: null, exitCode: null, logBuffer: [], targetDir: resolve(PROJECT_ROOT, `target-test${i + 1}`) }));
+let replaySlots = Array.from({length: REPLAY_SLOT_COUNT}, (_, i) => ({ id: i + 1, holder: null, command: null, startedAt: null, pid: null, process: null, exitCode: null, logBuffer: [], summary: null, caplog: null, outputDir: null }));
 let daemonStartedAt = new Date().toISOString();
 
 // SSE clients — connected response objects for event streaming
@@ -888,6 +891,205 @@ function getTestSlotLogs(slotId, { since = 0, tail = 200 } = {}) {
   return { logs: entries, total: slot.logBuffer.length, exitCode: slot.exitCode, holder: slot.holder };
 }
 
+// ─── Replay Slots ────────────────────────────────────────────────
+
+function findReplayBinary() {
+  const candidates = [
+    resolve(PROJECT_ROOT, 'target', 'fast', `replay${EXE}`),
+    resolve(PROJECT_ROOT, 'target', 'release', `replay${EXE}`),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return null;
+}
+
+function getReplaySlots() {
+  return replaySlots.map(s => {
+    const { process, ...rest } = s;
+    return {
+      ...rest,
+      alive: !!(process && s.pid && isPidAlive(s.pid)),
+      elapsed_s: s.startedAt ? Math.round((Date.now() - new Date(s.startedAt).getTime()) / 1000) : null,
+    };
+  });
+}
+
+function acquireReplaySlot({ holder, slot }) {
+  let target;
+  if (slot != null) {
+    const idx = parseInt(slot, 10) - 1;
+    if (idx < 0 || idx >= replaySlots.length) return { error: `Invalid slot ${slot} (valid: 1-${REPLAY_SLOT_COUNT})` };
+    target = replaySlots[idx];
+    if (target.holder) return { error: `Slot ${slot} held by '${target.holder}'`, slots: getReplaySlots() };
+  } else {
+    target = replaySlots.find(s => !s.holder);
+    if (!target) return { error: 'No free replay slots', slots: getReplaySlots() };
+  }
+
+  target.holder = holder || 'unknown';
+  target.startedAt = new Date().toISOString();
+  target.exitCode = null;
+  target.command = null;
+  target.logBuffer = [];
+  target.pid = null;
+  target.process = null;
+  target.summary = null;
+  target.caplog = null;
+  target.outputDir = null;
+
+  sseBroadcast('replaySlots', getReplaySlots());
+  return { slot: target.id };
+}
+
+function runReplay(slotId, { caplog, url, mode, speed, output, concurrency, window, stepDelay, scrapeMetrics, holder }) {
+  const idx = parseInt(slotId, 10) - 1;
+  if (idx < 0 || idx >= replaySlots.length) return { error: `Invalid slot ${slotId}` };
+  const slot = replaySlots[idx];
+
+  const binary = findReplayBinary();
+  if (!binary) return { error: 'Replay binary not found. Build with: cargo build --release --features replay --bin replay' };
+
+  if (!caplog) return { error: '--caplog is required' };
+
+  // Auto-detect URL from first running instance if not provided
+  let targetUrl = url;
+  if (!targetUrl) {
+    for (const [, inst] of instances) {
+      if (inst.status === 'running') {
+        targetUrl = `http://127.0.0.1:${inst.port}`;
+        break;
+      }
+    }
+  }
+  if (!targetUrl) targetUrl = 'http://localhost:3001';
+
+  // Build args
+  const args = ['--caplog', caplog, '--url', targetUrl];
+  if (mode) args.push('--mode', mode);
+  if (speed) args.push('--speed', speed);
+  if (output) args.push('--output', output);
+  if (concurrency) args.push('--concurrency', String(concurrency));
+  if (window) args.push('--window', window);
+  if (stepDelay) args.push('--step-delay', String(stepDelay));
+  if (scrapeMetrics) args.push('--scrape-metrics');
+
+  const cmdStr = `replay ${args.join(' ')}`;
+  const outputDir = output || resolve(PROJECT_ROOT, 'replay_results');
+
+  const proc = spawn(binary, args, {
+    cwd: PROJECT_ROOT,
+    shell: false,
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  slot.process = proc;
+  slot.pid = proc.pid;
+  slot.command = cmdStr;
+  slot.exitCode = null;
+  slot.summary = null;
+  slot.caplog = caplog;
+  slot.outputDir = outputDir;
+
+  // Capture stdout — line-buffered, parse last JSON block for summary
+  let stdoutBuf = '';
+  let lastJsonBlock = null;
+  proc.stdout.on('data', (data) => {
+    stdoutBuf += data.toString();
+    const lines = stdoutBuf.split('\n');
+    stdoutBuf = lines.pop();
+    for (const line of lines) {
+      if (line) {
+        // Try to parse as JSON (the summary block)
+        try {
+          const parsed = JSON.parse(line.trim());
+          lastJsonBlock = parsed;
+        } catch { /* not JSON, that's fine */ }
+        slot.logBuffer.push({
+          index: globalLogIndex++,
+          timestamp: new Date().toISOString(),
+          level: 'stdout',
+          message: line.trimEnd(),
+        });
+        if (slot.logBuffer.length > MAX_REPLAY_LOG_LINES) {
+          slot.logBuffer = slot.logBuffer.slice(-MAX_REPLAY_LOG_LINES);
+        }
+      }
+    }
+  });
+
+  // Capture stderr (progress lines)
+  let stderrBuf = '';
+  proc.stderr.on('data', (data) => {
+    stderrBuf += data.toString();
+    const lines = stderrBuf.split('\n');
+    stderrBuf = lines.pop();
+    for (const line of lines) {
+      if (line) {
+        slot.logBuffer.push({
+          index: globalLogIndex++,
+          timestamp: new Date().toISOString(),
+          level: 'stderr',
+          message: line.trimEnd(),
+        });
+        if (slot.logBuffer.length > MAX_REPLAY_LOG_LINES) {
+          slot.logBuffer = slot.logBuffer.slice(-MAX_REPLAY_LOG_LINES);
+        }
+      }
+    }
+  });
+
+  proc.on('error', (err) => {
+    slot.logBuffer.push({ index: globalLogIndex++, timestamp: new Date().toISOString(), level: 'daemon', message: `Process error: ${err.message}` });
+    slot.exitCode = 1;
+    slot.process = null;
+    sseBroadcast('replaySlots', getReplaySlots());
+  });
+
+  proc.on('exit', (code, signal) => {
+    slot.exitCode = code;
+    slot.process = null;
+    slot.summary = lastJsonBlock;
+    slot.logBuffer.push({ index: globalLogIndex++, timestamp: new Date().toISOString(), level: 'daemon', message: `Exited (code=${code}, signal=${signal})` });
+    sseBroadcast('replaySlots', getReplaySlots());
+  });
+
+  sseBroadcast('replaySlots', getReplaySlots());
+  return { slot: slot.id, command: cmdStr, pid: proc.pid, url: targetUrl, caplog, outputDir };
+}
+
+function stopReplay(slotId) {
+  const idx = parseInt(slotId, 10) - 1;
+  if (idx < 0 || idx >= replaySlots.length) return { error: `Invalid slot ${slotId}` };
+  const slot = replaySlots[idx];
+
+  if (slot.process && slot.pid) {
+    killProcess(slot.pid);
+    slot.process = null;
+  }
+
+  slot.holder = null;
+  slot.command = null;
+  slot.startedAt = null;
+  slot.pid = null;
+  slot.exitCode = null;
+
+  sseBroadcast('replaySlots', getReplaySlots());
+  return { stopped: true, slot: slot.id };
+}
+
+function getReplaySlotLogs(slotId, { since = 0, tail = 200 } = {}) {
+  const idx = parseInt(slotId, 10) - 1;
+  if (idx < 0 || idx >= replaySlots.length) return { error: `Invalid slot ${slotId}` };
+  const slot = replaySlots[idx];
+
+  let entries = slot.logBuffer;
+  if (since > 0) entries = entries.filter(e => e.index > since);
+  if (tail > 0) entries = entries.slice(-tail);
+  return { logs: entries, total: slot.logBuffer.length, exitCode: slot.exitCode, holder: slot.holder, summary: slot.summary };
+}
+
 // ─── Instance Stats Polling ─────────────────────────────────────
 
 async function pollInstanceStats(instance) {
@@ -1080,6 +1282,7 @@ function getStatus() {
       ? { locked: true, ...e2eLock, elapsed_s: Math.round((Date.now() - new Date(e2eLock.startedAt).getTime()) / 1000) }
       : { locked: false },
     testSlots: getTestSlots(),
+    replaySlots: getReplaySlots(),
   };
 }
 
@@ -1296,6 +1499,42 @@ async function handleRequest(req, res) {
     const testReleaseMatch = path.match(/^\/test\/slots\/(\d+)\/release$/);
     if (method === 'POST' && testReleaseMatch) {
       const result = releaseTestSlot(testReleaseMatch[1]);
+      if (result.error) return json(res, 404, result);
+      return json(res, 200, result);
+    }
+
+    // ── Replay routes ──
+
+    // GET /replay/slots — list all replay slots
+    if (method === 'GET' && path === '/replay/slots') {
+      return json(res, 200, getReplaySlots());
+    }
+
+    // POST /replay/run — acquire slot + start replay
+    if (method === 'POST' && path === '/replay/run') {
+      const body = await parseBody(req);
+      const acq = acquireReplaySlot({ holder: body.holder, slot: body.slot });
+      if (acq.error) return json(res, 409, acq);
+      const result = runReplay(acq.slot, body);
+      if (result.error) return json(res, 500, result);
+      return json(res, 200, result);
+    }
+
+    // GET /replay/slots/:id/logs — get logs from a replay slot
+    const replayLogMatch = path.match(/^\/replay\/slots\/(\d+)\/logs$/);
+    if (method === 'GET' && replayLogMatch) {
+      const result = getReplaySlotLogs(replayLogMatch[1], {
+        since: parseInt(query.since || '0', 10),
+        tail: parseInt(query.tail || '200', 10),
+      });
+      if (result.error) return json(res, 404, result);
+      return json(res, 200, result);
+    }
+
+    // POST /replay/slots/:id/stop — stop a running replay
+    const replayStopMatch = path.match(/^\/replay\/slots\/(\d+)\/stop$/);
+    if (method === 'POST' && replayStopMatch) {
+      const result = stopReplay(replayStopMatch[1]);
       if (result.error) return json(res, 404, result);
       return json(res, 200, result);
     }

@@ -482,6 +482,80 @@ async function cmdTestSlots() {
   console.log(JSON.stringify(slots, null, 2));
 }
 
+async function cmdReplay() {
+  const caplog = getArg('--caplog');
+  if (!caplog) { console.error('Usage: replay --caplog <path> [--url URL] [--mode MODE] [--speed Nx] [--output DIR] [--concurrency N] [--window RANGE] [--step-delay MS] [--scrape-metrics] [--slot N]'); process.exit(1); }
+  const holder = getWorktree();
+
+  const result = await daemonFetch('/replay/run', {
+    method: 'POST',
+    body: {
+      caplog: resolve(PROJECT_ROOT, caplog),
+      url: getArg('--url'),
+      mode: getArg('--mode'),
+      speed: getArg('--speed'),
+      output: getArg('--output'),
+      concurrency: getArg('--concurrency') ? parseInt(getArg('--concurrency'), 10) : undefined,
+      window: getArg('--window'),
+      stepDelay: getArg('--step-delay') ? parseInt(getArg('--step-delay'), 10) : undefined,
+      scrapeMetrics: hasFlag('--scrape-metrics'),
+      slot: getArg('--slot') ? parseInt(getArg('--slot'), 10) : undefined,
+      holder,
+    },
+  });
+
+  if (result.error) {
+    console.error(`Error: ${result.error}`);
+    console.log(JSON.stringify(result));
+    process.exit(1);
+  }
+
+  console.error(`Replay started in slot ${result.slot} (PID ${result.pid})`);
+  console.error(`  target: ${result.url}`);
+  console.error(`  caplog: ${result.caplog}`);
+  console.error(`  command: ${result.command}`);
+  console.error('Streaming logs...\n');
+
+  // Poll logs until completion
+  let cursor = 0;
+  while (true) {
+    await new Promise(r => setTimeout(r, 1000));
+    const logs = await daemonFetch(`/replay/slots/${result.slot}/logs?since=${cursor}`);
+    for (const entry of logs.logs || []) {
+      console.error(entry.message);
+      cursor = entry.index;
+    }
+    if (logs.exitCode != null) {
+      console.error(`\nReplay finished (exit code ${logs.exitCode})`);
+      if (logs.summary) {
+        console.error('\nSummary:');
+        console.log(JSON.stringify(logs.summary, null, 2));
+      } else {
+        console.log(JSON.stringify({ slot: result.slot, exitCode: logs.exitCode }));
+      }
+      process.exit(logs.exitCode === 0 ? 0 : 1);
+    }
+  }
+}
+
+async function cmdReplayStatus() {
+  const slots = await daemonFetch('/replay/slots');
+  const G = '\x1b[32m', Y = '\x1b[33m', R = '\x1b[0m', D = '\x1b[2m', B = '\x1b[1m';
+  console.error(`${B}Replay Slots${R} (${slots.length} total)`);
+  for (const s of slots) {
+    if (s.holder) {
+      const elapsed = s.elapsed_s != null ? `${s.elapsed_s}s` : '';
+      const code = s.exitCode != null ? ` exit=${s.exitCode}` : '';
+      const sum = s.summary ? ` p50=${s.summary.p50_ms || '?'}ms p99=${s.summary.p99_ms || '?'}ms` : '';
+      console.error(`  ${Y}●${R} slot ${s.id}: ${s.holder} (${elapsed}${code})${sum}`);
+      console.error(`    ${D}${s.command || ''}${R}`);
+    } else {
+      console.error(`  ${G}○${R} slot ${s.id}: free`);
+    }
+  }
+  console.log(JSON.stringify(slots, null, 2));
+}
+
 async function cmdForceKill() {
   const result = await daemonFetch('/force-kill', { method: 'POST' });
   console.error(result.message);
@@ -1827,6 +1901,8 @@ async function main() {
     case 'test': return cmdTest();
     case 'test-slots': return cmdTestSlots();
     case 'test-e2e': return cmdTestE2e();
+    case 'replay': return cmdReplay();
+    case 'replay-status': return cmdReplayStatus();
     case 'dash': case 'dashboard':
       if (hasFlag('--remote')) return cmdRemoteDashboard();
       return cmdDashboard();
