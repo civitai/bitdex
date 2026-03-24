@@ -6,6 +6,7 @@ pub mod concurrency;
 pub mod concurrent_engine;
 pub mod config;
 pub mod dictionary;
+
 pub mod doc_cache;
 pub mod docstore;
 pub mod engine;
@@ -18,6 +19,7 @@ pub mod meta_index;
 pub mod mutation;
 pub mod parser;
 pub mod planner;
+pub mod preset;
 pub mod query;
 pub mod query_metrics;
 pub mod field_handler;
