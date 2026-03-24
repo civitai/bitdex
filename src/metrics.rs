@@ -91,6 +91,9 @@ pub struct Metrics {
     pub boundstore_bytes_written: IntGaugeVec,
     pub boundstore_bytes_read: IntGaugeVec,
 
+    // -- HTTP round-trip (wall-clock from request arrival to response sent) --
+    pub http_response_seconds: HistogramVec,
+
     // -- Phase 2.5: DocStore I/O observability --
     pub docstore_read_seconds: HistogramVec,
     pub docstore_concurrent_reads: IntGauge,
@@ -160,6 +163,21 @@ impl Metrics {
             )
             .buckets(query_buckets),
             &["index"],
+        )
+        .unwrap();
+
+        // HTTP round-trip: wall-clock from request arrival to response sent.
+        // Wide buckets to catch the gap between fast queries and slow responses.
+        let http_buckets = vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ];
+        let http_response_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_http_response_seconds",
+                "Full HTTP round-trip time from request arrival to response sent",
+            )
+            .buckets(http_buckets),
+            &["method", "path"],
         )
         .unwrap();
 
@@ -555,6 +573,9 @@ impl Metrics {
         registry
             .register(Box::new(query_duration_seconds.clone()))
             .unwrap();
+        registry
+            .register(Box::new(http_response_seconds.clone()))
+            .unwrap();
         registry.register(Box::new(query_filter_seconds.clone())).unwrap();
         registry.register(Box::new(query_sort_seconds.clone())).unwrap();
         registry.register(Box::new(query_docs_seconds.clone())).unwrap();
@@ -652,6 +673,7 @@ impl Metrics {
             delete_total,
             query_total,
             query_duration_seconds,
+            http_response_seconds,
             query_filter_seconds,
             query_sort_seconds,
             query_docs_seconds,
