@@ -2182,24 +2182,33 @@ async fn handle_upsert(
         (idx.definition.data_schema.clone(), has_lcs)
     };
 
-    let mut upserted = 0u64;
-    let mut errors: Vec<String> = Vec::new();
+    // Run upserts on a blocking thread — engine.put() does sync disk I/O
+    // (docstore reads for diffing) that would starve the tokio runtime.
+    let documents = req.documents;
+    let engine_clone = Arc::clone(&engine);
+    let schema_clone = schema.clone();
+    let (upserted, errors) = tokio::task::spawn_blocking(move || {
+        let mut upserted = 0u64;
+        let mut errors: Vec<String> = Vec::new();
 
-    for (i, doc_json) in req.documents.iter().enumerate() {
-        let dicts = if has_lcs { Some(engine.dictionaries()) } else { None };
-        match loader::json_to_document_with_dicts(doc_json, &schema, dicts) {
-            Ok((slot, doc)) => {
-                if let Err(e) = engine.put(slot, &doc) {
-                    errors.push(format!("doc[{}] id={}: {}", i, slot, e));
-                } else {
-                    upserted += 1;
+        for (i, doc_json) in documents.iter().enumerate() {
+            let dicts = if has_lcs { Some(engine_clone.dictionaries()) } else { None };
+            match loader::json_to_document_with_dicts(doc_json, &schema_clone, dicts) {
+                Ok((slot, doc)) => {
+                    if let Err(e) = engine_clone.put(slot, &doc) {
+                        errors.push(format!("doc[{}] id={}: {}", i, slot, e));
+                    } else {
+                        upserted += 1;
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("doc[{}]: {}", i, e));
                 }
             }
-            Err(e) => {
-                errors.push(format!("doc[{}]: {}", i, e));
-            }
         }
-    }
+
+        (upserted, errors)
+    }).await.expect("spawn_blocking join");
 
     // Set cursor if provided (after mutations are submitted to coalescer)
     if let Some(cursor) = req.cursor {
@@ -2420,15 +2429,23 @@ async fn handle_delete_docs(
         }
     };
 
-    let mut deleted = 0u64;
-    let mut errors: Vec<String> = Vec::new();
+    // Run deletes on a blocking thread — engine.delete() reads the stored
+    // doc from disk for clean bitmap clearing, same sync I/O issue as put().
+    let ids = req.ids;
+    let engine_clone = Arc::clone(&engine);
+    let (deleted, errors) = tokio::task::spawn_blocking(move || {
+        let mut deleted = 0u64;
+        let mut errors: Vec<String> = Vec::new();
 
-    for id in &req.ids {
-        match engine.delete(*id) {
-            Ok(()) => deleted += 1,
-            Err(e) => errors.push(format!("id={}: {}", id, e)),
+        for id in &ids {
+            match engine_clone.delete(*id) {
+                Ok(()) => deleted += 1,
+                Err(e) => errors.push(format!("id={}: {}", id, e)),
+            }
         }
-    }
+
+        (deleted, errors)
+    }).await.expect("spawn_blocking join");
 
     // Set cursor if provided (after mutations are submitted to coalescer)
     if let Some(cursor) = req.cursor {
