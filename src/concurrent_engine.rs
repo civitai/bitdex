@@ -579,9 +579,16 @@ impl ConcurrentEngine {
             }
         }
 
-        let mut uc_config = UnifiedCacheConfig::default();
-        uc_config.max_maintenance_work = config.cache.max_maintenance_work;
-        uc_config.max_maintenance_ms = config.cache.max_maintenance_ms;
+        let uc_config = UnifiedCacheConfig {
+            max_entries: config.cache.max_entries,
+            max_bytes: config.cache.max_bytes,
+            initial_capacity: config.cache.initial_capacity,
+            max_capacity: config.cache.max_capacity,
+            min_filter_size: config.cache.min_filter_size,
+            max_maintenance_work: config.cache.max_maintenance_work,
+            max_maintenance_ms: config.cache.max_maintenance_ms,
+            prefetch_threshold: config.cache.prefetch_threshold,
+        };
         let mut uc = UnifiedCache::new(uc_config);
 
         // Initialize BoundStore for unified cache persistence
@@ -858,7 +865,9 @@ impl ConcurrentEngine {
         // Document cache: DashMap-based in-memory cache for include_docs queries
         let doc_cache: Option<Arc<crate::doc_cache::DocCache>> = if config.storage.bitmap_path.is_some() {
             Some(Arc::new(crate::doc_cache::DocCache::new(
-                crate::doc_cache::DocCacheConfig::default(),
+                crate::doc_cache::DocCacheConfig {
+                    max_bytes: config.doc_cache.max_bytes,
+                },
             )))
         } else {
             None
@@ -5172,6 +5181,31 @@ impl ConcurrentEngine {
     /// Update the max_maintenance_ms time budget on the live unified cache.
     pub fn set_max_maintenance_ms(&self, v: u64) {
         self.unified_cache.lock().config_mut().max_maintenance_ms = v;
+    }
+
+    /// Update the max_entries cap on the live unified cache.
+    pub fn set_cache_max_entries(&self, v: usize) {
+        self.unified_cache.lock().config_mut().max_entries = v;
+    }
+
+    /// Update the max_bytes cap on the live unified cache.
+    pub fn set_cache_max_bytes(&self, v: usize) {
+        self.unified_cache.lock().config_mut().max_bytes = v;
+    }
+
+    /// Update the initial_capacity on the live unified cache.
+    pub fn set_cache_initial_capacity(&self, v: usize) {
+        self.unified_cache.lock().config_mut().initial_capacity = v;
+    }
+
+    /// Update the max_capacity on the live unified cache.
+    pub fn set_cache_max_capacity(&self, v: usize) {
+        self.unified_cache.lock().config_mut().max_capacity = v;
+    }
+
+    /// Update the min_filter_size on the live unified cache.
+    pub fn set_cache_min_filter_size(&self, v: usize) {
+        self.unified_cache.lock().config_mut().min_filter_size = v;
     }
 
     /// Clear unified cache entries and reset counters (RAM only).

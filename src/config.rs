@@ -76,6 +76,10 @@ pub struct Config {
     #[serde(default)]
     pub deferred_alive: Option<DeferredAliveConfig>,
 
+    /// Document cache settings (in-memory cache for docstore reads).
+    #[serde(default)]
+    pub doc_cache: DocCacheConfigEntry,
+
     /// Headless mode: skip all background threads (flush, merge, eviction).
     /// Used by bulk loaders that write directly to BitmapFs and don't need
     /// the engine's write pipeline. The engine still provides config, BitmapFs
@@ -142,6 +146,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             eviction_sweep_interval: default_eviction_sweep_interval(),
             compact_threshold_pct: default_compact_threshold_pct(),
+            doc_cache: DocCacheConfigEntry::default(),
             deferred_alive: None,
             headless: false,
         }
@@ -331,9 +336,22 @@ impl Config {
 /// Trie cache configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
-    /// Maximum number of cached entries.
+    /// Maximum number of cached entries (safety cap). Default 100_000.
     #[serde(default = "default_cache_max_entries")]
     pub max_entries: usize,
+    /// Maximum total cache memory in bytes. Primary eviction trigger.
+    /// Default 512 MB (536_870_912).
+    #[serde(default = "default_cache_max_bytes")]
+    pub max_bytes: usize,
+    /// Initial bound capacity per entry. Default 4000.
+    #[serde(default = "default_cache_initial_capacity")]
+    pub initial_capacity: usize,
+    /// Maximum bound capacity per entry after expansion. Default 64000.
+    #[serde(default = "default_cache_max_capacity")]
+    pub max_capacity: usize,
+    /// Skip caching if filter result has fewer docs than this. Default 0 (cache everything).
+    #[serde(default = "default_cache_min_filter_size")]
+    pub min_filter_size: usize,
     /// Exponential decay rate for hit stats (0.0, 1.0].
     #[serde(default = "default_cache_decay_rate")]
     pub decay_rate: f64,
@@ -371,7 +389,19 @@ pub struct CacheConfig {
 }
 
 fn default_cache_max_entries() -> usize {
-    10_000
+    100_000
+}
+fn default_cache_max_bytes() -> usize {
+    512 * 1024 * 1024 // 512 MB
+}
+fn default_cache_initial_capacity() -> usize {
+    4_000
+}
+fn default_cache_max_capacity() -> usize {
+    64_000
+}
+fn default_cache_min_filter_size() -> usize {
+    0
 }
 fn default_cache_decay_rate() -> f64 {
     0.95
@@ -402,6 +432,10 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_entries: default_cache_max_entries(),
+            max_bytes: default_cache_max_bytes(),
+            initial_capacity: default_cache_initial_capacity(),
+            max_capacity: default_cache_max_capacity(),
+            min_filter_size: default_cache_min_filter_size(),
             decay_rate: default_cache_decay_rate(),
             bound_target_size: default_bound_target_size(),
             bound_max_size: default_bound_max_size(),
@@ -432,6 +466,26 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             bitmap_path: None,
+        }
+    }
+}
+
+fn default_doc_cache_max_bytes() -> u64 {
+    1_073_741_824 // 1 GB — matches DocCacheConfig::default()
+}
+
+/// Document cache configuration (in-memory LRU cache for docstore reads).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocCacheConfigEntry {
+    /// Maximum cache size in bytes. Eviction sweeps when exceeded. Default 1 GB.
+    #[serde(default = "default_doc_cache_max_bytes")]
+    pub max_bytes: u64,
+}
+
+impl Default for DocCacheConfigEntry {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_doc_cache_max_bytes(),
         }
     }
 }
@@ -705,8 +759,13 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.max_page_size, 100);
-        assert_eq!(config.cache.max_entries, 10_000);
+        assert_eq!(config.cache.max_entries, 100_000);
+        assert_eq!(config.cache.max_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.cache.initial_capacity, 4_000);
+        assert_eq!(config.cache.max_capacity, 64_000);
+        assert_eq!(config.cache.min_filter_size, 0);
         assert_eq!(config.cache.decay_rate, 0.95);
+        assert_eq!(config.doc_cache.max_bytes, 1_073_741_824);
         assert_eq!(config.autovac_interval_secs, 3600);
         assert_eq!(config.merge_interval_ms, 5000);
         assert_eq!(config.prometheus_port, 9090);
