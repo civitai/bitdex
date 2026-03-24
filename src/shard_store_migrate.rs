@@ -215,6 +215,179 @@ pub fn has_v2_shards(root: &Path) -> bool {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// BitmapFs → ShardStore migration
+// ---------------------------------------------------------------------------
+
+use crate::bitmap_fs::BitmapFs;
+use crate::shard_store_bitmap::{
+    AliveBitmapStore, FilterBitmapStore, SortBitmapStore,
+    AliveShardKey, FilterBucketKey, SortLayerShardKey,
+    FieldValueBucketShard, SortLayerShard, SingletonShard,
+};
+use crate::shard_store_meta::MetaStore;
+
+/// Check if BitmapFs data exists at the given path (alive.roar present).
+pub fn has_bitmapfs_data(bitmap_path: &Path) -> bool {
+    bitmap_path.join("system").join("alive.roar").exists()
+}
+
+/// Check if ShardStore data already exists (alive shard present).
+pub fn has_shardstore_data(bitmap_path: &Path) -> bool {
+    let ss_root = bitmap_path.join("shardstore");
+    // Check if alive store has any generation directory with data
+    let alive_root = ss_root.join("alive");
+    if !alive_root.exists() {
+        return false;
+    }
+    // Look for any gen_XXX directory with a system/alive.shard file
+    if let Ok(entries) = std::fs::read_dir(&alive_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("gen_") {
+                let shard = entry.path().join("system").join("alive.shard");
+                if shard.exists() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Migrate BitmapFs data to ShardStore format.
+///
+/// Reads alive bitmap, filter bitmaps, sort layers, and metadata from BitmapFs
+/// and writes them as ShardStore Gen 0 snapshots. This is a one-time migration
+/// that runs on first boot after ShardStore code is deployed.
+///
+/// The BitmapFs files are NOT deleted — they remain as a backup. The ShardStore
+/// presence check (`has_shardstore_data`) prevents re-migration on subsequent boots.
+///
+/// Returns (alive_count, filter_fields_migrated, sort_fields_migrated).
+pub fn migrate_bitmapfs_to_shardstore(
+    bitmap_path: &Path,
+    filter_field_names: &[String],
+    sort_field_configs: &[(String, usize)], // (field_name, bits)
+) -> io::Result<(u64, usize, usize)> {
+    let bfs = BitmapFs::new(bitmap_path)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("BitmapFs init: {e}")))?;
+    let ss_root = bitmap_path.join("shardstore");
+
+    eprintln!("Starting BitmapFs → ShardStore migration...");
+
+    // --- Alive bitmap ---
+    let alive_store = AliveBitmapStore::new(ss_root.join("alive"), SingletonShard)?;
+    let alive_count = if let Some(alive_bm) = bfs.load_alive()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("load alive: {e}")))?
+    {
+        let count = alive_bm.len();
+        alive_store.write_snapshot(&AliveShardKey, &alive_bm)?;
+        eprintln!("  Migrated alive bitmap: {} records", count);
+        count
+    } else {
+        eprintln!("  No alive bitmap found in BitmapFs");
+        0
+    };
+
+    // --- Slot counter ---
+    let meta_store = MetaStore::new(ss_root.clone())?;
+    if let Some(counter) = bfs.load_slot_counter()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("load slot_counter: {e}")))?
+    {
+        meta_store.write_slot_counter(counter)?;
+        eprintln!("  Migrated slot counter: {}", counter);
+    }
+
+    // --- Deferred alive ---
+    let deferred_path = bitmap_path.join("meta").join("deferred_alive.bin");
+    let meta_deferred_path = ss_root.join("deferred_alive.bin");
+    if deferred_path.exists() {
+        std::fs::copy(&deferred_path, &meta_deferred_path)?;
+        eprintln!("  Migrated deferred alive map");
+    }
+
+    // --- Filter bitmaps ---
+    let filter_store = FilterBitmapStore::new(ss_root.join("filter"), FieldValueBucketShard)?;
+    let mut filters_migrated = 0usize;
+    for field_name in filter_field_names {
+        let bitmaps = bfs.load_field(field_name)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("load filter '{}': {e}", field_name)))?;
+        if !bitmaps.is_empty() {
+            let entries: Vec<(&str, u64, &roaring::RoaringBitmap)> = bitmaps
+                .iter()
+                .map(|(v, bm)| (field_name.as_str(), *v, bm))
+                .collect();
+            filter_store.write_full_filter(&entries)?;
+            eprintln!("  Migrated filter '{}': {} values", field_name, bitmaps.len());
+            filters_migrated += 1;
+        }
+    }
+
+    // --- Sort layers ---
+    let sort_store = SortBitmapStore::new(ss_root.join("sort"), SortLayerShard)?;
+    let mut sorts_migrated = 0usize;
+    for (field_name, bits) in sort_field_configs {
+        if let Some(layers) = bfs.load_sort_layers(field_name, *bits)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("load sort '{}': {e}", field_name)))?
+        {
+            if !layers.is_empty() {
+                let layer_refs: Vec<&roaring::RoaringBitmap> = layers.iter().collect();
+                sort_store.write_sort_layers(field_name, &layer_refs)?;
+                eprintln!("  Migrated sort '{}': {} layers", field_name, layers.len());
+                sorts_migrated += 1;
+            }
+        }
+    }
+
+    // --- Time bucket bitmaps (if present) ---
+    let tb_dir = bitmap_path.join("meta").join("time_buckets");
+    if tb_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&tb_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".bin") {
+                    let bucket_name = name.trim_end_matches(".bin");
+                    if let Ok(data) = std::fs::read(entry.path()) {
+                        if let Ok(bm) = roaring::RoaringBitmap::deserialize_from(&data[..]) {
+                            if let Err(e) = meta_store.write_time_bucket(bucket_name, &bm) {
+                                eprintln!("  Warning: time bucket '{}' migration failed: {}", bucket_name, e);
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("  Migrated time buckets");
+        }
+    }
+
+    // --- Cursors ---
+    let cursors_dir = bitmap_path.join("meta").join("cursors");
+    if cursors_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&cursors_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".txt") {
+                    let cursor_name = name.trim_end_matches(".txt");
+                    if let Ok(value) = std::fs::read_to_string(entry.path()) {
+                        if let Err(e) = meta_store.write_cursor(cursor_name, value.trim()) {
+                            eprintln!("  Warning: cursor '{}' migration failed: {}", cursor_name, e);
+                        }
+                    }
+                }
+            }
+            eprintln!("  Migrated cursors");
+        }
+    }
+
+    eprintln!(
+        "BitmapFs → ShardStore migration complete: {} alive, {} filters, {} sorts",
+        alive_count, filters_migrated, sorts_migrated,
+    );
+
+    Ok((alive_count, filters_migrated, sorts_migrated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
