@@ -119,6 +119,30 @@ impl DocCache {
         }
     }
 
+    /// Update documents that are already in the cache; skip new ones.
+    ///
+    /// Used by the flush thread for write-through: only update docs that
+    /// queries have already loaded (cache-on-read). New docs from pg-sync
+    /// mutations go straight to disk without filling the cache with cold
+    /// entries that may never be queried.
+    pub fn update_batch_if_cached(&self, docs: &[(u32, StoredDoc)]) {
+        for (slot_id, doc) in docs {
+            if let Some(mut existing) = self.entries.get_mut(slot_id) {
+                let new_size = estimate_doc_size(doc);
+                let old_size = existing.size_bytes;
+                existing.doc = doc.clone();
+                existing.size_bytes = new_size;
+                existing.last_accessed_ms.store(now_ms(), Ordering::Relaxed);
+                if new_size > old_size {
+                    self.total_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
+                } else {
+                    self.total_bytes.fetch_sub(old_size - new_size, Ordering::Relaxed);
+                }
+            }
+            // Not in cache — skip. Doc goes to disk only.
+        }
+    }
+
     /// Remove a document from the cache (on delete).
     pub fn remove(&self, slot_id: u32) {
         if let Some((_, entry)) = self.entries.remove(&slot_id) {
