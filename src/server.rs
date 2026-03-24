@@ -342,6 +342,38 @@ async fn require_admin(
 /// Middleware: record requests/responses to the caplog when capture is active.
 ///
 /// Fast path: if not recording, `is_recording()` is a single mutex check (~ns)
+/// Outermost middleware: measures wall-clock time from HTTP request arrival
+/// to response sent. This captures the full round-trip including tokio scheduling,
+/// handler execution, response serialization, and any CPU contention delays.
+/// Records into bitdex_http_response_seconds histogram.
+async fn measure_http_roundtrip(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    // Normalize path: strip IDs/values to reduce label cardinality
+    let path_label = if path.starts_with("/api/indexes/") {
+        // /api/indexes/{name}/query → /api/indexes/*/query
+        let parts: Vec<&str> = path.splitn(4, '/').collect();
+        if parts.len() >= 4 {
+            format!("/api/indexes/*/{}", parts[3].split('/').next().unwrap_or(""))
+        } else {
+            "/api/indexes".to_string()
+        }
+    } else {
+        path.clone()
+    };
+    let start = std::time::Instant::now();
+    let response = next.run(req).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    state.metrics.http_response_seconds
+        .with_label_values(&[&method, &path_label])
+        .observe(elapsed);
+    response
+}
+
 /// and the middleware is a no-op passthrough. When recording, the request body
 /// is buffered, the response body is collected, and both are written to the caplog.
 async fn capture_traffic(
@@ -983,7 +1015,8 @@ impl BitdexServer {
             .merge(public_routes)
             .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), capture_traffic))
             .layer(CorsLayer::permissive())
-            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)); // 64MB for bulk upserts
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)) // 64MB for bulk upserts
+            .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), measure_http_roundtrip));
 
         eprintln!("BitDex server listening on http://{}", addr);
 
