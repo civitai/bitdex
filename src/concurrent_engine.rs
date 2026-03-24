@@ -238,6 +238,8 @@ pub struct ConcurrentEngine {
     flush_cache_nanos: Arc<AtomicU64>,
     /// Flush phase timing: last staging.clone() + ArcSwap publish duration in nanoseconds.
     flush_publish_nanos: Arc<AtomicU64>,
+    /// Flush phase timing: last ops-log append duration in nanoseconds (after publish).
+    flush_opslog_nanos: Arc<AtomicU64>,
     /// Flush phase timing: last time bucket maintenance duration in nanoseconds.
     flush_timebucket_nanos: Arc<AtomicU64>,
     /// Flush phase timing: last diff compaction duration in nanoseconds.
@@ -871,6 +873,7 @@ impl ConcurrentEngine {
         let flush_publish_nanos = Arc::new(AtomicU64::new(0));
         let flush_timebucket_nanos = Arc::new(AtomicU64::new(0));
         let flush_compact_nanos = Arc::new(AtomicU64::new(0));
+        let flush_opslog_nanos = Arc::new(AtomicU64::new(0));
 
         // BoundStore operational counters (defined before flush/merge threads)
         let boundstore_shard_loads = Arc::new(AtomicU64::new(0));
@@ -924,6 +927,7 @@ impl ConcurrentEngine {
                 flush_publish_nanos,
                 flush_timebucket_nanos,
                 flush_compact_nanos,
+                flush_opslog_nanos,
                 cursors,
                 existing_keys,
                 eviction_stamps,
@@ -964,6 +968,7 @@ impl ConcurrentEngine {
             let flush_publish_ns = Arc::clone(&flush_publish_nanos);
             let flush_timebucket_ns = Arc::clone(&flush_timebucket_nanos);
             let flush_compact_ns = Arc::clone(&flush_compact_nanos);
+            let flush_opslog_ns = Arc::clone(&flush_opslog_nanos);
             let flush_existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> =
                 existing_keys.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
             let flush_eviction_stamps = Arc::clone(&eviction_stamps);
@@ -1082,79 +1087,6 @@ impl ConcurrentEngine {
                         // This avoids the expensive staging.clone() → Arc::make_mut clone
                         // cascade that dominates write cost at scale.
                         if !flush_loading_mode.load(Ordering::Relaxed) {
-                            // ── Ops-log append ─────────────────────────────────
-                            // Persist mutations as ops-log entries. In-memory state
-                            // is already updated by apply_prepared() above; this
-                            // makes the changes durable on disk incrementally,
-                            // replacing the merge thread's full snapshot writes.
-                            if let (Some(ref as_), Some(ref fs_), Some(ref ss_)) =
-                                (&flush_alive_store, &flush_filter_store, &flush_sort_store)
-                            {
-                                // Alive ops
-                                let alive_ins = coalescer.alive_inserts();
-                                if !alive_ins.is_empty() {
-                                    let op = BitmapOp::BatchSet { bits: alive_ins.to_vec() };
-                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
-                                        eprintln!("flush: alive insert op failed: {e}");
-                                    }
-                                }
-                                let alive_rem = coalescer.alive_removes();
-                                if !alive_rem.is_empty() {
-                                    let op = BitmapOp::BatchClear { bits: alive_rem.to_vec() };
-                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
-                                        eprintln!("flush: alive remove op failed: {e}");
-                                    }
-                                }
-
-                                // Filter ops — one BatchSet/BatchClear per (field, value)
-                                for (fgk, slots) in coalescer.filter_insert_entries() {
-                                    let bucket_key = FilterBucketKey::from_value(
-                                        fgk.field.to_string(), fgk.value,
-                                    );
-                                    let op = FilterOp::BatchSet {
-                                        value: fgk.value,
-                                        bits: slots.clone(),
-                                    };
-                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
-                                        eprintln!("flush: filter insert op failed: {e}");
-                                    }
-                                }
-                                for (fgk, slots) in coalescer.filter_remove_entries() {
-                                    let bucket_key = FilterBucketKey::from_value(
-                                        fgk.field.to_string(), fgk.value,
-                                    );
-                                    let op = FilterOp::BatchClear {
-                                        value: fgk.value,
-                                        bits: slots.clone(),
-                                    };
-                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
-                                        eprintln!("flush: filter remove op failed: {e}");
-                                    }
-                                }
-
-                                // Sort ops — one BatchSet/BatchClear per (field, bit_layer)
-                                for (sgk, slots) in coalescer.sort_set_entries() {
-                                    let shard_key = SortLayerShardKey {
-                                        field: sgk.field.to_string(),
-                                        bit_position: sgk.bit_layer as u8,
-                                    };
-                                    let op = BitmapOp::BatchSet { bits: slots.clone() };
-                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
-                                        eprintln!("flush: sort set op failed: {e}");
-                                    }
-                                }
-                                for (sgk, slots) in coalescer.sort_clear_entries() {
-                                    let shard_key = SortLayerShardKey {
-                                        field: sgk.field.to_string(),
-                                        bit_position: sgk.bit_layer as u8,
-                                    };
-                                    let op = BitmapOp::BatchClear { bits: slots.clone() };
-                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
-                                        eprintln!("flush: sort clear op failed: {e}");
-                                    }
-                                }
-                            }
-
                             // Live maintenance for time buckets: add newly-alive slots to
                             // qualifying buckets, remove deleted slots from all buckets.
                             let t_tb = Instant::now();
@@ -1300,6 +1232,71 @@ impl ConcurrentEngine {
                             flush_pub_count.fetch_add(1, Ordering::Relaxed);
                             flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
                             flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
+
+                            // ── Ops-log append (after publish) ─────────────
+                            // Persist mutations as ops-log entries AFTER the
+                            // snapshot is published. This removes disk I/O from
+                            // the critical path — readers already see the new
+                            // snapshot. On crash between publish and persist,
+                            // pg-sync replays lost ops idempotently on restart.
+                            let t_opslog = Instant::now();
+                            if let (Some(ref as_), Some(ref fs_), Some(ref ss_)) =
+                                (&flush_alive_store, &flush_filter_store, &flush_sort_store)
+                            {
+                                let alive_ins = coalescer.alive_inserts();
+                                if !alive_ins.is_empty() {
+                                    let op = BitmapOp::BatchSet { bits: alive_ins.to_vec() };
+                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
+                                        eprintln!("flush: alive insert op failed: {e}");
+                                    }
+                                }
+                                let alive_rem = coalescer.alive_removes();
+                                if !alive_rem.is_empty() {
+                                    let op = BitmapOp::BatchClear { bits: alive_rem.to_vec() };
+                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
+                                        eprintln!("flush: alive remove op failed: {e}");
+                                    }
+                                }
+                                for (fgk, slots) in coalescer.filter_insert_entries() {
+                                    let bucket_key = FilterBucketKey::from_value(
+                                        fgk.field.to_string(), fgk.value,
+                                    );
+                                    let op = FilterOp::BatchSet { value: fgk.value, bits: slots.clone() };
+                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
+                                        eprintln!("flush: filter insert op failed: {e}");
+                                    }
+                                }
+                                for (fgk, slots) in coalescer.filter_remove_entries() {
+                                    let bucket_key = FilterBucketKey::from_value(
+                                        fgk.field.to_string(), fgk.value,
+                                    );
+                                    let op = FilterOp::BatchClear { value: fgk.value, bits: slots.clone() };
+                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
+                                        eprintln!("flush: filter remove op failed: {e}");
+                                    }
+                                }
+                                for (sgk, slots) in coalescer.sort_set_entries() {
+                                    let shard_key = SortLayerShardKey {
+                                        field: sgk.field.to_string(),
+                                        bit_position: sgk.bit_layer as u8,
+                                    };
+                                    let op = BitmapOp::BatchSet { bits: slots.clone() };
+                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
+                                        eprintln!("flush: sort set op failed: {e}");
+                                    }
+                                }
+                                for (sgk, slots) in coalescer.sort_clear_entries() {
+                                    let shard_key = SortLayerShardKey {
+                                        field: sgk.field.to_string(),
+                                        bit_position: sgk.bit_layer as u8,
+                                    };
+                                    let op = BitmapOp::BatchClear { bits: slots.clone() };
+                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
+                                        eprintln!("flush: sort clear op failed: {e}");
+                                    }
+                                }
+                            }
+                            flush_opslog_ns.store(t_opslog.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
                     }
 
@@ -2303,6 +2300,7 @@ impl ConcurrentEngine {
             flush_publish_nanos,
             flush_timebucket_nanos,
             flush_compact_nanos,
+            flush_opslog_nanos,
             cursors,
             existing_keys,
             eviction_stamps,
@@ -4870,14 +4868,15 @@ impl ConcurrentEngine {
         )
     }
 
-    /// Per-phase flush timing in nanoseconds: (apply, cache, publish, timebucket, compact).
-    pub fn flush_phase_stats(&self) -> (u64, u64, u64, u64, u64) {
+    /// Per-phase flush timing in nanoseconds: (apply, cache, publish, timebucket, compact, opslog).
+    pub fn flush_phase_stats(&self) -> (u64, u64, u64, u64, u64, u64) {
         (
             self.flush_apply_nanos.load(Ordering::Relaxed),
             self.flush_cache_nanos.load(Ordering::Relaxed),
             self.flush_publish_nanos.load(Ordering::Relaxed),
             self.flush_timebucket_nanos.load(Ordering::Relaxed),
             self.flush_compact_nanos.load(Ordering::Relaxed),
+            self.flush_opslog_nanos.load(Ordering::Relaxed),
         )
     }
 

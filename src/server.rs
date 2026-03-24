@@ -2271,28 +2271,38 @@ async fn handle_patch_documents(
         (idx.definition.data_schema.clone(), has_lcs)
     };
 
-    let mut patched = 0u64;
-    let mut errors: Vec<String> = Vec::new();
+    // Run patch_document on a blocking thread to avoid starving the tokio
+    // runtime. patch_document does sync disk I/O (reads old doc for diffing)
+    // and 5000 patches per pg-sync cycle would exhaust the async thread pool.
+    let documents = req.documents;
+    let engine_clone = Arc::clone(&engine);
+    let schema_clone = schema.clone();
+    let (patched, errors) = tokio::task::spawn_blocking(move || {
+        let mut patched = 0u64;
+        let mut errors: Vec<String> = Vec::new();
 
-    for (i, doc_json) in req.documents.iter().enumerate() {
-        let dicts = if has_lcs { Some(engine.dictionaries()) } else { None };
-        match loader::json_to_document_with_dicts(doc_json, &schema, dicts) {
-            Ok((slot, doc)) => {
-                match engine.patch_document(slot, &doc) {
-                    Ok(()) => patched += 1,
-                    Err(crate::error::BitdexError::SlotNotFound(_)) => {
-                        errors.push(format!("doc[{}] id={}: not alive (use upsert for new docs)", i, slot));
-                    }
-                    Err(e) => {
-                        errors.push(format!("doc[{}] id={}: {}", i, slot, e));
+        for (i, doc_json) in documents.iter().enumerate() {
+            let dicts = if has_lcs { Some(engine_clone.dictionaries()) } else { None };
+            match loader::json_to_document_with_dicts(doc_json, &schema_clone, dicts) {
+                Ok((slot, doc)) => {
+                    match engine_clone.patch_document(slot, &doc) {
+                        Ok(()) => patched += 1,
+                        Err(crate::error::BitdexError::SlotNotFound(_)) => {
+                            errors.push(format!("doc[{}] id={}: not alive (use upsert for new docs)", i, slot));
+                        }
+                        Err(e) => {
+                            errors.push(format!("doc[{}] id={}: {}", i, slot, e));
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                errors.push(format!("doc[{}]: {}", i, e));
+                Err(e) => {
+                    errors.push(format!("doc[{}]: {}", i, e));
+                }
             }
         }
-    }
+
+        (patched, errors)
+    }).await.expect("spawn_blocking join");
 
     if let Some(cursor) = req.cursor {
         engine.set_cursor(cursor.name, cursor.value);
@@ -3635,12 +3645,13 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .set(last_nanos as i64);
 
             // Flush phase timing
-            let (apply_ns, cache_ns, publish_ns, tb_ns, compact_ns) = engine.flush_phase_stats();
+            let (apply_ns, cache_ns, publish_ns, tb_ns, compact_ns, opslog_ns) = engine.flush_phase_stats();
             m.flush_apply_nanos.with_label_values(&[name]).set(apply_ns as i64);
             m.flush_cache_nanos.with_label_values(&[name]).set(cache_ns as i64);
             m.flush_publish_nanos.with_label_values(&[name]).set(publish_ns as i64);
             m.flush_timebucket_nanos.with_label_values(&[name]).set(tb_ns as i64);
             m.flush_compact_nanos.with_label_values(&[name]).set(compact_ns as i64);
+            let _ = opslog_ns; // TODO: add bitdex_flush_opslog_nanos Prometheus metric
 
             // Pending fields (lazy loading)
             let pending = engine.pending_field_count();
