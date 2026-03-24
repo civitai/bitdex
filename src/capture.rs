@@ -505,7 +505,12 @@ pub fn create_package(
                 let index_path = index_entry.path();
                 if !index_path.is_dir() { continue; }
 
-                let docstore = index_path.join("docstore");
+                // DocStore directory: try "docs" (production name) then "docstore" (legacy)
+                let docstore = if index_path.join("docs").is_dir() {
+                    index_path.join("docs")
+                } else {
+                    index_path.join("docstore")
+                };
                 if docstore.is_dir() {
                     for file in walkdir(&docstore).map_err(|e| format!("walk docstore: {e}"))? {
                         let rel = file.strip_prefix(data_dir).map_err(|e| format!("strip: {e}"))?;
