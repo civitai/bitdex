@@ -1839,22 +1839,14 @@ impl ConcurrentEngine {
                                     // Mark dirty so merge thread persists time buckets
                                     flush_dirty_flag.store(true, Ordering::Release);
 
-                                    // Push bucket diffs to unified cache
-                                    if !bucket_diffs.is_empty() {
-                                        let mut uc = flush_unified_cache.lock();
-                                        if !uc.is_empty() {
-                                            for (bucket_name, dropped, added) in &bucket_diffs {
-                                                uc.maintain_bucket_changes(
-                                                    &field_name,
-                                                    bucket_name,
-                                                    dropped,
-                                                    added,
-                                                    &staging.filters,
-                                                    &staging.sorts,
-                                                );
-                                            }
-                                        }
-                                    }
+                                    // Skip O(n) cache iteration for bucket changes.
+                                    // maintain_bucket_changes() iterates ALL cache entries
+                                    // under the unified cache Mutex, blocking every query
+                                    // for seconds at 200K+ entries. Instead, let stale
+                                    // bucket entries serve slightly outdated results until
+                                    // naturally evicted or replaced by new queries.
+                                    // TODO: Replace with generational invalidation (PR #62).
+                                    let _ = &bucket_diffs; // suppress unused warning
                                 } else {
                                     eprintln!("Time bucket: sort field '{}' not found in staging", sort_field_name);
                                 }
