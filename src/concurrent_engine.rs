@@ -26,7 +26,10 @@ use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
 use crate::query_metrics::{QueryTrace, QueryTraceCollector, SortTrace};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
-use crate::unified_cache::{UnifiedCache, UnifiedCacheConfig, UnifiedEntry, UnifiedKey};
+use crate::unified_cache::{
+    UnifiedCache, UnifiedCacheConfig, UnifiedEntry, UnifiedKey,
+    evaluate_filter_work, evaluate_sort_work,
+};
 use crate::shard_store_bitmap::{
     AliveShardKey, BitmapOp, FilterBucketKey, FilterOp, SortLayerShardKey,
 };
@@ -1115,44 +1118,47 @@ impl ConcurrentEngine {
                             }
                             flush_timebucket_ns.store(t_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-                            // Unified cache live maintenance.
-                            // Runs after bitmap mutations are applied to staging.
+                            // Unified cache live maintenance (two-phase).
+                            //
+                            // Split into three brief-lock phases to avoid blocking
+                            // query handlers during the expensive slot evaluation:
+                            //   Phase A: brief lock — collect work + cheap ops
+                            //   Phase B: NO lock — evaluate slots against staging
+                            //   Phase C: brief lock — apply results
                             let t_cache = Instant::now();
-                            {
+
+                            // Phase A: Brief lock — collect work items and do cheap ops
+                            let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
                                 let mut uc = flush_unified_cache.lock();
+
+                                // Targeted alive removal (fast: O(1) per entry per remove)
                                 if !uc.is_empty() {
-                                    // Targeted alive removal: remove deleted slots from
-                                    // all cache entries without blanket rebuild.
                                     for &slot in coalescer.alive_removes() {
                                         uc.remove_slot_from_all(slot);
                                     }
-                                    // Filter maintenance
-                                    if !coalescer.mutated_filter_fields().is_empty() {
-                                        uc.maintain_filter_changes(
-                                            coalescer.filter_insert_entries(),
-                                            coalescer.filter_remove_entries(),
-                                            &staging.filters,
-                                            &staging.sorts,
-                                        );
-                                    }
-                                    // Sort maintenance
-                                    let sort_mutations = coalescer.mutated_sort_slots();
-                                    if !sort_mutations.is_empty() {
-                                        uc.maintain_sort_changes(
-                                            &sort_mutations,
-                                            &staging.filters,
-                                            &staging.sorts,
-                                        );
-                                    }
-                                    // Reconcile tracked byte total after in-place mutations
-                                    uc.reconcile_bytes();
                                 }
-                                // Tombstone unloaded entries affected by mutations.
-                                // Runs OUTSIDE the is_empty() gate because after restart,
-                                // the cache has 0 RAM entries but the meta-index IS populated
-                                // from meta.bin. Tombstoning uses meta-index field registrations,
-                                // not the RAM HashMap. Without this, stale entries would be
-                                // served after restart+mutation (§3.2 violation).
+
+                                // Collect filter maintenance work
+                                let (fw, fob) = if !coalescer.mutated_filter_fields().is_empty() {
+                                    uc.collect_filter_work(
+                                        coalescer.filter_insert_entries(),
+                                        coalescer.filter_remove_entries(),
+                                    )
+                                } else {
+                                    (Vec::new(), Vec::new())
+                                };
+
+                                // Collect sort maintenance work
+                                let sort_mutations = coalescer.mutated_sort_slots();
+                                let (sw, sob) = if !sort_mutations.is_empty() {
+                                    uc.collect_sort_work(&sort_mutations)
+                                } else {
+                                    (Vec::new(), Vec::new())
+                                };
+
+                                // Tombstone unloaded entries (fast meta-index ops).
+                                // Runs even when cache is empty — meta-index may be
+                                // populated from meta.bin after restart (§3.2).
                                 if uc.persistence_enabled() {
                                     let filter_fields: Vec<&str> = coalescer
                                         .mutated_filter_fields()
@@ -1176,10 +1182,6 @@ impl ConcurrentEngine {
                                             flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
                                         }
                                     }
-                                    // Alive removals (deletes) affect ALL cache entries.
-                                    // For in-RAM entries, remove_slot_from_all handles it.
-                                    // For unloaded entries, tombstone them — a deleted slot
-                                    // in a cached bitmap would be served as a stale result.
                                     if coalescer.has_alive_mutations()
                                         && !coalescer.alive_removes().is_empty()
                                     {
@@ -1189,7 +1191,46 @@ impl ConcurrentEngine {
                                         }
                                     }
                                 }
+
+                                (fw, fob, sw, sob)
+                            }; // Phase A lock released
+
+                            // Phase B: NO lock — evaluate slots against staging data.
+                            // This is the expensive part (slot_matches_filter, reconstruct_value)
+                            // that previously held the Mutex for ~469ms.
+                            let deadline = if flush_config.cache.max_maintenance_ms > 0 {
+                                Some(Instant::now() + Duration::from_millis(flush_config.cache.max_maintenance_ms))
+                            } else {
+                                None
+                            };
+
+                            let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
+                                evaluate_filter_work(&filter_work, &staging.filters, &staging.sorts, deadline)
+                            } else {
+                                (Vec::new(), Vec::new())
+                            };
+
+                            let (sort_results, sort_timed_out) = if !sort_work.is_empty() {
+                                evaluate_sort_work(&sort_work, &staging.filters, &staging.sorts, deadline)
+                            } else {
+                                (Vec::new(), Vec::new())
+                            };
+
+                            // Phase C: Brief lock — apply results
+                            if !filter_results.is_empty() || !sort_results.is_empty()
+                                || !filter_over_budget.is_empty() || !sort_over_budget.is_empty()
+                                || !filter_timed_out.is_empty() || !sort_timed_out.is_empty()
+                            {
+                                let mut uc = flush_unified_cache.lock();
+                                uc.apply_maintenance_results(&filter_results);
+                                uc.apply_maintenance_results(&sort_results);
+                                uc.mark_for_rebuild_batch(&filter_over_budget);
+                                uc.mark_for_rebuild_batch(&sort_over_budget);
+                                uc.mark_for_rebuild_batch(&filter_timed_out);
+                                uc.mark_for_rebuild_batch(&sort_timed_out);
+                                uc.reconcile_bytes();
                             }
+
                             flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                             // Periodic filter diff compaction: merge dirty diffs into
