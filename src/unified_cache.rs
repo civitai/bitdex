@@ -686,6 +686,10 @@ impl UnifiedCache {
     }
 
     /// Store a new entry, evicting LRU if over budget. Returns the meta_id assigned.
+    ///
+    /// Uses batch eviction: when over budget, evicts ~10% of entries in one O(n)
+    /// pass instead of calling evict_lru() per entry. This prevents repeated O(n)
+    /// scans while holding the Mutex under high cache churn.
     pub fn store(&mut self, key: UnifiedKey, entry: UnifiedEntry) -> CacheEntryId {
         let meta_id = entry.meta_id;
         let new_bytes = entry.memory_bytes();
@@ -697,12 +701,15 @@ impl UnifiedCache {
             self.meta.deregister(old.meta_id);
         }
 
-        // Evict LRU entries while over byte budget or entry count cap
-        while (self.total_bytes + new_bytes > self.config.max_bytes
+        // Batch eviction: when over budget, evict ~10% of entries at once.
+        // One O(n) pass handles many evictions, creating headroom so subsequent
+        // inserts don't trigger eviction. Prevents O(n) scan per insert under
+        // high churn (the Mutex is held during this scan, blocking all queries).
+        if (self.total_bytes + new_bytes > self.config.max_bytes
             || self.entries.len() >= self.config.max_entries)
             && !self.entries.is_empty()
         {
-            self.evict_lru();
+            self.evict_batch();
         }
 
         // Mark dirty for persistence
@@ -796,6 +803,59 @@ impl UnifiedCache {
         }
 
         Some(lru_key)
+    }
+
+    /// Batch eviction: evict ~10% of entries (minimum 1) in one O(n) pass.
+    ///
+    /// Collects all entries sorted by last_used, evicts the oldest 10%.
+    /// This creates headroom so subsequent inserts don't trigger eviction,
+    /// avoiding repeated O(n) scans under high cache churn.
+    fn evict_batch(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+
+        // Collect (last_used, key) for all evictable entries
+        let mut candidates: Vec<(Instant, UnifiedKey)> = if self.persistence_enabled {
+            // Prefer non-dirty entries first
+            let mut non_dirty: Vec<_> = self.entries.iter()
+                .filter(|(_, e)| !e.persist_dirty)
+                .map(|(k, e)| (e.last_used, k.clone()))
+                .collect();
+            if non_dirty.is_empty() {
+                // All dirty — fall back to all entries
+                self.entries.iter()
+                    .map(|(k, e)| (e.last_used, k.clone()))
+                    .collect()
+            } else {
+                non_dirty
+            }
+        } else {
+            self.entries.iter()
+                .map(|(k, e)| (e.last_used, k.clone()))
+                .collect()
+        };
+
+        // Sort by last_used ascending (oldest first)
+        candidates.sort_unstable_by_key(|(t, _)| *t);
+
+        // Evict 10% of total entries (minimum 1), or enough to get under budget
+        let target_evict = (self.entries.len() / 10).max(1);
+        let mut evicted = 0;
+        for (_, key) in candidates.into_iter().take(target_evict) {
+            if let Some(entry) = self.entries.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.memory_bytes());
+                self.meta_id_to_key.remove(&entry.meta_id);
+                self.evictions += 1;
+                if !self.persistence_enabled {
+                    self.meta.deregister(entry.meta_id);
+                }
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            tracing::info!("Cache batch eviction: evicted {evicted} entries, {} remaining", self.entries.len());
+        }
     }
 
     /// Get a mutable reference to an entry by key (no touch).
