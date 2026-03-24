@@ -57,6 +57,8 @@ struct CliArgs {
     step_delay_ms: u64,
     /// Speed multiplier for realtime/window mode (1.0 = realtime, 2.0 = 2x faster)
     speed: f64,
+    /// Optional config TOML to PATCH onto the server before replay
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -80,6 +82,7 @@ fn parse_args() -> CliArgs {
     let mut concurrency = 16;
     let mut step_delay_ms = 1000;
     let mut speed = 1.0f64;
+    let mut config = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -114,6 +117,7 @@ fn parse_args() -> CliArgs {
                 speed = args[i].trim_end_matches('x').parse().unwrap_or(1.0);
                 if speed <= 0.0 { speed = 1.0; }
             }
+            "--config" => { i += 1; config = Some(PathBuf::from(&args[i])); }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -131,7 +135,7 @@ fn parse_args() -> CliArgs {
         std::process::exit(1);
     }
 
-    CliArgs { url, caplog, mode, output, window, scrape_metrics, concurrency, step_delay_ms, speed }
+    CliArgs { url, caplog, mode, output, window, scrape_metrics, concurrency, step_delay_ms, speed, config }
 }
 
 fn parse_window(s: &str) -> Option<(f64, f64)> {
@@ -157,6 +161,7 @@ fn print_usage() {
     eprintln!("  --step-delay <ms>    Delay between requests in stepped mode (default: 1000)");
     eprintln!("  --speed <mult>       Speed multiplier for realtime/window mode (default: 1.0)");
     eprintln!("                       Examples: 2.0 or 2x = 2x faster, 0.5 = half speed");
+    eprintln!("  --config <path>      TOML config preset to PATCH onto server before replay");
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +760,85 @@ fn scrape_metrics(base_url: &str) -> Option<String> {
 // Main
 // ---------------------------------------------------------------------------
 
+/// Apply a config preset to the server via PATCH /api/indexes/{name}/config.
+///
+/// Reads a TOML file with the same structure as the server's ConfigPatch:
+/// ```toml
+/// [cache]
+/// bound_target_size = 50000
+/// bound_max_size = 100000
+/// max_maintenance_ms = 5
+///
+/// max_query_concurrency = 0
+/// enable_traces = true
+/// trace_min_us = 0
+/// ```
+///
+/// Returns the index name discovered from the server.
+fn apply_config_preset(base_url: &str, toml_path: &std::path::Path) -> Result<String, String> {
+    // Read TOML file
+    let toml_str = std::fs::read_to_string(toml_path)
+        .map_err(|e| format!("Failed to read config file {}: {e}", toml_path.display()))?;
+
+    // Parse TOML into a serde_json::Value (TOML keys map 1:1 to the PATCH JSON)
+    let toml_val: toml::Value = toml_str.parse()
+        .map_err(|e| format!("Failed to parse TOML: {e}"))?;
+
+    // Convert TOML value to JSON for the PATCH request
+    let json_val = toml_to_json(&toml_val);
+
+    // Discover index name
+    let list_url = format!("{}/api/indexes", base_url.trim_end_matches('/'));
+    let resp = ureq::get(&list_url).call()
+        .map_err(|e| format!("Failed to reach server: {e}"))?;
+    let mut body = String::new();
+    resp.into_reader().read_to_string(&mut body)
+        .map_err(|e| format!("Failed to read index list: {e}"))?;
+    let list: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse index list: {e}"))?;
+    let index_name = list["indexes"][0]["name"].as_str()
+        .ok_or("No indexes found")?
+        .to_string();
+
+    // PATCH the config
+    let patch_url = format!("{}/api/indexes/{}/config", base_url.trim_end_matches('/'), index_name);
+    let resp = ureq::request("PATCH", &patch_url)
+        .set("Content-Type", "application/json")
+        .send_bytes(json_val.to_string().as_bytes())
+        .map_err(|e| format!("PATCH config failed: {e}"))?;
+
+    let status = resp.status();
+    let mut resp_body = String::new();
+    resp.into_reader().read_to_string(&mut resp_body).ok();
+
+    if status != 200 {
+        return Err(format!("PATCH config returned {status}: {resp_body}"));
+    }
+
+    Ok(index_name)
+}
+
+/// Convert a TOML value tree to a serde_json::Value tree.
+fn toml_to_json(val: &toml::Value) -> serde_json::Value {
+    match val {
+        toml::Value::String(s) => serde_json::Value::String(s.clone()),
+        toml::Value::Integer(n) => serde_json::json!(*n),
+        toml::Value::Float(f) => serde_json::json!(*f),
+        toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+        toml::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(toml_to_json).collect())
+        }
+        toml::Value::Table(table) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in table {
+                map.insert(k.clone(), toml_to_json(v));
+            }
+            serde_json::Value::Object(map)
+        }
+        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+    }
+}
+
 fn main() {
     let args = parse_args();
 
@@ -768,6 +852,9 @@ fn main() {
     }
     if args.speed != 1.0 {
         println!("  Speed:  {}x", args.speed);
+    }
+    if let Some(ref cfg) = args.config {
+        println!("  Config: {}", cfg.display());
     }
     println!();
 
@@ -836,6 +923,21 @@ fn main() {
         }
     }
     println!();
+
+    // Apply config preset if specified
+    if let Some(ref config_path) = args.config {
+        println!("Applying config preset: {}", config_path.display());
+        match apply_config_preset(&args.url, config_path) {
+            Ok(index_name) => {
+                println!("  Config applied to index '{index_name}'");
+            }
+            Err(e) => {
+                eprintln!("WARNING: Failed to apply config preset: {e}");
+                eprintln!("  Continuing with server's current config.");
+            }
+        }
+        println!();
+    }
 
     // Create output directory
     let run_id = chrono_run_id();
