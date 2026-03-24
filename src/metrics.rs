@@ -97,9 +97,12 @@ pub struct Metrics {
     pub save_snapshot_seconds: HistogramVec,
     pub flush_queue_depth: IntGauge,
 
-    // -- Phase 2.5: Doc cache (stubs — wired when Phase 1 lands) --
-    pub doc_cache_hit_total: IntCounterVec,
-    pub doc_cache_miss_total: IntCounterVec,
+    // -- Phase 2.5: Doc cache --
+    pub doc_cache_hit_total: IntGaugeVec,
+    pub doc_cache_miss_total: IntGaugeVec,
+    pub doc_cache_entries: IntGaugeVec,
+    pub doc_cache_bytes: IntGaugeVec,
+    pub doc_cache_evictions_total: IntGaugeVec,
     pub doc_cache_backlog: IntGaugeVec,
 
     // -- Phase 2.5: ShardStore ops (stub — wired when Phase 1 lands) --
@@ -482,14 +485,29 @@ impl Metrics {
         )
         .unwrap();
 
-        // Phase 2.5: Doc cache stubs (wired when Phase 1 task 1.10 lands)
-        let doc_cache_hit_total = IntCounterVec::new(
-            Opts::new("bitdex_doc_cache_hit_total", "Document cache hits"),
+        // Phase 2.5: Doc cache — synced from DocCache atomics on each scrape
+        let doc_cache_hit_total = IntGaugeVec::new(
+            Opts::new("bitdex_doc_cache_hit_total", "Document cache cumulative hits"),
             &["index"],
         )
         .unwrap();
-        let doc_cache_miss_total = IntCounterVec::new(
-            Opts::new("bitdex_doc_cache_miss_total", "Document cache misses"),
+        let doc_cache_miss_total = IntGaugeVec::new(
+            Opts::new("bitdex_doc_cache_miss_total", "Document cache cumulative misses"),
+            &["index"],
+        )
+        .unwrap();
+        let doc_cache_entries = IntGaugeVec::new(
+            Opts::new("bitdex_doc_cache_entries", "Document cache entry count"),
+            &["index"],
+        )
+        .unwrap();
+        let doc_cache_bytes = IntGaugeVec::new(
+            Opts::new("bitdex_doc_cache_bytes", "Document cache memory bytes"),
+            &["index"],
+        )
+        .unwrap();
+        let doc_cache_evictions_total = IntGaugeVec::new(
+            Opts::new("bitdex_doc_cache_evictions_total", "Document cache cumulative evictions"),
             &["index"],
         )
         .unwrap();
@@ -617,6 +635,9 @@ impl Metrics {
         registry.register(Box::new(flush_queue_depth.clone())).unwrap();
         registry.register(Box::new(doc_cache_hit_total.clone())).unwrap();
         registry.register(Box::new(doc_cache_miss_total.clone())).unwrap();
+        registry.register(Box::new(doc_cache_entries.clone())).unwrap();
+        registry.register(Box::new(doc_cache_bytes.clone())).unwrap();
+        registry.register(Box::new(doc_cache_evictions_total.clone())).unwrap();
         registry.register(Box::new(doc_cache_backlog.clone())).unwrap();
         registry.register(Box::new(shardstore_ops_count.clone())).unwrap();
         registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
@@ -687,6 +708,9 @@ impl Metrics {
             flush_queue_depth,
             doc_cache_hit_total,
             doc_cache_miss_total,
+            doc_cache_entries,
+            doc_cache_bytes,
+            doc_cache_evictions_total,
             doc_cache_backlog,
             shardstore_ops_count,
             pgsync_cycle_seconds,
