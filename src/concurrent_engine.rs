@@ -969,7 +969,7 @@ impl ConcurrentEngine {
             let flush_eviction_stamps = Arc::clone(&eviction_stamps);
             let flush_eviction_total = Arc::clone(&eviction_total);
             let flush_cycle_clone = Arc::clone(&flush_cycle);
-            let flush_bitmap_store = bitmap_store.clone();
+            let _flush_bitmap_store = bitmap_store.clone();
             let flush_doc_cache = doc_cache.clone();
             let flush_alive_store = alive_store.clone();
             let flush_filter_store = filter_store.clone();
@@ -1423,7 +1423,8 @@ impl ConcurrentEngine {
                                     &mut staging.sorts,
                                 );
                                 if extra > 0 {
-                                    staging_dirty = true;
+                                    #[allow(unused_assignments)]
+                                    { staging_dirty = true; }
                                 }
                                 let flush_elapsed = t_flush.elapsed();
                                 // Compact diffs before publishing — only needed if
@@ -1846,18 +1847,18 @@ impl ConcurrentEngine {
             let shutdown = Arc::clone(&shutdown);
             let merge_inner = Arc::clone(&inner);
             let merge_interval_ms = config.merge_interval_ms;
-            let merge_bitmap_store = bitmap_store.clone();
+            let _merge_bitmap_store = bitmap_store.clone();
             let merge_alive_store = alive_store.clone();
             let merge_filter_store = filter_store.clone();
             let merge_sort_store = sort_store.clone();
             let merge_meta_store = meta_store.clone();
-            let merge_config = Arc::clone(&config);
+            let _merge_config = Arc::clone(&config);
             let merge_dirty_flag = Arc::clone(&dirty_flag);
-            let sort_field_configs: Vec<crate::config::SortFieldConfig> =
+            let _sort_field_configs: Vec<crate::config::SortFieldConfig> =
                 config.sort_fields.clone();
-            let merge_pending_sorts = Arc::clone(&pending_sort_loads);
-            let merge_pending_filters = Arc::clone(&pending_filter_loads);
-            let merge_lazy_values = Arc::clone(&lazy_value_fields);
+            let _merge_pending_sorts = Arc::clone(&pending_sort_loads);
+            let _merge_pending_filters = Arc::clone(&pending_filter_loads);
+            let _merge_lazy_values = Arc::clone(&lazy_value_fields);
             let merge_time_buckets = time_buckets.as_ref().map(Arc::clone);
             let merge_cursors = Arc::clone(&cursors);
             let merge_bound_store = bound_store.clone();
@@ -1966,7 +1967,7 @@ impl ConcurrentEngine {
                         if meta_dirty || !dirty_shards.is_empty() || !cleanup_shards.is_empty() {
                             // Collect meta entries from meta-index registrations
                             let meta_entries: Vec<crate::bound_store::MetaEntry> = {
-                                let meta = uc.meta();
+                                let _meta = uc.meta();
                                 // Iterate all registered entries to build meta entries
                                 let mut entries = Vec::new();
                                 // We need to collect from the meta_id_to_key reverse index
@@ -2164,7 +2165,7 @@ impl ConcurrentEngine {
                         // Load snapshot and build executor
                         let snap = pf_inner.load();
 
-                        let mut executor = QueryExecutor::new(
+                        let executor = QueryExecutor::new(
                             &snap.slots,
                             &snap.filters,
                             &snap.sorts,
@@ -2176,7 +2177,7 @@ impl ConcurrentEngine {
                             .collect();
 
                         // Resolve filters
-                        let now_unix = std::time::SystemTime::now()
+                        let _now_unix = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
@@ -3377,7 +3378,7 @@ impl ConcurrentEngine {
     }
 
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
-        let query_start = std::time::Instant::now();
+        let _query_start = std::time::Instant::now();
 
         // Lazy-load any fields not yet loaded from disk
         let t0 = std::time::Instant::now();
@@ -3686,7 +3687,7 @@ impl ConcurrentEngine {
         query: &BitdexQuery,
         collector: &mut QueryTraceCollector,
     ) -> Result<QueryResult> {
-        let query_start = std::time::Instant::now();
+        let _query_start = std::time::Instant::now();
 
         // Lazy-load any fields not yet loaded from disk
         self.ensure_fields_loaded(
@@ -3972,7 +3973,7 @@ impl ConcurrentEngine {
         cached: Option<(UnifiedKey, Arc<RoaringBitmap>, bool, u32, usize, u64)>,
         collector: &mut QueryTraceCollector,
     ) -> Result<QueryResult> {
-        let slow_start = std::time::Instant::now();
+        let _slow_start = std::time::Instant::now();
 
         let filter_start = Instant::now();
         let (filter_arc, use_simple_sort) =
@@ -6121,11 +6122,11 @@ impl ConcurrentEngine {
         let (tx, rx) = crossbeam_channel::bounded::<ChunkResult>(4);
 
         // Merge thread: accumulates into staging directly
-        let sort_bits_clone = sort_bits.clone();
+        let _sort_bits_clone = sort_bits.clone();
         let filter_configs_clone = filter_configs.clone();
         let sort_configs_clone = sort_configs.clone();
         let inner_clone = self.inner.clone();
-        let progress_merge = progress.clone();
+        let _progress_merge = progress.clone();
 
         let merge_handle = thread::spawn(move || {
             let mut staging = {
@@ -6251,7 +6252,7 @@ impl ConcurrentEngine {
             });
 
         // Wait for merge thread to finish
-        let (staging, total_merged) = merge_handle.join()
+        let (staging, _total_merged) = merge_handle.join()
             .expect("merge thread panicked");
 
         let read_elapsed = t0.elapsed().as_secs_f64();

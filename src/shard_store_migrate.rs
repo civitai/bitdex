@@ -11,10 +11,9 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::docstore::PackedValue;
-use crate::shard_store_doc::{DocSnapshot, DocOp, DocShardStore, SlotHexShard};
+use crate::shard_store_doc::{DocSnapshot, DocShardStore};
 
 // ---------------------------------------------------------------------------
 // V2 DocStore migration
@@ -53,6 +52,7 @@ pub fn read_v2_shard(path: &Path) -> io::Result<HashMap<u32, Vec<(u16, Vec<u8>)>
         slot: u32,
         field_idx: u16,
         value: Vec<u8>,
+        #[allow(dead_code)]
         order: usize, // insertion order for LIFO
     }
 
@@ -222,7 +222,7 @@ pub fn has_v2_shards(root: &Path) -> bool {
 use crate::bitmap_fs::BitmapFs;
 use crate::shard_store_bitmap::{
     AliveBitmapStore, FilterBitmapStore, SortBitmapStore,
-    AliveShardKey, FilterBucketKey, SortLayerShardKey,
+    AliveShardKey,
     FieldValueBucketShard, SortLayerShard, SingletonShard,
 };
 use crate::shard_store_meta::MetaStore;

@@ -24,7 +24,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::query::{
-    BitdexQuery, CursorPosition, FilterClause, ParseError, QueryParser, SortClause, SortDirection,
+    BitdexQuery, FilterClause, ParseError, QueryParser, SortClause, SortDirection,
     Value,
 };
 
@@ -272,6 +272,7 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn peek_byte(&self) -> Option<u8> {
         self.input.get(self.pos).copied()
     }
