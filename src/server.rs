@@ -285,6 +285,11 @@ struct AppState {
     max_query_concurrency: AtomicU32,
     /// Snapshot capture session manager (Phase 2).
     capture: crate::capture::CaptureManager,
+    /// Toggleable metric groups — disable expensive metrics without redeploy.
+    /// Default: all enabled. PATCH /config to toggle at runtime.
+    metrics_bitmap_memory: AtomicBool,
+    metrics_eviction_stats: AtomicBool,
+    metrics_boundstore_disk: AtomicBool,
 }
 
 type SharedState = Arc<AppState>;
@@ -834,6 +839,12 @@ struct ConfigPatch {
     /// Minimum query latency (microseconds) to record a trace. 0 = record all.
     #[serde(default)]
     trace_min_us: Option<u64>,
+    /// Toggle expensive metric groups at runtime. Array of group names to enable.
+    /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
+    /// If provided, ONLY listed groups are enabled (others disabled).
+    /// Omit to leave current state unchanged.
+    #[serde(default)]
+    enabled_metrics: Option<Vec<String>>,
 }
 
 /// Patchable fields for a filter field.
@@ -950,6 +961,9 @@ impl BitdexServer {
             queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
             capture: crate::capture::CaptureManager::new(&self.data_dir),
+            metrics_bitmap_memory: AtomicBool::new(true),
+            metrics_eviction_stats: AtomicBool::new(true),
+            metrics_boundstore_disk: AtomicBool::new(true),
         });
 
         // Try to restore an existing index from disk
@@ -1657,6 +1671,17 @@ async fn handle_patch_config(
                 if let Some(v) = patch.trace_min_us {
                     state.trace_min_us.store(v, Ordering::Relaxed);
                     eprintln!("Config patch: trace_min_us set to {v}μs");
+                }
+
+                // Toggle metric groups (server-wide, not persisted)
+                if let Some(ref groups) = patch.enabled_metrics {
+                    let bm = groups.iter().any(|g| g == "bitmap_memory");
+                    let ev = groups.iter().any(|g| g == "eviction_stats");
+                    let bd = groups.iter().any(|g| g == "boundstore_disk");
+                    state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
+                    state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
+                    state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
+                    eprintln!("Config patch: enabled_metrics = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
                 }
 
                 // Persist updated config.json
@@ -3702,26 +3727,31 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(uc.prefetches as i64);
 
-            // Per-field bitmap memory gauges
-            let t1 = std::time::Instant::now();
-            let (slot_bytes, _filter_bytes, _sort_bytes, _ce, _cb, filter_details, sort_details) =
-                engine.bitmap_memory_report();
-            let t_bitmap_mem = t1.elapsed();
-            m.slot_bitmap_bytes
-                .with_label_values(&[name])
-                .set(slot_bytes as i64);
-            for (field, count, bytes) in &filter_details {
-                m.filter_bitmap_bytes
-                    .with_label_values(&[name, field])
-                    .set(*bytes as i64);
-                m.filter_bitmap_count
-                    .with_label_values(&[name, field])
-                    .set(*count as i64);
-            }
-            for (field, bytes) in &sort_details {
-                m.sort_bitmap_bytes
-                    .with_label_values(&[name, field])
-                    .set(*bytes as i64);
+            // Per-field bitmap memory gauges (EXPENSIVE: iterates all bitmaps)
+            // Gated by metrics_bitmap_memory toggle — disable at runtime via
+            // PATCH /config {"enabled_metrics": []} to avoid 52s scrape stalls.
+            if state.metrics_bitmap_memory.load(Ordering::Relaxed) {
+                let t1 = std::time::Instant::now();
+                let (slot_bytes, _filter_bytes, _sort_bytes, _ce, _cb, filter_details, sort_details) =
+                    engine.bitmap_memory_report();
+                let t_bitmap_mem = t1.elapsed();
+                let _ = t_bitmap_mem; // timing available for debug logging
+                m.slot_bitmap_bytes
+                    .with_label_values(&[name])
+                    .set(slot_bytes as i64);
+                for (field, count, bytes) in &filter_details {
+                    m.filter_bitmap_bytes
+                        .with_label_values(&[name, field])
+                        .set(*bytes as i64);
+                    m.filter_bitmap_count
+                        .with_label_values(&[name, field])
+                        .set(*count as i64);
+                }
+                for (field, bytes) in &sort_details {
+                    m.sort_bitmap_bytes
+                        .with_label_values(&[name, field])
+                        .set(*bytes as i64);
+                }
             }
 
             // Flush pipeline stats
@@ -3748,18 +3778,17 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(pending as i64);
 
-            // Eviction stats
-            let t2 = std::time::Instant::now();
-            for (field, total, resident) in engine.eviction_stats() {
-                m.eviction_total
-                    .with_label_values(&[name, &field])
-                    .set(total as i64);
-                m.eviction_resident_values
-                    .with_label_values(&[name, &field])
-                    .set(resident as i64);
+            // Eviction stats (gated — iterates per-field eviction data)
+            if state.metrics_eviction_stats.load(Ordering::Relaxed) {
+                for (field, total, resident) in engine.eviction_stats() {
+                    m.eviction_total
+                        .with_label_values(&[name, &field])
+                        .set(total as i64);
+                    m.eviction_resident_values
+                        .with_label_values(&[name, &field])
+                        .set(resident as i64);
+                }
             }
-
-            let t_eviction = t2.elapsed();
 
             // Compaction skipped (scrape-time from atomic counter)
             m.compaction_skipped_total
@@ -3771,7 +3800,7 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .set(state.queries_in_flight_peak.load(Ordering::Relaxed));
 
             // BoundStore stats
-            let t3 = std::time::Instant::now();
+            m.boundstore_meta_entries
                 .with_label_values(&[name])
                 .set(uc.meta_index_entries as i64);
             m.boundstore_tombstones
@@ -3780,9 +3809,12 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.boundstore_pending_shards
                 .with_label_values(&[name])
                 .set(uc.pending_shard_count as i64);
-            m.boundstore_disk_bytes
-                .with_label_values(&[name])
-                .set(engine.boundstore_disk_bytes() as i64);
+            // Disk bytes scan gated — does sync I/O (directory listing)
+            if state.metrics_boundstore_disk.load(Ordering::Relaxed) {
+                m.boundstore_disk_bytes
+                    .with_label_values(&[name])
+                    .set(engine.boundstore_disk_bytes() as i64);
+            }
             m.boundstore_shard_loads_total
                 .with_label_values(&[name])
                 .set(engine.boundstore_shard_loads() as i64);
@@ -3802,8 +3834,6 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(engine.boundstore_bytes_read() as i64);
 
-            let t_boundstore = t3.elapsed();
-
             // Phase 2.5: Flush queue depth
             m.flush_queue_depth.set(engine.flush_queue_depth() as i64);
 
@@ -3817,8 +3847,8 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.doc_cache_bytes.with_label_values(&[name]).set(dc_bytes as i64);
             m.doc_cache_evictions_total.with_label_values(&[name]).set(dc_evictions as i64);
 
-            eprintln!("[metrics-timing] cache_stats={:?} bitmap_mem={:?} eviction={:?} boundstore={:?} doc_cache={:?} total={:?}",
-                t_cache_stats, t_bitmap_mem, t_eviction, t_boundstore, t_doc_cache, metrics_start.elapsed());
+            eprintln!("[metrics-timing] cache_stats={:?} doc_cache={:?} total={:?}",
+                t_cache_stats, t_doc_cache, metrics_start.elapsed());
         }
     }
 
