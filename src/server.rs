@@ -1958,31 +1958,44 @@ async fn handle_query(
 
             let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
 
-            // Fetch documents (timed separately for trace)
+            // Fetch documents on a blocking thread to avoid starving tokio.
+            // Doc reads can hit disk (cache miss) — sync I/O on the async
+            // runtime causes 4s+ response times under load.
             let doc_start = Instant::now();
-            let docstore_hist = &m.docstore_read_seconds;
             let documents = if !include_docs.is_none() {
-                let mut docs = Vec::with_capacity(result.ids.len());
+                let engine_docs = Arc::clone(&engine);
+                let ids = result.ids.clone();
+                let schema_docs = schema.clone();
+                let reverse_maps_docs = Arc::clone(&reverse_maps);
+                let include_docs_docs = include_docs.clone();
+                let schema_registry_docs = Arc::clone(&schema_registry);
+                let docstore_hist = m.docstore_read_seconds.clone();
+                let name_docs = name.clone();
+
                 m.docstore_concurrent_reads.inc();
-                for &id in &result.ids {
-                    let read_start = Instant::now();
-                    let doc = engine.get_document(id as u32);
-                    docstore_hist
-                        .with_label_values(&[&name])
-                        .observe(read_start.elapsed().as_secs_f64());
-                    docs.push(match doc {
-                        Ok(Some(stored)) => {
-                            format_document(&stored, &schema, &reverse_maps, &include_docs, &schema_registry)
-                        }
-                        Ok(None) => {
-                            serde_json::json!({ "id": id })
-                        }
-                        Err(e) => {
-                            tracing::warn!("doc read error for slot {}: {e}", id);
-                            serde_json::json!({ "id": id })
-                        }
-                    });
-                }
+                let docs = tokio::task::spawn_blocking(move || {
+                    let mut docs = Vec::with_capacity(ids.len());
+                    for &id in &ids {
+                        let read_start = Instant::now();
+                        let doc = engine_docs.get_document(id as u32);
+                        docstore_hist
+                            .with_label_values(&[&name_docs])
+                            .observe(read_start.elapsed().as_secs_f64());
+                        docs.push(match doc {
+                            Ok(Some(stored)) => {
+                                format_document(&stored, &schema_docs, &reverse_maps_docs, &include_docs_docs, &schema_registry_docs)
+                            }
+                            Ok(None) => {
+                                serde_json::json!({ "id": id })
+                            }
+                            Err(e) => {
+                                tracing::warn!("doc read error for slot {}: {e}", id);
+                                serde_json::json!({ "id": id })
+                            }
+                        });
+                    }
+                    docs
+                }).await.unwrap();
                 m.docstore_concurrent_reads.dec();
                 Some(docs)
             } else {
