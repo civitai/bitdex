@@ -1151,10 +1151,25 @@ impl ConcurrentEngine {
                             // bases so apply_diff/fused don't accumulate unbounded diffs.
                             // Runs every COMPACTION_INTERVAL flush cycles (~5s).
                             // Sort diffs and alive are already merged eagerly in WriteBatch::apply().
+                            //
+                            // CRITICAL: Only compact fields that have dirty diffs. Using
+                            // fields_mut() iterates ALL fields and calls Arc::make_mut on
+                            // each — which deep-clones the entire FilterField HashMap when
+                            // the Arc is shared with a published snapshot (refcount > 1).
+                            // For tagIds (31K entries), this clone takes seconds. Targeted
+                            // compaction avoids the clone cascade on untouched fields.
                             let t_compact = Instant::now();
                             if flush_cycle % COMPACTION_INTERVAL == 0 {
-                                for (_name, field) in staging.filters.fields_mut() {
-                                    field.merge_dirty();
+                                // Collect names of dirty fields first (read-only, no Arc::make_mut)
+                                let dirty_fields: Vec<String> = staging.filters.fields()
+                                    .filter(|(_, field)| field.has_dirty())
+                                    .map(|(name, _)| name.clone())
+                                    .collect();
+                                // Only make_mut + merge on fields that actually have dirty diffs
+                                for name in &dirty_fields {
+                                    if let Some(field) = staging.filters.get_field_mut(name) {
+                                        field.merge_dirty();
+                                    }
                                 }
                             }
                             flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -5455,6 +5470,28 @@ impl ConcurrentEngine {
     /// Get a reference to the BitmapFs store, if configured.
     pub fn bitmap_store(&self) -> Option<&Arc<BitmapFs>> {
         self.bitmap_store.as_ref()
+    }
+
+    /// Pin ShardStore generations across alive, filter, and sort stores.
+    ///
+    /// Bumps the generation counter on all three stores so that new writes go
+    /// to Gen N+1 while Gen N preserves the pre-pin state. Returns the frozen
+    /// generation number. Used by capture start/stop to bracket a time window.
+    ///
+    /// Returns None if no shard stores are configured.
+    pub fn pin_shard_generations(&self) -> Result<Option<u64>> {
+        let (alive_s, filter_s, sort_s) = match (&self.alive_store, &self.filter_store, &self.sort_store) {
+            (Some(a), Some(f), Some(s)) => (a, f, s),
+            _ => return Ok(None),
+        };
+        let gen_alive = alive_s.pin_generation()
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("pin alive gen: {e}")))?;
+        let gen_filter = filter_s.pin_generation()
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("pin filter gen: {e}")))?;
+        let gen_sort = sort_s.pin_generation()
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("pin sort gen: {e}")))?;
+        eprintln!("Pinned shard generations: alive={gen_alive}, filter={gen_filter}, sort={gen_sort}");
+        Ok(Some(gen_alive))
     }
 
     /// Get a reference to the in-flight tracker.

@@ -71,6 +71,10 @@ pub struct CaptureSession {
     pub metrics_start_path: Option<PathBuf>,
     /// Path to metrics_stop.prom (written on capture stop).
     pub metrics_stop_path: Option<PathBuf>,
+    /// ShardStore generation pinned at capture start (pre-capture state).
+    pub gen_start: Option<u64>,
+    /// ShardStore generation pinned at capture stop (mutations during capture).
+    pub gen_stop: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,8 +179,8 @@ impl CaptureManager {
 
         self.requests_counter.store(0, Ordering::Release);
 
-        // TODO: Gen pin hook — bump ShardStore generation counter here
-        // once Adam's ShardStore lands. For now this is a no-op.
+        // Gen pin is called by the server handler after start() returns.
+        // CaptureManager doesn't hold a reference to the engine.
 
         // Open caplog writer
         let caplog_path = session_dir.join("traffic.caplog");
@@ -195,6 +199,8 @@ impl CaptureManager {
             session_dir,
             metrics_start_path: None,
             metrics_stop_path: None,
+            gen_start: None,
+            gen_stop: None,
         };
 
         let status = session_to_status(&session, &self.requests_counter);
@@ -210,7 +216,7 @@ impl CaptureManager {
             return Err(CaptureError::NotRecording);
         }
 
-        // TODO: Gen pin hook — bump generation counter again to bracket the capture window.
+        // Gen pin is called by the server handler after stop() returns.
 
         // Flush and close caplog writer
         if let Some(ref mut writer) = *self.caplog.lock() {
@@ -239,6 +245,8 @@ impl CaptureManager {
                 duration_seconds: None,
                 requests_recorded: 0,
                 session_dir: None,
+                gen_start: None,
+                gen_stop: None,
             },
         }
     }
@@ -292,6 +300,22 @@ impl CaptureManager {
         let mut guard = self.session.lock();
         if let Some(ref mut s) = *guard {
             s.metrics_stop_path = Some(path);
+        }
+    }
+
+    /// Record the ShardStore generation pinned at capture start.
+    pub fn set_gen_start(&self, gen: u64) {
+        let mut guard = self.session.lock();
+        if let Some(ref mut s) = *guard {
+            s.gen_start = Some(gen);
+        }
+    }
+
+    /// Record the ShardStore generation pinned at capture stop.
+    pub fn set_gen_stop(&self, gen: u64) {
+        let mut guard = self.session.lock();
+        if let Some(ref mut s) = *guard {
+            s.gen_stop = Some(gen);
         }
     }
 
@@ -472,6 +496,10 @@ pub struct CaptureStatus {
     pub duration_seconds: Option<u64>,
     pub requests_recorded: u64,
     pub session_dir: Option<String>,
+    /// ShardStore generation pinned at capture start.
+    pub gen_start: Option<u64>,
+    /// ShardStore generation pinned at capture stop.
+    pub gen_stop: Option<u64>,
 }
 
 /// Errors from capture operations.
@@ -513,6 +541,8 @@ fn session_to_status(session: &CaptureSession, counter: &AtomicU64) -> CaptureSt
             counter.load(Ordering::Relaxed)
         },
         session_dir: Some(session.session_dir.display().to_string()),
+        gen_start: session.gen_start,
+        gen_stop: session.gen_stop,
     }
 }
 
