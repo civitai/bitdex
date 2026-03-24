@@ -55,9 +55,9 @@ pub struct FilterGroupKey {
 
 /// Key for grouping sort operations by target bit layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SortGroupKey {
-    field: Arc<str>,
-    bit_layer: usize,
+pub struct SortGroupKey {
+    pub field: Arc<str>,
+    pub bit_layer: usize,
 }
 
 /// Accumulates MutationOps from a channel drain and groups them by target bitmap
@@ -528,6 +528,18 @@ impl WriteCoalescer {
     /// Used by trie cache live updates to remove mutated slots from matching entries.
     pub fn filter_remove_entries(&self) -> &HashMap<FilterGroupKey, Vec<u32>> {
         &self.batch.filter_removes
+    }
+
+    /// Returns the sort set entries from the prepared batch.
+    /// Used by ops-log wiring to append BitmapOp::BatchSet per sort layer shard.
+    pub fn sort_set_entries(&self) -> &HashMap<SortGroupKey, Vec<u32>> {
+        &self.batch.sort_sets
+    }
+
+    /// Returns the sort clear entries from the prepared batch.
+    /// Used by ops-log wiring to append BitmapOp::BatchClear per sort layer shard.
+    pub fn sort_clear_entries(&self) -> &HashMap<SortGroupKey, Vec<u32>> {
+        &self.batch.sort_clears
     }
 }
 

@@ -27,6 +27,9 @@ use crate::query_metrics::{QueryTrace, QueryTraceCollector, SortTrace};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
 use crate::unified_cache::{UnifiedCache, UnifiedCacheConfig, UnifiedEntry, UnifiedKey};
+use crate::shard_store_bitmap::{
+    AliveShardKey, BitmapOp, FilterBucketKey, FilterOp, SortLayerShardKey,
+};
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 
 /// Bridge for passing Prometheus metric handles from the server layer into
@@ -1055,6 +1058,79 @@ impl ConcurrentEngine {
                         // This avoids the expensive staging.clone() → Arc::make_mut clone
                         // cascade that dominates write cost at scale.
                         if !flush_loading_mode.load(Ordering::Relaxed) {
+                            // ── Ops-log append ─────────────────────────────────
+                            // Persist mutations as ops-log entries. In-memory state
+                            // is already updated by apply_prepared() above; this
+                            // makes the changes durable on disk incrementally,
+                            // replacing the merge thread's full snapshot writes.
+                            if let (Some(ref as_), Some(ref fs_), Some(ref ss_)) =
+                                (&flush_alive_store, &flush_filter_store, &flush_sort_store)
+                            {
+                                // Alive ops
+                                let alive_ins = coalescer.alive_inserts();
+                                if !alive_ins.is_empty() {
+                                    let op = BitmapOp::BatchSet { bits: alive_ins.to_vec() };
+                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
+                                        eprintln!("flush: alive insert op failed: {e}");
+                                    }
+                                }
+                                let alive_rem = coalescer.alive_removes();
+                                if !alive_rem.is_empty() {
+                                    let op = BitmapOp::BatchClear { bits: alive_rem.to_vec() };
+                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
+                                        eprintln!("flush: alive remove op failed: {e}");
+                                    }
+                                }
+
+                                // Filter ops — one BatchSet/BatchClear per (field, value)
+                                for (fgk, slots) in coalescer.filter_insert_entries() {
+                                    let bucket_key = FilterBucketKey::from_value(
+                                        fgk.field.to_string(), fgk.value,
+                                    );
+                                    let op = FilterOp::BatchSet {
+                                        value: fgk.value,
+                                        bits: slots.clone(),
+                                    };
+                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
+                                        eprintln!("flush: filter insert op failed: {e}");
+                                    }
+                                }
+                                for (fgk, slots) in coalescer.filter_remove_entries() {
+                                    let bucket_key = FilterBucketKey::from_value(
+                                        fgk.field.to_string(), fgk.value,
+                                    );
+                                    let op = FilterOp::BatchClear {
+                                        value: fgk.value,
+                                        bits: slots.clone(),
+                                    };
+                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
+                                        eprintln!("flush: filter remove op failed: {e}");
+                                    }
+                                }
+
+                                // Sort ops — one BatchSet/BatchClear per (field, bit_layer)
+                                for (sgk, slots) in coalescer.sort_set_entries() {
+                                    let shard_key = SortLayerShardKey {
+                                        field: sgk.field.to_string(),
+                                        bit_position: sgk.bit_layer as u8,
+                                    };
+                                    let op = BitmapOp::BatchSet { bits: slots.clone() };
+                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
+                                        eprintln!("flush: sort set op failed: {e}");
+                                    }
+                                }
+                                for (sgk, slots) in coalescer.sort_clear_entries() {
+                                    let shard_key = SortLayerShardKey {
+                                        field: sgk.field.to_string(),
+                                        bit_position: sgk.bit_layer as u8,
+                                    };
+                                    let op = BitmapOp::BatchClear { bits: slots.clone() };
+                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
+                                        eprintln!("flush: sort clear op failed: {e}");
+                                    }
+                                }
+                            }
+
                             // Live maintenance for time buckets: add newly-alive slots to
                             // qualifying buckets, remove deleted slots from all buckets.
                             let t_tb = Instant::now();
@@ -1768,32 +1844,45 @@ impl ConcurrentEngine {
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(sleep_duration);
 
-                    // Snapshot, compact filter diffs, persist to filesystem
-                    // Only write if bitmaps have changed since last snapshot.
+                    // ── Per-shard compaction ────────────────────────────────
+                    // The flush thread now appends ops incrementally, so the
+                    // merge thread's job is compaction (not full snapshots).
+                    // Only check when new ops have been written.
                     let needs_write = merge_dirty_flag.swap(false, Ordering::AcqRel);
                     if needs_write {
                     if let (Some(ref as_), Some(ref fs_), Some(ref ss_), Some(ref ms_)) =
                         (&merge_alive_store, &merge_filter_store, &merge_sort_store, &merge_meta_store)
                     {
-                        // Use write_inner_to_store which reads through Arc refs (zero copy)
-                        // instead of the old (*snap).clone() which deep-clones all FilterField
-                        // HashMaps (3-4s at 107M records with tagIds 31K entries).
-                        let pending_s = merge_pending_sorts.lock().clone();
-                        let pending_f = merge_pending_filters.lock().clone();
-                        let lazy_v = merge_lazy_values.lock().clone();
-
-                        if let Err(e) = ConcurrentEngine::write_snapshot_to_store(
-                            as_, fs_, ss_, ms_,
-                            &merge_inner,
-                            &merge_config,
-                            &pending_s,
-                            &pending_f,
-                            &lazy_v,
-                        ) {
-                            eprintln!("merge thread: snapshot write failed: {e}");
+                        // Compact alive shard if ops exceed threshold
+                        if as_.needs_compaction(&AliveShardKey).unwrap_or(false) {
+                            if let Err(e) = as_.compact_current(&AliveShardKey) {
+                                eprintln!("merge: alive compaction failed: {e}");
+                            }
                         }
 
-                        // Persist time bucket bitmaps
+                        // Compact filter shards that have accumulated too many ops
+                        if let Ok(filter_shards) = fs_.list_current_shards() {
+                            for key in &filter_shards {
+                                if fs_.needs_compaction(key).unwrap_or(false) {
+                                    if let Err(e) = fs_.compact_current(key) {
+                                        eprintln!("merge: filter compaction failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+
+                        // Compact sort shards that have accumulated too many ops
+                        if let Ok(sort_shards) = ss_.list_current_shards() {
+                            for key in &sort_shards {
+                                if ss_.needs_compaction(key).unwrap_or(false) {
+                                    if let Err(e) = ss_.compact_current(key) {
+                                        eprintln!("merge: sort compaction failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+
+                        // Persist time bucket bitmaps (MetaStore, unchanged)
                         if let Some(ref tb_arc) = merge_time_buckets {
                             let tb = tb_arc.lock();
                             for (name, bitmap) in tb.all_buckets() {
@@ -1805,7 +1894,7 @@ impl ConcurrentEngine {
                             }
                         }
 
-                        // Persist named cursors
+                        // Persist named cursors (MetaStore, unchanged)
                         {
                             let cursor_snapshot = merge_cursors.lock().clone();
                             for (name, value) in &cursor_snapshot {
@@ -9657,5 +9746,123 @@ mod tests {
 
             engine.shutdown();
         }
+    }
+
+    #[test]
+    fn test_flush_thread_appends_ops_to_shard_stores() {
+        // Verify that the flush thread writes ops-log entries to disk
+        // instead of relying solely on merge thread full snapshots.
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+
+        let ss_root = bitmap_path.join("shardstore");
+
+        let mut engine =
+            ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
+
+        // Insert a document — this goes through the flush thread which should
+        // append ops to alive, filter, and sort shard stores.
+        engine
+            .put(
+                1,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                    ("tagIds", FieldValue::Multi(vec![Value::Integer(100)])),
+                    ("reactionCount", FieldValue::Single(Value::Integer(500))),
+                ]),
+            )
+            .unwrap();
+
+        // Wait for flush thread to process the mutation and append ops.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Verify ops landed on disk — alive shard should have ops
+        let alive_store = crate::shard_store_bitmap::AliveBitmapStore::new(
+            ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
+        ).unwrap();
+        let alive_ops = alive_store.ops_count(&AliveShardKey).unwrap();
+        assert!(
+            alive_ops.is_some() && alive_ops.unwrap() > 0,
+            "alive shard should have ops after insert, got {:?}",
+            alive_ops,
+        );
+
+        // Verify alive bitmap is recoverable from ops
+        let alive_bm = alive_store.read(&AliveShardKey).unwrap();
+        assert!(alive_bm.is_some(), "alive bitmap should be readable from ops");
+        assert!(
+            alive_bm.as_ref().unwrap().contains(1),
+            "alive bitmap should contain slot 1",
+        );
+
+        // Verify filter ops — nsfwLevel value 1 should have an op
+        let filter_store = crate::shard_store_bitmap::FilterBitmapStore::new(
+            ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
+        ).unwrap();
+        let bucket_key = FilterBucketKey::from_value("nsfwLevel".to_string(), 1);
+        let filter_snap = filter_store.read(&bucket_key).unwrap();
+        assert!(filter_snap.is_some(), "filter bucket should exist after insert");
+        let filter_snap = filter_snap.unwrap();
+        let bm = filter_snap.values.get(&1);
+        assert!(bm.is_some(), "nsfwLevel=1 bitmap should exist");
+        assert!(bm.unwrap().contains(1), "nsfwLevel=1 should contain slot 1");
+
+        // Verify sort ops — reactionCount layers should have ops
+        let sort_store = crate::shard_store_bitmap::SortBitmapStore::new(
+            ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
+        ).unwrap();
+        // 500 in binary: bit 8 (256), bit 7 (128), bit 6 (64), bit 5 (32),
+        // bit 4 (16), bit 2 (4) = 0b111110100
+        // At least bit 8 should be set for slot 1
+        let layer_key = SortLayerShardKey {
+            field: "reactionCount".to_string(),
+            bit_position: 8,
+        };
+        let layer_snap = sort_store.read(&layer_key).unwrap();
+        assert!(layer_snap.is_some(), "sort layer bit8 should exist");
+        assert!(
+            layer_snap.unwrap().contains(1),
+            "sort layer bit8 should contain slot 1 for reactionCount=500",
+        );
+
+        // Insert more docs to accumulate ops, then verify compaction works
+        for i in 2..=5u32 {
+            engine
+                .put(
+                    i,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 100))),
+                    ]),
+                )
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Verify alive ops accumulated
+        let alive_ops_after = alive_store.ops_count(&AliveShardKey).unwrap().unwrap_or(0);
+        assert!(
+            alive_ops_after > 1,
+            "alive shard should have multiple ops, got {}",
+            alive_ops_after,
+        );
+
+        // Compact and verify the shard is now a clean snapshot (0 ops)
+        alive_store.compact_current(&AliveShardKey).unwrap();
+        let alive_ops_compacted = alive_store.ops_count(&AliveShardKey).unwrap().unwrap_or(999);
+        assert_eq!(
+            alive_ops_compacted, 0,
+            "alive shard should have 0 ops after compaction",
+        );
+
+        // Verify data survived compaction
+        let alive_bm = alive_store.read(&AliveShardKey).unwrap().unwrap();
+        for i in 1..=5u32 {
+            assert!(alive_bm.contains(i), "slot {} should survive compaction", i);
+        }
+
+        engine.shutdown();
     }
 }
