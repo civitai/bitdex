@@ -5,8 +5,30 @@
  * Usage: node .claude/skills/deploy/cli.mjs <command> [args]
  */
 import { execSync, spawnSync } from 'child_process';
-import { readFileSync, writeFileSync } from 'fs';
-import { resolve } from 'path';
+import { readFileSync, writeFileSync, existsSync, createWriteStream, statSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import http from 'http';
+import https from 'https';
+
+// Load .env from dev-server skill dir (shared admin token)
+const __d = dirname(fileURLToPath(import.meta.url));
+try {
+  const envFile = readFileSync(resolve(__d, '..', 'dev-server', '.env'), 'utf8');
+  for (const line of envFile.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq > 0) {
+      const key = trimmed.slice(0, eq).trim();
+      const val = trimmed.slice(eq + 1).trim();
+      if (!process.env[key]) process.env[key] = val;
+    }
+  }
+} catch { /* no .env */ }
+
+const ADMIN_TOKEN = process.env.BITDEX_ADMIN_TOKEN || null;
+const BITDEX_URL = process.env.BITDEX_PROD_URL || 'https://bitdex.civitai.com';
 
 const NS = 'bitdex';
 const STS = 'bitdex';
@@ -278,6 +300,110 @@ function configRead() {
   }
 }
 
+// --- Snapshot Download ---
+
+function snapshotStatus(sessionId) {
+  if (!sessionId) { json({ error: 'Usage: snapshot-status <session_id>' }); process.exit(1); }
+  if (!ADMIN_TOKEN) { json({ error: 'BITDEX_ADMIN_TOKEN not set. Add it to .claude/skills/dev-server/.env' }); process.exit(1); }
+  const result = run(`curl -sf -H "Authorization: Bearer ${ADMIN_TOKEN}" "${BITDEX_URL}/debug/snapshot/${sessionId}/status"`, { throws: false });
+  try { json(JSON.parse(result)); } catch { json({ error: 'Failed to fetch status', raw: result }); }
+}
+
+async function snapshotDownload(sessionId) {
+  if (!sessionId) { json({ error: 'Usage: snapshot-download <session_id> [--output <path>]' }); process.exit(1); }
+  if (!ADMIN_TOKEN) { json({ error: 'BITDEX_ADMIN_TOKEN not set. Add it to .claude/skills/dev-server/.env' }); process.exit(1); }
+
+  const outputIdx = process.argv.indexOf('--output');
+  const outputPath = outputIdx !== -1 ? process.argv[outputIdx + 1] : `data/snapshots/snapshot-${sessionId}.tar.gz`;
+
+  // Ensure output dir exists
+  const outputDir = resolve(dirname(outputPath));
+  run(`mkdir -p "${outputDir}"`, { throws: false });
+
+  const url = `${BITDEX_URL}/debug/snapshot/${sessionId}/download`;
+  const fullPath = resolve(outputPath);
+
+  // Check for existing partial download (resume support)
+  let startByte = 0;
+  if (existsSync(fullPath)) {
+    startByte = statSync(fullPath).size;
+    console.error(`Resuming from byte ${startByte} (${(startByte / 1073741824).toFixed(2)} GB)`);
+  }
+
+  console.error(`Downloading snapshot ${sessionId} from ${BITDEX_URL}`);
+  console.error(`Output: ${fullPath}`);
+
+  const urlObj = new URL(url);
+  const client = urlObj.protocol === 'https:' ? https : http;
+
+  return new Promise((resolveP, rejectP) => {
+    const headers = { 'Authorization': `Bearer ${ADMIN_TOKEN}` };
+    if (startByte > 0) headers['Range'] = `bytes=${startByte}-`;
+
+    const req = client.get(urlObj, { headers }, (res) => {
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        console.error(`Auth error: ${res.statusCode}`);
+        json({ error: `Auth failed (${res.statusCode})`, hint: 'Check BITDEX_ADMIN_TOKEN in .env' });
+        process.exit(1);
+      }
+      if (res.statusCode >= 400) {
+        let body = '';
+        res.on('data', c => body += c);
+        res.on('end', () => { json({ error: `HTTP ${res.statusCode}`, body }); process.exit(1); });
+        return;
+      }
+
+      const totalHeader = res.headers['content-length'];
+      const total = totalHeader ? parseInt(totalHeader, 10) + startByte : null;
+      const flags = startByte > 0 ? { flags: 'a' } : {};
+      const file = createWriteStream(fullPath, flags);
+      let downloaded = startByte;
+      let lastPrint = 0;
+
+      res.on('data', (chunk) => {
+        file.write(chunk);
+        downloaded += chunk.length;
+        const now = Date.now();
+        if (now - lastPrint > 2000) {
+          const gb = (downloaded / 1073741824).toFixed(2);
+          const pct = total ? ` (${((downloaded / total) * 100).toFixed(1)}%)` : '';
+          process.stderr.write(`\r  ${gb} GB downloaded${pct}`);
+          lastPrint = now;
+        }
+      });
+
+      res.on('end', () => {
+        file.end();
+        const gb = (downloaded / 1073741824).toFixed(2);
+        console.error(`\nDownload complete: ${gb} GB → ${fullPath}`);
+        json({ downloaded_bytes: downloaded, path: fullPath, session_id: sessionId });
+        resolveP();
+      });
+
+      res.on('error', (e) => {
+        file.end();
+        console.error(`\nDownload error at ${(downloaded / 1073741824).toFixed(2)} GB: ${e.message}`);
+        console.error('Re-run the same command to resume.');
+        json({ error: e.message, downloaded_bytes: downloaded, path: fullPath, resumable: true });
+        rejectP(e);
+      });
+    });
+
+    req.on('error', (e) => {
+      console.error(`Connection error: ${e.message}`);
+      json({ error: e.message });
+      rejectP(e);
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      console.error('Connection timed out. Re-run to resume.');
+      json({ error: 'timeout', downloaded_bytes: startByte, resumable: true });
+      rejectP(new Error('timeout'));
+    });
+  });
+}
+
 // --- Router ---
 
 const command = process.argv[2];
@@ -298,12 +424,15 @@ switch (command) {
   case 'resources': resources(); break;
   case 'wipe': wipe(); break;
   case 'config-read': configRead(); break;
+  case 'snapshot-status': snapshotStatus(process.argv[3]); break;
+  case 'snapshot-download': await snapshotDownload(process.argv[3]); break;
   default:
     json({
       error: `Unknown command: ${command}`,
       commands: ['release', 'watch-build', 'build-status', 'rollout', 'deploy', 'status', 'scale',
                  'cursor-reset', 'cursor-read', 'cursor-csv', 'pg-sync-health', 'pg-sync-logs',
-                 'server-logs', 'resources', 'wipe', 'config-read'],
+                 'server-logs', 'resources', 'wipe', 'config-read',
+                 'snapshot-status', 'snapshot-download'],
     });
     process.exit(1);
 }
