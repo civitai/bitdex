@@ -401,18 +401,42 @@ pub enum PackageState {
 pub type SharedPackageState = std::sync::Arc<std::sync::Mutex<PackageState>>;
 
 /// Create a tar.zst package from a capture session directory.
+/// Package mode controls what's included in the snapshot archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageMode {
+    /// Traffic capture only: caplog + metrics + manifest (~100MB).
+    MetricsOnly,
+    /// Full snapshot: caplog + metrics + bitmaps (~7GB compressed). No docstore.
+    Bitmaps,
+    /// Everything: caplog + metrics + bitmaps + docstore (~20-30GB compressed).
+    Full,
+}
+
+impl Default for PackageMode {
+    fn default() -> Self {
+        PackageMode::MetricsOnly
+    }
+}
+
 /// Runs synchronously — call from a blocking task or spawn_blocking.
 ///
-/// Walks the session directory and adds all files to a zstd-compressed tar archive.
+/// Creates a zstd-compressed tar archive containing the session data and
+/// optionally the bitmap/docstore shard data from the data directory.
 /// Output: `{session_dir}.snapshot.tar.zst`
-pub fn create_package(session_dir: &Path, state: &SharedPackageState) -> Result<PathBuf, String> {
-    // Update state: compressing
+pub fn create_package(
+    session_dir: &Path,
+    data_dir: &Path,
+    mode: PackageMode,
+    state: &SharedPackageState,
+) -> Result<PathBuf, String> {
     *state.lock().unwrap() = PackageState::Compressing;
 
     // Write manifest.json
     let manifest = serde_json::json!({
         "session_id": session_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"),
         "packaged_at": format_system_time(SystemTime::now()),
+        "mode": format!("{:?}", mode),
         "files": list_session_files(session_dir),
     });
     let manifest_path = session_dir.join("manifest.json");
@@ -427,7 +451,7 @@ pub fn create_package(session_dir: &Path, state: &SharedPackageState) -> Result<
         .map_err(|e| format!("zstd encoder: {e}"))?;
     let mut tar_builder = tar::Builder::new(zstd_encoder);
 
-    // Walk session dir and add all files
+    // 1. Always include session dir (caplog + metrics + manifest)
     let session_name = session_dir.file_name().and_then(|n| n.to_str()).unwrap_or("session");
     for entry in walkdir(session_dir).map_err(|e| format!("walk session dir: {e}"))? {
         let rel_path = entry.strip_prefix(session_dir)
@@ -437,17 +461,72 @@ pub fn create_package(session_dir: &Path, state: &SharedPackageState) -> Result<
             .map_err(|e| format!("tar append {}: {e}", entry.display()))?;
     }
 
+    // 2. Include bitmap shard data if mode is Bitmaps or Full
+    if mode == PackageMode::Bitmaps || mode == PackageMode::Full {
+        // Find the index data dir (e.g., /data/indexes/civitai/)
+        let indexes_dir = data_dir.join("indexes");
+        if indexes_dir.is_dir() {
+            for index_entry in std::fs::read_dir(&indexes_dir).map_err(|e| format!("read indexes: {e}"))? {
+                let index_entry = index_entry.map_err(|e| format!("index entry: {e}"))?;
+                let index_path = index_entry.path();
+                if !index_path.is_dir() { continue; }
+
+                // Include shardstore/ (bitmap shard files)
+                let shardstore = index_path.join("shardstore");
+                if shardstore.is_dir() {
+                    for file in walkdir(&shardstore).map_err(|e| format!("walk shardstore: {e}"))? {
+                        let rel = file.strip_prefix(data_dir).map_err(|e| format!("strip: {e}"))?;
+                        let archive_path = PathBuf::from("data").join(rel);
+                        tar_builder.append_path_with_name(&file, &archive_path)
+                            .map_err(|e| format!("tar bitmap {}: {e}", file.display()))?;
+                    }
+                }
+
+                // Include bitmaps/ (legacy BitmapFs, if present)
+                let bitmaps = index_path.join("bitmaps");
+                if bitmaps.is_dir() {
+                    for file in walkdir(&bitmaps).map_err(|e| format!("walk bitmaps: {e}"))? {
+                        let rel = file.strip_prefix(data_dir).map_err(|e| format!("strip: {e}"))?;
+                        let archive_path = PathBuf::from("data").join(rel);
+                        tar_builder.append_path_with_name(&file, &archive_path)
+                            .map_err(|e| format!("tar bitmap {}: {e}", file.display()))?;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Include docstore if mode is Full
+    if mode == PackageMode::Full {
+        let indexes_dir = data_dir.join("indexes");
+        if indexes_dir.is_dir() {
+            for index_entry in std::fs::read_dir(&indexes_dir).map_err(|e| format!("read indexes: {e}"))? {
+                let index_entry = index_entry.map_err(|e| format!("index entry: {e}"))?;
+                let index_path = index_entry.path();
+                if !index_path.is_dir() { continue; }
+
+                let docstore = index_path.join("docstore");
+                if docstore.is_dir() {
+                    for file in walkdir(&docstore).map_err(|e| format!("walk docstore: {e}"))? {
+                        let rel = file.strip_prefix(data_dir).map_err(|e| format!("strip: {e}"))?;
+                        let archive_path = PathBuf::from("data").join(rel);
+                        tar_builder.append_path_with_name(&file, &archive_path)
+                            .map_err(|e| format!("tar doc {}: {e}", file.display()))?;
+                    }
+                }
+            }
+        }
+    }
+
     let zstd_encoder = tar_builder.into_inner()
         .map_err(|e| format!("tar finalize: {e}"))?;
     zstd_encoder.finish()
         .map_err(|e| format!("zstd finish: {e}"))?;
 
-    // Get output size
     let size_bytes = std::fs::metadata(&output_path)
         .map(|m| m.len())
         .unwrap_or(0);
 
-    // Update state: ready
     *state.lock().unwrap() = PackageState::Ready {
         path: output_path.display().to_string(),
         size_bytes,
