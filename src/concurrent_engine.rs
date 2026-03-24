@@ -5016,6 +5016,21 @@ impl ConcurrentEngine {
         self.sender.pending_count()
     }
 
+    /// Doc cache stats for Prometheus scrape: (hits, misses, entries, bytes, evictions).
+    /// Returns zeros if doc_cache is not configured.
+    pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64) {
+        match &self.doc_cache {
+            Some(cache) => (
+                cache.hits(),
+                cache.misses(),
+                cache.len(),
+                cache.size_bytes(),
+                cache.eviction_count(),
+            ),
+            None => (0, 0, 0, 0, 0),
+        }
+    }
+
     /// Report bitmap memory usage broken down by component (lock-free snapshot).
     ///
     /// Returns (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes,

@@ -3729,6 +3729,14 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
 
             // Phase 2.5: Flush queue depth
             m.flush_queue_depth.set(engine.flush_queue_depth() as i64);
+
+            // Doc cache stats (synced from DocCache atomic counters)
+            let (dc_hits, dc_misses, dc_entries, dc_bytes, dc_evictions) = engine.doc_cache_stats();
+            m.doc_cache_hit_total.with_label_values(&[name]).set(dc_hits as i64);
+            m.doc_cache_miss_total.with_label_values(&[name]).set(dc_misses as i64);
+            m.doc_cache_entries.with_label_values(&[name]).set(dc_entries as i64);
+            m.doc_cache_bytes.with_label_values(&[name]).set(dc_bytes as i64);
+            m.doc_cache_evictions_total.with_label_values(&[name]).set(dc_evictions as i64);
         }
     }
 
