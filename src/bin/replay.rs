@@ -55,6 +55,8 @@ struct CliArgs {
     concurrency: usize,
     /// Step delay in milliseconds for stepped mode
     step_delay_ms: u64,
+    /// Speed multiplier for realtime/window mode (1.0 = realtime, 2.0 = 2x faster)
+    speed: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +79,7 @@ fn parse_args() -> CliArgs {
     let mut scrape_metrics = false;
     let mut concurrency = 16;
     let mut step_delay_ms = 1000;
+    let mut speed = 1.0f64;
 
     let mut i = 1;
     while i < args.len() {
@@ -106,6 +109,11 @@ fn parse_args() -> CliArgs {
             "--scrape-metrics" => { scrape_metrics = true; }
             "--concurrency" => { i += 1; concurrency = args[i].parse().unwrap_or(16); }
             "--step-delay" => { i += 1; step_delay_ms = args[i].parse().unwrap_or(1000); }
+            "--speed" => {
+                i += 1;
+                speed = args[i].trim_end_matches('x').parse().unwrap_or(1.0);
+                if speed <= 0.0 { speed = 1.0; }
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -123,7 +131,7 @@ fn parse_args() -> CliArgs {
         std::process::exit(1);
     }
 
-    CliArgs { url, caplog, mode, output, window, scrape_metrics, concurrency, step_delay_ms }
+    CliArgs { url, caplog, mode, output, window, scrape_metrics, concurrency, step_delay_ms, speed }
 }
 
 fn parse_window(s: &str) -> Option<(f64, f64)> {
@@ -147,6 +155,8 @@ fn print_usage() {
     eprintln!("  --scrape-metrics     Scrape /metrics before and after replay");
     eprintln!("  --concurrency <n>    Worker count for saturate mode (default: 16)");
     eprintln!("  --step-delay <ms>    Delay between requests in stepped mode (default: 1000)");
+    eprintln!("  --speed <mult>       Speed multiplier for realtime/window mode (default: 1.0)");
+    eprintln!("                       Examples: 2.0 or 2x = 2x faster, 0.5 = half speed");
 }
 
 // ---------------------------------------------------------------------------
@@ -266,58 +276,106 @@ fn execute_request(
 // Replay modes
 // ---------------------------------------------------------------------------
 
-/// Replay in realtime mode: fire requests at their original timestamps.
+/// Replay in realtime mode: fire requests at their original timestamps with
+/// concurrent dispatch. A scheduler thread sleeps until each entry's scheduled
+/// time, then submits the request to a thread pool (non-blocking). Worker
+/// threads execute requests in parallel and push results to a shared collector.
+///
+/// `speed` controls the replay rate: 1.0 = realtime, 2.0 = 2x faster, etc.
 fn replay_realtime(
     entries: &[CaptureEntry],
     base_url: &str,
+    speed: f64,
 ) -> Vec<ReplayResult> {
+    use std::sync::Mutex;
+
     if entries.is_empty() {
         return Vec::new();
     }
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(30))
-        .build();
-
+    let speed = if speed <= 0.0 { 1.0 } else { speed };
     let base_ns = entries[0].arrived_at_ns;
     let replay_start = Instant::now();
-    let mut results = Vec::with_capacity(entries.len());
+    let results = Arc::new(Mutex::new(Vec::with_capacity(entries.len())));
+    let in_flight = Arc::new(AtomicU64::new(0));
+    let completed = Arc::new(AtomicU64::new(0));
+    let total = entries.len();
 
+    // Thread pool sized for peak concurrency. Production captures show ~91 req/s
+    // with tails up to ~30s, so 64 threads covers worst-case in-flight count.
+    let pool_size = 64usize;
+    let (tx, rx) = crossbeam_channel::bounded::<(usize, CaptureEntry)>(pool_size * 2);
+
+    // Spawn worker threads — each gets its own ureq Agent (connection pool).
+    let handles: Vec<_> = (0..pool_size)
+        .map(|_| {
+            let rx = rx.clone();
+            let base_url = base_url.to_string();
+            let results = Arc::clone(&results);
+            let in_flight = Arc::clone(&in_flight);
+            let completed = Arc::clone(&completed);
+
+            std::thread::spawn(move || {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout_connect(Duration::from_secs(10))
+                    .timeout_read(Duration::from_secs(30))
+                    .build();
+
+                while let Ok((index, entry)) = rx.recv() {
+                    in_flight.fetch_add(1, Ordering::Relaxed);
+                    let result = fire_and_compare(&agent, &base_url, &entry, index);
+                    in_flight.fetch_sub(1, Ordering::Relaxed);
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    results.lock().unwrap().push(result);
+                }
+            })
+        })
+        .collect();
+
+    // Scheduler: iterate entries, wait until each entry's scheduled time, then
+    // submit to the pool without blocking on the response.
     for (i, entry) in entries.iter().enumerate() {
-        // Wait until the right time
-        let target_offset = Duration::from_nanos(entry.arrived_at_ns.saturating_sub(base_ns));
+        let target_offset_ns = entry.arrived_at_ns.saturating_sub(base_ns);
+        let target_offset = Duration::from_nanos((target_offset_ns as f64 / speed) as u64);
         let now_offset = replay_start.elapsed();
+
         if target_offset > now_offset {
             let wait = target_offset - now_offset;
-            // Use spin-wait for sub-ms precision
-            if wait < Duration::from_millis(1) {
-                let deadline = Instant::now() + wait;
-                while Instant::now() < deadline {
-                    std::hint::spin_loop();
-                }
-            } else {
+            if wait > Duration::from_millis(1) {
+                // Sleep for the bulk, then spin-wait for sub-ms precision.
                 std::thread::sleep(wait - Duration::from_micros(500));
-                // Spin for the remaining sub-ms
-                let deadline = replay_start + target_offset;
-                while Instant::now() < deadline {
-                    std::hint::spin_loop();
-                }
+            }
+            // Spin-wait for the remainder.
+            while replay_start.elapsed() < target_offset {
+                std::hint::spin_loop();
             }
         }
 
-        let result = fire_and_compare(&agent, base_url, entry, i);
-        if (i + 1) % 100 == 0 {
+        // Submit to thread pool (blocks only if the bounded channel is full,
+        // which means 128 requests are already queued — back-pressure).
+        let _ = tx.send((i, entry.clone()));
+
+        // Progress every 500 requests.
+        if (i + 1) % 500 == 0 {
             let elapsed = replay_start.elapsed();
+            let done = completed.load(Ordering::Relaxed);
+            let flying = in_flight.load(Ordering::Relaxed);
             eprintln!(
-                "  [{}/{}] {:.1}s elapsed, last replay_us={}",
-                i + 1, entries.len(), elapsed.as_secs_f64(),
-                result.replay_latency_us
+                "  [{}/{}] {:.1}s elapsed, {} completed, {} in-flight",
+                i + 1, total, elapsed.as_secs_f64(), done, flying
             );
         }
-        results.push(result);
     }
 
+    // Drop sender to signal workers to drain remaining work and exit.
+    drop(tx);
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let mut results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+    results.sort_by_key(|r| r.request_index);
     results
 }
 
@@ -411,15 +469,19 @@ fn replay_stepped(
 }
 
 /// Fire a request and compare with the original captured response.
+///
+/// On network errors, the actual elapsed time is still recorded so stall
+/// detection and latency analysis reflect reality rather than showing 0.
 fn fire_and_compare(
     agent: &ureq::Agent,
     base_url: &str,
     entry: &CaptureEntry,
     index: usize,
 ) -> ReplayResult {
-    let original_latency_us = (entry.responded_at_ns - entry.arrived_at_ns) / 1_000;
+    let original_latency_us = entry.responded_at_ns.saturating_sub(entry.arrived_at_ns) / 1_000;
     let endpoint = format!("{} {}", entry.method, entry.path);
 
+    let start = Instant::now();
     match execute_request(agent, base_url, entry) {
         Ok((status, body, elapsed)) => {
             let replay_latency_us = elapsed.as_micros() as u64;
@@ -439,12 +501,13 @@ fn fire_and_compare(
             }
         }
         Err(e) => {
-            eprintln!("  Request {} failed: {e}", index);
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            eprintln!("  Request {} failed ({}us): {e}", index, elapsed_us);
             ReplayResult {
                 request_index: index,
                 original_arrived_ns: entry.arrived_at_ns,
                 original_latency_us,
-                replay_latency_us: 0,
+                replay_latency_us: elapsed_us,
                 status_match: false,
                 original_status: entry.response_status,
                 replay_status: 0,
@@ -635,6 +698,9 @@ fn main() {
     if let Some((start, end)) = args.window {
         println!("  Window: {start}s - {end}s");
     }
+    if args.speed != 1.0 {
+        println!("  Speed:  {}x", args.speed);
+    }
     println!();
 
     // Read caplog
@@ -712,7 +778,7 @@ fn main() {
 
     let results = match args.mode {
         ReplayMode::Realtime | ReplayMode::Window => {
-            replay_realtime(&entries, &args.url)
+            replay_realtime(&entries, &args.url, args.speed)
         }
         ReplayMode::Saturate => {
             replay_saturate(&entries, &args.url, args.concurrency)
