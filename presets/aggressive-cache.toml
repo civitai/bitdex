@@ -1,0 +1,20 @@
+# Aggressive cache preset — maximize cache hit rate at the cost of memory.
+# Target: production servers with 32GB+ RAM.
+#
+# Legend: [hot] = hot-swappable via PATCH /config, [restart] = requires server restart
+
+[metadata]
+name = "aggressive-cache"
+description = "Max cache hit rate — 2GB unified, 2GB doc, 50K bound target"
+
+[cache]
+bound_target_size = 50000   # [hot]
+bound_max_size = 100000     # [hot]
+bound_max_count = 200       # [hot]
+max_entries = 20000         # [hot]
+
+[unified_cache]
+max_bytes = 2147483648      # [restart] 2 GB
+
+[doc_cache]
+max_bytes = 2147483648      # [restart] 2 GB
