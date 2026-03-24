@@ -404,6 +404,159 @@ async function snapshotDownload(sessionId) {
   });
 }
 
+// --- Prometheus Metrics ---
+
+const PROM_CONTEXT = 'civit-datapacket';
+const PROM_NS = 'monitoring';
+const PROM_SVC = 'svc/kube-prometheus-stack-prometheus';
+const PROM_PORT = 9090;
+const PROM_URL = `http://localhost:${PROM_PORT}`;
+
+function ensurePromPortForward() {
+  // Check if port-forward is already running
+  try {
+    const check = run(`curl -sf ${PROM_URL}/api/v1/status/runtimeinfo 2>/dev/null | head -c 20`, { throws: false });
+    if (check && check.includes('{')) return true;
+  } catch {}
+
+  // Start port-forward in background
+  console.error(`Starting port-forward to Prometheus (${PROM_SVC})...`);
+  try {
+    spawnSync('kubectl', ['--context', PROM_CONTEXT, 'port-forward', '-n', PROM_NS, PROM_SVC, `${PROM_PORT}:${PROM_PORT}`], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      shell: process.platform === 'win32',
+    });
+    // Wait for it to be ready
+    for (let i = 0; i < 15; i++) {
+      try {
+        const check = run(`curl -sf ${PROM_URL}/api/v1/status/runtimeinfo 2>/dev/null | head -c 20`, { throws: false });
+        if (check && check.includes('{')) { console.error('Port-forward ready.'); return true; }
+      } catch {}
+      run('sleep 0.5', { throws: false });
+    }
+  } catch {}
+  console.error('Warning: could not verify Prometheus port-forward. Queries may fail.');
+  return false;
+}
+
+function promQuery(query) {
+  const encoded = encodeURIComponent(query);
+  const result = run(`curl -sf "${PROM_URL}/api/v1/query?query=${encoded}"`, { throws: false });
+  try { return JSON.parse(result); } catch { return { error: 'Failed to parse response', raw: result }; }
+}
+
+function promQueryRange(query, start, end, step) {
+  const encoded = encodeURIComponent(query);
+  const result = run(`curl -sf "${PROM_URL}/api/v1/query_range?query=${encoded}&start=${start}&end=${end}&step=${step}"`, { throws: false });
+  try { return JSON.parse(result); } catch { return { error: 'Failed to parse response', raw: result }; }
+}
+
+function extractScalar(promResult) {
+  if (promResult?.data?.result?.[0]?.value?.[1]) return parseFloat(promResult.data.result[0].value[1]);
+  return null;
+}
+
+function metricsNow() {
+  ensurePromPortForward();
+
+  const queries = {
+    qps: 'sum(rate(bitdex_query_total{index="civitai"}[5m]))',
+    query_p50_ms: 'histogram_quantile(0.5, sum by (le) (rate(bitdex_query_duration_seconds_bucket{index="civitai"}[5m]))) * 1000',
+    query_p95_ms: 'histogram_quantile(0.95, sum by (le) (rate(bitdex_query_duration_seconds_bucket{index="civitai"}[5m]))) * 1000',
+    query_p99_ms: 'histogram_quantile(0.99, sum by (le) (rate(bitdex_query_duration_seconds_bucket{index="civitai"}[5m]))) * 1000',
+    docs_p95_ms: 'histogram_quantile(0.95, sum by (le) (rate(bitdex_query_docs_seconds_bucket{index="civitai"}[5m]))) * 1000',
+    http_p95_ms: 'histogram_quantile(0.95, sum by (le) (rate(bitdex_http_response_seconds_bucket{method="POST",path=~".*civitai.*"}[5m]))) * 1000',
+    cache_hits: 'sum(bitdex_cache_hits_total{index="civitai"})',
+    cache_misses: 'sum(bitdex_cache_misses_total{index="civitai"})',
+  };
+
+  const results = {};
+  for (const [name, q] of Object.entries(queries)) {
+    const v = extractScalar(promQuery(q));
+    results[name] = v != null ? (name.includes('_ms') ? Math.round(v * 100) / 100 : name === 'qps' ? Math.round(v * 10) / 10 : v) : null;
+  }
+
+  // Compute cache hit rate
+  if (results.cache_hits != null && results.cache_misses != null) {
+    const total = results.cache_hits + results.cache_misses;
+    results.cache_hit_rate = total > 0 ? `${((results.cache_hits / total) * 100).toFixed(1)}%` : '—';
+  }
+
+  console.error(`BitDex Production Metrics (5m window)`);
+  console.error(`  QPS:          ${results.qps ?? '—'}`);
+  console.error(`  Query p50:    ${results.query_p50_ms ?? '—'} ms`);
+  console.error(`  Query p95:    ${results.query_p95_ms ?? '—'} ms`);
+  console.error(`  Query p99:    ${results.query_p99_ms ?? '—'} ms`);
+  console.error(`  Docs p95:     ${results.docs_p95_ms ?? '—'} ms`);
+  console.error(`  HTTP p95:     ${results.http_p95_ms ?? '—'} ms`);
+  console.error(`  Cache:        ${results.cache_hit_rate ?? '—'} (${results.cache_hits ?? 0} hits, ${results.cache_misses ?? 0} misses)`);
+  json(results);
+}
+
+function metricsTrend(window) {
+  ensurePromPortForward();
+  const win = window || '15m';
+  const end = Math.floor(Date.now() / 1000);
+  const durSec = parseDuration(win);
+  const start = end - durSec;
+  const step = Math.max(15, Math.floor(durSec / 60));
+
+  const queries = {
+    qps: `sum(rate(bitdex_query_total{index="civitai"}[1m]))`,
+    query_p95_ms: `histogram_quantile(0.95, sum by (le) (rate(bitdex_query_duration_seconds_bucket{index="civitai"}[1m]))) * 1000`,
+  };
+
+  const results = {};
+  for (const [name, q] of Object.entries(queries)) {
+    const data = promQueryRange(q, start, end, step);
+    if (data?.data?.result?.[0]?.values) {
+      results[name] = data.data.result[0].values.map(([ts, val]) => ({
+        time: new Date(ts * 1000).toISOString().slice(11, 19),
+        value: Math.round(parseFloat(val) * 100) / 100,
+      }));
+    }
+  }
+
+  if (results.qps) {
+    console.error(`QPS trend (${win}):`);
+    for (const p of results.qps) console.error(`  ${p.time}  ${p.value}`);
+  }
+  if (results.query_p95_ms) {
+    console.error(`p95 latency trend (${win}):`);
+    for (const p of results.query_p95_ms) console.error(`  ${p.time}  ${p.value} ms`);
+  }
+  json(results);
+}
+
+function metricsQuery(query) {
+  if (!query) { json({ error: 'Usage: metrics-query <promql>' }); process.exit(1); }
+  ensurePromPortForward();
+  const result = promQuery(query);
+  if (result?.data?.result) {
+    for (const r of result.data.result) {
+      const labels = Object.entries(r.metric || {}).map(([k, v]) => `${k}="${v}"`).join(', ');
+      const val = r.value?.[1] ?? '—';
+      console.error(`  {${labels}} => ${val}`);
+    }
+  }
+  json(result);
+}
+
+function parseDuration(s) {
+  const m = s.match(/^(\d+)(s|m|h|d)$/);
+  if (!m) return 900; // default 15m
+  const n = parseInt(m[1], 10);
+  switch (m[2]) {
+    case 's': return n;
+    case 'm': return n * 60;
+    case 'h': return n * 3600;
+    case 'd': return n * 86400;
+    default: return 900;
+  }
+}
+
 // --- Router ---
 
 const command = process.argv[2];
@@ -426,13 +579,17 @@ switch (command) {
   case 'config-read': configRead(); break;
   case 'snapshot-status': snapshotStatus(process.argv[3]); break;
   case 'snapshot-download': await snapshotDownload(process.argv[3]); break;
+  case 'metrics-now': metricsNow(); break;
+  case 'metrics-trend': metricsTrend(process.argv[3]); break;
+  case 'metrics-query': metricsQuery(process.argv.slice(3).join(' ')); break;
   default:
     json({
       error: `Unknown command: ${command}`,
       commands: ['release', 'watch-build', 'build-status', 'rollout', 'deploy', 'status', 'scale',
                  'cursor-reset', 'cursor-read', 'cursor-csv', 'pg-sync-health', 'pg-sync-logs',
                  'server-logs', 'resources', 'wipe', 'config-read',
-                 'snapshot-status', 'snapshot-download'],
+                 'snapshot-status', 'snapshot-download',
+                 'metrics-now', 'metrics-trend', 'metrics-query'],
     });
     process.exit(1);
 }
