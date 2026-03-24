@@ -597,13 +597,175 @@ impl FilterBitmapStore {
 
         Ok(values)
     }
+
+    /// Load all bitmaps for a field, merging all buckets into a flat map.
+    ///
+    /// Equivalent to BitmapFs::load_field(). Reads all bucket shards for the
+    /// field and collects value→bitmap entries into a single HashMap.
+    pub fn load_field(&self, field: &str) -> io::Result<HashMap<u64, RoaringBitmap>> {
+        let mut result = HashMap::new();
+        let current_gen = self.current_generation();
+
+        for gen in (0..=current_gen).rev() {
+            let gen_dir = self.gen_dir(gen);
+            let field_dir = gen_dir.join("filter").join(field);
+            if !field_dir.exists() { continue; }
+
+            for entry in std::fs::read_dir(&field_dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(hex_str) = name.strip_suffix(".shard") {
+                    if let Ok(bucket) = u8::from_str_radix(hex_str, 16) {
+                        let key = FilterBucketKey { field: field.to_string(), bucket };
+                        if let Some(snap) = self.read(&key)? {
+                            for (value, bm) in snap.values {
+                                result.entry(value).or_insert(bm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Load specific values for a field. Only reads the bucket shards that
+    /// contain the requested values, then extracts just those entries.
+    ///
+    /// Equivalent to BitmapFs::load_field_values().
+    pub fn load_field_values(&self, field: &str, values: &[u64]) -> io::Result<HashMap<u64, RoaringBitmap>> {
+        // Group requested values by bucket
+        let mut by_bucket: HashMap<u8, Vec<u64>> = HashMap::new();
+        for &v in values {
+            let bucket = ((v >> 8) & 0xFF) as u8;
+            by_bucket.entry(bucket).or_default().push(v);
+        }
+
+        let mut result = HashMap::new();
+        for (bucket, wanted) in by_bucket {
+            let key = FilterBucketKey { field: field.to_string(), bucket };
+            if let Some(snap) = self.read(&key)? {
+                for v in wanted {
+                    if let Some(bm) = snap.values.get(&v) {
+                        result.insert(v, bm.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Read a single filter bucket as a vec of (value, bitmap) pairs.
+    ///
+    /// Equivalent to BitmapFs::read_filter_bucket().
+    pub fn read_filter_bucket(&self, field: &str, bucket: u8) -> io::Result<Vec<(u64, RoaringBitmap)>> {
+        let key = FilterBucketKey { field: field.to_string(), bucket };
+        match self.read(&key)? {
+            Some(snap) => Ok(snap.values.into_iter().collect()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Write a filter bucket from (value, bitmap) pairs.
+    ///
+    /// Equivalent to BitmapFs::write_filter_bucket().
+    pub fn write_filter_bucket(&self, field: &str, bucket: u8, entries: &[(u64, &RoaringBitmap)]) -> io::Result<()> {
+        let key = FilterBucketKey { field: field.to_string(), bucket };
+        let mut snap = BucketSnapshot::new();
+        for &(value, bm) in entries {
+            snap.values.insert(value, bm.clone());
+        }
+        self.write_snapshot(&key, &snap)
+    }
+
+    /// Write a full snapshot of all filter bitmaps for all fields.
+    ///
+    /// Takes filter entries as (field, value, bitmap) triples and an alive bitmap
+    /// with slot counter. Groups by (field, bucket) and writes each bucket shard.
+    pub fn write_full_filter(&self, entries: &[(&str, u64, &RoaringBitmap)]) -> io::Result<()> {
+        // Group by (field, bucket)
+        let mut by_bucket: HashMap<(String, u8), Vec<(u64, &RoaringBitmap)>> = HashMap::new();
+        for &(field, value, bm) in entries {
+            let bucket = ((value >> 8) & 0xFF) as u8;
+            by_bucket.entry((field.to_string(), bucket))
+                .or_default()
+                .push((value, bm));
+        }
+        for ((field, bucket), entries) in by_bucket {
+            let key = FilterBucketKey { field, bucket };
+            let mut snap = BucketSnapshot::new();
+            for (value, bm) in entries {
+                snap.values.insert(value, bm.clone());
+            }
+            self.write_snapshot(&key, &snap)?;
+        }
+        Ok(())
+    }
 }
 
 /// ShardStore for sort layer bitmaps.
 pub type SortBitmapStore = crate::shard_store::ShardStore<BitmapSnapshotCodec, BitmapOpCodec, SortLayerShard>;
 
+impl SortBitmapStore {
+    /// Load all sort layers for a field.
+    ///
+    /// Equivalent to BitmapFs::load_sort_layers(). Reads bit00..bit{N-1} shards
+    /// and returns them as a Vec<RoaringBitmap> ordered by bit position.
+    /// Returns None if no layers exist on disk.
+    pub fn load_sort_layers(&self, field: &str, bits: usize) -> io::Result<Option<Vec<RoaringBitmap>>> {
+        let mut layers = Vec::with_capacity(bits);
+        let mut any_found = false;
+
+        for bit in 0..bits {
+            let key = SortLayerShardKey { field: field.to_string(), bit_position: bit as u8 };
+            match self.read(&key)? {
+                Some(bm) => {
+                    any_found = true;
+                    layers.push(bm);
+                }
+                None => layers.push(RoaringBitmap::new()),
+            }
+        }
+
+        if any_found {
+            Ok(Some(layers))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Write sort layers for a field.
+    ///
+    /// Equivalent to BitmapFs::write_sort_layers().
+    pub fn write_sort_layers(&self, field: &str, layers: &[&RoaringBitmap]) -> io::Result<()> {
+        for (bit, bm) in layers.iter().enumerate() {
+            let key = SortLayerShardKey { field: field.to_string(), bit_position: bit as u8 };
+            self.write_snapshot(&key, bm)?;
+        }
+        Ok(())
+    }
+}
+
 /// ShardStore for the alive bitmap.
 pub type AliveBitmapStore = crate::shard_store::ShardStore<BitmapSnapshotCodec, BitmapOpCodec, SingletonShard>;
+
+impl AliveBitmapStore {
+    /// Load the alive bitmap.
+    ///
+    /// Equivalent to BitmapFs::load_alive().
+    pub fn load_alive(&self) -> io::Result<Option<RoaringBitmap>> {
+        self.read(&AliveShardKey)
+    }
+
+    /// Write the alive bitmap.
+    ///
+    /// Equivalent to BitmapFs::write_alive().
+    pub fn write_alive(&self, bitmap: &RoaringBitmap) -> io::Result<()> {
+        self.write_snapshot(&AliveShardKey, bitmap)
+    }
+}
 
 // ===========================================================================
 // SECTION 5: Tests

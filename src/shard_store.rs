@@ -108,9 +108,10 @@ const OP_ENTRY_OVERHEAD: usize = 8;
 const HEADER_OPS_COUNT_OFFSET: u64 = 20;
 
 /// Default janitor compaction threshold: compact when ops_count exceeds this.
-/// Based on Ollie's microbench results: knee at 500-1000 ops, <2x overhead
-/// below 500, linear scaling above 1000. 500 is the sweet spot.
-pub const DEFAULT_COMPACT_THRESHOLD: u32 = 500;
+/// Based on Ollie's final microbench results: 2x read overhead at 1,000 ops
+/// is acceptable. Configurable per-field: tagIds tolerates 50K+, low-cardinality
+/// fields like nsfwLevel should compact at ~5K.
+pub const DEFAULT_COMPACT_THRESHOLD: u32 = 1_000;
 
 // ---------------------------------------------------------------------------
 // Shard file header
