@@ -956,6 +956,8 @@ impl BitdexServer {
             .route("/debug/snapshot/{session_id}/package", post(handle_package_snapshot))
             .route("/debug/snapshot/{session_id}/status", get(handle_package_status))
             .route("/debug/snapshot/{session_id}/download", get(handle_package_download))
+            .route("/debug/snapshot/{session_id}", delete(handle_snapshot_delete))
+            .route("/debug/snapshots", get(handle_snapshots_list))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
             .with_state(Arc::clone(&state));
 
@@ -3422,6 +3424,34 @@ async fn handle_package_download(
                 Json(serde_json::json!({"error": format!("open package file: {e}")})),
             ).into_response()
         }
+    }
+}
+
+/// GET /debug/snapshots — List all snapshot packages on disk.
+async fn handle_snapshots_list(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let packages = state.capture.list_packages();
+    let list: Vec<_> = packages.iter().map(|(id, size)| {
+        serde_json::json!({"session_id": id, "size_bytes": size})
+    }).collect();
+    Json(serde_json::json!({"packages": list}))
+}
+
+/// DELETE /debug/snapshot/{session_id} — Delete a snapshot package and its session data.
+async fn handle_snapshot_delete(
+    State(state): State<SharedState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.capture.delete_package(&session_id) {
+        Ok(freed) => Json(serde_json::json!({
+            "deleted": session_id,
+            "freed_bytes": freed,
+        })).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": e})),
+        ).into_response(),
     }
 }
 

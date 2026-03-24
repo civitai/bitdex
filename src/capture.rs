@@ -389,6 +389,56 @@ impl CaptureManager {
         let mut guard = self.session.lock();
         *guard = None;
     }
+
+    /// List all snapshot packages on disk (survives restarts).
+    pub fn list_packages(&self) -> Vec<(String, u64)> {
+        let mut results = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&self.base_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".snapshot.tar.zst") {
+                    let session_id = name.trim_end_matches(".snapshot.tar.zst").to_string();
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    results.push((session_id, size));
+                }
+            }
+        }
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results
+    }
+
+    /// Delete a snapshot package (tar.zst + session directory).
+    pub fn delete_package(&self, session_id: &str) -> Result<u64, String> {
+        let tar_path = self.base_dir.join(format!("{session_id}.snapshot.tar.zst"));
+        let session_dir = self.base_dir.join(session_id);
+
+        if !tar_path.exists() && !session_dir.exists() {
+            return Err(format!("no package or session data for '{session_id}'"));
+        }
+
+        let mut freed = 0u64;
+
+        // Remove the tar.zst package
+        if tar_path.exists() {
+            freed += std::fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
+            std::fs::remove_file(&tar_path)
+                .map_err(|e| format!("failed to delete {}: {e}", tar_path.display()))?;
+        }
+
+        // Remove the session directory (caplog, metrics snapshots)
+        if session_dir.is_dir() {
+            for entry in std::fs::read_dir(&session_dir).into_iter().flatten().flatten() {
+                freed += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+            std::fs::remove_dir_all(&session_dir)
+                .map_err(|e| format!("failed to delete {}: {e}", session_dir.display()))?;
+        }
+
+        // Clear from in-memory state
+        self.packages.lock().remove(session_id);
+
+        Ok(freed)
+    }
 }
 
 // ---------------------------------------------------------------------------
