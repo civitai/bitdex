@@ -1086,6 +1086,12 @@ impl ConcurrentEngine {
                             }
                         }
 
+                        // Yield CPU after apply to let tokio I/O threads deliver
+                        // pending HTTP responses. Without this, the flush thread
+                        // monopolizes CPU across apply+cache+publish (~20ms aggregate),
+                        // causing 1-4s response delivery delays under concurrent load.
+                        std::thread::yield_now();
+
                         // In loading mode, skip all maintenance and snapshot publishing.
                         // This avoids the expensive staging.clone() → Arc::make_mut clone
                         // cascade that dominates write cost at scale.
@@ -1233,6 +1239,9 @@ impl ConcurrentEngine {
 
                             flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+                            // Yield CPU after cache maintenance to let tokio deliver responses.
+                            std::thread::yield_now();
+
                             // Periodic filter diff compaction: merge dirty diffs into
                             // bases so apply_diff/fused don't accumulate unbounded diffs.
                             // Runs every COMPACTION_INTERVAL flush cycles (~5s).
@@ -1273,6 +1282,10 @@ impl ConcurrentEngine {
                             flush_pub_count.fetch_add(1, Ordering::Relaxed);
                             flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
                             flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
+
+                            // Yield after publish — snapshot is live, let tokio
+                            // deliver responses before we do ops-log disk I/O.
+                            std::thread::yield_now();
 
                             // ── Ops-log append (after publish) ─────────────
                             // Persist mutations as ops-log entries AFTER the
@@ -1983,107 +1996,129 @@ impl ConcurrentEngine {
 
                     } // needs_write
 
-                    // ── BoundStore persistence ──────────────────────────────
-                    // Runs on every merge cycle, independent of bitmap dirty flag.
-                    // Cache has its own dirty tracking (meta_dirty, shard_dirty).
+                    // ── BoundStore persistence (two-phase lock) ──────────────
+                    //
+                    // Previously held the Mutex for ~90 lines of entry iteration
+                    // + shard data collection every 5s, causing 1-4.6s query stalls.
+                    // Now: brief lock to collect data, release, then disk I/O outside.
                     if let Some(ref bs) = merge_bound_store {
-                        let mut uc = merge_unified_cache.lock();
-                        let meta_dirty = uc.is_meta_dirty();
-                        let dirty_shards: Vec<crate::bound_store::ShardKey> =
-                            uc.dirty_shards().iter().cloned().collect();
+                        // Phase 1: Brief lock — check dirty flags + collect ALL data
+                        let persist_data = {
+                            let mut uc = merge_unified_cache.lock();
+                            let meta_dirty = uc.is_meta_dirty();
+                            let dirty_shards: Vec<crate::bound_store::ShardKey> =
+                                uc.dirty_shards().iter().cloned().collect();
 
-                        // Also check for shards needing tombstone cleanup
-                        let mut cleanup_shards: Vec<crate::bound_store::ShardKey> = Vec::new();
-                        if let Ok(shard_list) = bs.list_shards() {
-                            for sk in &shard_list {
-                                if uc.shard_needs_cleanup(sk) && !dirty_shards.contains(sk) {
-                                    cleanup_shards.push(sk.clone());
-                                }
-                            }
-                        }
-
-                        if meta_dirty || !dirty_shards.is_empty() || !cleanup_shards.is_empty() {
-                            // Collect meta entries from meta-index registrations
-                            let meta_entries: Vec<crate::bound_store::MetaEntry> = {
-                                let _meta = uc.meta();
-                                // Iterate all registered entries to build meta entries
-                                let mut entries = Vec::new();
-                                // We need to collect from the meta_id_to_key reverse index
-                                // and the entries themselves
-                                for (&meta_id, key) in uc.iter_meta_id_to_key() {
-                                    if let Some(entry) = uc.get(key) {
-                                        entries.push(crate::bound_store::MetaEntry {
-                                            entry_id: meta_id,
-                                            sort_field: key.sort_field.clone(),
-                                            direction: key.direction,
-                                            filter_clauses: key.filter_clauses.clone(),
-                                            capacity: entry.capacity() as u32,
-                                            max_capacity: entry.max_capacity() as u32,
-                                            min_tracked_value: entry.min_tracked_value(),
-                                            total_matched: entry.total_matched(),
-                                            has_more: entry.has_more(),
-                                        });
-                                    } else {
-                                        // Entry is not in RAM (orphan) — reconstruct
-                                        // meta from pending on-disk data. We still have
-                                        // the registration, just no live entry. Use defaults.
-                                        entries.push(crate::bound_store::MetaEntry {
-                                            entry_id: meta_id,
-                                            sort_field: key.sort_field.clone(),
-                                            direction: key.direction,
-                                            filter_clauses: key.filter_clauses.clone(),
-                                            capacity: 4000,
-                                            max_capacity: 64000,
-                                            min_tracked_value: 0,
-                                            total_matched: 0,
-                                            has_more: true,
-                                        });
+                            let mut cleanup_shards: Vec<crate::bound_store::ShardKey> = Vec::new();
+                            if let Ok(shard_list) = bs.list_shards() {
+                                for sk in &shard_list {
+                                    if uc.shard_needs_cleanup(sk) && !dirty_shards.contains(sk) {
+                                        cleanup_shards.push(sk.clone());
                                     }
                                 }
-                                entries
-                            };
-
-                            let tombstones = uc.meta().tombstones().clone();
-                            let next_id = uc.meta().next_id();
-
-                            // Collect shard data for dirty shards
-                            let all_dirty: Vec<crate::bound_store::ShardKey> = dirty_shards
-                                .iter()
-                                .chain(cleanup_shards.iter())
-                                .cloned()
-                                .collect();
-
-                            let shard_snapshots: Vec<(
-                                crate::bound_store::ShardKey,
-                                Vec<(u32, Vec<crate::cache::CanonicalClause>, roaring::RoaringBitmap, Option<Vec<u64>>)>,
-                            )> = all_dirty
-                                .iter()
-                                .map(|sk| {
-                                    let entries = uc.entries_for_shard(sk);
-                                    let data: Vec<_> = entries
-                                        .into_iter()
-                                        .map(|(id, key, bm, sk)| (id, key.filter_clauses, bm, sk))
-                                        .collect();
-                                    (sk.clone(), data)
-                                })
-                                .collect();
-
-                            // Clear dirty flags under lock
-                            if meta_dirty {
-                                uc.clear_meta_dirty();
-                            }
-                            for sk in &all_dirty {
-                                uc.clear_shard_dirty(sk);
-                                uc.clear_shard_entry_dirty(sk);
                             }
 
-                            drop(uc); // Release lock for I/O
+                            if !meta_dirty && dirty_shards.is_empty() && cleanup_shards.is_empty() {
+                                None // Nothing dirty — skip entirely
+                            } else {
+                                // Collect ALL data under this one lock acquisition
+                                let meta_entries: Vec<crate::bound_store::MetaEntry> = {
+                                    let mut entries = Vec::new();
+                                    for (&meta_id, key) in uc.iter_meta_id_to_key() {
+                                        if let Some(entry) = uc.get(key) {
+                                            entries.push(crate::bound_store::MetaEntry {
+                                                entry_id: meta_id,
+                                                sort_field: key.sort_field.clone(),
+                                                direction: key.direction,
+                                                filter_clauses: key.filter_clauses.clone(),
+                                                capacity: entry.capacity() as u32,
+                                                max_capacity: entry.max_capacity() as u32,
+                                                min_tracked_value: entry.min_tracked_value(),
+                                                total_matched: entry.total_matched(),
+                                                has_more: entry.has_more(),
+                                            });
+                                        } else {
+                                            entries.push(crate::bound_store::MetaEntry {
+                                                entry_id: meta_id,
+                                                sort_field: key.sort_field.clone(),
+                                                direction: key.direction,
+                                                filter_clauses: key.filter_clauses.clone(),
+                                                capacity: 4000,
+                                                max_capacity: 64000,
+                                                min_tracked_value: 0,
+                                                total_matched: 0,
+                                                has_more: true,
+                                            });
+                                        }
+                                    }
+                                    entries
+                                };
 
-                            // Write meta.bin FIRST (ordering guarantee)
+                                let tombstones = uc.meta().tombstones().clone();
+                                let next_id = uc.meta().next_id();
+
+                                // Snapshot tombstone + registration state for orphan filtering
+                                // (used during shard merging, avoids relocking per shard)
+                                let registered_ids: std::collections::HashSet<u32> =
+                                    uc.meta().all_registered_ids().collect();
+
+                                let all_dirty: Vec<crate::bound_store::ShardKey> = dirty_shards
+                                    .iter()
+                                    .chain(cleanup_shards.iter())
+                                    .cloned()
+                                    .collect();
+
+                                let shard_snapshots: Vec<(
+                                    crate::bound_store::ShardKey,
+                                    Vec<(u32, Vec<crate::cache::CanonicalClause>, roaring::RoaringBitmap, Option<Vec<u64>>)>,
+                                )> = all_dirty
+                                    .iter()
+                                    .map(|sk| {
+                                        let entries = uc.entries_for_shard(sk);
+                                        let data: Vec<_> = entries
+                                            .into_iter()
+                                            .map(|(id, key, bm, sk)| (id, key.filter_clauses, bm, sk))
+                                            .collect();
+                                        (sk.clone(), data)
+                                    })
+                                    .collect();
+
+                                // Collect per-shard tombstone IDs for cleanup
+                                let per_shard_tombstones: Vec<Vec<u32>> = all_dirty
+                                    .iter()
+                                    .map(|sk| {
+                                        tombstones.iter()
+                                            .filter(|id| {
+                                                uc.key_for_meta_id(*id)
+                                                    .map(|k| k.sort_field == sk.sort_field && k.direction == sk.direction)
+                                                    .unwrap_or(false)
+                                            })
+                                            .collect()
+                                    })
+                                    .collect();
+
+                                // Clear dirty flags before releasing
+                                if meta_dirty {
+                                    uc.clear_meta_dirty();
+                                }
+                                for sk in &all_dirty {
+                                    uc.clear_shard_dirty(sk);
+                                    uc.clear_shard_entry_dirty(sk);
+                                }
+
+                                Some((meta_dirty, meta_entries, tombstones, next_id,
+                                      registered_ids, shard_snapshots, per_shard_tombstones))
+                            }
+                        }; // Lock released here — ALL data collected
+
+                        // Phase 2: Disk I/O outside the lock
+                        if let Some((meta_dirty, meta_entries, tombstones, next_id,
+                                     registered_ids, shard_snapshots, per_shard_tombstones)) = persist_data
+                        {
                             if meta_dirty {
                                 let meta_file = crate::bound_store::MetaFile {
                                     entries: meta_entries,
-                                    tombstones,
+                                    tombstones: tombstones.clone(),
                                     next_entry_id: next_id,
                                 };
                                 if let Err(e) = bs.write_meta(&meta_file) {
@@ -2091,29 +2126,24 @@ impl ConcurrentEngine {
                                 }
                             }
 
-                            // Write dirty shards with read-modify-write
-                            for (sk, ram_entries) in &shard_snapshots {
-                                // Read existing shard from disk
+                            // Write shards — NO lock needed (using snapshotted data)
+                            let mut all_cleaned: Vec<u32> = Vec::new();
+                            for (i, (sk, ram_entries)) in shard_snapshots.iter().enumerate() {
                                 let mut merged: Vec<crate::bound_store::ShardEntry> = Vec::new();
 
                                 if let Ok(Some(disk_entries)) = bs.load_shard(sk) {
-                                    // Preserve orphaned entries (on disk, not in RAM,
-                                    // not tombstoned)
-                                    let uc = merge_unified_cache.lock();
                                     let ram_ids: std::collections::HashSet<u32> =
                                         ram_entries.iter().map(|(id, _, _, _)| *id).collect();
                                     for de in disk_entries {
                                         if !ram_ids.contains(&de.entry_id)
-                                            && !uc.meta().is_tombstoned(de.entry_id)
-                                            && uc.meta().is_registered(de.entry_id)
+                                            && !tombstones.contains(de.entry_id)
+                                            && registered_ids.contains(&de.entry_id)
                                         {
                                             merged.push(de);
                                         }
                                     }
-                                    drop(uc);
                                 }
 
-                                // Add RAM entries
                                 for (id, clauses, bm, sk) in ram_entries {
                                     merged.push(crate::bound_store::ShardEntry {
                                         entry_id: *id,
@@ -2124,31 +2154,16 @@ impl ConcurrentEngine {
                                 }
 
                                 if let Err(e) = bs.write_shard(sk, &merged) {
-                                    eprintln!(
-                                        "merge thread: shard {} write failed: {e}",
-                                        sk.filename()
-                                    );
+                                    eprintln!("merge thread: shard {} write failed: {e}", sk.filename());
                                 }
 
-                                // Clean up tombstones that were omitted
+                                all_cleaned.extend_from_slice(&per_shard_tombstones[i]);
+                            }
+
+                            // Phase 3: Brief lock — finalize tombstones
+                            if !all_cleaned.is_empty() {
                                 let mut uc = merge_unified_cache.lock();
-                                let cleaned: Vec<u32> = uc
-                                    .meta()
-                                    .tombstones()
-                                    .iter()
-                                    .filter(|id| {
-                                        // Only clean tombstones for this shard
-                                        uc.key_for_meta_id(*id)
-                                            .map(|k| {
-                                                k.sort_field == sk.sort_field
-                                                    && k.direction == sk.direction
-                                            })
-                                            .unwrap_or(false)
-                                    })
-                                    .collect();
-                                if !cleaned.is_empty() {
-                                    uc.finalize_shard_write(&cleaned);
-                                }
+                                uc.finalize_shard_write(&all_cleaned);
                             }
                         }
                     }

@@ -1977,42 +1977,46 @@ async fn handle_query(
         query.skip_cache = true;
     }
 
-    // Move ALL sync work to a blocking thread. Query execution does sync
-    // bitmap ops (ArcSwap load + roaring traversal), ensure_fields_loaded()
-    // does sync disk I/O for lazy loading, and doc fetching hits disk on
-    // cache misses. None of this should run on the tokio async runtime.
-    let state_bg = Arc::clone(&state);
-    let name_bg = name.clone();
-    let resp = tokio::task::spawn_blocking(move || {
-        tracing::info!("[{name_bg}] {query}");
-        let start = Instant::now();
-        let m = &state_bg.metrics;
+    tracing::info!("[{name}] {query}");
+    let start = Instant::now();
+    let m = &state.metrics;
+    match engine.execute_query_traced(&query, &name) {
+        Ok((result, trace)) => {
+            let elapsed = start.elapsed();
+            let elapsed_us = elapsed.as_micros() as u64;
+            m.query_total.with_label_values(&[&name]).inc();
+            m.query_duration_seconds
+                .with_label_values(&[&name])
+                .observe(elapsed.as_secs_f64());
 
-        match engine.execute_query_traced(&query, &name_bg) {
-            Ok((result, trace)) => {
-                let elapsed = start.elapsed();
-                let elapsed_us = elapsed.as_micros() as u64;
-                m.query_total.with_label_values(&[&name_bg]).inc();
-                m.query_duration_seconds
-                    .with_label_values(&[&name_bg])
-                    .observe(elapsed.as_secs_f64());
+            let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
 
-                let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
+            // Fetch documents on a blocking thread to avoid starving tokio.
+            // Doc reads can hit disk (cache miss) — sync I/O on the async
+            // runtime causes 4s+ response times under load.
+            let doc_start = Instant::now();
+            let documents = if !include_docs.is_none() {
+                let engine_docs = Arc::clone(&engine);
+                let ids = result.ids.clone();
+                let schema_docs = schema.clone();
+                let reverse_maps_docs = Arc::clone(&reverse_maps);
+                let include_docs_docs = include_docs.clone();
+                let schema_registry_docs = Arc::clone(&schema_registry);
+                let docstore_hist = m.docstore_read_seconds.clone();
+                let name_docs = name.clone();
 
-                // Fetch documents (sync disk I/O, safe on blocking thread)
-                let doc_start = Instant::now();
-                let documents = if !include_docs.is_none() {
-                    let mut docs = Vec::with_capacity(result.ids.len());
-                    m.docstore_concurrent_reads.inc();
-                    for &id in &result.ids {
+                m.docstore_concurrent_reads.inc();
+                let docs = tokio::task::spawn_blocking(move || {
+                    let mut docs = Vec::with_capacity(ids.len());
+                    for &id in &ids {
                         let read_start = Instant::now();
-                        let doc = engine.get_document(id as u32);
-                        m.docstore_read_seconds
-                            .with_label_values(&[&name_bg])
+                        let doc = engine_docs.get_document(id as u32);
+                        docstore_hist
+                            .with_label_values(&[&name_docs])
                             .observe(read_start.elapsed().as_secs_f64());
                         docs.push(match doc {
                             Ok(Some(stored)) => {
-                                format_document(&stored, &schema, &reverse_maps, &include_docs, &schema_registry)
+                                format_document(&stored, &schema_docs, &reverse_maps_docs, &include_docs_docs, &schema_registry_docs)
                             }
                             Ok(None) => {
                                 serde_json::json!({ "id": id })
@@ -2023,77 +2027,78 @@ async fn handle_query(
                             }
                         });
                     }
-                    m.docstore_concurrent_reads.dec();
-                    Some(docs)
-                } else {
-                    None
-                };
-                let docs_us = doc_start.elapsed().as_micros() as u64;
-                let docs_count = documents.as_ref().map_or(0, |d| d.len()) as u64;
+                    docs
+                }).await.unwrap();
+                m.docstore_concurrent_reads.dec();
+                Some(docs)
+            } else {
+                None
+            };
+            let docs_us = doc_start.elapsed().as_micros() as u64;
+            let docs_count = documents.as_ref().map_or(0, |d| d.len()) as u64;
 
-                // Update trace with doc fetch timing
-                let mut trace = trace;
-                trace.docs_us = docs_us;
-                trace.docs_count = docs_count;
+            // Update trace with doc fetch timing
+            let mut trace = trace;
+            trace.docs_us = docs_us;
+            trace.docs_count = docs_count;
 
-                // Observe query phase histograms
-                m.query_filter_seconds
-                    .with_label_values(&[&name_bg])
-                    .observe(trace.filter_us as f64 / 1_000_000.0);
-                m.query_sort_seconds
-                    .with_label_values(&[&name_bg])
-                    .observe(trace.sort_us as f64 / 1_000_000.0);
-                m.query_docs_seconds
-                    .with_label_values(&[&name_bg])
-                    .observe(docs_us as f64 / 1_000_000.0);
+            // Observe query phase histograms
+            m.query_filter_seconds
+                .with_label_values(&[&name])
+                .observe(trace.filter_us as f64 / 1_000_000.0);
+            m.query_sort_seconds
+                .with_label_values(&[&name])
+                .observe(trace.sort_us as f64 / 1_000_000.0);
+            m.query_docs_seconds
+                .with_label_values(&[&name])
+                .observe(docs_us as f64 / 1_000_000.0);
 
-                let cache_tag = if trace.cache_hit { " cache" } else { "" };
-                let docs_tag = if docs_count > 0 { format!("  docs={}μs({})", docs_us, docs_count) } else { String::new() };
-                tracing::info!(
-                    "[{name_bg}]   → {} results  total={elapsed_us}μs  plan={}μs  filter={}μs  sort={}μs{docs_tag}{cache_tag}",
-                    result.total_matched, trace.plan_us, trace.filter_us, trace.sort_us
-                );
+            let cache_tag = if trace.cache_hit { " cache" } else { "" };
+            let docs_tag = if docs_count > 0 { format!("  docs={}μs({})", docs_us, docs_count) } else { String::new() };
+            tracing::info!(
+                "[{name}]   → {} results  total={elapsed_us}μs  plan={}μs  filter={}μs  sort={}μs{docs_tag}{cache_tag}",
+                result.total_matched, trace.plan_us, trace.filter_us, trace.sort_us
+            );
 
-                // Write trace to ring buffer
-                if state_bg.enable_traces.load(Ordering::Relaxed) {
-                    let min_us = state_bg.trace_min_us.load(Ordering::Relaxed);
-                    if min_us == 0 || trace.total_us >= min_us {
-                        state_bg.trace_buffer.push(trace.clone());
-                    }
+            // Write trace to ring buffer if enabled and above latency threshold.
+            // trace_min_us=0 means record all; trace_min_us=100000 means only >100ms.
+            if state.enable_traces.load(Ordering::Relaxed) {
+                let min_us = state.trace_min_us.load(Ordering::Relaxed);
+                if min_us == 0 || trace.total_us >= min_us {
+                    state.trace_buffer.push(trace.clone());
                 }
-
-                let mut response = serde_json::json!({
-                    "ids": result.ids,
-                    "cursor": cursor,
-                    "total_matched": result.total_matched,
-                    "elapsed_us": elapsed_us,
-                });
-                if let Some(docs) = documents {
-                    response["documents"] = serde_json::json!(docs);
-                }
-
-                let mut resp = Json(response).into_response();
-                resp.headers_mut().insert(
-                    "X-BitDex-Duration-Us",
-                    axum::http::HeaderValue::from_str(&elapsed_us.to_string()).unwrap(),
-                );
-                resp
             }
-            Err(e) => {
-                let elapsed_us = start.elapsed().as_micros() as u64;
-                tracing::warn!("[{name_bg}]   → ERROR: {e}, {elapsed_us}μs");
-                m.query_total.with_label_values(&[&name_bg]).inc();
-                m.query_duration_seconds
-                    .with_label_values(&[&name_bg])
-                    .observe(start.elapsed().as_secs_f64());
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                ).into_response()
+
+            let mut response = serde_json::json!({
+                "ids": result.ids,
+                "cursor": cursor,
+                "total_matched": result.total_matched,
+                "elapsed_us": elapsed_us,
+            });
+            if let Some(docs) = documents {
+                response["documents"] = serde_json::json!(docs);
             }
+
+            let mut resp = Json(response).into_response();
+            resp.headers_mut().insert(
+                "X-BitDex-Duration-Us",
+                axum::http::HeaderValue::from_str(&elapsed_us.to_string()).unwrap(),
+            );
+            resp
         }
-    }).await.unwrap();
-    resp
+        Err(e) => {
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            tracing::warn!("[{name}]   → ERROR: {e}, {elapsed_us}μs");
+            m.query_total.with_label_values(&[&name]).inc();
+            m.query_duration_seconds
+                .with_label_values(&[&name])
+                .observe(start.elapsed().as_secs_f64());
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
