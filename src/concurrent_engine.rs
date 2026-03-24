@@ -1151,10 +1151,25 @@ impl ConcurrentEngine {
                             // bases so apply_diff/fused don't accumulate unbounded diffs.
                             // Runs every COMPACTION_INTERVAL flush cycles (~5s).
                             // Sort diffs and alive are already merged eagerly in WriteBatch::apply().
+                            //
+                            // CRITICAL: Only compact fields that have dirty diffs. Using
+                            // fields_mut() iterates ALL fields and calls Arc::make_mut on
+                            // each — which deep-clones the entire FilterField HashMap when
+                            // the Arc is shared with a published snapshot (refcount > 1).
+                            // For tagIds (31K entries), this clone takes seconds. Targeted
+                            // compaction avoids the clone cascade on untouched fields.
                             let t_compact = Instant::now();
                             if flush_cycle % COMPACTION_INTERVAL == 0 {
-                                for (_name, field) in staging.filters.fields_mut() {
-                                    field.merge_dirty();
+                                // Collect names of dirty fields first (read-only, no Arc::make_mut)
+                                let dirty_fields: Vec<String> = staging.filters.fields()
+                                    .filter(|(_, field)| field.has_dirty())
+                                    .map(|(name, _)| name.clone())
+                                    .collect();
+                                // Only make_mut + merge on fields that actually have dirty diffs
+                                for name in &dirty_fields {
+                                    if let Some(field) = staging.filters.get_field_mut(name) {
+                                        field.merge_dirty();
+                                    }
                                 }
                             }
                             flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
