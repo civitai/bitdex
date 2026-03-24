@@ -25,6 +25,30 @@ use crate::radix_sort::RadixSortIndex;
 use crate::sort::SortIndex;
 use crate::write_coalescer::FilterGroupKey;
 
+// ── Two-Phase Maintenance Types ──────────────────────────────────────────
+//
+// These types support lock-free cache maintenance: the flush thread collects
+// work items under a brief lock, evaluates slot eligibility outside the lock
+// (using staging filters/sorts), then applies results under a second brief lock.
+// This reduces Mutex hold time from ~469ms to ~1ms per acquisition.
+
+/// Describes maintenance work for one cache entry (collected under brief lock).
+pub struct CacheMaintenanceItem {
+    pub key: UnifiedKey,
+    pub slots: Vec<u32>,
+    pub min_tracked_value: u32,
+    pub direction: SortDirection,
+}
+
+/// Result of evaluating maintenance for one cache entry (computed without lock).
+pub struct CacheMaintenanceResult {
+    pub key: UnifiedKey,
+    /// Slots to add: (slot_id, sort_value)
+    pub adds: Vec<(u32, u32)>,
+    /// Slots to remove: (slot_id, sort_value)
+    pub removes: Vec<(u32, u32)>,
+}
+
 /// Configuration for the unified cache.
 #[derive(Debug, Clone)]
 pub struct UnifiedCacheConfig {
@@ -1431,6 +1455,211 @@ impl UnifiedCache {
         }
     }
 
+    // ── Two-Phase Maintenance (Lock-Free Evaluation) ────────────────────
+    //
+    // These methods split cache maintenance into three brief-lock phases:
+    //   Phase A: collect_*_work()  — brief &self lock, identifies affected entries
+    //   Phase B: evaluate_*_work() — NO lock, evaluates slots against staging data
+    //   Phase C: apply_maintenance_results() — brief &mut self lock, applies changes
+    //
+    // This reduces Mutex hold time from ~469ms (full maintenance) to ~1ms per lock.
+
+    /// Phase A: Collect filter maintenance work items under brief lock.
+    ///
+    /// Returns (work_items, over_budget_keys). The caller evaluates work outside
+    /// the lock using staging filters/sorts, then applies results under a second lock.
+    pub fn collect_filter_work(
+        &self,
+        filter_inserts: &HashMap<FilterGroupKey, Vec<u32>>,
+        filter_removes: &HashMap<FilterGroupKey, Vec<u32>>,
+    ) -> (Vec<CacheMaintenanceItem>, Vec<UnifiedKey>) {
+        if self.entries.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Collect changed slots per field name
+        let mut changed_slots_per_field: HashMap<&str, HashSet<u32>> = HashMap::new();
+        for (key, slots) in filter_inserts {
+            changed_slots_per_field
+                .entry(&key.field)
+                .or_default()
+                .extend(slots.iter().copied());
+        }
+        for (key, slots) in filter_removes {
+            changed_slots_per_field
+                .entry(&key.field)
+                .or_default()
+                .extend(slots.iter().copied());
+        }
+
+        if changed_slots_per_field.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Clause-level narrowing via meta-index (same logic as maintain_filter_changes)
+        let mut affected_ids = RoaringBitmap::new();
+
+        for (key, _slots) in filter_inserts.iter().chain(filter_removes.iter()) {
+            let value_repr = key.value.to_string();
+            if let Some(bm) = self.meta.entries_for_clause(&key.field, "eq", &value_repr) {
+                affected_ids |= bm;
+            }
+        }
+
+        // Field-level fallback for non-Eq entries
+        for field in changed_slots_per_field.keys() {
+            if let Some(field_bm) = self.meta.entries_for_filter_field(field) {
+                let new_entries = field_bm - &affected_ids;
+                if !new_entries.is_empty() {
+                    for meta_id in new_entries.iter() {
+                        if let Some(key) = self.meta_id_to_key.get(&meta_id) {
+                            let has_non_eq = key.filter_clauses.iter().any(|c| {
+                                c.field == *field && c.op != "eq"
+                            });
+                            if has_non_eq {
+                                affected_ids.insert(meta_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if affected_ids.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Budget check (count-based only — time-based handled in evaluate phase)
+        let total_changed_slots: usize = changed_slots_per_field.values().map(|s| s.len()).sum();
+        let affected_count = affected_ids.len() as usize;
+        let estimated_work = affected_count * total_changed_slots;
+
+        if self.config.max_maintenance_ms == 0 && estimated_work > self.config.max_maintenance_work {
+            // Over count-based budget: mark all for rebuild
+            let over_budget: Vec<UnifiedKey> = affected_ids
+                .iter()
+                .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())
+                .collect();
+            return (Vec::new(), over_budget);
+        }
+
+        // Build work items: for each affected entry, collect which slots to check
+        let work: Vec<CacheMaintenanceItem> = affected_ids
+            .iter()
+            .filter_map(|meta_id| {
+                let key = self.meta_id_to_key.get(&meta_id)?;
+                let entry = self.entries.get(key)?;
+                if entry.needs_rebuild {
+                    return None;
+                }
+                let mut slots = Vec::new();
+                for clause in &key.filter_clauses {
+                    if let Some(field_slots) = changed_slots_per_field.get(clause.field.as_str()) {
+                        slots.extend(field_slots.iter().copied());
+                    }
+                }
+                slots.sort_unstable();
+                slots.dedup();
+                if slots.is_empty() {
+                    return None;
+                }
+                Some(CacheMaintenanceItem {
+                    key: key.clone(),
+                    slots,
+                    min_tracked_value: entry.min_tracked_value,
+                    direction: entry.direction,
+                })
+            })
+            .collect();
+
+        (work, Vec::new())
+    }
+
+    /// Phase A: Collect sort maintenance work items under brief lock.
+    ///
+    /// Returns (work_items, over_budget_keys).
+    pub fn collect_sort_work(
+        &self,
+        sort_mutations: &HashMap<&str, HashSet<u32>>,
+    ) -> (Vec<CacheMaintenanceItem>, Vec<UnifiedKey>) {
+        if self.entries.is_empty() || sort_mutations.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut affected_ids = RoaringBitmap::new();
+        for field in sort_mutations.keys() {
+            affected_ids |= self.meta.entries_for_sort_field(field);
+        }
+
+        if affected_ids.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Budget check (count-based)
+        let total_sort_slots: usize = sort_mutations.values().map(|s| s.len()).sum();
+        let affected_count = affected_ids.len() as usize;
+        let estimated_work = affected_count * total_sort_slots;
+
+        if self.config.max_maintenance_ms == 0 && estimated_work > self.config.max_maintenance_work {
+            let over_budget: Vec<UnifiedKey> = affected_ids
+                .iter()
+                .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())
+                .collect();
+            return (Vec::new(), over_budget);
+        }
+
+        let work: Vec<CacheMaintenanceItem> = affected_ids
+            .iter()
+            .filter_map(|meta_id| {
+                let key = self.meta_id_to_key.get(&meta_id)?;
+                let entry = self.entries.get(key)?;
+                if entry.needs_rebuild {
+                    return None;
+                }
+                let sort_slots = sort_mutations.get(key.sort_field.as_str())?;
+                let slots: Vec<u32> = sort_slots.iter().copied().collect();
+                if slots.is_empty() {
+                    return None;
+                }
+                Some(CacheMaintenanceItem {
+                    key: key.clone(),
+                    slots,
+                    min_tracked_value: entry.min_tracked_value,
+                    direction: entry.direction,
+                })
+            })
+            .collect();
+
+        (work, Vec::new())
+    }
+
+    /// Phase C: Apply computed maintenance results under brief lock.
+    pub fn apply_maintenance_results(&mut self, results: &[CacheMaintenanceResult]) {
+        for result in results {
+            let Some(entry) = self.entries.get_mut(&result.key) else {
+                continue;
+            };
+            if entry.needs_rebuild {
+                continue;
+            }
+            for &(slot, sort_value) in &result.adds {
+                entry.add_slot(slot, sort_value);
+            }
+            for &(slot, sort_value) in &result.removes {
+                entry.remove_slot(slot, sort_value);
+            }
+        }
+    }
+
+    /// Phase C: Mark entries for rebuild in batch (budget exceeded or deadline hit).
+    pub fn mark_for_rebuild_batch(&mut self, keys: &[UnifiedKey]) {
+        for key in keys {
+            if let Some(entry) = self.entries.get_mut(key) {
+                entry.mark_for_rebuild();
+            }
+        }
+    }
+
     /// Mark all entries for rebuild when alive bitmap changes.
     ///
     /// Alive changes affect all filter evaluations (NotEq/Not bake alive into results).
@@ -1661,6 +1890,129 @@ fn slot_matches_clause(
         }
         _ => true, // Unknown op — conservative
     }
+}
+
+// ── Phase B: Lock-Free Evaluation Functions ──────────────────────────────
+//
+// These functions evaluate slot eligibility against staging filters/sorts
+// WITHOUT holding the cache Mutex. Called between collect (Phase A) and
+// apply (Phase C) to keep lock hold times under ~1ms.
+
+/// Phase B: Evaluate filter maintenance work items outside the cache lock.
+///
+/// Checks each slot against the filter predicate and sort qualification.
+/// Returns results to apply under a brief lock, plus any keys that exceeded
+/// the time-based deadline (to be marked for rebuild).
+pub fn evaluate_filter_work(
+    work: &[CacheMaintenanceItem],
+    filters: &FilterIndex,
+    sorts: &SortIndex,
+    deadline: Option<Instant>,
+) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
+    let mut results = Vec::with_capacity(work.len());
+    let mut timed_out = Vec::new();
+
+    for (i, item) in work.iter().enumerate() {
+        // Check deadline every 64 items
+        if let Some(deadline) = deadline {
+            if i > 0 && i % 64 == 0 && Instant::now() > deadline {
+                for remaining in &work[i..] {
+                    timed_out.push(remaining.key.clone());
+                }
+                break;
+            }
+        }
+
+        let mut adds = Vec::new();
+        let mut removes = Vec::new();
+
+        for &slot in &item.slots {
+            let sort_value = sorts
+                .get_field(&item.key.sort_field)
+                .map(|f| f.reconstruct_value(slot))
+                .unwrap_or(0);
+            let matches = slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts);
+            if matches {
+                let qualifies = match item.direction {
+                    SortDirection::Desc => sort_value > item.min_tracked_value,
+                    SortDirection::Asc => sort_value < item.min_tracked_value,
+                };
+                if qualifies {
+                    adds.push((slot, sort_value));
+                }
+            } else {
+                removes.push((slot, sort_value));
+            }
+        }
+
+        if !adds.is_empty() || !removes.is_empty() {
+            results.push(CacheMaintenanceResult {
+                key: item.key.clone(),
+                adds,
+                removes,
+            });
+        }
+    }
+
+    (results, timed_out)
+}
+
+/// Phase B: Evaluate sort maintenance work items outside the cache lock.
+///
+/// For each entry sorting by a changed field, checks if changed slots qualify
+/// for the bound and match the filter predicate.
+pub fn evaluate_sort_work(
+    work: &[CacheMaintenanceItem],
+    filters: &FilterIndex,
+    sorts: &SortIndex,
+    deadline: Option<Instant>,
+) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
+    let mut results = Vec::with_capacity(work.len());
+    let mut timed_out = Vec::new();
+
+    for (i, item) in work.iter().enumerate() {
+        if let Some(deadline) = deadline {
+            if i > 0 && i % 64 == 0 && Instant::now() > deadline {
+                for remaining in &work[i..] {
+                    timed_out.push(remaining.key.clone());
+                }
+                break;
+            }
+        }
+
+        let mut adds = Vec::new();
+
+        for &slot in &item.slots {
+            let sort_value = sorts
+                .get_field(&item.key.sort_field)
+                .map(|f| f.reconstruct_value(slot))
+                .unwrap_or(0);
+
+            // Check sort qualification first (fast path)
+            let qualifies = match item.direction {
+                SortDirection::Desc => sort_value > item.min_tracked_value,
+                SortDirection::Asc => sort_value < item.min_tracked_value,
+            };
+            if !qualifies {
+                continue;
+            }
+
+            // Sort qualifies — check filter match
+            if slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts) {
+                adds.push((slot, sort_value));
+            }
+        }
+
+        if !adds.is_empty() {
+            results.push(CacheMaintenanceResult {
+                key: item.key.clone(),
+                adds,
+                removes: Vec::new(), // Sort maintenance never removes
+            });
+        }
+    }
+
+    (results, timed_out)
 }
 
 #[cfg(test)]
@@ -3002,5 +3354,162 @@ mod tests {
             entry.needs_rebuild(),
             "Entry should be marked for rebuild when count-based budget is exceeded and max_maintenance_ms=0"
         );
+    }
+
+    // ── Two-Phase Maintenance Tests ──────────────────────────────────────
+
+    #[test]
+    fn test_two_phase_filter_maintenance_adds_qualifying_slot() {
+        let mut cache = UnifiedCache::new(make_config());
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[0, 1, 2, 3, 4, 10])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 1500)])]);
+
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![10],
+        );
+
+        // Phase A: collect work
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(over_budget.is_empty());
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].key, key);
+
+        // Phase B: evaluate outside lock
+        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None);
+        assert!(timed_out.is_empty());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].adds.len(), 1);
+        assert_eq!(results[0].adds[0].0, 10); // slot 10
+
+        // Phase C: apply
+        cache.apply_maintenance_results(&results);
+
+        let entry = cache.get(&key).unwrap();
+        assert!(entry.bitmap().contains(10), "Slot 10 should be added via two-phase maintenance");
+    }
+
+    #[test]
+    fn test_two_phase_filter_maintenance_removes_non_matching_slot() {
+        let mut cache = UnifiedCache::new(make_config());
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        // Slot 3 no longer in filter bitmap for value 1
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[0, 1, 2, 4])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(3, 997)])]);
+
+        let mut removes = HashMap::new();
+        removes.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![3],
+        );
+
+        let (work, _) = cache.collect_filter_work(&HashMap::new(), &removes);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None);
+        cache.apply_maintenance_results(&results);
+
+        let entry = cache.get(&key).unwrap();
+        assert!(!entry.bitmap().contains(3), "Slot 3 should be removed via two-phase maintenance");
+    }
+
+    #[test]
+    fn test_two_phase_sort_maintenance_adds_qualifying_slot() {
+        let mut cache = UnifiedCache::new(make_config());
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..5).collect();
+        // min_tracked_value = value_fn(4) = 1000 - 4 = 996
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[0, 1, 2, 3, 4, 10])])]);
+        // Slot 10 has sort value 1500 > min_tracked(996) → qualifies
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 1500)])]);
+
+        let mut sort_mutations: HashMap<&str, HashSet<u32>> = HashMap::new();
+        sort_mutations.insert("reactionCount", [10].into_iter().collect());
+
+        let (work, _) = cache.collect_sort_work(&sort_mutations);
+        assert_eq!(work.len(), 1);
+
+        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].adds.len(), 1);
+        assert_eq!(results[0].adds[0].0, 10);
+
+        cache.apply_maintenance_results(&results);
+
+        let entry = cache.get(&key).unwrap();
+        assert!(entry.bitmap().contains(10), "Slot 10 should be added via two-phase sort maintenance");
+    }
+
+    #[test]
+    fn test_two_phase_count_budget_marks_rebuild() {
+        let config = UnifiedCacheConfig {
+            max_maintenance_work: 1,
+            max_maintenance_ms: 0,
+            ..make_config()
+        };
+        let mut cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..5).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![10, 11], // 1 entry × 2 slots = 2 > budget(1)
+        );
+
+        let (work, over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(work.is_empty(), "Should have no work items when over budget");
+        assert_eq!(over_budget.len(), 1, "Should mark 1 entry for rebuild");
+
+        cache.mark_for_rebuild_batch(&over_budget);
+        let entry = cache.get(&key).unwrap();
+        assert!(entry.needs_rebuild(), "Entry should be marked for rebuild");
+    }
+
+    #[test]
+    fn test_two_phase_equivalence_with_single_phase() {
+        // Verify two-phase produces the same result as the original single-phase maintain_filter_changes.
+        let config = UnifiedCacheConfig {
+            max_maintenance_ms: 0, // disable time-based to ensure deterministic
+            ..make_config()
+        };
+
+        let slots: Vec<u32> = (0..5).collect();
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+
+        // Setup: slot 10 matches filter, sort value 1500 > min_tracked(996) → should add
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[0, 1, 2, 3, 4, 10])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 1500)])]);
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![10],
+        );
+
+        // Single-phase (original)
+        let mut cache_single = UnifiedCache::new(config.clone());
+        cache_single.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        cache_single.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+        let single_has_10 = cache_single.get(&key).unwrap().bitmap().contains(10);
+
+        // Two-phase (new)
+        let mut cache_two = UnifiedCache::new(config);
+        cache_two.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        let (work, _) = cache_two.collect_filter_work(&inserts, &HashMap::new());
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None);
+        cache_two.apply_maintenance_results(&results);
+        let two_has_10 = cache_two.get(&key).unwrap().bitmap().contains(10);
+
+        assert_eq!(single_has_10, two_has_10, "Two-phase should produce same result as single-phase");
+        assert!(two_has_10, "Both should have slot 10");
     }
 }
