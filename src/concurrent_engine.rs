@@ -295,6 +295,8 @@ pub struct ConcurrentEngine {
     prefetch_tx: Option<Sender<UnifiedKey>>,
     /// Background prefetch worker thread handle.
     prefetch_handle: Option<JoinHandle<()>>,
+    /// Background doc cache eviction thread handle.
+    doc_cache_eviction_handle: Option<JoinHandle<()>>,
 }
 
 impl ConcurrentEngine {
@@ -867,6 +869,8 @@ impl ConcurrentEngine {
             Some(Arc::new(crate::doc_cache::DocCache::new(
                 crate::doc_cache::DocCacheConfig {
                     max_bytes: config.doc_cache.max_bytes,
+                    generation_interval_secs: config.doc_cache.generation_interval_secs,
+                    max_generations: config.doc_cache.max_generations,
                 },
             )))
         } else {
@@ -960,6 +964,7 @@ impl ConcurrentEngine {
                 compact_tx: None,
                 prefetch_tx: None,
                 prefetch_handle: None,
+                doc_cache_eviction_handle: None,
             });
         }
 
@@ -2330,6 +2335,22 @@ impl ConcurrentEngine {
             (None, None)
         };
 
+        // Spawn doc cache eviction thread (generational rotation + memory-pressure eviction)
+        let doc_cache_eviction_handle = if let Some(ref cache) = doc_cache {
+            let cache_clone = Arc::clone(cache);
+            let shutdown_clone = Arc::clone(&shutdown);
+            Some(
+                thread::Builder::new()
+                    .name("bitdex-doc-cache-eviction".into())
+                    .spawn(move || {
+                        crate::doc_cache::eviction_thread(cache_clone, shutdown_clone);
+                    })
+                    .expect("Failed to spawn bitdex-doc-cache-eviction thread"),
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             inner,
             sender,
@@ -2389,6 +2410,7 @@ impl ConcurrentEngine {
             compact_handle,
             prefetch_tx,
             prefetch_handle,
+            doc_cache_eviction_handle,
         })
     }
 
@@ -5023,10 +5045,7 @@ impl ConcurrentEngine {
 
         if let (Some(ref cache), Some(ref doc)) = (&self.doc_cache, &doc) {
             cache.insert(slot_id, doc.clone());
-            // Check if eviction is needed (amortized, not every insert)
-            if cache.needs_eviction() {
-                cache.evict();
-            }
+            // Eviction handled by dedicated eviction thread — no inline check
         }
 
         Ok(doc)
@@ -5084,9 +5103,9 @@ impl ConcurrentEngine {
         self.sender.pending_count()
     }
 
-    /// Doc cache stats for Prometheus scrape: (hits, misses, entries, bytes, evictions).
+    /// Doc cache stats for Prometheus scrape: (hits, misses, entries, bytes, evictions, generations).
     /// Returns zeros if doc_cache is not configured.
-    pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64) {
+    pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64, usize) {
         match &self.doc_cache {
             Some(cache) => (
                 cache.hits(),
@@ -5094,8 +5113,9 @@ impl ConcurrentEngine {
                 cache.len(),
                 cache.size_bytes(),
                 cache.eviction_count(),
+                cache.generation_count(),
             ),
-            None => (0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0),
         }
     }
 
@@ -6944,6 +6964,10 @@ impl ConcurrentEngine {
         // then join it. Must drop before join to avoid deadlock.
         drop(self.prefetch_tx.take());
         if let Some(handle) = self.prefetch_handle.take() {
+            handle.join().ok();
+        }
+        // Doc cache eviction thread uses the shutdown flag (already set above)
+        if let Some(handle) = self.doc_cache_eviction_handle.take() {
             handle.join().ok();
         }
     }

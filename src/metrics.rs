@@ -106,6 +106,7 @@ pub struct Metrics {
     pub doc_cache_entries: IntGaugeVec,
     pub doc_cache_bytes: IntGaugeVec,
     pub doc_cache_evictions_total: IntGaugeVec,
+    pub doc_cache_generations: IntGaugeVec,
     pub doc_cache_backlog: IntGaugeVec,
 
     // -- Phase 2.5: ShardStore ops (stub — wired when Phase 1 lands) --
@@ -529,6 +530,11 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let doc_cache_generations = IntGaugeVec::new(
+            Opts::new("bitdex_doc_cache_generations", "Document cache active generation count"),
+            &["index"],
+        )
+        .unwrap();
         let doc_cache_backlog = IntGaugeVec::new(
             Opts::new("bitdex_doc_cache_backlog", "Document cache write-through channel backlog"),
             &["index"],
@@ -659,6 +665,7 @@ impl Metrics {
         registry.register(Box::new(doc_cache_entries.clone())).unwrap();
         registry.register(Box::new(doc_cache_bytes.clone())).unwrap();
         registry.register(Box::new(doc_cache_evictions_total.clone())).unwrap();
+        registry.register(Box::new(doc_cache_generations.clone())).unwrap();
         registry.register(Box::new(doc_cache_backlog.clone())).unwrap();
         registry.register(Box::new(shardstore_ops_count.clone())).unwrap();
         registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
@@ -733,6 +740,7 @@ impl Metrics {
             doc_cache_entries,
             doc_cache_bytes,
             doc_cache_evictions_total,
+            doc_cache_generations,
             doc_cache_backlog,
             shardstore_ops_count,
             pgsync_cycle_seconds,
