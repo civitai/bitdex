@@ -34,11 +34,13 @@ Time ─────────────────────────
    next flush cycle)                next flush cycle)
 ```
 
-**On capture start**: Flag flush thread → after next flush completes, bump generation counter. Gen N becomes the frozen pre-capture state. All new writes go to Gen N+1. Traffic recording begins.
+**On capture start**: Server handler calls `ConcurrentEngine::pin_shard_generations()` which bumps the generation counter on all three ShardStore instances (alive, filter, sort) simultaneously. Gen N becomes the frozen pre-capture state. All new writes go to Gen N+1. The frozen generation number is recorded in `CaptureSession::gen_start` and returned in the HTTP response. Traffic recording begins.
 
-**During capture**: Reads unaffected (in-memory snapshot via ArcSwap). Writes append ops to Gen N+1 shard files. Traffic log records every request + timing + response.
+**During capture**: Reads unaffected (in-memory snapshot via ArcSwap). Writes go to Gen N+1 shard files. Traffic log records every request + timing + response via `capture.rs` caplog.
 
-**On capture stop**: Flag flush thread → after next flush completes, bump generation again. Gen N+1 is now frozen (contains all writes during capture). Traffic recording stops. Prometheus metrics scraped.
+**On capture stop**: Server handler calls `pin_shard_generations()` again (also on auto-stop timer). Gen N+1 is now frozen (contains all writes during capture). Generation number recorded in `CaptureSession::gen_stop`. Traffic recording stops. Prometheus metrics scraped.
+
+**Implementation**: `src/capture.rs` (`CaptureManager`), wired in `src/server.rs` (`handle_capture_start`, `handle_capture_stop`). Gen pin via `src/concurrent_engine.rs` (`pin_shard_generations()`). Merged in PR #29.
 
 **Result**: Two frozen generations (Gen N = starting state, Gen N+1 = mutations during capture) plus a traffic log and metrics.
 

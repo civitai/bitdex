@@ -50,12 +50,21 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 - Custom sharded filesystem store (`src/docstore.rs`) keyed by slot ID
 - **DocStore V2 (production):** append-only tuple logs, no compression, LIFO scan for reads (2.6x faster than V1). Field dictionary encoding for low-cardinality strings.
+- **DocCache** (`src/doc_cache.rs`): DashMap-based in-memory cache. Cache-on-read (first query populates), write-through (flush thread populates on writes), LRU eviction at 1GB. Drops doc reads from 16ms/doc (disk) to <1μs/doc (memory).
 - Hex-nested directory structure keeps each dir under ~1000 files at 105M+ scale
-- On PUT upsert: read old doc from disk, diff old vs new, update only changed bitmaps
-- On fresh insert (slot not alive): write doc to disk, set bitmaps directly — no diff needed
+- On PUT upsert: read old doc from disk (or cache), diff old vs new, update only changed bitmaps
+- On fresh insert (slot not alive): write doc to disk + cache, set bitmaps directly — no diff needed
 - On DELETE: clear alive bit (doc stays on disk until autovac cleans it)
-- NVMe random reads are microseconds — disk lookup adds negligible latency to writes
 - Documents can optionally be returned alongside query result IDs
+
+### Bitmap Persistence — ShardStore
+
+- **ShardStore** (`src/shard_store.rs`): Generic unified storage engine with `SnapshotCodec`, `OpCodec`, `ShardingStrategy` traits. 28-byte header, CRC32-protected ops log, generation model for point-in-time snapshots.
+- **Three bitmap stores**: `AliveBitmapStore` (single alive bitmap), `FilterBitmapStore` (packed bucket shards per field), `SortBitmapStore` (per-bit-layer shards). All in `src/shard_store_bitmap.rs`.
+- **MetaStore** (`src/shard_store_meta.rs`): Simple atomic files for metadata that doesn't need generations (slot_counter, deferred_alive, time_buckets, cursors).
+- **Generation pinning**: `pin_generation()` freezes current gen, new writes go to gen N+1. Used by capture start/stop to bracket time windows for replay.
+- **Compaction**: per-shard, triggered when ops count exceeds threshold (default 1,000). Reads snapshot + ops → writes fresh snapshot.
+- **BitmapFs** (`src/bitmap_fs.rs`): Legacy persistence layer. Still exists in code but all ConcurrentEngine I/O now routes through ShardStore.
 
 ### Bitmap Categories
 
@@ -69,8 +78,10 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 - **Arc-per-bitmap CoW**: Each `RoaringBitmap` wrapped in `Arc`. `Arc::make_mut()` only clones bitmaps with refcount > 1. Filter/sort fields also Arc-wrapped for O(num_fields) snapshot clone.
 - **Write path**: Writers compute diffs and send `MutationOp`s to a crossbeam channel. Flush thread drains, batches, applies to staging, publishes new snapshot atomically.
 - **In-flight tracking**: Writers mark slot IDs in an atomic in-flight set before mutation, clear after. Readers post-validate overlapping IDs.
-- **Cache**: `Arc<Mutex<UnifiedCache>>` flat HashMap keyed by (filter_clauses, sort_field, direction). Live maintenance by flush thread. Persistent on disk via BoundStore (`bitmaps/bounds/`). Targeted invalidation: only filter fields that actually changed are invalidated; sort-only flushes skip cache invalidation entirely.
+- **Cache**: `Arc<Mutex<UnifiedCache>>` flat HashMap keyed by (filter_clauses, sort_field, direction). Live maintenance by flush thread. Persistent on disk via BoundStore (`shardstore/bounds/`). Targeted invalidation: only filter fields that actually changed are invalidated; sort-only flushes skip cache invalidation entirely.
 - **Loading mode**: `enter_loading_mode()` / `exit_loading_mode()` skips snapshot publishing and all maintenance during bulk inserts. Avoids `Arc::make_mut()` deep-cloning FilterField HashMaps every flush cycle. On exit, force-publishes staging and invalidates all caches.
+- **Targeted compaction**: Periodic filter diff compaction only touches fields with dirty diffs (checked via `has_dirty()` read-only). Avoids `Arc::make_mut` clone cascade on untouched fields like tagIds (31K entries).
+- **Zero-copy merge**: Merge thread uses `write_snapshot_to_store()` which reads through Arc refs via `fused_cow()` — no deep clone of InnerEngine. Eliminates the 3-4s stall from the old `(*snap).clone()` approach.
 
 ### Unified Cache
 
