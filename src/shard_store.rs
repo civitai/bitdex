@@ -424,41 +424,67 @@ where
 
     /// Read a snapshot for a key, walking generations LIFO (newest → oldest).
     ///
-    /// 1. Find the newest generation containing a shard for this key.
-    /// 2. Read snapshot section (materialized state at compaction time).
-    /// 3. Apply ops log entries on top (LIFO within the shard is handled by
-    ///    applying all ops in file order — they're append-only, newest last).
-    /// 4. Return the reconstructed snapshot.
+    /// Walks newest → oldest collecting ops from each generation until finding
+    /// a generation with a materialized snapshot (snapshot_len > 0). Then applies
+    /// all collected ops chronologically (oldest gen first, newest last) on top
+    /// of that base snapshot.
+    ///
+    /// This ensures that after a gen pin, ops in Gen N+1 (which have no snapshot)
+    /// are correctly applied on top of Gen N's base snapshot.
     ///
     /// Returns `None` if no shard exists for this key in any generation.
     pub fn read(&self, key: &Sh::Key) -> io::Result<Option<S::Snapshot>> {
         let current_gen = self.current_generation();
 
-        // Walk generations newest → oldest
+        // Collect ops from newest → oldest until we find a snapshot.
+        // Each entry: (gen, ops) — ops in file order (append-order within gen).
+        let mut pending_ops: Vec<Vec<O::Op>> = Vec::new();
+        let mut found_any = false;
+
         for gen in (0..=current_gen).rev() {
             let shard_path = self.shard_path_in_gen(key, gen);
             if !shard_path.exists() {
                 continue;
             }
+            found_any = true;
 
             let (header, snapshot_bytes, ops_bytes) = read_shard_file_raw(&shard_path)?;
 
-            // Decode snapshot
-            let mut snapshot = if header.snapshot_len > 0 {
-                S::decode(&snapshot_bytes)?
-            } else {
-                S::empty()
-            };
-
-            // Apply ops in file order (oldest first, naturally ordered by append)
+            // Collect this gen's ops (will be applied later in chronological order)
             if header.ops_count > 0 {
-                let ops = read_op_entries::<O>(&ops_bytes);
-                for op in &ops {
+                pending_ops.push(read_op_entries::<O>(&ops_bytes));
+            }
+
+            // If this gen has a snapshot, we've found our base — stop walking
+            if header.snapshot_len > 0 {
+                let mut snapshot = S::decode(&snapshot_bytes)?;
+
+                // Apply ops chronologically: oldest gen first (reverse of collection order).
+                // Within each gen, ops are already in append order (oldest first).
+                for ops in pending_ops.iter().rev() {
+                    for op in ops {
+                        O::apply(&mut snapshot, op);
+                    }
+                }
+
+                return Ok(Some(snapshot));
+            }
+        }
+
+        // No snapshot found in any gen — apply all ops to empty if we found any shards
+        if found_any && !pending_ops.is_empty() {
+            let mut snapshot = S::empty();
+            for ops in pending_ops.iter().rev() {
+                for op in ops {
                     O::apply(&mut snapshot, op);
                 }
             }
-
             return Ok(Some(snapshot));
+        }
+
+        if found_any {
+            // Shards exist but all are empty (no snapshot, no ops)
+            return Ok(Some(S::empty()));
         }
 
         Ok(None)
@@ -1158,6 +1184,49 @@ mod tests {
         // Read doc2 should find gen 1
         let result = store.read(&"doc2".to_string()).unwrap().unwrap();
         assert_eq!(result.values.get("v").unwrap(), "gen1_doc2");
+    }
+
+    #[test]
+    fn test_cross_generation_ops_on_snapshot() {
+        // Verifies that after a gen pin, ops in Gen N+1 (no snapshot)
+        // are correctly applied on top of Gen N's base snapshot.
+        let (_dir, store) = temp_store();
+
+        // Write base snapshot in gen 0
+        store.write_snapshot(&"doc1".to_string(), &TestSnapshot {
+            values: [("a".into(), "1".into()), ("b".into(), "2".into())].into_iter().collect(),
+        }).unwrap();
+
+        // Pin → gen 1
+        store.pin_generation().unwrap();
+
+        // Append ops to gen 1 (no snapshot — this is what append_op does)
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "c".into(), value: "3".into(),
+        }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "a".into(), value: "updated".into(),
+        }).unwrap();
+
+        // Read should find gen 1 ops-only shard, walk back to gen 0 for
+        // the base snapshot, then apply gen 1 ops on top.
+        let result = store.read(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(result.values.get("a").unwrap(), "updated", "gen 1 op should override gen 0 snapshot");
+        assert_eq!(result.values.get("b").unwrap(), "2", "gen 0 value should survive");
+        assert_eq!(result.values.get("c").unwrap(), "3", "gen 1 new key should appear");
+        assert_eq!(result.values.len(), 3);
+
+        // Pin again → gen 2, add more ops
+        store.pin_generation().unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "d".into(), value: "4".into(),
+        }).unwrap();
+
+        // Read should walk gen 2 (ops) → gen 1 (ops) → gen 0 (snapshot)
+        let result = store.read(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(result.values.len(), 4);
+        assert_eq!(result.values.get("a").unwrap(), "updated");
+        assert_eq!(result.values.get("d").unwrap(), "4", "gen 2 op should appear");
     }
 
     #[test]
