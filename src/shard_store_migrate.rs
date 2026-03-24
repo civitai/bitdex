@@ -11,10 +11,9 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::docstore::PackedValue;
-use crate::shard_store_doc::{DocSnapshot, DocOp, DocShardStore, SlotHexShard};
+use crate::shard_store_doc::{DocSnapshot, DocShardStore};
 
 // ---------------------------------------------------------------------------
 // V2 DocStore migration
@@ -53,6 +52,7 @@ pub fn read_v2_shard(path: &Path) -> io::Result<HashMap<u32, Vec<(u16, Vec<u8>)>
         slot: u32,
         field_idx: u16,
         value: Vec<u8>,
+        #[allow(dead_code)]
         order: usize, // insertion order for LIFO
     }
 
@@ -222,7 +222,7 @@ pub fn has_v2_shards(root: &Path) -> bool {
 use crate::bitmap_fs::BitmapFs;
 use crate::shard_store_bitmap::{
     AliveBitmapStore, FilterBitmapStore, SortBitmapStore,
-    AliveShardKey, FilterBucketKey, SortLayerShardKey,
+    AliveShardKey,
     FieldValueBucketShard, SortLayerShard, SingletonShard,
 };
 use crate::shard_store_meta::MetaStore;
@@ -235,19 +235,23 @@ pub fn has_bitmapfs_data(bitmap_path: &Path) -> bool {
 /// Check if ShardStore data already exists (alive shard present).
 pub fn has_shardstore_data(bitmap_path: &Path) -> bool {
     let ss_root = bitmap_path.join("shardstore");
-    // Check if alive store has any generation directory with data
+    // Check if alive store has any generation directory with a non-empty alive shard.
+    // An empty shardstore directory (created by ShardStore::new on first boot) should
+    // NOT count as "having data" — we need to trigger migration in that case.
     let alive_root = ss_root.join("alive");
     if !alive_root.exists() {
         return false;
     }
-    // Look for any gen_XXX directory with a system/alive.shard file
+    // Look for any gen_XXX directory with a non-empty alive.shard file
     if let Ok(entries) = std::fs::read_dir(&alive_root) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with("gen_") {
                 let shard = entry.path().join("system").join("alive.shard");
-                if shard.exists() {
-                    return true;
+                if let Ok(meta) = std::fs::metadata(&shard) {
+                    if meta.len() > 0 {
+                        return true;
+                    }
                 }
             }
         }

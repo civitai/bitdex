@@ -968,6 +968,7 @@ impl DocStore {
 
     /// Parse all V2 tuples from raw shard data.
     /// Returns tuples in file order (append order).
+    #[allow(dead_code)]
     fn parse_v2_tuples(data: &[u8]) -> Result<Vec<(u32, u16, Vec<u8>)>> {
         if data.len() < V2_HEADER_SIZE {
             return Err(BitdexError::DocStore("v2 shard too short".into()));
