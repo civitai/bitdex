@@ -3562,11 +3562,13 @@ impl ConcurrentEngine {
     ) -> Result<QueryResult> {
         let query_start = std::time::Instant::now();
 
-        // Lazy-load any fields not yet loaded from disk
+        // Lazy-load any fields not yet loaded from disk (timed for trace)
+        let lazy_start = std::time::Instant::now();
         self.ensure_fields_loaded(
             &query.filters,
             query.sort.as_ref().map(|s| s.field.as_str()),
         )?;
+        collector.lazy_load_us = lazy_start.elapsed().as_micros() as u64;
 
         // Lazy-load cached shard from disk if pending
         if let Some(sort_clause) = query.sort.as_ref() {
