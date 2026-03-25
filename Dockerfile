@@ -11,7 +11,7 @@ COPY src/ src/
 COPY benches/ benches/
 COPY static/ static/
 
-# Build both binaries in release mode
+# Build both binaries in release mode (heap-prof enabled for OOM diagnosis)
 RUN cargo build --release --features server,heap-prof --bin server && \
     cargo build --release --features pg-sync --bin pg-sync
 
