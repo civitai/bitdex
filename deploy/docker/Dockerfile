@@ -15,7 +15,7 @@ RUN sed -i 's/members = \[".", "scratch"\]/members = ["."]/' Cargo.toml
 ARG TARGET_CPU=native
 ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 
-RUN cargo build --release --features server --bin bitdex-server && \
+RUN cargo build --release --features server,heap-prof --bin bitdex-server && \
     cargo build --release --features pg-sync --bin bitdex-pg-sync
 
 # --- Runtime ---
@@ -32,4 +32,5 @@ COPY --from=builder /build/static /opt/bitdex/static
 VOLUME /data
 EXPOSE 3000
 ENTRYPOINT ["bitdex-server"]
+ENV MALLOC_CONF="prof:true,prof_prefix:/data/captures/jeprof"
 CMD ["--data-dir", "/data"]
