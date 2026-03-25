@@ -4,7 +4,7 @@ default-members = ["."]
 
 [package]
 name = "bitdex-v2"
-version = "1.0.92"
+version = "1.0.93"
 edition = "2021"
 license = "MIT"
 description = "Purpose-built in-memory bitmap index engine"
@@ -180,5 +180,5 @@ required-features = ["pg-sync"]
 
 [profile.profiling]
 inherits = "release"
-debug = 1
+debug = false
 strip = false
