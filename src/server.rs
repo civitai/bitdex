@@ -1038,6 +1038,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/cursors", get(handle_list_cursors))
             .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
             .route("/api/health", get(handle_health))
+            .route("/debug/memory", get(handle_debug_memory))
             .route("/api/formats", get(handle_list_formats))
             .route("/api/internal/pgsync-metrics", post(handle_pgsync_metrics))
             .route("/metrics", get(handle_metrics))
@@ -3676,6 +3677,81 @@ async fn handle_list_cursors(
 
 async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// Memory budget endpoint — shows where every GB of RSS goes.
+/// Bitmap totals run on a blocking thread (can be slow at 107M records).
+/// Designed for manual debugging, not Prometheus scraping.
+async fn handle_debug_memory(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let rss_bytes = crate::concurrent_engine::get_rss_bytes() as u64;
+
+    let (engine, engine_name, uc_bytes, doc_cache_bytes) = {
+        let guard = state.index.lock();
+        if let Some(idx) = guard.as_ref() {
+            let engine = Arc::clone(&idx.engine);
+            let name = idx.definition.name.clone();
+            let uc = engine.unified_cache_stats();
+            let (_, _, _, dc_bytes, _, _) = engine.doc_cache_stats();
+            (Some(engine), name, uc.memory_bytes as u64, dc_bytes)
+        } else {
+            (None, String::new(), 0, 0)
+        }
+    };
+
+    let (slot_bytes, filter_bytes, sort_bytes) = if let Some(engine) = engine {
+        tokio::task::spawn_blocking(move || {
+            let (s, f, so) = engine.bitmap_memory_totals();
+            (s as u64, f as u64, so as u64)
+        }).await.unwrap_or((0, 0, 0))
+    } else {
+        (0, 0, 0)
+    };
+
+    let bitmap_total = slot_bytes + filter_bytes + sort_bytes;
+    let tracked_total = bitmap_total + uc_bytes + doc_cache_bytes;
+    let untracked = rss_bytes.saturating_sub(tracked_total);
+
+    let pod_limit: u64 = std::env::var("BITDEX_MEMORY_LIMIT_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32 * 1024 * 1024 * 1024);
+
+    let headroom = pod_limit.saturating_sub(rss_bytes);
+    let non_doc_tracked = tracked_total.saturating_sub(doc_cache_bytes);
+    let safe_doc_cache = pod_limit
+        .saturating_sub(non_doc_tracked)
+        .saturating_sub(untracked)
+        .saturating_sub(2 * 1024 * 1024 * 1024);
+
+    Json(serde_json::json!({
+        "index": engine_name,
+        "rss_bytes": rss_bytes,
+        "tracked": {
+            "alive_bitmap": slot_bytes,
+            "filter_bitmaps": filter_bytes,
+            "sort_bitmaps": sort_bytes,
+            "bitmap_total": bitmap_total,
+            "unified_cache": uc_bytes,
+            "doc_cache": doc_cache_bytes,
+        },
+        "tracked_total": tracked_total,
+        "untracked": untracked,
+        "budget": {
+            "pod_limit": pod_limit,
+            "rss_current": rss_bytes,
+            "headroom": headroom,
+            "safe_doc_cache_max": safe_doc_cache,
+        },
+        "human": {
+            "rss": format!("{:.2} GB", rss_bytes as f64 / 1e9),
+            "tracked": format!("{:.2} GB", tracked_total as f64 / 1e9),
+            "untracked": format!("{:.2} GB", untracked as f64 / 1e9),
+            "headroom": format!("{:.2} GB", headroom as f64 / 1e9),
+            "safe_doc_cache": format!("{:.2} GB", safe_doc_cache as f64 / 1e9),
+        }
+    }))
 }
 
 async fn handle_list_formats(State(state): State<SharedState>) -> impl IntoResponse {
