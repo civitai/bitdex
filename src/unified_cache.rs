@@ -656,6 +656,8 @@ pub struct UnifiedCache {
     wall_hits: u64,
     /// Cumulative count of prefetch triggers (background expansion requests).
     prefetches: u64,
+    /// True during shard restore — skips per-insert eviction.
+    restoring: bool,
 }
 
 impl UnifiedCache {
@@ -682,6 +684,7 @@ impl UnifiedCache {
             extensions: 0,
             wall_hits: 0,
             prefetches: 0,
+            restoring: false,
         }
     }
 
@@ -1124,21 +1127,50 @@ impl UnifiedCache {
 
     /// Insert a restored entry from disk (shard load). Does NOT register with
     /// meta-index (that was done during meta.bin load). Does NOT set meta_dirty.
+    ///
+    /// Skips eviction during restore (restoring flag). Call `finish_restore()` after
+    /// loading all entries to run a single eviction pass.
     pub fn insert_restored_entry(&mut self, key: UnifiedKey, entry: UnifiedEntry) {
         let meta_id = entry.meta_id;
         let bytes = entry.memory_bytes();
 
-        // Evict if needed
-        while (self.total_bytes + bytes > self.config.max_bytes
-            || self.entries.len() >= self.config.max_entries)
-            && !self.entries.is_empty()
-        {
-            self.evict_lru();
+        // Skip per-insert eviction during restore — batch evict at the end
+        if !self.restoring {
+            while (self.total_bytes + bytes > self.config.max_bytes
+                || self.entries.len() >= self.config.max_entries)
+                && !self.entries.is_empty()
+            {
+                self.evict_lru();
+            }
         }
 
         self.total_bytes += bytes;
         self.meta_id_to_key.insert(meta_id, key.clone());
         self.entries.insert(key, entry);
+    }
+
+    /// Begin restore mode: skip per-insert eviction during shard restore.
+    pub fn begin_restore(&mut self) {
+        self.restoring = true;
+    }
+
+    /// Finish restore mode: run a single eviction pass to bring the cache under budget.
+    pub fn finish_restore(&mut self) {
+        self.restoring = false;
+        // Single eviction pass to bring cache under budget
+        let mut evicted = 0usize;
+        while (self.total_bytes > self.config.max_bytes
+            || self.entries.len() > self.config.max_entries)
+            && !self.entries.is_empty()
+        {
+            self.evict_lru();
+            evicted += 1;
+        }
+        if evicted > 0 {
+            eprintln!("BoundStore restore: evicted {evicted} entries to fit budget ({}MB / {}MB)",
+                self.total_bytes / 1_048_576,
+                self.config.max_bytes / 1_048_576);
+        }
     }
 
     /// Check if meta needs writing.
