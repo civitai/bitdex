@@ -32,5 +32,5 @@ COPY --from=builder /build/static /opt/bitdex/static
 VOLUME /data
 EXPOSE 3000
 ENTRYPOINT ["bitdex-server"]
-ENV MALLOC_CONF="prof:true,prof_prefix:/data/captures/jeprof"
+ENV _RJEM_MALLOC_CONF="prof:true,prof_prefix:/tmp/bitdex"
 CMD ["--data-dir", "/data"]
