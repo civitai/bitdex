@@ -602,6 +602,30 @@ pub struct SortFieldConfig {
     /// deferring to first query (lazy loading). Default: false.
     #[serde(default)]
     pub eager_load: bool,
+    /// If set, this sort field's value is computed from other fields rather
+    /// than read directly from the document. On mutation, when any source
+    /// field changes, the computed value is recalculated and sort layers updated.
+    #[serde(default)]
+    pub computed: Option<ComputedField>,
+}
+
+/// Defines how a sort field value is computed from other document fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputedField {
+    /// The computation operation to apply.
+    pub op: ComputedOp,
+    /// Names of sort or document fields to read as u32 inputs.
+    pub source_fields: Vec<String>,
+}
+
+/// Operations available for computed sort fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputedOp {
+    /// Result = max(source_fields...)
+    Greatest,
+    /// Result = min(source_fields...)
+    Least,
 }
 
 fn default_source_type() -> String {
@@ -940,6 +964,7 @@ max_entries = 999
                     encoding: "linear".to_string(),
                     bits: 32,
                     eager_load: false,
+                    computed: None,
                 },
                 SortFieldConfig {
                     name: "x".to_string(),
@@ -947,6 +972,7 @@ max_entries = 999
                     encoding: "linear".to_string(),
                     bits: 32,
                     eager_load: false,
+                    computed: None,
                 },
             ],
             ..Default::default()
@@ -975,6 +1001,7 @@ max_entries = 999
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             }],
             ..Default::default()
         };
@@ -990,6 +1017,7 @@ max_entries = 999
                 encoding: "linear".to_string(),
                 bits: 0,
                 eager_load: false,
+                computed: None,
             }],
             ..Default::default()
         };
@@ -1002,6 +1030,7 @@ max_entries = 999
                 encoding: "linear".to_string(),
                 bits: 65,
                 eager_load: false,
+                computed: None,
             }],
             ..Default::default()
         };
@@ -1094,6 +1123,7 @@ bits = 32
                 encoding: "linear".into(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             }],
             filter_fields: vec![FilterFieldConfig {
                 name: "status".into(),
@@ -1394,6 +1424,7 @@ ms_to_seconds = true
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             }],
             cache: CacheConfig {
                 max_entries: 5_000,

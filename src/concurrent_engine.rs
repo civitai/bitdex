@@ -7324,6 +7324,7 @@ mod tests {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             }],
             max_page_size: 100,
             flush_interval_us: 50, // Fast flush for tests
@@ -8474,6 +8475,7 @@ mod tests {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             }],
             max_page_size: 100,
             flush_interval_us: 50,
@@ -9430,6 +9432,7 @@ mod tests {
                     encoding: "linear".to_string(),
                     bits: 32,
                     eager_load: true, // <-- eager
+                    computed: None,
                 },
             ],
             max_page_size: 100,
@@ -10074,6 +10077,7 @@ mod tests {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             }],
             max_page_size: 100,
             flush_interval_us: 50,

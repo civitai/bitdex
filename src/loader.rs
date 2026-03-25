@@ -840,6 +840,34 @@ pub fn json_to_document_with_dicts(
     Ok((slot, Document { fields }))
 }
 
+/// Apply computed sort field values to a document.
+/// Call this after `json_to_document` when the engine config is available.
+/// For each computed sort field, reads source field values from the document,
+/// applies the computation (e.g., GREATEST), and inserts the result.
+pub fn apply_computed_sort_fields(doc: &mut Document, sort_fields: &[crate::config::SortFieldConfig]) {
+    use crate::mutation::apply_computed_op;
+
+    for sort_field in sort_fields {
+        if let Some(ref computed) = sort_field.computed {
+            let values: Vec<u32> = computed.source_fields.iter()
+                .filter_map(|f| {
+                    doc.fields.get(f).and_then(|fv| match fv {
+                        FieldValue::Single(Value::Integer(v)) => Some((*v).max(0) as u32),
+                        _ => None,
+                    })
+                })
+                .collect();
+            if !values.is_empty() {
+                let result = apply_computed_op(&computed.op, &values);
+                doc.fields.insert(
+                    sort_field.name.clone(),
+                    FieldValue::Single(Value::Integer(result as i64)),
+                );
+            }
+        }
+    }
+}
+
 /// Convert a raw serde_json Value field to a FieldValue.
 #[allow(dead_code)] // Used by test helpers
 fn convert_field(raw: &serde_json::Value, mapping: &FieldMapping, ms_to_seconds: bool) -> Option<FieldValue> {

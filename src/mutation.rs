@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
-use crate::config::Config;
+use crate::config::{ComputedOp, ComputedField, Config};
 use crate::docstore::{DocStore, StoredDoc};
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
@@ -181,69 +181,37 @@ pub fn diff_document(
         }
 
         for sort_config in &config.sort_fields {
-            let field_name = &sort_config.name;
-            let old_val = old_fields.get(field_name);
-            let new_val = new_doc.fields.get(field_name);
+            let (old_sort, new_sort) = if let Some(ref computed) = sort_config.computed {
+                // Computed sort field: resolve value from source fields
+                resolve_computed_sort(computed, old_fields, &new_doc.fields)
+            } else {
+                // Direct sort field: read value from document
+                let field_name = &sort_config.name;
+                let old_val = old_fields.get(field_name);
+                let new_val = new_doc.fields.get(field_name);
 
-            if field_values_equal(old_val, new_val) {
+                if field_values_equal(old_val, new_val) {
+                    continue;
+                }
+
+                let old_s = old_val.and_then(|v| match v {
+                    FieldValue::Single(val) => value_to_sort_u32(val),
+                    _ => None,
+                });
+                let new_s = new_val.and_then(|v| match v {
+                    FieldValue::Single(val) => value_to_sort_u32(val),
+                    _ => None,
+                });
+                (old_s, new_s)
+            };
+
+            if old_sort == new_sort {
                 continue;
             }
 
-            let old_sort = old_val.and_then(|v| match v {
-                FieldValue::Single(val) => value_to_sort_u32(val),
-                _ => None,
-            });
-            let new_sort = new_val.and_then(|v| match v {
-                FieldValue::Single(val) => value_to_sort_u32(val),
-                _ => None,
-            });
-
-            let arc_name = registry.get(field_name);
+            let arc_name = registry.get(&sort_config.name);
             let num_bits = sort_config.bits as usize;
-            match (old_sort, new_sort) {
-                (Some(old_s), Some(new_s)) => {
-                    let diff = old_s ^ new_s;
-                    for bit in 0..num_bits {
-                        if (diff >> bit) & 1 == 1 {
-                            if (new_s >> bit) & 1 == 1 {
-                                ops.push(MutationOp::SortSet {
-                                    field: arc_name.clone(),
-                                    bit_layer: bit,
-                                    slots: vec![slot],
-                                });
-                            } else {
-                                ops.push(MutationOp::SortClear {
-                                    field: arc_name.clone(),
-                                    bit_layer: bit,
-                                    slots: vec![slot],
-                                });
-                            }
-                        }
-                    }
-                }
-                (Some(_), None) => {
-                    // Remove all sort layers
-                    for bit in 0..num_bits {
-                        ops.push(MutationOp::SortClear {
-                            field: arc_name.clone(),
-                            bit_layer: bit,
-                            slots: vec![slot],
-                        });
-                    }
-                }
-                (None, Some(new_s)) => {
-                    for bit in 0..num_bits {
-                        if (new_s >> bit) & 1 == 1 {
-                            ops.push(MutationOp::SortSet {
-                                field: arc_name.clone(),
-                                bit_layer: bit,
-                                slots: vec![slot],
-                            });
-                        }
-                    }
-                }
-                (None, None) => {}
-            }
+            emit_sort_diff_ops(&mut ops, &arc_name, num_bits, slot, old_sort, new_sort);
         }
     } else {
         // Fresh insert: set all bitmaps, but first clear stale bits if old doc exists
@@ -283,20 +251,30 @@ pub fn diff_document(
             }
         }
         for sort_config in &config.sort_fields {
-            if let Some(field_value) = new_doc.fields.get(&sort_config.name) {
-                if let FieldValue::Single(val) = field_value {
-                    if let Some(sort_val) = value_to_sort_u32(val) {
-                        let arc_name = registry.get(&sort_config.name);
-                        let num_bits = sort_config.bits as usize;
-                        for bit in 0..num_bits {
-                            if (sort_val >> bit) & 1 == 1 {
-                                ops.push(MutationOp::SortSet {
-                                    field: arc_name.clone(),
-                                    bit_layer: bit,
-                                    slots: vec![slot],
-                                });
-                            }
-                        }
+            let sort_val = if let Some(ref computed) = sort_config.computed {
+                // Computed: resolve from source fields in the new doc
+                let values: Vec<u32> = computed.source_fields.iter()
+                    .filter_map(|f| field_to_sort_u32(&new_doc.fields, f))
+                    .collect();
+                if values.is_empty() { None } else { Some(apply_computed_op(&computed.op, &values)) }
+            } else {
+                // Direct: read from document
+                new_doc.fields.get(&sort_config.name).and_then(|fv| match fv {
+                    FieldValue::Single(val) => value_to_sort_u32(val),
+                    _ => None,
+                })
+            };
+
+            if let Some(sort_val) = sort_val {
+                let arc_name = registry.get(&sort_config.name);
+                let num_bits = sort_config.bits as usize;
+                for bit in 0..num_bits {
+                    if (sort_val >> bit) & 1 == 1 {
+                        ops.push(MutationOp::SortSet {
+                            field: arc_name.clone(),
+                            bit_layer: bit,
+                            slots: vec![slot],
+                        });
                     }
                 }
             }
@@ -348,72 +326,45 @@ pub fn diff_document_partial(
     }
 
     for sort_config in &config.sort_fields {
-        let field_name = &sort_config.name;
-        // PATCH semantics: skip fields not in the new doc
-        let new_val = match new_doc.fields.get(field_name) {
-            Some(v) => Some(v),
-            None => continue,
-        };
-        let old_val = old_fields.get(field_name);
+        let (old_sort, new_sort) = if let Some(ref computed) = sort_config.computed {
+            // Computed sort field: check if any source field is in the PATCH
+            let any_source_in_patch = computed.source_fields.iter()
+                .any(|f| new_doc.fields.contains_key(f));
+            if !any_source_in_patch {
+                continue; // PATCH semantics: skip if no source field is being patched
+            }
+            resolve_computed_sort(computed, old_fields, &new_doc.fields)
+        } else {
+            let field_name = &sort_config.name;
+            // PATCH semantics: skip fields not in the new doc
+            let new_val = match new_doc.fields.get(field_name) {
+                Some(v) => Some(v),
+                None => continue,
+            };
+            let old_val = old_fields.get(field_name);
 
-        if field_values_equal(old_val, new_val) {
+            if field_values_equal(old_val, new_val) {
+                continue;
+            }
+
+            let old_s = old_val.and_then(|v| match v {
+                FieldValue::Single(val) => value_to_sort_u32(val),
+                _ => None,
+            });
+            let new_s = new_val.and_then(|v| match v {
+                FieldValue::Single(val) => value_to_sort_u32(val),
+                _ => None,
+            });
+            (old_s, new_s)
+        };
+
+        if old_sort == new_sort {
             continue;
         }
 
-        let old_sort = old_val.and_then(|v| match v {
-            FieldValue::Single(val) => value_to_sort_u32(val),
-            _ => None,
-        });
-        let new_sort = new_val.and_then(|v| match v {
-            FieldValue::Single(val) => value_to_sort_u32(val),
-            _ => None,
-        });
-
-        let arc_name = registry.get(field_name);
+        let arc_name = registry.get(&sort_config.name);
         let num_bits = sort_config.bits as usize;
-        match (old_sort, new_sort) {
-            (Some(old_s), Some(new_s)) => {
-                let diff = old_s ^ new_s;
-                for bit in 0..num_bits {
-                    if (diff >> bit) & 1 == 1 {
-                        if (new_s >> bit) & 1 == 1 {
-                            ops.push(MutationOp::SortSet {
-                                field: arc_name.clone(),
-                                bit_layer: bit,
-                                slots: vec![slot],
-                            });
-                        } else {
-                            ops.push(MutationOp::SortClear {
-                                field: arc_name.clone(),
-                                bit_layer: bit,
-                                slots: vec![slot],
-                            });
-                        }
-                    }
-                }
-            }
-            (Some(_), None) => {
-                for bit in 0..num_bits {
-                    ops.push(MutationOp::SortClear {
-                        field: arc_name.clone(),
-                        bit_layer: bit,
-                        slots: vec![slot],
-                    });
-                }
-            }
-            (None, Some(new_s)) => {
-                for bit in 0..num_bits {
-                    if (new_s >> bit) & 1 == 1 {
-                        ops.push(MutationOp::SortSet {
-                            field: arc_name.clone(),
-                            bit_layer: bit,
-                            slots: vec![slot],
-                        });
-                    }
-                }
-            }
-            (None, None) => {}
-        }
+        emit_sort_diff_ops(&mut ops, &arc_name, num_bits, slot, old_sort, new_sort);
     }
 
     ops
@@ -572,6 +523,121 @@ pub fn value_to_sort_u32(val: &Value) -> Option<u32> {
     match val {
         Value::Integer(v) => Some((*v).max(0) as u32),
         _ => None,
+    }
+}
+
+/// Extract a u32 sort value from a field in a field map.
+fn field_to_sort_u32(fields: &HashMap<String, FieldValue>, name: &str) -> Option<u32> {
+    fields.get(name).and_then(|fv| match fv {
+        FieldValue::Single(val) => value_to_sort_u32(val),
+        _ => None,
+    })
+}
+
+/// Resolve old and new computed sort values from source fields.
+/// For each source field, reads from new_fields if present, else old_fields.
+fn resolve_computed_sort(
+    computed: &ComputedField,
+    old_fields: &HashMap<String, FieldValue>,
+    new_fields: &HashMap<String, FieldValue>,
+) -> (Option<u32>, Option<u32>) {
+    // Check if any source field actually changed
+    let any_changed = computed.source_fields.iter().any(|f| {
+        let old_val = old_fields.get(f);
+        let new_val = new_fields.get(f);
+        // Changed if new_fields has this field and it differs from old
+        new_val.is_some() && !field_values_equal(old_val, new_val)
+    });
+
+    if !any_changed {
+        return (None, None); // Caller will see equal values and skip
+    }
+
+    // Compute old value from old_fields
+    let old_values: Vec<u32> = computed.source_fields.iter()
+        .filter_map(|f| field_to_sort_u32(old_fields, f))
+        .collect();
+    let old_computed = if old_values.is_empty() {
+        None
+    } else {
+        Some(apply_computed_op(&computed.op, &old_values))
+    };
+
+    // Compute new value: use new_fields if field is present, else fall back to old_fields
+    let new_values: Vec<u32> = computed.source_fields.iter()
+        .filter_map(|f| {
+            field_to_sort_u32(new_fields, f)
+                .or_else(|| field_to_sort_u32(old_fields, f))
+        })
+        .collect();
+    let new_computed = if new_values.is_empty() {
+        None
+    } else {
+        Some(apply_computed_op(&computed.op, &new_values))
+    };
+
+    (old_computed, new_computed)
+}
+
+/// Apply a computed operation to a set of u32 values.
+pub fn apply_computed_op(op: &ComputedOp, values: &[u32]) -> u32 {
+    match op {
+        ComputedOp::Greatest => values.iter().copied().max().unwrap_or(0),
+        ComputedOp::Least => values.iter().copied().min().unwrap_or(0),
+    }
+}
+
+/// Emit sort layer set/clear ops for a value change on a single slot.
+fn emit_sort_diff_ops(
+    ops: &mut Vec<MutationOp>,
+    field: &Arc<str>,
+    num_bits: usize,
+    slot: u32,
+    old_sort: Option<u32>,
+    new_sort: Option<u32>,
+) {
+    match (old_sort, new_sort) {
+        (Some(old_s), Some(new_s)) => {
+            let diff = old_s ^ new_s;
+            for bit in 0..num_bits {
+                if (diff >> bit) & 1 == 1 {
+                    if (new_s >> bit) & 1 == 1 {
+                        ops.push(MutationOp::SortSet {
+                            field: field.clone(),
+                            bit_layer: bit,
+                            slots: vec![slot],
+                        });
+                    } else {
+                        ops.push(MutationOp::SortClear {
+                            field: field.clone(),
+                            bit_layer: bit,
+                            slots: vec![slot],
+                        });
+                    }
+                }
+            }
+        }
+        (Some(_), None) => {
+            for bit in 0..num_bits {
+                ops.push(MutationOp::SortClear {
+                    field: field.clone(),
+                    bit_layer: bit,
+                    slots: vec![slot],
+                });
+            }
+        }
+        (None, Some(new_s)) => {
+            for bit in 0..num_bits {
+                if (new_s >> bit) & 1 == 1 {
+                    ops.push(MutationOp::SortSet {
+                        field: field.clone(),
+                        bit_layer: bit,
+                        slots: vec![slot],
+                    });
+                }
+            }
+        }
+        (None, None) => {}
     }
 }
 
@@ -990,6 +1056,7 @@ mod tests {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             }],
             ..Default::default()
         }
@@ -1363,5 +1430,203 @@ mod tests {
         for i in 5..10 {
             assert!(slots.is_alive(i));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Computed sort field tests
+    // -----------------------------------------------------------------------
+
+    fn computed_config() -> Config {
+        use crate::config::{ComputedField, ComputedOp};
+        Config {
+            filter_fields: vec![],
+            sort_fields: vec![
+                SortFieldConfig {
+                    name: "existedAt".to_string(),
+                    source_type: "uint32".to_string(),
+                    encoding: "linear".to_string(),
+                    bits: 32,
+                    eager_load: false,
+                    computed: None,
+                },
+                SortFieldConfig {
+                    name: "publishedAt".to_string(),
+                    source_type: "uint32".to_string(),
+                    encoding: "linear".to_string(),
+                    bits: 32,
+                    eager_load: false,
+                    computed: None,
+                },
+                SortFieldConfig {
+                    name: "sortAt".to_string(),
+                    source_type: "uint32".to_string(),
+                    encoding: "linear".to_string(),
+                    bits: 32,
+                    eager_load: false,
+                    computed: Some(ComputedField {
+                        op: ComputedOp::Greatest,
+                        source_fields: vec!["existedAt".to_string(), "publishedAt".to_string()],
+                    }),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn setup_computed() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocStore) {
+        let config = computed_config();
+        let slots = SlotAllocator::new();
+        let mut filters = FilterIndex::new();
+        let mut sorts = SortIndex::new();
+        let docstore = DocStore::open_temp().unwrap();
+
+        for fc in &config.filter_fields {
+            filters.add_field(fc.clone());
+        }
+        for sc in &config.sort_fields {
+            sorts.add_field(sc.clone());
+        }
+        (slots, filters, sorts, config, docstore)
+    }
+
+    #[test]
+    fn test_computed_sort_fresh_insert() {
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
+        let registry = FieldRegistry::from_config(&config);
+        let slot = 0u32;
+
+        let mut fields = HashMap::new();
+        fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
+        fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
+        let doc = Document { fields };
+
+        let ops = diff_document(slot, None, &doc, &config, false, &registry);
+
+        // Should have sort ops for existedAt=100, publishedAt=200, and sortAt=200 (GREATEST)
+        let sort_at_sets: Vec<_> = ops.iter().filter(|op| matches!(op,
+            MutationOp::SortSet { field, .. } if field.as_ref() == "sortAt"
+        )).collect();
+        assert!(!sort_at_sets.is_empty(), "Should have sortAt set ops");
+
+        // Verify the computed value is 200 (max of 100, 200) by checking bit pattern
+        let mut reconstructed: u32 = 0;
+        for op in &ops {
+            if let MutationOp::SortSet { field, bit_layer, .. } = op {
+                if field.as_ref() == "sortAt" {
+                    reconstructed |= 1 << bit_layer;
+                }
+            }
+        }
+        assert_eq!(reconstructed, 200, "sortAt should be GREATEST(100, 200) = 200");
+    }
+
+    #[test]
+    fn test_computed_sort_upsert_source_changes() {
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
+        let registry = FieldRegistry::from_config(&config);
+        let slot = 0u32;
+
+        // Old doc: existedAt=100, publishedAt=200 → sortAt=200
+        let mut old_fields = HashMap::new();
+        old_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
+        old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
+        old_fields.insert("sortAt".into(), FieldValue::Single(Value::Integer(200)));
+        let old_doc = StoredDoc { fields: old_fields, schema_version: 0 };
+
+        // New doc: existedAt=300 (changed), publishedAt=200 → sortAt should become 300
+        let mut new_fields = HashMap::new();
+        new_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(300)));
+        new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
+        let new_doc = Document { fields: new_fields };
+
+        let ops = diff_document(slot, Some(&old_doc), &new_doc, &config, true, &registry);
+
+        // Reconstruct sortAt from ops: should have clears for old value (200) and sets for new (300)
+        let mut set_bits: u32 = 0;
+        let mut clear_bits: u32 = 0;
+        for op in &ops {
+            match op {
+                MutationOp::SortSet { field, bit_layer, .. } if field.as_ref() == "sortAt" => {
+                    set_bits |= 1 << bit_layer;
+                }
+                MutationOp::SortClear { field, bit_layer, .. } if field.as_ref() == "sortAt" => {
+                    clear_bits |= 1 << bit_layer;
+                }
+                _ => {}
+            }
+        }
+        // The XOR diff between 200 and 300 should produce the right set/clear pattern
+        let diff = 200u32 ^ 300u32;
+        assert_ne!(diff, 0, "Values differ so diff should be nonzero");
+        // set_bits | clear_bits should equal the diff (all changed bits accounted for)
+        assert_eq!(set_bits | clear_bits, diff, "All changed bits should have ops");
+    }
+
+    #[test]
+    fn test_computed_sort_no_change_when_sources_unchanged() {
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
+        let registry = FieldRegistry::from_config(&config);
+        let slot = 0u32;
+
+        let mut old_fields = HashMap::new();
+        old_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
+        old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
+        let old_doc = StoredDoc { fields: old_fields, schema_version: 0 };
+
+        // Same values in new doc
+        let mut new_fields = HashMap::new();
+        new_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
+        new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
+        let new_doc = Document { fields: new_fields };
+
+        let ops = diff_document(slot, Some(&old_doc), &new_doc, &config, true, &registry);
+
+        // Should have no sortAt ops since sources didn't change
+        let sort_at_ops: Vec<_> = ops.iter().filter(|op| match op {
+            MutationOp::SortSet { field, .. } | MutationOp::SortClear { field, .. } => field.as_ref() == "sortAt",
+            _ => false,
+        }).collect();
+        assert!(sort_at_ops.is_empty(), "No sortAt ops when sources unchanged");
+    }
+
+    #[test]
+    fn test_computed_sort_patch_updates_computed() {
+        let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
+        let registry = FieldRegistry::from_config(&config);
+        let slot = 0u32;
+
+        // Old doc with both source fields
+        let mut old_fields = HashMap::new();
+        old_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
+        old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
+        let old_doc = StoredDoc { fields: old_fields, schema_version: 0 };
+
+        // PATCH only changes publishedAt to 50
+        let mut new_fields = HashMap::new();
+        new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(50)));
+        let new_doc = Document { fields: new_fields };
+
+        let ops = diff_document_partial(slot, Some(&old_doc), &new_doc, &config, &registry);
+
+        // sortAt should change from GREATEST(100,200)=200 to GREATEST(100,50)=100
+        let has_sort_at_ops = ops.iter().any(|op| match op {
+            MutationOp::SortSet { field, .. } | MutationOp::SortClear { field, .. } => field.as_ref() == "sortAt",
+            _ => false,
+        });
+        assert!(has_sort_at_ops, "PATCH changing publishedAt should update sortAt");
+    }
+
+    #[test]
+    fn test_apply_computed_op_greatest() {
+        assert_eq!(apply_computed_op(&crate::config::ComputedOp::Greatest, &[10, 20, 5]), 20);
+        assert_eq!(apply_computed_op(&crate::config::ComputedOp::Greatest, &[0]), 0);
+        assert_eq!(apply_computed_op(&crate::config::ComputedOp::Greatest, &[]), 0);
+    }
+
+    #[test]
+    fn test_apply_computed_op_least() {
+        assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[10, 20, 5]), 5);
+        assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[0]), 0);
+        assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[]), 0);
     }
 }
