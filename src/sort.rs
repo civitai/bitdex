@@ -558,6 +558,7 @@ mod tests {
             encoding: "linear".to_string(),
             bits: 32,
             eager_load: false,
+            computed: None,
         }
     }
 
