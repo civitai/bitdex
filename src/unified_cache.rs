@@ -790,7 +790,8 @@ impl UnifiedCache {
         );
 
         let direction = key.direction;
-        let entry = UnifiedEntry::new(
+        let uses_bucket = key.filter_clauses.iter().any(|c| c.op == "bucket");
+        let mut entry = UnifiedEntry::new(
             sorted_slots,
             self.config.initial_capacity,
             self.config.max_capacity,
@@ -800,6 +801,16 @@ impl UnifiedCache {
             direction,
             value_fn,
         );
+        entry.set_uses_bucket(uses_bucket);
+        if uses_bucket {
+            // Tag with current time so lazy diff application knows when this entry was computed.
+            // Snapping is applied later when compared against pending diffs.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            entry.set_bucket_cutoff(now);
+        }
 
         self.store(key, entry)
     }

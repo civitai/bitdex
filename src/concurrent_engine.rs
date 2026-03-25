@@ -3612,7 +3612,19 @@ impl ConcurrentEngine {
 
                 let cache_data = {
                     let mut uc = self.unified_cache.lock();
+                    let pending = self.pending_bucket_diffs.load();
                     uc.lookup(&ukey).map(|entry| {
+                        // Apply pending bucket diffs lazily before reading
+                        if pending.current_cutoff() > 0
+                            && entry.uses_bucket()
+                            && entry.bucket_cutoff() < pending.current_cutoff()
+                        {
+                            if entry.bucket_cutoff() >= pending.oldest_cutoff() {
+                                entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
+                            } else {
+                                entry.mark_for_rebuild();
+                            }
+                        }
                         let bm = Arc::clone(entry.bitmap());
                         let has_more = entry.has_more();
                         let min_val = entry.min_tracked_value();
@@ -3914,7 +3926,19 @@ impl ConcurrentEngine {
 
                 let cache_data = {
                     let mut uc = self.unified_cache.lock();
+                    let pending = self.pending_bucket_diffs.load();
                     uc.lookup(&ukey).map(|entry| {
+                        // Apply pending bucket diffs lazily before reading
+                        if pending.current_cutoff() > 0
+                            && entry.uses_bucket()
+                            && entry.bucket_cutoff() < pending.current_cutoff()
+                        {
+                            if entry.bucket_cutoff() >= pending.oldest_cutoff() {
+                                entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
+                            } else {
+                                entry.mark_for_rebuild();
+                            }
+                        }
                         let bm = Arc::clone(entry.bitmap());
                         let has_more = entry.has_more();
                         let min_val = entry.min_tracked_value();
