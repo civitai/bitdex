@@ -998,6 +998,19 @@ impl BitdexServer {
             eprintln!("Warning: failed to restore index from disk: {e}");
         }
 
+        // Apply persisted enabled_metrics from restored config
+        if let Some(ref idx) = *state.index.lock() {
+            if let Some(ref groups) = idx.definition.config.enabled_metrics {
+                let bm = groups.iter().any(|g| g == "bitmap_memory");
+                let ev = groups.iter().any(|g| g == "eviction_stats");
+                let bd = groups.iter().any(|g| g == "boundstore_disk");
+                state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
+                state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
+                state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
+                eprintln!("Restored enabled_metrics from config: {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
+            }
+        }
+
         // Rebuild mode: delete existing bitmaps and rebuild from docstore
         if self.rebuild {
             if let Err(e) = rebuild_on_boot(&state) {
@@ -1753,7 +1766,7 @@ async fn handle_patch_config(
                     eprintln!("Config patch: trace_buffer_size set to {v}");
                 }
 
-                // Toggle metric groups (server-wide, not persisted)
+                // Toggle metric groups and persist to config.json
                 if let Some(ref groups) = patch.enabled_metrics {
                     let bm = groups.iter().any(|g| g == "bitmap_memory");
                     let ev = groups.iter().any(|g| g == "eviction_stats");
@@ -1761,6 +1774,7 @@ async fn handle_patch_config(
                     state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
                     state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
                     state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
+                    idx.definition.config.enabled_metrics = Some(groups.clone());
                     eprintln!("Config patch: enabled_metrics = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
                 }
 

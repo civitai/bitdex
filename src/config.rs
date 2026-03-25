@@ -80,6 +80,15 @@ pub struct Config {
     #[serde(default)]
     pub doc_cache: DocCacheConfigEntry,
 
+    /// Enabled metric groups. Controls which expensive metric groups are
+    /// collected on the Prometheus scrape endpoint.
+    /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
+    /// When `None` (default), all groups are enabled (backward compatible).
+    /// When `Some(vec)`, only the listed groups are enabled.
+    /// Persisted to config.json and applied on startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_metrics: Option<Vec<String>>,
+
     /// Headless mode: skip all background threads (flush, merge, eviction).
     /// Used by bulk loaders that write directly to BitmapFs and don't need
     /// the engine's write pipeline. The engine still provides config, BitmapFs
@@ -147,6 +156,7 @@ impl Default for Config {
             eviction_sweep_interval: default_eviction_sweep_interval(),
             compact_threshold_pct: default_compact_threshold_pct(),
             doc_cache: DocCacheConfigEntry::default(),
+            enabled_metrics: None,
             deferred_alive: None,
             headless: false,
         }
