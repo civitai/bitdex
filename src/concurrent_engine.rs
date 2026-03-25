@@ -2329,9 +2329,42 @@ impl ConcurrentEngine {
                                      registered_ids, shard_snapshots, per_shard_tombstones)) = persist_data
                         {
                             if meta_dirty {
+                                // Compact meta.bin: exclude tombstoned entries from the entries list.
+                                // Tombstones are only needed for entries that still exist in shard
+                                // files on disk (to prevent stale data from being loaded). Once an
+                                // entry is removed from meta_entries, its tombstone is no longer needed.
+                                let live_entry_ids: std::collections::HashSet<u32> = meta_entries
+                                    .iter()
+                                    .map(|e| e.entry_id)
+                                    .collect();
+                                let compacted_entries: Vec<_> = meta_entries
+                                    .into_iter()
+                                    .filter(|e| !tombstones.contains(e.entry_id))
+                                    .collect();
+                                // Only keep tombstones for entries that are NOT in compacted_entries
+                                // but ARE still in shard files (we can't know for certain without
+                                // scanning shards, so keep tombstones for registered IDs that were
+                                // filtered out — they may still be in unmodified shard files)
+                                let compacted_ids: std::collections::HashSet<u32> = compacted_entries
+                                    .iter()
+                                    .map(|e| e.entry_id)
+                                    .collect();
+                                let mut compacted_tombstones = RoaringBitmap::new();
+                                for id in tombstones.iter() {
+                                    // Keep tombstone only if the entry was registered (in live_entry_ids)
+                                    // but excluded from compacted_entries (still in a shard file on disk)
+                                    if live_entry_ids.contains(&id) && !compacted_ids.contains(&id) {
+                                        compacted_tombstones.insert(id);
+                                    }
+                                }
+                                let removed = tombstones.len() - compacted_tombstones.len();
+                                if removed > 0 {
+                                    eprintln!("merge thread: compacted meta.bin — removed {} stale tombstones (kept {})",
+                                        removed, compacted_tombstones.len());
+                                }
                                 let meta_file = crate::bound_store::MetaFile {
-                                    entries: meta_entries,
-                                    tombstones: tombstones.clone(),
+                                    entries: compacted_entries,
+                                    tombstones: compacted_tombstones,
                                     next_entry_id: next_id,
                                 };
                                 if let Err(e) = bs.write_meta(&meta_file) {
