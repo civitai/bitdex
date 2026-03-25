@@ -164,6 +164,8 @@ pub fn assemble_document(image: &ImageRow, enrichment: &EnrichmentData) -> Value
         "existedAtUnix": existed_at_unix_ms,
         "url": image.url.as_deref(),
         "hash": image.hash.as_deref(),
+        "width": image.width,
+        "height": image.height,
     });
 
     // Only include metrics when we have real data from ClickHouse

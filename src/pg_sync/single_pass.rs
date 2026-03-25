@@ -1021,6 +1021,12 @@ fn append_image_docstore_tuples(
     if let Some(ref hash) = row.hash {
         append_str!("hash", hash);
     }
+    if let Some(w) = row.width {
+        append_int!("width", w);
+    }
+    if let Some(h) = row.height {
+        append_int!("height", h);
+    }
 }
 
 // ---------------------------------------------------------------------------

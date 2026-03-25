@@ -20,8 +20,8 @@ use sqlx::PgPool;
 
 /// Stream Image table via COPY CSV (no JOINs).
 ///
-/// Columns (11): id, url, nsfwLevel, hash, flags, type, userId, blockedFor,
-///               scannedAtSecs, createdAtSecs, postId
+/// Columns (13): id, url, nsfwLevel, hash, flags, type, userId, blockedFor,
+///               scannedAtSecs, createdAtSecs, postId, width, height
 pub async fn copy_images(
     pool: &PgPool,
 ) -> Result<BoxStream<'static, Result<Bytes, sqlx::Error>>, sqlx::Error> {
@@ -30,7 +30,8 @@ pub async fn copy_images(
                       "userId", "blockedFor",
                       extract(epoch from "scannedAt")::bigint,
                       extract(epoch from "createdAt")::bigint,
-                      "postId"
+                      "postId",
+                      width, height
                FROM "Image"
         ) TO STDOUT WITH (FORMAT csv)"#,
     )
@@ -157,6 +158,8 @@ pub struct CopyImageRow {
     pub scanned_at_secs: Option<i64>,
     pub created_at_secs: Option<i64>,
     pub post_id: Option<i64>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
     // Post-enriched fields (set after Post stream merges)
     pub published_at_secs: Option<i64>,
     pub availability: String,
@@ -418,6 +421,14 @@ fn parse_opt_i64(field: &[u8]) -> Option<i64> {
     }
 }
 
+fn parse_opt_i32(field: &[u8]) -> Option<i32> {
+    if is_null(field) {
+        None
+    } else {
+        parse_i32_fast(field)
+    }
+}
+
 /// Parse an optional string — returns None for empty (NULL) fields.
 #[inline]
 fn parse_opt_string(field: &[u8]) -> Option<String> {
@@ -438,10 +449,10 @@ fn parse_bool(field: &[u8]) -> bool {
 // Row parse functions
 // ---------------------------------------------------------------------------
 
-/// Parse a CSV line into a [`CopyImageRow`] (Image table only, 11 fields).
+/// Parse a CSV line into a [`CopyImageRow`] (Image table only, 13 fields).
 ///
 /// Expected: id, url, nsfwLevel, hash, flags, type, userId, blockedFor,
-///           scannedAtSecs, createdAtSecs, postId
+///           scannedAtSecs, createdAtSecs, postId, width, height
 pub fn parse_image_row(line: &[u8]) -> Option<CopyImageRow> {
     let fields = split_csv_fields(line);
     if fields.len() < 11 {
@@ -460,6 +471,8 @@ pub fn parse_image_row(line: &[u8]) -> Option<CopyImageRow> {
         scanned_at_secs: parse_opt_i64(&fields[8]),
         created_at_secs: parse_opt_i64(&fields[9]),
         post_id: parse_opt_i64(&fields[10]),
+        width: if fields.len() > 11 { parse_opt_i32(&fields[11]) } else { None },
+        height: if fields.len() > 12 { parse_opt_i32(&fields[12]) } else { None },
         // Post-enriched fields — defaults, set after Post stream
         published_at_secs: None,
         availability: String::new(),
