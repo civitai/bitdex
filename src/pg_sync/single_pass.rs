@@ -168,6 +168,7 @@ pub fn run_single_pass_v2(
             &progress,
             &post_map,
             schema,
+            &config,
             &type_dict,
             &availability_dict,
             &blocked_for_dict,
@@ -211,8 +212,8 @@ pub fn run_single_pass_v2(
                 eprintln!("  Saved sort {}: {} layers", field_name, bits);
             }
         }
-        // Save alive bitmap
-        let max_slot = img_result.alive.max().unwrap_or(0);
+        // Save alive bitmap (excludes deferred slots — they're not alive yet)
+        let max_alive_slot = img_result.alive.max().unwrap_or(0);
         bitmap_fs
             .write_alive(&img_result.alive)
             .map_err(|e| format!("write_alive: {e}"))?;
@@ -220,11 +221,24 @@ pub fn run_single_pass_v2(
             "  Saved alive bitmap: {} bits",
             img_result.alive.len()
         );
-        // Save slot counter
-        let slot_counter = max_slot.saturating_add(1);
+        // Save slot counter — must account for deferred slots too (they're allocated)
+        let max_deferred_slot = img_result.deferred_slots.values()
+            .flat_map(|v| v.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let slot_counter = max_alive_slot.max(max_deferred_slot).saturating_add(1);
         bitmap_fs
             .write_slot_counter(slot_counter)
             .map_err(|e| format!("write_slot_counter: {e}"))?;
+        // Save deferred alive map (flush thread reads this on startup to activate due slots)
+        if !img_result.deferred_slots.is_empty() {
+            bitmap_fs
+                .write_deferred_alive(&img_result.deferred_slots)
+                .map_err(|e| format!("write_deferred_alive: {e}"))?;
+            let deferred_total: usize = img_result.deferred_slots.values().map(|v| v.len()).sum();
+            eprintln!("  Saved deferred alive map: {} slots", deferred_total);
+        }
         eprintln!(
             "  Image bitmaps saved in {:.1}s, slot_counter={}",
             t.elapsed().as_secs_f64(),
@@ -472,6 +486,7 @@ struct ImageCsvResult {
     filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
     sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
     alive: RoaringBitmap,
+    deferred_slots: std::collections::BTreeMap<u64, Vec<u32>>,
 }
 
 struct ResourceCsvResult {
@@ -689,6 +704,7 @@ fn process_images_csv(
     progress: &Arc<LoadProgress>,
     post_map: &HashMap<i64, (Option<i64>, String, Option<i64>)>,
     schema: &crate::config::DataSchema,
+    config: &crate::config::Config,
     type_dict: &FieldDictionary,
     availability_dict: &FieldDictionary,
     blocked_for_dict: &FieldDictionary,
@@ -742,11 +758,19 @@ fn process_images_csv(
     let total = AtomicU64::new(0);
     let total_ref = &total;
 
-    // Thread-local result: (filter_maps, sort_maps, alive, count)
+    // Deferred alive: check config and capture current time
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let has_deferred_alive = config.deferred_alive.is_some();
+
+    // Thread-local result: (filter_maps, sort_maps, alive, deferred_slots, count)
     type ThreadResult = (
         HashMap<String, HashMap<u64, RoaringBitmap>>,
         HashMap<String, HashMap<usize, RoaringBitmap>>,
         RoaringBitmap,
+        Vec<(u32, u64)>, // (slot, activate_at) for deferred alive
         u64,
     );
 
@@ -761,6 +785,7 @@ fn process_images_csv(
             let mut sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>> =
                 img_sort_configs.iter().map(|(n, _)| (n.clone(), HashMap::new())).collect();
             let mut alive = RoaringBitmap::new();
+            let mut deferred: Vec<(u32, u64)> = Vec::new();
             let mut count = 0u64;
             let mut line_start = 0;
 
@@ -788,10 +813,19 @@ fn process_images_csv(
 
                     let slot = row.id as u32;
 
-                    alive.insert(slot);
-                    build_image_filter_bitmaps(&row, slot, filter_set, &type_dict, &availability_dict, &blocked_for_dict, &mut filter_maps);
-                    build_image_sort_bitmaps(&row, slot, sort_bits, &mut sort_maps);
-                    append_image_docstore_tuples(&row, slot, bulk_writer);
+                    // Deferred alive: future-dated posts get docstore entries but
+                    // skip alive/filter/sort bits. Activated by flush thread later.
+                    let published_at_secs = row.published_at_secs.unwrap_or(0) as u64;
+                    if has_deferred_alive && published_at_secs > now_unix {
+                        // Still write docstore entry so activate_due() can read it back
+                        append_image_docstore_tuples(&row, slot, bulk_writer);
+                        deferred.push((slot, published_at_secs));
+                    } else {
+                        alive.insert(slot);
+                        build_image_filter_bitmaps(&row, slot, filter_set, &type_dict, &availability_dict, &blocked_for_dict, &mut filter_maps);
+                        build_image_sort_bitmaps(&row, slot, sort_bits, &mut sort_maps);
+                        append_image_docstore_tuples(&row, slot, bulk_writer);
+                    }
 
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
@@ -803,7 +837,7 @@ fn process_images_csv(
             // Flush remaining count
             total_ref.fetch_add(count % LOG_INTERVAL, Ordering::Relaxed);
 
-            (filter_maps, sort_maps, alive, count)
+            (filter_maps, sort_maps, alive, deferred, count)
         })
         .collect();
 
@@ -813,11 +847,17 @@ fn process_images_csv(
     let mut merged_sorts: HashMap<String, HashMap<usize, RoaringBitmap>> =
         img_sort_configs.iter().map(|(n, _)| (n.clone(), HashMap::new())).collect();
     let mut merged_alive = RoaringBitmap::new();
+    let mut merged_deferred: std::collections::BTreeMap<u64, Vec<u32>> =
+        std::collections::BTreeMap::new();
     let mut merged_count = 0u64;
 
-    for (filter_maps, sort_maps, alive, count) in thread_results {
+    for (filter_maps, sort_maps, alive, deferred, count) in thread_results {
         merged_alive |= alive;
         merged_count += count;
+
+        for (slot, activate_at) in deferred {
+            merged_deferred.entry(activate_at).or_default().push(slot);
+        }
 
         for (field, values) in filter_maps {
             let dest = merged_filters.entry(field).or_default();
@@ -833,6 +873,10 @@ fn process_images_csv(
         }
     }
 
+    let deferred_total: usize = merged_deferred.values().map(|v| v.len()).sum();
+    if deferred_total > 0 {
+        eprintln!("  deferred alive: {} slots with future publishedAt (will activate later)", deferred_total);
+    }
     progress.image_rows.store(merged_count, Ordering::Release);
 
     Ok(ImageCsvResult {
@@ -840,6 +884,7 @@ fn process_images_csv(
         filter_maps: merged_filters,
         sort_maps: merged_sorts,
         alive: merged_alive,
+        deferred_slots: merged_deferred,
     })
 }
 
