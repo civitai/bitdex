@@ -830,6 +830,9 @@ struct ConfigPatch {
     sort_fields: Option<HashMap<String, SortFieldPatch>>,
     #[serde(default)]
     cache: Option<CachePatch>,
+    /// Update time bucket refresh intervals without restart.
+    #[serde(default)]
+    time_buckets: Option<TimeBucketPatch>,
     /// Update the query concurrency limit. 0 = unlimited (no backpressure).
     #[serde(default)]
     max_query_concurrency: Option<u32>,
@@ -857,6 +860,19 @@ struct FilterFieldPatch {
 #[derive(Deserialize)]
 struct SortFieldPatch {
     eager_load: Option<bool>,
+}
+
+/// Patchable fields for time bucket config.
+#[derive(Deserialize)]
+struct TimeBucketPatch {
+    range_buckets: Option<Vec<TimeBucketRangePatch>>,
+}
+
+/// Patchable fields for a single time bucket.
+#[derive(Deserialize)]
+struct TimeBucketRangePatch {
+    name: String,
+    refresh_interval_secs: Option<u64>,
 }
 
 /// Patchable fields for cache config.
@@ -1654,6 +1670,43 @@ async fn handle_patch_config(
                     if let Some(v) = cache_patch.max_maintenance_ms {
                         idx.definition.config.cache.max_maintenance_ms = v;
                         idx.engine.set_max_maintenance_ms(v);
+                    }
+                }
+
+                // Apply time bucket patches
+                if let Some(ref tb_patch) = patch.time_buckets {
+                    if let Some(ref range_patches) = tb_patch.range_buckets {
+                        for rp in range_patches {
+                            if let Some(interval) = rp.refresh_interval_secs {
+                                if interval == 0 {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        Json(serde_json::json!({
+                                            "error": format!(
+                                                "time_buckets bucket '{}': refresh_interval_secs must be > 0",
+                                                rp.name
+                                            )
+                                        })),
+                                    ).into_response();
+                                }
+                                let found = idx.engine.set_time_bucket_refresh_interval(&rp.name, interval);
+                                if !found {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        Json(serde_json::json!({
+                                            "error": format!("Unknown time bucket: '{}'", rp.name)
+                                        })),
+                                    ).into_response();
+                                }
+                                // Update persisted config so it survives restart
+                                if let Some(ref mut tb_config) = idx.definition.config.time_buckets {
+                                    if let Some(bc) = tb_config.range_buckets.iter_mut().find(|b| b.name == rp.name) {
+                                        bc.refresh_interval_secs = interval;
+                                    }
+                                }
+                                eprintln!("Config patch: time_bucket '{}' refresh_interval_secs set to {interval}", rp.name);
+                            }
+                        }
                     }
                 }
 
