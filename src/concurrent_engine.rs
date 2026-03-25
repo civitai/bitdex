@@ -3599,8 +3599,9 @@ impl ConcurrentEngine {
     }
 
     /// Execute a parsed BitdexQuery.
-    /// Load a pending cache shard from disk if needed (loading sentinel pattern).
-    /// Called before cache lookup in the query path.
+    /// Trigger background loading of a pending cache shard from disk.
+    /// Non-blocking: sets loading sentinel and spawns a background thread.
+    /// The query proceeds via slow path; next query after loading gets cache hit.
     fn ensure_cache_shard_loaded(&self, sort_field: &str, direction: crate::query::SortDirection) {
         if let Some(ref bs) = self.bound_store {
             let mut uc = self.unified_cache.lock();
@@ -3611,10 +3612,47 @@ impl ConcurrentEngine {
                 // Another thread is loading — drop lock, proceed without cache
                 return;
             }
-            // We are the loading thread. Set sentinel, release lock for I/O.
+            // Set sentinel so other queries skip loading. Spawn background thread.
             uc.mark_shard_loading(sort_field, direction);
             drop(uc);
 
+            // Spawn background shard loading — don't block the query thread
+            let bs = Arc::clone(bs);
+            let uc_arc = Arc::clone(&self.unified_cache);
+            let inner = Arc::clone(&self.inner);
+            let sort_field = sort_field.to_string();
+            let boundstore_entries_restored = Arc::clone(&self.boundstore_entries_restored);
+            let boundstore_shard_loads = Arc::clone(&self.boundstore_shard_loads);
+            let boundstore_entries_skipped = Arc::clone(&self.boundstore_entries_skipped);
+
+            std::thread::Builder::new()
+                .name(format!("shard-load-{}_{:?}", sort_field, direction))
+                .spawn(move || {
+                    Self::load_shard_background(
+                        &bs, &uc_arc, &inner, &sort_field, direction,
+                        &boundstore_entries_restored, &boundstore_shard_loads, &boundstore_entries_skipped,
+                    );
+                })
+                .map_err(|e| {
+                    eprintln!("WARNING: failed to spawn shard-load thread: {e}. Shard stuck in loading state.");
+                })
+                .ok();
+
+            return; // Don't block — query proceeds without cache
+        }
+    }
+
+    /// Background shard loading. Called from a spawned thread.
+    fn load_shard_background(
+        bs: &crate::bound_store::BoundStore,
+        uc_arc: &Arc<parking_lot::Mutex<UnifiedCache>>,
+        inner: &Arc<ArcSwap<InnerEngine>>,
+        sort_field: &str,
+        direction: crate::query::SortDirection,
+        boundstore_entries_restored: &Arc<AtomicU64>,
+        boundstore_shard_loads: &Arc<AtomicU64>,
+        boundstore_entries_skipped: &Arc<AtomicU64>,
+    ) {
             let t0 = std::time::Instant::now();
             let shard_key = crate::bound_store::ShardKey::new(
                 sort_field.to_string(),
@@ -3623,10 +3661,10 @@ impl ConcurrentEngine {
             match bs.load_shard(&shard_key) {
                 Ok(Some(shard_entries)) => {
                     let disk_elapsed = t0.elapsed();
-                    let snap = self.snapshot();
+                    let snap = inner.load();
                     let sf = snap.sorts.get_field(sort_field);
 
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = uc_arc.lock();
                     let mut loaded = 0usize;
                     let mut skipped = 0usize;
                     uc.begin_restore(); // Skip per-insert eviction during shard restore
@@ -3667,12 +3705,12 @@ impl ConcurrentEngine {
                         );
                         uc.insert_restored_entry(key, entry);
                         loaded += 1;
-                        self.boundstore_entries_restored.fetch_add(1, Ordering::Relaxed);
+                        boundstore_entries_restored.fetch_add(1, Ordering::Relaxed);
                     }
                     uc.finish_restore(); // Single eviction pass to bring cache under budget
                     uc.mark_shard_loaded(sort_field, direction);
-                    self.boundstore_shard_loads.fetch_add(1, Ordering::Relaxed);
-                    self.boundstore_entries_skipped.fetch_add(skipped as u64, Ordering::Relaxed);
+                    boundstore_shard_loads.fetch_add(1, Ordering::Relaxed);
+                    boundstore_entries_skipped.fetch_add(skipped as u64, Ordering::Relaxed);
                     let total_elapsed = t0.elapsed();
                     if loaded > 0 || skipped > 0 {
                         tracing::info!(
@@ -3685,16 +3723,15 @@ impl ConcurrentEngine {
                 }
                 Ok(None) => {
                     // Shard file doesn't exist — mark as loaded
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = uc_arc.lock();
                     uc.mark_shard_loaded(sort_field, direction);
                 }
                 Err(e) => {
                     eprintln!("BoundStore: failed to load shard {}_{:?}: {e}", sort_field, direction);
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = uc_arc.lock();
                     uc.mark_shard_loaded(sort_field, direction);
                 }
             }
-        }
     }
 
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
