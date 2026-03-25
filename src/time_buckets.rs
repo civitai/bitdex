@@ -301,6 +301,16 @@ impl TimeBucketManager {
         }
     }
 
+    /// Update the refresh interval for a named bucket. Returns true if the bucket was found.
+    pub fn set_refresh_interval(&mut self, bucket_name: &str, interval_secs: u64) -> bool {
+        if let Some(bucket) = self.buckets.get_mut(bucket_name) {
+            bucket.refresh_interval_secs = interval_secs;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn bucket_count(&self) -> usize {
         self.buckets.len()
     }
@@ -530,5 +540,40 @@ mod tests {
         ]);
         // Should not panic.
         mgr.rebuild_bucket("nonexistent", std::iter::empty(), 1_700_000_000);
+    }
+
+    #[test]
+    fn test_set_refresh_interval() {
+        let mut mgr = make_manager(vec![
+            ("24h", 86400, 300),
+            ("7d", 604800, 3600),
+        ]);
+
+        // Update existing bucket — returns true
+        assert!(mgr.set_refresh_interval("24h", 60));
+        assert_eq!(mgr.get_bucket("24h").unwrap().refresh_interval_secs, 60);
+
+        // Other bucket unchanged
+        assert_eq!(mgr.get_bucket("7d").unwrap().refresh_interval_secs, 3600);
+
+        // Unknown bucket — returns false
+        assert!(!mgr.set_refresh_interval("nonexistent", 120));
+    }
+
+    #[test]
+    fn test_set_refresh_interval_affects_needs_refresh() {
+        let mut mgr = make_manager(vec![
+            ("24h", 86400, 300),
+        ]);
+
+        let now: u64 = 1_700_000_000;
+        mgr.rebuild_bucket("24h", std::iter::empty(), now);
+
+        // At now+200, with interval=300 the bucket does NOT need refresh
+        assert!(!mgr.get_bucket("24h").unwrap().needs_refresh(now + 200));
+
+        // Shorten interval to 100 — now it DOES need refresh at now+200
+        mgr.set_refresh_interval("24h", 100);
+        assert!(mgr.get_bucket("24h").unwrap().needs_refresh(now + 200));
     }
 }

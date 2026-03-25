@@ -5313,6 +5313,17 @@ impl ConcurrentEngine {
         self.unified_cache.lock().config_mut().min_filter_size = v;
     }
 
+    /// Update the refresh interval for a named time bucket.
+    /// Returns true if the bucket was found and updated, false if no time bucket
+    /// manager exists or the bucket name was not found.
+    pub fn set_time_bucket_refresh_interval(&self, bucket_name: &str, interval_secs: u64) -> bool {
+        if let Some(ref tb_arc) = self.time_buckets {
+            tb_arc.lock().set_refresh_interval(bucket_name, interval_secs)
+        } else {
+            false
+        }
+    }
+
     /// Clear unified cache entries and reset counters (RAM only).
     pub fn clear_unified_cache(&self) {
         self.unified_cache.lock().clear();
