@@ -12,7 +12,7 @@ COPY benches/ benches/
 COPY static/ static/
 
 # Build both binaries in release mode
-RUN cargo build --release --features server --bin server && \
+RUN cargo build --release --features server,heap-prof --bin server && \
     cargo build --release --features pg-sync --bin pg-sync
 
 # ---- Runtime stage ----
@@ -40,4 +40,5 @@ EXPOSE 3000
 # Default: run the server
 # Config (config.json) expected at /data/indexes/<name>/config.json (from PVC)
 # Override with: bitdex-pg-sync load --config /etc/sync/sync.toml
+ENV MALLOC_CONF="prof:true,prof_prefix:/data/captures/jeprof"
 CMD ["bitdex-server", "--port", "3000", "--data-dir", "/data"]
