@@ -658,6 +658,9 @@ pub struct UnifiedCache {
     prefetches: u64,
     /// True during shard restore — skips per-insert eviction.
     restoring: bool,
+    /// Reverse index: ShardKey → set of UnifiedKeys in that shard.
+    /// Avoids O(all_entries) scan in entries_for_shard() and clear_shard_entry_dirty().
+    shard_to_keys: HashMap<ShardKey, HashSet<UnifiedKey>>,
 }
 
 impl UnifiedCache {
@@ -685,6 +688,7 @@ impl UnifiedCache {
             wall_hits: 0,
             prefetches: 0,
             restoring: false,
+            shard_to_keys: HashMap::new(),
         }
     }
 
@@ -748,6 +752,11 @@ impl UnifiedCache {
             self.total_bytes = self.total_bytes.saturating_sub(old.memory_bytes());
             self.meta_id_to_key.remove(&old.meta_id);
             self.meta.deregister(old.meta_id);
+            // Remove from shard→keys index
+            let old_sk = ShardKey::new(key.sort_field.clone(), key.direction);
+            if let Some(set) = self.shard_to_keys.get_mut(&old_sk) {
+                set.remove(&key);
+            }
         }
 
         // Batch eviction: when over budget, evict ~10% of entries at once.
@@ -770,6 +779,9 @@ impl UnifiedCache {
 
         self.total_bytes += new_bytes;
         self.meta_id_to_key.insert(meta_id, key.clone());
+        // Maintain shard→keys index
+        let sk = ShardKey::new(key.sort_field.clone(), key.direction);
+        self.shard_to_keys.entry(sk).or_default().insert(key.clone());
         self.entries.insert(key, entry);
         self.inserts += 1;
         meta_id
@@ -853,6 +865,11 @@ impl UnifiedCache {
             );
             self.total_bytes = self.total_bytes.saturating_sub(evicted.memory_bytes());
             self.meta_id_to_key.remove(&evicted.meta_id);
+            // Remove from shard→keys index
+            let sk = ShardKey::new(lru_key.sort_field.clone(), lru_key.direction);
+            if let Some(set) = self.shard_to_keys.get_mut(&sk) {
+                set.remove(&lru_key);
+            }
             self.evictions += 1;
             if !self.persistence_enabled {
                 // Without persistence, deregister fully (original behavior)
@@ -906,6 +923,11 @@ impl UnifiedCache {
             if let Some(entry) = self.entries.remove(&key) {
                 self.total_bytes = self.total_bytes.saturating_sub(entry.memory_bytes());
                 self.meta_id_to_key.remove(&entry.meta_id);
+                // Remove from shard→keys index
+                let sk = ShardKey::new(key.sort_field.clone(), key.direction);
+                if let Some(set) = self.shard_to_keys.get_mut(&sk) {
+                    set.remove(&key);
+                }
                 self.evictions += 1;
                 if !self.persistence_enabled {
                     self.meta.deregister(entry.meta_id);
@@ -958,6 +980,7 @@ impl UnifiedCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.meta_id_to_key.clear();
+        self.shard_to_keys.clear();
         self.meta = MetaIndex::new();
         self.hits = 0;
         self.misses = 0;
@@ -1146,6 +1169,9 @@ impl UnifiedCache {
 
         self.total_bytes += bytes;
         self.meta_id_to_key.insert(meta_id, key.clone());
+        // Maintain shard→keys index
+        let sk = ShardKey::new(key.sort_field.clone(), key.direction);
+        self.shard_to_keys.entry(sk).or_default().insert(key.clone());
         self.entries.insert(key, entry);
     }
 
@@ -1210,21 +1236,30 @@ impl UnifiedCache {
 
     /// Collect entries for a specific shard (for merge thread shard write).
     /// Returns (meta_id, key, bitmap_clone, sorted_keys_clone) for each entry in the shard.
+    /// Uses shard→keys index for O(shard_entries) instead of O(all_entries).
     pub fn entries_for_shard(&self, shard_key: &ShardKey) -> Vec<(CacheEntryId, UnifiedKey, RoaringBitmap, Option<Vec<u64>>)> {
-        self.entries
-            .iter()
-            .filter(|(key, _)| key.sort_field == shard_key.sort_field && key.direction == shard_key.direction)
-            .map(|(key, entry)| {
-                let sk = entry.sorted_keys().map(|arc| arc.as_ref().clone());
-                (entry.meta_id, key.clone(), entry.bitmap.as_ref().clone(), sk)
+        let Some(keys) = self.shard_to_keys.get(shard_key) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter_map(|key| {
+                self.entries.get(key).map(|entry| {
+                    let sk = entry.sorted_keys().map(|arc| arc.as_ref().clone());
+                    (entry.meta_id, key.clone(), entry.bitmap.as_ref().clone(), sk)
+                })
             })
             .collect()
     }
 
     /// Clear persist_dirty flags for entries in a specific shard (after successful write).
+    /// Uses shard→keys index for O(shard_entries) instead of O(all_entries).
     pub fn clear_shard_entry_dirty(&mut self, shard_key: &ShardKey) {
-        for (key, entry) in self.entries.iter_mut() {
-            if key.sort_field == shard_key.sort_field && key.direction == shard_key.direction {
+        let keys: Vec<UnifiedKey> = self.shard_to_keys
+            .get(shard_key)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        for key in &keys {
+            if let Some(entry) = self.entries.get_mut(key) {
                 entry.persist_dirty = false;
             }
         }
