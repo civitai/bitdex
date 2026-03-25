@@ -189,6 +189,8 @@ pub struct ImageRow {
     pub posted_to_id: Option<i64>,
     #[sqlx(rename = "sortAt")]
     pub sort_at: Option<DateTime<Utc>>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
 }
 
 #[derive(Debug, FromRow)]
@@ -318,7 +320,8 @@ pub async fn fetch_images_by_ids(
            i.minor, i.poi, i."blockedFor", i."scannedAt"::timestamptz, i."createdAt"::timestamptz,
            i.meta,
            p."publishedAt"::timestamptz, p.availability::text, p."modelVersionId"::int8 as "postedToId",
-           GREATEST(p."publishedAt", i."scannedAt", i."createdAt")::timestamptz as "sortAt"
+           GREATEST(p."publishedAt", i."scannedAt", i."createdAt")::timestamptz as "sortAt",
+           i.width, i.height
         FROM "Image" i
         JOIN "Post" p ON p.id = i."postId"
         WHERE i.id = ANY($1)"#,
