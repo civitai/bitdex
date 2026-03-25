@@ -1050,6 +1050,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/cursors/{cursor_name}", get(handle_get_cursor))
             .route("/api/health", get(handle_health))
             .route("/debug/memory", get(handle_debug_memory))
+            .route("/debug/heap-dump", axum::routing::post(handle_heap_dump))
             .route("/api/formats", get(handle_list_formats))
             .route("/api/internal/pgsync-metrics", post(handle_pgsync_metrics))
             .route("/metrics", get(handle_metrics))
@@ -3778,6 +3779,70 @@ async fn handle_debug_memory(
             "safe_doc_cache": format!("{:.2} GB", safe_doc_cache as f64 / 1e9),
         }
     }))
+}
+
+/// Trigger a jemalloc heap profile dump. Only available with `--features heap-prof`.
+/// Returns the path to the dump file, or an error if heap profiling is not enabled.
+///
+/// Usage: POST /debug/heap-dump
+/// Optional JSON body: { "path": "/tmp/heap.prof" }
+/// Default dump path: /tmp/bitdex-heap-<timestamp>.prof
+async fn handle_heap_dump(
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    #[cfg(feature = "heap-prof")]
+    {
+        use tikv_jemalloc_ctl::raw;
+        use std::ffi::CString;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let default_path = format!("/tmp/bitdex-heap-{}.prof", timestamp);
+        let dump_path = body
+            .and_then(|b| b.get("path").and_then(|p| p.as_str().map(String::from)))
+            .unwrap_or(default_path);
+
+        // Activate profiling if not already active
+        let prof_active_key = b"prof.active\0";
+        let _ = unsafe { raw::write(prof_active_key, true) };
+
+        // Trigger dump
+        let c_path = match CString::new(dump_path.clone()) {
+            Ok(p) => p,
+            Err(e) => return Json(serde_json::json!({
+                "error": format!("invalid path: {e}"),
+            })),
+        };
+        let dump_key = b"prof.dump\0";
+        match unsafe { raw::write(dump_key, c_path.as_ptr() as *const std::ffi::c_char) } {
+            Ok(()) => {
+                eprintln!("Heap profile dumped to: {}", dump_path);
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "path": dump_path,
+                    "message": "Heap profile dumped. Use jeprof to analyze.",
+                }))
+            }
+            Err(e) => {
+                Json(serde_json::json!({
+                    "error": format!("prof.dump failed: {e}"),
+                    "hint": "Ensure MALLOC_CONF=prof:true is set at startup",
+                }))
+            }
+        }
+    }
+
+    #[cfg(not(feature = "heap-prof"))]
+    {
+        let _ = body; // suppress unused warning
+        Json(serde_json::json!({
+            "error": "Heap profiling not enabled. Build with --features heap-prof",
+            "hint": "cargo build --release --features 'server,heap-prof'",
+        }))
+    }
 }
 
 async fn handle_list_formats(State(state): State<SharedState>) -> impl IntoResponse {
