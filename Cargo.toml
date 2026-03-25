@@ -177,3 +177,8 @@ path = "src/bin/rebuild_bench.rs"
 name = "load_from_csv"
 path = "examples/load_from_csv.rs"
 required-features = ["pg-sync"]
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
