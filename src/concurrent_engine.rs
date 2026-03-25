@@ -687,7 +687,7 @@ impl ConcurrentEngine {
                 tb_config.range_buckets.clone(),
             );
 
-            // Restore persisted time bucket bitmaps from disk
+            // Restore persisted time bucket bitmaps + cutoffs from disk
             if let Some(ref ms) = meta_store {
                 match ms.load_time_buckets() {
                     Ok(persisted) if !persisted.is_empty() => {
@@ -697,6 +697,21 @@ impl ConcurrentEngine {
                             .as_secs();
                         let count = persisted.len();
                         tb.load_persisted(&persisted, now);
+
+                        // Restore persisted cutoffs (for boot diff computation)
+                        for (name, _) in &persisted {
+                            match ms.load_time_bucket_cutoff(name) {
+                                Ok(cutoff) if cutoff > 0 => {
+                                    if let Some(bucket) = tb.get_bucket_mut(name) {
+                                        bucket.set_last_cutoff(cutoff);
+                                        eprintln!("  Restored cutoff for '{}': {}", name, cutoff);
+                                    }
+                                }
+                                Ok(_) => {} // no persisted cutoff — first boot
+                                Err(e) => eprintln!("Warning: failed to load cutoff for '{}': {e}", name),
+                            }
+                        }
+
                         eprintln!("Restored {count} time bucket bitmaps from disk");
                     }
                     Ok(_) => {}
@@ -707,17 +722,18 @@ impl ConcurrentEngine {
             Arc::new(parking_lot::Mutex::new(tb))
         });
 
-        // Initialize pending bucket diffs (load from append-only log on disk)
+        // Initialize pending bucket diffs (load from append-only log on disk + compute boot diff)
         let pending_bucket_diffs = {
             let max_diffs = 100; // ~8 hours at 300s intervals
             let mut pending = crate::bucket_diff_log::PendingBucketDiffs::new(max_diffs);
+            let diff_log_path = config.storage.bitmap_path.as_ref()
+                .map(|bp| std::path::Path::new(bp).join("bucket_diffs.log"));
 
-            // Load persisted diffs from disk if storage is configured
-            if let Some(ref bp) = config.storage.bitmap_path {
-                let log_path = std::path::Path::new(bp).join("bucket_diffs.log");
+            // Step 1: Load persisted diffs from append-only log
+            if let Some(ref log_path) = diff_log_path {
                 if log_path.exists() {
                     let log = crate::bucket_diff_log::BucketDiffLog::new(
-                        log_path, max_diffs, 0.3,
+                        log_path.clone(), max_diffs, 0.3,
                     );
                     match log.read_retained() {
                         Ok(diffs) if !diffs.is_empty() => {
@@ -728,6 +744,118 @@ impl ConcurrentEngine {
                         }
                         Ok(_) => {}
                         Err(e) => eprintln!("Warning: failed to load bucket diffs: {e}"),
+                    }
+                }
+            }
+
+            // Step 2: Compute boot diff to cover the gap between persisted diffs and now.
+            // The sort field for time buckets was eagerly loaded above, so it's available in `sorts`.
+            if let Some(ref tb_config) = config.time_buckets {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                if let Some(ref tb_arc) = time_buckets {
+                    let tb = tb_arc.lock();
+                    let sort_field_name = tb.sort_field_name().to_string();
+                    drop(tb);
+
+                    if let Some(sort_field) = sorts.get_field(&sort_field_name) {
+                        let tb = tb_arc.lock();
+
+                        for bucket_config in &tb_config.range_buckets {
+                            let bucket_name = &bucket_config.name;
+                            if let Some(bucket) = tb.get_bucket(bucket_name) {
+                                let current_cutoff = crate::bucket_diff_log::snap_cutoff(
+                                    now_secs.saturating_sub(bucket_config.duration_secs),
+                                    bucket_config.refresh_interval_secs,
+                                );
+
+                                // Determine where persisted diffs leave off
+                                let persisted_cutoff = if pending.current_cutoff() > 0 {
+                                    pending.current_cutoff()
+                                } else {
+                                    bucket.last_cutoff()
+                                };
+
+                                if current_cutoff > persisted_cutoff && persisted_cutoff > 0 {
+                                    // Gap exists — compute boot diff by scanning bucket bitmap
+                                    let gap_secs = current_cutoff - persisted_cutoff;
+
+                                    // Safety check: if gap > bucket duration, the persisted bitmap
+                                    // is meaningless. The flush thread will do a full rebuild on
+                                    // the first refresh cycle. Don't compute a boot diff.
+                                    if gap_secs > bucket_config.duration_secs {
+                                        eprintln!("Boot diff: gap {}s exceeds bucket duration {}s for '{}' — skipping (full rebuild on first refresh)",
+                                            gap_secs, bucket_config.duration_secs, bucket_name);
+                                        continue;
+                                    }
+
+                                    let bucket_bm = bucket.bitmap();
+                                    let old_cutoff_u32 = persisted_cutoff as u32;
+                                    let new_cutoff_u32 = current_cutoff as u32;
+
+                                    let start = std::time::Instant::now();
+                                    let mut expired = roaring::RoaringBitmap::new();
+                                    for slot in bucket_bm.iter() {
+                                        let val = sort_field.reconstruct_value(slot);
+                                        if val >= old_cutoff_u32 && val < new_cutoff_u32 {
+                                            expired.insert(slot);
+                                        }
+                                    }
+                                    let boot_elapsed = start.elapsed();
+
+                                    let expired_count = expired.len();
+                                    eprintln!("Boot diff for '{}': gap={}s, scanned {} bucket slots, found {} expired in {:?}",
+                                        bucket_name, gap_secs, bucket_bm.len(), expired_count, boot_elapsed);
+
+                                    if expired_count > 0 || gap_secs > 0 {
+                                        let diff = crate::bucket_diff_log::BucketDiff {
+                                            cutoff_before: persisted_cutoff,
+                                            cutoff_after: current_cutoff,
+                                            expired: std::sync::Arc::new(expired),
+                                        };
+
+                                        // Append boot diff to on-disk log
+                                        if let Some(ref log_path) = diff_log_path {
+                                            let log = crate::bucket_diff_log::BucketDiffLog::new(
+                                                log_path.clone(), max_diffs, 0.3,
+                                            );
+                                            if let Err(e) = log.append(&diff) {
+                                                eprintln!("Warning: failed to append boot diff to log: {e}");
+                                            }
+                                        }
+
+                                        pending.push(diff);
+                                    }
+                                } else if persisted_cutoff == 0 {
+                                    eprintln!("Boot diff: no persisted cutoff for '{}' — first boot, full rebuild on first refresh", bucket_name);
+                                } else {
+                                    eprintln!("Boot diff: '{}' already current (persisted={}, current={})", bucket_name, persisted_cutoff, current_cutoff);
+                                }
+                            }
+                        }
+
+                        drop(tb);
+
+                        // Also apply boot diffs to the bucket bitmaps themselves
+                        if pending.current_cutoff() > 0 {
+                            let mut tb = tb_arc.lock();
+                            for bucket_config in &tb_config.range_buckets {
+                                if let Some(bucket) = tb.get_bucket_mut(&bucket_config.name) {
+                                    let new_cutoff = crate::bucket_diff_log::snap_cutoff(
+                                        now_secs.saturating_sub(bucket_config.duration_secs),
+                                        bucket_config.refresh_interval_secs,
+                                    );
+                                    if new_cutoff > bucket.last_cutoff() {
+                                        bucket.subtract_expired(pending.merged_expired(), new_cutoff);
+                                        eprintln!("Applied boot diff to '{}' bucket bitmap (cutoff → {})",
+                                            bucket_config.name, new_cutoff);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2045,13 +2173,24 @@ impl ConcurrentEngine {
                             }
                         }
 
-                        // Persist time bucket bitmaps (MetaStore, unchanged)
+                        // Persist time bucket bitmaps + cutoffs (MetaStore)
                         if let Some(ref tb_arc) = merge_time_buckets {
                             let tb = tb_arc.lock();
                             for (name, bitmap) in tb.all_buckets() {
                                 if !bitmap.is_empty() {
                                     if let Err(e) = ms_.write_time_bucket(name, bitmap) {
                                         eprintln!("merge thread: time bucket write failed: {e}");
+                                    }
+                                }
+                            }
+                            // Persist last_cutoff for each bucket (for boot diff recovery)
+                            for bucket_name in tb.bucket_names() {
+                                if let Some(bucket) = tb.get_bucket(&bucket_name) {
+                                    let cutoff = bucket.last_cutoff();
+                                    if cutoff > 0 {
+                                        if let Err(e) = ms_.write_time_bucket_cutoff(&bucket_name, cutoff) {
+                                            eprintln!("merge thread: time bucket cutoff write failed: {e}");
+                                        }
                                     }
                                 }
                             }

@@ -139,6 +139,25 @@ impl MetaStore {
         Ok(result)
     }
 
+    /// Write a time bucket's last_cutoff to disk for incremental diff recovery on restart.
+    pub fn write_time_bucket_cutoff(&self, name: &str, cutoff: u64) -> io::Result<()> {
+        let path = self.root.join("time_buckets").join(format!("{}.cutoff", name));
+        write_atomic(&path, &cutoff.to_le_bytes())
+    }
+
+    /// Load a time bucket's persisted last_cutoff. Returns 0 if not found.
+    pub fn load_time_bucket_cutoff(&self, name: &str) -> io::Result<u64> {
+        let path = self.root.join("time_buckets").join(format!("{}.cutoff", name));
+        match fs::read(&path) {
+            Ok(data) if data.len() == 8 => {
+                Ok(u64::from_le_bytes(data[..8].try_into().unwrap()))
+            }
+            Ok(_) => Ok(0),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Cursors
     // -----------------------------------------------------------------------
