@@ -3596,6 +3596,7 @@ impl ConcurrentEngine {
                     let mut uc = self.unified_cache.lock();
                     let mut loaded = 0usize;
                     let mut skipped = 0usize;
+                    uc.begin_restore(); // Skip per-insert eviction during shard restore
                     for se in shard_entries {
                         // Skip entries not in meta-index (orphan from crash)
                         if !uc.meta().is_registered(se.entry_id) {
@@ -3635,6 +3636,7 @@ impl ConcurrentEngine {
                         loaded += 1;
                         self.boundstore_entries_restored.fetch_add(1, Ordering::Relaxed);
                     }
+                    uc.finish_restore(); // Single eviction pass to bring cache under budget
                     uc.mark_shard_loaded(sort_field, direction);
                     self.boundstore_shard_loads.fetch_add(1, Ordering::Relaxed);
                     self.boundstore_entries_skipped.fetch_add(skipped as u64, Ordering::Relaxed);
