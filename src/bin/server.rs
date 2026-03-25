@@ -41,6 +41,7 @@ struct Config {
     enable_traces: bool,
     admin_token: Option<String>,
     max_query_concurrency: u32,
+    trace_buffer_size: usize,
 }
 
 /// Get the directory containing the current executable.
@@ -85,6 +86,7 @@ fn parse_config() -> Config {
     let mut cli_log_level: Option<String> = None;
     let mut cli_enable_traces = false;
     let mut cli_max_query_concurrency: Option<u32> = None;
+    let mut cli_trace_buffer_size: Option<usize> = None;
 
     let mut i = 1;
     while i < cli_args.len() {
@@ -123,6 +125,10 @@ fn parse_config() -> Config {
                 i += 1;
                 cli_max_query_concurrency = Some(cli_args[i].parse().expect("--max-query-concurrency must be a number"));
             }
+            "--trace-buffer-size" => {
+                i += 1;
+                cli_trace_buffer_size = Some(cli_args[i].parse().expect("--trace-buffer-size must be a number"));
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -140,10 +146,11 @@ fn parse_config() -> Config {
     let mut enable_traces = false;
     let mut admin_token: Option<String> = None;
     let mut max_query_concurrency: u32 = 0;
+    let mut trace_buffer_size: usize = 1000;
 
     // --- Config file ---
     // Only auto-generate bitdex.toml if no CLI args were passed at all
-    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_index.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some() || cli_log_level.is_some() || cli_enable_traces || cli_max_query_concurrency.is_some();
+    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_index.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some() || cli_log_level.is_some() || cli_enable_traces || cli_max_query_concurrency.is_some() || cli_trace_buffer_size.is_some();
     let config_path = match &cli_config {
         Some(path) => path.clone(),
         None => {
@@ -184,6 +191,9 @@ fn parse_config() -> Config {
         if let Some(v) = table.get("max_query_concurrency").and_then(|v| v.as_integer()) {
             max_query_concurrency = v as u32;
         }
+        if let Some(v) = table.get("trace_buffer_size").and_then(|v| v.as_integer()) {
+            trace_buffer_size = v as usize;
+        }
     }
 
     // --- CLI flags override everything ---
@@ -208,6 +218,9 @@ fn parse_config() -> Config {
     if let Some(v) = cli_max_query_concurrency {
         max_query_concurrency = v;
     }
+    if let Some(v) = cli_trace_buffer_size {
+        trace_buffer_size = v;
+    }
 
     // Env var overrides TOML for admin token (safer for deployments)
     if let Ok(v) = std::env::var("BITDEX_ADMIN_TOKEN") {
@@ -216,7 +229,7 @@ fn parse_config() -> Config {
         }
     }
 
-    Config { port, data_dir, index: cli_index, rebuild, default_query_format, log_level, enable_traces, admin_token, max_query_concurrency }
+    Config { port, data_dir, index: cli_index, rebuild, default_query_format, log_level, enable_traces, admin_token, max_query_concurrency, trace_buffer_size }
 }
 
 #[tokio::main]
@@ -266,6 +279,10 @@ async fn main() {
         server = server.with_default_query_format(fmt);
     }
     server = server.with_admin_token(config.admin_token);
+    if config.trace_buffer_size != 1000 {
+        eprintln!("  trace-buffer-size: {}", config.trace_buffer_size);
+        server = server.with_trace_buffer_size(config.trace_buffer_size);
+    }
     if config.max_query_concurrency > 0 {
         eprintln!("  max-query-concurrency: {}", config.max_query_concurrency);
         server = server.with_max_query_concurrency(config.max_query_concurrency);

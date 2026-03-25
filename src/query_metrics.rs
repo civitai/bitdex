@@ -5,6 +5,7 @@
 //! ring buffer (`TraceBuffer`) — no disk I/O. Retrieved via the `/traces` endpoint.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
@@ -122,20 +123,21 @@ const DEFAULT_CAPACITY: usize = 1000;
 
 pub struct TraceBuffer {
     buf: Mutex<VecDeque<QueryTrace>>,
-    capacity: usize,
+    capacity: AtomicUsize,
 }
 
 impl TraceBuffer {
     pub fn new(capacity: usize) -> Self {
         Self {
             buf: Mutex::new(VecDeque::with_capacity(capacity)),
-            capacity,
+            capacity: AtomicUsize::new(capacity),
         }
     }
 
     pub fn push(&self, trace: QueryTrace) {
+        let cap = self.capacity.load(Ordering::Relaxed);
         let mut buf = self.buf.lock().unwrap();
-        if buf.len() >= self.capacity {
+        while buf.len() >= cap {
             buf.pop_front();
         }
         buf.push_back(trace);
@@ -145,6 +147,22 @@ impl TraceBuffer {
         let buf = self.buf.lock().unwrap();
         let skip = buf.len().saturating_sub(n);
         buf.iter().skip(skip).cloned().collect()
+    }
+
+    /// Resize the ring buffer capacity. If the new capacity is smaller than
+    /// the current number of entries, the oldest entries are dropped.
+    pub fn resize(&self, new_capacity: usize) {
+        let mut buf = self.buf.lock().unwrap();
+        // Drop oldest entries if shrinking
+        while buf.len() > new_capacity {
+            buf.pop_front();
+        }
+        self.capacity.store(new_capacity, Ordering::Relaxed);
+    }
+
+    /// Return the current capacity.
+    pub fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::Relaxed)
     }
 }
 
@@ -357,5 +375,62 @@ mod tests {
         let limited = buf.last_n(1);
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].result_count, 4);
+    }
+
+    #[test]
+    fn test_trace_buffer_resize_grow() {
+        let buf = super::TraceBuffer::new(2);
+        let make_trace = |n: u64| QueryTrace {
+            ts: String::new(), index: "t".into(), total_us: n, plan_us: 0,
+            filter_us: 0, sort_us: 0, result_count: n, docs_us: 0,
+            docs_count: 0, cache_hit: false, clauses: vec![], sort: None,
+            lazy_load_us: 0,
+        };
+
+        buf.push(make_trace(1));
+        buf.push(make_trace(2));
+        assert_eq!(buf.capacity(), 2);
+        assert_eq!(buf.last_n(10).len(), 2);
+
+        // Grow: existing entries preserved, new pushes don't evict
+        buf.resize(5);
+        assert_eq!(buf.capacity(), 5);
+        assert_eq!(buf.last_n(10).len(), 2);
+        buf.push(make_trace(3));
+        buf.push(make_trace(4));
+        buf.push(make_trace(5));
+        assert_eq!(buf.last_n(10).len(), 5);
+    }
+
+    #[test]
+    fn test_trace_buffer_resize_shrink() {
+        let buf = super::TraceBuffer::new(5);
+        let make_trace = |n: u64| QueryTrace {
+            ts: String::new(), index: "t".into(), total_us: n, plan_us: 0,
+            filter_us: 0, sort_us: 0, result_count: n, docs_us: 0,
+            docs_count: 0, cache_hit: false, clauses: vec![], sort: None,
+            lazy_load_us: 0,
+        };
+
+        for i in 1..=5 {
+            buf.push(make_trace(i));
+        }
+        assert_eq!(buf.last_n(10).len(), 5);
+
+        // Shrink: oldest entries dropped immediately
+        buf.resize(2);
+        assert_eq!(buf.capacity(), 2);
+        let traces = buf.last_n(10);
+        assert_eq!(traces.len(), 2);
+        // Should keep the two newest (4, 5)
+        assert_eq!(traces[0].result_count, 4);
+        assert_eq!(traces[1].result_count, 5);
+
+        // Next push respects new capacity
+        buf.push(make_trace(6));
+        let traces = buf.last_n(10);
+        assert_eq!(traces.len(), 2);
+        assert_eq!(traces[0].result_count, 5);
+        assert_eq!(traces[1].result_count, 6);
     }
 }
