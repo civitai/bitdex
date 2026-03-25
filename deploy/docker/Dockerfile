@@ -15,7 +15,7 @@ RUN sed -i 's/members = \[".", "scratch"\]/members = ["."]/' Cargo.toml
 ARG TARGET_CPU=native
 ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 
-RUN cargo build --release --features server,heap-prof --bin bitdex-server && \
+RUN cargo build --profile profiling --features server,heap-prof --bin bitdex-server && \
     cargo build --release --features pg-sync --bin bitdex-pg-sync
 
 # --- Runtime ---
@@ -25,7 +25,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/bitdex-server /usr/local/bin/bitdex-server
+COPY --from=builder /build/target/profiling/bitdex-server /usr/local/bin/bitdex-server
 COPY --from=builder /build/target/release/bitdex-pg-sync /usr/local/bin/bitdex-pg-sync
 COPY --from=builder /build/static /opt/bitdex/static
 
