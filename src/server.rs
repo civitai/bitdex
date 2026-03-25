@@ -3792,7 +3792,6 @@ async fn handle_heap_dump(
 ) -> impl IntoResponse {
     #[cfg(feature = "heap-prof")]
     {
-        use tikv_jemalloc_ctl::raw;
         use std::ffi::CString;
 
         let timestamp = std::time::SystemTime::now()
@@ -3806,18 +3805,30 @@ async fn handle_heap_dump(
             .unwrap_or(default_path);
 
         // Activate profiling if not already active
-        let prof_active_key = b"prof.active\0";
-        let _ = unsafe { raw::write(prof_active_key, true) };
+        if let Err(e) = tikv_jemalloc_ctl::prof::active::write(true) {
+            eprintln!("Warning: prof.active write failed (may already be active): {e}");
+        }
 
-        // Trigger dump
+        // Trigger dump via mallctl. prof.dump takes a const char* filename.
+        // We use raw mallctl because the typed API doesn't expose prof.dump directly.
         let c_path = match CString::new(dump_path.clone()) {
             Ok(p) => p,
             Err(e) => return Json(serde_json::json!({
                 "error": format!("invalid path: {e}"),
             })),
         };
-        let dump_key = b"prof.dump\0";
-        match unsafe { raw::write(dump_key, c_path.as_ptr() as *const std::ffi::c_char) } {
+
+        // mallctl("prof.dump", NULL, NULL, &filename_ptr, sizeof(ptr))
+        let ptr = c_path.as_ptr();
+        let result = unsafe {
+            tikv_jemalloc_ctl::raw::write(
+                b"prof.dump\0",
+                ptr as *const _ as *const u8,
+                std::mem::size_of::<*const std::ffi::c_char>(),
+            )
+        };
+
+        match result {
             Ok(()) => {
                 eprintln!("Heap profile dumped to: {}", dump_path);
                 Json(serde_json::json!({
@@ -3827,9 +3838,16 @@ async fn handle_heap_dump(
                 }))
             }
             Err(e) => {
+                // Check if profiling is actually enabled
+                let prof_enabled = tikv_jemalloc_ctl::opt::prof::read().unwrap_or(false);
                 Json(serde_json::json!({
                     "error": format!("prof.dump failed: {e}"),
-                    "hint": "Ensure MALLOC_CONF=prof:true is set at startup",
+                    "prof_enabled": prof_enabled,
+                    "hint": if prof_enabled {
+                        "Profiling is enabled but dump failed. Check file permissions."
+                    } else {
+                        "Profiling not enabled. Set _RJEM_MALLOC_CONF=prof:true before starting."
+                    },
                 }))
             }
         }
