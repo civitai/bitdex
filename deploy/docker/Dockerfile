@@ -31,5 +31,8 @@ COPY --from=builder /build/static /opt/bitdex/static
 
 VOLUME /data
 EXPOSE 3000
+# Force jemalloc to release freed memory immediately instead of caching it.
+# _RJEM_ prefix required for tikv-jemallocator's prefixed build.
+ENV _RJEM_MALLOC_CONF="dirty_decay_ms:0,muzzy_decay_ms:0"
 ENTRYPOINT ["bitdex-server"]
 CMD ["--data-dir", "/data"]
