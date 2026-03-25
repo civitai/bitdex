@@ -1159,11 +1159,11 @@ impl UnifiedCache {
 
         // Skip per-insert eviction during restore — batch evict at the end
         if !self.restoring {
-            while (self.total_bytes + bytes > self.config.max_bytes
+            if (self.total_bytes + bytes > self.config.max_bytes
                 || self.entries.len() >= self.config.max_entries)
                 && !self.entries.is_empty()
             {
-                self.evict_lru();
+                self.evict_batch();
             }
         }
 
@@ -1181,16 +1181,59 @@ impl UnifiedCache {
     }
 
     /// Finish restore mode: run a single eviction pass to bring the cache under budget.
+    ///
+    /// Uses sort-once-remove-N approach: O(n log n) instead of the old O(n²)
+    /// loop that called evict_lru() repeatedly (each call did O(n) linear scan).
     pub fn finish_restore(&mut self) {
         self.restoring = false;
-        // Single eviction pass to bring cache under budget
+
+        let over_bytes = self.total_bytes > self.config.max_bytes;
+        let over_entries = self.entries.len() > self.config.max_entries;
+        if !over_bytes && !over_entries {
+            return;
+        }
+
+        // Collect all entries sorted by last_used (oldest first)
+        let mut candidates: Vec<(Instant, UnifiedKey)> = if self.persistence_enabled {
+            let non_dirty: Vec<_> = self.entries.iter()
+                .filter(|(_, e)| !e.persist_dirty)
+                .map(|(k, e)| (e.last_used, k.clone()))
+                .collect();
+            if non_dirty.is_empty() {
+                self.entries.iter()
+                    .map(|(k, e)| (e.last_used, k.clone()))
+                    .collect()
+            } else {
+                non_dirty
+            }
+        } else {
+            self.entries.iter()
+                .map(|(k, e)| (e.last_used, k.clone()))
+                .collect()
+        };
+        candidates.sort_unstable_by_key(|(t, _)| *t);
+
+        // Remove oldest entries until under budget
         let mut evicted = 0usize;
-        while (self.total_bytes > self.config.max_bytes
-            || self.entries.len() > self.config.max_entries)
-            && !self.entries.is_empty()
-        {
-            self.evict_lru();
-            evicted += 1;
+        for (_, key) in &candidates {
+            if self.total_bytes <= self.config.max_bytes
+                && self.entries.len() <= self.config.max_entries
+            {
+                break;
+            }
+            if let Some(entry) = self.entries.remove(key) {
+                self.total_bytes = self.total_bytes.saturating_sub(entry.memory_bytes());
+                self.meta_id_to_key.remove(&entry.meta_id);
+                let sk = ShardKey::new(key.sort_field.clone(), key.direction);
+                if let Some(set) = self.shard_to_keys.get_mut(&sk) {
+                    set.remove(key);
+                }
+                self.evictions += 1;
+                if !self.persistence_enabled {
+                    self.meta.deregister(entry.meta_id);
+                }
+                evicted += 1;
+            }
         }
         if evicted > 0 {
             eprintln!("BoundStore restore: evicted {evicted} entries to fit budget ({}MB / {}MB)",
@@ -3695,5 +3738,46 @@ mod tests {
 
         assert_eq!(single_has_10, two_has_10, "Two-phase should produce same result as single-phase");
         assert!(two_has_10, "Both should have slot 10");
+    }
+
+    #[test]
+    fn test_finish_restore_batch_eviction() {
+        // Verify finish_restore uses O(n log n) batch eviction, not O(n²) per-item.
+        // With 10 entries and max_entries=5, it should evict 5 in one sorted pass.
+        let config = UnifiedCacheConfig {
+            max_entries: 5,
+            max_bytes: usize::MAX, // only constrain by entry count
+            initial_capacity: 10,
+            max_capacity: 10,
+            min_filter_size: 0,
+            ..Default::default()
+        };
+        let mut cache = UnifiedCache::new(config);
+        cache.begin_restore();
+
+        // Insert 10 entries via insert_restored_entry (the actual restore path)
+        for i in 0..10u32 {
+            let key = make_key(
+                &[("nsfwLevel", "eq", &i.to_string())],
+                "reactionCount",
+                SortDirection::Desc,
+            );
+            let meta_id = cache.meta_mut().register(
+                &key.filter_clauses,
+                Some(&key.sort_field),
+                Some(key.direction),
+            );
+            let slots: Vec<u32> = (0..10).collect();
+            let entry = UnifiedEntry::new(
+                &slots, 10, 10, true, 100, meta_id, SortDirection::Desc, |s| 1000 - s,
+            );
+            cache.insert_restored_entry(key, entry);
+        }
+        assert_eq!(cache.len(), 10, "All 10 should be stored during restore");
+
+        // finish_restore should evict down to max_entries=5
+        cache.finish_restore();
+        assert_eq!(cache.len(), 5, "Should evict down to max_entries");
+        assert_eq!(cache.evictions, 5, "Should have evicted exactly 5");
     }
 }
