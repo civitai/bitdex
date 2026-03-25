@@ -18,8 +18,13 @@
 //!   --default-format <FMT>        Default query format: bitdex, compact, meilisearch (default: bitdex)
 //!   --max-query-concurrency <N>   Max concurrent queries; 0 = unlimited (default: 0)
 
+#[cfg(not(feature = "heap-prof"))]
 #[global_allocator]
 static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
+
+#[cfg(feature = "heap-prof")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
