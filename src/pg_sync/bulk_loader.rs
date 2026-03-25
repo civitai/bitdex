@@ -564,6 +564,16 @@ pub async fn run_bulk_load_copy(
     let availability_dict = crate::dictionary::FieldDictionary::new();
     let blocked_for_dict = crate::dictionary::FieldDictionary::new();
     let mut image_accum = BitmapAccum::new(&filter_names, &sort_configs);
+
+    // Deferred alive: collect future-dated slots to defer activation
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let deferred_alive_config = config.deferred_alive.as_ref();
+    let mut deferred_slots: std::collections::BTreeMap<u64, Vec<u32>> =
+        std::collections::BTreeMap::new();
+    let mut deferred_count = 0u64;
     let img_file = std::io::BufReader::with_capacity(
         4 * 1024 * 1024,
         std::fs::File::open(stage_dir.join("images.csv"))
@@ -614,15 +624,29 @@ pub async fn run_bulk_load_copy(
             published_at_ms,
         });
 
-        image_accum.alive.insert(slot);
+        // Deferred alive check: if publishedAt is in the future, defer this slot.
+        // The slot gets its scalars stored but NO alive/filter/sort bits are set.
+        // The flush thread will activate it via activate_due() when the time arrives.
+        let published_at_secs = row.published_at_secs.unwrap_or(0) as u64;
+        if deferred_alive_config.is_some() && published_at_secs > now_unix {
+            deferred_slots
+                .entry(published_at_secs)
+                .or_default()
+                .push(slot);
+            deferred_count += 1;
+            // Still store scalars (above) so docstore has the data for activation,
+            // but skip alive + filter/sort bitmaps — the slot is invisible until activated.
+        } else {
+            image_accum.alive.insert(slot);
 
-        // Build filter/sort bitmaps directly (same logic as copy_streams)
-        copy_streams::build_image_bitmaps(
-            &row, slot, sort_at, schema,
-            &type_dict, &availability_dict, &blocked_for_dict,
-            &filter_set, &sort_bits,
-            &mut image_accum.filter_maps, &mut image_accum.sort_maps,
-        );
+            // Build filter/sort bitmaps directly (same logic as copy_streams)
+            copy_streams::build_image_bitmaps(
+                &row, slot, sort_at, schema,
+                &type_dict, &availability_dict, &blocked_for_dict,
+                &filter_set, &sort_bits,
+                &mut image_accum.filter_maps, &mut image_accum.sort_maps,
+            );
+        }
 
         img_total += 1;
         if img_total % 1_000_000 == 0 {
@@ -635,6 +659,9 @@ pub async fn run_bulk_load_copy(
     eprintln!("  images: complete — {} rows in {:.1}s ({:.0}/s)",
         img_total, img_start.elapsed().as_secs_f64(),
         img_total as f64 / img_start.elapsed().as_secs_f64().max(0.001));
+    if deferred_count > 0 {
+        eprintln!("  deferred alive: {} slots with future publishedAt (will activate later)", deferred_count);
+    }
 
     // Build tags bitmaps (NO arena writes — tags reconstructed from bitmaps at finalization)
     eprintln!("Building tags...");
@@ -842,6 +869,21 @@ pub async fn run_bulk_load_copy(
         merged.sort_maps,
         merged.alive,
     );
+
+    // Apply deferred alive slots: these have future publishedAt and should not be
+    // set alive until their activation time. The flush thread will activate them
+    // via activate_due() when the time arrives.
+    if !deferred_slots.is_empty() {
+        // Update high-water mark for deferred slots so slot allocator knows about them.
+        // schedule_alive handles both the high-water mark update and adding to the deferred map.
+        for (&activate_at, slots) in &deferred_slots {
+            for &slot in slots {
+                staging.slots.schedule_alive(slot, activate_at);
+            }
+        }
+        eprintln!("Applied {} deferred slots to staging", deferred_count);
+    }
+
     engine.publish_staging(staging);
 
     eprintln!(
@@ -865,10 +907,19 @@ pub async fn run_bulk_load_copy(
         .prepare_bulk_writer(&all_field_names)
         .map_err(|e| format!("prepare_bulk_writer: {e}"))?;
 
+    // Include deferred slots in docstore finalization — they need docstore entries
+    // so the flush thread can read them back during activate_due() to replay mutations.
+    let mut all_slots_bitmap = alive_bitmap.clone();
+    for slots in deferred_slots.values() {
+        for &slot in slots {
+            all_slots_bitmap.insert(slot);
+        }
+    }
+
     let (docs_finalized, bytes_finalized) = finalize_from_bitmaps(
         &bulk_writer,
         schema,
-        &alive_bitmap,
+        &all_slots_bitmap,
         &image_scalars,
         &resource_enrichments,
         &tag_bitmaps,

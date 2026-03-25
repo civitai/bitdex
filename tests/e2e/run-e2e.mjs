@@ -134,6 +134,11 @@ const SUITES = [
     file: 'tests/e2e/e2e-remote-dash.mjs',
     description: 'Remote dashboard endpoints (health, index discovery, stats, config patch, cache clear, traces)',
   },
+  {
+    name: 'deferred-alive',
+    file: 'tests/e2e/e2e-deferred-alive.mjs',
+    description: 'Deferred alive time-progression (future docs invisible, activation, mixed batch, negation)',
+  },
 ];
 
 // Suites that manage their own server lifecycle (not auto-run)
