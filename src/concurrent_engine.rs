@@ -3633,7 +3633,10 @@ impl ConcurrentEngine {
                         &boundstore_entries_restored, &boundstore_shard_loads, &boundstore_entries_skipped,
                     );
                 })
-                .ok(); // If spawn fails, shard stays in "loading" state — queries use slow path
+                .map_err(|e| {
+                    eprintln!("WARNING: failed to spawn shard-load thread: {e}. Shard stuck in loading state.");
+                })
+                .ok();
 
             return; // Don't block — query proceeds without cache
         }
