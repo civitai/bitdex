@@ -348,6 +348,28 @@ impl SortField {
         value
     }
 
+    /// Find all slots in the given universe whose reconstructed value
+    /// falls in `[min_value, max_value)`.
+    ///
+    /// Iterates every slot in `universe` and reconstructs its value from the
+    /// bit layers. O(universe_size * num_bits) — acceptable when the matching
+    /// fraction is small (e.g. a 300-second window out of 86400 seconds).
+    pub fn slots_in_range(
+        &self,
+        universe: &RoaringBitmap,
+        min_value: u32,
+        max_value: u32,
+    ) -> RoaringBitmap {
+        let mut result = RoaringBitmap::new();
+        for slot in universe.iter() {
+            let val = self.reconstruct_value(slot);
+            if val >= min_value && val < max_value {
+                result.insert(slot);
+            }
+        }
+        result
+    }
+
     /// Merge all bit layers, compacting diffs into bases.
     pub fn merge_all(&mut self) {
         for layer in &mut self.bit_layers {
@@ -806,5 +828,145 @@ mod tests {
         assert_eq!(sf.reconstruct_value(1), 100);
         assert_eq!(sf.reconstruct_value(2), 999);
         assert_eq!(sf.reconstruct_value(3), 300);
+    }
+
+    /// Microbenchmark: slots_in_range vs full-rebuild approach.
+    ///
+    /// Simulates realistic scale: ~1M slots with sortAt values spread across 86400 seconds,
+    /// a universe of ~700K slots (simulating a 24h alive bucket), and a target window of
+    /// 300 seconds (~0.35% of the total range).
+    ///
+    /// Run with: cargo test --lib sort::tests::bench_slots_in_range_vs_rebuild -- --nocapture
+    #[test]
+    fn bench_slots_in_range_vs_rebuild() {
+        use std::time::Instant;
+
+        let total_slots: u32 = 1_000_000;
+        let universe_size: u32 = 700_000;
+        let max_sort_value: u32 = 86_400; // seconds in a day
+        let window_start: u32 = 43_000;
+        let window_end: u32 = 43_300; // 300-second window
+
+        // Build sort field with ~1M slots, values spread across 0..86400
+        let mut sf = SortField::new(make_config("sortAt"));
+        for slot in 0..total_slots {
+            // Spread values deterministically across the range
+            let value = (slot as u64 * max_sort_value as u64 / total_slots as u64) as u32;
+            sf.insert(slot, value);
+        }
+        sf.merge_all();
+
+        // Build universe bitmap (~700K of the 1M slots)
+        let mut universe = RoaringBitmap::new();
+        for slot in 0..universe_size {
+            universe.insert(slot);
+        }
+
+        // Approach 1: slots_in_range (targeted scan of universe)
+        let start = Instant::now();
+        let range_result = sf.slots_in_range(&universe, window_start, window_end);
+        let range_elapsed = start.elapsed();
+
+        // Approach 2: full rebuild (iterate ALL alive slots, reconstruct values,
+        // build complete bucket bitmap from scratch — what current code does)
+        let start = Instant::now();
+        let mut rebuild_result = RoaringBitmap::new();
+        for slot in universe.iter() {
+            let val = sf.reconstruct_value(slot);
+            // In a full rebuild you'd bucket ALL values, not just this window.
+            // Simulate by checking the full range (every slot gets reconstructed).
+            if val >= window_start && val < window_end {
+                rebuild_result.insert(slot);
+            }
+        }
+        let rebuild_elapsed = start.elapsed();
+
+        // Both approaches should produce identical results
+        assert_eq!(range_result, rebuild_result);
+
+        // Approach 3: TRUE full rebuild — reconstruct ALL values and bucket them.
+        // This is the real cost when rebuilding a complete time bucket from scratch
+        // (e.g. what happens if you don't have an incremental range query).
+        let all_alive = {
+            let mut bm = RoaringBitmap::new();
+            for slot in 0..total_slots {
+                bm.insert(slot);
+            }
+            bm
+        };
+        let start = Instant::now();
+        let mut full_rebuild_result = RoaringBitmap::new();
+        for slot in all_alive.iter() {
+            let val = sf.reconstruct_value(slot);
+            if val >= window_start && val < window_end {
+                full_rebuild_result.insert(slot);
+            }
+        }
+        let full_rebuild_elapsed = start.elapsed();
+
+        eprintln!("--- slots_in_range microbenchmark ---");
+        eprintln!("  Total slots:     {total_slots}");
+        eprintln!("  Universe size:   {universe_size}");
+        eprintln!("  Window:          [{window_start}, {window_end}) = {} seconds", window_end - window_start);
+        eprintln!("  Matches:         {}", range_result.len());
+        eprintln!();
+        eprintln!("  slots_in_range(universe):    {:>10?}", range_elapsed);
+        eprintln!("  rebuild(universe):           {:>10?}  (same work, baseline)", rebuild_elapsed);
+        eprintln!("  rebuild(ALL alive, 1M):      {:>10?}  (full bucket rebuild)", full_rebuild_elapsed);
+        eprintln!();
+        eprintln!("  Speedup vs full rebuild:     {:.1}x",
+            full_rebuild_elapsed.as_nanos() as f64 / range_elapsed.as_nanos().max(1) as f64);
+    }
+
+    #[test]
+    fn test_slots_in_range() {
+        let mut sf = SortField::new(make_config("sortAt"));
+        // Insert slots with various values
+        sf.insert(1, 100);
+        sf.insert(2, 200);
+        sf.insert(3, 300);
+        sf.insert(4, 400);
+        sf.insert(5, 500);
+        sf.insert(6, 250);
+        sf.insert(7, 299);
+        sf.insert(8, 301);
+        sf.merge_all();
+
+        let mut universe = RoaringBitmap::new();
+        for i in 1..=8 {
+            universe.insert(i);
+        }
+
+        // [200, 400) should match slots 2 (200), 3 (300), 6 (250), 7 (299), 8 (301)
+        let result = sf.slots_in_range(&universe, 200, 400);
+        assert_eq!(result.len(), 5);
+        assert!(result.contains(2));
+        assert!(result.contains(3));
+        assert!(result.contains(6));
+        assert!(result.contains(7));
+        assert!(result.contains(8));
+        // Should NOT contain slots outside range
+        assert!(!result.contains(1)); // 100 < 200
+        assert!(!result.contains(4)); // 400 not < 400 (exclusive upper bound)
+        assert!(!result.contains(5)); // 500 >= 400
+
+        // Empty universe → empty result
+        let empty = RoaringBitmap::new();
+        assert!(sf.slots_in_range(&empty, 0, u32::MAX).is_empty());
+
+        // Range matching nothing
+        assert!(sf.slots_in_range(&universe, 600, 700).is_empty());
+
+        // Single-value range [300, 301) should match only slot 3
+        let single = sf.slots_in_range(&universe, 300, 301);
+        assert_eq!(single.len(), 1);
+        assert!(single.contains(3));
+
+        // Partial universe — only check slots in universe
+        let mut partial = RoaringBitmap::new();
+        partial.insert(1);
+        partial.insert(2);
+        let partial_result = sf.slots_in_range(&partial, 0, 1000);
+        assert_eq!(partial_result.len(), 2);
     }
 }

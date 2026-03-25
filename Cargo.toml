@@ -37,6 +37,9 @@ parking_lot = "0.12"
 crossbeam-channel = "0.5"
 arc-swap = "1"
 
+# CRC32 checksums (bucket diff log, shard store)
+crc32fast = "1"
+
 # Serialization (document store)
 rmp-serde = "1"
 zstd = "0.13"

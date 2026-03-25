@@ -17,6 +17,9 @@ pub struct TimeBucket {
     bitmap: Arc<RoaringBitmap>,
     /// Unix timestamp (seconds) when this bucket was last rebuilt.
     last_refreshed: u64,
+    /// The snapped cutoff used in the last refresh: snap(now - duration, refresh_interval).
+    /// Used for incremental rebuild: expired slots are those in [last_cutoff, new_cutoff).
+    last_cutoff: u64,
 }
 
 impl TimeBucket {
@@ -27,6 +30,7 @@ impl TimeBucket {
             refresh_interval_secs,
             bitmap: Arc::new(RoaringBitmap::new()),
             last_refreshed: 0,
+            last_cutoff: 0,
         }
     }
 
@@ -51,6 +55,31 @@ impl TimeBucket {
     /// Remove a slot from this bucket's bitmap (live maintenance on delete).
     pub fn remove_slot(&mut self, slot: u32) {
         Arc::make_mut(&mut self.bitmap).remove(slot);
+    }
+
+    /// The snapped cutoff from the last refresh.
+    pub fn last_cutoff(&self) -> u64 {
+        self.last_cutoff
+    }
+
+    /// Set the last cutoff (used when loading persisted state).
+    pub fn set_last_cutoff(&mut self, cutoff: u64) {
+        self.last_cutoff = cutoff;
+    }
+
+    /// Subtract expired slots from the bucket bitmap and update the cutoff.
+    /// Used for incremental refresh: only removes slots that aged out since
+    /// the last cutoff, instead of rebuilding the entire bitmap.
+    pub fn subtract_expired(&mut self, expired: &RoaringBitmap, new_cutoff: u64) {
+        if !expired.is_empty() {
+            let bm = Arc::make_mut(&mut self.bitmap);
+            *bm -= expired;
+        }
+        self.last_cutoff = new_cutoff;
+        self.last_refreshed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
     }
 }
 
@@ -108,11 +137,15 @@ impl TimeBucketManager {
 
     /// Load persisted bitmaps into matching buckets. Sets last_refreshed to now
     /// so the periodic refresh timer starts from the restore point.
+    /// Sets last_cutoff based on the current time and bucket duration.
     pub fn load_persisted(&mut self, persisted: &[(String, RoaringBitmap)], now: u64) {
         for (name, bitmap) in persisted {
             if let Some(bucket) = self.buckets.get_mut(name.as_str()) {
+                let cutoff = now.saturating_sub(bucket.duration_secs);
+                let snapped = crate::bucket_diff_log::snap_cutoff(cutoff, bucket.refresh_interval_secs);
                 bucket.bitmap = Arc::new(bitmap.clone());
                 bucket.last_refreshed = now;
+                bucket.last_cutoff = snapped;
             }
         }
     }
@@ -153,6 +186,7 @@ impl TimeBucketManager {
 
         let duration = bucket.duration_secs;
         let cutoff = now.saturating_sub(duration);
+        let snapped_cutoff = crate::bucket_diff_log::snap_cutoff(cutoff, bucket.refresh_interval_secs);
 
         let mut new_bitmap = RoaringBitmap::new();
         for (slot, ts) in value_iter {
@@ -163,11 +197,17 @@ impl TimeBucketManager {
 
         bucket.bitmap = Arc::new(new_bitmap);
         bucket.last_refreshed = now;
+        bucket.last_cutoff = snapped_cutoff;
     }
 
     /// Look up a bucket by name.
     pub fn get_bucket(&self, name: &str) -> Option<&TimeBucket> {
         self.buckets.get(name)
+    }
+
+    /// Mutable access to a bucket (for incremental subtract_expired).
+    pub fn get_bucket_mut(&mut self, name: &str) -> Option<&mut TimeBucket> {
+        self.buckets.get_mut(name)
     }
 
     /// Swap in a pre-built bitmap for a bucket. Used by the lock-free rebuild path
@@ -179,8 +219,11 @@ impl TimeBucketManager {
         now: u64,
     ) {
         if let Some(bucket) = self.buckets.get_mut(bucket_name) {
+            let cutoff = now.saturating_sub(bucket.duration_secs);
+            let snapped = crate::bucket_diff_log::snap_cutoff(cutoff, bucket.refresh_interval_secs);
             bucket.bitmap = Arc::new(bitmap);
             bucket.last_refreshed = now;
+            bucket.last_cutoff = snapped;
         }
     }
 
