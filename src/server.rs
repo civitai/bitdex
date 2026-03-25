@@ -842,6 +842,10 @@ struct ConfigPatch {
     /// Minimum query latency (microseconds) to record a trace. 0 = record all.
     #[serde(default)]
     trace_min_us: Option<u64>,
+    /// Resize the in-memory trace ring buffer. At 180 QPS the default 1000
+    /// entries give only ~5.5s of history — increase for cache analysis.
+    #[serde(default)]
+    trace_buffer_size: Option<usize>,
     /// Toggle expensive metric groups at runtime. Array of group names to enable.
     /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
     /// If provided, ONLY listed groups are enabled (others disabled).
@@ -904,11 +908,12 @@ pub struct BitdexServer {
     enable_traces: bool,
     admin_token: Option<String>,
     max_query_concurrency: u32,
+    trace_buffer_size: usize,
 }
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0 }
+        Self { data_dir, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0, trace_buffer_size: 1000 }
     }
 
     /// Enable rebuild mode: on startup, delete existing bitmap indexes and
@@ -928,6 +933,12 @@ impl BitdexServer {
 
     pub fn with_enable_traces(mut self, enable: bool) -> Self {
         self.enable_traces = enable;
+        self
+    }
+
+    /// Set the trace ring buffer capacity. Default is 1000 entries.
+    pub fn with_trace_buffer_size(mut self, size: usize) -> Self {
+        self.trace_buffer_size = size;
         self
     }
 
@@ -972,7 +983,7 @@ impl BitdexServer {
             enable_traces: AtomicBool::new(self.enable_traces),
             trace_min_us: AtomicU64::new(0),
             admin_token,
-            trace_buffer: crate::query_metrics::TraceBuffer::default(),
+            trace_buffer: crate::query_metrics::TraceBuffer::new(self.trace_buffer_size),
             queries_in_flight: AtomicI64::new(0),
             queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
@@ -1726,6 +1737,18 @@ async fn handle_patch_config(
                     state.trace_min_us.store(v, Ordering::Relaxed);
                     eprintln!("Config patch: trace_min_us set to {v}μs");
                 }
+                if let Some(v) = patch.trace_buffer_size {
+                    if v == 0 {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "trace_buffer_size must be > 0"
+                            })),
+                        ).into_response();
+                    }
+                    state.trace_buffer.resize(v);
+                    eprintln!("Config patch: trace_buffer_size set to {v}");
+                }
 
                 // Toggle metric groups (server-wide, not persisted)
                 if let Some(ref groups) = patch.enabled_metrics {
@@ -2233,7 +2256,10 @@ async fn handle_traces(
     }
 
     let traces = state.trace_buffer.last_n(params.last);
-    Json(serde_json::json!({ "traces": traces })).into_response()
+    Json(serde_json::json!({
+        "traces": traces,
+        "buffer_capacity": state.trace_buffer.capacity(),
+    })).into_response()
 }
 
 async fn handle_document(
