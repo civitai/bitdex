@@ -723,6 +723,7 @@ mod tests {
             flags: (1 << 13),
             image_type: String::new(), user_id: 1, blocked_for: None,
             scanned_at_secs: None, created_at_secs: None, post_id: None,
+            width: None, height: None,
             published_at_secs: None, availability: String::new(), posted_to_id: None,
         };
         assert!(row.has_meta());
@@ -739,6 +740,7 @@ mod tests {
             flags: (1 << 14),
             image_type: String::new(), user_id: 1, blocked_for: None,
             scanned_at_secs: None, created_at_secs: None, post_id: None,
+            width: None, height: None,
             published_at_secs: None, availability: String::new(), posted_to_id: None,
         };
         assert!(row.on_site());
@@ -754,6 +756,7 @@ mod tests {
             scanned_at_secs: Some(100),
             created_at_secs: Some(200),
             published_at_secs: Some(150),
+            width: None, height: None,
             availability: String::new(), posted_to_id: None, post_id: None,
         };
         assert_eq!(row.sort_at_secs(), 200);
