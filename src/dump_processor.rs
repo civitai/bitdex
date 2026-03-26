@@ -929,7 +929,7 @@ fn split_mmap_ranges(data: &[u8], num_threads: usize) -> Vec<(usize, usize)> {
 pub struct PhaseResult {
     pub row_count: u64,
     pub filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
-    pub sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
+    pub sort_maps: HashMap<String, Vec<RoaringBitmap>>,
     pub alive: RoaringBitmap,
     pub deferred_slots: BTreeMap<u64, Vec<u32>>,
     pub max_slot: u32,
@@ -1184,9 +1184,11 @@ pub fn process_dump(
         })
         .collect();
 
+    // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
+    // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
     type ThreadResult = (
         HashMap<String, HashMap<u64, RoaringBitmap>>,  // filter maps
-        HashMap<String, HashMap<usize, RoaringBitmap>>, // sort maps
+        HashMap<String, Vec<RoaringBitmap>>,            // sort maps (Vec indexed by bit pos)
         RoaringBitmap,                                   // alive
         Vec<(u32, u64)>,                                 // deferred (slot, activate_at)
         u64,                                             // count
@@ -1209,10 +1211,13 @@ pub fn process_dump(
                     filter_maps.entry(def.target.clone()).or_default();
                 }
             }
-            let mut sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>> = sort_targets
+            let mut sort_maps: HashMap<String, Vec<RoaringBitmap>> = sort_targets
                 .iter()
                 .chain(computed_sort_targets.iter())
-                .map(|(n, _)| (n.clone(), HashMap::new()))
+                .map(|(n, b)| {
+                    let layers: Vec<RoaringBitmap> = (0..*b as usize).map(|_| RoaringBitmap::new()).collect();
+                    (n.clone(), layers)
+                })
                 .collect();
             let mut alive = RoaringBitmap::new();
             let mut deferred: Vec<(u32, u64)> = Vec::new();
@@ -1342,9 +1347,7 @@ pub fn process_dump(
                             if let Some(sm) = sort_maps.get_mut(target) {
                                 for bit in 0..(bits as usize) {
                                     if (val32 >> bit) & 1 == 1 {
-                                        sm.entry(bit)
-                                            .or_insert_with(RoaringBitmap::new)
-                                            .insert(slot);
+                                        sm[bit].insert(slot);
                                     }
                                 }
                             }
@@ -1371,9 +1374,7 @@ pub fn process_dump(
                                 if let Some(sm) = sort_maps.get_mut(&def.target) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
-                                            sm.entry(bit)
-                                                .or_insert_with(RoaringBitmap::new)
-                                                .insert(slot);
+                                            sm[bit].insert(slot);
                                         }
                                     }
                                 }
@@ -1432,7 +1433,7 @@ pub fn process_dump(
 
     // Merge all thread results
     let mut merged_filters: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
-    let mut merged_sorts: HashMap<String, HashMap<usize, RoaringBitmap>> = HashMap::new();
+    let mut merged_sorts: HashMap<String, Vec<RoaringBitmap>> = HashMap::new();
     let mut merged_alive = RoaringBitmap::new();
     let mut merged_deferred: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
     let mut total_count = 0u64;
@@ -1456,9 +1457,13 @@ pub fn process_dump(
             }
         }
         for (field, layers) in sort_maps {
-            let dest = merged_sorts.entry(field).or_default();
-            for (bit, bm) in layers {
-                dest.entry(bit).and_modify(|e| *e |= &bm).or_insert(bm);
+            let dest = merged_sorts.entry(field).or_insert_with(|| {
+                (0..layers.len()).map(|_| RoaringBitmap::new()).collect()
+            });
+            for (bit, bm) in layers.into_iter().enumerate() {
+                if bit < dest.len() {
+                    dest[bit] |= bm;
+                }
             }
         }
     }
@@ -1477,13 +1482,14 @@ pub fn process_dump(
         );
     }
 
-    for (field_name, bit_map) in &merged_sorts {
-        if bit_map.is_empty() {
+    for (field_name, layers) in &merged_sorts {
+        if layers.is_empty() || layers.iter().all(|bm| bm.is_empty()) {
             continue;
         }
-        let num_bits = sort_bits.get(field_name).copied().unwrap_or(32);
-        save_sort_field_to_disk(&bitmap_fs, field_name, bit_map, num_bits)?;
-        eprintln!("  Saved sort {}: {} layers", field_name, num_bits);
+        let layer_refs: Vec<&RoaringBitmap> = layers.iter().collect();
+        bitmap_fs.write_sort_layers(field_name, &layer_refs)
+            .map_err(|e| format!("write_sort_layers({field_name}): {e}"))?;
+        eprintln!("  Saved sort {}: {} layers", field_name, layers.len());
     }
 
     if sets_alive {
