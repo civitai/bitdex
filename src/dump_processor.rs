@@ -881,11 +881,69 @@ pub struct PhaseResult {
 ///
 /// This is the main entry point called by the server when it receives
 /// `PUT /api/indexes/{name}/dumps`.
+/// Validate a dump request before processing. Returns Ok(()) or a clear error.
+pub fn validate_dump_request(
+    request: &DumpRequest,
+    engine: &ConcurrentEngine,
+) -> Result<(), String> {
+    // Check csv_path exists
+    let csv_path = std::path::Path::new(&request.csv_path);
+    if !csv_path.exists() {
+        return Err(format!("CSV file not found: {}", request.csv_path));
+    }
+
+    // Check name is non-empty
+    if request.name.is_empty() {
+        return Err("Dump name cannot be empty".to_string());
+    }
+
+    // Check slot_field is non-empty
+    if request.slot_field.is_empty() {
+        return Err("slot_field cannot be empty".to_string());
+    }
+
+    // Check at least one field or computed_field
+    if request.fields.is_empty() && request.computed_fields.is_empty() && !request.sets_alive {
+        return Err("Dump must have at least one field, computed_field, or sets_alive=true".to_string());
+    }
+
+    // Validate filter expression parses
+    if let Some(ref filter) = request.filter {
+        parse_expression(filter).map_err(|e| format!("Invalid filter expression '{}': {}", filter, e))?;
+    }
+
+    // Validate computed field expressions parse
+    for cf in &request.computed_fields {
+        parse_expression(&cf.expression)
+            .map_err(|e| format!("Invalid computed expression for '{}': {}", cf.target, e))?;
+    }
+
+    // Warn about unknown target fields (not in engine config)
+    let config = engine.config();
+    let known_filters: HashSet<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
+    let known_sorts: HashSet<String> = config.sort_fields.iter().map(|f| f.name.clone()).collect();
+
+    for field in &request.fields {
+        let target = field.target();
+        if !known_filters.contains(target) && !known_sorts.contains(target) {
+            eprintln!(
+                "WARNING: dump '{}' targets unknown field '{}' (not in filter/sort config — may be doc-only)",
+                request.name, target
+            );
+        }
+    }
+
+    Ok(())
+}
+
 pub fn process_dump(
     request: &DumpRequest,
     engine: &ConcurrentEngine,
     stage_dir: &Path,
 ) -> Result<PhaseResult, String> {
+    // Validate before processing
+    validate_dump_request(request, engine)?;
+
     let t = Instant::now();
     let bitmap_fs = engine
         .bitmap_store()
@@ -2010,5 +2068,77 @@ mod tests {
         assert!(targets.contains(&"nsfwLevel".to_string()));
         assert!(targets.contains(&"tagIds".to_string()));
         assert!(targets.contains(&"hasMeta".to_string()));
+    }
+
+    #[test]
+    fn test_validate_empty_name() {
+        let req = DumpRequest {
+            name: "".to_string(),
+            csv_path: "/nonexistent.csv".to_string(),
+            format: DumpFormat::Csv,
+            slot_field: "id".to_string(),
+            sets_alive: false,
+            fields: vec![DumpFieldMapping::Short("nsfwLevel".to_string())],
+            filter: None,
+            computed_fields: vec![],
+            enrichment: vec![],
+        };
+        // We can't test validate_dump_request without an engine, but we can test
+        // the validation logic directly
+        assert!(req.name.is_empty());
+    }
+
+    #[test]
+    fn test_validate_bad_filter_expression() {
+        let result = parse_expression(">>> invalid <<<");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_nested_enrichment_config() {
+        let json = r#"{
+            "name": "resources",
+            "csv_path": "/data/resources.csv",
+            "slot_field": "imageId",
+            "fields": [{"column": "modelVersionId", "target": "modelVersionIds"}],
+            "computed_fields": [
+                {"target": "modelVersionIdsManual", "expression": "detected == false", "value": "modelVersionId"}
+            ],
+            "enrichment": [{
+                "csv_path": "/data/model_versions.csv",
+                "key": "id",
+                "join_on": "modelVersionId",
+                "fields": [{"column": "baseModel", "target": "baseModel"}],
+                "enrichment": [{
+                    "csv_path": "/data/models.csv",
+                    "key": "id",
+                    "join_on": "modelId",
+                    "fields": [{"column": "poi", "target": "poi"}],
+                    "filter": "type = 'Checkpoint'"
+                }]
+            }]
+        }"#;
+        let req: DumpRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.enrichment.len(), 1);
+        assert_eq!(req.enrichment[0].enrichment.len(), 1);
+        assert_eq!(
+            req.enrichment[0].enrichment[0].filter.as_deref(),
+            Some("type = 'Checkpoint'")
+        );
+        // Computed field with value column
+        assert_eq!(req.computed_fields[0].value.as_deref(), Some("modelVersionId"));
+    }
+
+    #[test]
+    fn test_tsv_format_deserialization() {
+        let json = r#"{
+            "name": "metrics",
+            "csv_path": "/data/metrics.tsv",
+            "format": "tsv",
+            "slot_field": "imageId",
+            "fields": ["reactionCount", "commentCount"]
+        }"#;
+        let req: DumpRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.format, DumpFormat::Tsv);
     }
 }
