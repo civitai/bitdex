@@ -518,10 +518,11 @@ pub fn process_wal_dump(
     (total_applied, total_errors, start.elapsed().as_secs_f64())
 }
 
-/// Direct dump pipeline: CSV → rayon parallel parse → BitmapAccum → apply.
+/// Direct dump pipeline: CSV → chunked reader → rayon parallel parse → BitmapAccum → apply.
 ///
-/// Bypasses WAL entirely. Uses rayon fold+reduce for parallel CSV parsing,
-/// matching the single-pass loader's throughput pattern.
+/// Bypasses WAL entirely. Uses a reader thread + rayon fold+reduce for parallel
+/// CSV parsing, matching the single-pass loader's throughput pattern. Memory-safe
+/// at any scale — reads in ~300MB blocks, never loads the full file.
 ///
 /// Returns (total_applied, total_errors, elapsed_secs).
 pub fn process_csv_dump_direct(
@@ -533,6 +534,8 @@ pub fn process_csv_dump_direct(
     use crate::loader::BitmapAccum;
     use crate::pg_sync::copy_queries::{parse_image_row, parse_tag_row, parse_tool_row};
     use rayon::prelude::*;
+    use std::io::Read;
+    use std::thread;
     use std::time::Instant;
 
     let config = engine.config();
@@ -544,181 +547,261 @@ pub fn process_csv_dump_direct(
     let start = Instant::now();
     let mut total_applied = 0u64;
     let mut total_errors = 0u64;
+    let record_limit = limit.map(|l| l as usize).unwrap_or(usize::MAX);
 
-    // Helper: read file lines (respecting limit), return Vec<Vec<u8>>
-    let read_lines = |path: &Path, limit: Option<u64>| -> Vec<Vec<u8>> {
-        use std::io::{BufRead, BufReader};
-        let file = std::fs::File::open(path).expect("open CSV");
-        let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-        let mut lines = Vec::new();
-        for line in reader.split(b'\n') {
-            if let Some(max) = limit {
-                if lines.len() as u64 >= max { break; }
-            }
-            match line {
-                Ok(l) if !l.is_empty() => lines.push(l),
-                _ => {}
-            }
-        }
-        lines
-    };
+    // Chunked reader: sends ~300MB blocks of complete lines through a channel.
+    // Same pattern as the single-pass loader. Never loads full file into memory.
+    fn spawn_block_reader(
+        path: std::path::PathBuf,
+        target_bytes: usize,
+    ) -> (std::sync::mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let handle = thread::spawn(move || {
+            let file = std::fs::File::open(&path).expect("open CSV");
+            let mut reader = std::io::BufReader::with_capacity(16 * 1024 * 1024, file);
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            let mut accum = Vec::<u8>::with_capacity(target_bytes + 4 * 1024 * 1024);
 
-    // Phase 1: Images (rayon parallel parse → BitmapAccum)
+            loop {
+                let n = reader.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    if !accum.is_empty() {
+                        let _ = tx.send(accum);
+                    }
+                    break;
+                }
+                accum.extend_from_slice(&buf[..n]);
+
+                if accum.len() >= target_bytes {
+                    // Split at last newline to keep lines intact
+                    if let Some(last_nl) = accum.iter().rposition(|&b| b == b'\n') {
+                        let remainder = accum[last_nl + 1..].to_vec();
+                        accum.truncate(last_nl + 1);
+                        let batch = std::mem::replace(
+                            &mut accum,
+                            Vec::with_capacity(target_bytes + 4 * 1024 * 1024),
+                        );
+                        accum = remainder;
+                        if tx.send(batch).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        (rx, handle)
+    }
+
+    let target_block_bytes = 300 * 1024 * 1024; // ~300MB per block
+
+    // Phase 1: Images (creates alive slots)
     let images_csv = csv_dir.join("images.csv");
     if images_csv.exists() {
         let img_start = Instant::now();
-        let lines = read_lines(&images_csv, limit);
-        let read_elapsed = img_start.elapsed();
+        let (rx, reader_handle) = spawn_block_reader(images_csv, target_block_bytes);
 
         let f_names = &filter_names;
         let s_configs = &sort_configs;
         let meta_ref = &meta;
+        let mut phase_total = 0usize;
+        let mut phase_errors = 0u64;
 
-        let accum = lines
-            .into_par_iter()
-            .fold(
-                || BitmapAccum::new(f_names, s_configs),
-                |mut acc, line| {
-                    let row = match parse_image_row(&line) {
-                        Some(r) => r,
-                        None => { acc.errors += 1; return acc; }
-                    };
-                    let slot = row.id as u32;
-                    acc.alive.insert(slot);
+        while let Ok(block) = rx.recv() {
+            if phase_total >= record_limit { break; }
 
-                    // Process ops directly into accum (no BitmapSink indirection)
-                    let ops = crate::pg_sync::csv_ops::image_row_to_ops_pub(&row);
-                    for op in &ops {
-                        if let Op::Set { field, value } = op {
-                            let qval = json_to_qvalue(value);
-                            if let Some((_, _)) = meta_ref.filter_fields.get(field.as_str()) {
-                                if let Some(key) = value_to_bitmap_key(&qval) {
-                                    acc.filter_maps
-                                        .get_mut(field.as_str())
-                                        .map(|m| m.entry(key).or_insert_with(roaring::RoaringBitmap::new).insert(slot));
+            let block_str = match std::str::from_utf8(&block) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut lines: Vec<&[u8]> = block_str
+                .split('\n')
+                .filter(|l| !l.is_empty())
+                .map(|l| l.as_bytes())
+                .collect();
+            let remaining = record_limit.saturating_sub(phase_total);
+            if lines.len() > remaining {
+                lines.truncate(remaining);
+            }
+
+            let accum = lines
+                .into_par_iter()
+                .fold(
+                    || BitmapAccum::new(f_names, s_configs),
+                    |mut acc, line| {
+                        let row = match parse_image_row(line) {
+                            Some(r) => r,
+                            None => { acc.errors += 1; return acc; }
+                        };
+                        let slot = row.id as u32;
+                        acc.alive.insert(slot);
+
+                        let ops = crate::pg_sync::csv_ops::image_row_to_ops_pub(&row);
+                        for op in &ops {
+                            if let Op::Set { field, value } = op {
+                                let qval = json_to_qvalue(value);
+                                if let Some((_, _)) = meta_ref.filter_fields.get(field.as_str()) {
+                                    if let Some(key) = value_to_bitmap_key(&qval) {
+                                        acc.filter_maps
+                                            .get_mut(field.as_str())
+                                            .map(|m| m.entry(key).or_insert_with(roaring::RoaringBitmap::new).insert(slot));
+                                    }
                                 }
-                            }
-                            if let Some((_, num_bits)) = meta_ref.sort_fields.get(field.as_str()) {
-                                if let Some(sort_val) = value_to_sort_u32(&qval) {
-                                    for bit in 0..*num_bits {
-                                        if (sort_val >> bit) & 1 == 1 {
-                                            acc.sort_maps
-                                                .get_mut(field.as_str())
-                                                .map(|m| m.entry(bit).or_insert_with(roaring::RoaringBitmap::new).insert(slot));
+                                if let Some((_, num_bits)) = meta_ref.sort_fields.get(field.as_str()) {
+                                    if let Some(sort_val) = value_to_sort_u32(&qval) {
+                                        for bit in 0..*num_bits {
+                                            if (sort_val >> bit) & 1 == 1 {
+                                                acc.sort_maps
+                                                    .get_mut(field.as_str())
+                                                    .map(|m| m.entry(bit).or_insert_with(roaring::RoaringBitmap::new).insert(slot));
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                    acc.count += 1;
-                    acc
-                },
-            )
-            .reduce(
-                || BitmapAccum::new(f_names, s_configs),
-                |a, b| a.merge(b),
-            );
+                        acc.count += 1;
+                        acc
+                    },
+                )
+                .reduce(
+                    || BitmapAccum::new(f_names, s_configs),
+                    |a, b| a.merge(b),
+                );
 
-        let rows = accum.count as u64;
-        total_applied += rows;
-        total_errors += accum.errors;
+            phase_total += accum.count;
+            phase_errors += accum.errors;
+            engine.apply_accum(&accum);
+        }
+        let _ = reader_handle.join();
+        total_applied += phase_total as u64;
+        total_errors += phase_errors;
 
-        eprintln!("  images: {rows} rows, {:.1}s read + {:.1}s parse = {:.1}s ({:.0}/s)",
-            read_elapsed.as_secs_f64(),
-            img_start.elapsed().as_secs_f64() - read_elapsed.as_secs_f64(),
+        eprintln!("  images: {} rows, {:.1}s ({:.0}/s)",
+            phase_total,
             img_start.elapsed().as_secs_f64(),
-            rows as f64 / img_start.elapsed().as_secs_f64().max(0.001));
-
-        engine.apply_accum(&accum);
+            phase_total as f64 / img_start.elapsed().as_secs_f64().max(0.001));
     }
 
-    // Phase 2: Tags (rayon parallel parse)
+    // Phase 2: Tags (chunked reader + rayon)
     let tags_csv = csv_dir.join("tags.csv");
     if tags_csv.exists() {
         let tag_start = Instant::now();
-        let lines = read_lines(&tags_csv, limit);
+        let (rx, reader_handle) = spawn_block_reader(tags_csv, target_block_bytes);
 
         let f_names = &filter_names;
         let s_configs = &sort_configs;
+        let mut phase_total = 0usize;
+        let mut phase_errors = 0u64;
 
-        let accum = lines
-            .into_par_iter()
-            .fold(
-                || BitmapAccum::new(f_names, s_configs),
-                |mut acc, line| {
-                    let (tag_id, image_id) = match parse_tag_row(&line) {
-                        Some(pair) => pair,
-                        None => { acc.errors += 1; return acc; }
-                    };
-                    let slot = image_id as u32;
-                    if let Some(m) = acc.filter_maps.get_mut("tagIds") {
-                        m.entry(tag_id as u64)
-                            .or_insert_with(roaring::RoaringBitmap::new)
-                            .insert(slot);
-                    }
-                    acc.count += 1;
-                    acc
-                },
-            )
-            .reduce(
-                || BitmapAccum::new(f_names, s_configs),
-                |a, b| a.merge(b),
-            );
+        while let Ok(block) = rx.recv() {
+            if phase_total >= record_limit { break; }
 
-        let rows = accum.count as u64;
-        total_applied += rows;
-        total_errors += accum.errors;
+            let mut lines: Vec<&[u8]> = block
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .collect();
+            let remaining = record_limit.saturating_sub(phase_total);
+            if lines.len() > remaining {
+                lines.truncate(remaining);
+            }
 
-        eprintln!("  tags: {rows} rows, {:.1}s ({:.0}/s)",
+            let accum = lines
+                .into_par_iter()
+                .fold(
+                    || BitmapAccum::new(f_names, s_configs),
+                    |mut acc, line| {
+                        let (tag_id, image_id) = match parse_tag_row(line) {
+                            Some(pair) => pair,
+                            None => { acc.errors += 1; return acc; }
+                        };
+                        let slot = image_id as u32;
+                        if let Some(m) = acc.filter_maps.get_mut("tagIds") {
+                            m.entry(tag_id as u64)
+                                .or_insert_with(roaring::RoaringBitmap::new)
+                                .insert(slot);
+                        }
+                        acc.count += 1;
+                        acc
+                    },
+                )
+                .reduce(
+                    || BitmapAccum::new(f_names, s_configs),
+                    |a, b| a.merge(b),
+                );
+
+            phase_total += accum.count;
+            phase_errors += accum.errors;
+            engine.apply_accum(&accum);
+        }
+        let _ = reader_handle.join();
+        total_applied += phase_total as u64;
+        total_errors += phase_errors;
+
+        eprintln!("  tags: {} rows, {:.1}s ({:.0}/s)",
+            phase_total,
             tag_start.elapsed().as_secs_f64(),
-            rows as f64 / tag_start.elapsed().as_secs_f64().max(0.001));
-
-        engine.apply_accum(&accum);
+            phase_total as f64 / tag_start.elapsed().as_secs_f64().max(0.001));
     }
 
-    // Phase 3: Tools (rayon parallel parse)
+    // Phase 3: Tools (chunked reader + rayon)
     let tools_csv = csv_dir.join("tools.csv");
     if tools_csv.exists() {
         let tool_start = Instant::now();
-        let lines = read_lines(&tools_csv, limit);
+        let (rx, reader_handle) = spawn_block_reader(tools_csv, target_block_bytes);
 
         let f_names = &filter_names;
         let s_configs = &sort_configs;
+        let mut phase_total = 0usize;
+        let mut phase_errors = 0u64;
 
-        let accum = lines
-            .into_par_iter()
-            .fold(
-                || BitmapAccum::new(f_names, s_configs),
-                |mut acc, line| {
-                    let (tool_id, image_id) = match parse_tool_row(&line) {
-                        Some(pair) => pair,
-                        None => { acc.errors += 1; return acc; }
-                    };
-                    let slot = image_id as u32;
-                    if let Some(m) = acc.filter_maps.get_mut("toolIds") {
-                        m.entry(tool_id as u64)
-                            .or_insert_with(roaring::RoaringBitmap::new)
-                            .insert(slot);
-                    }
-                    acc.count += 1;
-                    acc
-                },
-            )
-            .reduce(
-                || BitmapAccum::new(f_names, s_configs),
-                |a, b| a.merge(b),
-            );
+        while let Ok(block) = rx.recv() {
+            if phase_total >= record_limit { break; }
 
-        let rows = accum.count as u64;
-        total_applied += rows;
-        total_errors += accum.errors;
+            let mut lines: Vec<&[u8]> = block
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .collect();
+            let remaining = record_limit.saturating_sub(phase_total);
+            if lines.len() > remaining {
+                lines.truncate(remaining);
+            }
 
-        eprintln!("  tools: {rows} rows, {:.1}s ({:.0}/s)",
+            let accum = lines
+                .into_par_iter()
+                .fold(
+                    || BitmapAccum::new(f_names, s_configs),
+                    |mut acc, line| {
+                        let (tool_id, image_id) = match parse_tool_row(line) {
+                            Some(pair) => pair,
+                            None => { acc.errors += 1; return acc; }
+                        };
+                        let slot = image_id as u32;
+                        if let Some(m) = acc.filter_maps.get_mut("toolIds") {
+                            m.entry(tool_id as u64)
+                                .or_insert_with(roaring::RoaringBitmap::new)
+                                .insert(slot);
+                        }
+                        acc.count += 1;
+                        acc
+                    },
+                )
+                .reduce(
+                    || BitmapAccum::new(f_names, s_configs),
+                    |a, b| a.merge(b),
+                );
+
+            phase_total += accum.count;
+            phase_errors += accum.errors;
+            engine.apply_accum(&accum);
+        }
+        let _ = reader_handle.join();
+        total_applied += phase_total as u64;
+        total_errors += phase_errors;
+
+        eprintln!("  tools: {} rows, {:.1}s ({:.0}/s)",
+            phase_total,
             tool_start.elapsed().as_secs_f64(),
-            rows as f64 / tool_start.elapsed().as_secs_f64().max(0.001));
-
-        engine.apply_accum(&accum);
+            phase_total as f64 / tool_start.elapsed().as_secs_f64().max(0.001));
     }
 
     eprintln!("  Total: {total_applied} ops in {:.1}s ({:.0}/s)",

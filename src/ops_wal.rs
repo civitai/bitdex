@@ -12,7 +12,7 @@
 //! Partial records at EOF are skipped (crash recovery).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::pg_sync::ops::{EntityOps, Op};
@@ -112,8 +112,8 @@ impl WalReader {
     }
 
     /// Read up to `max_records` from the WAL starting at the current cursor.
-    /// Advances the cursor past successfully read records.
-    /// Stops at EOF or on partial/corrupted records.
+    /// Uses incremental seek+read — only reads new data from the cursor position,
+    /// not the entire file. Safe for large WAL files.
     pub fn read_batch(&mut self, max_records: usize) -> io::Result<WalBatch> {
         if !self.path.exists() {
             return Ok(WalBatch {
@@ -124,11 +124,26 @@ impl WalReader {
             });
         }
 
-        let data = fs::read(&self.path)?;
+        let file_len = fs::metadata(&self.path)?.len();
+        if self.cursor >= file_len {
+            return Ok(WalBatch {
+                entries: Vec::new(),
+                new_cursor: self.cursor,
+                bytes_read: 0,
+                crc_failures: 0,
+            });
+        }
+
+        // Read only from cursor to EOF (incremental, not full-file read)
+        let mut file = File::open(&self.path)?;
+        file.seek(std::io::SeekFrom::Start(self.cursor))?;
+        let remaining = (file_len - self.cursor) as usize;
+        let mut data = vec![0u8; remaining];
+        file.read_exact(&mut data)?;
+
         let mut entries = Vec::new();
-        let mut pos = self.cursor as usize;
+        let mut pos = 0usize;
         let mut crc_failures = 0u64;
-        let start_pos = pos;
 
         while entries.len() < max_records && pos + HEADER_SIZE <= data.len() {
             // Read header: [4-byte len][8-byte entity_id][1-byte flags]
@@ -155,7 +170,6 @@ impl WalReader {
             let computed_crc = crc32fast::hash(crc_input);
 
             if stored_crc != computed_crc {
-                // CRC failure — skip this record
                 crc_failures += 1;
                 pos = record_end;
                 continue;
@@ -168,7 +182,6 @@ impl WalReader {
                     entries.push(EntityOps { entity_id, ops, creates_slot });
                 }
                 Err(_) => {
-                    // Invalid JSON — skip
                     crc_failures += 1;
                 }
             }
@@ -176,8 +189,8 @@ impl WalReader {
             pos = record_end;
         }
 
-        let bytes_read = (pos - start_pos) as u64;
-        self.cursor = pos as u64;
+        let bytes_read = pos as u64;
+        self.cursor += bytes_read;
 
         Ok(WalBatch {
             entries,
