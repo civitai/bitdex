@@ -41,7 +41,7 @@ const LOG_INTERVAL: u64 = 1_000_000;
 
 /// Check if a filter field already has data on disk (skip-if-loaded).
 /// Returns true if the field's BitmapFs directory has at least one fpack file.
-fn field_already_loaded(bitmap_fs: &BitmapFs, field_name: &str) -> bool {
+pub fn field_already_loaded(bitmap_fs: &BitmapFs, field_name: &str) -> bool {
     match bitmap_fs.list_field_keys(field_name) {
         Ok(keys) if !keys.is_empty() => {
             eprintln!("  {field_name}: already loaded ({} values on disk), skipping", keys.len());

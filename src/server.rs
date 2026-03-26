@@ -46,6 +46,7 @@ pub enum TaskType {
     Rebuild,
     AddFields,
     RemoveFields,
+    Dump,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -4367,28 +4368,152 @@ async fn handle_list_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoRespon
     Json(serde_json::json!({"dumps": {}}))
 }
 
-/// PUT /api/indexes/{name}/dumps — Register a new dump.
+/// PUT /api/indexes/{name}/dumps — Register and process a dump.
+///
+/// Accepts either:
+/// - V2 DumpRequest (has csv_path, slot_field) → async dump processing via dump_processor
+/// - V1 legacy body (has wal_path) → register in dump registry only
 #[cfg(feature = "pg-sync")]
 async fn handle_register_dump(
     State(state): State<SharedState>,
     AxumPath(_name): AxumPath<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let dump_name = body["name"].as_str().unwrap_or("unknown").to_string();
-    let wal_path = body["wal_path"].as_str().map(|s| s.to_string());
+    // Detect V2 DumpRequest by presence of csv_path
+    if body.get("csv_path").is_some() {
+        // V2: parse DumpRequest and process asynchronously
+        let request: crate::dump_processor::DumpRequest = match serde_json::from_value(body) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid dump request: {e}")})),
+                )
+                    .into_response();
+            }
+        };
 
-    let mut reg = state.dump_registry.lock();
-    reg.register(dump_name.clone(), wal_path);
+        let dump_name = request.name.clone();
 
-    let dumps_path = state.data_dir.join("dumps.json");
-    if let Err(e) = reg.save(&dumps_path) {
-        eprintln!("Warning: failed to save dump registry: {e}");
+        // Get engine and tasks from IndexState
+        let (engine, tasks) = {
+            let guard = state.index.lock();
+            match guard.as_ref() {
+                Some(idx) => (Arc::clone(&idx.engine), Arc::clone(&idx.tasks)),
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": "Index not loaded"})),
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        // Try to start a task
+        let (task_id, progress) = match tasks.try_start(TaskType::Dump) {
+            Ok(v) => v,
+            Err(active) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "Another task is already running",
+                        "active_task": serde_json::to_value(&active).unwrap_or_default(),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        // Register in dump registry
+        {
+            let mut reg = state.dump_registry.lock();
+            reg.register(dump_name.clone(), None);
+            let dumps_path = state.data_dir.join("dumps.json");
+            reg.save(&dumps_path).ok();
+        }
+
+        // Spawn async processing
+        let state_clone = Arc::clone(&state);
+        let dump_name_for_task = dump_name.clone();
+        let stage_dir = std::path::Path::new(&request.csv_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/data/load_stage"))
+            .to_path_buf();
+
+        tokio::spawn(async move {
+            let dump_name_inner = dump_name_for_task;
+            let result = tokio::task::spawn_blocking(move || {
+                crate::dump_processor::process_dump(&request, &engine, &stage_dir)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(phase_result)) => {
+                    tasks.set_complete(
+                        task_id,
+                        Some(serde_json::json!({
+                            "rows_processed": phase_result.row_count,
+                            "dump_name": dump_name_inner,
+                        })),
+                    );
+                    // Mark dump as complete in registry
+                    let mut reg = state_clone.dump_registry.lock();
+                    if let Some(entry) = reg.dumps.get_mut(&dump_name_inner) {
+                        entry.status = crate::pg_sync::dump::DumpStatus::Complete;
+                        entry.ops_processed = phase_result.row_count;
+                        entry.completed_at = Some(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        );
+                    }
+                    let dumps_path = state_clone.data_dir.join("dumps.json");
+                    reg.save(&dumps_path).ok();
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Dump failed: {e}");
+                    tasks.set_error(task_id, e);
+                }
+                Err(e) => {
+                    eprintln!("Dump panicked: {e}");
+                    tasks.set_error(task_id, format!("Task panicked: {e}"));
+                }
+            }
+        });
+
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "name": dump_name,
+                "task_id": task_id,
+                "status": "running",
+            })),
+        )
+            .into_response()
+    } else {
+        // V1 legacy: just register the dump name
+        let dump_name = body["name"].as_str().unwrap_or("unknown").to_string();
+        let wal_path = body["wal_path"].as_str().map(|s| s.to_string());
+
+        let mut reg = state.dump_registry.lock();
+        reg.register(dump_name.clone(), wal_path);
+
+        let dumps_path = state.data_dir.join("dumps.json");
+        if let Err(e) = reg.save(&dumps_path) {
+            eprintln!("Warning: failed to save dump registry: {e}");
+        }
+
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "name": dump_name,
+                "status": "writing",
+            })),
+        )
+            .into_response()
     }
-
-    (StatusCode::CREATED, Json(serde_json::json!({
-        "name": dump_name,
-        "status": "writing",
-    })))
 }
 
 #[cfg(not(feature = "pg-sync"))]
