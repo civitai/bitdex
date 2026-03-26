@@ -806,13 +806,37 @@ pub fn process_wal_dump(
     (total_applied, total_errors, start.elapsed().as_secs_f64())
 }
 
+/// Apply a BitmapAccum directly to an owned InnerEngine staging.
+/// This is the clone-once pattern: one staging clone for the entire dump,
+/// mutated in-place per chunk. No ArcSwap interaction, no deep clones.
+fn apply_accum_to_staging(
+    staging: &mut crate::concurrent_engine::InnerEngine,
+    accum: &crate::loader::BitmapAccum,
+) {
+    for (field_name, value_map) in &accum.filter_maps {
+        if let Some(field) = staging.filters.get_field_mut(field_name) {
+            for (&value, bitmap) in value_map {
+                field.or_bitmap(value, bitmap);
+            }
+        }
+    }
+    for (field_name, layer_map) in &accum.sort_maps {
+        if let Some(field) = staging.sorts.get_field_mut(field_name) {
+            for (&bit_layer, bitmap) in layer_map {
+                field.or_layer(bit_layer, bitmap);
+            }
+        }
+    }
+    staging.slots.alive_or_bitmap(&accum.alive);
+}
+
 /// Generic multi-value CSV processor: reads a CSV, parses (slot_id, value) pairs,
 /// accumulates into BitmapAccum filter maps, and applies to engine.
 /// Skips silently if the file doesn't exist.
 fn process_multi_value_csv(
     csv_path: &Path,
     field_name: &str,
-    engine: &ConcurrentEngine,
+    staging: &mut crate::concurrent_engine::InnerEngine,
     record_limit: usize,
     filter_names: &[String],
     sort_configs: &[(String, u8)],
@@ -894,7 +918,7 @@ fn process_multi_value_csv(
 
         phase_total += accum.count;
         phase_errors += accum.errors;
-        engine.apply_accum(&accum);
+        apply_accum_to_staging(staging, &accum);
     }
     *total_applied += phase_total as u64;
     *total_errors += phase_errors;
@@ -947,8 +971,11 @@ pub fn process_csv_dump_direct(
     let mut total_errors = 0u64;
     let record_limit = limit.map(|l| l as usize).unwrap_or(usize::MAX);
 
-    // Enter loading mode ONCE for the entire dump — avoids Arc clone cascade.
-    engine.enter_loading_mode();
+    // Clone staging ONCE and mutate in-place across all chunks/phases.
+    // This matches the single-pass loader pattern (clone_staging → mutate → publish_staging).
+    // The old apply_accum() deep-cloned InnerEngine on every 2M-row chunk via ArcSwap,
+    // causing OOM at 107M from 54 deep clones with growing staging (~8GB each).
+    let mut staging = engine.clone_staging();
 
     // Chunk size for reading CSV lines. 2M lines per chunk keeps memory bounded
     // while giving rayon enough work for parallelism. Enriched images produce
@@ -1165,7 +1192,7 @@ pub fn process_csv_dump_direct(
             // Collect deferred alive entries before apply_accum consumes the accum
             let mut accum = accum;
             let chunk_deferred: Vec<(u32, u64)> = accum.deferred_alive.drain(..).collect();
-            engine.apply_accum(&accum);
+            apply_accum_to_staging(&mut staging, &accum);
             all_deferred_alive.extend(chunk_deferred);
 
             eprintln!("  images: chunk {}..{} ({:.0}/s cumulative)",
@@ -1197,7 +1224,7 @@ pub fn process_csv_dump_direct(
     // Phase 2: Tags (chunked rayon) — same as before
     // ---------------------------------------------------------------------------
     process_multi_value_csv(
-        &csv_dir.join("tags.csv"), "tagIds", engine, record_limit,
+        &csv_dir.join("tags.csv"), "tagIds", &mut staging, record_limit,
         &filter_names, &sort_configs, &mut total_applied, &mut total_errors,
         |line| parse_tag_row(line).map(|(tag_id, image_id)| (image_id, tag_id as u64)),
     );
@@ -1206,7 +1233,7 @@ pub fn process_csv_dump_direct(
     // Phase 3: Tools (chunked rayon)
     // ---------------------------------------------------------------------------
     process_multi_value_csv(
-        &csv_dir.join("tools.csv"), "toolIds", engine, record_limit,
+        &csv_dir.join("tools.csv"), "toolIds", &mut staging, record_limit,
         &filter_names, &sort_configs, &mut total_applied, &mut total_errors,
         |line| parse_tool_row(line).map(|(tool_id, image_id)| (image_id, tool_id as u64)),
     );
@@ -1215,7 +1242,7 @@ pub fn process_csv_dump_direct(
     // Phase 4: Techniques (chunked rayon) — same pattern as tags/tools
     // ---------------------------------------------------------------------------
     process_multi_value_csv(
-        &csv_dir.join("techniques.csv"), "techniqueIds", engine, record_limit,
+        &csv_dir.join("techniques.csv"), "techniqueIds", &mut staging, record_limit,
         &filter_names, &sort_configs, &mut total_applied, &mut total_errors,
         |line| parse_technique_row(line).map(|(tech_id, image_id)| (image_id, tech_id as u64)),
     );
@@ -1303,7 +1330,7 @@ pub fn process_csv_dump_direct(
 
             phase_total += accum.count;
             phase_errors += accum.errors;
-            engine.apply_accum(&accum);
+            apply_accum_to_staging(&mut staging, &accum);
         }
         total_applied += phase_total as u64;
         total_errors += phase_errors;
@@ -1368,7 +1395,7 @@ pub fn process_csv_dump_direct(
 
             phase_total += accum.count;
             phase_errors += accum.errors;
-            engine.apply_accum(&accum);
+            apply_accum_to_staging(&mut staging, &accum);
         }
         total_applied += phase_total as u64;
         total_errors += phase_errors;
@@ -1383,14 +1410,14 @@ pub fn process_csv_dump_direct(
     // Phase 7: Collection items (collectionIds multi-value, if CSV exists)
     // ---------------------------------------------------------------------------
     process_multi_value_csv(
-        &csv_dir.join("collection_items.csv"), "collectionIds", engine, record_limit,
+        &csv_dir.join("collection_items.csv"), "collectionIds", &mut staging, record_limit,
         &filter_names, &sort_configs, &mut total_applied, &mut total_errors,
         |line| parse_collection_item_row(line).map(|(coll_id, image_id)| (image_id, coll_id as u64)),
     );
 
-    // Exit loading mode. On headless, this will timeout (no flush thread) but
-    // that's OK — the warning is harmless and the flag gets cleared.
-    engine.exit_loading_mode();
+    // Publish the mutated staging as the new live snapshot.
+    // This is an atomic swap — no loading mode dance needed.
+    engine.publish_staging(staging);
 
     // Schedule deferred alive entries via mutation channel.
     // This runs after loading mode exits so the flush thread is active.
