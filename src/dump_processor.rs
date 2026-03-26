@@ -1306,27 +1306,27 @@ pub fn process_dump(
                     let column = field_mapping.column();
 
                     if filter_field_names_ref.contains(target) {
-                        // Determine value: from row or enrichment
-                        let val = row
-                            .get_i64(column)
-                            .or_else(|| {
-                                enriched_values.get(target).and_then(|s| s.parse::<i64>().ok())
-                            });
+                        // LCS dictionary fields: resolve string→key FIRST (before i64 parse)
+                        // This fixes availability, baseModel, blockedFor, type which are
+                        // string values that would fail i64 parse and silently produce
+                        // empty bitmaps.
+                        let bitmap_key: Option<u64> = if let Some(dict) = dictionaries_ref.get(target) {
+                            let s = row
+                                .get_str(column)
+                                .or_else(|| enriched_values.get(target).map(|s| s.as_str()));
+                            s.map(|v| dict.get_or_insert(v) as u64)
+                        } else {
+                            // Non-LCS: use i64 value from row or enrichment
+                            row.get_i64(column)
+                                .or_else(|| {
+                                    enriched_values.get(target).and_then(|s| s.parse::<i64>().ok())
+                                })
+                                .map(|v| v as u64)
+                        };
 
-                        if let Some(v) = val {
-                            // Handle LCS dictionary encoding
-                            let bitmap_key = if let Some(dict) = dictionaries_ref.get(target) {
-                                let s = row
-                                    .get_str(column)
-                                    .or_else(|| enriched_values.get(target).map(|s| s.as_str()))
-                                    .unwrap_or("");
-                                dict.get_or_insert(s) as u64
-                            } else {
-                                v as u64
-                            };
-
+                        if let Some(key) = bitmap_key {
                             if let Some(fm) = filter_maps.get_mut(target) {
-                                fm.entry(bitmap_key)
+                                fm.entry(key)
                                     .or_insert_with(RoaringBitmap::new)
                                     .insert(slot);
                             }
