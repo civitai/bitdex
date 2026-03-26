@@ -839,7 +839,7 @@ fn process_multi_value_csv(
     let mut phase_total = 0usize;
     let mut phase_errors = 0u64;
 
-    const CHUNK_SIZE: usize = 10_000_000;
+    const CHUNK_SIZE: usize = 2_000_000;
     let mut chunk_buf: Vec<Vec<u8>> = Vec::with_capacity(CHUNK_SIZE);
 
     loop {
@@ -950,9 +950,11 @@ pub fn process_csv_dump_direct(
     // Enter loading mode ONCE for the entire dump — avoids Arc clone cascade.
     engine.enter_loading_mode();
 
-    // Chunk size for reading CSV lines. 10M lines per chunk keeps memory bounded
-    // (~1-2GB per chunk) while giving rayon enough work for parallelism.
-    const CHUNK_SIZE: usize = 10_000_000;
+    // Chunk size for reading CSV lines. 2M lines per chunk keeps memory bounded
+    // while giving rayon enough work for parallelism. Enriched images produce
+    // ~16 bitmap ops each (sort + filter + enrichment). At 107M scale, the
+    // staging engine holds ~6-8GB of bitmaps, so chunk overhead must be low.
+    const CHUNK_SIZE: usize = 2_000_000;
 
     /// Helper: read up to `chunk` lines from a BufReader, returns lines read.
     fn read_chunk(
@@ -1134,6 +1136,11 @@ pub fn process_csv_dump_direct(
             img_start.elapsed().as_secs_f64(),
             phase_total as f64 / img_start.elapsed().as_secs_f64().max(0.001));
     }
+
+    // Free enrichment data — no longer needed after image phase.
+    // Posts HashMap at 22.8M entries uses ~1.5GB.
+    drop(posts);
+    eprintln!("  Freed enrichment tables");
 
     // ---------------------------------------------------------------------------
     // Phase 2: Tags (chunked rayon) — same as before
