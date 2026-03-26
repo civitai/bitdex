@@ -1,18 +1,20 @@
 //! ClickHouse metrics poller: polls for recent metric events, fetches aggregate
-//! counts, rebuilds full docs from PG, and pushes to Bitdex.
+//! counts, and pushes sort-field ops to BitDex via the V2 ops pipeline.
 //!
 //! ClickHouse is queried via its HTTP interface (POST with SQL).
+//! Metrics (reactionCount, commentCount, collectedCount) are sort-only fields,
+//! so ops are sent with `creates_slot: false` — they update existing slots
+//! without touching the alive bitmap.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
-use sqlx::PgPool;
+use serde_json::json;
 use tokio::time::{Duration, interval};
 
 use super::bitdex_client::BitdexClient;
-use super::queries;
-use super::row_assembler::{assemble_batch, EnrichmentData, MetricInfo};
+use super::ops::{EntityOps, Op, OpsBatch, SyncMeta};
 
 /// ClickHouse connection config.
 pub struct ClickHouseConfig {
@@ -21,9 +23,19 @@ pub struct ClickHouseConfig {
     pub password: Option<String>,
 }
 
+/// Aggregate metric counts for a single image from ClickHouse.
+struct MetricInfo {
+    reaction_count: i64,
+    comment_count: i64,
+    collected_count: i64,
+}
+
 /// Run the ClickHouse metrics poller loop. Runs forever until cancelled.
+///
+/// V2 pipeline: fetches aggregate counts from ClickHouse, converts them to
+/// `Op::Set` ops for sort fields, and POSTs via the `/ops` endpoint.
+/// No PG round-trip needed — metrics are self-contained sort-field updates.
 pub async fn run_metrics_poller(
-    pool: &PgPool,
     ch_config: &ClickHouseConfig,
     bitdex_client: &BitdexClient,
     poll_interval_secs: u64,
@@ -41,7 +53,7 @@ pub async fn run_metrics_poller(
     loop {
         ticker.tick().await;
 
-        // Health gate: skip ClickHouse + PG fetch if BitDex is unreachable.
+        // Health gate: skip ClickHouse fetch if BitDex is unreachable.
         if !bitdex_client.is_healthy().await {
             if !bitdex_was_down {
                 eprintln!("Metrics: BitDex is unreachable, pausing until healthy");
@@ -56,10 +68,10 @@ pub async fn run_metrics_poller(
 
         let now = current_epoch_secs();
 
-        match poll_metrics_and_push(pool, &http, ch_config, bitdex_client, last_poll_ts).await {
+        match poll_metrics_and_push(&http, ch_config, bitdex_client, last_poll_ts).await {
             Ok(count) => {
                 if count > 0 {
-                    eprintln!("Metrics: updated {count} documents");
+                    eprintln!("Metrics: pushed {count} ops batches");
                 }
                 last_poll_ts = now;
             }
@@ -78,9 +90,12 @@ fn current_epoch_secs() -> i64 {
         .as_secs() as i64
 }
 
-/// Single poll + push cycle.
+/// Maximum number of entity ops per HTTP request to `/ops`.
+/// Keeps request bodies reasonable and avoids timeouts.
+const OPS_BATCH_SIZE: usize = 5_000;
+
+/// Single poll + push cycle. Fetches CH metrics, converts to V2 ops, POSTs to BitDex.
 async fn poll_metrics_and_push(
-    pool: &PgPool,
     http: &Client,
     ch_config: &ClickHouseConfig,
     bitdex_client: &BitdexClient,
@@ -93,41 +108,25 @@ async fn poll_metrics_and_push(
         return Ok(0);
     }
 
-    let image_ids: Vec<i64> = metrics.keys().copied().collect();
+    let entity_ops = metrics_to_entity_ops(metrics);
 
-    // Fetch full documents from PG (same enrichment pipeline as outbox)
-    let images = queries::fetch_images_by_ids(pool, &image_ids)
-        .await
-        .map_err(|e| format!("fetch_images_by_ids: {e}"))?;
+    let total = entity_ops.len();
 
-    if images.is_empty() {
-        return Ok(0);
+    // Send in batches to keep request sizes manageable.
+    for chunk in entity_ops.chunks(OPS_BATCH_SIZE) {
+        let batch = OpsBatch {
+            ops: chunk.to_vec(),
+            meta: Some(SyncMeta {
+                source: "clickhouse-metrics".into(),
+                cursor: None,
+                max_id: None,
+                lag_rows: None,
+            }),
+        };
+        bitdex_client.post_ops(&batch).await?;
     }
 
-    let fetched_ids: Vec<i64> = images.iter().map(|r| r.id).collect();
-
-    let (tags, tools, techniques, resources) = tokio::try_join!(
-        queries::fetch_tags(pool, &fetched_ids),
-        queries::fetch_tools(pool, &fetched_ids),
-        queries::fetch_techniques(pool, &fetched_ids),
-        queries::fetch_resources(pool, &fetched_ids),
-    )
-    .map_err(|e| format!("enrichment queries: {e}"))?;
-
-    let mut enrichment = EnrichmentData::from_rows(tags, tools, techniques, resources);
-
-    // Merge ClickHouse metrics into enrichment
-    enrichment.metrics = metrics;
-
-    let docs = assemble_batch(&images, &enrichment);
-    let count = docs.len();
-
-    // Use PATCH for metrics updates — preserves fields not included in this update.
-    if !docs.is_empty() {
-        bitdex_client.patch_batch(&docs, None).await?;
-    }
-
-    Ok(count)
+    Ok(total)
 }
 
 /// Query ClickHouse HTTP interface for aggregate metrics.
@@ -213,4 +212,189 @@ async fn fetch_metrics_from_clickhouse(
     }
 
     Ok(metrics)
+}
+
+/// Convert a map of CH metrics into V2 EntityOps.
+///
+/// Each image gets three `Op::Set` ops (reactionCount, commentCount, collectedCount).
+/// `creates_slot` is false because these are sort-only field updates — they should
+/// never create new alive slots.
+fn metrics_to_entity_ops(metrics: HashMap<i64, MetricInfo>) -> Vec<EntityOps> {
+    metrics
+        .into_iter()
+        .map(|(image_id, info)| {
+            EntityOps::new(
+                image_id,
+                vec![
+                    Op::Set {
+                        field: "reactionCount".into(),
+                        value: json!(info.reaction_count),
+                    },
+                    Op::Set {
+                        field: "commentCount".into(),
+                        value: json!(info.comment_count),
+                    },
+                    Op::Set {
+                        field: "collectedCount".into(),
+                        value: json!(info.collected_count),
+                    },
+                ],
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_metrics_to_entity_ops_single() {
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            42,
+            MetricInfo {
+                reaction_count: 100,
+                comment_count: 5,
+                collected_count: 3,
+            },
+        );
+
+        let ops = metrics_to_entity_ops(metrics);
+        assert_eq!(ops.len(), 1);
+
+        let entity = &ops[0];
+        assert_eq!(entity.entity_id, 42);
+        assert!(!entity.creates_slot, "metrics ops must not create slots");
+        assert_eq!(entity.ops.len(), 3);
+
+        // Verify all three sort fields are present as Set ops
+        let fields: Vec<&str> = entity
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Set { field, .. } => Some(field.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(fields.contains(&"reactionCount"));
+        assert!(fields.contains(&"commentCount"));
+        assert!(fields.contains(&"collectedCount"));
+    }
+
+    #[test]
+    fn test_metrics_to_entity_ops_values() {
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            99,
+            MetricInfo {
+                reaction_count: 1234,
+                comment_count: 56,
+                collected_count: 78,
+            },
+        );
+
+        let ops = metrics_to_entity_ops(metrics);
+        let entity = &ops[0];
+
+        for op in &entity.ops {
+            match op {
+                Op::Set { field, value } => match field.as_str() {
+                    "reactionCount" => assert_eq!(value, &json!(1234)),
+                    "commentCount" => assert_eq!(value, &json!(56)),
+                    "collectedCount" => assert_eq!(value, &json!(78)),
+                    other => panic!("unexpected field: {other}"),
+                },
+                other => panic!("expected Op::Set, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_metrics_to_entity_ops_empty() {
+        let metrics = HashMap::new();
+        let ops = metrics_to_entity_ops(metrics);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_metrics_to_entity_ops_multiple_images() {
+        let mut metrics = HashMap::new();
+        for id in 1..=100 {
+            metrics.insert(
+                id,
+                MetricInfo {
+                    reaction_count: id * 10,
+                    comment_count: id,
+                    collected_count: id / 2,
+                },
+            );
+        }
+
+        let ops = metrics_to_entity_ops(metrics);
+        assert_eq!(ops.len(), 100);
+
+        // Every entry should have creates_slot = false and 3 ops
+        for entity in &ops {
+            assert!(!entity.creates_slot);
+            assert_eq!(entity.ops.len(), 3);
+        }
+    }
+
+    #[test]
+    fn test_metrics_ops_batch_serialization() {
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            42,
+            MetricInfo {
+                reaction_count: 100,
+                comment_count: 5,
+                collected_count: 3,
+            },
+        );
+
+        let entity_ops = metrics_to_entity_ops(metrics);
+        let batch = OpsBatch {
+            ops: entity_ops,
+            meta: Some(SyncMeta {
+                source: "clickhouse-metrics".into(),
+                cursor: None,
+                max_id: None,
+                lag_rows: None,
+            }),
+        };
+
+        // Verify it serializes to valid JSON matching the expected ops format
+        let json = serde_json::to_value(&batch).unwrap();
+        assert_eq!(json["meta"]["source"], "clickhouse-metrics");
+        assert_eq!(json["ops"].as_array().unwrap().len(), 1);
+
+        let first = &json["ops"][0];
+        assert_eq!(first["entity_id"], 42);
+        assert_eq!(first["creates_slot"], false);
+        assert_eq!(first["ops"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_metrics_zero_counts() {
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            1,
+            MetricInfo {
+                reaction_count: 0,
+                comment_count: 0,
+                collected_count: 0,
+            },
+        );
+
+        let ops = metrics_to_entity_ops(metrics);
+        assert_eq!(ops.len(), 1);
+        // Zero counts should still produce Set ops (correct cumulative value)
+        assert_eq!(ops[0].ops.len(), 3);
+        for op in &ops[0].ops {
+            if let Op::Set { value, .. } = op {
+                assert_eq!(value, &json!(0));
+            }
+        }
+    }
 }
