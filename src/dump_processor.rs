@@ -59,6 +59,12 @@ pub struct DumpRequest {
     #[serde(default)]
     pub sets_alive: bool,
 
+    /// Explicit column names (positional order) for headerless CSVs.
+    /// PG COPY output has no header row — this tells the parser what each column is.
+    /// If omitted, the first line of the CSV is treated as a header.
+    #[serde(default)]
+    pub columns: Vec<String>,
+
     /// Field mappings: CSV column → BitDex target field
     #[serde(default)]
     pub fields: Vec<DumpFieldMapping>,
@@ -1092,15 +1098,25 @@ pub fn process_dump(
         request.format
     );
 
-    // Parse header row to build column index
-    let first_newline = data
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(data.len());
-    let header_line = &data[..first_newline];
-    let headers = parse_delimited_line(header_line, delimiter);
-    let col_index: Arc<HashMap<String, usize>> = Arc::new(
-        headers
+    // Build column index: from explicit columns (headerless CSV) or first row (header CSV)
+    let (col_index, data_start) = if !request.columns.is_empty() {
+        // Headerless CSV (PG COPY output) — columns provided in dump request
+        let index: HashMap<String, usize> = request
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
+        (Arc::new(index), 0usize) // Data starts at byte 0
+    } else {
+        // Header CSV — parse first row as column names
+        let first_newline = data
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(data.len());
+        let header_line = &data[..first_newline];
+        let headers = parse_delimited_line(header_line, delimiter);
+        let index: HashMap<String, usize> = headers
             .iter()
             .enumerate()
             .map(|(i, h)| {
@@ -1111,11 +1127,11 @@ pub fn process_dump(
                     .to_string();
                 (name, i)
             })
-            .collect(),
-    );
+            .collect();
+        (Arc::new(index), first_newline + 1) // Data starts after header
+    };
 
     // Data starts after header
-    let data_start = first_newline + 1;
     let body = &data[data_start..];
 
     // Deferred alive config
@@ -2123,6 +2139,7 @@ mod tests {
             format: DumpFormat::Csv,
             slot_field: "id".to_string(),
             sets_alive: false,
+            columns: vec![],
             fields: vec![
                 DumpFieldMapping::Short("nsfwLevel".to_string()),
                 DumpFieldMapping::Expanded {
@@ -2152,6 +2169,7 @@ mod tests {
             format: DumpFormat::Csv,
             slot_field: "id".to_string(),
             sets_alive: false,
+            columns: vec![],
             fields: vec![DumpFieldMapping::Short("nsfwLevel".to_string())],
             filter: None,
             computed_fields: vec![],
