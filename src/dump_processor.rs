@@ -1769,21 +1769,6 @@ fn process_multi_value_phase(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Save sort field bitmaps to BitmapFs.
-fn save_sort_field_to_disk(
-    fs: &BitmapFs,
-    field_name: &str,
-    bit_map: &HashMap<usize, RoaringBitmap>,
-    num_bits: u8,
-) -> Result<(), String> {
-    let empty = RoaringBitmap::new();
-    let mut layers: Vec<&RoaringBitmap> = Vec::with_capacity(num_bits as usize);
-    for bit in 0..(num_bits as usize) {
-        layers.push(bit_map.get(&bit).unwrap_or(&empty));
-    }
-    fs.write_sort_layers(field_name, &layers)
-        .map_err(|e| format!("write_sort_layers({field_name}): {e}"))
-}
 
 /// Collect all target field names from a dump request (direct + computed + enrichment).
 fn collect_target_fields(request: &DumpRequest) -> Vec<String> {
