@@ -14,6 +14,7 @@ pub mod copy_streams;
 pub mod metrics_poller;
 pub mod op_dedup;
 pub mod ops;
+pub mod ops_poller;
 pub mod outbox_poller;
 pub mod progress;
 pub mod queries;
