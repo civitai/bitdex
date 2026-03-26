@@ -48,25 +48,32 @@ fn main() {
     std::fs::create_dir_all(&bitmap_dir).ok();
     std::fs::create_dir_all(&docs_dir).ok();
 
-    // Phase 1: CSV → WAL
-    eprintln!("\n--- Phase 1: CSV → WAL ---");
-    let csv_start = Instant::now();
-    let csv_results = run_csv_dump(
-        &PathBuf::from(&csv_dir),
-        &wal_path,
-        10_000,
-        Some(limit),
-    )
-    .expect("CSV dump failed");
+    // Phase 1: CSV → WAL (skip for direct mode — it reads CSVs directly)
+    let csv_results: Vec<(String, bitdex_v2::pg_sync::csv_ops::CsvOpsStats)> = if direct {
+        eprintln!("\n--- Phase 1: Skipped (direct mode) ---");
+        Vec::new()
+    } else {
+        eprintln!("\n--- Phase 1: CSV → WAL ---");
+        let csv_start = Instant::now();
+        let results = run_csv_dump(
+            &PathBuf::from(&csv_dir),
+            &wal_path,
+            10_000,
+            Some(limit),
+        )
+        .expect("CSV dump failed");
 
-    let csv_elapsed = csv_start.elapsed();
-    let total_ops: u64 = csv_results.iter().map(|(_, s)| s.ops_written).sum();
+        let csv_elapsed = csv_start.elapsed();
+        let total_ops: u64 = results.iter().map(|(_, s)| s.ops_written).sum();
+        let total_rows: u64 = results.iter().map(|(_, s)| s.rows_read).sum();
+        eprintln!("\nCSV → WAL complete:");
+        eprintln!("  Total rows:  {total_rows}");
+        eprintln!("  Total ops:   {total_ops}");
+        eprintln!("  Time:        {:.2}s", csv_elapsed.as_secs_f64());
+        eprintln!("  Throughput:  {:.0} rows/s", total_rows as f64 / csv_elapsed.as_secs_f64().max(0.001));
+        results
+    };
     let total_rows: u64 = csv_results.iter().map(|(_, s)| s.rows_read).sum();
-    eprintln!("\nCSV → WAL complete:");
-    eprintln!("  Total rows:  {total_rows}");
-    eprintln!("  Total ops:   {total_ops}");
-    eprintln!("  Time:        {:.2}s", csv_elapsed.as_secs_f64());
-    eprintln!("  Throughput:  {:.0} rows/s", total_rows as f64 / csv_elapsed.as_secs_f64().max(0.001));
 
     // Phase 2: WAL → Engine
     eprintln!("\n--- Phase 2: WAL → Engine ---");
