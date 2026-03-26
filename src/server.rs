@@ -241,12 +241,67 @@ impl Drop for TaskGuard {
     }
 }
 
-/// Persisted index definition (saved as config.json in the index directory).
+/// Persisted index definition (saved as config.yaml or config.json in the index directory).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDefinition {
     pub name: String,
     pub config: Config,
     pub data_schema: DataSchema,
+}
+
+impl IndexDefinition {
+    /// Load an index definition from a file, auto-detecting format from extension.
+    pub fn from_file(path: &std::path::Path) -> std::result::Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        match ext {
+            "yaml" | "yml" => {
+                serde_yaml::from_str(&content)
+                    .map_err(|e| format!("YAML parse error in {}: {e}", path.display()))
+            }
+            "json" => {
+                serde_json::from_str(&content)
+                    .map_err(|e| format!("JSON parse error in {}: {e}", path.display()))
+            }
+            other => Err(format!("unsupported index config format: '{other}'")),
+        }
+    }
+
+    /// Save the index definition to a YAML file in the given directory.
+    pub fn save_yaml(&self, dir: &std::path::Path) -> std::result::Result<(), String> {
+        let yaml = serde_yaml::to_string(self)
+            .map_err(|e| format!("Failed to serialize config to YAML: {e}"))?;
+        let path = dir.join("config.yaml");
+        let tmp = dir.join("config.yaml.tmp");
+        std::fs::write(&tmp, &yaml)
+            .map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("Failed to rename to {}: {e}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Find the index config file in a directory. Prefers config.yaml, falls back to config.json.
+pub fn find_index_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let yaml = dir.join("config.yaml");
+    if yaml.exists() {
+        return Some(yaml);
+    }
+    let yml = dir.join("config.yml");
+    if yml.exists() {
+        return Some(yml);
+    }
+    let json = dir.join("config.json");
+    if json.exists() {
+        return Some(json);
+    }
+    None
 }
 
 /// Reverse string maps for MappedString fields: field_name → (int → original_string).
@@ -1241,7 +1296,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         return Ok(());
     }
 
-    // Scan for index directories with config.json
+    // Scan for index directories with config.yaml or config.json
     let entries = std::fs::read_dir(&indexes_dir).map_err(|e| e.to_string())?;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -1250,13 +1305,12 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             continue;
         }
 
-        let config_path = path.join("config.json");
-        if !config_path.exists() {
-            continue;
-        }
+        let config_path = match find_index_config(&path) {
+            Some(p) => p,
+            None => continue,
+        };
 
-        let json = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
-        let mut def: IndexDefinition = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        let mut def: IndexDefinition = IndexDefinition::from_file(&config_path)?;
 
         // Load LowCardinalityString dictionaries from disk
         let bitmap_path = path.join("bitmaps");
@@ -1343,14 +1397,14 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 
 /// Delete existing bitmap indexes and rebuild all bitmaps from the docstore.
 ///
-/// Requires an index to already be restored (config.json + docstore must exist).
+/// Requires an index to already be restored (config.yaml/json + docstore must exist).
 /// Deletes the bitmaps directory, runs `build_all_from_docstore`, then
 /// `save_and_unload` to persist and free memory.
 fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
     use crate::concurrent_engine::get_rss_bytes;
 
     let guard = state.index.lock();
-    let idx = guard.as_ref().ok_or("No index found — cannot rebuild without config.json")?;
+    let idx = guard.as_ref().ok_or("No index found — cannot rebuild without config")?;
 
     let engine = Arc::clone(&idx.engine);
     let index_name = idx.definition.name.clone();
@@ -1553,9 +1607,7 @@ async fn handle_create_index(
         config: req.config.clone(),
         data_schema,
     };
-    let config_json = serde_json::to_string_pretty(&definition).unwrap();
-    let config_path = index_dir.join("config.json");
-    if let Err(e) = std::fs::write(&config_path, &config_json) {
+    if let Err(e) = definition.save_yaml(&index_dir) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to write config: {e}")})),
@@ -1863,7 +1915,7 @@ async fn handle_patch_config(
                     eprintln!("Config patch: trace_buffer_size set to {v}");
                 }
 
-                // Toggle metric groups and persist to config.json
+                // Toggle metric groups and persist to config
                 if let Some(ref groups) = patch.enabled_metrics {
                     let bm = groups.iter().any(|g| g == "bitmap_memory");
                     let ev = groups.iter().any(|g| g == "eviction_stats");
@@ -1875,10 +1927,9 @@ async fn handle_patch_config(
                     eprintln!("Config patch: enabled_metrics = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
                 }
 
-                // Persist updated config.json
+                // Persist updated config
                 let index_dir = state.data_dir.join("indexes").join(&name);
-                let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
-                if let Err(e) = std::fs::write(index_dir.join("config.json"), &config_json) {
+                if let Err(e) = idx.definition.save_yaml(&index_dir) {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({
@@ -3137,10 +3188,9 @@ async fn handle_add_fields(
                 idx.definition.config.filter_fields.extend(req.filter_fields.clone());
                 idx.definition.config.sort_fields.extend(req.sort_fields.clone());
 
-                // Save updated config.json
+                // Save updated config
                 let index_dir = state.data_dir.join("indexes").join(&name);
-                let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
-                if let Err(e) = std::fs::write(index_dir.join("config.json"), &config_json) {
+                if let Err(e) = idx.definition.save_yaml(&index_dir) {
                     // Rollback config changes
                     for fc in &req.filter_fields {
                         idx.definition.config.filter_fields.retain(|f| f.name != fc.name);
@@ -3322,10 +3372,9 @@ async fn handle_remove_fields(
                     idx.definition.config.sort_fields.retain(|f| &f.name != sname);
                 }
 
-                // Save updated config.json
+                // Save updated config
                 let index_dir = state.data_dir.join("indexes").join(&name);
-                let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
-                if let Err(e) = std::fs::write(index_dir.join("config.json"), &config_json) {
+                if let Err(e) = idx.definition.save_yaml(&index_dir) {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": format!("Failed to persist config: {e}")})),

@@ -7063,7 +7063,7 @@ impl ConcurrentEngine {
     /// 3. Scans all alive documents to build bitmaps for the new fields
     /// 4. Publishes the updated snapshot
     ///
-    /// The caller (server) is responsible for updating the persisted config.json.
+    /// The caller (server) is responsible for updating the persisted config.
     /// Returns (slots_processed, field_names_added).
     pub fn add_fields_from_docstore(
         &self,
@@ -7310,7 +7310,7 @@ impl ConcurrentEngine {
     /// Removes the fields from the in-memory staging snapshot and publishes.
     /// Does NOT delete bitmap files on disk — orphaned files are overwritten
     /// on next `save_snapshot` or ignored on boot (field not in config = not loaded).
-    /// The caller (server) is responsible for updating the persisted config.json.
+    /// The caller (server) is responsible for updating the persisted config.
     pub fn remove_fields(
         &self,
         filter_names: &[String],
