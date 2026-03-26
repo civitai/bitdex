@@ -172,38 +172,44 @@ Two evaluation contexts:
 
 New file `src/dump_processor.rs` based on single_pass.rs patterns. Config-driven from the start — receives dump request body (D3) and processes CSV generically.
 
+### Agent Assignments
+
+- **Josh (Agent A)** — Core dump processor. File: `src/dump_processor.rs`. Owns the skeleton, CSV parsing, per-phase bitmap loop, BitmapFs persistence, docstore, crash recovery, server wiring.
+- **Nate (Agent B)** — Enrichment + expression engine. Files: `src/dump_expression.rs`, `src/dump_enrichment.rs`. Owns filter/computed expression evaluation, HashMap enrichment with nesting, LCS dictionary handling.
+- Josh calls Nate's library for enrichment/expression evaluation. Josh builds with placeholder calls initially; integrate when both are ready.
+
 ### Task List
 
-- [ ] **1.1** Create `src/dump_processor.rs` — skeleton with dump request body deserialization (D3 schema)
-- [ ] **1.2** Generic CSV column parser — parse CSV/TSV using named columns from dump request (not hardcoded parsers). Support both comma (CSV) and tab (TSV) delimiters via `format` field.
-- [ ] **1.3** Filter expression evaluator — evaluate config `filter` expressions per row. Support expression types from D7 (bitfield, equality, null check, boolean inversion). Filter is optional — absent means include all rows.
-- [ ] **1.4** Computed field evaluator — evaluate `computed_fields` expressions per row (bitfield extraction, max, identity, lookup_key, null check). Results feed into bitmap writes.
-- [ ] **1.5** Enrichment system — HashMap lookups with nested enrichment from config (see D1)
-  - [ ] 1.5a Single-level lookup (Post → Image enrichment)
-  - [ ] 1.5b Nested lookup (MV → Model within Resources)
-  - [ ] 1.5c Lazy loading per-phase (load before dependent CSV, drop after)
-- [ ] **1.6** Per-phase bitmap processing: build bitmaps in HashMap, save to BitmapFs, drop
-  - [ ] 1.6a Tags — Vec indexing optimization (MAX_TAG_ID=300K preallocated Vec, convert to HashMap for save). If tag count exceeds MAX_TAG_ID, fall back to HashMap.
-  - [ ] 1.6b Images — direct field writes + enrichment + computed fields
-  - [ ] 1.6c Resources — nested enrichment (MV → Model chain), baseModel Checkpoint filter
-  - [ ] 1.6d Tools, Techniques — simple multi-value (concise `fields: [toolIds]` shorthand)
-  - [ ] 1.6e Metrics — TSV format from ClickHouse, sort fields only
-- [ ] **1.7** Port mmap + `split_mmap_ranges` from single_pass.rs for large CSVs (>1GB). Keep BufReader for small enrichment CSVs (<100MB).
-- [ ] **1.8** Deferred alive — skip ALL bitmaps (alive + filter + sort) for future publishedAt, write docstore tuples only, collect `BTreeMap<u64, Vec<u32>>` (activate_at → slots), save via `write_deferred_alive()`. Slot counter = `max(max_alive_slot, max_deferred_slot) + 1`.
-- [ ] **1.9** Docstore writes — BulkWriter integration, append tuples per row (including deferred slots — required for `activate_due()` to rebuild bitmaps later)
-- [ ] **1.10** LCS dictionary handling — resolve string fields via FieldDictionary (type, availability, blockedFor, baseModel), persist to `dictionaries/{name}.dict` after all phases
-- [ ] **1.11** Crash recovery — `field_already_loaded()` checks BitmapFs for existing data files per field name; skip phase if present (ref: single_pass.rs:44-52)
-- [ ] **1.12** Computed sort fields — existedAt = GREATEST(scannedAt, createdAt), id = slot. sortAt = GREATEST(existedAt, publishedAt) resolved by BitDex from index config's `computed` property. **Prerequisite:** verify computed sort field feature exists (Ryan's PR #82).
-- [ ] **1.13** Wire dump_processor into server — PUT /dumps endpoint triggers async processing via existing task system (`GET /api/tasks/{task_id}` for status polling)
-- [ ] **1.14** Config validation — malformed dump request → clear error (not crash), unknown target field → warning
-- [ ] **1.15** Address ALL Ollie findings:
+- [ ] **1.1** `[Josh]` Create `src/dump_processor.rs` — skeleton with dump request body deserialization (D3 schema)
+- [ ] **1.2** `[Josh]` Generic CSV column parser — parse CSV/TSV using named columns from dump request (not hardcoded parsers). Support both comma (CSV) and tab (TSV) delimiters via `format` field.
+- [ ] **1.3** `[Nate]` Filter expression evaluator — evaluate config `filter` expressions per row. Support expression types from D7 (bitfield, equality, null check, boolean inversion). Filter is optional — absent means include all rows. **File: `src/dump_expression.rs`**
+- [ ] **1.4** `[Nate]` Computed field evaluator — evaluate `computed_fields` expressions per row (bitfield extraction, max, identity, lookup_key, null check). Results feed into bitmap writes. **File: `src/dump_expression.rs`**
+- [ ] **1.5** `[Nate]` Enrichment system — HashMap lookups with nested enrichment from config (see D1). **File: `src/dump_enrichment.rs`**
+  - [ ] 1.5a `[Nate]` Single-level lookup (Post → Image enrichment)
+  - [ ] 1.5b `[Nate]` Nested lookup (MV → Model within Resources)
+  - [ ] 1.5c `[Nate]` Lazy loading per-phase (load before dependent CSV, drop after)
+- [ ] **1.6** `[Josh]` Per-phase bitmap processing: build bitmaps in HashMap, save to BitmapFs, drop. Josh owns the phase loop; calls Nate's enrichment/expression APIs within each phase.
+  - [ ] 1.6a `[Josh]` Tags — Vec indexing optimization (MAX_TAG_ID=300K preallocated Vec, convert to HashMap for save). If tag count exceeds MAX_TAG_ID, fall back to HashMap.
+  - [ ] 1.6b `[Josh]` Images — direct field writes + calls Nate's enrichment + computed fields
+  - [ ] 1.6c `[Josh]` Resources — calls Nate's nested enrichment (MV → Model chain), baseModel Checkpoint filter
+  - [ ] 1.6d `[Josh]` Tools, Techniques — simple multi-value (concise `fields: [toolIds]` shorthand)
+  - [ ] 1.6e `[Josh]` Metrics — TSV format from ClickHouse, sort fields only
+- [ ] **1.7** `[Josh]` Port mmap + `split_mmap_ranges` from single_pass.rs for large CSVs (>1GB). Keep BufReader for small enrichment CSVs (<100MB).
+- [ ] **1.8** `[Josh]` Deferred alive — skip ALL bitmaps (alive + filter + sort) for future publishedAt, write docstore tuples only, collect `BTreeMap<u64, Vec<u32>>` (activate_at → slots), save via `write_deferred_alive()`. Slot counter = `max(max_alive_slot, max_deferred_slot) + 1`.
+- [ ] **1.9** `[Josh]` Docstore writes — BulkWriter integration, append tuples per row (including deferred slots — required for `activate_due()` to rebuild bitmaps later)
+- [ ] **1.10** `[Nate]` LCS dictionary handling — resolve string fields via FieldDictionary (type, availability, blockedFor, baseModel), persist to `dictionaries/{name}.dict` after all phases. **Nate provides the API; Josh calls it from the phase loop.**
+- [ ] **1.11** `[Josh]` Crash recovery — `field_already_loaded()` checks BitmapFs for existing data files per field name; skip phase if present (ref: single_pass.rs:44-52)
+- [ ] **1.12** `[Josh]` Computed sort fields — existedAt = GREATEST(scannedAt, createdAt), id = slot. sortAt = GREATEST(existedAt, publishedAt) resolved by BitDex from index config's `computed` property. **Prerequisite:** verify computed sort field feature exists (Ryan's PR #82). ✅ PR #82 merged.
+- [ ] **1.13** `[Josh]` Wire dump_processor into server — PUT /dumps endpoint triggers async processing via existing task system (`GET /api/tasks/{task_id}` for status polling)
+- [ ] **1.14** `[Josh]` Config validation — malformed dump request → clear error (not crash), unknown target field → warning
+- [ ] **1.15** `[Josh]` Address ALL Ollie findings:
   - [ ] #1 Direct bitmap writes (done by design — no Op abstraction in dump)
   - [ ] #2 Mmap for large CSVs (1.7)
   - [ ] #3 Arc<str> field names instead of String clones per rayon task
   - [ ] #4 No double conversion (done by design — CSV value → bitmap key directly)
   - [ ] #5 Vec for sort bit layers instead of HashMap (preallocate `Vec<RoaringBitmap>` of size `num_bits`)
   - [ ] #6 No apply_accum (write to BitmapFs directly, no engine staging)
-  - [ ] #7 Dict refs — pass individual `&FieldDictionary` refs, not full `HashMap<String, FieldDictionary>`
+  - [ ] #7 `[Nate]` Dict refs — pass individual `&FieldDictionary` refs, not full `HashMap<String, FieldDictionary>` (part of 1.10 API design)
   - [ ] #8 Deferred alive skips all bitmaps (1.8)
 
 ### Phase 1 Validation
