@@ -116,6 +116,10 @@ pub struct FieldMeta {
     /// Reverse map: source_field → computed sort fields that depend on it.
     /// When a source field is set, all computed fields referencing it must be recomputed.
     computed_deps: HashMap<String, Vec<ComputedSortInfo>>,
+    /// Deferred alive config: if present, the source_field name whose future timestamps
+    /// trigger deferred alive instead of immediate alive. ms_to_seconds indicates
+    /// whether the field value is in milliseconds (needs /1000 for epoch comparison).
+    deferred_alive_field: Option<(String, bool)>,
     /// Field registry for Arc<str> interning (kept for future DocSink use)
     #[allow(dead_code)]
     registry: FieldRegistry,
@@ -160,10 +164,16 @@ impl FieldMeta {
             }
         }
 
+        // Deferred alive config
+        let deferred_alive_field = config.deferred_alive.as_ref().map(|da| {
+            (da.source_field.clone(), da.ms_to_seconds)
+        });
+
         Self {
             filter_fields,
             sort_fields,
             computed_deps,
+            deferred_alive_field,
             registry,
         }
     }
@@ -443,7 +453,32 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // Join tables (tags, tools) set creates_slot=false — they only
         // add multi-value bitmaps to existing slots.
         if entry.creates_slot {
-            sink.alive_insert(slot);
+            // Check deferred alive: if the source field (e.g., publishedAt) is in
+            // the future, defer the alive bit instead of setting it immediately.
+            let mut deferred = false;
+            if let Some((ref da_field, ms_to_secs)) = meta.deferred_alive_field {
+                for op in &entry.ops {
+                    if let Op::Set { field, value } = op {
+                        if field == da_field {
+                            if let Some(ts) = value.as_i64() {
+                                let secs = if ms_to_secs { ts / 1000 } else { ts };
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs() as i64;
+                                if secs > now {
+                                    sink.deferred_alive(slot, secs as u64);
+                                    deferred = true;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if !deferred {
+                sink.alive_insert(slot);
+            }
         }
 
         if has_any_ops {
@@ -1336,6 +1371,7 @@ mod tests {
         sort_clears: Vec<(String, usize, u32)>,
         alive_inserts: Vec<u32>,
         alive_removes: Vec<u32>,
+        deferred_alive: Vec<(u32, u64)>,
     }
 
     impl RecordingSink {
@@ -1347,6 +1383,7 @@ mod tests {
                 sort_clears: Vec::new(),
                 alive_inserts: Vec::new(),
                 alive_removes: Vec::new(),
+                deferred_alive: Vec::new(),
             }
         }
     }
@@ -1369,6 +1406,9 @@ mod tests {
         }
         fn alive_remove(&mut self, slot: u32) {
             self.alive_removes.push(slot);
+        }
+        fn deferred_alive(&mut self, slot: u32, activate_at: u64) {
+            self.deferred_alive.push((slot, activate_at));
         }
         fn flush(&mut self) -> crate::error::Result<()> {
             Ok(())
@@ -1740,5 +1780,93 @@ mod tests {
         assert_eq!(load_cursor(&path), 0);
         save_cursor(&path, 12345).unwrap();
         assert_eq!(load_cursor(&path), 12345);
+    }
+
+    #[test]
+    fn test_deferred_alive_future_publishedat() {
+        use crate::config::DeferredAliveConfig;
+
+        let mut config = test_config();
+        config.deferred_alive = Some(DeferredAliveConfig {
+            source_field: "publishedAt".into(),
+            ms_to_seconds: false,
+        });
+        // Add publishedAt as a sort field so it appears in meta
+        config.sort_fields.push(SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        });
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        // Future timestamp (year 2050)
+        let future_ts = 2524608000i64;
+
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "nsfwLevel".into(), value: json!(16) },
+                Op::Set { field: "publishedAt".into(), value: json!(future_ts) },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // Should NOT have alive_insert (deferred instead)
+        assert!(sink.alive_inserts.is_empty(), "future publishedAt should NOT set alive");
+        assert_eq!(sink.deferred_alive.len(), 1);
+        assert_eq!(sink.deferred_alive[0], (42, future_ts as u64));
+
+        // But filter/sort bitmaps should still be set
+        assert!(!sink.filter_inserts.is_empty(), "filter bitmaps should still be set");
+        assert!(!sink.sort_sets.is_empty(), "sort layers should still be set");
+    }
+
+    #[test]
+    fn test_deferred_alive_past_publishedat() {
+        use crate::config::DeferredAliveConfig;
+
+        let mut config = test_config();
+        config.deferred_alive = Some(DeferredAliveConfig {
+            source_field: "publishedAt".into(),
+            ms_to_seconds: false,
+        });
+        config.sort_fields.push(SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        });
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        // Past timestamp (year 2024)
+        let past_ts = 1704067200i64;
+
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "nsfwLevel".into(), value: json!(16) },
+                Op::Set { field: "publishedAt".into(), value: json!(past_ts) },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // Past timestamp should set alive immediately
+        assert_eq!(sink.alive_inserts, vec![42]);
+        assert!(sink.deferred_alive.is_empty(), "past publishedAt should NOT defer alive");
     }
 }
