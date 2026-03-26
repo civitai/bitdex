@@ -118,6 +118,7 @@ async fn poll_and_process(
         .map(|row| EntityOps {
             entity_id: row.entity_id,
             ops: row.ops.0,
+            creates_slot: false, // Determined by trigger config at source; override in pg-sync
         })
         .collect();
 

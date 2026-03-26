@@ -56,6 +56,7 @@ pub fn images_csv_to_wal(csv_path: &Path, writer: &WalWriter, batch_size: usize)
         batch.push(EntityOps {
             entity_id: row.id,
             ops,
+            creates_slot: true, // Image table creates alive slots
         });
 
         if batch.len() >= batch_size {
@@ -75,6 +76,11 @@ pub fn images_csv_to_wal(csv_path: &Path, writer: &WalWriter, batch_size: usize)
 
     stats.elapsed_secs = start.elapsed().as_secs_f64();
     Ok(stats)
+}
+
+/// Convert a single image CSV row to ops (public for direct dump path).
+pub fn image_row_to_ops_pub(row: &CopyImageRow) -> Vec<Op> {
+    image_row_to_ops(row)
 }
 
 /// Convert a single image CSV row to ops.
@@ -170,6 +176,7 @@ fn multi_value_csv_to_wal(
                 field: field_name.to_string(),
                 value: json!(value),
             }],
+            creates_slot: false, // Join tables don't create alive slots
         });
 
         if batch.len() >= batch_size {
@@ -277,7 +284,7 @@ fn images_csv_to_wal_limited(csv_path: &Path, writer: &WalWriter, batch_size: us
             None => { stats.rows_skipped += 1; continue; }
         };
         stats.rows_read += 1;
-        batch.push(EntityOps { entity_id: row.id, ops: image_row_to_ops(&row) });
+        batch.push(EntityOps { entity_id: row.id, ops: image_row_to_ops(&row), creates_slot: true });
         if batch.len() >= batch_size {
             let bytes = writer.append_batch(&batch)?;
             stats.ops_written += batch.len() as u64;
@@ -323,6 +330,7 @@ fn multi_value_csv_to_wal_limited(
         batch.push(EntityOps {
             entity_id: slot_id,
             ops: vec![Op::Add { field: field_name.to_string(), value: json!(value) }],
+            creates_slot: false,
         });
         if batch.len() >= batch_size {
             let bytes = writer.append_batch(&batch)?;

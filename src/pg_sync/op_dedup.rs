@@ -20,13 +20,18 @@ use super::ops::{EntityOps, Op};
 /// Add/remove cancellation eliminates net-zero multi-value ops.
 /// A delete op absorbs all prior ops for that entity.
 pub fn dedup_ops(batch: &mut Vec<EntityOps>) {
-    // Phase 1: Merge all ops per entity_id
+    // Phase 1: Merge all ops per entity_id, preserving creates_slot (OR across sources)
     let mut entity_map: HashMap<i64, Vec<Op>> = HashMap::new();
+    let mut creates_slot_map: HashMap<i64, bool> = HashMap::new();
     for entry in batch.drain(..) {
         entity_map
             .entry(entry.entity_id)
             .or_default()
             .extend(entry.ops);
+        // If ANY source for this entity sets creates_slot, preserve it
+        if entry.creates_slot {
+            creates_slot_map.insert(entry.entity_id, true);
+        }
     }
 
     // Phase 2: Dedup ops within each entity
@@ -38,7 +43,11 @@ pub fn dedup_ops(batch: &mut Vec<EntityOps>) {
     *batch = entity_map
         .into_iter()
         .filter(|(_, ops)| !ops.is_empty())
-        .map(|(entity_id, ops)| EntityOps { entity_id, ops })
+        .map(|(entity_id, ops)| EntityOps {
+            entity_id,
+            ops,
+            creates_slot: creates_slot_map.get(&entity_id).copied().unwrap_or(false),
+        })
         .collect();
 }
 
@@ -139,7 +148,7 @@ mod tests {
     use serde_json::json;
 
     fn entity(id: i64, ops: Vec<Op>) -> EntityOps {
-        EntityOps { entity_id: id, ops }
+        EntityOps { entity_id: id, ops, creates_slot: false }
     }
 
     #[test]

@@ -86,6 +86,23 @@ pub struct EntityOps {
     pub entity_id: i64,
     /// Operations to apply
     pub ops: Vec<Op>,
+    /// If true, this entity should have its alive bit set (creates the slot if new).
+    /// Only the primary entity table (e.g., Image with sets_alive: true) sets this.
+    /// Join tables (tags, tools) leave this false — they only add multi-value bitmaps.
+    #[serde(default)]
+    pub creates_slot: bool,
+}
+
+impl EntityOps {
+    /// Convenience constructor — creates_slot defaults to false.
+    pub fn new(entity_id: i64, ops: Vec<Op>) -> Self {
+        Self { entity_id, ops, creates_slot: false }
+    }
+
+    /// Constructor for primary entity ops that should create alive slots.
+    pub fn with_alive(entity_id: i64, ops: Vec<Op>) -> Self {
+        Self { entity_id, ops, creates_slot: true }
+    }
 }
 
 /// Sync source metadata, bundled with ops payloads.
@@ -203,6 +220,7 @@ mod tests {
         let batch = OpsBatch {
             ops: vec![EntityOps {
                 entity_id: 123,
+                creates_slot: false,
                 ops: vec![Op::Set {
                     field: "nsfwLevel".into(),
                     value: json!(16),

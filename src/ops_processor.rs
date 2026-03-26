@@ -1,25 +1,34 @@
-//! WAL ops processor — reads ops from WAL files and applies them as engine mutations.
+//! WAL ops processor — translates ops from WAL files into bitmap mutations.
 //!
-//! The processor runs as a dedicated thread, tailing WAL files and converting ops
-//! into engine mutations (put/patch/delete). It handles:
-//! - Regular ops (set/remove/add) via PatchPayload
-//! - queryOpSet via query resolution + bulk bitmap ops
-//! - Delete via engine.delete()
-//! - Deduplication via shared dedup helper
+//! Two processing modes per the Sync V2 design:
+//!
+//! - **Steady-state**: Ops → BitmapSink (CoalescerSink) → coalescer channel → flush thread.
+//!   Used by the WAL reader thread during normal operation.
+//!
+//! - **Dump mode**: Ops → BitmapSink (AccumSink) → direct bitmap accumulation.
+//!   Used during initial load. Bypasses coalescer, snapshot publishing, and cache.
+//!
+//! Both paths use the same `process_entity_ops()` core that translates Op variants
+//! into BitmapSink calls using the engine Config for field awareness and
+//! `value_to_bitmap_key()` / `value_to_sort_u32()` for value conversion.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value as JsonValue;
 
 use crate::concurrent_engine::ConcurrentEngine;
-use crate::mutation::{FieldValue, PatchField, PatchPayload};
+use crate::config::Config;
+use crate::filter::FilterFieldType;
+use crate::ingester::BitmapSink;
+use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
 use crate::pg_sync::op_dedup::dedup_ops;
 use crate::pg_sync::ops::{EntityOps, Op};
 use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 
-/// Convert a serde_json::Value to a query::Value.
+/// Convert a serde_json::Value to a query::Value for bitmap key conversion.
 fn json_to_qvalue(v: &JsonValue) -> QValue {
     match v {
         JsonValue::Number(n) => {
@@ -33,8 +42,8 @@ fn json_to_qvalue(v: &JsonValue) -> QValue {
         }
         JsonValue::Bool(b) => QValue::Bool(*b),
         JsonValue::String(s) => QValue::String(s.clone()),
-        JsonValue::Null => QValue::Integer(0), // Null → zero for bitmap purposes
-        _ => QValue::String(v.to_string()), // Arrays/objects → string representation
+        JsonValue::Null => QValue::Integer(0),
+        _ => QValue::String(v.to_string()),
     }
 }
 
@@ -58,13 +67,59 @@ impl Default for OpsProcessorConfig {
     }
 }
 
-/// Process a single batch of entity ops against the engine.
+/// Precomputed field metadata from Config, used during ops processing.
+/// Built once, reused across all batches.
+pub struct FieldMeta {
+    /// Filter field name → (Arc<str>, FilterFieldType)
+    filter_fields: HashMap<String, (Arc<str>, FilterFieldType)>,
+    /// Sort field name → (Arc<str>, num_bits)
+    sort_fields: HashMap<String, (Arc<str>, usize)>,
+    /// Field registry for Arc<str> interning (kept for future DocSink use)
+    #[allow(dead_code)]
+    registry: FieldRegistry,
+}
+
+impl FieldMeta {
+    /// Build FieldMeta from engine config.
+    pub fn from_config(config: &Config) -> Self {
+        let registry = FieldRegistry::from_config(config);
+        let mut filter_fields = HashMap::new();
+        for fc in &config.filter_fields {
+            filter_fields.insert(
+                fc.name.clone(),
+                (registry.get(&fc.name), fc.field_type.clone()),
+            );
+        }
+        let mut sort_fields = HashMap::new();
+        for sc in &config.sort_fields {
+            sort_fields.insert(
+                sc.name.clone(),
+                (registry.get(&sc.name), sc.bits as usize),
+            );
+        }
+        Self {
+            filter_fields,
+            sort_fields,
+            registry,
+        }
+    }
+}
+
+/// Process a batch of entity ops, translating them into BitmapSink calls.
+///
+/// This is the core function used by both steady-state (CoalescerSink) and
+/// dump (AccumSink) paths. The sink determines where mutations go.
+///
+/// For queryOpSet resolution, an engine reference is needed to execute queries.
+/// Pass `None` during dump mode (queryOpSets are only used in steady-state).
+///
 /// Returns (applied, skipped, errors).
-pub fn apply_ops_batch(
-    engine: &ConcurrentEngine,
+pub fn apply_ops_batch<S: BitmapSink>(
+    sink: &mut S,
+    meta: &FieldMeta,
     batch: &mut Vec<EntityOps>,
+    engine: Option<&ConcurrentEngine>,
 ) -> (usize, usize, usize) {
-    // Dedup first
     dedup_ops(batch);
 
     let mut applied = 0usize;
@@ -79,155 +134,208 @@ pub fn apply_ops_batch(
         }
         let slot = entity_id as u32;
 
-        for op in &entry.ops {
-            match op {
-                Op::Delete => {
-                    match engine.delete(slot) {
-                        Ok(()) => applied += 1,
-                        Err(e) => {
-                            tracing::warn!("ops processor: delete slot {slot} failed: {e}");
-                            errors += 1;
-                        }
-                    }
+        // Delete absorbs everything — clear all bitmaps for this slot.
+        if entry.ops.iter().any(|op| matches!(op, Op::Delete)) {
+            match process_delete(sink, meta, slot, engine) {
+                Ok(()) => applied += 1,
+                Err(e) => {
+                    tracing::warn!("ops processor: delete slot {slot} failed: {e}");
+                    errors += 1;
                 }
+            }
+            continue;
+        }
 
-                Op::QueryOpSet { query, ops } => {
-                    match apply_query_op_set(engine, query, ops) {
+        // Handle queryOpSets (steady-state only — needs engine for query resolution)
+        for op in &entry.ops {
+            if let Op::QueryOpSet { query, ops } = op {
+                if let Some(eng) = engine {
+                    match apply_query_op_set(sink, meta, eng, query, ops) {
                         Ok(count) => applied += count,
                         Err(e) => {
                             tracing::warn!("ops processor: queryOpSet '{query}' failed: {e}");
                             errors += 1;
                         }
                     }
-                }
-
-                // Accumulate set/remove/add ops per entity, then apply as a patch
-                _ => {
-                    // Collect all non-delete, non-queryOpSet ops for this entity
-                    // and apply as a single patch
+                } else {
+                    tracing::warn!("ops processor: queryOpSet skipped (no engine in dump mode)");
+                    skipped += 1;
                 }
             }
         }
 
-        // Build a PatchPayload from the set/remove/add ops for this entity
-        let patch = build_patch_from_ops(&entry.ops);
-        if !patch.fields.is_empty() {
-            match engine.patch(slot, &patch) {
-                Ok(()) => applied += 1,
-                Err(e) => {
-                    tracing::warn!("ops processor: patch slot {slot} failed: {e}");
-                    errors += 1;
+        // Process set/remove/add ops → direct bitmap mutations
+        let mut has_any_ops = false;
+        for op in &entry.ops {
+            match op {
+                Op::Set { field, value } => {
+                    process_set_op(sink, meta, slot, field, value);
+                    has_any_ops = true;
+                }
+                Op::Remove { field, value } => {
+                    process_remove_op(sink, meta, slot, field, value);
+                    has_any_ops = true;
+                }
+                Op::Add { field, value } => {
+                    process_add_op(sink, meta, slot, field, value);
+                    has_any_ops = true;
+                }
+                Op::Delete | Op::QueryOpSet { .. } => {
+                    // Already handled above
                 }
             }
         }
+
+        // Set alive only if creates_slot is true (primary entity table).
+        // Join tables (tags, tools) set creates_slot=false — they only
+        // add multi-value bitmaps to existing slots.
+        if entry.creates_slot {
+            sink.alive_insert(slot);
+        }
+
+        if has_any_ops {
+            applied += 1;
+        }
+    }
+
+    // Flush buffered operations
+    if let Err(e) = sink.flush() {
+        tracing::error!("ops processor: sink flush failed: {e}");
+        errors += 1;
     }
 
     (applied, skipped, errors)
 }
 
-/// Build a PatchPayload from a list of ops for a single entity.
-/// Pairs remove/set ops on the same field into PatchField { old, new }.
-/// Add ops become multi-value inserts.
-fn build_patch_from_ops(ops: &[Op]) -> PatchPayload {
-    let mut fields: HashMap<String, PatchField> = HashMap::new();
+/// Process a `set` op: set the new value's bitmap bit for this slot.
+fn process_set_op<S: BitmapSink>(
+    sink: &mut S,
+    meta: &FieldMeta,
+    slot: u32,
+    field: &str,
+    value: &JsonValue,
+) {
+    let qval = json_to_qvalue(value);
 
-    // First pass: collect removes (old values) and sets (new values) per field
-    let mut old_values: HashMap<&str, &JsonValue> = HashMap::new();
-    let mut new_values: HashMap<&str, &JsonValue> = HashMap::new();
-    let mut add_values: HashMap<&str, Vec<&JsonValue>> = HashMap::new();
-    let mut remove_values: HashMap<&str, Vec<&JsonValue>> = HashMap::new();
+    // Check if this is a filter field
+    if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
+        if let Some(key) = value_to_bitmap_key(&qval) {
+            sink.filter_insert(arc_name.clone(), key, slot);
+        }
+    }
 
-    for op in ops {
-        match op {
-            Op::Remove { field, value } => {
-                // Check if there's a corresponding Set for this field (scalar update)
-                let has_set = ops.iter().any(|o| matches!(o, Op::Set { field: f, .. } if f == field));
-                if has_set {
-                    old_values.insert(field, value);
-                } else {
-                    // Multi-value remove
-                    remove_values.entry(field).or_default().push(value);
+    // Check if this is a sort field
+    if let Some((arc_name, num_bits)) = meta.sort_fields.get(field) {
+        if let Some(sort_val) = value_to_sort_u32(&qval) {
+            for bit in 0..*num_bits {
+                if (sort_val >> bit) & 1 == 1 {
+                    sink.sort_set(arc_name.clone(), bit, slot);
                 }
             }
-            Op::Set { field, value } => {
-                new_values.insert(field, value);
-            }
-            Op::Add { field, value } => {
-                add_values.entry(field).or_default().push(value);
-            }
-            Op::Delete | Op::QueryOpSet { .. } => {
-                // Handled separately
-            }
         }
     }
-
-    // Build PatchFields for scalar set/remove pairs
-    for (field, new_val) in &new_values {
-        let old = old_values
-            .get(*field)
-            .map(|v| FieldValue::Single(json_to_qvalue(v)))
-            .unwrap_or(FieldValue::Single(QValue::Integer(0)));
-        let new = FieldValue::Single(json_to_qvalue(new_val));
-        fields.insert(field.to_string(), PatchField { old, new });
-    }
-
-    // Build PatchFields for multi-value adds
-    for (field, vals) in &add_values {
-        let new_multi: Vec<QValue> = vals.iter().map(|v| json_to_qvalue(v)).collect();
-        let existing = fields.entry(field.to_string()).or_insert_with(|| PatchField {
-            old: FieldValue::Multi(vec![]),
-            new: FieldValue::Multi(vec![]),
-        });
-        if let FieldValue::Multi(ref mut m) = existing.new {
-            m.extend(new_multi);
-        } else {
-            *existing = PatchField {
-                old: FieldValue::Multi(vec![]),
-                new: FieldValue::Multi(vals.iter().map(|v| json_to_qvalue(v)).collect()),
-            };
-        }
-    }
-
-    // Build PatchFields for multi-value removes
-    for (field, vals) in &remove_values {
-        let removed: Vec<QValue> = vals.iter().map(|v| json_to_qvalue(v)).collect();
-        let existing = fields.entry(field.to_string()).or_insert_with(|| PatchField {
-            old: FieldValue::Multi(vec![]),
-            new: FieldValue::Multi(vec![]),
-        });
-        if let FieldValue::Multi(ref mut m) = existing.old {
-            m.extend(removed);
-        } else {
-            *existing = PatchField {
-                old: FieldValue::Multi(vals.iter().map(|v| json_to_qvalue(v)).collect()),
-                new: FieldValue::Multi(vec![]),
-            };
-        }
-    }
-
-    PatchPayload { fields }
 }
 
-/// Resolve a queryOpSet: execute the query to get matching slots, then apply
-/// the nested ops to each slot.
-fn apply_query_op_set(
+/// Process a `remove` op: clear the old value's bitmap bit for this slot.
+fn process_remove_op<S: BitmapSink>(
+    sink: &mut S,
+    meta: &FieldMeta,
+    slot: u32,
+    field: &str,
+    value: &JsonValue,
+) {
+    let qval = json_to_qvalue(value);
+
+    // Check if this is a filter field
+    if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
+        if let Some(key) = value_to_bitmap_key(&qval) {
+            sink.filter_remove(arc_name.clone(), key, slot);
+        }
+    }
+
+    // Check if this is a sort field
+    if let Some((arc_name, num_bits)) = meta.sort_fields.get(field) {
+        if let Some(sort_val) = value_to_sort_u32(&qval) {
+            for bit in 0..*num_bits {
+                if (sort_val >> bit) & 1 == 1 {
+                    sink.sort_clear(arc_name.clone(), bit, slot);
+                }
+            }
+        }
+    }
+}
+
+/// Process an `add` op: set a multi-value bitmap bit.
+/// Same as `set` for bitmap purposes — adds the value's bit.
+fn process_add_op<S: BitmapSink>(
+    sink: &mut S,
+    meta: &FieldMeta,
+    slot: u32,
+    field: &str,
+    value: &JsonValue,
+) {
+    let qval = json_to_qvalue(value);
+
+    if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
+        if let Some(key) = value_to_bitmap_key(&qval) {
+            sink.filter_insert(arc_name.clone(), key, slot);
+        }
+    }
+    // Multi-value fields don't have sort layers, but handle it generically
+    if let Some((arc_name, num_bits)) = meta.sort_fields.get(field) {
+        if let Some(sort_val) = value_to_sort_u32(&qval) {
+            for bit in 0..*num_bits {
+                if (sort_val >> bit) & 1 == 1 {
+                    sink.sort_set(arc_name.clone(), bit, slot);
+                }
+            }
+        }
+    }
+}
+
+/// Process a delete: read stored doc from engine to know which bitmaps to clear
+/// (clean delete principle), then clear all filter/sort bits + alive bit.
+///
+/// Per design doc H1: deletes are the one op type that requires a docstore read.
+fn process_delete<S: BitmapSink>(
+    sink: &mut S,
+    _meta: &FieldMeta,
+    slot: u32,
+    engine: Option<&ConcurrentEngine>,
+) -> std::result::Result<(), String> {
+    // If we have an engine, read stored doc to clear filter/sort bitmaps cleanly.
+    // Without engine (dump mode), we can only clear alive — filter bitmaps may be stale.
+    if let Some(eng) = engine {
+        // Use the engine's delete method which handles clean delete internally.
+        eng.delete(slot).map_err(|e| format!("engine delete failed: {e}"))?;
+        return Ok(());
+    }
+
+    // Dump mode fallback: just clear alive bit (no stored doc to read)
+    sink.alive_remove(slot);
+    Ok(())
+}
+
+/// Resolve a queryOpSet: execute the query to get matching slots,
+/// then apply the nested ops to each matching slot via the BitmapSink.
+fn apply_query_op_set<S: BitmapSink>(
+    sink: &mut S,
+    meta: &FieldMeta,
     engine: &ConcurrentEngine,
     query_str: &str,
     ops: &[Op],
-) -> Result<usize, String> {
-    // Parse the query string into filter clauses
+) -> std::result::Result<usize, String> {
     let filters = parse_filter_from_query_str(query_str)?;
 
     let query = BitdexQuery {
         filters,
         sort: None,
-        limit: usize::MAX, // Get all matching slots
+        limit: usize::MAX,
         offset: None,
         cursor: None,
-        skip_cache: true, // Don't pollute cache with internal queries
+        skip_cache: true,
     };
 
-    // Execute query to get matching slot IDs
     let result = engine
         .execute_query(&query)
         .map_err(|e| format!("queryOpSet query failed: {e}"))?;
@@ -237,25 +345,36 @@ fn apply_query_op_set(
         return Ok(0);
     }
 
-    // Build the patch from nested ops
-    let patch = build_patch_from_ops(ops);
-    if patch.fields.is_empty() {
-        return Ok(0);
-    }
-
-    // Apply patch to each matching slot
+    // Apply nested ops to each matching slot
     let mut applied = 0;
     for &slot_id in slot_ids {
-        if slot_id < 0 {
+        if slot_id < 0 || slot_id > u32::MAX as i64 {
             continue;
         }
         let slot = slot_id as u32;
-        match engine.patch(slot, &patch) {
-            Ok(()) => applied += 1,
-            Err(e) => {
-                tracing::warn!("queryOpSet: patch slot {slot} failed: {e}");
+
+        for op in ops {
+            match op {
+                Op::Set { field, value } => {
+                    process_set_op(sink, meta, slot, field, value);
+                }
+                Op::Remove { field, value } => {
+                    process_remove_op(sink, meta, slot, field, value);
+                }
+                Op::Add { field, value } => {
+                    process_add_op(sink, meta, slot, field, value);
+                }
+                Op::Delete => {
+                    // Delete within queryOpSet clears alive for each matched slot
+                    sink.alive_remove(slot);
+                }
+                Op::QueryOpSet { .. } => {
+                    // Nested queryOpSets not supported
+                    tracing::warn!("nested queryOpSet ignored");
+                }
             }
         }
+        applied += 1;
     }
 
     Ok(applied)
@@ -263,7 +382,7 @@ fn apply_query_op_set(
 
 /// Parse a simple filter string like "modelVersionIds eq 456" or "postId eq 789"
 /// into filter clauses.
-fn parse_filter_from_query_str(query_str: &str) -> Result<Vec<FilterClause>, String> {
+fn parse_filter_from_query_str(query_str: &str) -> std::result::Result<Vec<FilterClause>, String> {
     let clauses: Vec<&str> = query_str.split(" AND ").collect();
     let mut filters = Vec::new();
 
@@ -297,7 +416,7 @@ fn parse_filter_from_query_str(query_str: &str) -> Result<Vec<FilterClause>, Str
 }
 
 /// Parse a single query value from a string.
-fn parse_query_value(s: &str) -> Result<QValue, String> {
+fn parse_query_value(s: &str) -> std::result::Result<QValue, String> {
     if let Ok(n) = s.parse::<i64>() {
         return Ok(QValue::Integer(n));
     }
@@ -315,7 +434,7 @@ fn parse_query_value(s: &str) -> Result<QValue, String> {
 }
 
 /// Parse an array of query values like "[101, 102, 103]".
-fn parse_query_values_array(s: &str) -> Result<Vec<QValue>, String> {
+fn parse_query_values_array(s: &str) -> std::result::Result<Vec<QValue>, String> {
     let trimmed = s.trim();
     if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
         return Err(format!("Expected array for 'in' filter, got: '{s}'"));
@@ -329,6 +448,241 @@ fn parse_query_values_array(s: &str) -> Result<Vec<QValue>, String> {
         }
     }
     Ok(values)
+}
+
+/// Process a batch of entity ops in dump mode using AccumSink.
+///
+/// This is the bulk-loading path that bypasses the coalescer entirely.
+/// Ops are accumulated directly into bitmaps (like the single-pass loader).
+///
+/// Returns (applied, skipped, errors).
+pub(crate) fn apply_ops_batch_dump(
+    accum: &mut crate::loader::BitmapAccum,
+    meta: &FieldMeta,
+    batch: &mut Vec<EntityOps>,
+) -> (usize, usize, usize) {
+    let mut sink = crate::ingester::AccumSink::new(accum);
+    apply_ops_batch(&mut sink, meta, batch, None)
+}
+
+/// Process all WAL entries in dump mode: reads WAL, accumulates bitmaps, applies to engine.
+///
+/// This is the high-level dump pipeline entry point. It:
+/// 1. Creates a BitmapAccum from the engine config
+/// 2. Reads all WAL entries, processes via AccumSink
+/// 3. Applies accumulated bitmaps directly to engine staging
+///
+/// Returns (total_applied, total_errors, elapsed_secs).
+pub fn process_wal_dump(
+    engine: &ConcurrentEngine,
+    wal_path: &Path,
+    batch_size: usize,
+) -> (u64, u64, f64) {
+    use crate::loader::BitmapAccum;
+    use crate::ops_wal::WalReader;
+    use std::time::Instant;
+
+    let config = engine.config();
+    let meta = FieldMeta::from_config(config);
+
+    let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
+    let sort_configs: Vec<(String, u8)> = config.sort_fields.iter().map(|s| (s.name.clone(), s.bits)).collect();
+    let mut accum = BitmapAccum::new(&filter_names, &sort_configs);
+
+    let start = Instant::now();
+    let mut reader = WalReader::new(wal_path, 0);
+    let mut total_applied = 0u64;
+    let mut total_errors = 0u64;
+
+    loop {
+        let batch = match reader.read_batch(batch_size) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("WAL read error in dump mode: {e}");
+                total_errors += 1;
+                break;
+            }
+        };
+        if batch.entries.is_empty() {
+            break;
+        }
+        let mut entries = batch.entries;
+        let (applied, _skipped, errors) = apply_ops_batch_dump(&mut accum, &meta, &mut entries);
+        total_applied += applied as u64;
+        total_errors += errors as u64;
+    }
+
+    // Apply accumulated bitmaps to engine staging
+    engine.apply_accum(&accum);
+
+    (total_applied, total_errors, start.elapsed().as_secs_f64())
+}
+
+/// Direct dump pipeline: CSV → ops → AccumSink, bypassing WAL entirely.
+///
+/// For bulk loading, the WAL roundtrip (JSON serialize → disk → read → deserialize)
+/// adds ~8x overhead vs direct processing. This function goes straight from
+/// CSV rows to bitmap accumulation, matching the single-pass loader's throughput.
+///
+/// Returns (total_applied, total_errors, elapsed_secs).
+pub fn process_csv_dump_direct(
+    engine: &ConcurrentEngine,
+    csv_dir: &Path,
+    batch_size: usize,
+    limit: Option<u64>,
+) -> (u64, u64, f64) {
+    use crate::ingester::AccumSink;
+    use crate::loader::BitmapAccum;
+    use crate::pg_sync::copy_queries::{parse_image_row, parse_tag_row, parse_tool_row};
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    use std::time::Instant;
+
+    let config = engine.config();
+    let meta = FieldMeta::from_config(config);
+
+    let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
+    let sort_configs: Vec<(String, u8)> = config.sort_fields.iter().map(|s| (s.name.clone(), s.bits)).collect();
+    let mut accum = BitmapAccum::new(&filter_names, &sort_configs);
+
+    let start = Instant::now();
+    let mut total_applied = 0u64;
+    let mut total_errors = 0u64;
+
+    // Phase 1: Images (creates alive slots)
+    let images_csv = csv_dir.join("images.csv");
+    if images_csv.exists() {
+        let file = File::open(&images_csv).expect("open images.csv");
+        let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+        let mut rows = 0u64;
+        let img_start = Instant::now();
+
+        for line in reader.split(b'\n') {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.is_empty() { continue; }
+            if let Some(max) = limit {
+                if rows >= max { break; }
+            }
+
+            let row = match parse_image_row(&line) {
+                Some(r) => r,
+                None => continue,
+            };
+            rows += 1;
+
+            let slot = row.id as u32;
+            // Process each op directly into AccumSink
+            let ops = crate::pg_sync::csv_ops::image_row_to_ops_pub(&row);
+            {
+                let mut sink = AccumSink::new(&mut accum);
+                for op in &ops {
+                    match op {
+                        Op::Set { field, value } => {
+                            process_set_op(&mut sink, &meta, slot, field, value);
+                        }
+                        Op::Remove { field, value } => {
+                            process_remove_op(&mut sink, &meta, slot, field, value);
+                        }
+                        _ => {}
+                    }
+                }
+                sink.alive_insert(slot);
+            }
+            total_applied += 1;
+        }
+        eprintln!("  images: {rows} rows, {:.1}s ({:.0}/s)",
+            img_start.elapsed().as_secs_f64(),
+            rows as f64 / img_start.elapsed().as_secs_f64().max(0.001));
+    }
+
+    // Phase 2: Tags (multi-value, no alive)
+    let tags_csv = csv_dir.join("tags.csv");
+    if tags_csv.exists() {
+        let file = File::open(&tags_csv).expect("open tags.csv");
+        let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+        let mut rows = 0u64;
+        let tag_start = Instant::now();
+
+        for line in reader.split(b'\n') {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.is_empty() { continue; }
+            if let Some(max) = limit {
+                if rows >= max { break; }
+            }
+
+            let (tag_id, image_id) = match parse_tag_row(&line) {
+                Some(pair) => pair,
+                None => continue,
+            };
+            rows += 1;
+
+            let slot = image_id as u32;
+            let qval = QValue::Integer(tag_id);
+            if let Some((arc_name, _)) = meta.filter_fields.get("tagIds") {
+                if let Some(key) = value_to_bitmap_key(&qval) {
+                    let mut sink = AccumSink::new(&mut accum);
+                    sink.filter_insert(arc_name.clone(), key, slot);
+                }
+            }
+            total_applied += 1;
+        }
+        eprintln!("  tags: {rows} rows, {:.1}s ({:.0}/s)",
+            tag_start.elapsed().as_secs_f64(),
+            rows as f64 / tag_start.elapsed().as_secs_f64().max(0.001));
+    }
+
+    // Phase 3: Tools (multi-value, no alive)
+    let tools_csv = csv_dir.join("tools.csv");
+    if tools_csv.exists() {
+        let file = File::open(&tools_csv).expect("open tools.csv");
+        let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+        let mut rows = 0u64;
+        let tool_start = Instant::now();
+
+        for line in reader.split(b'\n') {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.is_empty() { continue; }
+            if let Some(max) = limit {
+                if rows >= max { break; }
+            }
+
+            let (tool_id, image_id) = match parse_tool_row(&line) {
+                Some(pair) => pair,
+                None => continue,
+            };
+            rows += 1;
+
+            let slot = image_id as u32;
+            let qval = QValue::Integer(tool_id);
+            if let Some((arc_name, _)) = meta.filter_fields.get("toolIds") {
+                if let Some(key) = value_to_bitmap_key(&qval) {
+                    let mut sink = AccumSink::new(&mut accum);
+                    sink.filter_insert(arc_name.clone(), key, slot);
+                }
+            }
+            total_applied += 1;
+        }
+        eprintln!("  tools: {rows} rows, {:.1}s ({:.0}/s)",
+            tool_start.elapsed().as_secs_f64(),
+            rows as f64 / tool_start.elapsed().as_secs_f64().max(0.001));
+    }
+
+    // Apply accumulated bitmaps to engine staging
+    eprintln!("  Applying accum to staging...");
+    let apply_start = Instant::now();
+    engine.apply_accum(&accum);
+    eprintln!("  Apply: {:.3}s", apply_start.elapsed().as_secs_f64());
+
+    (total_applied, total_errors, start.elapsed().as_secs_f64())
 }
 
 /// Persist cursor position to disk.
@@ -349,83 +703,389 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn test_build_patch_from_scalar_update() {
-        let ops = vec![
-            Op::Remove { field: "nsfwLevel".into(), value: json!(8) },
-            Op::Set { field: "nsfwLevel".into(), value: json!(16) },
-        ];
-        let patch = build_patch_from_ops(&ops);
-        assert_eq!(patch.fields.len(), 1);
-        let field = &patch.fields["nsfwLevel"];
-        assert_eq!(field.old, FieldValue::Single(QValue::Integer(8)));
-        assert_eq!(field.new, FieldValue::Single(QValue::Integer(16)));
+    use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
+    use crate::filter::FilterFieldType;
+    use crate::ingester::BitmapSink;
+
+    /// A test sink that records all operations for verification.
+    struct RecordingSink {
+        filter_inserts: Vec<(String, u64, u32)>,
+        filter_removes: Vec<(String, u64, u32)>,
+        sort_sets: Vec<(String, usize, u32)>,
+        sort_clears: Vec<(String, usize, u32)>,
+        alive_inserts: Vec<u32>,
+        alive_removes: Vec<u32>,
     }
 
-    #[test]
-    fn test_build_patch_from_insert_no_old() {
-        let ops = vec![
-            Op::Set { field: "nsfwLevel".into(), value: json!(16) },
-            Op::Set { field: "type".into(), value: json!("image") },
-        ];
-        let patch = build_patch_from_ops(&ops);
-        assert_eq!(patch.fields.len(), 2);
-        assert_eq!(patch.fields["nsfwLevel"].old, FieldValue::Single(QValue::Integer(0)));
-        assert_eq!(patch.fields["nsfwLevel"].new, FieldValue::Single(QValue::Integer(16)));
-    }
-
-    #[test]
-    fn test_build_patch_from_add() {
-        let ops = vec![
-            Op::Add { field: "tagIds".into(), value: json!(42) },
-            Op::Add { field: "tagIds".into(), value: json!(99) },
-        ];
-        let patch = build_patch_from_ops(&ops);
-        assert_eq!(patch.fields.len(), 1);
-        if let FieldValue::Multi(ref vals) = patch.fields["tagIds"].new {
-            assert_eq!(vals.len(), 2);
-        } else {
-            panic!("Expected Multi");
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                filter_inserts: Vec::new(),
+                filter_removes: Vec::new(),
+                sort_sets: Vec::new(),
+                sort_clears: Vec::new(),
+                alive_inserts: Vec::new(),
+                alive_removes: Vec::new(),
+            }
         }
     }
 
-    #[test]
-    fn test_build_patch_from_multi_remove() {
-        let ops = vec![
-            Op::Remove { field: "tagIds".into(), value: json!(42) },
-        ];
-        let patch = build_patch_from_ops(&ops);
-        assert_eq!(patch.fields.len(), 1);
-        if let FieldValue::Multi(ref vals) = patch.fields["tagIds"].old {
-            assert_eq!(vals.len(), 1);
-            assert_eq!(vals[0], QValue::Integer(42));
-        } else {
-            panic!("Expected Multi for old");
+    impl BitmapSink for RecordingSink {
+        fn filter_insert(&mut self, field: Arc<str>, value: u64, slot: u32) {
+            self.filter_inserts.push((field.to_string(), value, slot));
+        }
+        fn filter_remove(&mut self, field: Arc<str>, value: u64, slot: u32) {
+            self.filter_removes.push((field.to_string(), value, slot));
+        }
+        fn sort_set(&mut self, field: Arc<str>, bit_layer: usize, slot: u32) {
+            self.sort_sets.push((field.to_string(), bit_layer, slot));
+        }
+        fn sort_clear(&mut self, field: Arc<str>, bit_layer: usize, slot: u32) {
+            self.sort_clears.push((field.to_string(), bit_layer, slot));
+        }
+        fn alive_insert(&mut self, slot: u32) {
+            self.alive_inserts.push(slot);
+        }
+        fn alive_remove(&mut self, slot: u32) {
+            self.alive_removes.push(slot);
+        }
+        fn flush(&mut self) -> crate::error::Result<()> {
+            Ok(())
         }
     }
 
-    #[test]
-    fn test_build_patch_skips_delete_and_query() {
-        let ops = vec![
-            Op::Delete,
-            Op::QueryOpSet { query: "x eq 1".into(), ops: vec![] },
-            Op::Set { field: "a".into(), value: json!(1) },
+    fn test_config() -> Config {
+        let mut config = Config::default();
+        config.filter_fields = vec![
+            FilterFieldConfig {
+                name: "nsfwLevel".into(),
+                field_type: FilterFieldType::SingleValue,
+                behaviors: None,
+                eviction: None,
+                eager_load: false,
+            },
+            FilterFieldConfig {
+                name: "type".into(),
+                field_type: FilterFieldType::SingleValue,
+                behaviors: None,
+                eviction: None,
+                eager_load: false,
+            },
+            FilterFieldConfig {
+                name: "tagIds".into(),
+                field_type: FilterFieldType::MultiValue,
+                behaviors: None,
+                eviction: None,
+                eager_load: false,
+            },
+            FilterFieldConfig {
+                name: "hasMeta".into(),
+                field_type: FilterFieldType::Boolean,
+                behaviors: None,
+                eviction: None,
+                eager_load: false,
+            },
         ];
-        let patch = build_patch_from_ops(&ops);
-        assert_eq!(patch.fields.len(), 1);
-        assert!(patch.fields.contains_key("a"));
+        config.sort_fields = vec![SortFieldConfig {
+            name: "existedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+        }];
+        config
+    }
+
+    #[test]
+    fn test_set_op_filter_insert() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![Op::Set {
+                field: "nsfwLevel".into(),
+                value: json!(16),
+            }],
+        }];
+
+        let (applied, skipped, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        assert_eq!(applied, 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(errors, 0);
+
+        assert_eq!(sink.filter_inserts.len(), 1);
+        assert_eq!(sink.filter_inserts[0], ("nsfwLevel".to_string(), 16, 42));
+        assert_eq!(sink.alive_inserts, vec![42]);
+    }
+
+    #[test]
+    fn test_remove_then_set_scalar_update() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![
+                Op::Remove {
+                    field: "nsfwLevel".into(),
+                    value: json!(8),
+                },
+                Op::Set {
+                    field: "nsfwLevel".into(),
+                    value: json!(16),
+                },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // Should have one remove (old value 8) and one insert (new value 16)
+        assert_eq!(sink.filter_removes.len(), 1);
+        assert_eq!(sink.filter_removes[0], ("nsfwLevel".to_string(), 8, 42));
+        assert_eq!(sink.filter_inserts.len(), 1);
+        assert_eq!(sink.filter_inserts[0], ("nsfwLevel".to_string(), 16, 42));
+    }
+
+    #[test]
+    fn test_add_multi_value() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 100,
+            creates_slot: false,
+            ops: vec![
+                Op::Add {
+                    field: "tagIds".into(),
+                    value: json!(42),
+                },
+                Op::Add {
+                    field: "tagIds".into(),
+                    value: json!(99),
+                },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        assert_eq!(sink.filter_inserts.len(), 2);
+        // Order after dedup is nondeterministic (HashMap iteration)
+        let mut values: Vec<u64> = sink.filter_inserts.iter().map(|(_, v, _)| *v).collect();
+        values.sort();
+        assert_eq!(values, vec![42, 99]);
+        // Add-only ops should NOT set alive (only Set ops do)
+        assert!(sink.alive_inserts.is_empty());
+    }
+
+    #[test]
+    fn test_sort_field_bit_decomposition() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        // existedAt = 5 = 0b101 → bits 0 and 2 set
+        let mut batch = vec![EntityOps {
+            entity_id: 10,
+            creates_slot: true,
+            ops: vec![Op::Set {
+                field: "existedAt".into(),
+                value: json!(5),
+            }],
+        }];
+
+        apply_ops_batch(&mut sink, &meta, &mut batch, None);
+
+        // Should have sort_set for bits 0 and 2
+        let sort_bits: Vec<usize> = sink.sort_sets.iter().map(|(_, bit, _)| *bit).collect();
+        assert!(sort_bits.contains(&0));
+        assert!(sort_bits.contains(&2));
+        assert!(!sort_bits.contains(&1)); // bit 1 not set for value 5
+    }
+
+    #[test]
+    fn test_sort_field_remove_clears_bits() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        // Remove old sort value 5 = 0b101, set new value 6 = 0b110
+        let mut batch = vec![EntityOps {
+            entity_id: 10,
+            creates_slot: true,
+            ops: vec![
+                Op::Remove {
+                    field: "existedAt".into(),
+                    value: json!(5),
+                },
+                Op::Set {
+                    field: "existedAt".into(),
+                    value: json!(6),
+                },
+            ],
+        }];
+
+        apply_ops_batch(&mut sink, &meta, &mut batch, None);
+
+        // Clears: bits 0, 2 (from value 5)
+        let clear_bits: Vec<usize> = sink.sort_clears.iter().map(|(_, bit, _)| *bit).collect();
+        assert!(clear_bits.contains(&0));
+        assert!(clear_bits.contains(&2));
+
+        // Sets: bits 1, 2 (from value 6)
+        let set_bits: Vec<usize> = sink.sort_sets.iter().map(|(_, bit, _)| *bit).collect();
+        assert!(set_bits.contains(&1));
+        assert!(set_bits.contains(&2));
+    }
+
+    #[test]
+    fn test_boolean_field() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 50,
+            creates_slot: true,
+            ops: vec![Op::Set {
+                field: "hasMeta".into(),
+                value: json!(true),
+            }],
+        }];
+
+        apply_ops_batch(&mut sink, &meta, &mut batch, None);
+
+        // true → bitmap key 1
+        assert_eq!(sink.filter_inserts.len(), 1);
+        assert_eq!(sink.filter_inserts[0], ("hasMeta".to_string(), 1, 50));
+    }
+
+    #[test]
+    fn test_unknown_field_ignored() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 1,
+            creates_slot: true,
+            ops: vec![Op::Set {
+                field: "unknownField".into(),
+                value: json!(42),
+            }],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        assert_eq!(applied, 1); // still counts as applied (alive set)
+        assert_eq!(errors, 0);
+
+        // No filter or sort ops emitted for unknown field
+        assert!(sink.filter_inserts.is_empty());
+        assert!(sink.sort_sets.is_empty());
+    }
+
+    #[test]
+    fn test_delete_without_engine() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: false,
+            ops: vec![Op::Delete],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // In dump mode (no engine), delete only clears alive
+        assert_eq!(sink.alive_removes, vec![42]);
+    }
+
+    #[test]
+    fn test_image_insert_all_fields() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 1000,
+            creates_slot: true,
+            ops: vec![
+                Op::Set {
+                    field: "nsfwLevel".into(),
+                    value: json!(1),
+                },
+                Op::Set {
+                    field: "type".into(),
+                    value: json!(0), // "image" mapped to 0
+                },
+                Op::Set {
+                    field: "hasMeta".into(),
+                    value: json!(true),
+                },
+                Op::Set {
+                    field: "existedAt".into(),
+                    value: json!(1711234567u64),
+                },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // 3 filter inserts (nsfwLevel, type, hasMeta) + sort bits for existedAt
+        assert_eq!(sink.filter_inserts.len(), 3);
+        assert!(!sink.sort_sets.is_empty()); // existedAt bit layers
+        assert_eq!(sink.alive_inserts, vec![1000]);
+    }
+
+    #[test]
+    fn test_negative_entity_id_skipped() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: -1,
+            creates_slot: true,
+            ops: vec![Op::Set {
+                field: "nsfwLevel".into(),
+                value: json!(1),
+            }],
+        }];
+
+        let (_, skipped, _) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        assert_eq!(skipped, 1);
+        assert!(sink.filter_inserts.is_empty());
     }
 
     #[test]
     fn test_parse_filter_eq() {
         let filters = parse_filter_from_query_str("modelVersionIds eq 456").unwrap();
         assert_eq!(filters.len(), 1);
-        assert!(matches!(&filters[0], FilterClause::Eq(f, QValue::Integer(456)) if f == "modelVersionIds"));
+        assert!(matches!(
+            &filters[0],
+            FilterClause::Eq(f, QValue::Integer(456)) if f == "modelVersionIds"
+        ));
     }
 
     #[test]
     fn test_parse_filter_in() {
-        let filters = parse_filter_from_query_str("modelVersionIds in [101, 102, 103]").unwrap();
+        let filters =
+            parse_filter_from_query_str("modelVersionIds in [101, 102, 103]").unwrap();
         assert_eq!(filters.len(), 1);
         if let FilterClause::In(f, vals) = &filters[0] {
             assert_eq!(f, "modelVersionIds");
@@ -437,9 +1097,18 @@ mod tests {
 
     #[test]
     fn test_parse_query_value_types() {
-        assert!(matches!(parse_query_value("42").unwrap(), QValue::Integer(42)));
-        assert!(matches!(parse_query_value("true").unwrap(), QValue::Bool(true)));
-        assert!(matches!(parse_query_value("\"hello\"").unwrap(), QValue::String(s) if s == "hello"));
+        assert!(matches!(
+            parse_query_value("42").unwrap(),
+            QValue::Integer(42)
+        ));
+        assert!(matches!(
+            parse_query_value("true").unwrap(),
+            QValue::Bool(true)
+        ));
+        assert!(matches!(
+            parse_query_value("\"hello\"").unwrap(),
+            QValue::String(s) if s == "hello"
+        ));
     }
 
     #[test]

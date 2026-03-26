@@ -3,8 +3,9 @@
 //! Format per record:
 //!   [4 bytes: payload_len (u32 LE)]
 //!   [8 bytes: entity_id (i64 LE)]
+//!   [1 byte:  flags (bit 0 = creates_slot)]
 //!   [payload_len bytes: ops JSONB]
-//!   [4 bytes: CRC32 of entity_id + ops]
+//!   [4 bytes: CRC32 of entity_id + flags + ops]
 //!
 //! The writer appends records and fsyncs. The reader tails the file,
 //! reading batches of records and tracking a byte-offset cursor.
@@ -16,7 +17,8 @@ use std::path::{Path, PathBuf};
 
 use crate::pg_sync::ops::{EntityOps, Op};
 
-const HEADER_SIZE: usize = 4 + 8; // payload_len + entity_id
+const HEADER_SIZE: usize = 4 + 8 + 1; // payload_len + entity_id + flags
+const FLAG_CREATES_SLOT: u8 = 0x01;
 const CRC_SIZE: usize = 4;
 
 /// WAL writer — appends ops records to a file with CRC32 integrity.
@@ -48,16 +50,19 @@ impl WalWriter {
 
             let payload_len = ops_json.len() as u32;
             let entity_id_bytes = entry.entity_id.to_le_bytes();
+            let flags: u8 = if entry.creates_slot { FLAG_CREATES_SLOT } else { 0 };
 
-            // CRC covers entity_id + ops (not the length prefix)
-            let mut crc_input = Vec::with_capacity(8 + ops_json.len());
+            // CRC covers entity_id + flags + ops (not the length prefix)
+            let mut crc_input = Vec::with_capacity(9 + ops_json.len());
             crc_input.extend_from_slice(&entity_id_bytes);
+            crc_input.push(flags);
             crc_input.extend_from_slice(&ops_json);
             let crc = crc32fast::hash(&crc_input);
 
-            // Write: [len][entity_id][ops][crc]
+            // Write: [len][entity_id][flags][ops][crc]
             file.write_all(&payload_len.to_le_bytes())?;
             file.write_all(&entity_id_bytes)?;
+            file.write_all(&[flags])?;
             file.write_all(&ops_json)?;
             file.write_all(&crc.to_le_bytes())?;
 
@@ -126,11 +131,13 @@ impl WalReader {
         let start_pos = pos;
 
         while entries.len() < max_records && pos + HEADER_SIZE <= data.len() {
-            // Read header
+            // Read header: [4-byte len][8-byte entity_id][1-byte flags]
             let payload_len =
                 u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             let entity_id =
                 i64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap());
+            let flags = data[pos + 12];
+            let creates_slot = (flags & FLAG_CREATES_SLOT) != 0;
 
             let record_end = pos + HEADER_SIZE + payload_len + CRC_SIZE;
             if record_end > data.len() {
@@ -138,8 +145,8 @@ impl WalReader {
                 break;
             }
 
-            // Verify CRC
-            let crc_input = &data[pos + 4..pos + HEADER_SIZE + payload_len]; // entity_id + ops
+            // Verify CRC (covers entity_id + flags + ops)
+            let crc_input = &data[pos + 4..pos + HEADER_SIZE + payload_len];
             let stored_crc = u32::from_le_bytes(
                 data[pos + HEADER_SIZE + payload_len..record_end]
                     .try_into()
@@ -158,7 +165,7 @@ impl WalReader {
             let ops_data = &data[pos + HEADER_SIZE..pos + HEADER_SIZE + payload_len];
             match serde_json::from_slice::<Vec<Op>>(ops_data) {
                 Ok(ops) => {
-                    entries.push(EntityOps { entity_id, ops });
+                    entries.push(EntityOps { entity_id, ops, creates_slot });
                 }
                 Err(_) => {
                     // Invalid JSON — skip
@@ -212,7 +219,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_ops(entity_id: i64, ops: Vec<Op>) -> EntityOps {
-        EntityOps { entity_id, ops }
+        EntityOps { entity_id, ops, creates_slot: false }
     }
 
     #[test]

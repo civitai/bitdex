@@ -27,18 +27,21 @@ fn test_ops_wal_roundtrip_with_dedup() {
     let batch = vec![
         EntityOps {
             entity_id: 1,
+            creates_slot: false,
             ops: vec![
                 Op::Set { field: "nsfwLevel".into(), value: json!(8) },
             ],
         },
         EntityOps {
             entity_id: 1,
+            creates_slot: false,
             ops: vec![
                 Op::Set { field: "nsfwLevel".into(), value: json!(16) }, // Overwrites first
             ],
         },
         EntityOps {
             entity_id: 2,
+            creates_slot: false,
             ops: vec![
                 Op::Add { field: "tagIds".into(), value: json!(42) },
             ],
@@ -81,6 +84,7 @@ fn test_delete_absorbs_prior_ops_through_wal() {
     // First batch: set some fields
     writer.append_batch(&[EntityOps {
         entity_id: 1,
+        creates_slot: false,
         ops: vec![
             Op::Set { field: "nsfwLevel".into(), value: json!(16) },
             Op::Add { field: "tagIds".into(), value: json!(42) },
@@ -90,6 +94,7 @@ fn test_delete_absorbs_prior_ops_through_wal() {
     // Second batch: delete the entity
     writer.append_batch(&[EntityOps {
         entity_id: 1,
+        creates_slot: false,
         ops: vec![Op::Delete],
     }]).unwrap();
 
@@ -115,10 +120,12 @@ fn test_add_remove_cancellation_through_wal() {
     writer.append_batch(&[
         EntityOps {
             entity_id: 1,
+            creates_slot: false,
             ops: vec![Op::Add { field: "tagIds".into(), value: json!(42) }],
         },
         EntityOps {
             entity_id: 1,
+            creates_slot: false,
             ops: vec![Op::Remove { field: "tagIds".into(), value: json!(42) }],
         },
     ]).unwrap();
@@ -140,6 +147,7 @@ fn test_query_op_set_through_wal() {
     let writer = WalWriter::new(&wal_path);
     writer.append_batch(&[EntityOps {
         entity_id: 456,
+        creates_slot: false,
         ops: vec![Op::QueryOpSet {
             query: "modelVersionIds eq 456".into(),
             ops: vec![
@@ -175,6 +183,7 @@ fn test_wal_cursor_resume_across_appends() {
     // Batch 1
     writer.append_batch(&[EntityOps {
         entity_id: 1,
+        creates_slot: false,
         ops: vec![Op::Set { field: "a".into(), value: json!(1) }],
     }]).unwrap();
 
@@ -187,6 +196,7 @@ fn test_wal_cursor_resume_across_appends() {
     // Batch 2 (appended after first read)
     writer.append_batch(&[EntityOps {
         entity_id: 2,
+        creates_slot: false,
         ops: vec![Op::Set { field: "b".into(), value: json!(2) }],
     }]).unwrap();
 
@@ -342,6 +352,7 @@ fn test_ops_batch_json_format() {
         ops: vec![
             EntityOps {
                 entity_id: 123,
+                creates_slot: false,
                 ops: vec![
                     Op::Remove { field: "nsfwLevel".into(), value: json!(8) },
                     Op::Set { field: "nsfwLevel".into(), value: json!(16) },
@@ -349,6 +360,7 @@ fn test_ops_batch_json_format() {
             },
             EntityOps {
                 entity_id: 456,
+                creates_slot: false,
                 ops: vec![Op::QueryOpSet {
                     query: "modelVersionIds eq 456".into(),
                     ops: vec![
