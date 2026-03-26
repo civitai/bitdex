@@ -887,7 +887,7 @@ impl UnifiedCache {
     /// Collects all entries sorted by last_used, evicts the oldest 10%.
     /// This creates headroom so subsequent inserts don't trigger eviction,
     /// avoiding repeated O(n) scans under high cache churn.
-    fn evict_batch(&mut self) {
+    pub fn evict_batch(&mut self) {
         if self.entries.is_empty() {
             return;
         }

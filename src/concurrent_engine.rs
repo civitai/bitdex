@@ -2105,7 +2105,7 @@ impl ConcurrentEngine {
             let merge_filter_store = filter_store.clone();
             let merge_sort_store = sort_store.clone();
             let merge_meta_store = meta_store.clone();
-            let _merge_config = Arc::clone(&config);
+            let merge_config = Arc::clone(&config);
             let merge_dirty_flag = Arc::clone(&dirty_flag);
             let _sort_field_configs: Vec<crate::config::SortFieldConfig> =
                 config.sort_fields.clone();
@@ -2414,6 +2414,48 @@ impl ConcurrentEngine {
                         }
                     }
                 }
+
+                    // ── RSS-aware memory pressure eviction ──────────────────
+                    //
+                    // Check real RSS against the memory budget. When RSS exceeds
+                    // the pressure threshold, evict cache entries until RSS drops
+                    // below the target. This catches the serialized_size() undercount
+                    // (~170KB real vs ~2KB tracked per cache entry).
+                    {
+                        let rss = get_rss_bytes();
+                        let budget = merge_config.memory_budget_bytes
+                            .unwrap_or_else(|| crate::memory_pressure::detect_memory_budget(None));
+                        let threshold = (budget as f64 * merge_config.memory_pressure_threshold) as u64;
+                        let target = (budget as f64 * merge_config.memory_pressure_target) as u64;
+
+                        if rss > threshold {
+                            let mut evicted = 0u64;
+                            let mut rounds = 0u32;
+                            loop {
+                                {
+                                    let mut uc = merge_unified_cache.lock();
+                                    if uc.len() == 0 { break; }
+                                    uc.evict_batch();
+                                }
+                                evicted += 1;
+                                rounds += 1;
+
+                                // Re-check RSS after each batch eviction
+                                let new_rss = get_rss_bytes();
+                                if new_rss <= target || rounds >= 50 {
+                                    eprintln!(
+                                        "memory pressure: evicted {} batches, RSS {:.2} GB → {:.2} GB (budget {:.2} GB, target {:.2} GB)",
+                                        evicted,
+                                        rss as f64 / 1e9,
+                                        new_rss as f64 / 1e9,
+                                        budget as f64 / 1e9,
+                                        target as f64 / 1e9,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
             })
         };
 
