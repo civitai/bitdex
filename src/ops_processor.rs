@@ -1186,6 +1186,13 @@ pub fn process_csv_dump_direct(
     drop(posts);
     eprintln!("  Freed enrichment tables");
 
+    // TODO: Inter-phase save+unload to reduce peak memory.
+    // The old bulk_loader saves + unloads bitmaps between CSV phases so
+    // only one phase's bitmaps are in memory at a time. This needs careful
+    // staging/snapshot lifecycle management with the flush thread.
+    // For now, all phases accumulate in memory. 107M scale requires ~20GB
+    // (production K8s pod). The 50M test validates correctness on 16GB.
+
     // ---------------------------------------------------------------------------
     // Phase 2: Tags (chunked rayon) — same as before
     // ---------------------------------------------------------------------------
