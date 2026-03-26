@@ -1044,30 +1044,57 @@ pub fn process_csv_dump_direct(
                         let slot = row.id as u32;
                         // alive is set after enrichment (deferred alive check needs publishedAt)
 
-                        // --- Image scalar fields (existing) ---
-                        let ops = crate::pg_sync::csv_ops::image_row_to_ops_pub(&row);
-                        for op in &ops {
-                            if let Op::Set { field, value } = op {
-                                let qval = json_to_qvalue(value);
-                                if meta_ref.filter_fields.contains_key(field.as_str()) {
-                                    // For LCS string fields, resolve through dictionary
-                                    let key = if let QValue::String(ref s) = qval {
-                                        resolve_string_dict(dicts_ref, field, s)
-                                    } else {
-                                        value_to_bitmap_key(&qval)
-                                    };
-                                    if let Some(key) = key {
-                                        if let Some(m) = acc.filter_maps.get_mut(field.as_str()) {
-                                            m.entry(key).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
-                                        }
-                                    }
+                        // --- Direct bitmap writes from CopyImageRow fields ---
+                        // Bypasses Op/Json/QValue allocation chain for dump perf.
+                        // Integer filter fields: direct u64 cast
+                        macro_rules! filter_int {
+                            ($field:expr, $val:expr) => {
+                                if let Some(m) = acc.filter_maps.get_mut($field) {
+                                    m.entry($val as u64).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
                                 }
-                                if let Some((_, num_bits)) = meta_ref.sort_fields.get(field.as_str()) {
-                                    if let Some(sort_val) = value_to_sort_u32(&qval) {
-                                        accum_set_sort(&mut acc.sort_maps, field, *num_bits, sort_val, slot);
+                            }
+                        }
+                        macro_rules! filter_bool {
+                            ($field:expr, $val:expr) => {
+                                if let Some(m) = acc.filter_maps.get_mut($field) {
+                                    m.entry(if $val { 1u64 } else { 0u64 }).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
+                                }
+                            }
+                        }
+                        macro_rules! filter_str {
+                            ($field:expr, $val:expr) => {
+                                if let Some(key) = resolve_string_dict(dicts_ref, $field, $val) {
+                                    if let Some(m) = acc.filter_maps.get_mut($field) {
+                                        m.entry(key).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
                                     }
                                 }
                             }
+                        }
+
+                        filter_int!("nsfwLevel", row.nsfw_level);
+                        filter_str!("type", &row.image_type);
+                        filter_int!("userId", row.user_id);
+                        if let Some(post_id) = row.post_id {
+                            filter_int!("postId", post_id);
+                        }
+                        filter_bool!("hasMeta", row.has_meta());
+                        filter_bool!("onSite", row.on_site());
+                        filter_bool!("minor", row.minor());
+                        filter_bool!("poi", row.poi());
+                        if let Some(ref bf) = row.blocked_for {
+                            filter_str!("blockedFor", bf);
+                        }
+
+                        // existedAt sort field
+                        let existed_at = match (row.scanned_at_secs, row.created_at_secs) {
+                            (Some(s), Some(c)) => s.max(c),
+                            (Some(s), None) => s,
+                            (None, Some(c)) => c,
+                            (None, None) => 0,
+                        };
+                        let existed_at_u32 = existed_at.max(0) as u32;
+                        if let Some(&bits) = sort_bits_ref.get("existedAt") {
+                            accum_set_sort(&mut acc.sort_maps, "existedAt", bits, existed_at_u32, slot);
                         }
 
                         // --- Post enrichment ---
@@ -1104,12 +1131,6 @@ pub fn process_csv_dump_direct(
                         }
 
                         // --- Computed sortAt = GREATEST(existedAt, publishedAt) ---
-                        let existed_at = match (row.scanned_at_secs, row.created_at_secs) {
-                            (Some(s), Some(c)) => s.max(c),
-                            (Some(s), None) => s,
-                            (None, Some(c)) => c,
-                            (None, None) => 0,
-                        };
                         let sort_at = existed_at.max(published_at_secs.unwrap_or(0)).max(0) as u32;
                         if let Some(&bits) = sort_bits_ref.get("sortAt") {
                             accum_set_sort(&mut acc.sort_maps, "sortAt", bits, sort_at, slot);
