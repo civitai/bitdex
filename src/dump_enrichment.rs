@@ -50,6 +50,10 @@ pub struct EnrichmentConfig {
     pub filter: Option<FilterExpression>,
     /// Nested enrichment (child lookup from this lookup's rows).
     pub child: Option<Box<EnrichmentConfig>>,
+    /// Explicit column names for headerless CSVs (PG COPY output).
+    /// When set, the CSV has no header row — columns are positional.
+    /// When empty, the first row is treated as a header.
+    pub columns: Vec<String>,
 }
 
 /// A row stored in the enrichment lookup table.
@@ -103,12 +107,16 @@ impl EnrichmentTable {
 
         let mut lines = reader.lines();
 
-        // First line is header
-        let header_line = lines
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty CSV file"))??;
-        let headers: Vec<&str> = parse_csv_fields(&header_line);
-        let header_names: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+        // Column names: from explicit config (headerless CSV) or first row (header CSV)
+        let header_names: Vec<String> = if !config.columns.is_empty() {
+            config.columns.clone()
+        } else {
+            let header_line = lines
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty CSV file"))??;
+            let headers: Vec<&str> = parse_csv_fields(&header_line);
+            headers.iter().map(|h| h.to_string()).collect()
+        };
 
         // Find key column index
         let key_idx = header_names
@@ -542,6 +550,7 @@ mod tests {
             computed_fields: vec![],
             filter: None,
             child: None,
+            columns: vec![],
         };
 
         let table = EnrichmentTable::load(&config).unwrap();
@@ -581,6 +590,7 @@ mod tests {
             ],
             filter: None,
             child: None,
+            columns: vec![],
         };
 
         let table = EnrichmentTable::load(&config).unwrap();
@@ -618,6 +628,7 @@ mod tests {
             computed_fields: vec![],
             filter: None,
             child: None,
+            columns: vec![],
         };
 
         let table = EnrichmentTable::load(&config).unwrap();
@@ -639,6 +650,7 @@ mod tests {
             computed_fields: vec![],
             filter: None,
             child: None,
+            columns: vec![],
         };
 
         let table = EnrichmentTable::load(&config).unwrap();
@@ -680,6 +692,7 @@ mod tests {
             fields: vec![("baseModel".into(), "baseModel".into())],
             computed_fields: vec![],
             filter: None,
+            columns: vec![],
             child: Some(Box::new(EnrichmentConfig {
                 csv_path: models_csv,
                 key: "id".into(),
@@ -688,6 +701,7 @@ mod tests {
                 computed_fields: vec![],
                 filter: Some(FilterExpression::parse("type = 'Checkpoint'").unwrap()),
                 child: None,
+            columns: vec![],
             })),
         };
 
@@ -731,6 +745,7 @@ mod tests {
             computed_fields: vec![],
             filter: None,
             child: None,
+            columns: vec![],
         })
         .unwrap();
 
@@ -759,6 +774,7 @@ mod tests {
             computed_fields: vec![],
             filter: None,
             child: None,
+            columns: vec![],
         })
         .unwrap();
 

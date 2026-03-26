@@ -170,6 +170,10 @@ pub struct EnrichmentConfig {
     #[serde(default)]
     pub filter: Option<String>,
 
+    /// Explicit column names for headerless CSVs (PG COPY output).
+    #[serde(default)]
+    pub columns: Vec<String>,
+
     /// Nested enrichment (e.g., MV → Model chain)
     #[serde(default)]
     pub enrichment: Vec<EnrichmentConfig>,
@@ -839,6 +843,7 @@ fn to_nate_enrichment_config(
         computed_fields,
         filter,
         child,
+        columns: config.columns.clone(),
     }
 }
 
