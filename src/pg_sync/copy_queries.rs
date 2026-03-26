@@ -236,6 +236,16 @@ pub struct CopyModelRow {
     pub model_type: String,
 }
 
+/// Metrics row from ClickHouse dump (TAB-separated).
+/// Columns: imageId, reactionCount, commentCount, collectedCount
+#[derive(Debug)]
+pub struct CopyMetricRow {
+    pub image_id: i64,
+    pub reaction_count: i64,
+    pub comment_count: i64,
+    pub collected_count: i64,
+}
+
 // ---------------------------------------------------------------------------
 // CSV chunk parser
 // ---------------------------------------------------------------------------
@@ -558,6 +568,32 @@ pub fn parse_model_version_row(line: &[u8]) -> Option<CopyModelVersionRow> {
     })
 }
 
+/// Parse a TAB-separated metrics row (ClickHouse dump format).
+///
+/// Expected: imageId\treactionCount\tcommentCount\tcollectedCount
+pub fn parse_metric_row(line: &[u8]) -> Option<CopyMetricRow> {
+    let mut iter = line.split(|&b| b == b'\t');
+    let image_id = parse_i64_fast(iter.next()?)?;
+    let reaction_count = iter.next().and_then(parse_i64_fast).unwrap_or(0);
+    let comment_count = iter.next().and_then(parse_i64_fast).unwrap_or(0);
+    let collected_count = iter.next().and_then(parse_i64_fast).unwrap_or(0);
+    Some(CopyMetricRow {
+        image_id,
+        reaction_count,
+        comment_count,
+        collected_count,
+    })
+}
+
+/// Parse a CSV line into a (collectionId, imageId) pair.
+pub fn parse_collection_item_row(line: &[u8]) -> Option<(i64, i64)> {
+    let fields = split_csv_fields(line);
+    if fields.len() < 2 {
+        return None;
+    }
+    Some((parse_i64_fast(&fields[0])?, parse_i64_fast(&fields[1])?))
+}
+
 /// Parse a CSV line into a [`CopyModelRow`] (3 fields).
 ///
 /// Expected: id, poi, type
@@ -811,6 +847,32 @@ mod tests {
         assert_eq!(row.id, 42);
         assert!(!row.poi);
         assert_eq!(row.model_type, "Checkpoint");
+    }
+
+    #[test]
+    fn test_parse_metric_row() {
+        let line = b"16224430\t2\t0\t0";
+        let row = parse_metric_row(line).expect("should parse");
+        assert_eq!(row.image_id, 16224430);
+        assert_eq!(row.reaction_count, 2);
+        assert_eq!(row.comment_count, 0);
+        assert_eq!(row.collected_count, 0);
+    }
+
+    #[test]
+    fn test_parse_metric_row_high_counts() {
+        let line = b"38906357\t125\t1\t12";
+        let row = parse_metric_row(line).expect("should parse");
+        assert_eq!(row.image_id, 38906357);
+        assert_eq!(row.reaction_count, 125);
+        assert_eq!(row.comment_count, 1);
+        assert_eq!(row.collected_count, 12);
+    }
+
+    #[test]
+    fn test_parse_collection_item_row() {
+        assert_eq!(parse_collection_item_row(b"100,12345"), Some((100, 12345)));
+        assert_eq!(parse_collection_item_row(b""), None);
     }
 
     #[test]
