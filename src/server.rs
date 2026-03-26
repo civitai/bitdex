@@ -290,6 +290,12 @@ struct AppState {
     metrics_bitmap_memory: AtomicBool,
     metrics_eviction_stats: AtomicBool,
     metrics_boundstore_disk: AtomicBool,
+    /// WAL writer for V2 ops endpoint. Created lazily on first ops POST.
+    #[cfg(feature = "pg-sync")]
+    ops_wal: Mutex<Option<crate::ops_wal::WalWriter>>,
+    /// Latest sync source metadata (cursor, lag) keyed by source name.
+    #[cfg(feature = "pg-sync")]
+    sync_meta: Mutex<std::collections::HashMap<String, crate::pg_sync::ops::SyncMeta>>,
 }
 
 type SharedState = Arc<AppState>;
@@ -991,6 +997,10 @@ impl BitdexServer {
             metrics_bitmap_memory: AtomicBool::new(true),
             metrics_eviction_stats: AtomicBool::new(true),
             metrics_boundstore_disk: AtomicBool::new(true),
+            #[cfg(feature = "pg-sync")]
+            ops_wal: Mutex::new(None),
+            #[cfg(feature = "pg-sync")]
+            sync_meta: Mutex::new(std::collections::HashMap::new()),
         });
 
         // Try to restore an existing index from disk
@@ -1068,6 +1078,8 @@ impl BitdexServer {
             .route("/debug/heap-dump", axum::routing::post(handle_heap_dump))
             .route("/api/formats", get(handle_list_formats))
             .route("/api/internal/pgsync-metrics", post(handle_pgsync_metrics))
+            .route("/api/indexes/{name}/ops", post(handle_ops))
+            .route("/api/internal/sync-lag", get(handle_sync_lag))
             .route("/metrics", get(handle_metrics))
             .route("/", get(handle_ui))
             .with_state(Arc::clone(&state));
@@ -4154,6 +4166,103 @@ async fn handle_pgsync_metrics(
             .set(cursor);
     }
     StatusCode::NO_CONTENT
+}
+
+/// POST /api/indexes/{name}/ops — Accept a batch of sync ops, append to WAL.
+/// Returns 200 only after all records are written and fsynced.
+#[cfg(feature = "pg-sync")]
+async fn handle_ops(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(batch): Json<crate::pg_sync::ops::OpsBatch>,
+) -> impl IntoResponse {
+    // Verify index exists
+    {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => {}
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    }
+
+    // Store sync metadata if provided
+    if let Some(meta) = &batch.meta {
+        let mut sync_meta = state.sync_meta.lock();
+        sync_meta.insert(meta.source.clone(), meta.clone());
+    }
+
+    let ops_count = batch.ops.len();
+    if ops_count == 0 {
+        return (StatusCode::OK, Json(serde_json::json!({"accepted": 0}))).into_response();
+    }
+
+    // Ensure WAL writer exists (lazy init)
+    let wal_path = {
+        let mut wal_guard = state.ops_wal.lock();
+        if wal_guard.is_none() {
+            let wal_dir = state.data_dir.join("wal");
+            std::fs::create_dir_all(&wal_dir).ok();
+            let path = wal_dir.join("ops.wal");
+            *wal_guard = Some(crate::ops_wal::WalWriter::new(path));
+        }
+        wal_guard.as_ref().unwrap().path().to_path_buf()
+    };
+
+    // Write to WAL on blocking thread (fsync is blocking I/O)
+    let result = tokio::task::spawn_blocking(move || {
+        let writer = crate::ops_wal::WalWriter::new(&wal_path);
+        writer.append_batch(&batch.ops)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(bytes)) => {
+            (StatusCode::OK, Json(serde_json::json!({
+                "accepted": ops_count,
+                "bytes_written": bytes,
+            }))).into_response()
+        }
+        Ok(Err(e)) => {
+            eprintln!("WAL write error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("WAL write failed: {e}"),
+            }))).into_response()
+        }
+        Err(e) => {
+            eprintln!("WAL write task panicked: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Internal error",
+            }))).into_response()
+        }
+    }
+}
+
+/// Fallback for when pg-sync feature is disabled.
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_ops(
+    AxumPath(_name): AxumPath<String>,
+) -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "pg-sync feature not enabled"})))
+}
+
+/// GET /api/internal/sync-lag — Return latest sync metadata from all sources.
+#[cfg(feature = "pg-sync")]
+async fn handle_sync_lag(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let sync_meta = state.sync_meta.lock();
+    let sources: Vec<&crate::pg_sync::ops::SyncMeta> = sync_meta.values().collect();
+    Json(serde_json::json!({ "sources": sources }))
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_sync_lag() -> impl IntoResponse {
+    Json(serde_json::json!({ "sources": [] }))
 }
 
 async fn handle_ui() -> impl IntoResponse {
