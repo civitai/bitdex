@@ -14,23 +14,24 @@ const STAGE_DIR = 'C:/Dev/Repos/open-source/bitdex-v2/data/load_stage';
 
 // D3 dump requests for each phase (derived from sync-config-civitai.yaml)
 const DUMP_REQUESTS = [
-  // Phase 1: Tags (63GB)
+  // Phase 1: Tags (63GB) — PG COPY columns: tagId, imageId, attributes
   {
     name: 'tags-v1',
     csv_path: `${STAGE_DIR}/tags.csv`,
     format: 'csv',
     slot_field: 'imageId',
+    columns: ['tagId', 'imageId'],  // attributes column may be absent
     sets_alive: false,
     fields: [{ column: 'tagId', target: 'tagIds' }],
-    // Note: attributes column may not exist in test CSVs — filter is optional
   },
 
-  // Phase 2: Images (14GB, primary entity)
+  // Phase 2: Images (14GB) — PG COPY columns from sync config
   {
     name: 'images-v1',
     csv_path: `${STAGE_DIR}/images.csv`,
     format: 'csv',
     slot_field: 'id',
+    columns: ['id', 'url', 'nsfwLevel', 'hash', 'flags', 'type', 'userId', 'blockedFor', 'scannedAtSecs', 'createdAtSecs', 'postId', 'width', 'height'],
     sets_alive: true,
     fields: [
       'nsfwLevel',
@@ -68,12 +69,13 @@ const DUMP_REQUESTS = [
     ],
   },
 
-  // Phase 3: Resources (820MB)
+  // Phase 3: Resources (820MB) — PG COPY columns: imageId, modelVersionId, detected
   {
     name: 'resources-v1',
     csv_path: `${STAGE_DIR}/resources.csv`,
     format: 'csv',
     slot_field: 'imageId',
+    columns: ['imageId', 'modelVersionId', 'detected'],
     sets_alive: false,
     fields: [{ column: 'modelVersionId', target: 'modelVersionIds' }],
     computed_fields: [
@@ -98,30 +100,33 @@ const DUMP_REQUESTS = [
     ],
   },
 
-  // Phase 4: Tools (50MB)
+  // Phase 4: Tools (50MB) — PG COPY columns: toolId, imageId
   {
     name: 'tools-v1',
     csv_path: `${STAGE_DIR}/tools.csv`,
     format: 'csv',
     slot_field: 'imageId',
+    columns: ['toolIds', 'imageId'],
     fields: ['toolIds'],
   },
 
-  // Phase 5: Techniques (71MB)
+  // Phase 5: Techniques (71MB) — PG COPY columns: techniqueId, imageId
   {
     name: 'techniques-v1',
     csv_path: `${STAGE_DIR}/techniques.csv`,
     format: 'csv',
     slot_field: 'imageId',
+    columns: ['techniqueIds', 'imageId'],
     fields: ['techniqueIds'],
   },
 
-  // Phase 6: Metrics (TSV from ClickHouse)
+  // Phase 6: Metrics (TSV) — columns: imageId, reactionCount, commentCount, collectedCount
   {
     name: 'metrics-v1',
     csv_path: `${STAGE_DIR}/metrics.csv`,
     format: 'tsv',
     slot_field: 'imageId',
+    columns: ['imageId', 'reactionCount', 'commentCount', 'collectedCount'],
     fields: ['reactionCount', 'commentCount', 'collectedCount'],
   },
 ];
