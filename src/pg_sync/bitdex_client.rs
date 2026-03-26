@@ -243,24 +243,6 @@ impl BitdexClient {
             .await;
     }
 
-    /// POST a batch of V2 ops to the BitDex /ops endpoint.
-    pub async fn post_ops(&self, batch: &super::ops::OpsBatch) -> Result<(), String> {
-        let url = format!("{}/ops", self.base_url);
-        let resp = self.client
-            .post(&url)
-            .json(batch)
-            .send()
-            .await
-            .map_err(|e| format!("post_ops request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("post_ops returned {status}: {body}"));
-        }
-        Ok(())
-    }
-
     pub async fn get_cursor(&self, cursor_name: &str) -> Result<Option<String>, String> {
         let url = format!("{}/cursors/{}", self.base_url, cursor_name);
         let resp = self.client
