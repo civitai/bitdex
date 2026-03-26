@@ -792,6 +792,7 @@ mod tests {
             encoding: "linear".into(),
             bits: 32,
             eager_load: false,
+            computed: None,
         }];
         config
     }
