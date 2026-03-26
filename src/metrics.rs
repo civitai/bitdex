@@ -116,6 +116,13 @@ pub struct Metrics {
     pub pgsync_cycle_seconds: HistogramVec,
     pub pgsync_rows_fetched_total: IntCounterVec,
     pub pgsync_cursor_position: IntGaugeVec,
+
+    // V2 sync metrics (unified namespace with source label)
+    pub sync_cursor_position: IntGaugeVec,
+    pub sync_max_id: IntGaugeVec,
+    pub sync_lag_rows: IntGaugeVec,
+    pub sync_ops_total: IntCounterVec,
+    pub sync_wal_bytes: IntGaugeVec,
 }
 
 impl Metrics {
@@ -570,6 +577,28 @@ impl Metrics {
         )
         .unwrap();
 
+        // V2 sync metrics (unified namespace)
+        let sync_cursor_position = IntGaugeVec::new(
+            Opts::new("bitdex_sync_cursor_position", "Current sync cursor position"),
+            &["source"],
+        ).unwrap();
+        let sync_max_id = IntGaugeVec::new(
+            Opts::new("bitdex_sync_max_id", "Max ops table ID (for lag calculation)"),
+            &["source"],
+        ).unwrap();
+        let sync_lag_rows = IntGaugeVec::new(
+            Opts::new("bitdex_sync_lag_rows", "Number of ops rows behind"),
+            &["source"],
+        ).unwrap();
+        let sync_ops_total = IntCounterVec::new(
+            Opts::new("bitdex_sync_ops_total", "Total ops received from sync sources"),
+            &["source"],
+        ).unwrap();
+        let sync_wal_bytes = IntGaugeVec::new(
+            Opts::new("bitdex_sync_wal_bytes", "Current WAL file size in bytes"),
+            &["source"],
+        ).unwrap();
+
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
         registry.register(Box::new(slot_high_water.clone())).unwrap();
@@ -671,6 +700,11 @@ impl Metrics {
         registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
         registry.register(Box::new(pgsync_rows_fetched_total.clone())).unwrap();
         registry.register(Box::new(pgsync_cursor_position.clone())).unwrap();
+        registry.register(Box::new(sync_cursor_position.clone())).unwrap();
+        registry.register(Box::new(sync_max_id.clone())).unwrap();
+        registry.register(Box::new(sync_lag_rows.clone())).unwrap();
+        registry.register(Box::new(sync_ops_total.clone())).unwrap();
+        registry.register(Box::new(sync_wal_bytes.clone())).unwrap();
 
         Self {
             registry,
@@ -746,6 +780,11 @@ impl Metrics {
             pgsync_cycle_seconds,
             pgsync_rows_fetched_total,
             pgsync_cursor_position,
+            sync_cursor_position,
+            sync_max_id,
+            sync_lag_rows,
+            sync_ops_total,
+            sync_wal_bytes,
         }
     }
 

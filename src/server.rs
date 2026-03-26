@@ -290,6 +290,15 @@ struct AppState {
     metrics_bitmap_memory: AtomicBool,
     metrics_eviction_stats: AtomicBool,
     metrics_boundstore_disk: AtomicBool,
+    /// WAL writer for V2 ops endpoint. Created lazily on first ops POST.
+    #[cfg(feature = "pg-sync")]
+    ops_wal: Mutex<Option<crate::ops_wal::WalWriter>>,
+    /// Latest sync source metadata (cursor, lag) keyed by source name.
+    #[cfg(feature = "pg-sync")]
+    sync_meta: Mutex<std::collections::HashMap<String, crate::pg_sync::ops::SyncMeta>>,
+    /// Dump registry for tracking table dump lifecycle.
+    #[cfg(feature = "pg-sync")]
+    dump_registry: Mutex<crate::pg_sync::dump::DumpRegistry>,
 }
 
 type SharedState = Arc<AppState>;
@@ -991,6 +1000,15 @@ impl BitdexServer {
             metrics_bitmap_memory: AtomicBool::new(true),
             metrics_eviction_stats: AtomicBool::new(true),
             metrics_boundstore_disk: AtomicBool::new(true),
+            #[cfg(feature = "pg-sync")]
+            ops_wal: Mutex::new(None),
+            #[cfg(feature = "pg-sync")]
+            sync_meta: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "pg-sync")]
+            dump_registry: {
+                let dumps_path = self.data_dir.join("dumps.json");
+                Mutex::new(crate::pg_sync::dump::DumpRegistry::load(&dumps_path))
+            },
         });
 
         // Try to restore an existing index from disk
@@ -1017,6 +1035,71 @@ impl BitdexServer {
                 eprintln!("FATAL: rebuild failed: {e}");
                 std::process::exit(1);
             }
+        }
+
+        // Spawn WAL reader thread if pg-sync feature is enabled and index exists
+        #[cfg(feature = "pg-sync")]
+        {
+            let wal_dir = self.data_dir.join("wal");
+            let wal_path = wal_dir.join("ops.wal");
+            let cursor_path = wal_dir.join("cursor");
+            let wal_state = Arc::clone(&state);
+            std::thread::Builder::new()
+                .name("wal-reader".into())
+                .spawn(move || {
+                    let cursor = crate::ops_processor::load_cursor(&cursor_path);
+                    let mut reader = crate::ops_wal::WalReader::new(&wal_path, cursor);
+                    eprintln!("WAL reader started (cursor={cursor}, path={})", wal_path.display());
+
+                    loop {
+                        // Read a batch from the WAL
+                        match reader.read_batch(10_000) {
+                            Ok(batch) if !batch.entries.is_empty() => {
+                                // Get engine reference
+                                let engine = {
+                                    let guard = wal_state.index.lock();
+                                    guard.as_ref().map(|idx| Arc::clone(&idx.engine))
+                                };
+
+                                if let Some(engine) = engine {
+                                    let mut entries = batch.entries;
+                                    let (applied, skipped, errors) =
+                                        crate::ops_processor::apply_ops_batch(&engine, &mut entries);
+
+                                    if applied > 0 || errors > 0 {
+                                        eprintln!(
+                                            "WAL reader: applied={applied} skipped={skipped} errors={errors} cursor={}",
+                                            reader.cursor()
+                                        );
+                                    }
+
+                                    // Persist cursor after successful processing
+                                    if let Err(e) = crate::ops_processor::save_cursor(&cursor_path, reader.cursor()) {
+                                        eprintln!("WAL reader: failed to save cursor: {e}");
+                                    }
+
+                                    // Update WAL bytes metric
+                                    let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+                                    wal_state.metrics.sync_wal_bytes
+                                        .with_label_values(&["wal-reader"])
+                                        .set(wal_size as i64);
+                                } else {
+                                    // No index loaded yet — sleep and retry
+                                    std::thread::sleep(std::time::Duration::from_secs(1));
+                                }
+                            }
+                            Ok(_) => {
+                                // No new records — sleep briefly
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            Err(e) => {
+                                eprintln!("WAL reader error: {e}");
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                            }
+                        }
+                    }
+                })
+                .ok();
         }
 
         let shutdown_state = Arc::clone(&state);
@@ -1068,6 +1151,13 @@ impl BitdexServer {
             .route("/debug/heap-dump", axum::routing::post(handle_heap_dump))
             .route("/api/formats", get(handle_list_formats))
             .route("/api/internal/pgsync-metrics", post(handle_pgsync_metrics))
+            .route("/api/indexes/{name}/ops", post(handle_ops))
+            .route("/api/internal/sync-lag", get(handle_sync_lag))
+            .route("/api/indexes/{name}/dumps", get(handle_list_dumps))
+            .route("/api/indexes/{name}/dumps", put(handle_register_dump))
+            .route("/api/indexes/{name}/dumps/{dump_name}/loaded", post(handle_dump_loaded))
+            .route("/api/indexes/{name}/dumps/{dump_name}", delete(handle_delete_dump))
+            .route("/api/indexes/{name}/dumps/clear", post(handle_clear_dumps))
             .route("/metrics", get(handle_metrics))
             .route("/", get(handle_ui))
             .with_state(Arc::clone(&state));
@@ -4154,6 +4244,233 @@ async fn handle_pgsync_metrics(
             .set(cursor);
     }
     StatusCode::NO_CONTENT
+}
+
+/// POST /api/indexes/{name}/ops — Accept a batch of sync ops, append to WAL.
+/// Returns 200 only after all records are written and fsynced.
+#[cfg(feature = "pg-sync")]
+async fn handle_ops(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(batch): Json<crate::pg_sync::ops::OpsBatch>,
+) -> impl IntoResponse {
+    // Verify index exists
+    {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => {}
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    }
+
+    // Store sync metadata + update Prometheus metrics
+    if let Some(meta) = &batch.meta {
+        let mut sync_meta = state.sync_meta.lock();
+        sync_meta.insert(meta.source.clone(), meta.clone());
+
+        let m = &state.metrics;
+        let source = meta.source.as_str();
+        if let Some(cursor) = meta.cursor {
+            m.sync_cursor_position.with_label_values(&[source]).set(cursor);
+        }
+        if let Some(max_id) = meta.max_id {
+            m.sync_max_id.with_label_values(&[source]).set(max_id);
+        }
+        if let Some(lag) = meta.lag_rows {
+            m.sync_lag_rows.with_label_values(&[source]).set(lag);
+        }
+    }
+
+    let ops_count = batch.ops.len();
+    if ops_count == 0 {
+        return (StatusCode::OK, Json(serde_json::json!({"accepted": 0}))).into_response();
+    }
+
+    // Ensure WAL writer exists (lazy init)
+    let wal_path = {
+        let mut wal_guard = state.ops_wal.lock();
+        if wal_guard.is_none() {
+            let wal_dir = state.data_dir.join("wal");
+            std::fs::create_dir_all(&wal_dir).ok();
+            let path = wal_dir.join("ops.wal");
+            *wal_guard = Some(crate::ops_wal::WalWriter::new(path));
+        }
+        wal_guard.as_ref().unwrap().path().to_path_buf()
+    };
+
+    // Write to WAL on blocking thread (fsync is blocking I/O)
+    let result = tokio::task::spawn_blocking(move || {
+        let writer = crate::ops_wal::WalWriter::new(&wal_path);
+        writer.append_batch(&batch.ops)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(bytes)) => {
+            (StatusCode::OK, Json(serde_json::json!({
+                "accepted": ops_count,
+                "bytes_written": bytes,
+            }))).into_response()
+        }
+        Ok(Err(e)) => {
+            eprintln!("WAL write error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("WAL write failed: {e}"),
+            }))).into_response()
+        }
+        Err(e) => {
+            eprintln!("WAL write task panicked: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": "Internal error",
+            }))).into_response()
+        }
+    }
+}
+
+/// Fallback for when pg-sync feature is disabled.
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_ops(
+    AxumPath(_name): AxumPath<String>,
+) -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "pg-sync feature not enabled"})))
+}
+
+// ── Dump endpoints ──
+
+/// GET /api/indexes/{name}/dumps — List all dumps and their status.
+#[cfg(feature = "pg-sync")]
+async fn handle_list_dumps(
+    State(state): State<SharedState>,
+    AxumPath(_name): AxumPath<String>,
+) -> impl IntoResponse {
+    let reg = state.dump_registry.lock();
+    Json(serde_json::json!({
+        "dumps": reg.dumps,
+        "all_complete": reg.all_complete(),
+    }))
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_list_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoResponse {
+    Json(serde_json::json!({"dumps": {}}))
+}
+
+/// PUT /api/indexes/{name}/dumps — Register a new dump.
+#[cfg(feature = "pg-sync")]
+async fn handle_register_dump(
+    State(state): State<SharedState>,
+    AxumPath(_name): AxumPath<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let dump_name = body["name"].as_str().unwrap_or("unknown").to_string();
+    let wal_path = body["wal_path"].as_str().map(|s| s.to_string());
+
+    let mut reg = state.dump_registry.lock();
+    reg.register(dump_name.clone(), wal_path);
+
+    let dumps_path = state.data_dir.join("dumps.json");
+    if let Err(e) = reg.save(&dumps_path) {
+        eprintln!("Warning: failed to save dump registry: {e}");
+    }
+
+    (StatusCode::CREATED, Json(serde_json::json!({
+        "name": dump_name,
+        "status": "writing",
+    })))
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_register_dump(
+    AxumPath(_name): AxumPath<String>,
+    Json(_body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "pg-sync not enabled"})))
+}
+
+/// POST /api/indexes/{name}/dumps/{dump_name}/loaded — Signal dump file is complete.
+#[cfg(feature = "pg-sync")]
+async fn handle_dump_loaded(
+    State(state): State<SharedState>,
+    AxumPath((_name, dump_name)): AxumPath<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let ops_written = body["ops_written"].as_u64().unwrap_or(0);
+
+    let mut reg = state.dump_registry.lock();
+    match reg.mark_loaded(&dump_name, ops_written) {
+        Some(_) => {
+            let dumps_path = state.data_dir.join("dumps.json");
+            reg.save(&dumps_path).ok();
+            Json(serde_json::json!({"status": "loading", "name": dump_name}))
+        }
+        None => Json(serde_json::json!({"error": format!("Dump '{}' not found", dump_name)})),
+    }
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_dump_loaded(
+    AxumPath((_name, _dump_name)): AxumPath<(String, String)>,
+    Json(_body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({"error": "pg-sync not enabled"}))
+}
+
+/// DELETE /api/indexes/{name}/dumps/{dump_name} — Remove a dump from history.
+#[cfg(feature = "pg-sync")]
+async fn handle_delete_dump(
+    State(state): State<SharedState>,
+    AxumPath((_name, dump_name)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    let mut reg = state.dump_registry.lock();
+    reg.remove(&dump_name);
+    let dumps_path = state.data_dir.join("dumps.json");
+    reg.save(&dumps_path).ok();
+    StatusCode::NO_CONTENT
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_delete_dump(
+    AxumPath((_name, _dump_name)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    StatusCode::NOT_FOUND
+}
+
+/// POST /api/indexes/{name}/dumps/clear — Clear all dump history.
+#[cfg(feature = "pg-sync")]
+async fn handle_clear_dumps(
+    State(state): State<SharedState>,
+    AxumPath(_name): AxumPath<String>,
+) -> impl IntoResponse {
+    let mut reg = state.dump_registry.lock();
+    reg.clear();
+    let dumps_path = state.data_dir.join("dumps.json");
+    reg.save(&dumps_path).ok();
+    StatusCode::NO_CONTENT
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_clear_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoResponse {
+    StatusCode::NOT_FOUND
+}
+
+/// GET /api/internal/sync-lag — Return latest sync metadata from all sources.
+#[cfg(feature = "pg-sync")]
+async fn handle_sync_lag(
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let sync_meta = state.sync_meta.lock();
+    let sources: Vec<&crate::pg_sync::ops::SyncMeta> = sync_meta.values().collect();
+    Json(serde_json::json!({ "sources": sources }))
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_sync_lag() -> impl IntoResponse {
+    Json(serde_json::json!({ "sources": [] }))
 }
 
 async fn handle_ui() -> impl IntoResponse {
