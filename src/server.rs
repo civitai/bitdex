@@ -1037,6 +1037,71 @@ impl BitdexServer {
             }
         }
 
+        // Spawn WAL reader thread if pg-sync feature is enabled and index exists
+        #[cfg(feature = "pg-sync")]
+        {
+            let wal_dir = self.data_dir.join("wal");
+            let wal_path = wal_dir.join("ops.wal");
+            let cursor_path = wal_dir.join("cursor");
+            let wal_state = Arc::clone(&state);
+            std::thread::Builder::new()
+                .name("wal-reader".into())
+                .spawn(move || {
+                    let cursor = crate::ops_processor::load_cursor(&cursor_path);
+                    let mut reader = crate::ops_wal::WalReader::new(&wal_path, cursor);
+                    eprintln!("WAL reader started (cursor={cursor}, path={})", wal_path.display());
+
+                    loop {
+                        // Read a batch from the WAL
+                        match reader.read_batch(10_000) {
+                            Ok(batch) if !batch.entries.is_empty() => {
+                                // Get engine reference
+                                let engine = {
+                                    let guard = wal_state.index.lock();
+                                    guard.as_ref().map(|idx| Arc::clone(&idx.engine))
+                                };
+
+                                if let Some(engine) = engine {
+                                    let mut entries = batch.entries;
+                                    let (applied, skipped, errors) =
+                                        crate::ops_processor::apply_ops_batch(&engine, &mut entries);
+
+                                    if applied > 0 || errors > 0 {
+                                        eprintln!(
+                                            "WAL reader: applied={applied} skipped={skipped} errors={errors} cursor={}",
+                                            reader.cursor()
+                                        );
+                                    }
+
+                                    // Persist cursor after successful processing
+                                    if let Err(e) = crate::ops_processor::save_cursor(&cursor_path, reader.cursor()) {
+                                        eprintln!("WAL reader: failed to save cursor: {e}");
+                                    }
+
+                                    // Update WAL bytes metric
+                                    let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+                                    wal_state.metrics.sync_wal_bytes
+                                        .with_label_values(&["wal-reader"])
+                                        .set(wal_size as i64);
+                                } else {
+                                    // No index loaded yet — sleep and retry
+                                    std::thread::sleep(std::time::Duration::from_secs(1));
+                                }
+                            }
+                            Ok(_) => {
+                                // No new records — sleep briefly
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            Err(e) => {
+                                eprintln!("WAL reader error: {e}");
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
+
         let shutdown_state = Arc::clone(&state);
 
         // Admin routes — require Bearer token (or disabled if no token configured)
