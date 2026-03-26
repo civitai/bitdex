@@ -46,5 +46,6 @@ pub mod types;
 pub mod unified_cache;
 pub mod versioned_bitmap;
 pub mod write_coalescer;
+pub mod dump_processor;
 #[cfg(feature = "pg-sync")]
 pub mod pg_sync;
