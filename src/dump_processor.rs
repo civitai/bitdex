@@ -167,10 +167,13 @@ pub struct EnrichmentConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Expression evaluation
+// Expression evaluation (placeholder — Nate's dump_expression.rs will replace)
 // ---------------------------------------------------------------------------
 
 /// A parsed expression ready for evaluation.
+/// NOTE: This is a placeholder implementation. Nate (Agent B) is building
+/// dump_expression.rs with the full expression engine. These types and
+/// functions will be replaced at integration time.
 #[derive(Debug, Clone)]
 pub enum Expr {
     /// Bitfield extraction: (column >> shift) & mask == expected
@@ -539,10 +542,14 @@ pub fn eval_computed(expr: &Expr, row: &ParsedRow, lookup_key: Option<i64>) -> O
 }
 
 // ---------------------------------------------------------------------------
-// Enrichment system
+// Enrichment system (placeholder — Nate's dump_enrichment.rs will replace)
 // ---------------------------------------------------------------------------
 
 /// A loaded enrichment HashMap — keyed by the join column value.
+/// NOTE: This is a placeholder implementation. Nate (Agent B) is building
+/// dump_enrichment.rs with the full enrichment engine including nested
+/// lookups and expression evaluation. These types will be replaced at
+/// integration time.
 /// Values are raw column data stored as (column_name → value_bytes).
 pub struct EnrichmentMap {
     /// key_value → { column_name → value_string }
