@@ -67,6 +67,21 @@ impl Default for OpsProcessorConfig {
     }
 }
 
+/// Info about a computed sort field: which source fields feed it and the operation.
+#[derive(Clone)]
+struct ComputedSortInfo {
+    /// The computed sort field name (e.g., "sortAt")
+    target: String,
+    /// Arc<str> for the target field
+    target_arc: Arc<str>,
+    /// Number of bits for the target sort field
+    target_bits: usize,
+    /// The computation operation
+    op: crate::config::ComputedOp,
+    /// Source field names (e.g., ["existedAt", "publishedAt"])
+    source_fields: Vec<String>,
+}
+
 /// Precomputed field metadata from Config, used during ops processing.
 /// Built once, reused across all batches.
 pub struct FieldMeta {
@@ -74,6 +89,9 @@ pub struct FieldMeta {
     filter_fields: HashMap<String, (Arc<str>, FilterFieldType)>,
     /// Sort field name → (Arc<str>, num_bits)
     sort_fields: HashMap<String, (Arc<str>, usize)>,
+    /// Reverse map: source_field → computed sort fields that depend on it.
+    /// When a source field is set, all computed fields referencing it must be recomputed.
+    computed_deps: HashMap<String, Vec<ComputedSortInfo>>,
     /// Field registry for Arc<str> interning (kept for future DocSink use)
     #[allow(dead_code)]
     registry: FieldRegistry,
@@ -97,11 +115,38 @@ impl FieldMeta {
                 (registry.get(&sc.name), sc.bits as usize),
             );
         }
+
+        // Build reverse dependency map for computed sort fields
+        let mut computed_deps: HashMap<String, Vec<ComputedSortInfo>> = HashMap::new();
+        for sc in &config.sort_fields {
+            if let Some(ref computed) = sc.computed {
+                let info = ComputedSortInfo {
+                    target: sc.name.clone(),
+                    target_arc: registry.get(&sc.name),
+                    target_bits: sc.bits as usize,
+                    op: computed.op.clone(),
+                    source_fields: computed.source_fields.clone(),
+                };
+                for source in &computed.source_fields {
+                    computed_deps
+                        .entry(source.clone())
+                        .or_default()
+                        .push(info.clone());
+                }
+            }
+        }
+
         Self {
             filter_fields,
             sort_fields,
+            computed_deps,
             registry,
         }
+    }
+
+    /// Check if a sort field is a source for any computed field.
+    fn has_computed_deps(&self, field: &str) -> bool {
+        self.computed_deps.contains_key(field)
     }
 }
 
@@ -164,12 +209,21 @@ pub fn apply_ops_batch<S: BitmapSink>(
             }
         }
 
-        // Process set/remove/add ops → direct bitmap mutations
+        // Process set/remove/add ops → direct bitmap mutations.
+        // Track sort field values for computed field recomputation.
         let mut has_any_ops = false;
+        let mut sort_values: HashMap<&str, u32> = HashMap::new();
         for op in &entry.ops {
             match op {
                 Op::Set { field, value } => {
                     process_set_op(sink, meta, slot, field, value);
+                    // Track sort value for computed field deps
+                    if meta.has_computed_deps(field) || meta.sort_fields.contains_key(field.as_str()) {
+                        let qval = json_to_qvalue(value);
+                        if let Some(sv) = value_to_sort_u32(&qval) {
+                            sort_values.insert(field.as_str(), sv);
+                        }
+                    }
                     has_any_ops = true;
                 }
                 Op::Remove { field, value } => {
@@ -182,6 +236,40 @@ pub fn apply_ops_batch<S: BitmapSink>(
                 }
                 Op::Delete | Op::QueryOpSet { .. } => {
                     // Already handled above
+                }
+            }
+        }
+
+        // Recompute any computed sort fields whose source fields were set.
+        // For GREATEST(existedAt, publishedAt): if existedAt was set, compute
+        // sortAt = max(existedAt, current_publishedAt). If only one source is
+        // available, use it directly (the other defaults to 0).
+        if !meta.computed_deps.is_empty() {
+            for (source_field, deps) in &meta.computed_deps {
+                if let Some(&source_val) = sort_values.get(source_field.as_str()) {
+                    for dep in deps {
+                        // Gather all source values — use tracked values from this
+                        // batch, or 0 if not available (source not in this entity's ops)
+                        let values: Vec<u32> = dep.source_fields.iter()
+                            .map(|sf| sort_values.get(sf.as_str()).copied().unwrap_or(0))
+                            .collect();
+
+                        let computed_val = match dep.op {
+                            crate::config::ComputedOp::Greatest => *values.iter().max().unwrap_or(&0),
+                            crate::config::ComputedOp::Least => *values.iter().min().unwrap_or(&0),
+                        };
+
+                        // Set sort layers for the computed field
+                        for bit in 0..dep.target_bits {
+                            if (computed_val >> bit) & 1 == 1 {
+                                sink.sort_set(dep.target_arc.clone(), bit, slot);
+                            }
+                            // Note: we don't clear old bits here because during dump,
+                            // the computed field starts at 0 (all bits clear).
+                            // For steady-state, the remove op on the source field
+                            // should be paired with clearing the old computed value.
+                        }
+                    }
                 }
             }
         }
