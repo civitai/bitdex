@@ -352,7 +352,6 @@ async fn main() {
                     password: sync_config.clickhouse_password.clone(),
                 };
                 let metrics_fut = metrics_poller::run_metrics_poller(
-                    &pool,
                     &ch_config,
                     &bitdex_client,
                     sync_config.metrics_poll_interval_secs,

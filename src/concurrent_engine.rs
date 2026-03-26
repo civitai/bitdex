@@ -6067,6 +6067,12 @@ impl ConcurrentEngine {
         &self.config
     }
 
+    /// Get a cloneable MutationSender for submitting ops to the coalescer channel.
+    /// Used by the WAL reader thread to send ops via CoalescerSink.
+    pub fn mutation_sender(&self) -> MutationSender {
+        self.sender.clone()
+    }
+
     /// Get a reference to the BitmapFs store, if configured.
     pub fn bitmap_store(&self) -> Option<&Arc<BitmapFs>> {
         self.bitmap_store.as_ref()
@@ -6481,6 +6487,49 @@ impl ConcurrentEngine {
             t3.as_secs_f64());
 
         total_count
+    }
+
+    /// Apply a BitmapAccum's accumulated bitmaps directly to staging.
+    ///
+    /// Used by the dump pipeline (Sync V2) to apply ops-derived bitmaps
+    /// without going through the coalescer channel.
+    ///
+    /// **Caller must be in loading mode** (`enter_loading_mode()` before first call,
+    /// `exit_loading_mode()` after all accums are applied). This avoids the Arc clone
+    /// cascade — in loading mode, staging refcount=1 so clone is cheap.
+    ///
+    /// ORs filter bitmaps, sort layer bitmaps, and alive bitmap into staging.
+    pub fn apply_accum(&self, accum: &crate::loader::BitmapAccum) {
+        // In loading mode, the flush thread doesn't publish snapshots, so the
+        // ArcSwap holds the sole reference. Clone is O(num_fields) — just Arc
+        // pointer copies, no deep bitmap clones.
+        let snap = self.inner.load_full();
+        let mut staging = (*snap).clone();
+        drop(snap);
+
+        // Apply filter bitmaps
+        for (field_name, value_map) in &accum.filter_maps {
+            if let Some(field) = staging.filters.get_field_mut(field_name) {
+                for (&value, bitmap) in value_map {
+                    field.or_bitmap(value, bitmap);
+                }
+            }
+        }
+
+        // Apply sort layer bitmaps
+        for (field_name, layer_map) in &accum.sort_maps {
+            if let Some(field) = staging.sorts.get_field_mut(field_name) {
+                for (&bit_layer, bitmap) in layer_map {
+                    field.or_layer(bit_layer, bitmap);
+                }
+            }
+        }
+
+        // Apply alive bitmap (also updates slot counter)
+        staging.slots.alive_or_bitmap(&accum.alive);
+
+        // Store back — in loading mode, no snapshot publish overhead
+        self.inner.store(Arc::new(staging));
     }
 
     /// Build all bitmap indexes from the docstore.
