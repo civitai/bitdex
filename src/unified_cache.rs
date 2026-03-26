@@ -2920,6 +2920,7 @@ mod tests {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             });
             let field = si.get_field_mut(name).unwrap();
             for &(slot, value) in *slot_values {
