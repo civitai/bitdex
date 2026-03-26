@@ -46,6 +46,11 @@ pub trait BitmapSink {
     /// Record an alive bit remove.
     fn alive_remove(&mut self, slot: u32);
 
+    /// Schedule deferred alive activation at a future unix timestamp.
+    /// The slot's filter/sort bitmaps are set immediately, but the alive bit
+    /// is deferred until `activate_at` (seconds since epoch).
+    fn deferred_alive(&mut self, slot: u32, activate_at: u64);
+
     /// Flush any buffered operations. Called after a batch of ingestions.
     fn flush(&mut self) -> Result<()>;
 }
@@ -103,6 +108,13 @@ impl BitmapSink for CoalescerSink {
     fn alive_insert(&mut self, slot: u32) {
         self.pending.push(MutationOp::AliveInsert {
             slots: vec![slot],
+        });
+    }
+
+    fn deferred_alive(&mut self, slot: u32, activate_at: u64) {
+        self.pending.push(MutationOp::DeferredAlive {
+            slot,
+            activate_at,
         });
     }
 
@@ -174,6 +186,13 @@ impl<'a> BitmapSink for AccumSink<'a> {
 
     fn alive_remove(&mut self, _slot: u32) {
         // Bulk loading never removes alive bits.
+    }
+
+    fn deferred_alive(&mut self, _slot: u32, _activate_at: u64) {
+        // In dump mode, deferred alive is a no-op for AccumSink.
+        // The slot is NOT added to the alive bitmap (skipped in the caller).
+        // The deferred alive map is built separately by the dump pipeline
+        // and applied to the engine after the dump completes.
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -295,6 +314,7 @@ mod tests {
             self.alive_inserts.push(slot);
         }
         fn alive_remove(&mut self, _slot: u32) {}
+        fn deferred_alive(&mut self, _slot: u32, _activate_at: u64) {}
         fn flush(&mut self) -> Result<()> { Ok(()) }
     }
 
