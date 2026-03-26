@@ -4203,10 +4203,22 @@ async fn handle_ops(
         }
     }
 
-    // Store sync metadata if provided
+    // Store sync metadata + update Prometheus metrics
     if let Some(meta) = &batch.meta {
         let mut sync_meta = state.sync_meta.lock();
         sync_meta.insert(meta.source.clone(), meta.clone());
+
+        let m = &state.metrics;
+        let source = meta.source.as_str();
+        if let Some(cursor) = meta.cursor {
+            m.sync_cursor_position.with_label_values(&[source]).set(cursor);
+        }
+        if let Some(max_id) = meta.max_id {
+            m.sync_max_id.with_label_values(&[source]).set(max_id);
+        }
+        if let Some(lag) = meta.lag_rows {
+            m.sync_lag_rows.with_label_values(&[source]).set(lag);
+        }
     }
 
     let ops_count = batch.ops.len();
