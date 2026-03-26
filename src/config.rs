@@ -76,6 +76,21 @@ pub struct Config {
     #[serde(default)]
     pub deferred_alive: Option<DeferredAliveConfig>,
 
+    /// Memory budget in bytes for RSS-aware cache eviction. When RSS exceeds
+    /// `memory_pressure_threshold` of this budget, the flush thread evicts cache
+    /// entries until RSS drops below `memory_pressure_target`.
+    /// Auto-detected from cgroup v2 / env var if not set.
+    #[serde(default)]
+    pub memory_budget_bytes: Option<u64>,
+
+    /// RSS fraction that triggers memory-pressure eviction (default 0.80).
+    #[serde(default = "default_memory_pressure_threshold")]
+    pub memory_pressure_threshold: f64,
+
+    /// RSS fraction to evict down to (default 0.75).
+    #[serde(default = "default_memory_pressure_target")]
+    pub memory_pressure_target: f64,
+
     /// Document cache settings (in-memory cache for docstore reads).
     #[serde(default)]
     pub doc_cache: DocCacheConfigEntry,
@@ -118,6 +133,12 @@ fn default_compact_threshold_pct() -> u64 {
 fn default_eviction_sweep_interval() -> u64 {
     1000
 }
+fn default_memory_pressure_threshold() -> f64 {
+    0.80
+}
+fn default_memory_pressure_target() -> f64 {
+    0.75
+}
 fn default_channel_capacity() -> usize {
     100_000
 }
@@ -158,6 +179,9 @@ impl Default for Config {
             doc_cache: DocCacheConfigEntry::default(),
             enabled_metrics: None,
             deferred_alive: None,
+            memory_budget_bytes: None,
+            memory_pressure_threshold: default_memory_pressure_threshold(),
+            memory_pressure_target: default_memory_pressure_target(),
             headless: false,
         }
     }

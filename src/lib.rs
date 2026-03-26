@@ -16,6 +16,7 @@ pub mod ingester;
 pub mod executor;
 pub mod filter;
 pub mod loader;
+pub mod memory_pressure;
 pub mod meta_index;
 pub mod mutation;
 pub mod parser;
