@@ -47,6 +47,9 @@ pub(crate) struct BitmapAccum {
     /// Pre-encoded msgpack bytes — encoding happens in the rayon fold so
     /// BulkWriter does pure I/O with no rayon contention.
     pub(crate) encoded_docs: Vec<(u32, Vec<u8>)>,
+    /// Deferred alive slots: (slot, activate_at_secs). These slots have
+    /// filter/sort bitmaps set but alive is NOT set — deferred until timestamp.
+    pub(crate) deferred_alive: Vec<(u32, u64)>,
     pub(crate) count: usize,
     pub(crate) errors: u64,
 }
@@ -66,6 +69,7 @@ impl BitmapAccum {
             sort_maps,
             alive: RoaringBitmap::new(),
             encoded_docs: Vec::new(),
+            deferred_alive: Vec::new(),
             count: 0,
             errors: 0,
         }
@@ -200,6 +204,7 @@ impl BitmapAccum {
             sort_maps,
             alive,
             encoded_docs: Vec::new(),
+            deferred_alive: Vec::new(),
             count: 0,
             errors: 0,
         })
@@ -231,6 +236,7 @@ impl BitmapAccum {
             }
         }
         self.encoded_docs.extend(other.encoded_docs);
+        self.deferred_alive.extend(other.deferred_alive);
         self.count += other.count;
         self.errors += other.errors;
         self

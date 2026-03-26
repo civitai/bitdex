@@ -998,6 +998,10 @@ pub fn process_csv_dump_direct(
         .map(|s| (s.name.as_str(), s.bits as usize))
         .collect();
 
+    // Collect deferred alive entries across all image chunks.
+    // Scheduled after loading mode exits (needs flush thread).
+    let mut all_deferred_alive: Vec<(u32, u64)> = Vec::new();
+
     // ---------------------------------------------------------------------------
     // Phase 1: Images (creates alive slots) — with post enrichment + string dict
     // ---------------------------------------------------------------------------
@@ -1016,6 +1020,11 @@ pub fn process_csv_dump_direct(
         let posts_ref = &posts;
         let dicts_ref = &*dicts;
         let sort_bits_ref = &sort_bits;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let deferred_alive_enabled = config.deferred_alive.is_some();
 
         loop {
             let remaining = record_limit.saturating_sub(phase_total);
@@ -1033,7 +1042,7 @@ pub fn process_csv_dump_direct(
                             None => { acc.errors += 1; return acc; }
                         };
                         let slot = row.id as u32;
-                        acc.alive.insert(slot);
+                        // alive is set after enrichment (deferred alive check needs publishedAt)
 
                         // --- Image scalar fields (existing) ---
                         let ops = crate::pg_sync::csv_ops::image_row_to_ops_pub(&row);
@@ -1111,6 +1120,16 @@ pub fn process_csv_dump_direct(
                             accum_set_sort(&mut acc.sort_maps, "id", bits, slot, slot);
                         }
 
+                        // --- Alive or deferred alive ---
+                        // If publishedAt is in the future, defer alive activation.
+                        let is_future = deferred_alive_enabled
+                            && published_at_secs.map_or(false, |ps| ps > now_secs);
+                        if is_future {
+                            acc.deferred_alive.push((slot, published_at_secs.unwrap() as u64));
+                        } else {
+                            acc.alive.insert(slot);
+                        }
+
                         acc.count += 1;
                         acc
                     },
@@ -1122,7 +1141,11 @@ pub fn process_csv_dump_direct(
 
             phase_total += accum.count;
             phase_errors += accum.errors;
+            // Collect deferred alive entries before apply_accum consumes the accum
+            let mut accum = accum;
+            let chunk_deferred: Vec<(u32, u64)> = accum.deferred_alive.drain(..).collect();
             engine.apply_accum(&accum);
+            all_deferred_alive.extend(chunk_deferred);
 
             eprintln!("  images: chunk {}..{} ({:.0}/s cumulative)",
                 phase_total - accum.count, phase_total,
@@ -1340,6 +1363,20 @@ pub fn process_csv_dump_direct(
     // Exit loading mode. On headless, this will timeout (no flush thread) but
     // that's OK — the warning is harmless and the flag gets cleared.
     engine.exit_loading_mode();
+
+    // Schedule deferred alive entries via mutation channel.
+    // This runs after loading mode exits so the flush thread is active.
+    if !all_deferred_alive.is_empty() {
+        use crate::write_coalescer::MutationOp;
+        let sender = engine.mutation_sender();
+        for (slot, activate_at) in &all_deferred_alive {
+            let _ = sender.send(MutationOp::DeferredAlive {
+                slot: *slot,
+                activate_at: *activate_at,
+            });
+        }
+        eprintln!("  Scheduled {} deferred alive entries", all_deferred_alive.len());
+    }
 
     eprintln!("  Total: {total_applied} ops in {:.1}s ({:.0}/s)",
         start.elapsed().as_secs_f64(),
