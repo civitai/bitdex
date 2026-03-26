@@ -15,9 +15,10 @@ default = []
 server = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus"]
 loadtest = ["ureq"]
 replay = ["ureq"]
-pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes"]
+pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes", "dep:serde_yaml"]
 simd = ["roaring/simd"]
 heap-prof = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+serde_yaml = ["dep:serde_yaml"]
 
 [dependencies]
 # Bitmap indexes
@@ -85,6 +86,7 @@ thiserror = "2"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_yaml = { version = "0.9.34", optional = true }
 
 [dev-dependencies]
 # Property-based testing

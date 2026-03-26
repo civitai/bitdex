@@ -16,6 +16,7 @@ pub mod op_dedup;
 pub mod ops;
 pub mod ops_poller;
 pub mod outbox_poller;
+pub mod trigger_gen;
 pub mod progress;
 pub mod queries;
 pub mod row_assembler;
