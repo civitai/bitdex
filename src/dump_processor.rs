@@ -28,6 +28,9 @@ use crate::bitmap_fs::BitmapFs;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
 use crate::docstore::{BulkWriter, PackedValue};
+use crate::dump_enrichment;
+use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
+use crate::dump_expression::ExprValue as NateExprValue;
 use crate::pg_sync::single_pass::{save_filter_field_to_disk};
 
 const LOG_INTERVAL: u64 = 1_000_000;
@@ -438,6 +441,26 @@ impl<'a> ParsedRow<'a> {
     pub fn slot(&self, slot_field: &str) -> Option<u32> {
         self.get_i64(slot_field).map(|v| v as u32)
     }
+
+    /// Convert to Nate's CsvRow format for expression/enrichment evaluation.
+    pub fn to_csv_row<'b>(&'b self) -> CsvRow<'b> {
+        let mut row = CsvRow::new();
+        for (name, &idx) in self.col_index.as_ref() {
+            if let Some(bytes) = self.fields.get(idx) {
+                if bytes.is_empty() {
+                    row.insert(name.as_str(), None);
+                } else {
+                    let s = if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+                        std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()
+                    } else {
+                        std::str::from_utf8(bytes).ok()
+                    };
+                    row.insert(name.as_str(), s);
+                }
+            }
+        }
+        row
+    }
 }
 
 /// Evaluate a filter expression against a parsed row.
@@ -774,6 +797,45 @@ fn resolve_csv_path(config: &EnrichmentConfig, stage_dir: &Path) -> std::path::P
     }
 }
 
+/// Convert a D3 EnrichmentConfig to Nate's dump_enrichment::EnrichmentConfig.
+fn to_nate_enrichment_config(
+    config: &EnrichmentConfig,
+    stage_dir: &Path,
+) -> dump_enrichment::EnrichmentConfig {
+    let csv_path = resolve_csv_path(config, stage_dir);
+    let fields: Vec<(String, String)> = config
+        .fields
+        .iter()
+        .map(|f| (f.column().to_string(), f.target().to_string()))
+        .collect();
+    let computed_fields: Vec<ComputedFieldDef> = config
+        .computed_fields
+        .iter()
+        .filter_map(|cf| {
+            ComputedFieldDef::parse(&cf.target, &cf.expression, cf.value.as_deref()).ok()
+        })
+        .collect();
+    let filter = config
+        .filter
+        .as_ref()
+        .and_then(|f| FilterExpression::parse(f).ok());
+
+    // Nested enrichment (only first child supported in Nate's API via Box)
+    let child = config.enrichment.first().map(|child_config| {
+        Box::new(to_nate_enrichment_config(child_config, stage_dir))
+    });
+
+    dump_enrichment::EnrichmentConfig {
+        csv_path,
+        key: config.key.clone(),
+        join_on: config.join_on.clone(),
+        fields,
+        computed_fields,
+        filter,
+        child,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CSV parsing helpers
 // ---------------------------------------------------------------------------
@@ -977,32 +1039,32 @@ pub fn process_dump(
         }
     }
 
-    // Parse filter expression
-    let filter_expr = request
+    // Parse filter expression (Nate's API)
+    let filter_expr: Option<FilterExpression> = request
         .filter
         .as_ref()
-        .map(|f| parse_expression(f))
+        .map(|f| FilterExpression::parse(f))
         .transpose()?;
 
-    // Parse computed field expressions
-    let computed_exprs: Vec<(String, Expr, Option<String>)> = request
+    // Parse computed field expressions (Nate's API)
+    let computed_defs: Vec<ComputedFieldDef> = request
         .computed_fields
         .iter()
         .map(|cf| {
-            let expr = parse_expression(&cf.expression)?;
-            Ok((cf.target.clone(), expr, cf.value.clone()))
+            ComputedFieldDef::parse(&cf.target, &cf.expression, cf.value.as_deref())
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    // Load enrichment maps
-    let enrichments: Vec<EnrichmentMap> = request
-        .enrichment
-        .iter()
-        .map(|ec| EnrichmentMap::load(ec, stage_dir))
-        .collect::<Result<Vec<_>, String>>()?;
+    // Load enrichment tables (Nate's API)
+    let mut enrichment_mgr = dump_enrichment::EnrichmentManager::new();
+    for ec in &request.enrichment {
+        let nate_config = to_nate_enrichment_config(ec, stage_dir);
+        enrichment_mgr
+            .load(nate_config)
+            .map_err(|e| format!("load enrichment: {e}"))?;
+    }
 
-    // Get LCS dictionaries from engine (already loaded from disk on startup).
-    // FieldDictionary uses DashMap internally — thread-safe for concurrent reads/inserts.
+    // Get LCS dictionaries from engine (thread-safe DashMap-based)
     let dictionaries: Arc<HashMap<String, FieldDictionary>> = engine.dictionaries_arc();
 
     // Prepare BulkWriter for docstore
@@ -1092,8 +1154,8 @@ pub fn process_dump(
 
     // Shared references for parallel access
     let filter_expr_ref = &filter_expr;
-    let computed_exprs_ref = &computed_exprs;
-    let enrichments_ref = &enrichments;
+    let computed_defs_ref = &computed_defs;
+    let enrichment_mgr_ref = &enrichment_mgr;
     let dictionaries_ref = dictionaries.as_ref();
     let filter_field_names_ref = &filter_field_names;
     let sort_bits_ref = &sort_bits;
@@ -1115,10 +1177,10 @@ pub fn process_dump(
         })
         .collect();
     // Also include computed fields that are sort fields
-    let computed_sort_targets: Vec<(String, u8)> = computed_exprs
+    let computed_sort_targets: Vec<(String, u8)> = computed_defs
         .iter()
-        .filter_map(|(target, _, _)| {
-            sort_bits.get(target).map(|&b| (target.clone(), b))
+        .filter_map(|def| {
+            sort_bits.get(&def.target).map(|&b| (def.target.clone(), b))
         })
         .collect();
 
@@ -1142,9 +1204,9 @@ pub fn process_dump(
                 .map(|n| (n.clone(), HashMap::new()))
                 .collect();
             // Also init for computed filter fields
-            for (target, _, _) in computed_exprs_ref {
-                if filter_field_names_ref.contains(target) {
-                    filter_maps.entry(target.clone()).or_default();
+            for def in computed_defs_ref {
+                if filter_field_names_ref.contains(&def.target) {
+                    filter_maps.entry(def.target.clone()).or_default();
                 }
             }
             let mut sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>> = sort_targets
@@ -1184,21 +1246,26 @@ pub fn process_dump(
                     max_slot = slot;
                 }
 
-                // Apply filter
-                if let Some(ref expr) = filter_expr_ref {
-                    if !eval_filter(expr, &row, None) {
+                // Apply filter (Nate's FilterExpression API)
+                let csv_row = row.to_csv_row();
+                if let Some(ref fexpr) = filter_expr_ref {
+                    if !fexpr.eval(&csv_row, None) {
                         continue;
                     }
                 }
 
-                // Resolve enrichment
+                // Resolve enrichment (Nate's EnrichmentManager API)
+                let enriched = enrichment_mgr_ref.enrich_row(&csv_row);
                 let mut enriched_values: HashMap<String, String> = HashMap::new();
-                for enrichment in enrichments_ref {
-                    let join_col = &enrichment.config.join_on;
-                    if let Some(join_val) = row.get_i64(join_col) {
-                        if let Some(resolved) = enrichment.resolve(join_val) {
-                            enriched_values.extend(resolved);
-                        }
+                for (target, value) in &enriched.fields {
+                    enriched_values.insert(target.clone(), value.clone());
+                }
+                for (target, value) in &enriched.computed {
+                    match value {
+                        NateExprValue::Int(n) => { enriched_values.insert(target.clone(), n.to_string()); }
+                        NateExprValue::Str(s) => { enriched_values.insert(target.clone(), s.clone()); }
+                        NateExprValue::Bool(b) => { enriched_values.insert(target.clone(), if *b { "1" } else { "0" }.to_string()); }
+                        NateExprValue::Null => {}
                     }
                 }
 
@@ -1211,11 +1278,11 @@ pub fn process_dump(
                                 write_docstore_row(
                                     &row,
                                     &enriched_values,
-                                    computed_exprs_ref,
+                                    computed_defs_ref,
+                                    &csv_row,
                                     slot,
                                     request_fields,
                                     &bulk_writer,
-                                    None,
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1285,17 +1352,39 @@ pub fn process_dump(
                     }
                 }
 
-                // Build bitmaps from computed fields
-                for (target, expr, value_col) in computed_exprs_ref {
-                    let computed_val = eval_computed(expr, &row, None);
+                // Build bitmaps from computed fields (Nate's ComputedFieldDef API)
+                for def in computed_defs_ref {
+                    let computed_val = def.eval(&csv_row, None);
 
-                    // For conditional computed fields with a value column
-                    if let Some(ref vcol) = value_col {
-                        // Expression returns boolean (1/0); if true, use the value column
-                        if computed_val == Some(1) {
+                    match computed_val {
+                        Some(NateExprValue::Int(v)) if def.value_column.is_none() => {
+                            // Regular computed field — use value directly as bitmap key
+                            if filter_field_names_ref.contains(&def.target) {
+                                if let Some(fm) = filter_maps.get_mut(&def.target) {
+                                    fm.entry(v as u64)
+                                        .or_insert_with(RoaringBitmap::new)
+                                        .insert(slot);
+                                }
+                            }
+                            if let Some(&bits) = sort_bits_ref.get(&def.target) {
+                                let val32 = v as u32;
+                                if let Some(sm) = sort_maps.get_mut(&def.target) {
+                                    for bit in 0..(bits as usize) {
+                                        if (val32 >> bit) & 1 == 1 {
+                                            sm.entry(bit)
+                                                .or_insert_with(RoaringBitmap::new)
+                                                .insert(slot);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(NateExprValue::Bool(true)) if def.value_column.is_some() => {
+                            // Conditional: expression is true, use the value column
+                            let vcol = def.value_column.as_deref().unwrap();
                             if let Some(v) = row.get_i64(vcol) {
-                                if filter_field_names_ref.contains(target.as_str()) {
-                                    if let Some(fm) = filter_maps.get_mut(target.as_str()) {
+                                if filter_field_names_ref.contains(&def.target) {
+                                    if let Some(fm) = filter_maps.get_mut(&def.target) {
                                         fm.entry(v as u64)
                                             .or_insert_with(RoaringBitmap::new)
                                             .insert(slot);
@@ -1303,27 +1392,18 @@ pub fn process_dump(
                                 }
                             }
                         }
-                    } else if let Some(v) = computed_val {
-                        // Regular computed field — use computed value directly
-                        if filter_field_names_ref.contains(target.as_str()) {
-                            if let Some(fm) = filter_maps.get_mut(target.as_str()) {
-                                fm.entry(v as u64)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(slot);
-                            }
-                        }
-                        if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
-                            let val32 = v as u32;
-                            if let Some(sm) = sort_maps.get_mut(target.as_str()) {
-                                for bit in 0..(bits as usize) {
-                                    if (val32 >> bit) & 1 == 1 {
-                                        sm.entry(bit)
-                                            .or_insert_with(RoaringBitmap::new)
-                                            .insert(slot);
-                                    }
+                        Some(NateExprValue::Bool(b)) if def.value_column.is_none() => {
+                            // Boolean computed field (e.g. hasMeta, isPublished)
+                            let key = if b { 1u64 } else { 0u64 };
+                            if filter_field_names_ref.contains(&def.target) {
+                                if let Some(fm) = filter_maps.get_mut(&def.target) {
+                                    fm.entry(key)
+                                        .or_insert_with(RoaringBitmap::new)
+                                        .insert(slot);
                                 }
                             }
                         }
+                        _ => {} // Null or non-matching pattern
                     }
                 }
 
@@ -1331,11 +1411,11 @@ pub fn process_dump(
                 write_docstore_row(
                     &row,
                     &enriched_values,
-                    computed_exprs_ref,
+                    computed_defs_ref,
+                    &csv_row,
                     slot,
                     request_fields,
                     &bulk_writer,
-                    None,
                 );
 
                 count += 1;
@@ -1479,7 +1559,7 @@ fn process_multi_value_phase(
     body: &[u8],
     delimiter: u8,
     col_index: &Arc<HashMap<String, usize>>,
-    filter_expr: &Option<Expr>,
+    filter_expr: &Option<FilterExpression>,
     bitmap_fs: &BitmapFs,
     _bulk_writer: &Arc<BulkWriter>,
 ) -> Result<PhaseResult, String> {
@@ -1523,8 +1603,9 @@ fn process_multi_value_phase(
                     };
 
                     // Apply filter
-                    if let Some(ref expr) = filter_expr {
-                        if !eval_filter(expr, &row, None) {
+                    if let Some(ref fexpr) = filter_expr {
+                        let csv_row = row.to_csv_row();
+                        if !fexpr.eval(&csv_row, None) {
                             continue;
                         }
                     }
@@ -1618,8 +1699,9 @@ fn process_multi_value_phase(
                         col_index: col_index.clone(),
                     };
 
-                    if let Some(ref expr) = filter_expr {
-                        if !eval_filter(expr, &row, None) {
+                    if let Some(ref fexpr) = filter_expr {
+                        let csv_row = row.to_csv_row();
+                        if !fexpr.eval(&csv_row, None) {
                             continue;
                         }
                     }
@@ -1730,11 +1812,11 @@ fn collect_enrichment_targets(config: &EnrichmentConfig, targets: &mut Vec<Strin
 fn write_docstore_row(
     row: &ParsedRow,
     enriched_values: &HashMap<String, String>,
-    computed_exprs: &[(String, Expr, Option<String>)],
+    computed_defs: &[ComputedFieldDef],
+    csv_row: &CsvRow,
     slot: u32,
     request_fields: &[DumpFieldMapping],
     bulk_writer: &Arc<BulkWriter>,
-    _lookup_key: Option<i64>,
 ) {
     let field_idx = bulk_writer.field_to_idx();
 
@@ -1744,7 +1826,6 @@ fn write_docstore_row(
         let column = mapping.column();
 
         if let Some(&fidx) = field_idx.get(target) {
-            // Try row value first, then enriched
             if let Some(v) = row.get_i64(column) {
                 let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
                 bulk_writer.append_tuple_raw(slot, fidx, &packed);
@@ -1769,21 +1850,23 @@ fn write_docstore_row(
         }
     }
 
-    // Write computed fields
-    for (target, expr, value_col) in computed_exprs {
-        if let Some(&fidx) = field_idx.get(target.as_str()) {
-            if let Some(ref vcol) = value_col {
-                // Conditional: write value column when expression is true
-                let computed = eval_computed(expr, row, None);
-                if computed == Some(1) {
-                    if let Some(v) = row.get_i64(vcol) {
-                        let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                        bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                    }
+    // Write computed fields (Nate's ComputedFieldDef API)
+    for def in computed_defs {
+        if let Some(&fidx) = field_idx.get(def.target.as_str()) {
+            match def.eval(csv_row, None) {
+                Some(NateExprValue::Int(v)) => {
+                    let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
+                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
                 }
-            } else if let Some(v) = eval_computed(expr, row, None) {
-                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                Some(NateExprValue::Bool(b)) => {
+                    let packed = rmp_serde::to_vec(&PackedValue::I(if b { 1 } else { 0 })).unwrap_or_default();
+                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                }
+                Some(NateExprValue::Str(ref s)) => {
+                    let packed = rmp_serde::to_vec(&PackedValue::S(s.clone())).unwrap_or_default();
+                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                }
+                _ => {}
             }
         }
     }
