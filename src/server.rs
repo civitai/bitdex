@@ -296,6 +296,9 @@ struct AppState {
     /// Latest sync source metadata (cursor, lag) keyed by source name.
     #[cfg(feature = "pg-sync")]
     sync_meta: Mutex<std::collections::HashMap<String, crate::pg_sync::ops::SyncMeta>>,
+    /// Dump registry for tracking table dump lifecycle.
+    #[cfg(feature = "pg-sync")]
+    dump_registry: Mutex<crate::pg_sync::dump::DumpRegistry>,
 }
 
 type SharedState = Arc<AppState>;
@@ -1001,6 +1004,11 @@ impl BitdexServer {
             ops_wal: Mutex::new(None),
             #[cfg(feature = "pg-sync")]
             sync_meta: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "pg-sync")]
+            dump_registry: {
+                let dumps_path = self.data_dir.join("dumps.json");
+                Mutex::new(crate::pg_sync::dump::DumpRegistry::load(&dumps_path))
+            },
         });
 
         // Try to restore an existing index from disk
@@ -1080,6 +1088,11 @@ impl BitdexServer {
             .route("/api/internal/pgsync-metrics", post(handle_pgsync_metrics))
             .route("/api/indexes/{name}/ops", post(handle_ops))
             .route("/api/internal/sync-lag", get(handle_sync_lag))
+            .route("/api/indexes/{name}/dumps", get(handle_list_dumps))
+            .route("/api/indexes/{name}/dumps", put(handle_register_dump))
+            .route("/api/indexes/{name}/dumps/{dump_name}/loaded", post(handle_dump_loaded))
+            .route("/api/indexes/{name}/dumps/{dump_name}", delete(handle_delete_dump))
+            .route("/api/indexes/{name}/dumps/clear", post(handle_clear_dumps))
             .route("/metrics", get(handle_metrics))
             .route("/", get(handle_ui))
             .with_state(Arc::clone(&state));
@@ -4248,6 +4261,124 @@ async fn handle_ops(
     AxumPath(_name): AxumPath<String>,
 ) -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "pg-sync feature not enabled"})))
+}
+
+// ── Dump endpoints ──
+
+/// GET /api/indexes/{name}/dumps — List all dumps and their status.
+#[cfg(feature = "pg-sync")]
+async fn handle_list_dumps(
+    State(state): State<SharedState>,
+    AxumPath(_name): AxumPath<String>,
+) -> impl IntoResponse {
+    let reg = state.dump_registry.lock();
+    Json(serde_json::json!({
+        "dumps": reg.dumps,
+        "all_complete": reg.all_complete(),
+    }))
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_list_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoResponse {
+    Json(serde_json::json!({"dumps": {}}))
+}
+
+/// PUT /api/indexes/{name}/dumps — Register a new dump.
+#[cfg(feature = "pg-sync")]
+async fn handle_register_dump(
+    State(state): State<SharedState>,
+    AxumPath(_name): AxumPath<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let dump_name = body["name"].as_str().unwrap_or("unknown").to_string();
+    let wal_path = body["wal_path"].as_str().map(|s| s.to_string());
+
+    let mut reg = state.dump_registry.lock();
+    reg.register(dump_name.clone(), wal_path);
+
+    let dumps_path = state.data_dir.join("dumps.json");
+    if let Err(e) = reg.save(&dumps_path) {
+        eprintln!("Warning: failed to save dump registry: {e}");
+    }
+
+    (StatusCode::CREATED, Json(serde_json::json!({
+        "name": dump_name,
+        "status": "writing",
+    })))
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_register_dump(
+    AxumPath(_name): AxumPath<String>,
+    Json(_body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "pg-sync not enabled"})))
+}
+
+/// POST /api/indexes/{name}/dumps/{dump_name}/loaded — Signal dump file is complete.
+#[cfg(feature = "pg-sync")]
+async fn handle_dump_loaded(
+    State(state): State<SharedState>,
+    AxumPath((_name, dump_name)): AxumPath<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let ops_written = body["ops_written"].as_u64().unwrap_or(0);
+
+    let mut reg = state.dump_registry.lock();
+    match reg.mark_loaded(&dump_name, ops_written) {
+        Some(_) => {
+            let dumps_path = state.data_dir.join("dumps.json");
+            reg.save(&dumps_path).ok();
+            Json(serde_json::json!({"status": "loading", "name": dump_name}))
+        }
+        None => Json(serde_json::json!({"error": format!("Dump '{}' not found", dump_name)})),
+    }
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_dump_loaded(
+    AxumPath((_name, _dump_name)): AxumPath<(String, String)>,
+    Json(_body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({"error": "pg-sync not enabled"}))
+}
+
+/// DELETE /api/indexes/{name}/dumps/{dump_name} — Remove a dump from history.
+#[cfg(feature = "pg-sync")]
+async fn handle_delete_dump(
+    State(state): State<SharedState>,
+    AxumPath((_name, dump_name)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    let mut reg = state.dump_registry.lock();
+    reg.remove(&dump_name);
+    let dumps_path = state.data_dir.join("dumps.json");
+    reg.save(&dumps_path).ok();
+    StatusCode::NO_CONTENT
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_delete_dump(
+    AxumPath((_name, _dump_name)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    StatusCode::NOT_FOUND
+}
+
+/// POST /api/indexes/{name}/dumps/clear — Clear all dump history.
+#[cfg(feature = "pg-sync")]
+async fn handle_clear_dumps(
+    State(state): State<SharedState>,
+    AxumPath(_name): AxumPath<String>,
+) -> impl IntoResponse {
+    let mut reg = state.dump_registry.lock();
+    reg.clear();
+    let dumps_path = state.data_dir.join("dumps.json");
+    reg.save(&dumps_path).ok();
+    StatusCode::NO_CONTENT
+}
+
+#[cfg(not(feature = "pg-sync"))]
+async fn handle_clear_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoResponse {
+    StatusCode::NOT_FOUND
 }
 
 /// GET /api/internal/sync-lag — Return latest sync metadata from all sources.
