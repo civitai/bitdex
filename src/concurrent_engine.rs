@@ -6494,20 +6494,18 @@ impl ConcurrentEngine {
     /// Used by the dump pipeline (Sync V2) to apply ops-derived bitmaps
     /// without going through the coalescer channel.
     ///
-    /// Enters loading mode before cloning staging (ensures refcount=1, avoiding
-    /// the Arc clone cascade). Exits loading mode after to publish the snapshot.
-    /// Safe to call multiple times — each call is a self-contained load cycle.
+    /// **Caller must be in loading mode** (`enter_loading_mode()` before first call,
+    /// `exit_loading_mode()` after all accums are applied). This avoids the Arc clone
+    /// cascade — in loading mode, staging refcount=1 so clone is cheap.
     ///
     /// ORs filter bitmaps, sort layer bitmaps, and alive bitmap into staging.
     pub fn apply_accum(&self, accum: &crate::loader::BitmapAccum) {
-        // Enter loading mode: drops published snapshot's Arc refs so the staging
-        // clone below is the sole owner (refcount=1). This avoids the deep-clone
-        // cascade from Arc::make_mut() that caused 94s stalls in PR #78.
-        self.enter_loading_mode();
-
+        // In loading mode, the flush thread doesn't publish snapshots, so the
+        // ArcSwap holds the sole reference. Clone is O(num_fields) — just Arc
+        // pointer copies, no deep bitmap clones.
         let snap = self.inner.load_full();
         let mut staging = (*snap).clone();
-        drop(snap); // Release Arc ref before mutation
+        drop(snap);
 
         // Apply filter bitmaps
         for (field_name, value_map) in &accum.filter_maps {
@@ -6530,9 +6528,8 @@ impl ConcurrentEngine {
         // Apply alive bitmap (also updates slot counter)
         staging.slots.alive_or_bitmap(&accum.alive);
 
-        // Store and publish
+        // Store back — in loading mode, no snapshot publish overhead
         self.inner.store(Arc::new(staging));
-        self.exit_loading_mode();
     }
 
     /// Build all bitmap indexes from the docstore.
