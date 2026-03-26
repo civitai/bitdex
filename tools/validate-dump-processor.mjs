@@ -140,14 +140,31 @@ async function sendDump(request) {
   return res.json();
 }
 
-async function pollTask(taskId) {
+const PHASE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes per phase
+
+async function pollTask(taskId, phaseName) {
+  const startTime = Date.now();
+  let lastProgress = 0;
   while (true) {
+    const elapsed = Date.now() - startTime;
+    if (elapsed > PHASE_TIMEOUT_MS) {
+      throw new Error(`TIMEOUT: Phase ${phaseName} exceeded 10 minutes (${(elapsed/1000).toFixed(0)}s). Task ${taskId} at ${lastProgress} rows.`);
+    }
+
     const res = await fetch(`${BASE}/api/tasks/${taskId}`);
     const task = await res.json();
-    if (task.status === 'complete') return task;
+    const progress = task.progress?.records_processed || 0;
+    const rate = progress > 0 ? (progress / (elapsed / 1000)).toFixed(0) : '---';
+    lastProgress = progress;
+
+    if (task.status === 'complete') {
+      console.log(`  Complete in ${(elapsed/1000).toFixed(1)}s: ${progress} rows (${rate}/s)`);
+      return task;
+    }
     if (task.status === 'error') throw new Error(`Task ${taskId} failed: ${task.error}`);
-    process.stderr.write(`  Task ${taskId}: ${task.status} (${task.progress?.records_processed || 0} rows)\n`);
-    await new Promise(r => setTimeout(r, 5000));
+
+    process.stderr.write(`  [${(elapsed/1000).toFixed(0)}s] ${phaseName}: ${(progress/1_000_000).toFixed(1)}M rows (${rate}/s)\n`);
+    await new Promise(r => setTimeout(r, 3000));
   }
 }
 
@@ -163,22 +180,34 @@ async function query(filter, sort, limit = 10) {
 }
 
 async function main() {
-  console.log('=== Phase 1 Validation Suite ===\n');
+  console.log('=== Phase 1 Validation Suite ===');
+  console.log(`Server: ${BASE}`);
+  console.log(`Stage dir: ${STAGE_DIR}`);
+  console.log(`Timeout: 10 min per phase\n`);
+  console.log('NOTE: Start server with RAYON_NUM_THREADS=28 to limit CPU usage:');
+  console.log('  RAYON_NUM_THREADS=28 cargo run --release --features server,pg-sync --bin bitdex-server -- --port 3001 --data-dir ./data\n');
 
   // V1.1: Load all CSVs
   const startTime = Date.now();
   for (const req of DUMP_REQUESTS) {
     console.log(`\n--- Dump: ${req.name} ---`);
     const result = await sendDump(req);
+    if (result.error) {
+      console.error(`  ERROR: ${result.error}`);
+      continue;
+    }
     console.log(`  Registered: task_id=${result.task_id}`);
 
     if (result.task_id) {
-      const completed = await pollTask(result.task_id);
-      console.log(`  Complete: ${JSON.stringify(completed.result)}`);
+      const completed = await pollTask(result.task_id, req.name);
+      if (completed.result) {
+        console.log(`  Result: ${JSON.stringify(completed.result)}`);
+      }
     }
   }
   const totalTime = (Date.now() - startTime) / 1000;
-  console.log(`\nV1.1: All dumps completed in ${totalTime.toFixed(1)}s`);
+  const pass = totalTime < 600;
+  console.log(`\nV1.1: All dumps completed in ${totalTime.toFixed(1)}s ${pass ? 'PASS' : 'FAIL (>10min)'}`);
 
   // V1.2: Bitmap spot checks
   console.log('\n--- V1.2: Bitmap spot checks ---');

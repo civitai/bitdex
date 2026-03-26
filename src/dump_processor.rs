@@ -1014,6 +1014,18 @@ pub fn process_dump(
     engine: &ConcurrentEngine,
     stage_dir: &Path,
 ) -> Result<PhaseResult, String> {
+    process_dump_with_progress(request, engine, stage_dir, None)
+}
+
+/// Process a dump phase with optional external progress counter.
+/// When `progress_counter` is provided (from the task system), it's incremented
+/// per row so `GET /api/tasks/{id}` shows real-time progress.
+pub fn process_dump_with_progress(
+    request: &DumpRequest,
+    engine: &ConcurrentEngine,
+    stage_dir: &Path,
+    progress_counter: Option<Arc<AtomicU64>>,
+) -> Result<PhaseResult, String> {
     // Validate before processing
     validate_dump_request(request, engine)?;
 
@@ -1172,6 +1184,7 @@ pub fn process_dump(
     let ranges = split_mmap_ranges(body, rayon::current_num_threads());
     let total = AtomicU64::new(0);
     let total_ref = &total;
+    let ext_progress = &progress_counter; // task system progress counter
 
     // Shared references for parallel access
     let filter_expr_ref = &filter_expr;
@@ -1314,6 +1327,7 @@ pub fn process_dump(
                                 count += 1;
                                 if count % LOG_INTERVAL == 0 {
                                     total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
+                                    if let Some(ref p) = ext_progress { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
                                 }
                                 continue;
                             }
@@ -1443,10 +1457,13 @@ pub fn process_dump(
                 count += 1;
                 if count % LOG_INTERVAL == 0 {
                     let t = total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed) + LOG_INTERVAL;
+                    if let Some(ref p) = ext_progress { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
                     eprintln!("  dump {}: {}M rows...", request.name, t / 1_000_000);
                 }
             }
-            total_ref.fetch_add(count % LOG_INTERVAL, Ordering::Relaxed);
+            let remainder = count % LOG_INTERVAL;
+            total_ref.fetch_add(remainder, Ordering::Relaxed);
+            if let Some(ref p) = ext_progress { p.fetch_add(remainder, Ordering::Relaxed); }
 
             (filter_maps, sort_maps, alive, deferred, count, max_slot)
         })

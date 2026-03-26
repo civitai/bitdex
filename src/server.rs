@@ -4541,7 +4541,7 @@ async fn handle_register_dump(
         tokio::spawn(async move {
             let dump_name_inner = dump_name_for_task;
             let result = tokio::task::spawn_blocking(move || {
-                crate::dump_processor::process_dump(&request, &engine, &stage_dir)
+                crate::dump_processor::process_dump_with_progress(&request, &engine, &stage_dir, Some(progress))
             })
             .await;
 
