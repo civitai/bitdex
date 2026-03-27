@@ -31,7 +31,8 @@ const DUMP_REQUESTS = [
     csv_path: `${STAGE_DIR}/images.csv`,
     format: 'csv',
     slot_field: 'id',
-    columns: ['id', 'url', 'nsfwLevel', 'hash', 'flags', 'type', 'userId', 'blockedFor', 'scannedAtSecs', 'createdAtSecs', 'postId', 'width', 'height'],
+    // Note: current test CSV has 11 columns (no width/height). Production COPY will have 13.
+    columns: ['id', 'url', 'nsfwLevel', 'hash', 'flags', 'type', 'userId', 'blockedFor', 'scannedAtSecs', 'createdAtSecs', 'postId'],
     sets_alive: true,
     fields: [
       'nsfwLevel',
@@ -41,8 +42,7 @@ const DUMP_REQUESTS = [
       'blockedFor',
       { column: 'url', target: 'url' },
       { column: 'hash', target: 'hash' },
-      'width',
-      'height',
+      // width/height not in current test CSV — will be in production COPY
     ],
     computed_fields: [
       { target: 'hasMeta', expression: '(flags >> 13) & 1 == 1 && (flags >> 2) & 1 == 0' },
