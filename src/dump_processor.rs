@@ -1126,12 +1126,24 @@ pub fn reload_after_dumps(engine: &ConcurrentEngine, had_alive_phase: bool) {
         .filter_fields.iter().map(|f| f.name.clone()).collect();
     let sort_names: Vec<String> = engine.config()
         .sort_fields.iter().map(|f| f.name.clone()).collect();
-    engine.mark_fields_pending_reload(&filter_names, &sort_names);
 
+    let t_mark = Instant::now();
+    engine.mark_fields_pending_reload(&filter_names, &sort_names);
+    let mark_s = t_mark.elapsed().as_secs_f64();
+
+    let mut alive_s = 0.0;
     if had_alive_phase {
+        let t_alive = Instant::now();
         engine.reload_alive_from_disk();
+        alive_s = t_alive.elapsed().as_secs_f64();
     }
-    eprintln!("  Dump reload complete in {:.2}s", t.elapsed().as_secs_f64());
+
+    let total_s = t.elapsed().as_secs_f64();
+    eprintln!("  Dump reload: mark_pending={:.2}s alive_reload={:.2}s total={:.2}s", mark_s, alive_s, total_s);
+    eprintln!(
+        r#"{{"stage":"reload_timing","mark_pending_s":{:.3},"alive_reload_s":{:.3},"total_s":{:.3}}}"#,
+        mark_s, alive_s, total_s,
+    );
 }
 
 /// Process a dump phase with optional external progress counter.

@@ -4534,13 +4534,15 @@ async fn handle_register_dump(
             reg.save(&dumps_path).ok();
         }
 
-        // Spawn async processing — inline parse + save + reload
+        // Spawn async processing — inline parse + save
         let state_clone = Arc::clone(&state);
         let dump_name_for_task = dump_name.clone();
         let stage_dir = std::path::Path::new(&request.csv_path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("/data/load_stage"))
             .to_path_buf();
+        let phase_sets_alive = request.sets_alive;
+        let engine_for_reload = Arc::clone(&engine);
 
         tokio::spawn(async move {
             let dump_name_inner = dump_name_for_task;
@@ -4556,10 +4558,8 @@ async fn handle_register_dump(
 
                     // Reload fields only for the alive phase (images).
                     // Other phases just save to disk — fields get loaded lazily on first query.
-                    // Reloading between every phase would trigger expensive lazy load of all
-                    // filter fields (tagIds: 31K values, ~7s per reload).
-                    if sets_alive {
-                        crate::dump_processor::reload_after_dumps(&engine_for_save, true);
+                    if phase_sets_alive {
+                        crate::dump_processor::reload_after_dumps(&engine_for_reload, true);
                     }
 
                     tasks.set_complete(
