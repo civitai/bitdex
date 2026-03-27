@@ -1083,19 +1083,22 @@ pub fn process_dump_with_progress(
     // Determine target fields and their types
     let target_fields = collect_target_fields(request);
 
-    // Check crash recovery: if field already loaded, skip
-    for target in &target_fields {
-        if crate::pg_sync::single_pass::field_already_loaded(&bitmap_fs, target) {
-            eprintln!("  Dump {}: field '{}' already loaded, skipping phase", request.name, target);
-            return Ok(PhaseResult {
-                row_count: 0,
-                filter_maps: HashMap::new(),
-                sort_maps: HashMap::new(),
-                alive: RoaringBitmap::new(),
-                deferred_slots: BTreeMap::new(),
-                max_slot: 0,
-            });
-        }
+    // Check crash recovery: skip phase only if ALL target fields already loaded.
+    // Previously skipped if ANY field existed, which caused resources to be skipped
+    // when poi was already written by the images phase.
+    let all_loaded = !target_fields.is_empty() && target_fields.iter().all(|target| {
+        crate::pg_sync::single_pass::field_already_loaded(&bitmap_fs, target)
+    });
+    if all_loaded {
+        eprintln!("  Dump {}: all {} fields already loaded, skipping phase", request.name, target_fields.len());
+        return Ok(PhaseResult {
+            row_count: 0,
+            filter_maps: HashMap::new(),
+            sort_maps: HashMap::new(),
+            alive: RoaringBitmap::new(),
+            deferred_slots: BTreeMap::new(),
+            max_slot: 0,
+        });
     }
 
     // Parse filter expression (Nate's API)
