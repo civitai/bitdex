@@ -206,7 +206,7 @@ impl BitdexClient {
     }
 
     /// Read a named cursor from BitDex. Returns None if the cursor doesn't exist.
-    /// Signal the engine to reload a field's existence set from BitmapFs.
+    /// Signal the engine to reload a field's existence set from disk.
     pub async fn reload_field(&self, field_name: &str) -> Result<(), String> {
         let url = format!("{}/fields/{}/reload", self.base_url, field_name);
         let resp = self.client.post(&url).send().await

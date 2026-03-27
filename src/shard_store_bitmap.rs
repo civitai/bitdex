@@ -600,7 +600,7 @@ impl FilterBitmapStore {
 
     /// Load all bitmaps for a field, merging all buckets into a flat map.
     ///
-    /// Equivalent to BitmapFs::load_field(). Reads all bucket shards for the
+    /// Replaces legacy BitmapFs::load_field(). Reads all bucket shards for the
     /// field and collects value→bitmap entries into a single HashMap.
     pub fn load_field(&self, field: &str) -> io::Result<HashMap<u64, RoaringBitmap>> {
         let mut result = HashMap::new();
@@ -633,7 +633,7 @@ impl FilterBitmapStore {
     /// Load specific values for a field. Only reads the bucket shards that
     /// contain the requested values, then extracts just those entries.
     ///
-    /// Equivalent to BitmapFs::load_field_values().
+    /// Replaces legacy BitmapFs::load_field_values().
     pub fn load_field_values(&self, field: &str, values: &[u64]) -> io::Result<HashMap<u64, RoaringBitmap>> {
         // Group requested values by bucket
         let mut by_bucket: HashMap<u8, Vec<u64>> = HashMap::new();
@@ -659,7 +659,7 @@ impl FilterBitmapStore {
 
     /// Read a single filter bucket as a vec of (value, bitmap) pairs.
     ///
-    /// Equivalent to BitmapFs::read_filter_bucket().
+    /// Replaces legacy BitmapFs::read_filter_bucket().
     pub fn read_filter_bucket(&self, field: &str, bucket: u8) -> io::Result<Vec<(u64, RoaringBitmap)>> {
         let key = FilterBucketKey { field: field.to_string(), bucket };
         match self.read(&key)? {
@@ -670,7 +670,7 @@ impl FilterBitmapStore {
 
     /// Write a filter bucket from (value, bitmap) pairs.
     ///
-    /// Equivalent to BitmapFs::write_filter_bucket().
+    /// Replaces legacy BitmapFs::write_filter_bucket().
     pub fn write_filter_bucket(&self, field: &str, bucket: u8, entries: &[(u64, &RoaringBitmap)]) -> io::Result<()> {
         let key = FilterBucketKey { field: field.to_string(), bucket };
         let mut snap = BucketSnapshot::new();
@@ -711,7 +711,7 @@ pub type SortBitmapStore = crate::shard_store::ShardStore<BitmapSnapshotCodec, B
 impl SortBitmapStore {
     /// Load all sort layers for a field.
     ///
-    /// Equivalent to BitmapFs::load_sort_layers(). Reads bit00..bit{N-1} shards
+    /// Replaces legacy BitmapFs::load_sort_layers(). Reads bit00..bit{N-1} shards
     /// and returns them as a Vec<RoaringBitmap> ordered by bit position.
     /// Returns None if no layers exist on disk.
     pub fn load_sort_layers(&self, field: &str, bits: usize) -> io::Result<Option<Vec<RoaringBitmap>>> {
@@ -738,7 +738,7 @@ impl SortBitmapStore {
 
     /// Write sort layers for a field.
     ///
-    /// Equivalent to BitmapFs::write_sort_layers().
+    /// Replaces legacy BitmapFs::write_sort_layers().
     pub fn write_sort_layers(&self, field: &str, layers: &[&RoaringBitmap]) -> io::Result<()> {
         for (bit, bm) in layers.iter().enumerate() {
             let key = SortLayerShardKey { field: field.to_string(), bit_position: bit as u8 };
@@ -754,14 +754,14 @@ pub type AliveBitmapStore = crate::shard_store::ShardStore<BitmapSnapshotCodec, 
 impl AliveBitmapStore {
     /// Load the alive bitmap.
     ///
-    /// Equivalent to BitmapFs::load_alive().
+    /// Replaces legacy BitmapFs::load_alive().
     pub fn load_alive(&self) -> io::Result<Option<RoaringBitmap>> {
         self.read(&AliveShardKey)
     }
 
     /// Write the alive bitmap.
     ///
-    /// Equivalent to BitmapFs::write_alive().
+    /// Replaces legacy BitmapFs::write_alive().
     pub fn write_alive(&self, bitmap: &RoaringBitmap) -> io::Result<()> {
         self.write_snapshot(&AliveShardKey, bitmap)
     }

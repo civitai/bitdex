@@ -1,8 +1,7 @@
-//! Backfill filter_only fields from Postgres via COPY CSV → BitmapFs.
+//! Backfill filter_only fields from Postgres via COPY CSV → ShardStore.
 //!
-//! Uses the same pattern as the single-pass bulk loader: mmap CSV, rayon
-//! parallel parse, build HashMap<u64, RoaringBitmap>, save to BitmapFs.
-//! Runs while the BitDex server is live — no downtime needed.
+//! Uses mmap CSV + rayon parallel parse to build HashMap<u64, RoaringBitmap>,
+//! then saves to FilterBitmapStore. Runs while the BitDex server is live.
 //!
 //! After writing bitmaps to disk, signals the engine to reload the field's
 //! existence set so lazy loading picks up the new data.
@@ -16,7 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
-use crate::bitmap_fs::BitmapFs;
 use super::bitdex_client::BitdexClient;
 
 /// Process collection_items.csv: build collectionIds filter bitmaps.
@@ -169,16 +167,22 @@ fn fast_parse_i64(bytes: &[u8]) -> Option<i64> {
 
 use std::ops::BitOrAssign;
 
-/// Save collectionIds bitmaps to BitmapFs and signal the engine to reload.
+/// Save collectionIds bitmaps to the FilterBitmapStore.
 ///
 /// This is the main entry point for the backfill subcommand and auto-backfill.
-/// Downloads the CSV from PG if not already staged, processes it, writes to
-/// BitmapFs, and signals the engine to pick up the new data.
-pub fn save_collection_bitmaps(
-    bitmap_fs: &BitmapFs,
+/// Writes bitmaps using ShardStore's `write_full_filter`.
+pub fn save_collection_bitmaps_to_store(
+    store: &crate::shard_store_bitmap::FilterBitmapStore,
     bitmaps: HashMap<u64, RoaringBitmap>,
 ) -> Result<u64, String> {
-    crate::pg_sync::single_pass::save_filter_field_to_disk(bitmap_fs, "collectionIds", bitmaps)
+    let entries: Vec<(&str, u64, &RoaringBitmap)> = bitmaps
+        .iter()
+        .map(|(k, v)| ("collectionIds", *k, v))
+        .collect();
+    let total_bytes: u64 = bitmaps.values().map(|bm| bm.serialized_size() as u64).sum();
+    store.write_full_filter(&entries)
+        .map_err(|e| format!("write_full_filter(collectionIds): {e}"))?;
+    Ok(total_bytes)
 }
 
 /// Check if a filter_only field needs backfilling by checking its cursor.
@@ -204,7 +208,7 @@ pub async fn mark_backfilled(client: &BitdexClient, field_name: &str) -> Result<
 /// For each filter_only field without a backfill cursor:
 /// 1. Download CollectionItem CSV from PG via COPY (if not staged)
 /// 2. Process CSV → bitmaps (mmap + rayon)
-/// 3. Save to BitmapFs (atomic fpack writes)
+/// 3. Save to FilterBitmapStore
 /// 4. Signal engine to reload existence set
 /// 5. Set backfill cursor
 ///
@@ -240,10 +244,14 @@ pub async fn auto_backfill(
                 // Step 2: Process CSV → bitmaps
                 let bitmaps = process_collection_items_csv(stage_dir)?;
 
-                // Step 3: Save to BitmapFs
-                let bitmap_fs = BitmapFs::new(bitmap_path).map_err(|e| format!("BitmapFs::new: {e}"))?;
+                // Step 3: Save to FilterBitmapStore
+                let ss_root = bitmap_path.join("shardstore");
+                let filter_store = crate::shard_store_bitmap::FilterBitmapStore::new(
+                    ss_root.join("filter"),
+                    crate::shard_store_bitmap::FieldValueBucketShard,
+                ).map_err(|e| format!("FilterBitmapStore::new: {e}"))?;
                 let bitmaps_count = bitmaps.len();
-                let bytes = save_collection_bitmaps(&bitmap_fs, bitmaps)?;
+                let bytes = save_collection_bitmaps_to_store(&filter_store, bitmaps)?;
                 eprintln!(
                     "  Saved collectionIds: {} values ({:.1} MB)",
                     bitmaps_count,
@@ -437,11 +445,12 @@ mod tests {
     }
 
     #[test]
-    fn test_save_and_load_bitmaps() {
+    fn test_save_and_load_bitmaps_via_shardstore() {
         let dir = tempfile::tempdir().unwrap();
-        let bitmap_dir = dir.path().join("bitmaps");
-        std::fs::create_dir_all(&bitmap_dir).unwrap();
-        let bitmap_fs = BitmapFs::new(&bitmap_dir).unwrap();
+        let store = crate::shard_store_bitmap::FilterBitmapStore::new(
+            dir.path().join("filter"),
+            crate::shard_store_bitmap::FieldValueBucketShard,
+        ).unwrap();
 
         // Build test bitmaps
         let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
@@ -456,18 +465,13 @@ mod tests {
         bm2.insert(4);
         bitmaps.insert(200, bm2);
 
-        // Save to BitmapFs
-        let bytes = save_collection_bitmaps(&bitmap_fs, bitmaps).unwrap();
+        // Save to FilterBitmapStore
+        let bytes = save_collection_bitmaps_to_store(&store, bitmaps).unwrap();
         assert!(bytes > 0);
 
-        // Verify we can list keys (existence set)
-        let keys = bitmap_fs.list_field_keys("collectionIds").unwrap();
-        assert!(keys.contains(&100));
-        assert!(keys.contains(&200));
-        assert_eq!(keys.len(), 2);
-
         // Verify we can load the full field
-        let loaded = bitmap_fs.load_field("collectionIds").unwrap();
+        let loaded = store.load_field("collectionIds").unwrap();
+        assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[&100].len(), 3);
         assert!(loaded[&100].contains(1));
         assert!(loaded[&100].contains(2));
@@ -478,13 +482,11 @@ mod tests {
     }
 
     #[test]
-    fn test_end_to_end_csv_to_bitmapfs() {
-        // Full pipeline: CSV → parse → bitmaps → BitmapFs → verify
+    fn test_end_to_end_csv_to_shardstore() {
+        // Full pipeline: CSV → parse → bitmaps → FilterBitmapStore → verify
         let dir = tempfile::tempdir().unwrap();
         let stage = dir.path().join("stage");
-        let bitmaps_dir = dir.path().join("bitmaps");
         std::fs::create_dir_all(&stage).unwrap();
-        std::fs::create_dir_all(&bitmaps_dir).unwrap();
 
         // Write a realistic CSV
         let csv = "1,100\n1,200\n1,300\n2,100\n2,400\n3,200\n3,300\n3,500\n";
@@ -495,14 +497,15 @@ mod tests {
         assert_eq!(bitmaps.len(), 3, "3 distinct collectionIds");
 
         // Save
-        let bitmap_fs = BitmapFs::new(&bitmaps_dir).unwrap();
-        save_collection_bitmaps(&bitmap_fs, bitmaps).unwrap();
+        let store = crate::shard_store_bitmap::FilterBitmapStore::new(
+            dir.path().join("filter"),
+            crate::shard_store_bitmap::FieldValueBucketShard,
+        ).unwrap();
+        save_collection_bitmaps_to_store(&store, bitmaps).unwrap();
 
         // Verify from disk
-        let keys = bitmap_fs.list_field_keys("collectionIds").unwrap();
-        assert_eq!(keys.len(), 3);
-
-        let loaded = bitmap_fs.load_field("collectionIds").unwrap();
+        let loaded = store.load_field("collectionIds").unwrap();
+        assert_eq!(loaded.len(), 3);
         // Collection 1 has images 100, 200, 300
         assert_eq!(loaded[&1].len(), 3);
         // Collection 2 has images 100, 400

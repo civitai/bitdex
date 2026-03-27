@@ -1,7 +1,7 @@
 #![allow(unexpected_cfgs)]
 //! ShardStore — Unified storage engine for BitDex.
 //!
-//! Replaces DocStore V2 and BitmapFs with a single generic system that supports:
+//! Unified storage engine. Replaces DocStore V2 with a single generic system that supports:
 //! - Shard-local ops logs (append-only mutations)
 //! - Materialized snapshots (compacted state)
 //! - Generation management (LIFO fall-through reads)

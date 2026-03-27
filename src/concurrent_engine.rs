@@ -338,31 +338,7 @@ impl ConcurrentEngine {
             None
         };
 
-        // One-time migration: if BitmapFs data exists but ShardStore doesn't,
-        // migrate all bitmap data from BitmapFs → ShardStore format.
-        if let Some(ref path) = config.storage.bitmap_path {
-            use crate::shard_store_migrate::{has_bitmapfs_data, has_shardstore_data, migrate_bitmapfs_to_shardstore};
-            if has_bitmapfs_data(path) && !has_shardstore_data(path) {
-                let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
-                let sort_configs: Vec<(String, usize)> = config.sort_fields.iter()
-                    .map(|s| (s.name.clone(), s.bits as usize))
-                    .collect();
-                match migrate_bitmapfs_to_shardstore(path, &filter_names, &sort_configs) {
-                    Ok((alive, filters, sorts)) => {
-                        eprintln!(
-                            "Migration complete: {} alive records, {} filter fields, {} sort fields",
-                            alive, filters, sorts,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("WARNING: BitmapFs → ShardStore migration failed: {e}");
-                        eprintln!("Continuing with empty ShardStore — data will repopulate via pg-sync");
-                    }
-                }
-            }
-        }
-
-        // Construct ShardStore instances (will find migrated data if migration ran above)
+        // Construct ShardStore instances
         let (alive_store, filter_store, sort_store, meta_store) = if let Some(ref path) = config.storage.bitmap_path {
             let ss_root = path.join("shardstore");
             use crate::error::BitdexError;
@@ -1060,7 +1036,7 @@ impl ConcurrentEngine {
         let boundstore_entries_skipped = Arc::new(AtomicU64::new(0));
 
         // Headless mode: skip all background threads.
-        // The engine provides config, BitmapFs, and docstore access but
+        // The engine provides config, bitmap store, and docstore access but
         // no flush/merge/eviction threads run.
         if config.headless {
             eprintln!("Engine starting in headless mode (no background threads)");
@@ -3096,9 +3072,9 @@ impl ConcurrentEngine {
         result
     }
 
-    /// Reload a field's positive existence set from BitmapFs.
+    /// Reload a field's positive existence set from the filter store.
     ///
-    /// Called after external bulk writes to BitmapFs (e.g., backfill) so that
+    /// Called after external bulk writes (e.g., backfill) so that
     /// lazy per-value loading picks up the new data. The existence set is stored
     /// behind an ArcSwap so the update is atomic and lock-free.
     pub fn reload_existence_set(&self, field_name: &str) -> Result<()> {
@@ -3320,7 +3296,7 @@ impl ConcurrentEngine {
 
         if total_tasks > 1 {
             // --- Parallel loading via std::thread::scope ---
-            // Each thread reads from BitmapFs (Arc, safe to share). Results collected
+            // Each thread reads from ShardStore (Arc, safe to share). Results collected
             // into thread-safe containers, then applied sequentially.
             use std::sync::Mutex;
             let par_filters: Mutex<Vec<(String, HashMap<u64, RoaringBitmap>)>> = Mutex::new(Vec::new());
@@ -5310,9 +5286,9 @@ impl ConcurrentEngine {
         self.pending_filter_loads.lock().len() + self.pending_sort_loads.lock().len()
     }
 
-    /// Mark fields as pending for lazy loading from BitmapFs.
-    /// Call after dump processor writes bitmaps directly to BitmapFs — this
-    /// tells the engine to reload them on the next query.
+    /// Mark fields as pending for lazy loading from disk.
+    /// Call after dump processor writes bitmaps — this tells the engine
+    /// to reload them on the next query.
     pub fn mark_fields_pending_reload(&self, filter_fields: &[String], sort_fields: &[String]) {
         {
             let mut pending = self.pending_filter_loads.lock();
@@ -5333,7 +5309,7 @@ impl ConcurrentEngine {
         );
     }
 
-    /// Reload the alive bitmap and slot counter from BitmapFs into the
+    /// Reload the alive bitmap and slot counter from the bitmap store into the
     /// in-memory engine snapshot. Call after dump processor writes alive
     /// to disk — without this, queries see a stale/empty alive bitmap.
     pub fn reload_alive_from_disk(&self) {
@@ -6135,7 +6111,8 @@ impl ConcurrentEngine {
         self.sender.clone()
     }
 
-    /// Get a reference to the BitmapFs store, if configured.
+    /// Get a reference to the legacy BitmapFs store, if configured.
+    /// Used by dump_processor for bitmap persistence.
     pub fn bitmap_store(&self) -> Option<&Arc<BitmapFs>> {
         self.bitmap_store.as_ref()
     }
@@ -10200,8 +10177,6 @@ mod tests {
     /// when the engine has only partial (lazy-loaded) data in memory.
     #[test]
     fn test_snapshot_save_preserves_bulk_loaded_lazy_value_field() {
-        use crate::bitmap_fs::BitmapFs;
-
         let dir = tempfile::tempdir().unwrap();
         let bitmap_path = dir.path().join("bitmaps");
         let docstore_path = dir.path().join("docs");

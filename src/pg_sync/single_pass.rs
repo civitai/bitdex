@@ -3,7 +3,7 @@
 //! Eliminates the scatter-gather pipeline by processing each CSV directly:
 //!   1. Rayon block reader parses CSV rows
 //!   2. Each row simultaneously builds bitmaps AND appends V2 docstore tuples
-//!   3. After each CSV: stream bitmap saves to BitmapFs, drop from memory
+//!   3. After each CSV: stream bitmap saves to disk, drop from memory
 //!   4. Enrichment maps loaded only when needed, dropped after
 //!
 //! Processing order (largest first to free memory sooner):

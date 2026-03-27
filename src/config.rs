@@ -105,9 +105,9 @@ pub struct Config {
     pub enabled_metrics: Option<Vec<String>>,
 
     /// Headless mode: skip all background threads (flush, merge, eviction).
-    /// Used by bulk loaders that write directly to BitmapFs and don't need
-    /// the engine's write pipeline. The engine still provides config, BitmapFs
-    /// access, and docstore, but no background work runs.
+    /// Used by bulk loaders that write directly to disk and don't need
+    /// the engine's write pipeline. The engine still provides config, bitmap
+    /// store access, and docstore, but no background work runs.
     #[serde(default)]
     pub headless: bool,
 }
@@ -550,7 +550,7 @@ pub struct FilterFieldConfig {
     pub behaviors: Option<FieldBehaviors>,
     /// Idle eviction config. Only meaningful on `multi_value` fields.
     /// Values untouched for `idle_seconds` are evicted from memory and
-    /// re-loaded from BitmapFs on the next query.
+    /// re-loaded from disk on the next query.
     #[serde(default)]
     pub eviction: Option<EvictionConfig>,
     /// If true, load this field's bitmaps eagerly on startup instead of

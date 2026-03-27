@@ -259,7 +259,7 @@ async fn main() {
                     std::process::exit(1);
                 });
 
-            // No enter_loading_mode — single_pass writes directly to BitmapFs.
+            // No enter_loading_mode — single_pass writes directly to disk.
             // Loading mode would trigger a snapshot save on exit that overwrites our bitmaps.
 
             // Set up progress tracking + HTTP endpoint
@@ -316,7 +316,7 @@ async fn main() {
                 let _ = tx.send(());
             }
 
-            // No exit_loading_mode needed — single_pass wrote everything to BitmapFs directly.
+            // No exit_loading_mode needed — single_pass wrote everything to disk directly.
             // The process exits after this; the server will restore from disk on next start.
 
             eprintln!(

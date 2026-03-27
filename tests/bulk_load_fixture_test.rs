@@ -8,7 +8,7 @@
 //!   3.15: Alive bitmap correctness after full load
 //!   3.16: Sort bitmap value correctness
 //!   3.17: Docstore tuple field names match schema
-//!   3.18: BitmapFs write + read round-trip for all field types
+//!   3.18: Bitmap write + read round-trip for all field types
 
 #![cfg(feature = "pg-sync")]
 
@@ -79,7 +79,7 @@ fn test_full_bulk_load_from_fixtures() {
             // 3.15: Alive bitmap should have records
             assert!(stats.records_loaded > 0, "Expected records loaded > 0");
 
-            // single_pass writes directly to BitmapFs, not through the engine's
+            // single_pass writes directly to disk, not through the engine's
             // mutation channel. The engine's in-memory alive bitmap stays empty.
             // Verify the alive bitmap exists ON DISK instead.
             let bitmap_fs = bitdex_v2::bitmap_fs::BitmapFs::new(&bitmap_path).unwrap();
@@ -88,7 +88,7 @@ fn test_full_bulk_load_from_fixtures() {
             eprintln!("Alive bitmap on disk: {} bits", alive_count);
             assert!(alive_count > 0, "Expected alive > 0 on disk after bulk load");
 
-            // 3.18: Verify BitmapFs has data for all field types on disk
+            // 3.18: Verify bitmap data exists for all field types on disk
 
             // Tag bitmaps should exist on disk (multi-value enrichment from tags.csv)
             let tag_keys = bitmap_fs.list_field_keys("tagIds").unwrap();
