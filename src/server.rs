@@ -4457,6 +4457,18 @@ async fn handle_register_dump(
                             "dump_name": dump_name_inner,
                         })),
                     );
+                    // Mark fields pending for lazy reload so queries pick up new bitmaps
+                    {
+                        let guard = state_clone.index.lock();
+                        if let Some(idx) = guard.as_ref() {
+                            let filter_names: Vec<String> = idx.engine.config()
+                                .filter_fields.iter().map(|f| f.name.clone()).collect();
+                            let sort_names: Vec<String> = idx.engine.config()
+                                .sort_fields.iter().map(|f| f.name.clone()).collect();
+                            idx.engine.mark_fields_pending_reload(&filter_names, &sort_names);
+                        }
+                    }
+
                     // Mark dump as complete in registry
                     let mut reg = state_clone.dump_registry.lock();
                     if let Some(entry) = reg.dumps.get_mut(&dump_name_inner) {
