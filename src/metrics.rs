@@ -123,6 +123,8 @@ pub struct Metrics {
     pub sync_lag_rows: IntGaugeVec,
     pub sync_ops_total: IntCounterVec,
     pub sync_wal_bytes: IntGaugeVec,
+    pub sync_cycle_duration_seconds: HistogramVec,
+    pub sync_wal_pending_bytes: IntGaugeVec,
 }
 
 impl Metrics {
@@ -598,6 +600,17 @@ impl Metrics {
             Opts::new("bitdex_sync_wal_bytes", "Current WAL file size in bytes"),
             &["source"],
         ).unwrap();
+        let sync_cycle_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_sync_cycle_duration_seconds",
+                "WAL reader cycle processing duration",
+            ).buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]),
+            &["source"],
+        ).unwrap();
+        let sync_wal_pending_bytes = IntGaugeVec::new(
+            Opts::new("bitdex_sync_wal_pending_bytes", "Unprocessed WAL bytes (file size - cursor)"),
+            &["source"],
+        ).unwrap();
 
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
@@ -705,6 +718,8 @@ impl Metrics {
         registry.register(Box::new(sync_lag_rows.clone())).unwrap();
         registry.register(Box::new(sync_ops_total.clone())).unwrap();
         registry.register(Box::new(sync_wal_bytes.clone())).unwrap();
+        registry.register(Box::new(sync_cycle_duration_seconds.clone())).unwrap();
+        registry.register(Box::new(sync_wal_pending_bytes.clone())).unwrap();
 
         Self {
             registry,
@@ -785,6 +800,8 @@ impl Metrics {
             sync_lag_rows,
             sync_ops_total,
             sync_wal_bytes,
+            sync_cycle_duration_seconds,
+            sync_wal_pending_bytes,
         }
     }
 

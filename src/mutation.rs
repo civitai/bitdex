@@ -299,6 +299,59 @@ pub fn diff_document_partial(
     config: &Config,
     registry: &FieldRegistry,
 ) -> Vec<MutationOp> {
+    // [2.5] Deferred alive check: if the PATCH changes publishedAt to a future
+    // date, defer this slot. Same logic as diff_document — clear old bitmaps
+    // and defer the alive bit.
+    if let Some(ref da_config) = config.deferred_alive {
+        if let Some(fv) = new_doc.fields.get(&da_config.source_field) {
+            if let FieldValue::Single(Value::Integer(ts)) = fv {
+                let mut activate_at = *ts as u64;
+                if da_config.ms_to_seconds {
+                    activate_at /= 1000;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if activate_at > now {
+                    let mut ops = Vec::new();
+                    let empty_fields = HashMap::new();
+                    let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
+
+                    // Clear old bitmaps if this was a live slot
+                    for filter_config in &config.filter_fields {
+                        if let Some(old_val) = old_fields.get(&filter_config.name) {
+                            let arc_name = registry.get(&filter_config.name);
+                            collect_filter_remove_ops(&mut ops, &arc_name, slot, old_val);
+                        }
+                    }
+                    for sort_config in &config.sort_fields {
+                        if let Some(old_val) = old_fields.get(&sort_config.name) {
+                            if let FieldValue::Single(val) = old_val {
+                                if let Some(old_s) = value_to_sort_u32(val) {
+                                    let arc_name = registry.get(&sort_config.name);
+                                    let num_bits = sort_config.bits as usize;
+                                    for bit in 0..num_bits {
+                                        if (old_s >> bit) & 1 == 1 {
+                                            ops.push(MutationOp::SortClear {
+                                                field: arc_name.clone(),
+                                                bit_layer: bit,
+                                                slots: vec![slot],
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ops.push(MutationOp::AliveRemove { slots: vec![slot] });
+                    ops.push(MutationOp::DeferredAlive { slot, activate_at });
+                    return ops;
+                }
+            }
+        }
+    }
+
     let mut ops = Vec::new();
     let empty_fields = HashMap::new();
     let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);

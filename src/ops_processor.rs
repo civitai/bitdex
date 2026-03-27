@@ -620,8 +620,10 @@ pub fn apply_ops_batch<S: BitmapSink>(
 
         // Process set/remove/add ops → direct bitmap mutations + docstore writes.
         // Track sort field values for computed field recomputation.
+        // old_sort_values tracks removed values, sort_values tracks new (set) values.
         let mut has_any_ops = false;
         let mut sort_values: HashMap<&str, u32> = HashMap::new();
+        let mut old_sort_values: HashMap<&str, u32> = HashMap::new();
         for op in &entry.ops {
             match op {
                 Op::Set { field, value } => {
@@ -643,6 +645,13 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_remove(slot, field, value);
                     }
+                    // [2.3] Track old sort values for computed field recomputation
+                    if meta.has_computed_deps(field) || meta.sort_fields.contains_key(field.as_str()) {
+                        let qval = json_to_qvalue(value);
+                        if let Some(sv) = value_to_sort_u32(&qval) {
+                            old_sort_values.insert(field.as_str(), sv);
+                        }
+                    }
                     has_any_ops = true;
                 }
                 Op::Add { field, value } => {
@@ -658,34 +667,62 @@ pub fn apply_ops_batch<S: BitmapSink>(
             }
         }
 
-        // Recompute any computed sort fields whose source fields were set.
-        // For GREATEST(existedAt, publishedAt): if existedAt was set, compute
-        // sortAt = max(existedAt, current_publishedAt). If only one source is
-        // available, use it directly (the other defaults to 0).
+        // [2.3] Recompute computed sort fields when source fields change.
+        // First clear old computed value bits, then set new ones.
+        // PG triggers emit remove+set pairs, so we have both old and new values.
         if !meta.computed_deps.is_empty() {
-            for (source_field, deps) in &meta.computed_deps {
-                if let Some(&source_val) = sort_values.get(source_field.as_str()) {
+            // Determine which source fields changed (have either old or new value)
+            let mut changed_sources: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for k in sort_values.keys() {
+                if meta.computed_deps.contains_key(*k) {
+                    changed_sources.insert(k);
+                }
+            }
+            for k in old_sort_values.keys() {
+                if meta.computed_deps.contains_key(*k) {
+                    changed_sources.insert(k);
+                }
+            }
+
+            for source_field in &changed_sources {
+                if let Some(deps) = meta.computed_deps.get(*source_field) {
                     for dep in deps {
-                        // Gather all source values — use tracked values from this
-                        // batch, or 0 if not available (source not in this entity's ops)
-                        let values: Vec<u32> = dep.source_fields.iter()
-                            .map(|sf| sort_values.get(sf.as_str()).copied().unwrap_or(0))
+                        // Clear old computed value (using old source values)
+                        let old_values: Vec<u32> = dep.source_fields.iter()
+                            .map(|sf| old_sort_values.get(sf.as_str())
+                                .or_else(|| sort_values.get(sf.as_str()))
+                                .copied()
+                                .unwrap_or(0))
                             .collect();
 
-                        let computed_val = match dep.op {
-                            crate::config::ComputedOp::Greatest => *values.iter().max().unwrap_or(&0),
-                            crate::config::ComputedOp::Least => *values.iter().min().unwrap_or(&0),
+                        let old_computed = match dep.op {
+                            crate::config::ComputedOp::Greatest => *old_values.iter().max().unwrap_or(&0),
+                            crate::config::ComputedOp::Least => *old_values.iter().min().unwrap_or(&0),
                         };
 
-                        // Set sort layers for the computed field
                         for bit in 0..dep.target_bits {
-                            if (computed_val >> bit) & 1 == 1 {
+                            if (old_computed >> bit) & 1 == 1 {
+                                sink.sort_clear(dep.target_arc.clone(), bit, slot);
+                            }
+                        }
+
+                        // Set new computed value (using new source values)
+                        let new_values: Vec<u32> = dep.source_fields.iter()
+                            .map(|sf| sort_values.get(sf.as_str())
+                                .or_else(|| old_sort_values.get(sf.as_str()))
+                                .copied()
+                                .unwrap_or(0))
+                            .collect();
+
+                        let new_computed = match dep.op {
+                            crate::config::ComputedOp::Greatest => *new_values.iter().max().unwrap_or(&0),
+                            crate::config::ComputedOp::Least => *new_values.iter().min().unwrap_or(&0),
+                        };
+
+                        for bit in 0..dep.target_bits {
+                            if (new_computed >> bit) & 1 == 1 {
                                 sink.sort_set(dep.target_arc.clone(), bit, slot);
                             }
-                            // Note: we don't clear old bits here because during dump,
-                            // the computed field starts at 0 (all bits clear).
-                            // For steady-state, the remove op on the source field
-                            // should be paired with clearing the old computed value.
                         }
                     }
                 }

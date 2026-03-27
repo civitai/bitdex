@@ -1063,6 +1063,8 @@ impl BitdexServer {
                                 };
 
                                 if let Some(engine) = engine {
+                                    let cycle_start = std::time::Instant::now();
+
                                     // Build FieldMeta, CoalescerSink, and DocWriter for the ops processor
                                     let meta = crate::ops_processor::FieldMeta::from_config(engine.config());
                                     let sender = engine.mutation_sender();
@@ -1090,11 +1092,18 @@ impl BitdexServer {
                                         eprintln!("WAL reader: failed to save cursor: {e}");
                                     }
 
-                                    // Update WAL bytes metric
+                                    // Update metrics
                                     let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-                                    wal_state.metrics.sync_wal_bytes
+                                    let m = &wal_state.metrics;
+                                    m.sync_wal_bytes
                                         .with_label_values(&["wal-reader"])
                                         .set(wal_size as i64);
+                                    m.sync_cycle_duration_seconds
+                                        .with_label_values(&["wal-reader"])
+                                        .observe(cycle_start.elapsed().as_secs_f64());
+                                    m.sync_wal_pending_bytes
+                                        .with_label_values(&["wal-reader"])
+                                        .set((wal_size as i64) - (reader.cursor() as i64));
                                 } else {
                                     // No index loaded yet — sleep and retry
                                     std::thread::sleep(std::time::Duration::from_secs(1));
