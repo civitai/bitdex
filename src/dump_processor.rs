@@ -35,6 +35,17 @@ use crate::pg_sync::single_pass::{save_filter_field_to_disk};
 
 const LOG_INTERVAL: u64 = 1_000_000;
 
+/// Emit a structured JSON stage marker to stderr for phase monitoring.
+/// Zero overhead — only called at stage transitions, not per row.
+fn emit_stage(dump_name: &str, stage: &str, detail: &str, t0: &Instant, rows: u64) {
+    let rss = crate::concurrent_engine::get_rss_bytes();
+    let elapsed_ms = t0.elapsed().as_millis();
+    eprintln!(
+        r#"{{"dump":"{}","stage":"{}","detail":"{}","elapsed_ms":{},"rss_bytes":{},"rss_gb":{:.3},"rows":{}}}"#,
+        dump_name, stage, detail, elapsed_ms, rss, rss as f64 / 1e9, rows
+    );
+}
+
 // ---------------------------------------------------------------------------
 // D3 Request Body Schema
 // ---------------------------------------------------------------------------
@@ -1062,10 +1073,11 @@ pub fn process_dump_with_progress(
     stage_dir: &Path,
     progress_counter: Option<Arc<AtomicU64>>,
 ) -> Result<PhaseResult, String> {
+    let t = Instant::now();
+
     // Validate before processing
     validate_dump_request(request, engine)?;
-
-    let t = Instant::now();
+    emit_stage(&request.name, "validated", "ok", &t, 0);
     let bitmap_fs = engine
         .bitmap_store()
         .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?
@@ -1118,6 +1130,7 @@ pub fn process_dump_with_progress(
         .collect::<Result<Vec<_>, String>>()?;
 
     // Load enrichment tables (Nate's API)
+    emit_stage(&request.name, "enrichment", "start", &t, 0);
     let mut enrichment_mgr = dump_enrichment::EnrichmentManager::new();
     for ec in &request.enrichment {
         let nate_config = to_nate_enrichment_config(ec, stage_dir);
@@ -1125,6 +1138,7 @@ pub fn process_dump_with_progress(
             .load(nate_config)
             .map_err(|e| format!("load enrichment: {e}"))?;
     }
+    emit_stage(&request.name, "enrichment", "done", &t, 0);
 
     // Get LCS dictionaries from engine (thread-safe DashMap-based)
     let dictionaries: Arc<HashMap<String, FieldDictionary>> = engine.dictionaries_arc();
@@ -1220,6 +1234,7 @@ pub fn process_dump_with_progress(
         );
     }
 
+    emit_stage(&request.name, "parallel_parse", "start", &t, 0);
     // General phase processing with rayon parallelism
     let ranges = split_mmap_ranges(body, rayon::current_num_threads());
     let total = AtomicU64::new(0);
@@ -1530,6 +1545,9 @@ pub fn process_dump_with_progress(
         })
         .collect();
 
+    emit_stage(&request.name, "parallel_parse", "done", &t, total.load(Ordering::Relaxed));
+
+    emit_stage(&request.name, "merge", "start", &t, total.load(Ordering::Relaxed));
     // Merge all thread results — parallel tree reduction
     type MergeAccum = (
         HashMap<String, HashMap<u64, RoaringBitmap>>,
@@ -1608,6 +1626,9 @@ pub fn process_dump_with_progress(
                 },
             );
 
+    emit_stage(&request.name, "merge", "done", &t, total_count);
+
+    emit_stage(&request.name, "bitmap_save", "start", &t, total_count);
     // Save to BitmapFs — parallel across fields for throughput
     {
         let save_start = Instant::now();
@@ -1656,6 +1677,7 @@ pub fn process_dump_with_progress(
         }
 
         eprintln!("  Bitmap save complete in {:.1}s", save_start.elapsed().as_secs_f64());
+        emit_stage(&request.name, "bitmap_save", "done", &t, total_count);
     }
 
     if sets_alive {
