@@ -1061,7 +1061,14 @@ pub fn process_dump(
     engine: &ConcurrentEngine,
     stage_dir: &Path,
 ) -> Result<PhaseResult, String> {
-    process_dump_with_progress(request, engine, stage_dir, None)
+    let mut result = process_dump_with_progress(request, engine, stage_dir, None)?;
+    let bitmap_fs = engine
+        .bitmap_store()
+        .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?
+        .clone();
+    let dictionaries = engine.dictionaries_arc();
+    save_phase_to_disk(&mut result, &bitmap_fs, &dictionaries, &request.name, request.sets_alive)?;
+    Ok(result)
 }
 
 /// Process a dump phase with optional external progress counter.
@@ -1628,82 +1635,116 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
-    emit_stage(&request.name, "bitmap_save", "start", &t, total_count);
-    // Save to BitmapFs — parallel across fields for throughput
-    {
-        let save_start = Instant::now();
+    let elapsed = t.elapsed();
+    eprintln!(
+        "  Dump {} parse+merge complete: {} rows in {:.1}s ({:.0}/s)",
+        request.name,
+        total_count,
+        elapsed.as_secs_f64(),
+        total_count as f64 / elapsed.as_secs_f64().max(0.001)
+    );
 
-        // Pre-create all filter field directories (avoid redundant create_dir_all per bucket)
-        for field_name in merged_filters.keys() {
-            let dir = bitmap_fs.root().join("filter").join(field_name);
-            std::fs::create_dir_all(&dir).ok();
-        }
+    Ok(PhaseResult {
+        row_count: total_count,
+        filter_maps: merged_filters,
+        sort_maps: merged_sorts,
+        alive: merged_alive,
+        deferred_slots: merged_deferred,
+        max_slot,
+    })
+}
 
-        // Parallel filter field saves — drain ownership for incremental memory release
-        let filter_items: Vec<_> = merged_filters.into_iter()
-            .filter(|(_, values)| !values.is_empty())
-            .collect();
-        let filter_results: Vec<Result<(String, u64, usize), String>> = filter_items
-            .into_par_iter()
-            .map(|(field_name, values)| {
-                let count = values.len();
-                let saved = save_filter_field_to_disk(&bitmap_fs, &field_name, values)?;
-                Ok((field_name, saved, count))
-            })
-            .collect();
-        for result in filter_results {
-            let (field_name, saved, count) = result?;
-            eprintln!(
-                "  Saved filter {}: {} values ({:.1} MB)",
-                field_name, count, saved as f64 / (1024.0 * 1024.0)
-            );
-        }
+// ---------------------------------------------------------------------------
+// save_phase_to_disk — extracted save logic for pipeline save
+// ---------------------------------------------------------------------------
 
-        // Parallel sort field saves
-        let sort_items: Vec<_> = merged_sorts.iter()
-            .filter(|(_, layers)| !layers.is_empty() && layers.iter().any(|bm| !bm.is_empty()))
-            .collect();
-        let sort_results: Vec<Result<(String, usize), String>> = sort_items
-            .par_iter()
-            .map(|(field_name, layers)| {
-                let layer_refs: Vec<&RoaringBitmap> = layers.iter().collect();
-                bitmap_fs.write_sort_layers(field_name, &layer_refs)
-                    .map_err(|e| format!("write_sort_layers({field_name}): {e}"))?;
-                Ok((field_name.to_string(), layers.len()))
-            })
-            .collect();
-        for result in sort_results {
-            let (field_name, num_layers) = result?;
-            eprintln!("  Saved sort {}: {} layers", field_name, num_layers);
-        }
+/// Save a PhaseResult's bitmaps to BitmapFs. Drains filter/sort HashMaps
+/// incrementally as each field is written to free memory while saving.
+///
+/// Call this after `process_dump_with_progress` to persist bitmaps.
+/// Can be run on a background thread via `SaveHandle::spawn`.
+pub fn save_phase_to_disk(
+    result: &mut PhaseResult,
+    bitmap_fs: &BitmapFs,
+    dictionaries: &HashMap<String, FieldDictionary>,
+    dump_name: &str,
+    sets_alive: bool,
+) -> Result<(), String> {
+    let t = Instant::now();
+    emit_stage(dump_name, "bitmap_save", "start", &t, result.row_count);
 
-        eprintln!("  Bitmap save complete in {:.1}s", save_start.elapsed().as_secs_f64());
-        emit_stage(&request.name, "bitmap_save", "done", &t, total_count);
+    let save_start = Instant::now();
+
+    // Pre-create all filter field directories
+    for field_name in result.filter_maps.keys() {
+        let dir = bitmap_fs.root().join("filter").join(field_name);
+        std::fs::create_dir_all(&dir).ok();
     }
+
+    // Parallel filter field saves — drain ownership for incremental memory release
+    let filter_items: Vec<_> = result.filter_maps.drain()
+        .filter(|(_, values)| !values.is_empty())
+        .collect();
+    let filter_results: Vec<Result<(String, u64, usize), String>> = filter_items
+        .into_par_iter()
+        .map(|(field_name, values)| {
+            let count = values.len();
+            let saved = save_filter_field_to_disk(bitmap_fs, &field_name, values)?;
+            Ok((field_name, saved, count))
+        })
+        .collect();
+    for r in filter_results {
+        let (field_name, saved, count) = r?;
+        eprintln!(
+            "  Saved filter {}: {} values ({:.1} MB)",
+            field_name, count, saved as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    // Parallel sort field saves — drain for memory release
+    let sort_items: Vec<_> = result.sort_maps.drain()
+        .filter(|(_, layers)| !layers.is_empty() && layers.iter().any(|bm| !bm.is_empty()))
+        .collect();
+    let sort_results: Vec<Result<(String, usize), String>> = sort_items
+        .par_iter()
+        .map(|(field_name, layers)| {
+            let layer_refs: Vec<&RoaringBitmap> = layers.iter().collect();
+            bitmap_fs.write_sort_layers(field_name, &layer_refs)
+                .map_err(|e| format!("write_sort_layers({field_name}): {e}"))?;
+            Ok((field_name.to_string(), layers.len()))
+        })
+        .collect();
+    for r in sort_results {
+        let (field_name, num_layers) = r?;
+        eprintln!("  Saved sort {}: {} layers", field_name, num_layers);
+    }
+
+    eprintln!("  Bitmap save complete in {:.1}s", save_start.elapsed().as_secs_f64());
+    emit_stage(dump_name, "bitmap_save", "done", &t, result.row_count);
 
     if sets_alive {
         bitmap_fs
-            .write_alive(&merged_alive)
+            .write_alive(&result.alive)
             .map_err(|e| format!("write_alive: {e}"))?;
-        eprintln!("  Saved alive bitmap: {} bits", merged_alive.len());
+        eprintln!("  Saved alive bitmap: {} bits", result.alive.len());
 
         // Slot counter: max of alive + deferred slots
-        let max_deferred = merged_deferred
+        let max_deferred = result.deferred_slots
             .values()
             .flat_map(|v| v.iter())
             .copied()
             .max()
             .unwrap_or(0);
-        let slot_counter = max_slot.max(max_deferred).saturating_add(1);
+        let slot_counter = result.max_slot.max(max_deferred).saturating_add(1);
         bitmap_fs
             .write_slot_counter(slot_counter)
             .map_err(|e| format!("write_slot_counter: {e}"))?;
 
-        if !merged_deferred.is_empty() {
+        if !result.deferred_slots.is_empty() {
             bitmap_fs
-                .write_deferred_alive(&merged_deferred)
+                .write_deferred_alive(&result.deferred_slots)
                 .map_err(|e| format!("write_deferred_alive: {e}"))?;
-            let deferred_total: usize = merged_deferred.values().map(|v| v.len()).sum();
+            let deferred_total: usize = result.deferred_slots.values().map(|v| v.len()).sum();
             eprintln!("  Saved deferred alive: {} slots", deferred_total);
         }
     }
@@ -1711,7 +1752,7 @@ pub fn process_dump_with_progress(
     // Persist LCS dictionaries
     let dict_dir = bitmap_fs.root().join("dictionaries");
     std::fs::create_dir_all(&dict_dir).ok();
-    for (name, dict) in dictionaries.as_ref() {
+    for (name, dict) in dictionaries {
         let snap = dict.snapshot();
         if snap.forward.is_empty() {
             continue;
@@ -1724,23 +1765,73 @@ pub fn process_dump_with_progress(
         }
     }
 
-    let elapsed = t.elapsed();
-    eprintln!(
-        "  Dump {} complete: {} rows in {:.1}s ({:.0}/s)",
-        request.name,
-        total_count,
-        elapsed.as_secs_f64(),
-        total_count as f64 / elapsed.as_secs_f64().max(0.001)
-    );
+    Ok(())
+}
 
-    Ok(PhaseResult {
-        row_count: total_count,
-        filter_maps: HashMap::new(), // drained during save
-        sort_maps: merged_sorts,
-        alive: merged_alive,
-        deferred_slots: merged_deferred,
-        max_slot,
-    })
+// ---------------------------------------------------------------------------
+// SaveHandle — background thread for bitmap persistence
+// ---------------------------------------------------------------------------
+
+/// Handle to a background save thread. The caller should `join()` this
+/// before any operation that depends on the save being complete (e.g.,
+/// `mark_fields_pending_reload`, `reload_alive_from_disk`).
+pub struct SaveHandle {
+    handle: Option<std::thread::JoinHandle<Result<(), String>>>,
+    unit_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SaveHandle {
+    /// Spawn a background thread that saves a PhaseResult to BitmapFs.
+    /// Takes ownership of the PhaseResult so bitmaps can be dropped
+    /// incrementally as each field is written.
+    pub fn spawn(
+        mut result: PhaseResult,
+        bitmap_fs: Arc<BitmapFs>,
+        dictionaries: Arc<HashMap<String, FieldDictionary>>,
+        dump_name: String,
+        sets_alive: bool,
+    ) -> Self {
+        let handle = std::thread::Builder::new()
+            .name(format!("save-{}", dump_name))
+            .spawn(move || {
+                save_phase_to_disk(
+                    &mut result,
+                    &bitmap_fs,
+                    &dictionaries,
+                    &dump_name,
+                    sets_alive,
+                )
+            })
+            .expect("failed to spawn save thread");
+        SaveHandle {
+            handle: Some(handle),
+            unit_handle: None,
+        }
+    }
+
+    /// Block until the save completes. Returns the save result.
+    pub fn join(mut self) -> Result<(), String> {
+        if let Some(h) = self.handle.take() {
+            h.join().map_err(|e| format!("save thread panicked: {:?}", e))?
+        } else if let Some(h) = self.unit_handle.take() {
+            h.join().map_err(|e| format!("save thread panicked: {:?}", e))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Create a no-op handle (for phases that have no save work).
+    pub fn noop() -> Self {
+        SaveHandle { handle: None, unit_handle: None }
+    }
+
+    /// Wrap an existing JoinHandle (e.g., a monitor thread that does save + reload).
+    pub fn from_join_handle(handle: std::thread::JoinHandle<()>) -> Self {
+        SaveHandle {
+            handle: None,
+            unit_handle: Some(handle),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1755,7 +1846,7 @@ fn process_multi_value_phase(
     delimiter: u8,
     col_index: &Arc<HashMap<String, usize>>,
     filter_expr: &Option<FilterExpression>,
-    bitmap_fs: &BitmapFs,
+    _bitmap_fs: &BitmapFs,
     bulk_writer: &Arc<BulkWriter>,
     progress_counter: &Option<Arc<AtomicU64>>,
 ) -> Result<PhaseResult, String> {
@@ -1870,27 +1961,27 @@ fn process_multi_value_phase(
             );
 
         // Convert to HashMap (non-empty only)
-        let mut result: HashMap<u64, RoaringBitmap> = HashMap::new();
+        let mut filter_map: HashMap<u64, RoaringBitmap> = HashMap::new();
         for (i, bm) in merged_vec.drain(..).enumerate() {
             if !bm.is_empty() {
-                result.insert(i as u64, bm);
+                filter_map.insert(i as u64, bm);
             }
         }
 
-        let result_count = result.len();
-        let saved = save_filter_field_to_disk(bitmap_fs, &target, result)?;
         let total_rows = total.load(Ordering::Relaxed);
         eprintln!(
-            "  Dump {} ({target}): {} rows, {} distinct values ({:.1} MB)",
+            "  Dump {} ({target}): {} rows, {} distinct values",
             request.name,
             total_rows,
-            result_count,
-            saved as f64 / (1024.0 * 1024.0)
+            filter_map.len(),
         );
+
+        let mut filter_maps = HashMap::new();
+        filter_maps.insert(target, filter_map);
 
         Ok(PhaseResult {
             row_count: total_rows,
-            filter_maps: HashMap::new(), // drained during save
+            filter_maps,
             sort_maps: HashMap::new(),
             alive: RoaringBitmap::new(),
             deferred_slots: BTreeMap::new(),
@@ -1984,20 +2075,20 @@ fn process_multi_value_phase(
             }
         }
 
-        let merged_count = merged.len();
-        let saved = save_filter_field_to_disk(bitmap_fs, &target, merged)?;
         let total_rows = total.load(Ordering::Relaxed);
         eprintln!(
-            "  Dump {} ({target}): {} rows, {} distinct values ({:.1} MB)",
+            "  Dump {} ({target}): {} rows, {} distinct values",
             request.name,
             total_rows,
-            merged_count,
-            saved as f64 / (1024.0 * 1024.0)
+            merged.len(),
         );
+
+        let mut filter_maps = HashMap::new();
+        filter_maps.insert(target, merged);
 
         Ok(PhaseResult {
             row_count: total_rows,
-            filter_maps: HashMap::new(), // drained during save
+            filter_maps,
             sort_maps: HashMap::new(),
             alive: RoaringBitmap::new(),
             deferred_slots: BTreeMap::new(),
