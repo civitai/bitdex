@@ -3358,7 +3358,7 @@ async fn handle_add_fields(
 // Handlers: Remove Fields
 // ---------------------------------------------------------------------------
 
-/// Reload a field's existence set from BitmapFs after external bulk writes.
+/// Reload a field's existence set after external bulk writes.
 async fn handle_reload_field(
     State(state): State<SharedState>,
     AxumPath((name, field)): AxumPath<(String, String)>,

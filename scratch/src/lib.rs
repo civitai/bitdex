@@ -14,7 +14,7 @@ mod bench_filter_pipeline {
     use std::sync::Arc;
     use std::time::Instant;
 
-    // ---- File format parsers (mirrors bitmap_fs.rs) ----
+    // ---- File format parsers (fpack/sort file format) ----
 
     const BITMAP_ROOT: &str = "C:/Dev/Repos/open-source/bitdex-v2/data/indexes/civitai/bitmaps";
 
@@ -604,7 +604,7 @@ mod bench_sort_opt {
     use std::path::Path;
     use std::time::Instant;
 
-    // ---- File format parsers (mirrors bitmap_fs.rs without the dependency) ----
+    // ---- File format parsers (fpack/sort file format, standalone) ----
 
     /// Load sort layers from a .sort file.
     /// Format: [u8 num_layers][N x (u8 bit_pos, u32 offset, u32 len)][packed roaring data]
@@ -1209,7 +1209,7 @@ mod bench_lazy_load {
         files
     }
 
-    // ---------- Baseline: sequential load (mirrors current bitmap_fs.rs) ----------
+    // ---------- Baseline: sequential load (fpack parsing) ----------
 
     fn parse_fpack(data: &[u8]) -> Vec<(u64, RoaringBitmap)> {
         let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
