@@ -1090,10 +1090,12 @@ pub fn validate_dump_request(
     Ok(())
 }
 
-/// Process a dump phase end-to-end: parse CSV → build bitmaps → save to disk → reload fields.
+/// Process a dump phase: parse CSV → build bitmaps → save to disk.
 ///
-/// This is the single entry point for dump processing. No background threads,
-/// no SaveHandle — everything runs inline on the calling thread.
+/// Does NOT reload fields into memory — call `reload_after_dumps()` once
+/// after all dump phases are complete to make data visible to queries.
+/// Reloading between phases is expensive (triggers lazy load of all fields
+/// including tagIds with 31K values).
 pub fn process_dump(
     request: &DumpRequest,
     engine: &ConcurrentEngine,
@@ -1112,20 +1114,24 @@ pub fn process_dump(
     let dictionaries = engine.dictionaries_arc();
     save_phase_to_disk(&mut result, &alive_s, &filter_s, &sort_s, &meta_s, &bitmap_path, &dictionaries, &request.name, request.sets_alive)?;
 
-    // Mark fields for lazy reload so queries pick up new data
+    eprintln!("  Dump {} save complete", request.name);
+    Ok(result)
+}
+
+/// Reload fields after all dump phases are complete.
+/// Call this ONCE after the last dump, not between phases.
+pub fn reload_after_dumps(engine: &ConcurrentEngine, had_alive_phase: bool) {
+    let t = Instant::now();
     let filter_names: Vec<String> = engine.config()
         .filter_fields.iter().map(|f| f.name.clone()).collect();
     let sort_names: Vec<String> = engine.config()
         .sort_fields.iter().map(|f| f.name.clone()).collect();
     engine.mark_fields_pending_reload(&filter_names, &sort_names);
 
-    // Reload alive bitmap from disk if this phase set it
-    if request.sets_alive {
+    if had_alive_phase {
         engine.reload_alive_from_disk();
     }
-
-    eprintln!("  Dump {} save+reload complete", request.name);
-    Ok(result)
+    eprintln!("  Dump reload complete in {:.2}s", t.elapsed().as_secs_f64());
 }
 
 /// Process a dump phase with optional external progress counter.

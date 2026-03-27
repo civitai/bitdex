@@ -4554,6 +4554,14 @@ async fn handle_register_dump(
                 Ok(Ok(phase_result)) => {
                     let row_count = phase_result.row_count;
 
+                    // Reload fields only for the alive phase (images).
+                    // Other phases just save to disk — fields get loaded lazily on first query.
+                    // Reloading between every phase would trigger expensive lazy load of all
+                    // filter fields (tagIds: 31K values, ~7s per reload).
+                    if sets_alive {
+                        crate::dump_processor::reload_after_dumps(&engine_for_save, true);
+                    }
+
                     tasks.set_complete(
                         task_id,
                         Some(serde_json::json!({
