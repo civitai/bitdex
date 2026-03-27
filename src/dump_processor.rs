@@ -10,7 +10,7 @@
 //!   4. Evaluate filter expressions (skip rows that don't pass)
 //!   5. Evaluate computed field expressions
 //!   6. Build filter/sort bitmaps + append docstore tuples
-//!   7. Save bitmaps to BitmapFs, drop from memory
+//!   7. Save bitmaps to ShardStore, drop from memory
 //!
 //! Processing is sequential per phase (no cross-phase parallelism in V2).
 
@@ -24,7 +24,6 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
-use crate::bitmap_fs::BitmapFs;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
 use crate::docstore::{BulkWriter, PackedValue};
@@ -1091,10 +1090,6 @@ pub fn process_dump_with_progress(
     // Validate before processing
     validate_dump_request(request, engine)?;
     emit_stage(&request.name, "validated", "ok", &t, 0);
-    let bitmap_fs = engine
-        .bitmap_store()
-        .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?
-        .clone();
 
     let config = engine.config();
     let filter_field_names: HashSet<String> =
@@ -1107,24 +1102,6 @@ pub fn process_dump_with_progress(
 
     // Determine target fields and their types
     let target_fields = collect_target_fields(request);
-
-    // Check crash recovery: skip phase only if ALL target fields already loaded.
-    // Previously skipped if ANY field existed, which caused resources to be skipped
-    // when poi was already written by the images phase.
-    let all_loaded = !target_fields.is_empty() && target_fields.iter().all(|target| {
-        crate::pg_sync::single_pass::field_already_loaded(&bitmap_fs, target)
-    });
-    if all_loaded {
-        eprintln!("  Dump {}: all {} fields already loaded, skipping phase", request.name, target_fields.len());
-        return Ok(PhaseResult {
-            row_count: 0,
-            filter_maps: HashMap::new(),
-            sort_maps: HashMap::new(),
-            alive: RoaringBitmap::new(),
-            deferred_slots: BTreeMap::new(),
-            max_slot: 0,
-        });
-    }
 
     // Parse filter expression (Nate's API)
     let filter_expr: Option<FilterExpression> = request
@@ -1258,7 +1235,6 @@ pub fn process_dump_with_progress(
             delimiter,
             &col_index,
             &filter_expr,
-            &bitmap_fs,
             &bulk_writer,
             &progress_counter,
         );
@@ -1681,7 +1657,7 @@ pub fn process_dump_with_progress(
 // save_phase_to_disk — extracted save logic for pipeline save
 // ---------------------------------------------------------------------------
 
-/// Save a PhaseResult's bitmaps to BitmapFs. Drains filter/sort HashMaps
+/// Save a PhaseResult's bitmaps to ShardStore. Drains filter/sort HashMaps
 /// incrementally as each field is written to free memory while saving.
 ///
 /// Call this after `process_dump_with_progress` to persist bitmaps.
@@ -1879,7 +1855,6 @@ fn process_multi_value_phase(
     delimiter: u8,
     col_index: &Arc<HashMap<String, usize>>,
     filter_expr: &Option<FilterExpression>,
-    _bitmap_fs: &BitmapFs,
     bulk_writer: &Arc<BulkWriter>,
     progress_counter: &Option<Arc<AtomicU64>>,
 ) -> Result<PhaseResult, String> {
