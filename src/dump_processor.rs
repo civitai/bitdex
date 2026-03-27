@@ -1527,42 +1527,83 @@ pub fn process_dump_with_progress(
         })
         .collect();
 
-    // Merge all thread results
-    let mut merged_filters: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
-    let mut merged_sorts: HashMap<String, Vec<RoaringBitmap>> = HashMap::new();
-    let mut merged_alive = RoaringBitmap::new();
-    let mut merged_deferred: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-    let mut total_count = 0u64;
-    let mut max_slot: u32 = 0;
+    // Merge all thread results — parallel tree reduction
+    type MergeAccum = (
+        HashMap<String, HashMap<u64, RoaringBitmap>>,
+        HashMap<String, Vec<RoaringBitmap>>,
+        RoaringBitmap,
+        BTreeMap<u64, Vec<u32>>,
+        u64,
+        u32,
+    );
 
-    for (filter_maps, sort_maps, alive, deferred, count, thread_max) in thread_results {
-        merged_alive |= alive;
-        total_count += count;
-        if thread_max > max_slot {
-            max_slot = thread_max;
-        }
+    let (merged_filters, merged_sorts, merged_alive, merged_deferred, total_count, max_slot) =
+        thread_results
+            .into_par_iter()
+            .fold(
+                || -> MergeAccum {
+                    (HashMap::new(), HashMap::new(), RoaringBitmap::new(), BTreeMap::new(), 0u64, 0u32)
+                },
+                |mut acc, (filter_maps, sort_maps, alive, deferred, count, thread_max)| {
+                    acc.2 |= alive;
+                    acc.4 += count;
+                    if thread_max > acc.5 { acc.5 = thread_max; }
 
-        for (slot, activate_at) in deferred {
-            merged_deferred.entry(activate_at).or_default().push(slot);
-        }
+                    for (slot, activate_at) in deferred {
+                        acc.3.entry(activate_at).or_default().push(slot);
+                    }
 
-        for (field, values) in filter_maps {
-            let dest = merged_filters.entry(field).or_default();
-            for (val, bm) in values {
-                dest.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
-            }
-        }
-        for (field, layers) in sort_maps {
-            let dest = merged_sorts.entry(field).or_insert_with(|| {
-                (0..layers.len()).map(|_| RoaringBitmap::new()).collect()
-            });
-            for (bit, bm) in layers.into_iter().enumerate() {
-                if bit < dest.len() {
-                    dest[bit] |= bm;
-                }
-            }
-        }
-    }
+                    for (field, values) in filter_maps {
+                        let dest = acc.0.entry(field).or_default();
+                        for (val, bm) in values {
+                            dest.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
+                        }
+                    }
+                    for (field, layers) in sort_maps {
+                        let dest = acc.1.entry(field).or_insert_with(|| {
+                            (0..layers.len()).map(|_| RoaringBitmap::new()).collect()
+                        });
+                        for (bit, bm) in layers.into_iter().enumerate() {
+                            if bit < dest.len() {
+                                dest[bit] |= bm;
+                            }
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || -> MergeAccum {
+                    (HashMap::new(), HashMap::new(), RoaringBitmap::new(), BTreeMap::new(), 0u64, 0u32)
+                },
+                |mut a, b| {
+                    a.2 |= b.2;
+                    a.4 += b.4;
+                    if b.5 > a.5 { a.5 = b.5; }
+
+                    for (activate_at, slots) in b.3 {
+                        a.3.entry(activate_at).or_default().extend(slots);
+                    }
+
+                    for (field, values) in b.0 {
+                        let dest = a.0.entry(field).or_default();
+                        for (val, bm) in values {
+                            dest.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
+                        }
+                    }
+                    for (field, layers) in b.1 {
+                        let dest = a.1.entry(field).or_insert_with(|| {
+                            (0..layers.len()).map(|_| RoaringBitmap::new()).collect()
+                        });
+                        for (bit, bm) in layers.into_iter().enumerate() {
+                            if bit < dest.len() {
+                                dest[bit] |= bm;
+                            }
+                        }
+                    }
+                    a
+                },
+            );
 
     // Save to BitmapFs — parallel across fields for throughput
     {
