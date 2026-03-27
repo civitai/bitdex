@@ -1886,6 +1886,9 @@ fn process_multi_value_phase(
         })
     });
 
+    let t_mv = Instant::now();
+    emit_stage(&request.name, "parallel_parse", "start", &t_mv, 0);
+
     if use_vec {
         let thread_results: Vec<Vec<RoaringBitmap>> = ranges
             .par_iter()
@@ -1990,6 +1993,8 @@ fn process_multi_value_phase(
         if let Some(handle) = doc_writer_handle {
             handle.join().ok();
         }
+
+        emit_stage(&request.name, "parallel_parse", "done", &t_mv, total_rows);
 
         Ok(PhaseResult {
             row_count: total_rows,
