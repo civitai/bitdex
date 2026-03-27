@@ -1062,12 +1062,13 @@ pub fn process_dump(
     stage_dir: &Path,
 ) -> Result<PhaseResult, String> {
     let mut result = process_dump_with_progress(request, engine, stage_dir, None, None)?;
-    let bitmap_fs = engine
-        .bitmap_store()
-        .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?
-        .clone();
+    let (alive_s, filter_s, sort_s, meta_s) = engine
+        .shard_stores()
+        .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?;
+    let bitmap_path = engine.config().storage.bitmap_path.as_ref()
+        .ok_or_else(|| "no bitmap_path configured".to_string())?.clone();
     let dictionaries = engine.dictionaries_arc();
-    save_phase_to_disk(&mut result, &bitmap_fs, &dictionaries, &request.name, request.sets_alive)?;
+    save_phase_to_disk(&mut result, &alive_s, &filter_s, &sort_s, &meta_s, &bitmap_path, &dictionaries, &request.name, request.sets_alive)?;
     Ok(result)
 }
 
@@ -1687,7 +1688,11 @@ pub fn process_dump_with_progress(
 /// Can be run on a background thread via `SaveHandle::spawn`.
 pub fn save_phase_to_disk(
     result: &mut PhaseResult,
-    bitmap_fs: &BitmapFs,
+    alive_store: &crate::shard_store_bitmap::AliveBitmapStore,
+    filter_store: &crate::shard_store_bitmap::FilterBitmapStore,
+    sort_store: &crate::shard_store_bitmap::SortBitmapStore,
+    meta_store: &crate::shard_store_meta::MetaStore,
+    bitmap_path: &Path,
     dictionaries: &HashMap<String, FieldDictionary>,
     dump_name: &str,
     sets_alive: bool,
@@ -1697,33 +1702,31 @@ pub fn save_phase_to_disk(
 
     let save_start = Instant::now();
 
-    // Pre-create all filter field directories
-    for field_name in result.filter_maps.keys() {
-        let dir = bitmap_fs.root().join("filter").join(field_name);
-        std::fs::create_dir_all(&dir).ok();
-    }
-
-    // Parallel filter field saves — drain ownership for incremental memory release
+    // Parallel filter field saves via ShardStore — drain ownership for incremental memory release
     let filter_items: Vec<_> = result.filter_maps.drain()
         .filter(|(_, values)| !values.is_empty())
         .collect();
-    let filter_results: Vec<Result<(String, u64, usize), String>> = filter_items
+    let filter_results: Vec<Result<(String, usize), String>> = filter_items
         .into_par_iter()
         .map(|(field_name, values)| {
             let count = values.len();
-            let saved = save_filter_field_to_disk(bitmap_fs, &field_name, values)?;
-            Ok((field_name, saved, count))
+            // Build entries for write_full_filter: (field, value, bitmap)
+            let entries: Vec<(&str, u64, &RoaringBitmap)> = values.iter()
+                .map(|(v, bm)| (field_name.as_str(), *v, bm))
+                .collect();
+            filter_store.write_full_filter(&entries)
+                .map_err(|e| format!("write_full_filter({field_name}): {e}"))?;
+            // values dropped here — this field's bitmaps freed
+            drop(values);
+            Ok((field_name, count))
         })
         .collect();
     for r in filter_results {
-        let (field_name, saved, count) = r?;
-        eprintln!(
-            "  Saved filter {}: {} values ({:.1} MB)",
-            field_name, count, saved as f64 / (1024.0 * 1024.0)
-        );
+        let (field_name, count) = r?;
+        eprintln!("  Saved filter {}: {} values", field_name, count);
     }
 
-    // Parallel sort field saves — drain for memory release
+    // Parallel sort field saves via ShardStore — drain for memory release
     let sort_items: Vec<_> = result.sort_maps.drain()
         .filter(|(_, layers)| !layers.is_empty() && layers.iter().any(|bm| !bm.is_empty()))
         .collect();
@@ -1731,7 +1734,7 @@ pub fn save_phase_to_disk(
         .par_iter()
         .map(|(field_name, layers)| {
             let layer_refs: Vec<&RoaringBitmap> = layers.iter().collect();
-            bitmap_fs.write_sort_layers(field_name, &layer_refs)
+            sort_store.write_sort_layers(field_name, &layer_refs)
                 .map_err(|e| format!("write_sort_layers({field_name}): {e}"))?;
             Ok((field_name.to_string(), layers.len()))
         })
@@ -1745,7 +1748,7 @@ pub fn save_phase_to_disk(
     emit_stage(dump_name, "bitmap_save", "done", &t, result.row_count);
 
     if sets_alive {
-        bitmap_fs
+        alive_store
             .write_alive(&result.alive)
             .map_err(|e| format!("write_alive: {e}"))?;
         eprintln!("  Saved alive bitmap: {} bits", result.alive.len());
@@ -1758,12 +1761,12 @@ pub fn save_phase_to_disk(
             .max()
             .unwrap_or(0);
         let slot_counter = result.max_slot.max(max_deferred).saturating_add(1);
-        bitmap_fs
+        meta_store
             .write_slot_counter(slot_counter)
             .map_err(|e| format!("write_slot_counter: {e}"))?;
 
         if !result.deferred_slots.is_empty() {
-            bitmap_fs
+            meta_store
                 .write_deferred_alive(&result.deferred_slots)
                 .map_err(|e| format!("write_deferred_alive: {e}"))?;
             let deferred_total: usize = result.deferred_slots.values().map(|v| v.len()).sum();
@@ -1772,7 +1775,7 @@ pub fn save_phase_to_disk(
     }
 
     // Persist LCS dictionaries
-    let dict_dir = bitmap_fs.root().join("dictionaries");
+    let dict_dir = bitmap_path.join("dictionaries");
     std::fs::create_dir_all(&dict_dir).ok();
     for (name, dict) in dictionaries {
         let snap = dict.snapshot();
@@ -1803,12 +1806,16 @@ pub struct SaveHandle {
 }
 
 impl SaveHandle {
-    /// Spawn a background thread that saves a PhaseResult to BitmapFs.
+    /// Spawn a background thread that saves a PhaseResult to ShardStore.
     /// Takes ownership of the PhaseResult so bitmaps can be dropped
     /// incrementally as each field is written.
     pub fn spawn(
         mut result: PhaseResult,
-        bitmap_fs: Arc<BitmapFs>,
+        alive_store: Arc<crate::shard_store_bitmap::AliveBitmapStore>,
+        filter_store: Arc<crate::shard_store_bitmap::FilterBitmapStore>,
+        sort_store: Arc<crate::shard_store_bitmap::SortBitmapStore>,
+        meta_store: Arc<crate::shard_store_meta::MetaStore>,
+        bitmap_path: std::path::PathBuf,
         dictionaries: Arc<HashMap<String, FieldDictionary>>,
         dump_name: String,
         sets_alive: bool,
@@ -1818,7 +1825,11 @@ impl SaveHandle {
             .spawn(move || {
                 save_phase_to_disk(
                     &mut result,
-                    &bitmap_fs,
+                    &alive_store,
+                    &filter_store,
+                    &sort_store,
+                    &meta_store,
+                    &bitmap_path,
                     &dictionaries,
                     &dump_name,
                     sets_alive,

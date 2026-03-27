@@ -4573,15 +4573,21 @@ async fn handle_register_dump(
                     let row_count = phase_result.row_count;
                     let dump_name_save = dump_name_inner.clone();
 
-                    // Spawn background save thread
-                    let bitmap_fs = engine_for_save.bitmap_store()
-                        .expect("bitmap_store required for dump save")
-                        .clone();
+                    // Spawn background save thread via ShardStore
+                    let (alive_s, filter_s, sort_s, meta_s) = engine_for_save
+                        .shard_stores()
+                        .expect("shard_stores required for dump save");
+                    let bitmap_path = engine_for_save.config().storage.bitmap_path.as_ref()
+                        .expect("bitmap_path required for dump save").clone();
                     let dictionaries = engine_for_save.dictionaries_arc();
 
                     let save_handle = crate::dump_processor::SaveHandle::spawn(
                         phase_result,
-                        bitmap_fs,
+                        alive_s,
+                        filter_s,
+                        sort_s,
+                        meta_s,
+                        bitmap_path,
                         dictionaries,
                         dump_name_save.clone(),
                         sets_alive,

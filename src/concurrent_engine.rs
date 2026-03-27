@@ -164,6 +164,11 @@ enum LazyLoad {
         name: String,
         layers: Vec<RoaringBitmap>,
     },
+    /// Reload the alive bitmap + slot counter from disk.
+    /// Used by the dump processor after writing alive to BitmapFs.
+    Slots {
+        slots: crate::slot::SlotAllocator,
+    },
 }
 
 /// Inner bitmap state published as immutable snapshots via ArcSwap.
@@ -1221,6 +1226,9 @@ impl ConcurrentEngine {
                                     }
                                 }
                             }
+                            LazyLoad::Slots { slots } => {
+                                staging.slots = slots;
+                            }
                         }
                         lazy_loaded = true;
                     }
@@ -1637,6 +1645,9 @@ impl ConcurrentEngine {
                                             if let Some(sf) = staging.sorts.get_field_mut(&name) {
                                                 sf.load_layers(layers);
                                             }
+                                        }
+                                        LazyLoad::Slots { slots } => {
+                                            staging.slots = slots;
                                         }
                                     }
                                 }
@@ -5333,19 +5344,25 @@ impl ConcurrentEngine {
         );
     }
 
-    /// Reload the alive bitmap and slot counter from BitmapFs into the
-    /// in-memory engine snapshot. Call after dump processor writes alive
-    /// to disk — without this, queries see a stale/empty alive bitmap.
+    /// Reload the alive bitmap and slot counter from ShardStore into the
+    /// in-memory engine snapshot. Sends via the lazy load channel so the
+    /// flush thread's staging stays in sync — same path as filter/sort
+    /// lazy loading. Without this, the flush thread's next publish would
+    /// overwrite the alive bitmap with its stale empty copy.
     pub fn reload_alive_from_disk(&self) {
-        let bitmap_fs = match self.bitmap_store() {
-            Some(fs) => fs,
+        let alive_store = match self.alive_store.as_ref() {
+            Some(s) => s,
             None => return,
         };
-        let alive_bm = match bitmap_fs.load_alive() {
+        let meta_store = match self.meta_store.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let alive_bm = match alive_store.load_alive() {
             Ok(Some(bm)) => bm,
             _ => return,
         };
-        let counter = bitmap_fs.load_slot_counter().ok().flatten().unwrap_or(0);
+        let counter = meta_store.load_slot_counter().ok().flatten().unwrap_or(0);
         let alive_count = alive_bm.len();
 
         // Build new SlotAllocator with the disk state
@@ -5356,15 +5373,19 @@ impl ConcurrentEngine {
         );
 
         // Load deferred alive if present
-        if let Ok(Some(deferred)) = bitmap_fs.load_deferred_alive() {
+        if let Some(deferred) = meta_store.load_deferred_alive().ok().flatten() {
             new_slots.set_deferred(deferred);
         }
 
-        // Update the in-memory snapshot atomically
-        let current = self.inner.load_full();
-        let mut updated: InnerEngine = (*current).clone();
-        updated.slots = new_slots;
-        self.inner.store(Arc::new(updated));
+        // Send to flush thread via lazy load channel — same pattern as
+        // ensure_fields_loaded for filter/sort bitmaps.
+        let _ = self.lazy_tx.send(LazyLoad::Slots { slots: new_slots });
+
+        // Ask the flush thread to drain the lazy channel and publish.
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        if self.cmd_tx.send(FlushCommand::ForcePublish { done: done_tx }).is_ok() {
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        }
 
         eprintln!(
             "Reloaded alive bitmap from disk: {} alive, slot_counter={}",
@@ -6149,6 +6170,21 @@ impl ConcurrentEngine {
     /// Get a reference to the BitmapFs store, if configured.
     pub fn bitmap_store(&self) -> Option<&Arc<BitmapFs>> {
         self.bitmap_store.as_ref()
+    }
+
+    /// Get the ShardStore instances for direct bitmap I/O (dump processor, etc.).
+    pub fn shard_stores(&self) -> Option<(
+        Arc<crate::shard_store_bitmap::AliveBitmapStore>,
+        Arc<crate::shard_store_bitmap::FilterBitmapStore>,
+        Arc<crate::shard_store_bitmap::SortBitmapStore>,
+        Arc<crate::shard_store_meta::MetaStore>,
+    )> {
+        Some((
+            Arc::clone(self.alive_store.as_ref()?),
+            Arc::clone(self.filter_store.as_ref()?),
+            Arc::clone(self.sort_store.as_ref()?),
+            Arc::clone(self.meta_store.as_ref()?),
+        ))
     }
 
     /// Pin ShardStore generations across alive, filter, and sort stores.
