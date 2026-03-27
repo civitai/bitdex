@@ -1090,12 +1090,6 @@ pub fn validate_dump_request(
     Ok(())
 }
 
-/// Process a dump phase: parse CSV → build bitmaps → save to disk.
-///
-/// Does NOT reload fields into memory — call `reload_after_dumps()` once
-/// after all dump phases are complete to make data visible to queries.
-/// Reloading between phases is expensive (triggers lazy load of all fields
-/// including tagIds with 31K values).
 pub fn process_dump(
     request: &DumpRequest,
     engine: &ConcurrentEngine,
@@ -1104,8 +1098,6 @@ pub fn process_dump(
     data_schema: Option<&crate::config::DataSchema>,
 ) -> Result<PhaseResult, String> {
     let mut result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema)?;
-
-    // Save bitmaps to disk
     let (alive_s, filter_s, sort_s, meta_s) = engine
         .shard_stores()
         .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?;
@@ -1113,37 +1105,27 @@ pub fn process_dump(
         .ok_or_else(|| "no bitmap_path configured".to_string())?.clone();
     let dictionaries = engine.dictionaries_arc();
     save_phase_to_disk(&mut result, &alive_s, &filter_s, &sort_s, &meta_s, &bitmap_path, &dictionaries, &request.name, request.sets_alive)?;
-
     eprintln!("  Dump {} save complete", request.name);
     Ok(result)
 }
 
-/// Reload fields after all dump phases are complete.
-/// Call this ONCE after the last dump, not between phases.
+/// Reload fields after dump phases complete. Call ONCE after the last dump.
 pub fn reload_after_dumps(engine: &ConcurrentEngine, had_alive_phase: bool) {
     let t = Instant::now();
     let filter_names: Vec<String> = engine.config()
         .filter_fields.iter().map(|f| f.name.clone()).collect();
     let sort_names: Vec<String> = engine.config()
         .sort_fields.iter().map(|f| f.name.clone()).collect();
-
     let t_mark = Instant::now();
     engine.mark_fields_pending_reload(&filter_names, &sort_names);
     let mark_s = t_mark.elapsed().as_secs_f64();
-
     let mut alive_s = 0.0;
     if had_alive_phase {
         let t_alive = Instant::now();
         engine.reload_alive_from_disk();
         alive_s = t_alive.elapsed().as_secs_f64();
     }
-
-    let total_s = t.elapsed().as_secs_f64();
-    eprintln!("  Dump reload: mark_pending={:.2}s alive_reload={:.2}s total={:.2}s", mark_s, alive_s, total_s);
-    eprintln!(
-        r#"{{"stage":"reload_timing","mark_pending_s":{:.3},"alive_reload_s":{:.3},"total_s":{:.3}}}"#,
-        mark_s, alive_s, total_s,
-    );
+    eprintln!("  Dump reload: mark_pending={:.2}s alive_reload={:.2}s total={:.2}s", mark_s, alive_s, t.elapsed().as_secs_f64());
 }
 
 /// Process a dump phase with optional external progress counter.
@@ -1194,19 +1176,17 @@ pub fn process_dump_with_progress(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    // Load enrichment tables (Nate's API) — per-table timing
+    // Load enrichment tables — per-table timing
     emit_stage(&request.name, "enrichment", "start", &t, 0);
     let mut enrichment_mgr = dump_enrichment::EnrichmentManager::new();
     for ec in &request.enrichment {
-        let table_name = ec.table.as_deref()
-            .or(ec.csv_path.as_deref())
-            .unwrap_or("unknown");
-        let t_enrich_load = Instant::now();
+        let table_name = ec.table.as_deref().or(ec.csv_path.as_deref()).unwrap_or("unknown");
+        let t_el = Instant::now();
         let nate_config = to_nate_enrichment_config(ec, stage_dir);
         enrichment_mgr
             .load(nate_config)
             .map_err(|e| format!("load enrichment: {e}"))?;
-        eprintln!("  Enrichment '{}': loaded in {:.2}s", table_name, t_enrich_load.elapsed().as_secs_f64());
+        eprintln!("  Enrichment '{}': loaded in {:.2}s", table_name, t_el.elapsed().as_secs_f64());
     }
     emit_stage(&request.name, "enrichment", "done", &t, 0);
 
@@ -1361,53 +1341,41 @@ pub fn process_dump_with_progress(
 
     // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
     // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
-    type ThreadResult = (
-        HashMap<String, HashMap<u64, RoaringBitmap>>,  // filter maps
-        HashMap<String, Vec<RoaringBitmap>>,            // sort maps (Vec indexed by bit pos)
-        RoaringBitmap,                                   // alive
-        Vec<(u32, u64)>,                                 // deferred (slot, activate_at)
-        u64,                                             // count
-        u32,                                             // max_slot
-    );
-
-    // Per-component timing: BITDEX_DUMP_SAMPLE_RATE controls sampling.
-    // 0 = off (default, zero overhead). N > 0 = time every Nth row, extrapolate.
-    let sample_rate: u64 = std::env::var("BITDEX_DUMP_SAMPLE_RATE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let timing_enabled = sample_rate > 0;
-
+    // Per-row component timing (general phase only — NOT on multi-value/tags path).
+    // At 107M rows × ~6 Instant::now() × 20ns ≈ 0.5s wall time. Acceptable.
     let timing_parse_ns = AtomicU64::new(0);
-    let timing_field_loop_ns = AtomicU64::new(0);
     let timing_filter_ns = AtomicU64::new(0);
     let timing_enrich_ns = AtomicU64::new(0);
-    let timing_bitmap_filter_ns = AtomicU64::new(0);
-    let timing_bitmap_sort_ns = AtomicU64::new(0);
+    let timing_bitmap_ns = AtomicU64::new(0);
     let timing_docstore_ns = AtomicU64::new(0);
     let timing_computed_ns = AtomicU64::new(0);
-    let timing_total_row_ns = AtomicU64::new(0);
-    let timing_sampled_rows = AtomicU64::new(0);
 
-    if timing_enabled {
-        eprintln!("  Dump timing enabled: sample_rate={}", sample_rate);
-    }
+    type ThreadResult = (
+        HashMap<String, HashMap<u64, RoaringBitmap>>,
+        HashMap<String, Vec<RoaringBitmap>>,
+        RoaringBitmap,
+        Vec<(u32, u64)>,
+        u64,
+        u32,
+    );
 
     let thread_results: Vec<ThreadResult> = ranges
         .par_iter()
         .map(|&(range_start, range_end)| {
             let chunk = &body[range_start..range_end];
 
-            // Cache field_to_idx() once per thread (not per row)
             let field_idx_cache: &HashMap<String, u16> = bulk_writer.field_to_idx();
-            // Dereference Arc once per thread (avoid atomic ops per row)
             let col_idx_ref: &HashMap<String, usize> = col_index.as_ref();
-            // Pre-allocate serialize buffer per thread (reused across all rows)
             let mut serialize_buf: Vec<u8> = Vec::with_capacity(64);
-            // Pre-allocate tuple buffer per thread (reused across all rows)
-            let mut tuple_buf: Vec<(u16, u32, u32)> = Vec::with_capacity(16);
 
-            // Thread-local accumulators
+            // Thread-local timing accumulators
+            let mut lp: u64 = 0; // parse
+            let mut lf: u64 = 0; // filter
+            let mut le: u64 = 0; // enrich
+            let mut lb: u64 = 0; // bitmap (filter + sort)
+            let mut ld: u64 = 0; // docstore
+            let mut lc: u64 = 0; // computed
+
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
                 .iter()
                 .map(|n| (n.clone(), HashMap::new()))
@@ -1432,19 +1400,6 @@ pub fn process_dump_with_progress(
             let mut max_slot: u32 = 0;
             let mut line_start = 0;
 
-            // Thread-local timing accumulators (flushed to shared atomics at end of chunk)
-            // Only incremented on sampled rows (count % sample_rate == 0).
-            let mut local_parse_ns: u64 = 0;
-            let mut local_field_loop_ns: u64 = 0;
-            let mut local_filter_ns: u64 = 0;
-            let mut local_enrich_ns: u64 = 0;
-            let mut local_bitmap_filter_ns: u64 = 0;
-            let mut local_bitmap_sort_ns: u64 = 0;
-            let mut local_docstore_ns: u64 = 0;
-            let mut local_computed_ns: u64 = 0;
-            let mut local_total_row_ns: u64 = 0;
-            let mut local_sampled: u64 = 0;
-
             for i in 0..chunk.len() {
                 if chunk[i] != b'\n' {
                     continue;
@@ -1456,9 +1411,7 @@ pub fn process_dump_with_progress(
                     continue;
                 }
 
-                let sample = timing_enabled && count % sample_rate == 0;
-                let t_parse = if sample { Instant::now() } else { Instant::now() };
-
+                let t0 = Instant::now();
                 let fields = parse_delimited_line(line, delimiter);
                 let row = ParsedRow {
                     fields,
@@ -1477,26 +1430,27 @@ pub fn process_dump_with_progress(
                 // Build indexed fields (Vec<Option<&str>> — cheap compared to HashMap)
                 let indexed_fields_buf = row.to_indexed_fields();
                 let col_idx = row.col_index_ref();
-                if sample { local_parse_ns += t_parse.elapsed().as_nanos() as u64; }
+                lp += t0.elapsed().as_nanos() as u64;
 
                 // Apply filter via indexed path (zero-allocation)
-                let t_filter = if sample { Instant::now() } else { t_parse };
+                let t1 = Instant::now();
                 if let Some(ref fexpr) = filter_expr_ref {
                     if !fexpr.eval_indexed(&indexed_fields_buf, col_idx, None) {
-                        if sample { local_filter_ns += t_filter.elapsed().as_nanos() as u64; }
+                        lf += t1.elapsed().as_nanos() as u64;
                         continue;
                     }
                 }
-                if sample { local_filter_ns += t_filter.elapsed().as_nanos() as u64; }
+
+                lf += t1.elapsed().as_nanos() as u64;
 
                 // Resolve enrichment via indexed path (no CsvRow HashMap)
-                let t_enrich = if sample { Instant::now() } else { t_parse };
+                let t2 = Instant::now();
                 let enriched = if enrichment_mgr_ref.table_count() > 0 {
                     Some(enrichment_mgr_ref.enrich_row_indexed(&indexed_fields_buf, col_idx))
                 } else {
                     None
                 };
-                if sample { local_enrich_ns += t_enrich.elapsed().as_nanos() as u64; }
+                le += t2.elapsed().as_nanos() as u64;
 
                 // Collect enriched field values (avoid HashMap — linear scan is fine for <10 fields)
                 let enriched = enriched.unwrap_or_default();
@@ -1534,7 +1488,6 @@ pub fn process_dump_with_progress(
                                     &bulk_writer,
                                     &field_idx_cache,
                                     &mut serialize_buf,
-                                    &mut tuple_buf,
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1553,15 +1506,14 @@ pub fn process_dump_with_progress(
                     alive.insert(slot);
                 }
 
-                // Build filter bitmaps from direct fields
-                let t_index = if sample { Instant::now() } else { t_parse };
+                // Build filter + sort bitmaps from direct fields
+                let t3 = Instant::now();
                 for field_mapping in request_fields {
                     let target = field_mapping.target();
                     let column = field_mapping.column();
 
                     // Filter bitmap: skip contains() check — just try get_mut directly
                     if let Some(fm) = filter_maps.get_mut(target) {
-                        let t_bf = if sample { Instant::now() } else { t_parse };
                         let bitmap_key: Option<u64> = if let Some(dict) = dictionaries_ref.get(target) {
                             let s = row
                                 .get_str(column)
@@ -1580,7 +1532,6 @@ pub fn process_dump_with_progress(
                                 .or_insert_with(RoaringBitmap::new)
                                 .insert(slot);
                         }
-                        if sample { local_bitmap_filter_ns += t_bf.elapsed().as_nanos() as u64; }
                     }
 
                     // Build sort bitmaps from direct fields
@@ -1588,7 +1539,6 @@ pub fn process_dump_with_progress(
                         if let Some(v) = row.get_i64(column).or_else(|| {
                             enriched_get(target).and_then(|s| s.parse::<i64>().ok())
                         }) {
-                            let t_bs = if sample { Instant::now() } else { t_parse };
                             let val32 = v as u32;
                             if let Some(sm) = sort_maps.get_mut(target) {
                                 for bit in 0..(bits as usize) {
@@ -1597,14 +1547,14 @@ pub fn process_dump_with_progress(
                                     }
                                 }
                             }
-                            if sample { local_bitmap_sort_ns += t_bs.elapsed().as_nanos() as u64; }
                         }
                     }
                 }
-                if sample { local_field_loop_ns += t_index.elapsed().as_nanos() as u64; }
+
+                lb += t3.elapsed().as_nanos() as u64;
 
                 // Build bitmaps from computed fields (Nate's ComputedFieldDef API)
-                let t_computed = if sample { Instant::now() } else { t_parse };
+                let t4 = Instant::now();
                 for def in computed_defs_ref {
                     let computed_val = def.eval_indexed(&indexed_fields_buf, col_idx, None);
 
@@ -1656,10 +1606,11 @@ pub fn process_dump_with_progress(
                         _ => {} // Null or non-matching pattern
                     }
                 }
-                if sample { local_computed_ns += t_computed.elapsed().as_nanos() as u64; }
+
+                lc += t4.elapsed().as_nanos() as u64;
 
                 // Write docstore
-                let t_doc = if sample { Instant::now() } else { t_parse };
+                let t5 = Instant::now();
                 write_docstore_row_indexed(
                     &row,
                     &enriched,
@@ -1671,13 +1622,8 @@ pub fn process_dump_with_progress(
                     &bulk_writer,
                     &field_idx_cache,
                     &mut serialize_buf,
-                    &mut tuple_buf,
                 );
-                if sample {
-                    local_docstore_ns += t_doc.elapsed().as_nanos() as u64;
-                    local_total_row_ns += t_parse.elapsed().as_nanos() as u64;
-                    local_sampled += 1;
-                }
+                ld += t5.elapsed().as_nanos() as u64;
 
                 count += 1;
                 if count % LOG_INTERVAL == 0 {
@@ -1690,17 +1636,13 @@ pub fn process_dump_with_progress(
             total_ref.fetch_add(remainder, Ordering::Relaxed);
             if let Some(ref p) = ext_progress { p.fetch_add(remainder, Ordering::Relaxed); }
 
-            // Flush thread-local timing to shared atomics
-            timing_parse_ns.fetch_add(local_parse_ns, Ordering::Relaxed);
-            timing_field_loop_ns.fetch_add(local_field_loop_ns, Ordering::Relaxed);
-            timing_filter_ns.fetch_add(local_filter_ns, Ordering::Relaxed);
-            timing_enrich_ns.fetch_add(local_enrich_ns, Ordering::Relaxed);
-            timing_bitmap_filter_ns.fetch_add(local_bitmap_filter_ns, Ordering::Relaxed);
-            timing_bitmap_sort_ns.fetch_add(local_bitmap_sort_ns, Ordering::Relaxed);
-            timing_docstore_ns.fetch_add(local_docstore_ns, Ordering::Relaxed);
-            timing_computed_ns.fetch_add(local_computed_ns, Ordering::Relaxed);
-            timing_total_row_ns.fetch_add(local_total_row_ns, Ordering::Relaxed);
-            timing_sampled_rows.fetch_add(local_sampled, Ordering::Relaxed);
+            // Flush timing
+            timing_parse_ns.fetch_add(lp, Ordering::Relaxed);
+            timing_filter_ns.fetch_add(lf, Ordering::Relaxed);
+            timing_enrich_ns.fetch_add(le, Ordering::Relaxed);
+            timing_bitmap_ns.fetch_add(lb, Ordering::Relaxed);
+            timing_docstore_ns.fetch_add(ld, Ordering::Relaxed);
+            timing_computed_ns.fetch_add(lc, Ordering::Relaxed);
 
             (filter_maps, sort_maps, alive, deferred, count, max_slot)
         })
@@ -1708,7 +1650,28 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "parallel_parse", "done", &t, total.load(Ordering::Relaxed));
 
-    emit_stage(&request.name, "merge", "start", &t, total.load(Ordering::Relaxed));
+    // Component timing breakdown (thread-seconds across all threads)
+    let num_threads = rayon::current_num_threads();
+    let parsed_rows = total.load(Ordering::Relaxed);
+    eprintln!("  Component breakdown (thread-seconds across {} threads, {} rows):", num_threads, parsed_rows);
+    eprintln!("    parse:    {:.2}s", timing_parse_ns.load(Ordering::Relaxed) as f64 / 1e9);
+    eprintln!("    filter:   {:.2}s", timing_filter_ns.load(Ordering::Relaxed) as f64 / 1e9);
+    eprintln!("    enrich:   {:.2}s", timing_enrich_ns.load(Ordering::Relaxed) as f64 / 1e9);
+    eprintln!("    bitmap:   {:.2}s", timing_bitmap_ns.load(Ordering::Relaxed) as f64 / 1e9);
+    eprintln!("    computed: {:.2}s", timing_computed_ns.load(Ordering::Relaxed) as f64 / 1e9);
+    eprintln!("    docstore: {:.2}s", timing_docstore_ns.load(Ordering::Relaxed) as f64 / 1e9);
+    eprintln!(
+        r#"{{"dump":"{}","stage":"component_timing","threads":{},"rows":{},"parse_s":{:.3},"filter_s":{:.3},"enrich_s":{:.3},"bitmap_s":{:.3},"computed_s":{:.3},"docstore_s":{:.3}}}"#,
+        request.name, num_threads, parsed_rows,
+        timing_parse_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        timing_filter_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        timing_enrich_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        timing_bitmap_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        timing_computed_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        timing_docstore_ns.load(Ordering::Relaxed) as f64 / 1e9,
+    );
+
+    emit_stage(&request.name, "merge", "start", &t, parsed_rows);
     // Merge all thread results — parallel tree reduction
     type MergeAccum = (
         HashMap<String, HashMap<u64, RoaringBitmap>>,
@@ -1789,42 +1752,6 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
-    // Component timing breakdown (only if sampling was enabled)
-    if timing_enabled {
-        let num_threads = rayon::current_num_threads();
-        let sampled = timing_sampled_rows.load(Ordering::Relaxed).max(1);
-        // Extrapolation factor: total_rows / sampled_rows
-        let scale = total_count as f64 / sampled as f64;
-        let p_ns = (timing_parse_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-        let fl_ns = (timing_field_loop_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-        let f_ns = (timing_filter_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-        let e_ns = (timing_enrich_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-        let bf_ns = (timing_bitmap_filter_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-        let bs_ns = (timing_bitmap_sort_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-        let d_ns = (timing_docstore_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-        let c_ns = (timing_computed_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-        let tr_ns = (timing_total_row_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-        let component_sum = p_ns + fl_ns + f_ns + e_ns + d_ns + c_ns;
-        let overhead_ns = tr_ns.saturating_sub(component_sum);
-        eprintln!("  Component breakdown (extrapolated from {} sampled rows, {} threads):", sampled, num_threads);
-        eprintln!("    total_row:     {:.2}s", tr_ns as f64 / 1e9);
-        eprintln!("    parse:         {:.2}s", p_ns as f64 / 1e9);
-        eprintln!("    field_loop:    {:.2}s (includes bitmap_filter + bitmap_sort)", fl_ns as f64 / 1e9);
-        eprintln!("    filter:        {:.2}s", f_ns as f64 / 1e9);
-        eprintln!("    enrich:        {:.2}s", e_ns as f64 / 1e9);
-        eprintln!("    bitmap_filter: {:.2}s", bf_ns as f64 / 1e9);
-        eprintln!("    bitmap_sort:   {:.2}s", bs_ns as f64 / 1e9);
-        eprintln!("    docstore:      {:.2}s", d_ns as f64 / 1e9);
-        eprintln!("    computed:      {:.2}s", c_ns as f64 / 1e9);
-        eprintln!("    overhead:      {:.2}s (line scan, alloc, deferred checks, etc)", overhead_ns as f64 / 1e9);
-        eprintln!(
-            r#"{{"dump":"{}","stage":"component_timing","threads":{},"sample_rate":{},"sampled_rows":{},"total_row_s":{:.3},"parse_s":{:.3},"field_loop_s":{:.3},"filter_s":{:.3},"enrich_s":{:.3},"bitmap_filter_s":{:.3},"bitmap_sort_s":{:.3},"docstore_s":{:.3},"computed_s":{:.3},"overhead_s":{:.3}}}"#,
-            request.name, num_threads, sample_rate, sampled,
-            tr_ns as f64 / 1e9, p_ns as f64 / 1e9, fl_ns as f64 / 1e9, f_ns as f64 / 1e9, e_ns as f64 / 1e9,
-            bf_ns as f64 / 1e9, bs_ns as f64 / 1e9, d_ns as f64 / 1e9, c_ns as f64 / 1e9, overhead_ns as f64 / 1e9,
-        );
-    }
-
     let elapsed = t.elapsed();
     eprintln!(
         "  Dump {} parse+merge complete: {} rows in {:.1}s ({:.0}/s)",
@@ -1868,8 +1795,8 @@ pub fn save_phase_to_disk(
     emit_stage(dump_name, "bitmap_save", "start", &t, result.row_count);
 
     let save_start = Instant::now();
-
     let t_filter_save = Instant::now();
+
     // Parallel filter saves — drain into per-bucket Vecs, write buckets in parallel.
     // Same pattern as the old BitmapFs path: parallel per-bucket writes with
     // incremental drop. Each bucket drops after its shard file is written.
@@ -1914,8 +1841,7 @@ pub fn save_phase_to_disk(
         eprintln!("  Saved filter {}: {} values", field_name, count);
     }
 
-    let filter_save_secs = t_filter_save.elapsed().as_secs_f64();
-
+    let filter_save_s = t_filter_save.elapsed().as_secs_f64();
     let t_sort_save = Instant::now();
     // Parallel sort field saves via ShardStore — drain for memory release
     let sort_items: Vec<_> = result.sort_maps.drain()
@@ -1940,9 +1866,9 @@ pub fn save_phase_to_disk(
         eprintln!("  Saved sort {}: {} layers", field_name, num_layers);
     }
 
-    let sort_save_secs = t_sort_save.elapsed().as_secs_f64();
-
+    let sort_save_s = t_sort_save.elapsed().as_secs_f64();
     let t_meta_save = Instant::now();
+
     if sets_alive {
         alive_store
             .write_alive(&result.alive)
@@ -1969,10 +1895,10 @@ pub fn save_phase_to_disk(
             eprintln!("  Saved deferred alive: {} slots", deferred_total);
         }
     }
-    let meta_save_secs = t_meta_save.elapsed().as_secs_f64();
+
+    let meta_save_s = t_meta_save.elapsed().as_secs_f64();
 
     // Persist LCS dictionaries
-    let t_dict_save = Instant::now();
     let dict_dir = bitmap_path.join("dictionaries");
     std::fs::create_dir_all(&dict_dir).ok();
     for (name, dict) in dictionaries {
@@ -1987,14 +1913,13 @@ pub fn save_phase_to_disk(
             eprintln!("  Saved dictionary '{name}': {} entries", snap.forward.len());
         }
     }
-    let dict_save_secs = t_dict_save.elapsed().as_secs_f64();
 
-    let total_save_secs = save_start.elapsed().as_secs_f64();
-    eprintln!("  Save breakdown: filter={:.2}s sort={:.2}s alive_meta={:.2}s dict={:.2}s total={:.2}s",
-        filter_save_secs, sort_save_secs, meta_save_secs, dict_save_secs, total_save_secs);
+    let total_save_s = save_start.elapsed().as_secs_f64();
+    eprintln!("  Save breakdown: filter={:.2}s sort={:.2}s alive_meta={:.2}s total={:.2}s",
+        filter_save_s, sort_save_s, meta_save_s, total_save_s);
     eprintln!(
-        r#"{{"dump":"{}","stage":"save_timing","filter_s":{:.3},"sort_s":{:.3},"alive_meta_s":{:.3},"dict_s":{:.3},"total_s":{:.3}}}"#,
-        dump_name, filter_save_secs, sort_save_secs, meta_save_secs, dict_save_secs, total_save_secs,
+        r#"{{"dump":"{}","stage":"save_timing","filter_s":{:.3},"sort_s":{:.3},"alive_meta_s":{:.3},"total_s":{:.3}}}"#,
+        dump_name, filter_save_s, sort_save_s, meta_save_s, total_save_s,
     );
     emit_stage(dump_name, "bitmap_save", "done", &t, result.row_count);
 
@@ -2138,16 +2063,6 @@ fn process_multi_value_phase(
     let t_mv = Instant::now();
     emit_stage(&request.name, "parallel_parse", "start", &t_mv, 0);
 
-    // Per-component timing counters for multi-value phase (same env var)
-    let mv_sample_rate: u64 = std::env::var("BITDEX_DUMP_SAMPLE_RATE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let mv_timing_enabled = mv_sample_rate > 0;
-    let mv_timing_parse_ns = AtomicU64::new(0);
-    let mv_timing_bitmap_ns = AtomicU64::new(0);
-    let mv_timing_sampled = AtomicU64::new(0);
-
     if use_vec {
 
         let thread_results: Vec<Vec<RoaringBitmap>> = ranges
@@ -2159,9 +2074,6 @@ fn process_multi_value_phase(
                 let mut doc_batch: Vec<(u32, i64)> = Vec::with_capacity(10_000);
                 let mut count = 0u64;
                 let mut line_start = 0;
-                let mut local_parse_ns: u64 = 0;
-                let mut local_bitmap_ns: u64 = 0;
-                let mut local_sampled: u64 = 0;
 
                 for i in 0..chunk.len() {
                     if chunk[i] != b'\n' {
@@ -2174,10 +2086,9 @@ fn process_multi_value_phase(
                         continue;
                     }
 
-                    let sample = mv_timing_enabled && count % mv_sample_rate == 0;
-
                     // Fast path: zero-alloc binary parse for simple two-column CSV
-                    let t_p = if sample { Instant::now() } else { Instant::now() };
+                    // (no filter expression, column indices known). Avoids Vec allocation
+                    // from parse_delimited_line — saves ~80s on 5.4B tag rows.
                     let (slot, value) = if can_fast_path {
                         match parse_two_cols_fast(line, delimiter, slot_idx, value_idx) {
                             Some((s, v)) => (s, v as usize),
@@ -2199,17 +2110,10 @@ fn process_multi_value_phase(
                         let v = match row.get_i64(&value_column) { Some(v) => v as usize, None => continue };
                         (s, v)
                     };
-                    if sample { local_parse_ns += t_p.elapsed().as_nanos() as u64; }
 
-                    let t_bm = if sample { Instant::now() } else { t_p };
                     if value < MAX_TAG_ID {
                         bitmaps[value].insert(slot);
                     }
-                    if sample {
-                        local_bitmap_ns += t_bm.elapsed().as_nanos() as u64;
-                        local_sampled += 1;
-                    }
-
                     // Batch for writer thread
                     if doc_tx.is_some() {
                         doc_batch.push((slot, value as i64));
@@ -2234,9 +2138,6 @@ fn process_multi_value_phase(
                 let remainder = count % LOG_INTERVAL;
                 total_ref.fetch_add(remainder, Ordering::Relaxed);
                 if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
-                // Flush thread-local timing to shared atomics
-                mv_timing_parse_ns.fetch_add(local_parse_ns, Ordering::Relaxed);
-                mv_timing_bitmap_ns.fetch_add(local_bitmap_ns, Ordering::Relaxed);
                 bitmaps
             })
             .collect();
@@ -2285,22 +2186,6 @@ fn process_multi_value_phase(
 
         emit_stage(&request.name, "parallel_parse", "done", &t_mv, total_rows);
 
-        // Multi-value component timing breakdown
-        if mv_timing_enabled {
-            let num_threads = rayon::current_num_threads();
-            let sampled = mv_timing_sampled.load(Ordering::Relaxed).max(1);
-            let scale = total_rows as f64 / sampled as f64;
-            let mv_p_ns = (mv_timing_parse_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-            let mv_b_ns = (mv_timing_bitmap_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-            eprintln!("  Component breakdown (extrapolated from {} sampled rows, {} threads):", sampled, num_threads);
-            eprintln!("    parse:         {:.2}s", mv_p_ns as f64 / 1e9);
-            eprintln!("    bitmap_insert: {:.2}s", mv_b_ns as f64 / 1e9);
-            eprintln!(
-                r#"{{"dump":"{}","stage":"component_timing","threads":{},"sample_rate":{},"sampled_rows":{},"parse_s":{:.3},"bitmap_insert_s":{:.3}}}"#,
-                request.name, num_threads, mv_sample_rate, sampled, mv_p_ns as f64 / 1e9, mv_b_ns as f64 / 1e9,
-            );
-        }
-
         Ok(PhaseResult {
             row_count: total_rows,
             filter_maps,
@@ -2320,9 +2205,6 @@ fn process_multi_value_phase(
                 let mut doc_batch: Vec<(u32, i64)> = Vec::with_capacity(10_000);
                 let mut count = 0u64;
                 let mut line_start = 0;
-                let mut local_parse_ns: u64 = 0;
-                let mut local_bitmap_ns: u64 = 0;
-                let mut local_sampled: u64 = 0;
 
                 for i in 0..chunk.len() {
                     if chunk[i] != b'\n' {
@@ -2335,8 +2217,6 @@ fn process_multi_value_phase(
                         continue;
                     }
 
-                    let sample = mv_timing_enabled && count % mv_sample_rate == 0;
-                    let t_p = if sample { Instant::now() } else { Instant::now() };
                     let (slot, value) = if can_fast_path {
                         match parse_two_cols_fast(line, delimiter, slot_idx, value_idx) {
                             Some((s, v)) => (s, v as u64),
@@ -2358,18 +2238,11 @@ fn process_multi_value_phase(
                         let v = match row.get_u64(&value_column) { Some(v) => v, None => continue };
                         (s, v)
                     };
-                    if sample { local_parse_ns += t_p.elapsed().as_nanos() as u64; }
 
-                    let t_bm = if sample { Instant::now() } else { t_p };
                     bitmaps
                         .entry(value)
                         .or_insert_with(RoaringBitmap::new)
                         .insert(slot);
-                    if sample {
-                        local_bitmap_ns += t_bm.elapsed().as_nanos() as u64;
-                        local_sampled += 1;
-                    }
-
                     // Batch for writer thread
                     if doc_tx.is_some() {
                         doc_batch.push((slot, value as i64));
@@ -2394,10 +2267,6 @@ fn process_multi_value_phase(
                 let remainder = count % LOG_INTERVAL;
                 total_ref.fetch_add(remainder, Ordering::Relaxed);
                 if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
-                // Flush thread-local timing to shared atomics
-                mv_timing_parse_ns.fetch_add(local_parse_ns, Ordering::Relaxed);
-                mv_timing_bitmap_ns.fetch_add(local_bitmap_ns, Ordering::Relaxed);
-                mv_timing_sampled.fetch_add(local_sampled, Ordering::Relaxed);
                 bitmaps
             })
             .collect();
@@ -2422,22 +2291,6 @@ fn process_multi_value_phase(
 
         let mut filter_maps = HashMap::new();
         filter_maps.insert(target, merged);
-
-        // Multi-value component timing breakdown (HashMap path)
-        if mv_timing_enabled {
-            let num_threads = rayon::current_num_threads();
-            let sampled = mv_timing_sampled.load(Ordering::Relaxed).max(1);
-            let scale = total_rows as f64 / sampled as f64;
-            let mv_p_ns = (mv_timing_parse_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-            let mv_b_ns = (mv_timing_bitmap_ns.load(Ordering::Relaxed) as f64 * scale) as u64;
-            eprintln!("  Component breakdown (extrapolated from {} sampled rows, {} threads):", sampled, num_threads);
-            eprintln!("    parse:         {:.2}s", mv_p_ns as f64 / 1e9);
-            eprintln!("    bitmap_insert: {:.2}s", mv_b_ns as f64 / 1e9);
-            eprintln!(
-                r#"{{"dump":"{}","stage":"component_timing","threads":{},"sample_rate":{},"sampled_rows":{},"parse_s":{:.3},"bitmap_insert_s":{:.3}}}"#,
-                request.name, num_threads, mv_sample_rate, sampled, mv_p_ns as f64 / 1e9, mv_b_ns as f64 / 1e9,
-            );
-        }
 
         Ok(PhaseResult {
             row_count: total_rows,
@@ -2497,18 +2350,13 @@ fn write_docstore_row_indexed(
     bulk_writer: &Arc<BulkWriter>,
     field_idx: &HashMap<String, u16>,
     serialize_buf: &mut Vec<u8>,
-    tuple_buf: &mut Vec<(u16, u32, u32)>,  // (field_idx, offset, length) into serialize_buf
 ) {
-    serialize_buf.clear();
-    tuple_buf.clear();
-
-    // Helper: serialize into shared buffer and record offset+length
-    macro_rules! collect_packed {
+    // Helper: serialize to reusable buffer and append
+    macro_rules! append_packed {
         ($fidx:expr, $value:expr) => {
-            let start = serialize_buf.len() as u32;
+            serialize_buf.clear();
             if rmp_serde::encode::write(serialize_buf, $value).is_ok() {
-                let len = serialize_buf.len() as u32 - start;
-                tuple_buf.push(($fidx, start, len));
+                bulk_writer.append_tuple_raw(slot, $fidx, serialize_buf);
             }
         };
     }
@@ -2520,9 +2368,9 @@ fn write_docstore_row_indexed(
 
         if let Some(&fidx) = field_idx.get(target) {
             if let Some(v) = row.get_i64(column) {
-                collect_packed!(fidx, &PackedValue::I(v));
+                append_packed!(fidx, &PackedValue::I(v));
             } else if let Some(s) = row.get_str(column) {
-                collect_packed!(fidx, &PackedValue::S(s.to_string()));
+                append_packed!(fidx, &PackedValue::S(s.to_string()));
             }
         }
     }
@@ -2531,9 +2379,9 @@ fn write_docstore_row_indexed(
     for (target, value) in &enriched.fields {
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             if let Ok(v) = value.parse::<i64>() {
-                collect_packed!(fidx, &PackedValue::I(v));
+                append_packed!(fidx, &PackedValue::I(v));
             } else {
-                collect_packed!(fidx, &PackedValue::S(value.clone()));
+                append_packed!(fidx, &PackedValue::S(value.clone()));
             }
         }
     }
@@ -2542,9 +2390,9 @@ fn write_docstore_row_indexed(
     for (target, value) in &enriched.computed {
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             match value {
-                NateExprValue::Int(v) => { collect_packed!(fidx, &PackedValue::I(*v)); }
-                NateExprValue::Bool(b) => { collect_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
-                NateExprValue::Str(ref s) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
+                NateExprValue::Int(v) => { append_packed!(fidx, &PackedValue::I(*v)); }
+                NateExprValue::Bool(b) => { append_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
+                NateExprValue::Str(ref s) => { append_packed!(fidx, &PackedValue::S(s.clone())); }
                 NateExprValue::Null => {}
             }
         }
@@ -2554,20 +2402,12 @@ fn write_docstore_row_indexed(
     for def in computed_defs {
         if let Some(&fidx) = field_idx.get(def.target.as_str()) {
             match def.eval_indexed(indexed_fields, col_idx, None) {
-                Some(NateExprValue::Int(v)) => { collect_packed!(fidx, &PackedValue::I(v)); }
-                Some(NateExprValue::Bool(b)) => { collect_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
-                Some(NateExprValue::Str(ref s)) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
+                Some(NateExprValue::Int(v)) => { append_packed!(fidx, &PackedValue::I(v)); }
+                Some(NateExprValue::Bool(b)) => { append_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
+                Some(NateExprValue::Str(ref s)) => { append_packed!(fidx, &PackedValue::S(s.clone())); }
                 _ => {}
             }
         }
-    }
-
-    // Batch write all tuples in one lock acquisition
-    if !tuple_buf.is_empty() {
-        let refs: Vec<(u16, &[u8])> = tuple_buf.iter()
-            .map(|&(idx, off, len)| (idx, &serialize_buf[off as usize..(off + len) as usize]))
-            .collect();
-        bulk_writer.append_tuples_raw(slot, &refs);
     }
 }
 

@@ -211,33 +211,29 @@ async function main() {
   const pipelineStart = Date.now();
   const phaseResults = [];
 
-  // Submit ALL dump phases at once (server queues them as async tasks)
-  const submitted = [];
   for (const req of DUMP_REQUESTS) {
-    console.log(`  ▸ ${req.name} (submitting)`);
+    const phaseStart = Date.now();
+    console.log(`  ▸ ${req.name}`);
+
     const result = await sendDump(req);
     if (result.error) {
       console.error(`    ERROR: ${result.error}`);
       phaseResults.push({ name: req.name, error: result.error });
-    } else if (result.task_id) {
-      submitted.push({ req, task_id: result.task_id, start: Date.now() });
+      continue;
     }
-  }
-  console.log(`\n  Submitted ${submitted.length} phases, polling...\n`);
 
-  // Poll all tasks — they execute sequentially on the server but we
-  // submit them all upfront so there's no client-side gap between phases.
-  for (const { req, task_id, start } of submitted) {
-    const completed = await pollTask(task_id, req.name);
-    const wallClock = (Date.now() - start) / 1000;
-    phaseResults.push({
-      name: req.name,
-      rows: completed.rows,
-      rate: completed.rows > 0 ? Math.round(completed.rows / wallClock) : 0,
-      wall_s: wallClock,
-      task_s: completed.elapsed_s,
-    });
-    console.log(`    ✓ ${fmt(completed.rows)} rows in ${fmtDur(wallClock)} (${fmt(phaseResults.at(-1).rate)}/s wall)`);
+    if (result.task_id) {
+      const completed = await pollTask(result.task_id, req.name);
+      const wallClock = (Date.now() - phaseStart) / 1000;
+      phaseResults.push({
+        name: req.name,
+        rows: completed.rows,
+        rate: completed.rows > 0 ? Math.round(completed.rows / wallClock) : 0,
+        wall_s: wallClock,
+        task_s: completed.elapsed_s,
+      });
+      console.log(`    ✓ ${fmt(completed.rows)} rows in ${fmtDur(wallClock)} (${fmt(phaseResults.at(-1).rate)}/s wall)`);
+    }
   }
 
   const pipelineTotal = (Date.now() - pipelineStart) / 1000;
