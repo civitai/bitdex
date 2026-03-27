@@ -1609,6 +1609,52 @@ impl BulkWriter {
         }
     }
 
+    /// Append multiple tuples for the same slot in one lock acquisition.
+    /// Avoids repeated DashMap lookups and Mutex lock/unlock per field.
+    pub fn append_tuples_raw(&self, slot: u32, tuples: &[(u16, &[u8])]) {
+        if tuples.is_empty() {
+            return;
+        }
+        let sid = DocStore::shard_id(slot);
+
+        // Ensure writer exists for this shard (same logic as append_tuple_raw)
+        if !self.v2_writers.contains_key(&sid) {
+            let path = DocStore::shard_path(&self.root, sid);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("BulkWriter: v2 open shard {sid}: {e}");
+                    return;
+                }
+            };
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut bw = BufWriter::new(file);
+            if file_len == 0 {
+                if let Err(e) = DocStore::write_v2_header(&mut bw) {
+                    eprintln!("BulkWriter: v2 write header shard {sid}: {e}");
+                    return;
+                }
+            }
+            self.v2_writers.insert(sid, parking_lot::Mutex::new(bw));
+        }
+
+        // One lock acquisition for all tuples
+        let entry = self.v2_writers.get(&sid).unwrap();
+        let mut w = entry.lock();
+        for &(field_idx, value_bytes) in tuples {
+            if let Err(e) = DocStore::write_v2_tuple(&mut *w, slot, field_idx, value_bytes) {
+                eprintln!("BulkWriter: v2 write tuple shard {sid}: {e}");
+            }
+        }
+    }
+
     /// Flush all open V2 writers. Call after bulk loading is complete.
     pub fn flush_v2_writers(&self) {
         for entry in self.v2_writers.iter() {
@@ -3016,5 +3062,124 @@ mod tests {
             let s = store.lock();
             assert!(s.v2_writers.len() > 0, "should have created v2 writers");
         }
+    }
+
+    /// Test append_tuples_raw writes multiple fields for the same slot in one
+    /// lock acquisition, and all tuples are readable via DocStore::get.
+    #[test]
+    fn test_append_tuples_raw_multiple_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        let field_names: Vec<String> = vec![
+            "alpha".into(), "beta".into(), "gamma".into(),
+        ];
+        let bw = store.prepare_bulk_load(&field_names).unwrap();
+        let fidx = bw.field_to_idx().clone();
+
+        let slot = 42u32;
+        let val_a = rmp_serde::to_vec(&PackedValue::I(100)).unwrap();
+        let val_b = rmp_serde::to_vec(&PackedValue::S("hello".into())).unwrap();
+        let val_c = rmp_serde::to_vec(&PackedValue::I(999)).unwrap();
+
+        let tuples: Vec<(u16, &[u8])> = vec![
+            (fidx["alpha"], &val_a),
+            (fidx["beta"], &val_b),
+            (fidx["gamma"], &val_c),
+        ];
+        bw.append_tuples_raw(slot, &tuples);
+        bw.flush_v2_writers();
+
+        // Read back and verify all three fields present
+        let doc = store.get(slot).unwrap().expect("doc should exist");
+        match &doc.fields["alpha"] {
+            FieldValue::Single(Value::Integer(v)) => assert_eq!(*v, 100),
+            other => panic!("expected alpha=100, got: {:?}", other),
+        }
+        match &doc.fields["beta"] {
+            FieldValue::Single(Value::String(s)) => assert_eq!(s, "hello"),
+            other => panic!("expected beta='hello', got: {:?}", other),
+        }
+        match &doc.fields["gamma"] {
+            FieldValue::Single(Value::Integer(v)) => assert_eq!(*v, 999),
+            other => panic!("expected gamma=999, got: {:?}", other),
+        }
+    }
+
+    /// Equivalence test: same data written via per-field append_tuple_raw vs
+    /// batched append_tuples_raw must produce identical documents on read-back.
+    #[test]
+    fn test_append_tuples_raw_equivalence_with_per_field() {
+        let dir_single = tempfile::tempdir().unwrap();
+        let dir_batch = tempfile::tempdir().unwrap();
+
+        let field_names: Vec<String> = vec![
+            "id".into(), "name".into(), "score".into(), "active".into(),
+        ];
+
+        // Set up per-field store
+        let mut store_single = DocStore::open(&dir_single.path().join("docs")).unwrap();
+        let bw_single = store_single.prepare_bulk_load(&field_names).unwrap();
+        let fidx = bw_single.field_to_idx().clone();
+
+        // Set up batched store
+        let mut store_batch = DocStore::open(&dir_batch.path().join("docs")).unwrap();
+        let bw_batch = store_batch.prepare_bulk_load(&field_names).unwrap();
+
+        // Write 50 slots with varying data via both paths
+        for slot in 0..50u32 {
+            let v_id = rmp_serde::to_vec(&PackedValue::I(slot as i64)).unwrap();
+            let v_name = rmp_serde::to_vec(&PackedValue::S(format!("item_{slot}"))).unwrap();
+            let v_score = rmp_serde::to_vec(&PackedValue::I(slot as i64 * 10)).unwrap();
+            let v_active = rmp_serde::to_vec(&PackedValue::I(if slot % 2 == 0 { 1 } else { 0 })).unwrap();
+
+            // Per-field path (existing method)
+            bw_single.append_tuple_raw(slot, fidx["id"], &v_id);
+            bw_single.append_tuple_raw(slot, fidx["name"], &v_name);
+            bw_single.append_tuple_raw(slot, fidx["score"], &v_score);
+            bw_single.append_tuple_raw(slot, fidx["active"], &v_active);
+
+            // Batched path (new method)
+            let tuples: Vec<(u16, &[u8])> = vec![
+                (fidx["id"], &v_id),
+                (fidx["name"], &v_name),
+                (fidx["score"], &v_score),
+                (fidx["active"], &v_active),
+            ];
+            bw_batch.append_tuples_raw(slot, &tuples);
+        }
+
+        bw_single.flush_v2_writers();
+        bw_batch.flush_v2_writers();
+
+        // Compare all documents
+        for slot in 0..50u32 {
+            let doc_single = store_single.get(slot).unwrap().expect("single doc");
+            let doc_batch = store_batch.get(slot).unwrap().expect("batch doc");
+
+            for field in &["id", "name", "score", "active"] {
+                assert_eq!(
+                    doc_single.fields.get(*field),
+                    doc_batch.fields.get(*field),
+                    "field '{}' mismatch at slot {}: single={:?}, batch={:?}",
+                    field, slot,
+                    doc_single.fields.get(*field),
+                    doc_batch.fields.get(*field),
+                );
+            }
+        }
+    }
+
+    /// Test that append_tuples_raw with an empty tuple slice is a no-op.
+    #[test]
+    fn test_append_tuples_raw_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        let bw = store.prepare_bulk_load(&["x".to_string()]).unwrap();
+
+        // Empty tuples should not create any shard files
+        bw.append_tuples_raw(42, &[]);
+        assert_eq!(bw.v2_writers.len(), 0, "empty tuples should not create writers");
     }
 }

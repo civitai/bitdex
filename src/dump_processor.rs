@@ -1346,6 +1346,8 @@ pub fn process_dump_with_progress(
             let col_idx_ref: &HashMap<String, usize> = col_index.as_ref();
             // Pre-allocate serialize buffer per thread (reused across all rows)
             let mut serialize_buf: Vec<u8> = Vec::with_capacity(64);
+            // Pre-allocate tuple buffer per thread (reused across all rows)
+            let mut tuple_buf: Vec<(u16, Vec<u8>)> = Vec::with_capacity(16);
 
             // Thread-local accumulators
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
@@ -1472,6 +1474,7 @@ pub fn process_dump_with_progress(
                                     &bulk_writer,
                                     &field_idx_cache,
                                     &mut serialize_buf,
+                                    &mut tuple_buf,
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1608,6 +1611,7 @@ pub fn process_dump_with_progress(
                     &bulk_writer,
                     &field_idx_cache,
                     &mut serialize_buf,
+                    &mut tuple_buf,
                 );
                 local_docstore_ns += t_doc.elapsed().as_nanos() as u64;
 
@@ -2398,13 +2402,16 @@ fn write_docstore_row_indexed(
     bulk_writer: &Arc<BulkWriter>,
     field_idx: &HashMap<String, u16>,
     serialize_buf: &mut Vec<u8>,
+    tuple_buf: &mut Vec<(u16, Vec<u8>)>,
 ) {
-    // Helper: serialize to reusable buffer and append
-    macro_rules! append_packed {
+    tuple_buf.clear();
+
+    // Helper: serialize to reusable buffer and collect into tuple_buf
+    macro_rules! collect_packed {
         ($fidx:expr, $value:expr) => {
             serialize_buf.clear();
             if rmp_serde::encode::write(serialize_buf, $value).is_ok() {
-                bulk_writer.append_tuple_raw(slot, $fidx, serialize_buf);
+                tuple_buf.push(($fidx, serialize_buf.clone()));
             }
         };
     }
@@ -2416,9 +2423,9 @@ fn write_docstore_row_indexed(
 
         if let Some(&fidx) = field_idx.get(target) {
             if let Some(v) = row.get_i64(column) {
-                append_packed!(fidx, &PackedValue::I(v));
+                collect_packed!(fidx, &PackedValue::I(v));
             } else if let Some(s) = row.get_str(column) {
-                append_packed!(fidx, &PackedValue::S(s.to_string()));
+                collect_packed!(fidx, &PackedValue::S(s.to_string()));
             }
         }
     }
@@ -2427,9 +2434,9 @@ fn write_docstore_row_indexed(
     for (target, value) in &enriched.fields {
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             if let Ok(v) = value.parse::<i64>() {
-                append_packed!(fidx, &PackedValue::I(v));
+                collect_packed!(fidx, &PackedValue::I(v));
             } else {
-                append_packed!(fidx, &PackedValue::S(value.clone()));
+                collect_packed!(fidx, &PackedValue::S(value.clone()));
             }
         }
     }
@@ -2438,9 +2445,9 @@ fn write_docstore_row_indexed(
     for (target, value) in &enriched.computed {
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             match value {
-                NateExprValue::Int(v) => { append_packed!(fidx, &PackedValue::I(*v)); }
-                NateExprValue::Bool(b) => { append_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
-                NateExprValue::Str(ref s) => { append_packed!(fidx, &PackedValue::S(s.clone())); }
+                NateExprValue::Int(v) => { collect_packed!(fidx, &PackedValue::I(*v)); }
+                NateExprValue::Bool(b) => { collect_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
+                NateExprValue::Str(ref s) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
                 NateExprValue::Null => {}
             }
         }
@@ -2450,12 +2457,18 @@ fn write_docstore_row_indexed(
     for def in computed_defs {
         if let Some(&fidx) = field_idx.get(def.target.as_str()) {
             match def.eval_indexed(indexed_fields, col_idx, None) {
-                Some(NateExprValue::Int(v)) => { append_packed!(fidx, &PackedValue::I(v)); }
-                Some(NateExprValue::Bool(b)) => { append_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
-                Some(NateExprValue::Str(ref s)) => { append_packed!(fidx, &PackedValue::S(s.clone())); }
+                Some(NateExprValue::Int(v)) => { collect_packed!(fidx, &PackedValue::I(v)); }
+                Some(NateExprValue::Bool(b)) => { collect_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
+                Some(NateExprValue::Str(ref s)) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
                 _ => {}
             }
         }
+    }
+
+    // Batch write all tuples in one lock acquisition
+    if !tuple_buf.is_empty() {
+        let refs: Vec<(u16, &[u8])> = tuple_buf.iter().map(|(idx, v)| (*idx, v.as_slice())).collect();
+        bulk_writer.append_tuples_raw(slot, &refs);
     }
 }
 
