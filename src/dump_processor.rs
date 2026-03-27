@@ -1639,15 +1639,16 @@ pub fn process_dump_with_progress(
             std::fs::create_dir_all(&dir).ok();
         }
 
-        // Parallel filter field saves
-        let filter_items: Vec<_> = merged_filters.iter()
+        // Parallel filter field saves — drain ownership for incremental memory release
+        let filter_items: Vec<_> = merged_filters.into_iter()
             .filter(|(_, values)| !values.is_empty())
             .collect();
         let filter_results: Vec<Result<(String, u64, usize), String>> = filter_items
-            .par_iter()
+            .into_par_iter()
             .map(|(field_name, values)| {
-                let saved = save_filter_field_to_disk(&bitmap_fs, field_name, values)?;
-                Ok((field_name.to_string(), saved, values.len()))
+                let count = values.len();
+                let saved = save_filter_field_to_disk(&bitmap_fs, &field_name, values)?;
+                Ok((field_name, saved, count))
             })
             .collect();
         for result in filter_results {
@@ -1734,7 +1735,7 @@ pub fn process_dump_with_progress(
 
     Ok(PhaseResult {
         row_count: total_count,
-        filter_maps: merged_filters,
+        filter_maps: HashMap::new(), // drained during save
         sort_maps: merged_sorts,
         alive: merged_alive,
         deferred_slots: merged_deferred,
@@ -1876,23 +1877,20 @@ fn process_multi_value_phase(
             }
         }
 
-        let saved = save_filter_field_to_disk(bitmap_fs, &target, &result)?;
+        let result_count = result.len();
+        let saved = save_filter_field_to_disk(bitmap_fs, &target, result)?;
         let total_rows = total.load(Ordering::Relaxed);
         eprintln!(
             "  Dump {} ({target}): {} rows, {} distinct values ({:.1} MB)",
             request.name,
             total_rows,
-            result.len(),
+            result_count,
             saved as f64 / (1024.0 * 1024.0)
         );
 
         Ok(PhaseResult {
             row_count: total_rows,
-            filter_maps: {
-                let mut m = HashMap::new();
-                m.insert(target, result);
-                m
-            },
+            filter_maps: HashMap::new(), // drained during save
             sort_maps: HashMap::new(),
             alive: RoaringBitmap::new(),
             deferred_slots: BTreeMap::new(),
@@ -1986,23 +1984,20 @@ fn process_multi_value_phase(
             }
         }
 
-        let saved = save_filter_field_to_disk(bitmap_fs, &target, &merged)?;
+        let merged_count = merged.len();
+        let saved = save_filter_field_to_disk(bitmap_fs, &target, merged)?;
         let total_rows = total.load(Ordering::Relaxed);
         eprintln!(
             "  Dump {} ({target}): {} rows, {} distinct values ({:.1} MB)",
             request.name,
             total_rows,
-            merged.len(),
+            merged_count,
             saved as f64 / (1024.0 * 1024.0)
         );
 
         Ok(PhaseResult {
             row_count: total_rows,
-            filter_maps: {
-                let mut m = HashMap::new();
-                m.insert(target, merged);
-                m
-            },
+            filter_maps: HashMap::new(), // drained during save
             sort_maps: HashMap::new(),
             alive: RoaringBitmap::new(),
             deferred_slots: BTreeMap::new(),
