@@ -694,12 +694,72 @@ impl FilterBitmapStore {
                 .push((value, bm));
         }
         for ((field, bucket), entries) in by_bucket {
-            let key = FilterBucketKey { field, bucket };
-            let mut snap = BucketSnapshot::new();
-            for (value, bm) in entries {
-                snap.values.insert(value, bm.clone());
+            self.write_filter_bucket_raw(&field, bucket, &entries)?;
+        }
+        Ok(())
+    }
+
+    /// Write a filter bucket directly from (value, &bitmap) refs — zero clones.
+    ///
+    /// Encodes the bucket snapshot format inline without constructing a
+    /// BucketSnapshot or cloning any bitmaps.
+    pub fn write_filter_bucket_raw(&self, field: &str, bucket: u8, entries: &[(u64, &RoaringBitmap)]) -> io::Result<()> {
+        let key = FilterBucketKey { field: field.to_string(), bucket };
+        let gen = self.current_generation();
+        let shard_path = self.shard_path_in_gen(&key, gen);
+
+        // Encode bucket snapshot format directly from references:
+        // [u32 num_values]
+        // [index: N × (u64 value_id, u32 bitmap_offset, u32 bitmap_length)]
+        // [packed serialized roaring bitmaps]
+        let count = entries.len() as u32;
+        let mut snapshot_bytes = Vec::new();
+        snapshot_bytes.extend_from_slice(&count.to_le_bytes());
+
+        // Serialize bitmaps to get sizes for index table
+        let mut bitmap_data: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
+        for &(value, bm) in entries {
+            let mut bm_buf = Vec::with_capacity(bm.serialized_size());
+            bm.serialize_into(&mut bm_buf).expect("bitmap serialize");
+            bitmap_data.push((value, bm_buf));
+        }
+
+        // Write index table
+        let mut offset: u32 = 0;
+        for (value_id, bm_buf) in &bitmap_data {
+            snapshot_bytes.extend_from_slice(&value_id.to_le_bytes());
+            snapshot_bytes.extend_from_slice(&offset.to_le_bytes());
+            snapshot_bytes.extend_from_slice(&(bm_buf.len() as u32).to_le_bytes());
+            offset += bm_buf.len() as u32;
+        }
+
+        // Write packed bitmap data
+        for (_, bm_buf) in &bitmap_data {
+            snapshot_bytes.extend_from_slice(bm_buf);
+        }
+
+        // Write shard file
+        let ops_offset = crate::shard_store::HEADER_SIZE as u64 + snapshot_bytes.len() as u64;
+        let header = crate::shard_store::ShardHeader {
+            version: crate::shard_store::SHARD_VERSION,
+            ops_section_offset: ops_offset,
+            snapshot_len: snapshot_bytes.len() as u32,
+            ops_count: 0,
+            flags: 0,
+        };
+        crate::shard_store::write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])
+    }
+
+    /// Pre-create shard directories for a field's filter buckets.
+    /// Avoids per-write `create_dir_all` overhead during parallel writes.
+    pub fn ensure_filter_dirs(&self, field: &str, buckets: &[u8]) -> io::Result<()> {
+        let gen = self.current_generation();
+        for &bucket in buckets {
+            let key = FilterBucketKey { field: field.to_string(), bucket };
+            let shard_path = self.shard_path_in_gen(&key, gen);
+            if let Some(parent) = shard_path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-            self.write_snapshot(&key, &snap)?;
         }
         Ok(())
     }
@@ -743,6 +803,18 @@ impl SortBitmapStore {
         for (bit, bm) in layers.iter().enumerate() {
             let key = SortLayerShardKey { field: field.to_string(), bit_position: bit as u8 };
             self.write_snapshot(&key, bm)?;
+        }
+        Ok(())
+    }
+
+    /// Pre-create the sort field directory for a field.
+    /// Avoids per-layer `create_dir_all` overhead during writes.
+    pub fn ensure_sort_dir(&self, field: &str) -> io::Result<()> {
+        let gen = self.current_generation();
+        let key = SortLayerShardKey { field: field.to_string(), bit_position: 0 };
+        let shard_path = self.shard_path_in_gen(&key, gen);
+        if let Some(parent) = shard_path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
         Ok(())
     }

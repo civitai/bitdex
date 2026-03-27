@@ -1678,22 +1678,42 @@ pub fn save_phase_to_disk(
 
     let save_start = Instant::now();
 
-    // Parallel filter field saves via ShardStore — drain ownership for incremental memory release
+    // Parallel filter saves — drain into per-bucket Vecs, write buckets in parallel.
+    // Same pattern as the old BitmapFs path: parallel per-bucket writes with
+    // incremental drop. Each bucket drops after its shard file is written.
     let filter_items: Vec<_> = result.filter_maps.drain()
         .filter(|(_, values)| !values.is_empty())
         .collect();
+
+    // Pre-create shard directories for all fields (avoids per-write create_dir_all)
+    for (field_name, _) in &filter_items {
+        let buckets: Vec<u8> = (0..=255u8).collect();
+        filter_store.ensure_filter_dirs(field_name, &buckets)
+            .map_err(|e| format!("ensure_filter_dirs({field_name}): {e}"))?;
+    }
+
+    // Bucket and parallel-write each field
     let filter_results: Vec<Result<(String, usize), String>> = filter_items
         .into_par_iter()
         .map(|(field_name, values)| {
             let count = values.len();
-            // Build entries for write_full_filter: (field, value, bitmap)
-            let entries: Vec<(&str, u64, &RoaringBitmap)> = values.iter()
-                .map(|(v, bm)| (field_name.as_str(), *v, bm))
-                .collect();
-            filter_store.write_full_filter(&entries)
-                .map_err(|e| format!("write_full_filter({field_name}): {e}"))?;
-            // values dropped here — this field's bitmaps freed
-            drop(values);
+            // Drain into per-bucket owned Vecs
+            let mut by_bucket: HashMap<u8, Vec<(u64, RoaringBitmap)>> = HashMap::new();
+            for (value, bm) in values {
+                let bucket = ((value >> 8) & 0xFF) as u8;
+                by_bucket.entry(bucket).or_default().push((value, bm));
+            }
+            // Parallel bucket writes within each field
+            let buckets: Vec<_> = by_bucket.into_iter().collect();
+            buckets.into_par_iter().try_for_each(|(bucket, entries)| -> Result<(), String> {
+                let refs: Vec<(u64, &RoaringBitmap)> = entries.iter()
+                    .map(|(v, bm)| (*v, bm))
+                    .collect();
+                filter_store.write_filter_bucket_raw(&field_name, bucket, &refs)
+                    .map_err(|e| format!("write_bucket({field_name}, {bucket:02x}): {e}"))?;
+                drop(entries); // free this bucket's bitmaps
+                Ok(())
+            })?;
             Ok((field_name, count))
         })
         .collect();
@@ -1706,6 +1726,11 @@ pub fn save_phase_to_disk(
     let sort_items: Vec<_> = result.sort_maps.drain()
         .filter(|(_, layers)| !layers.is_empty() && layers.iter().any(|bm| !bm.is_empty()))
         .collect();
+    // Pre-create sort field dirs
+    for (field_name, _) in &sort_items {
+        sort_store.ensure_sort_dir(field_name)
+            .map_err(|e| format!("ensure_sort_dir({field_name}): {e}"))?;
+    }
     let sort_results: Vec<Result<(String, usize), String>> = sort_items
         .par_iter()
         .map(|(field_name, layers)| {

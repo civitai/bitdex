@@ -88,7 +88,7 @@ pub trait ShardingStrategy: Send + Sync + 'static {
 const SHARD_MAGIC: [u8; 4] = *b"BDSS"; // BitDex ShardStore
 
 /// Current shard file format version.
-const SHARD_VERSION: u32 = 1;
+pub(crate) const SHARD_VERSION: u32 = 1;
 
 /// Shard file header size in bytes.
 /// Layout:
@@ -99,7 +99,7 @@ const SHARD_VERSION: u32 = 1;
 ///   [4] ops_count (u32 LE) — number of ops entries in the log
 ///   [4] flags (u32 LE) — reserved for future use
 ///   = 28 bytes total
-const HEADER_SIZE: usize = 28;
+pub(crate) const HEADER_SIZE: usize = 28;
 
 /// Per-op entry overhead: [4] length + [4] crc32 = 8 bytes wrapping each op.
 #[allow(dead_code)]
@@ -301,7 +301,7 @@ fn read_shard_file_raw(path: &Path) -> io::Result<(ShardHeader, Vec<u8>, Vec<u8>
 }
 
 /// Write a complete shard file atomically (tmp → fsync → rename).
-fn write_shard_file_atomic(
+pub(crate) fn write_shard_file_atomic(
     path: &Path,
     header: &ShardHeader,
     snapshot_bytes: &[u8],
