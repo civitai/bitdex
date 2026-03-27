@@ -4466,6 +4466,8 @@ async fn handle_register_dump(
                             let sort_names: Vec<String> = idx.engine.config()
                                 .sort_fields.iter().map(|f| f.name.clone()).collect();
                             idx.engine.mark_fields_pending_reload(&filter_names, &sort_names);
+                            // Reload alive bitmap + slot counter from disk so queries work
+                            idx.engine.reload_alive_from_disk();
                         }
                     }
 
