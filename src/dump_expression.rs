@@ -107,6 +107,36 @@ pub struct EvalContext<'a> {
     pub lookup_key: Option<i64>,
 }
 
+/// Column name → index mapping for zero-allocation row access.
+/// Build once from CSV headers, reuse for every row in the phase.
+pub type ColumnIndex = HashMap<String, usize>;
+
+/// Build a ColumnIndex from CSV header names.
+pub fn build_column_index(headers: &[&str]) -> ColumnIndex {
+    headers.iter().enumerate().map(|(i, &name)| (name.to_string(), i)).collect()
+}
+
+/// Zero-allocation evaluation context using column indices.
+/// The row is a slice of parsed fields — no HashMap per row.
+pub struct IndexedEvalContext<'a> {
+    /// The current CSV row fields (indexed by column position).
+    pub fields: &'a [Option<&'a str>],
+    /// Column name → index mapping (shared across all rows).
+    pub col_idx: &'a ColumnIndex,
+    /// The enrichment join key value (for `lookup_key` expressions).
+    pub lookup_key: Option<i64>,
+}
+
+impl<'a> IndexedEvalContext<'a> {
+    /// Look up a column value by name.
+    #[inline]
+    pub fn get(&self, name: &str) -> Option<&'a str> {
+        self.col_idx.get(name)
+            .and_then(|&idx| self.fields.get(idx))
+            .and_then(|opt| opt.as_deref())
+    }
+}
+
 impl Expr {
     /// Evaluate the expression against a row context.
     pub fn eval(&self, ctx: &EvalContext) -> ExprValue {
@@ -208,6 +238,106 @@ impl Expr {
                 let mut max_val: Option<i64> = None;
                 for col in columns {
                     if let Some(Some(val)) = ctx.row.get(col.as_str()) {
+                        if let Ok(n) = val.parse::<i64>() {
+                            max_val = Some(match max_val {
+                                Some(cur) => cur.max(n),
+                                None => n,
+                            });
+                        }
+                    }
+                }
+                match max_val {
+                    Some(n) => ExprValue::Int(n),
+                    None => ExprValue::Null,
+                }
+            }
+        }
+    }
+
+    /// Evaluate against an indexed row context (zero-allocation per row).
+    /// This is the hot-path method for 107M+ row processing.
+    pub fn eval_indexed(&self, ctx: &IndexedEvalContext) -> ExprValue {
+        match self {
+            Expr::Column(name) => {
+                match ctx.get(name) {
+                    Some(val) if !val.is_empty() => {
+                        if let Ok(n) = val.parse::<i64>() {
+                            ExprValue::Int(n)
+                        } else if val == "true" || val == "t" {
+                            ExprValue::Bool(true)
+                        } else if val == "false" || val == "f" {
+                            ExprValue::Bool(false)
+                        } else {
+                            ExprValue::Str(val.to_string())
+                        }
+                    }
+                    _ => ExprValue::Null,
+                }
+            }
+            Expr::IntLit(n) => ExprValue::Int(*n),
+            Expr::StrLit(s) => ExprValue::Str(s.clone()),
+            Expr::BoolLit(b) => ExprValue::Bool(*b),
+            Expr::NullLit => ExprValue::Null,
+            Expr::LookupKey => match ctx.lookup_key {
+                Some(k) => ExprValue::Int(k),
+                None => ExprValue::Null,
+            },
+            Expr::BitfieldExtract { expr, shift, mask } => {
+                match expr.eval_indexed(ctx).as_i64() {
+                    Some(n) => ExprValue::Int((n >> shift) & (*mask as i64)),
+                    None => ExprValue::Null,
+                }
+            }
+            Expr::Eq(left, right) => {
+                let l = left.eval_indexed(ctx);
+                let r = right.eval_indexed(ctx);
+                if l.is_null() && r.is_null() {
+                    return ExprValue::Bool(true);
+                }
+                if l.is_null() || r.is_null() {
+                    return ExprValue::Bool(false);
+                }
+                let result = match (&l, &r) {
+                    (ExprValue::Int(a), ExprValue::Int(b)) => a == b,
+                    (ExprValue::Str(a), ExprValue::Str(b)) => a == b,
+                    (ExprValue::Bool(a), ExprValue::Bool(b)) => a == b,
+                    _ => l.as_i64() == r.as_i64(),
+                };
+                ExprValue::Bool(result)
+            }
+            Expr::NotEq(left, right) => {
+                let l = left.eval_indexed(ctx);
+                let r = right.eval_indexed(ctx);
+                if r.is_null() {
+                    return ExprValue::Bool(!l.is_null());
+                }
+                if l.is_null() {
+                    return ExprValue::Bool(true);
+                }
+                let result = match (&l, &r) {
+                    (ExprValue::Int(a), ExprValue::Int(b)) => a != b,
+                    (ExprValue::Str(a), ExprValue::Str(b)) => a != b,
+                    (ExprValue::Bool(a), ExprValue::Bool(b)) => a != b,
+                    _ => l.as_i64() != r.as_i64(),
+                };
+                ExprValue::Bool(result)
+            }
+            Expr::And(left, right) => {
+                if !left.eval_indexed(ctx).as_bool() {
+                    return ExprValue::Bool(false);
+                }
+                ExprValue::Bool(right.eval_indexed(ctx).as_bool())
+            }
+            Expr::Or(left, right) => {
+                if left.eval_indexed(ctx).as_bool() {
+                    return ExprValue::Bool(true);
+                }
+                ExprValue::Bool(right.eval_indexed(ctx).as_bool())
+            }
+            Expr::Max(columns) => {
+                let mut max_val: Option<i64> = None;
+                for col in columns {
+                    if let Some(val) = ctx.get(col) {
                         if let Ok(n) = val.parse::<i64>() {
                             max_val = Some(match max_val {
                                 Some(cur) => cur.max(n),
@@ -518,6 +648,13 @@ impl FilterExpression {
         let ctx = EvalContext { row, lookup_key };
         self.expr.eval(&ctx).as_bool()
     }
+
+    /// Evaluate against an indexed row (zero-allocation hot path).
+    #[inline]
+    pub fn eval_indexed(&self, fields: &[Option<&str>], col_idx: &ColumnIndex, lookup_key: Option<i64>) -> bool {
+        let ctx = IndexedEvalContext { fields, col_idx, lookup_key };
+        self.expr.eval_indexed(&ctx).as_bool()
+    }
 }
 
 /// A parsed computed field definition.
@@ -574,6 +711,35 @@ impl ComputedFieldDef {
         } else {
             // Standard: expression IS the value
             let val = self.expr.eval(&ctx);
+            if val.is_null() {
+                None
+            } else {
+                Some(val)
+            }
+        }
+    }
+
+    /// Evaluate against an indexed row (zero-allocation hot path).
+    pub fn eval_indexed(&self, fields: &[Option<&str>], col_idx: &ColumnIndex, lookup_key: Option<i64>) -> Option<ExprValue> {
+        let ctx = IndexedEvalContext { fields, col_idx, lookup_key };
+
+        if let Some(ref value_col) = self.value_column {
+            if self.expr.eval_indexed(&ctx).as_bool() {
+                match ctx.get(value_col) {
+                    Some(val) if !val.is_empty() => {
+                        if let Ok(n) = val.parse::<i64>() {
+                            Some(ExprValue::Int(n))
+                        } else {
+                            Some(ExprValue::Str(val.to_string()))
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            let val = self.expr.eval_indexed(&ctx);
             if val.is_null() {
                 None
             } else {

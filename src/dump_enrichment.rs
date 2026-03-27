@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use crate::dictionary::FieldDictionary;
 use crate::dump_expression::{
-    ComputedFieldDef, CsvRow, EvalContext, ExprValue, FilterExpression,
+    ColumnIndex, ComputedFieldDef, CsvRow, EvalContext, ExprValue, FilterExpression,
 };
 
 /// Configuration for a single enrichment level, parsed from the dump request body.
@@ -252,12 +252,62 @@ impl EnrichmentTable {
             None => return result,
         };
 
-        let lookup_csv: CsvRow = lookup_row.to_csv_row();
+        self.enrich_from_lookup(lookup_row, join_key, config, &mut result);
+        result
+    }
 
-        // Check this level's filter (if any)
+    /// Enrich using indexed parent row (zero-allocation hot path for 107M+ rows).
+    ///
+    /// The parent row is `&[Option<&str>]` + `ColumnIndex` — no HashMap per row.
+    pub fn enrich_indexed(
+        &self,
+        parent_fields: &[Option<&str>],
+        parent_col_idx: &ColumnIndex,
+        config: &EnrichmentConfig,
+    ) -> EnrichedFields {
+        let mut result = EnrichedFields::default();
+
+        let join_value = match parent_col_idx.get(&config.join_on) {
+            Some(&idx) => match parent_fields.get(idx) {
+                Some(Some(v)) if !v.is_empty() => *v,
+                _ => return result,
+            },
+            None => return result,
+        };
+
+        let join_key: i64 = match join_value.parse() {
+            Ok(k) => k,
+            Err(_) => return result,
+        };
+
+        let lookup_row = match self.get(join_key) {
+            Some(row) => row,
+            None => return result,
+        };
+
+        self.enrich_from_lookup(lookup_row, join_key, config, &mut result);
+        result
+    }
+
+    /// Core enrichment: extract fields + eval computed from a lookup row.
+    /// Uses LookupRow's internal Vec + col_index for expression eval (no HashMap per lookup).
+    fn enrich_from_lookup(
+        &self,
+        lookup_row: &LookupRow,
+        join_key: i64,
+        config: &EnrichmentConfig,
+        result: &mut EnrichedFields,
+    ) {
+        // Borrow lookup row's Vec as indexed fields for expression eval
+        let lookup_fields: Vec<Option<&str>> = lookup_row.values.iter()
+            .map(|v| v.as_deref())
+            .collect();
+        let lookup_col_idx = lookup_row.col_index.as_ref();
+
+        // Check this level's filter
         if let Some(ref filter) = config.filter {
-            if !filter.eval(&lookup_csv, Some(join_key)) {
-                return result; // Filter failed → no fields from this level or children
+            if !filter.eval_indexed(&lookup_fields, lookup_col_idx, Some(join_key)) {
+                return;
             }
         }
 
@@ -268,21 +318,31 @@ impl EnrichmentTable {
             }
         }
 
-        // Evaluate computed fields
+        // Evaluate computed fields via indexed path
         for cf in &config.computed_fields {
-            if let Some(value) = cf.eval(&lookup_csv, Some(join_key)) {
+            if let Some(value) = cf.eval_indexed(&lookup_fields, lookup_col_idx, Some(join_key)) {
                 result.computed.push((cf.target.clone(), value));
             }
         }
 
-        // Resolve nested enrichment (recursive, with filter)
+        // Resolve nested enrichment (recursive)
         if let (Some(ref child_table), Some(ref child_config)) = (&self.child, &config.child) {
-            let nested = child_table.enrich(&lookup_csv, child_config);
-            result.fields.extend(nested.fields);
-            result.computed.extend(nested.computed);
+            // Use lookup row's indexed fields as parent for next level
+            let join_value = match lookup_col_idx.get(&child_config.join_on) {
+                Some(&idx) => match lookup_fields.get(idx) {
+                    Some(Some(v)) if !v.is_empty() => *v,
+                    _ => return,
+                },
+                None => return,
+            };
+            let child_key: i64 = match join_value.parse() {
+                Ok(k) => k,
+                Err(_) => return,
+            };
+            if let Some(child_row) = child_table.get(child_key) {
+                child_table.enrich_from_lookup(child_row, child_key, child_config, result);
+            }
         }
-
-        result
     }
 
     /// Memory usage estimate in bytes.
