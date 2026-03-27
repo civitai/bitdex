@@ -1913,10 +1913,10 @@ fn process_multi_value_phase(
                     if value < MAX_TAG_ID {
                         bitmaps[value].insert(slot);
                     }
-                    // Write individual value directly to docstore (no in-memory accumulation)
+                    // Write individual value to docstore as Mi (multi-value marker)
                     if let Some(fidx) = field_idx {
                         doc_buf.clear();
-                        if rmp_serde::encode::write(&mut doc_buf, &PackedValue::I(value as i64)).is_ok() {
+                        if rmp_serde::encode::write(&mut doc_buf, &PackedValue::Mi(vec![value as i64])).is_ok() {
                             bulk_writer.append_tuple_raw(slot, fidx, &doc_buf);
                         }
                     }
@@ -2026,10 +2026,10 @@ fn process_multi_value_phase(
                         .entry(value)
                         .or_insert_with(RoaringBitmap::new)
                         .insert(slot);
-                    // Write individual value directly to docstore (no in-memory accumulation)
+                    // Write individual value to docstore as Mi (multi-value marker)
                     if let Some(fidx) = field_idx {
                         doc_buf.clear();
-                        if rmp_serde::encode::write(&mut doc_buf, &PackedValue::I(value as i64)).is_ok() {
+                        if rmp_serde::encode::write(&mut doc_buf, &PackedValue::Mi(vec![value as i64])).is_ok() {
                             bulk_writer.append_tuple_raw(slot, fidx, &doc_buf);
                         }
                     }
