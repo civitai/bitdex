@@ -1176,14 +1176,19 @@ pub fn process_dump_with_progress(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    // Load enrichment tables (Nate's API)
+    // Load enrichment tables (Nate's API) — per-table timing
     emit_stage(&request.name, "enrichment", "start", &t, 0);
     let mut enrichment_mgr = dump_enrichment::EnrichmentManager::new();
     for ec in &request.enrichment {
+        let table_name = ec.table.as_deref()
+            .or(ec.csv_path.as_deref())
+            .unwrap_or("unknown");
+        let t_enrich_load = Instant::now();
         let nate_config = to_nate_enrichment_config(ec, stage_dir);
         enrichment_mgr
             .load(nate_config)
             .map_err(|e| format!("load enrichment: {e}"))?;
+        eprintln!("  Enrichment '{}': loaded in {:.2}s", table_name, t_enrich_load.elapsed().as_secs_f64());
     }
     emit_stage(&request.name, "enrichment", "done", &t, 0);
 
@@ -1356,6 +1361,7 @@ pub fn process_dump_with_progress(
     let timing_bitmap_sort_ns = AtomicU64::new(0);
     let timing_docstore_ns = AtomicU64::new(0);
     let timing_computed_ns = AtomicU64::new(0);
+    let timing_total_row_ns = AtomicU64::new(0);
 
     let thread_results: Vec<ThreadResult> = ranges
         .par_iter()
@@ -1405,6 +1411,7 @@ pub fn process_dump_with_progress(
             let mut local_bitmap_sort_ns: u64 = 0;
             let mut local_docstore_ns: u64 = 0;
             let mut local_computed_ns: u64 = 0;
+            let mut local_total_row_ns: u64 = 0;
 
             for i in 0..chunk.len() {
                 if chunk[i] != b'\n' {
@@ -1636,6 +1643,7 @@ pub fn process_dump_with_progress(
                     &mut tuple_buf,
                 );
                 local_docstore_ns += t_doc.elapsed().as_nanos() as u64;
+                local_total_row_ns += t_parse.elapsed().as_nanos() as u64;
 
                 count += 1;
                 if count % LOG_INTERVAL == 0 {
@@ -1657,6 +1665,7 @@ pub fn process_dump_with_progress(
             timing_bitmap_sort_ns.fetch_add(local_bitmap_sort_ns, Ordering::Relaxed);
             timing_docstore_ns.fetch_add(local_docstore_ns, Ordering::Relaxed);
             timing_computed_ns.fetch_add(local_computed_ns, Ordering::Relaxed);
+            timing_total_row_ns.fetch_add(local_total_row_ns, Ordering::Relaxed);
 
             (filter_maps, sort_maps, alive, deferred, count, max_slot)
         })
@@ -1755,7 +1764,11 @@ pub fn process_dump_with_progress(
     let bs_ns = timing_bitmap_sort_ns.load(Ordering::Relaxed);
     let d_ns = timing_docstore_ns.load(Ordering::Relaxed);
     let c_ns = timing_computed_ns.load(Ordering::Relaxed);
+    let tr_ns = timing_total_row_ns.load(Ordering::Relaxed);
+    let component_sum = p_ns + fl_ns + f_ns + e_ns + d_ns + c_ns;
+    let overhead_ns = tr_ns.saturating_sub(component_sum);
     eprintln!("  Component breakdown (thread-seconds across {} threads):", num_threads);
+    eprintln!("    total_row:     {:.2}s", tr_ns as f64 / 1e9);
     eprintln!("    parse:         {:.2}s", p_ns as f64 / 1e9);
     eprintln!("    field_loop:    {:.2}s (includes bitmap_filter + bitmap_sort)", fl_ns as f64 / 1e9);
     eprintln!("    filter:        {:.2}s", f_ns as f64 / 1e9);
@@ -1764,12 +1777,13 @@ pub fn process_dump_with_progress(
     eprintln!("    bitmap_sort:   {:.2}s", bs_ns as f64 / 1e9);
     eprintln!("    docstore:      {:.2}s", d_ns as f64 / 1e9);
     eprintln!("    computed:      {:.2}s", c_ns as f64 / 1e9);
+    eprintln!("    overhead:      {:.2}s (line scan, alloc, deferred checks, etc)", overhead_ns as f64 / 1e9);
     // Structured JSON for monitoring
     eprintln!(
-        r#"{{"dump":"{}","stage":"component_timing","threads":{},"parse_s":{:.3},"field_loop_s":{:.3},"filter_s":{:.3},"enrich_s":{:.3},"bitmap_filter_s":{:.3},"bitmap_sort_s":{:.3},"docstore_s":{:.3},"computed_s":{:.3}}}"#,
+        r#"{{"dump":"{}","stage":"component_timing","threads":{},"total_row_s":{:.3},"parse_s":{:.3},"field_loop_s":{:.3},"filter_s":{:.3},"enrich_s":{:.3},"bitmap_filter_s":{:.3},"bitmap_sort_s":{:.3},"docstore_s":{:.3},"computed_s":{:.3},"overhead_s":{:.3}}}"#,
         request.name, num_threads,
-        p_ns as f64 / 1e9, fl_ns as f64 / 1e9, f_ns as f64 / 1e9, e_ns as f64 / 1e9,
-        bf_ns as f64 / 1e9, bs_ns as f64 / 1e9, d_ns as f64 / 1e9, c_ns as f64 / 1e9,
+        tr_ns as f64 / 1e9, p_ns as f64 / 1e9, fl_ns as f64 / 1e9, f_ns as f64 / 1e9, e_ns as f64 / 1e9,
+        bf_ns as f64 / 1e9, bs_ns as f64 / 1e9, d_ns as f64 / 1e9, c_ns as f64 / 1e9, overhead_ns as f64 / 1e9,
     );
 
     let elapsed = t.elapsed();
@@ -1816,6 +1830,7 @@ pub fn save_phase_to_disk(
 
     let save_start = Instant::now();
 
+    let t_filter_save = Instant::now();
     // Parallel filter saves — drain into per-bucket Vecs, write buckets in parallel.
     // Same pattern as the old BitmapFs path: parallel per-bucket writes with
     // incremental drop. Each bucket drops after its shard file is written.
@@ -1860,6 +1875,9 @@ pub fn save_phase_to_disk(
         eprintln!("  Saved filter {}: {} values", field_name, count);
     }
 
+    let filter_save_secs = t_filter_save.elapsed().as_secs_f64();
+
+    let t_sort_save = Instant::now();
     // Parallel sort field saves via ShardStore — drain for memory release
     let sort_items: Vec<_> = result.sort_maps.drain()
         .filter(|(_, layers)| !layers.is_empty() && layers.iter().any(|bm| !bm.is_empty()))
@@ -1883,9 +1901,9 @@ pub fn save_phase_to_disk(
         eprintln!("  Saved sort {}: {} layers", field_name, num_layers);
     }
 
-    eprintln!("  Bitmap save complete in {:.1}s", save_start.elapsed().as_secs_f64());
-    emit_stage(dump_name, "bitmap_save", "done", &t, result.row_count);
+    let sort_save_secs = t_sort_save.elapsed().as_secs_f64();
 
+    let t_meta_save = Instant::now();
     if sets_alive {
         alive_store
             .write_alive(&result.alive)
@@ -1912,8 +1930,10 @@ pub fn save_phase_to_disk(
             eprintln!("  Saved deferred alive: {} slots", deferred_total);
         }
     }
+    let meta_save_secs = t_meta_save.elapsed().as_secs_f64();
 
     // Persist LCS dictionaries
+    let t_dict_save = Instant::now();
     let dict_dir = bitmap_path.join("dictionaries");
     std::fs::create_dir_all(&dict_dir).ok();
     for (name, dict) in dictionaries {
@@ -1928,6 +1948,16 @@ pub fn save_phase_to_disk(
             eprintln!("  Saved dictionary '{name}': {} entries", snap.forward.len());
         }
     }
+    let dict_save_secs = t_dict_save.elapsed().as_secs_f64();
+
+    let total_save_secs = save_start.elapsed().as_secs_f64();
+    eprintln!("  Save breakdown: filter={:.2}s sort={:.2}s alive_meta={:.2}s dict={:.2}s total={:.2}s",
+        filter_save_secs, sort_save_secs, meta_save_secs, dict_save_secs, total_save_secs);
+    eprintln!(
+        r#"{{"dump":"{}","stage":"save_timing","filter_s":{:.3},"sort_s":{:.3},"alive_meta_s":{:.3},"dict_s":{:.3},"total_s":{:.3}}}"#,
+        dump_name, filter_save_secs, sort_save_secs, meta_save_secs, dict_save_secs, total_save_secs,
+    );
+    emit_stage(dump_name, "bitmap_save", "done", &t, result.row_count);
 
     Ok(())
 }
