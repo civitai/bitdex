@@ -22,7 +22,7 @@ use super::bitdex_client::BitdexClient;
 /// Process collection_items.csv: build collectionIds filter bitmaps.
 /// Returns HashMap<collection_id_u64, RoaringBitmap>.
 ///
-/// Same mmap+rayon pattern as process_tags_csv in single_pass.rs.
+/// Uses mmap+rayon parallel parse pattern.
 /// CSV format: collectionId,imageId (2 columns, no header).
 pub fn process_collection_items_csv(
     stage_dir: &Path,
@@ -178,7 +178,39 @@ pub fn save_collection_bitmaps(
     bitmap_fs: &BitmapFs,
     bitmaps: &HashMap<u64, RoaringBitmap>,
 ) -> Result<u64, String> {
-    crate::pg_sync::single_pass::save_filter_field_to_disk(bitmap_fs, "collectionIds", bitmaps)
+    save_filter_field_to_disk(bitmap_fs, "collectionIds", bitmaps)
+}
+
+/// Write a HashMap<u64, RoaringBitmap> to BitmapFs as hex-bucketed fpack files.
+///
+/// Bucket key = `(value >> 8) & 0xFF` matching BitmapFs::filter_bucket().
+/// Returns total bytes serialized.
+fn save_filter_field_to_disk(
+    bitmap_fs: &BitmapFs,
+    field_name: &str,
+    bitmaps: &HashMap<u64, RoaringBitmap>,
+) -> Result<u64, String> {
+    use std::collections::HashMap as StdMap;
+
+    // Group entries by hex bucket
+    let mut by_bucket: StdMap<u8, Vec<(u64, &RoaringBitmap)>> = StdMap::new();
+    for (value, bm) in bitmaps {
+        let bucket = ((*value >> 8) & 0xFF) as u8;
+        by_bucket.entry(bucket).or_default().push((*value, bm));
+    }
+
+    let mut total_bytes = 0u64;
+    for (bucket, entries) in &by_bucket {
+        bitmap_fs
+            .write_filter_bucket(field_name, *bucket, entries)
+            .map_err(|e| format!("write_filter_bucket({field_name}/{bucket:02x}): {e}"))?;
+        // Estimate bytes from bitmap serialized sizes
+        for (_, bm) in entries {
+            total_bytes += bm.serialized_size() as u64;
+        }
+    }
+
+    Ok(total_bytes)
 }
 
 /// Check if a filter_only field needs backfilling by checking its cursor.

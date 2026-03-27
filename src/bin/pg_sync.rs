@@ -1,9 +1,10 @@
-//! bitdex-pg-sync binary: Postgres-to-Bitdex sync system.
+//! bitdex-pg-sync binary: Postgres-to-Bitdex sync system (V2).
 //!
 //! Subcommands:
-//!   load  — Create BitdexOutbox table/triggers + bulk load from PG + save snapshot
-//!   sync  — Outbox poller + ClickHouse metrics poller (steady-state)
-//!   setup — Create BitdexOutbox table/triggers only
+//!   load     — Download CSVs from PG/ClickHouse + seed cursor (V2 dump pipeline)
+//!   sync     — V2 ops poller + ClickHouse metrics poller (steady-state)
+//!   setup    — Create BitdexOutbox table/triggers only
+//!   validate — Check config, paths, and CSV availability
 
 #[global_allocator]
 static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
@@ -19,10 +20,9 @@ use bitdex_v2::pg_sync::bitdex_client::BitdexClient;
 use bitdex_v2::pg_sync::bulk_loader;
 use bitdex_v2::pg_sync::config::{IndexDefinition, PgSyncConfig};
 use bitdex_v2::pg_sync::metrics_poller;
-use bitdex_v2::pg_sync::outbox_poller;
+use bitdex_v2::pg_sync::ops_poller;
 use bitdex_v2::pg_sync::progress::{self, LoadProgress};
 use bitdex_v2::pg_sync::queries;
-use bitdex_v2::pg_sync::single_pass;
 
 #[derive(Parser)]
 #[command(name = "pg-sync", about = "Postgres-to-Bitdex sync system")]
@@ -259,9 +259,6 @@ async fn main() {
                     std::process::exit(1);
                 });
 
-            // No enter_loading_mode — single_pass writes directly to BitmapFs.
-            // Loading mode would trigger a snapshot save on exit that overwrites our bitmaps.
-
             // Set up progress tracking + HTTP endpoint
             let load_progress = Arc::new(LoadProgress::new());
             let progress_shutdown = if let Some(port) = sync_config.progress_port {
@@ -298,45 +295,31 @@ async fn main() {
                 eprintln!("WARNING: No clickhouse_url configured — metric sort fields will be 0");
             }
 
-            // Single-pass V2 loader: CSV → bitmaps + V2 docstore tuples in one pass
-            eprintln!("=== Using single-pass V2 loader ===");
-            let stats = single_pass::run_single_pass_v2(
-                &engine,
-                &index_def,
-                &stage_dir,
-                Arc::clone(&load_progress),
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("Single-pass V2 bulk load failed: {e}");
-                std::process::exit(1);
-            });
+            // V2 dump pipeline: CSVs are now processed via WAL ops through the
+            // server's /ops endpoint. Use `pg-sync sync` after starting the server
+            // with the downloaded CSVs, or implement the V2 dump pipeline here.
+            //
+            // The V1 single-pass in-process loader has been removed.
+            // TODO: Wire V2 dump pipeline (csv_ops → WAL file → server /ops endpoint).
+            eprintln!("=== CSV download complete ===");
+            eprintln!("V1 in-process loader removed. CSVs are staged at: {}", stage_dir.display());
+            eprintln!("Use the V2 dump pipeline to load CSVs via the server's /ops endpoint.");
 
             // Shut down progress server
             if let Some(tx) = progress_shutdown {
                 let _ = tx.send(());
             }
-
-            // No exit_loading_mode needed — single_pass wrote everything to BitmapFs directly.
-            // The process exits after this; the server will restore from disk on next start.
-
-            eprintln!(
-                "Bulk load complete: {} records in {:.1}s ({:.0}/s)",
-                stats.records_loaded,
-                stats.elapsed.as_secs_f64(),
-                stats.records_loaded as f64 / stats.elapsed.as_secs_f64()
-            );
         }
 
         Commands::Sync => {
             let bitdex_url = sync_config.bitdex_url.as_deref().unwrap_or("http://localhost:3000");
             let bitdex_client = BitdexClient::with_index(bitdex_url, Some(&index_def.name));
-            let bitmap_path = index_storage_dir.join(&sync_config.bitmap_subdir);
 
             eprintln!("Starting sync (bitdex={bitdex_url})...");
 
-            // Run outbox poller and metrics poller concurrently
+            // Run V2 ops poller and metrics poller concurrently
             let cursor_name = format!("pg-sync-{}", sync_config.replica_id);
-            let outbox_fut = outbox_poller::run_outbox_poller(
+            let ops_fut = ops_poller::run_ops_poller(
                 &pool,
                 &bitdex_client,
                 sync_config.poll_interval_secs,
@@ -359,17 +342,17 @@ async fn main() {
 
                 // Run both pollers concurrently
                 tokio::select! {
-                    res = outbox_fut => {
-                        eprintln!("Outbox poller exited: {res:?}");
+                    res = ops_fut => {
+                        eprintln!("Ops poller exited: {res:?}");
                     }
                     res = metrics_fut => {
                         eprintln!("Metrics poller exited: {res:?}");
                     }
                 }
             } else {
-                eprintln!("No clickhouse_url configured — outbox poller only");
-                if let Err(e) = outbox_fut.await {
-                    eprintln!("Outbox poller error: {e}");
+                eprintln!("No clickhouse_url configured — ops poller only");
+                if let Err(e) = ops_fut.await {
+                    eprintln!("Ops poller error: {e}");
                     std::process::exit(1);
                 }
             }
