@@ -233,6 +233,12 @@ fn read_op_entries<O: OpCodec>(data: &[u8]) -> Vec<O::Op> {
     ops
 }
 
+/// Public wrapper around `read_op_entries` for use by sibling modules
+/// (e.g., `shard_store_bitmap` reading packed sort shard ops).
+pub fn read_op_entries_pub<O: OpCodec>(data: &[u8]) -> Vec<O::Op> {
+    read_op_entries::<O>(data)
+}
+
 /// Simple CRC32 (IEEE / CRC-32C via software). We use a basic lookup table.
 fn crc32_of(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
