@@ -408,6 +408,17 @@ impl EnrichmentManager {
         combined
     }
 
+    /// Enrich a row using indexed fields (zero-allocation hot path).
+    pub fn enrich_row_indexed(&self, fields: &[Option<&str>], col_idx: &crate::dump_expression::ColumnIndex) -> EnrichedFields {
+        let mut combined = EnrichedFields::default();
+        for (table, config) in self.tables.values() {
+            let enriched = table.enrich_indexed(fields, col_idx, config);
+            combined.fields.extend(enriched.fields);
+            combined.computed.extend(enriched.computed);
+        }
+        combined
+    }
+
     /// Drop all tables to free memory. Call after the phase completes.
     pub fn clear(&mut self) {
         self.tables.clear();

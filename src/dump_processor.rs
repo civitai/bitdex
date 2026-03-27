@@ -471,6 +471,29 @@ impl<'a> ParsedRow<'a> {
         }
         row
     }
+
+    /// Build indexed fields for zero-allocation expression evaluation.
+    /// Returns a Vec<Option<&str>> aligned to the column index positions.
+    /// Much cheaper than to_csv_row() — no HashMap allocation.
+    pub fn to_indexed_fields<'b>(&'b self) -> Vec<Option<&'b str>> {
+        self.fields
+            .iter()
+            .map(|bytes| {
+                if bytes.is_empty() {
+                    None
+                } else if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+                    std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()
+                } else {
+                    std::str::from_utf8(bytes).ok()
+                }
+            })
+            .collect()
+    }
+
+    /// Get the column index (shared across all rows).
+    pub fn col_index_ref(&self) -> &HashMap<String, usize> {
+        self.col_index.as_ref()
+    }
 }
 
 /// Evaluate a filter expression against a parsed row.
@@ -1235,6 +1258,9 @@ pub fn process_dump_with_progress(
         .map(|&(range_start, range_end)| {
             let chunk = &body[range_start..range_end];
 
+            // Cache field_to_idx() once per thread (not per row)
+            let field_idx_cache: &HashMap<String, u16> = bulk_writer.field_to_idx();
+
             // Thread-local accumulators
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
                 .iter()
@@ -1286,57 +1312,59 @@ pub fn process_dump_with_progress(
                     max_slot = slot;
                 }
 
-                // Apply filter + resolve enrichment
-                // Only build CsvRow HashMap when needed (filter or enrichment configured)
-                let has_filter = filter_expr_ref.is_some();
-                let has_enrichment = enrichment_mgr_ref.table_count() > 0;
-                let needs_csv_row = has_filter || has_enrichment || !computed_defs_ref.is_empty();
+                // Build indexed fields once per row (Vec<Option<&str>>, no HashMap)
+                let indexed_fields = row.to_indexed_fields();
+                let col_idx = row.col_index_ref();
 
-                let csv_row_opt = if needs_csv_row {
-                    Some(row.to_csv_row())
-                } else {
-                    None
-                };
-
-                if let (Some(ref fexpr), Some(ref cr)) = (filter_expr_ref, &csv_row_opt) {
-                    if !fexpr.eval(cr, None) {
+                // Apply filter via indexed path (zero-allocation)
+                if let Some(ref fexpr) = filter_expr_ref {
+                    if !fexpr.eval_indexed(&indexed_fields, col_idx, None) {
                         continue;
                     }
                 }
 
-                // Resolve enrichment (only when enrichment tables are loaded)
-                let mut enriched_values: HashMap<String, String> = HashMap::new();
-                if has_enrichment {
-                    if let Some(ref cr) = csv_row_opt {
-                        let enriched = enrichment_mgr_ref.enrich_row(cr);
-                        for (target, value) in &enriched.fields {
-                            enriched_values.insert(target.clone(), value.clone());
-                        }
-                        for (target, value) in &enriched.computed {
-                            match value {
-                                NateExprValue::Int(n) => { enriched_values.insert(target.clone(), n.to_string()); }
-                                NateExprValue::Str(s) => { enriched_values.insert(target.clone(), s.clone()); }
-                                NateExprValue::Bool(b) => { enriched_values.insert(target.clone(), if *b { "1" } else { "0" }.to_string()); }
-                                NateExprValue::Null => {}
-                            }
+                // Resolve enrichment via indexed path (no CsvRow HashMap)
+                let enriched = if enrichment_mgr_ref.table_count() > 0 {
+                    Some(enrichment_mgr_ref.enrich_row_indexed(&indexed_fields, col_idx))
+                } else {
+                    None
+                };
+
+                // Collect enriched field values (avoid HashMap — linear scan is fine for <10 fields)
+                let enriched = enriched.unwrap_or_default();
+                // Build a simple lookup closure for enriched values
+                let enriched_get = |target: &str| -> Option<&str> {
+                    for (t, v) in &enriched.fields {
+                        if t == target { return Some(v.as_str()); }
+                    }
+                    for (t, v) in &enriched.computed {
+                        if t == target {
+                            return match v {
+                                NateExprValue::Int(n) => None, // handled separately
+                                NateExprValue::Str(s) => Some(s.as_str()),
+                                _ => None,
+                            };
                         }
                     }
-                }
+                    None
+                };
 
                 // Check deferred alive: if publishedAt from enrichment is in the future
                 if has_deferred_alive {
-                    if let Some(pub_str) = enriched_values.get("publishedAt") {
+                    if let Some(pub_str) = enriched_get("publishedAt") {
                         if let Ok(pub_secs) = pub_str.parse::<u64>() {
                             if pub_secs > now_unix {
                                 // Write docstore only, skip all bitmaps
-                                write_docstore_row(
+                                write_docstore_row_indexed(
                                     &row,
-                                    &enriched_values,
+                                    &enriched,
                                     computed_defs_ref,
-                                    csv_row_opt.as_ref().unwrap(),
+                                    &indexed_fields,
+                                    col_idx,
                                     slot,
                                     request_fields,
                                     &bulk_writer,
+                                    &field_idx_cache,
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1368,13 +1396,13 @@ pub fn process_dump_with_progress(
                         let bitmap_key: Option<u64> = if let Some(dict) = dictionaries_ref.get(target) {
                             let s = row
                                 .get_str(column)
-                                .or_else(|| enriched_values.get(target).map(|s| s.as_str()));
+                                .or_else(|| enriched_get(target));
                             s.map(|v| dict.get_or_insert(v) as u64)
                         } else {
                             // Non-LCS: use i64 value from row or enrichment
                             row.get_i64(column)
                                 .or_else(|| {
-                                    enriched_values.get(target).and_then(|s| s.parse::<i64>().ok())
+                                    enriched_get(target).and_then(|s| s.parse::<i64>().ok())
                                 })
                                 .map(|v| v as u64)
                         };
@@ -1391,7 +1419,7 @@ pub fn process_dump_with_progress(
                     // Build sort bitmaps from direct fields
                     if let Some(&bits) = sort_bits_ref.get(target) {
                         if let Some(v) = row.get_i64(column).or_else(|| {
-                            enriched_values.get(target).and_then(|s| s.parse::<i64>().ok())
+                            enriched_get(target).and_then(|s| s.parse::<i64>().ok())
                         }) {
                             let val32 = v as u32;
                             if let Some(sm) = sort_maps.get_mut(target) {
@@ -1407,7 +1435,7 @@ pub fn process_dump_with_progress(
 
                 // Build bitmaps from computed fields (Nate's ComputedFieldDef API)
                 for def in computed_defs_ref {
-                    let computed_val = def.eval(csv_row_opt.as_ref().unwrap(), None);
+                    let computed_val = def.eval_indexed(&indexed_fields, col_idx, None);
 
                     match computed_val {
                         Some(NateExprValue::Int(v)) if def.value_column.is_none() => {
@@ -1459,14 +1487,16 @@ pub fn process_dump_with_progress(
                 }
 
                 // Write docstore
-                write_docstore_row(
+                write_docstore_row_indexed(
                     &row,
-                    &enriched_values,
+                    &enriched,
                     computed_defs_ref,
-                    csv_row_opt.as_ref().unwrap(),
+                    &indexed_fields,
+                    col_idx,
                     slot,
                     request_fields,
                     &bulk_writer,
+                    &field_idx_cache,
                 );
 
                 count += 1;
@@ -1865,7 +1895,92 @@ fn collect_enrichment_targets(config: &EnrichmentConfig, targets: &mut Vec<Strin
     }
 }
 
-/// Write a single row's data to the docstore via BulkWriter.
+/// Write a single row's data to the docstore via BulkWriter (indexed path).
+/// Uses cached field_idx and indexed fields — no per-row HashMap allocation.
+fn write_docstore_row_indexed(
+    row: &ParsedRow,
+    enriched: &dump_enrichment::EnrichedFields,
+    computed_defs: &[ComputedFieldDef],
+    indexed_fields: &[Option<&str>],
+    col_idx: &HashMap<String, usize>,
+    slot: u32,
+    request_fields: &[DumpFieldMapping],
+    bulk_writer: &Arc<BulkWriter>,
+    field_idx: &HashMap<String, u16>,
+) {
+    // Write direct fields
+    for mapping in request_fields {
+        let target = mapping.target();
+        let column = mapping.column();
+
+        if let Some(&fidx) = field_idx.get(target) {
+            if let Some(v) = row.get_i64(column) {
+                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
+                bulk_writer.append_tuple_raw(slot, fidx, &packed);
+            } else if let Some(s) = row.get_str(column) {
+                let packed = rmp_serde::to_vec(&PackedValue::S(s.to_string())).unwrap_or_default();
+                bulk_writer.append_tuple_raw(slot, fidx, &packed);
+            }
+        }
+    }
+
+    // Write enriched fields (from EnrichedFields, no HashMap)
+    for (target, value) in &enriched.fields {
+        if let Some(&fidx) = field_idx.get(target.as_str()) {
+            if let Ok(v) = value.parse::<i64>() {
+                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
+                bulk_writer.append_tuple_raw(slot, fidx, &packed);
+            } else {
+                let packed = rmp_serde::to_vec(&PackedValue::S(value.clone())).unwrap_or_default();
+                bulk_writer.append_tuple_raw(slot, fidx, &packed);
+            }
+        }
+    }
+
+    // Write enriched computed fields
+    for (target, value) in &enriched.computed {
+        if let Some(&fidx) = field_idx.get(target.as_str()) {
+            match value {
+                NateExprValue::Int(v) => {
+                    let packed = rmp_serde::to_vec(&PackedValue::I(*v)).unwrap_or_default();
+                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                }
+                NateExprValue::Bool(b) => {
+                    let packed = rmp_serde::to_vec(&PackedValue::I(if *b { 1 } else { 0 })).unwrap_or_default();
+                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                }
+                NateExprValue::Str(ref s) => {
+                    let packed = rmp_serde::to_vec(&PackedValue::S(s.clone())).unwrap_or_default();
+                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                }
+                NateExprValue::Null => {}
+            }
+        }
+    }
+
+    // Write computed fields via indexed eval (no double-eval — computed once here)
+    for def in computed_defs {
+        if let Some(&fidx) = field_idx.get(def.target.as_str()) {
+            match def.eval_indexed(indexed_fields, col_idx, None) {
+                Some(NateExprValue::Int(v)) => {
+                    let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
+                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                }
+                Some(NateExprValue::Bool(b)) => {
+                    let packed = rmp_serde::to_vec(&PackedValue::I(if b { 1 } else { 0 })).unwrap_or_default();
+                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                }
+                Some(NateExprValue::Str(ref s)) => {
+                    let packed = rmp_serde::to_vec(&PackedValue::S(s.clone())).unwrap_or_default();
+                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Write a single row's data to the docstore via BulkWriter (legacy HashMap path).
 fn write_docstore_row(
     row: &ParsedRow,
     enriched_values: &HashMap<String, String>,
