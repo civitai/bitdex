@@ -1428,14 +1428,19 @@ pub fn save_filter_field_to_disk(
             .or_default()
             .push((*value, bm));
     }
-    let mut total_bytes = 0u64;
-    for (bucket, entries) in &by_bucket {
-        for (_, bm) in entries {
-            total_bytes += bm.serialized_size() as u64;
-        }
-        fs.write_filter_bucket(field_name, *bucket, entries)
-            .map_err(|e| format!("write_filter_bucket({field_name}, {bucket:02x}): {e}"))?;
-    }
+    let total_bytes: u64 = by_bucket.values()
+        .flat_map(|entries| entries.iter().map(|(_, bm)| bm.serialized_size() as u64))
+        .sum();
+
+    // Parallel bucket writes — each bucket is an independent file
+    let buckets: Vec<_> = by_bucket.iter().collect();
+    buckets
+        .par_iter()
+        .try_for_each(|(bucket, entries)| {
+            fs.write_filter_bucket(field_name, **bucket, entries)
+                .map_err(|e| format!("write_filter_bucket({field_name}, {:02x}): {e}", bucket))
+        })?;
+
     Ok(total_bytes)
 }
 
