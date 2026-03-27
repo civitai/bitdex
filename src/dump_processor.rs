@@ -1090,12 +1090,20 @@ pub fn validate_dump_request(
     Ok(())
 }
 
+/// Process a dump phase end-to-end: parse CSV → build bitmaps → save to disk → reload fields.
+///
+/// This is the single entry point for dump processing. No background threads,
+/// no SaveHandle — everything runs inline on the calling thread.
 pub fn process_dump(
     request: &DumpRequest,
     engine: &ConcurrentEngine,
     stage_dir: &Path,
+    progress_counter: Option<Arc<AtomicU64>>,
+    data_schema: Option<&crate::config::DataSchema>,
 ) -> Result<PhaseResult, String> {
-    let mut result = process_dump_with_progress(request, engine, stage_dir, None, None)?;
+    let mut result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema)?;
+
+    // Save bitmaps to disk
     let (alive_s, filter_s, sort_s, meta_s) = engine
         .shard_stores()
         .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?;
@@ -1103,6 +1111,20 @@ pub fn process_dump(
         .ok_or_else(|| "no bitmap_path configured".to_string())?.clone();
     let dictionaries = engine.dictionaries_arc();
     save_phase_to_disk(&mut result, &alive_s, &filter_s, &sort_s, &meta_s, &bitmap_path, &dictionaries, &request.name, request.sets_alive)?;
+
+    // Mark fields for lazy reload so queries pick up new data
+    let filter_names: Vec<String> = engine.config()
+        .filter_fields.iter().map(|f| f.name.clone()).collect();
+    let sort_names: Vec<String> = engine.config()
+        .sort_fields.iter().map(|f| f.name.clone()).collect();
+    engine.mark_fields_pending_reload(&filter_names, &sort_names);
+
+    // Reload alive bitmap from disk if this phase set it
+    if request.sets_alive {
+        engine.reload_alive_from_disk();
+    }
+
+    eprintln!("  Dump {} save+reload complete", request.name);
     Ok(result)
 }
 

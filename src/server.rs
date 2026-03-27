@@ -372,10 +372,6 @@ struct AppState {
     /// Dump registry for tracking table dump lifecycle.
     #[cfg(feature = "pg-sync")]
     dump_registry: Mutex<crate::pg_sync::dump::DumpRegistry>,
-    /// Handle to the previous dump phase's background save thread.
-    /// Joined at the start of the next dump to ensure sequential save ordering.
-    #[cfg(feature = "pg-sync")]
-    pending_save_handle: Mutex<Option<crate::dump_processor::SaveHandle>>,
 }
 
 type SharedState = Arc<AppState>;
@@ -1087,8 +1083,6 @@ impl BitdexServer {
                 let dumps_path = self.data_dir.join("dumps.json");
                 Mutex::new(crate::pg_sync::dump::DumpRegistry::load(&dumps_path))
             },
-            #[cfg(feature = "pg-sync")]
-            pending_save_handle: Mutex::new(None),
         });
 
         // Try to restore an existing index from disk
@@ -4540,102 +4534,25 @@ async fn handle_register_dump(
             reg.save(&dumps_path).ok();
         }
 
-        // Spawn async processing with pipelined save
+        // Spawn async processing — inline parse + save + reload
         let state_clone = Arc::clone(&state);
         let dump_name_for_task = dump_name.clone();
         let stage_dir = std::path::Path::new(&request.csv_path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new("/data/load_stage"))
             .to_path_buf();
-        let sets_alive = request.sets_alive;
 
         tokio::spawn(async move {
             let dump_name_inner = dump_name_for_task;
 
-            // Process the dump phase — can overlap with prior phase's save.
-            let engine_for_save = Arc::clone(&engine);
             let result = tokio::task::spawn_blocking(move || {
-                crate::dump_processor::process_dump_with_progress(&request, &engine, &stage_dir, Some(progress), Some(&data_schema))
+                crate::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema))
             })
             .await;
 
             match result {
                 Ok(Ok(phase_result)) => {
                     let row_count = phase_result.row_count;
-                    let dump_name_save = dump_name_inner.clone();
-
-                    // Join any previous save handle before starting THIS phase's save.
-                    // Processing ran in parallel with the prior save, but we must wait
-                    // for it to finish before writing new bitmaps to the same ShardStore.
-                    {
-                        let mut prev = state_clone.pending_save_handle.lock();
-                        if let Some(handle) = prev.take() {
-                            if let Err(e) = handle.join() {
-                                eprintln!("WARNING: previous save failed: {e}");
-                            }
-                        }
-                    }
-
-                    // Spawn background save thread via ShardStore
-                    let (alive_s, filter_s, sort_s, meta_s) = engine_for_save
-                        .shard_stores()
-                        .expect("shard_stores required for dump save");
-                    let bitmap_path = engine_for_save.config().storage.bitmap_path.as_ref()
-                        .expect("bitmap_path required for dump save").clone();
-                    let dictionaries = engine_for_save.dictionaries_arc();
-
-                    let save_handle = crate::dump_processor::SaveHandle::spawn(
-                        phase_result,
-                        alive_s,
-                        filter_s,
-                        sort_s,
-                        meta_s,
-                        bitmap_path,
-                        dictionaries,
-                        dump_name_save.clone(),
-                        sets_alive,
-                    );
-
-                    // Wrap in a monitor thread that joins the save, then does
-                    // mark_fields_pending_reload + reload_alive_from_disk.
-                    let state_for_monitor = Arc::clone(&state_clone);
-                    let engine_for_monitor = Arc::clone(&engine_for_save);
-                    let dump_name_monitor = dump_name_inner.clone();
-
-                    let monitor_handle = std::thread::Builder::new()
-                        .name(format!("save-monitor-{}", dump_name_save))
-                        .spawn(move || {
-                            let save_result = save_handle.join();
-
-                            match save_result {
-                                Ok(()) => {
-                                    // Mark fields pending for lazy reload
-                                    let filter_names: Vec<String> = engine_for_monitor.config()
-                                        .filter_fields.iter().map(|f| f.name.clone()).collect();
-                                    let sort_names: Vec<String> = engine_for_monitor.config()
-                                        .sort_fields.iter().map(|f| f.name.clone()).collect();
-                                    engine_for_monitor.mark_fields_pending_reload(&filter_names, &sort_names);
-
-                                    // Reload alive bitmap from disk
-                                    if sets_alive {
-                                        engine_for_monitor.reload_alive_from_disk();
-                                    }
-
-                                    eprintln!("  Dump {} save+reload complete", dump_name_monitor);
-                                }
-                                Err(e) => {
-                                    eprintln!("ERROR: Dump {} save failed: {}", dump_name_monitor, e);
-                                }
-                            }
-                        })
-                        .expect("failed to spawn save monitor thread");
-
-                    // Store as a SaveHandle wrapping the monitor thread —
-                    // next dump request will join it before starting.
-                    {
-                        let mut pending = state_clone.pending_save_handle.lock();
-                        *pending = Some(crate::dump_processor::SaveHandle::from_join_handle(monitor_handle));
-                    }
 
                     tasks.set_complete(
                         task_id,
