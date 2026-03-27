@@ -1396,6 +1396,7 @@ pub fn process_dump_with_progress(
                 .collect();
             let mut alive = RoaringBitmap::new();
             let mut deferred: Vec<(u32, u64)> = Vec::new();
+            let mut tuple_buf: Vec<(u16, u32, u32)> = Vec::with_capacity(20);
             let mut count = 0u64;
             let mut max_slot: u32 = 0;
             let mut line_start = 0;
@@ -1488,6 +1489,7 @@ pub fn process_dump_with_progress(
                                     &bulk_writer,
                                     &field_idx_cache,
                                     &mut serialize_buf,
+                                    &mut tuple_buf,
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1622,6 +1624,7 @@ pub fn process_dump_with_progress(
                     &bulk_writer,
                     &field_idx_cache,
                     &mut serialize_buf,
+                    &mut tuple_buf,
                 );
                 ld += t5.elapsed().as_nanos() as u64;
 
@@ -2350,64 +2353,76 @@ fn write_docstore_row_indexed(
     bulk_writer: &Arc<BulkWriter>,
     field_idx: &HashMap<String, u16>,
     serialize_buf: &mut Vec<u8>,
+    tuple_buf: &mut Vec<(u16, u32, u32)>,
 ) {
-    // Helper: serialize to reusable buffer and append
-    macro_rules! append_packed {
+    serialize_buf.clear();
+    tuple_buf.clear();
+
+    // Collect all fields into serialize_buf, track (field_idx, offset, len) in tuple_buf
+    macro_rules! collect_packed {
         ($fidx:expr, $value:expr) => {
-            serialize_buf.clear();
+            let start = serialize_buf.len() as u32;
             if rmp_serde::encode::write(serialize_buf, $value).is_ok() {
-                bulk_writer.append_tuple_raw(slot, $fidx, serialize_buf);
+                let len = serialize_buf.len() as u32 - start;
+                tuple_buf.push(($fidx, start, len));
             }
         };
     }
 
-    // Write direct fields
+    // Direct fields
     for mapping in request_fields {
         let target = mapping.target();
         let column = mapping.column();
-
         if let Some(&fidx) = field_idx.get(target) {
             if let Some(v) = row.get_i64(column) {
-                append_packed!(fidx, &PackedValue::I(v));
+                collect_packed!(fidx, &PackedValue::I(v));
             } else if let Some(s) = row.get_str(column) {
-                append_packed!(fidx, &PackedValue::S(s.to_string()));
+                collect_packed!(fidx, &PackedValue::S(s.to_string()));
             }
         }
     }
 
-    // Write enriched fields
+    // Enriched fields
     for (target, value) in &enriched.fields {
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             if let Ok(v) = value.parse::<i64>() {
-                append_packed!(fidx, &PackedValue::I(v));
+                collect_packed!(fidx, &PackedValue::I(v));
             } else {
-                append_packed!(fidx, &PackedValue::S(value.clone()));
+                collect_packed!(fidx, &PackedValue::S(value.clone()));
             }
         }
     }
 
-    // Write enriched computed fields
+    // Enriched computed fields
     for (target, value) in &enriched.computed {
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             match value {
-                NateExprValue::Int(v) => { append_packed!(fidx, &PackedValue::I(*v)); }
-                NateExprValue::Bool(b) => { append_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
-                NateExprValue::Str(ref s) => { append_packed!(fidx, &PackedValue::S(s.clone())); }
+                NateExprValue::Int(v) => { collect_packed!(fidx, &PackedValue::I(*v)); }
+                NateExprValue::Bool(b) => { collect_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
+                NateExprValue::Str(ref s) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
                 NateExprValue::Null => {}
             }
         }
     }
 
-    // Write computed fields via indexed eval
+    // Computed fields via indexed eval
     for def in computed_defs {
         if let Some(&fidx) = field_idx.get(def.target.as_str()) {
             match def.eval_indexed(indexed_fields, col_idx, None) {
-                Some(NateExprValue::Int(v)) => { append_packed!(fidx, &PackedValue::I(v)); }
-                Some(NateExprValue::Bool(b)) => { append_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
-                Some(NateExprValue::Str(ref s)) => { append_packed!(fidx, &PackedValue::S(s.clone())); }
+                Some(NateExprValue::Int(v)) => { collect_packed!(fidx, &PackedValue::I(v)); }
+                Some(NateExprValue::Bool(b)) => { collect_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
+                Some(NateExprValue::Str(ref s)) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
                 _ => {}
             }
         }
+    }
+
+    // One lock acquisition for all fields
+    if !tuple_buf.is_empty() {
+        let refs: Vec<(u16, &[u8])> = tuple_buf.iter()
+            .map(|&(idx, off, len)| (idx, &serialize_buf[off as usize..(off + len) as usize]))
+            .collect();
+        bulk_writer.append_tuples_raw(slot, &refs);
     }
 }
 
