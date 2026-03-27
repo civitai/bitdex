@@ -4552,16 +4552,7 @@ async fn handle_register_dump(
         tokio::spawn(async move {
             let dump_name_inner = dump_name_for_task;
 
-            // Join any previous save handle before starting this phase
-            {
-                let mut prev = state_clone.pending_save_handle.lock();
-                if let Some(handle) = prev.take() {
-                    if let Err(e) = handle.join() {
-                        eprintln!("WARNING: previous save failed: {e}");
-                    }
-                }
-            }
-
+            // Process the dump phase — can overlap with prior phase's save.
             let engine_for_save = Arc::clone(&engine);
             let result = tokio::task::spawn_blocking(move || {
                 crate::dump_processor::process_dump_with_progress(&request, &engine, &stage_dir, Some(progress), Some(&data_schema))
@@ -4572,6 +4563,18 @@ async fn handle_register_dump(
                 Ok(Ok(phase_result)) => {
                     let row_count = phase_result.row_count;
                     let dump_name_save = dump_name_inner.clone();
+
+                    // Join any previous save handle before starting THIS phase's save.
+                    // Processing ran in parallel with the prior save, but we must wait
+                    // for it to finish before writing new bitmaps to the same ShardStore.
+                    {
+                        let mut prev = state_clone.pending_save_handle.lock();
+                        if let Some(handle) = prev.take() {
+                            if let Err(e) = handle.join() {
+                                eprintln!("WARNING: previous save failed: {e}");
+                            }
+                        }
+                    }
 
                     // Spawn background save thread via ShardStore
                     let (alive_s, filter_s, sort_s, meta_s) = engine_for_save
