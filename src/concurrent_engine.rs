@@ -5310,6 +5310,29 @@ impl ConcurrentEngine {
         self.pending_filter_loads.lock().len() + self.pending_sort_loads.lock().len()
     }
 
+    /// Mark fields as pending for lazy loading from BitmapFs.
+    /// Call after dump processor writes bitmaps directly to BitmapFs — this
+    /// tells the engine to reload them on the next query.
+    pub fn mark_fields_pending_reload(&self, filter_fields: &[String], sort_fields: &[String]) {
+        {
+            let mut pending = self.pending_filter_loads.lock();
+            for name in filter_fields {
+                pending.insert(name.clone());
+            }
+        }
+        {
+            let mut pending = self.pending_sort_loads.lock();
+            for name in sort_fields {
+                pending.insert(name.clone());
+            }
+        }
+        eprintln!(
+            "Marked {} filter + {} sort fields for lazy reload",
+            filter_fields.len(),
+            sort_fields.len()
+        );
+    }
+
     /// Get eviction stats: (field_name, evicted_total, resident_count).
     pub fn eviction_stats(&self) -> Vec<(String, u64, usize)> {
         let snap = self.snapshot();
