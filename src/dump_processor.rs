@@ -1286,26 +1286,40 @@ pub fn process_dump_with_progress(
                     max_slot = slot;
                 }
 
-                // Apply filter (Nate's FilterExpression API)
-                let csv_row = row.to_csv_row();
-                if let Some(ref fexpr) = filter_expr_ref {
-                    if !fexpr.eval(&csv_row, None) {
+                // Apply filter + resolve enrichment
+                // Only build CsvRow HashMap when needed (filter or enrichment configured)
+                let has_filter = filter_expr_ref.is_some();
+                let has_enrichment = enrichment_mgr_ref.table_count() > 0;
+                let needs_csv_row = has_filter || has_enrichment || !computed_defs_ref.is_empty();
+
+                let csv_row_opt = if needs_csv_row {
+                    Some(row.to_csv_row())
+                } else {
+                    None
+                };
+
+                if let (Some(ref fexpr), Some(ref cr)) = (filter_expr_ref, &csv_row_opt) {
+                    if !fexpr.eval(cr, None) {
                         continue;
                     }
                 }
 
-                // Resolve enrichment (Nate's EnrichmentManager API)
-                let enriched = enrichment_mgr_ref.enrich_row(&csv_row);
+                // Resolve enrichment (only when enrichment tables are loaded)
                 let mut enriched_values: HashMap<String, String> = HashMap::new();
-                for (target, value) in &enriched.fields {
-                    enriched_values.insert(target.clone(), value.clone());
-                }
-                for (target, value) in &enriched.computed {
-                    match value {
-                        NateExprValue::Int(n) => { enriched_values.insert(target.clone(), n.to_string()); }
-                        NateExprValue::Str(s) => { enriched_values.insert(target.clone(), s.clone()); }
-                        NateExprValue::Bool(b) => { enriched_values.insert(target.clone(), if *b { "1" } else { "0" }.to_string()); }
-                        NateExprValue::Null => {}
+                if has_enrichment {
+                    if let Some(ref cr) = csv_row_opt {
+                        let enriched = enrichment_mgr_ref.enrich_row(cr);
+                        for (target, value) in &enriched.fields {
+                            enriched_values.insert(target.clone(), value.clone());
+                        }
+                        for (target, value) in &enriched.computed {
+                            match value {
+                                NateExprValue::Int(n) => { enriched_values.insert(target.clone(), n.to_string()); }
+                                NateExprValue::Str(s) => { enriched_values.insert(target.clone(), s.clone()); }
+                                NateExprValue::Bool(b) => { enriched_values.insert(target.clone(), if *b { "1" } else { "0" }.to_string()); }
+                                NateExprValue::Null => {}
+                            }
+                        }
                     }
                 }
 
@@ -1319,7 +1333,7 @@ pub fn process_dump_with_progress(
                                     &row,
                                     &enriched_values,
                                     computed_defs_ref,
-                                    &csv_row,
+                                    csv_row_opt.as_ref().unwrap(),
                                     slot,
                                     request_fields,
                                     &bulk_writer,
@@ -1393,7 +1407,7 @@ pub fn process_dump_with_progress(
 
                 // Build bitmaps from computed fields (Nate's ComputedFieldDef API)
                 for def in computed_defs_ref {
-                    let computed_val = def.eval(&csv_row, None);
+                    let computed_val = def.eval(csv_row_opt.as_ref().unwrap(), None);
 
                     match computed_val {
                         Some(NateExprValue::Int(v)) if def.value_column.is_none() => {
@@ -1449,7 +1463,7 @@ pub fn process_dump_with_progress(
                     &row,
                     &enriched_values,
                     computed_defs_ref,
-                    &csv_row,
+                    csv_row_opt.as_ref().unwrap(),
                     slot,
                     request_fields,
                     &bulk_writer,
