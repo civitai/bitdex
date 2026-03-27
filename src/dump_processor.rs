@@ -1866,13 +1866,13 @@ fn process_multi_value_phase(
     if use_vec {
         // Vec<RoaringBitmap> indexed by value_id — no hashing
         // Also collect per-slot value lists for docstore writes
-        let thread_results: Vec<(Vec<RoaringBitmap>, HashMap<u32, Vec<i64>>)> = ranges
+        let thread_results: Vec<Vec<RoaringBitmap>> = ranges
             .par_iter()
             .map(|&(range_start, range_end)| {
                 let chunk = &body[range_start..range_end];
                 let mut bitmaps: Vec<RoaringBitmap> =
                     (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect();
-                let mut slot_values: HashMap<u32, Vec<i64>> = HashMap::new();
+                let mut doc_buf: Vec<u8> = Vec::with_capacity(16);
                 let mut count = 0u64;
                 let mut line_start = 0;
 
@@ -1913,8 +1913,12 @@ fn process_multi_value_phase(
                     if value < MAX_TAG_ID {
                         bitmaps[value].insert(slot);
                     }
-                    if field_idx.is_some() {
-                        slot_values.entry(slot).or_default().push(value as i64);
+                    // Write individual value directly to docstore (no in-memory accumulation)
+                    if let Some(fidx) = field_idx {
+                        doc_buf.clear();
+                        if rmp_serde::encode::write(&mut doc_buf, &PackedValue::I(value as i64)).is_ok() {
+                            bulk_writer.append_tuple_raw(slot, fidx, &doc_buf);
+                        }
                     }
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
@@ -1925,29 +1929,15 @@ fn process_multi_value_phase(
                 let remainder = count % LOG_INTERVAL;
                 total_ref.fetch_add(remainder, Ordering::Relaxed);
                 if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
-                (bitmaps, slot_values)
+                bitmaps
             })
             .collect();
 
-        // Write collected multi-value arrays to docstore
-        if let Some(fidx) = field_idx {
-            let mut merged_values: HashMap<u32, Vec<i64>> = HashMap::new();
-            for (_, sv) in &thread_results {
-                for (&slot, values) in sv {
-                    merged_values.entry(slot).or_default().extend(values);
-                }
-            }
-            for (slot, values) in &merged_values {
-                let packed = rmp_serde::to_vec(&PackedValue::Mi(values.clone())).unwrap_or_default();
-                bulk_writer.append_tuple_raw(*slot, fidx, &packed);
-            }
-            eprintln!("  {target}: wrote {} multi-value docstore tuples", merged_values.len());
-        }
+        // Docstore writes already done inline per-row (no post-merge step needed)
 
         // Merge Vec<RoaringBitmap> — parallel tree reduction
         let mut merged_vec = thread_results
             .into_par_iter()
-            .map(|(bitmaps, _)| bitmaps)
             .reduce(
                 || (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect::<Vec<_>>(),
                 |mut dst, src| {
@@ -1990,12 +1980,12 @@ fn process_multi_value_phase(
     } else {
         // HashMap path for tools, techniques (smaller datasets)
         // Also collect per-slot value lists for docstore writes
-        let thread_results: Vec<(HashMap<u64, RoaringBitmap>, HashMap<u32, Vec<i64>>)> = ranges
+        let thread_results: Vec<HashMap<u64, RoaringBitmap>> = ranges
             .par_iter()
             .map(|&(range_start, range_end)| {
                 let chunk = &body[range_start..range_end];
                 let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
-                let mut slot_values: HashMap<u32, Vec<i64>> = HashMap::new();
+                let mut doc_buf: Vec<u8> = Vec::with_capacity(16);
                 let mut count = 0u64;
                 let mut line_start = 0;
 
@@ -2036,8 +2026,12 @@ fn process_multi_value_phase(
                         .entry(value)
                         .or_insert_with(RoaringBitmap::new)
                         .insert(slot);
-                    if field_idx.is_some() {
-                        slot_values.entry(slot).or_default().push(value as i64);
+                    // Write individual value directly to docstore (no in-memory accumulation)
+                    if let Some(fidx) = field_idx {
+                        doc_buf.clear();
+                        if rmp_serde::encode::write(&mut doc_buf, &PackedValue::I(value as i64)).is_ok() {
+                            bulk_writer.append_tuple_raw(slot, fidx, &doc_buf);
+                        }
                     }
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
@@ -2048,28 +2042,15 @@ fn process_multi_value_phase(
                 let remainder = count % LOG_INTERVAL;
                 total_ref.fetch_add(remainder, Ordering::Relaxed);
                 if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
-                (bitmaps, slot_values)
+                bitmaps
             })
             .collect();
 
-        // Write collected multi-value arrays to docstore
-        if let Some(fidx) = field_idx {
-            let mut merged_values: HashMap<u32, Vec<i64>> = HashMap::new();
-            for (_, sv) in &thread_results {
-                for (&slot, values) in sv {
-                    merged_values.entry(slot).or_default().extend(values);
-                }
-            }
-            for (slot, values) in &merged_values {
-                let packed = rmp_serde::to_vec(&PackedValue::Mi(values.clone())).unwrap_or_default();
-                bulk_writer.append_tuple_raw(*slot, fidx, &packed);
-            }
-            eprintln!("  {target}: wrote {} multi-value docstore tuples", merged_values.len());
-        }
+        // Docstore writes already done inline per-row
 
         // Merge
         let mut merged: HashMap<u64, RoaringBitmap> = HashMap::new();
-        for (bitmaps, _) in thread_results {
+        for bitmaps in thread_results {
             for (val, bm) in bitmaps {
                 merged.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
             }
