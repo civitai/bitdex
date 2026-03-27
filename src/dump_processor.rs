@@ -1863,16 +1863,36 @@ fn process_multi_value_phase(
     let total = AtomicU64::new(0);
     let total_ref = &total;
 
+    // Spawn docstore writer thread — rayon threads push (slot, value) to channel,
+    // writer drains and writes per shard. Zero contention on parse threads.
+    let (doc_tx, doc_rx) = if field_idx.is_some() {
+        let (tx, rx) = crossbeam_channel::bounded::<(u32, i64)>(100_000);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let doc_writer_handle = doc_rx.map(|rx| {
+        let bw = Arc::clone(bulk_writer);
+        let fidx = field_idx.unwrap();
+        std::thread::spawn(move || {
+            let mut buf = Vec::with_capacity(32);
+            for (slot, value) in rx {
+                buf.clear();
+                if rmp_serde::encode::write(&mut buf, &PackedValue::Mi(vec![value])).is_ok() {
+                    bw.append_tuple_raw(slot, fidx, &buf);
+                }
+            }
+        })
+    });
+
     if use_vec {
-        // Vec<RoaringBitmap> indexed by value_id — no hashing
-        // Also collect per-slot value lists for docstore writes
         let thread_results: Vec<Vec<RoaringBitmap>> = ranges
             .par_iter()
             .map(|&(range_start, range_end)| {
                 let chunk = &body[range_start..range_end];
                 let mut bitmaps: Vec<RoaringBitmap> =
                     (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect();
-                let mut doc_buf: Vec<u8> = Vec::with_capacity(16);
                 let mut count = 0u64;
                 let mut line_start = 0;
 
@@ -1893,7 +1913,6 @@ fn process_multi_value_phase(
                         col_index: col_index.as_ref(),
                     };
 
-                    // Apply filter
                     if let Some(ref fexpr) = filter_expr {
                         let csv_row = row.to_csv_row();
                         if !fexpr.eval(&csv_row, None) {
@@ -1913,12 +1932,9 @@ fn process_multi_value_phase(
                     if value < MAX_TAG_ID {
                         bitmaps[value].insert(slot);
                     }
-                    // Write individual value to docstore as Mi (multi-value marker)
-                    if let Some(fidx) = field_idx {
-                        doc_buf.clear();
-                        if rmp_serde::encode::write(&mut doc_buf, &PackedValue::Mi(vec![value as i64])).is_ok() {
-                            bulk_writer.append_tuple_raw(slot, fidx, &doc_buf);
-                        }
+                    // Send to writer thread (non-blocking with bounded channel)
+                    if let Some(ref tx) = doc_tx {
+                        let _ = tx.send((slot, value as i64));
                     }
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
@@ -1933,7 +1949,7 @@ fn process_multi_value_phase(
             })
             .collect();
 
-        // Docstore writes already done inline per-row (no post-merge step needed)
+        // Docstore writes sent to writer thread above
 
         // Merge Vec<RoaringBitmap> — parallel tree reduction
         let mut merged_vec = thread_results
@@ -1969,6 +1985,12 @@ fn process_multi_value_phase(
         let mut filter_maps = HashMap::new();
         filter_maps.insert(target, filter_map);
 
+        // Wait for docstore writer thread to finish
+        drop(doc_tx);
+        if let Some(handle) = doc_writer_handle {
+            handle.join().ok();
+        }
+
         Ok(PhaseResult {
             row_count: total_rows,
             filter_maps,
@@ -1985,7 +2007,6 @@ fn process_multi_value_phase(
             .map(|&(range_start, range_end)| {
                 let chunk = &body[range_start..range_end];
                 let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
-                let mut doc_buf: Vec<u8> = Vec::with_capacity(16);
                 let mut count = 0u64;
                 let mut line_start = 0;
 
@@ -2026,12 +2047,9 @@ fn process_multi_value_phase(
                         .entry(value)
                         .or_insert_with(RoaringBitmap::new)
                         .insert(slot);
-                    // Write individual value to docstore as Mi (multi-value marker)
-                    if let Some(fidx) = field_idx {
-                        doc_buf.clear();
-                        if rmp_serde::encode::write(&mut doc_buf, &PackedValue::Mi(vec![value as i64])).is_ok() {
-                            bulk_writer.append_tuple_raw(slot, fidx, &doc_buf);
-                        }
+                    // Send to writer thread (non-blocking)
+                    if let Some(ref tx) = doc_tx {
+                        let _ = tx.send((slot, value as i64));
                     }
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
