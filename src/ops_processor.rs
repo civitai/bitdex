@@ -2181,9 +2181,11 @@ mod tests {
         assert_eq!(sink.deferred_alive.len(), 1);
         assert_eq!(sink.deferred_alive[0], (42, future_ts as u64));
 
-        // But filter/sort bitmaps should still be set
-        assert!(!sink.filter_inserts.is_empty(), "filter bitmaps should still be set");
-        assert!(!sink.sort_sets.is_empty(), "sort layers should still be set");
+        // [2.4] ALL bitmaps should be skipped for deferred alive —
+        // filter/sort bitmaps are NOT set. Only docstore gets written.
+        // activate_due() rebuilds bitmaps from stored doc when the time comes.
+        assert!(sink.filter_inserts.is_empty(), "deferred should skip ALL bitmaps including filter");
+        assert!(sink.sort_sets.is_empty(), "deferred should skip ALL bitmaps including sort");
     }
 
     #[test]
