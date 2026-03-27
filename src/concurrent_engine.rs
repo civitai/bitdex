@@ -5402,6 +5402,17 @@ impl ConcurrentEngine {
         self.docstore.lock().schema_version()
     }
 
+    /// Get a clone of the Arc<Mutex<DocStore>> for external writers (e.g., DocWriter).
+    pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<crate::docstore::DocStore>> {
+        Arc::clone(&self.docstore)
+    }
+
+    /// Check if a slot is alive (for non-alive slot filtering in ops processing).
+    pub fn is_slot_alive(&self, slot: u32) -> bool {
+        let snap = self.snapshot();
+        snap.slots.is_alive(slot)
+    }
+
     /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> std::collections::HashMap<u8, std::collections::HashMap<String, serde_json::Value>> {
         self.docstore.lock().build_schema_registry()

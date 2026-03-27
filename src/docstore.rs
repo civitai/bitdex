@@ -251,6 +251,26 @@ impl DocStore {
         idx
     }
 
+    /// Get the field index for a name, or None if not in the dictionary.
+    pub fn field_index(&self, name: &str) -> Option<u16> {
+        self.field_to_idx.get(name).copied()
+    }
+
+    /// Get or create a field index. Saves the dict if a new field was added.
+    pub fn ensure_field_index(&mut self, name: &str) -> Result<u16> {
+        let existed = self.field_to_idx.contains_key(name);
+        let idx = self.ensure_field_idx(name);
+        if !existed {
+            self.save_field_dict()?;
+        }
+        Ok(idx)
+    }
+
+    /// Snapshot the current field name → index mapping.
+    pub fn field_dict_snapshot(&self) -> HashMap<String, u16> {
+        self.field_to_idx.clone()
+    }
+
     /// Build the field_defaults map from a DataSchema.
     /// Must be called after field dictionary is populated (i.e., after prepare_bulk_load
     /// or after fields have been ensured). For null defaults, we treat them as

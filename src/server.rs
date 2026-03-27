@@ -1063,15 +1063,19 @@ impl BitdexServer {
                                 };
 
                                 if let Some(engine) = engine {
-                                    // Build FieldMeta and CoalescerSink for the ops processor
+                                    // Build FieldMeta, CoalescerSink, and DocWriter for the ops processor
                                     let meta = crate::ops_processor::FieldMeta::from_config(engine.config());
                                     let sender = engine.mutation_sender();
                                     let mut sink = crate::ingester::CoalescerSink::new(sender);
+                                    let mut doc_writer = crate::ops_processor::DocWriter::new(
+                                        engine.docstore_arc(),
+                                    );
 
                                     let mut entries = batch.entries;
                                     let (applied, skipped, errors) =
                                         crate::ops_processor::apply_ops_batch(
                                             &mut sink, &meta, &mut entries, Some(&engine),
+                                            Some(&mut doc_writer),
                                         );
 
                                     if applied > 0 || errors > 0 {

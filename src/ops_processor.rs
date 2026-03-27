@@ -22,12 +22,163 @@ use serde_json::Value as JsonValue;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
+use crate::docstore::{DocStore, PackedValue};
 use crate::filter::FilterFieldType;
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
 use crate::pg_sync::op_dedup::dedup_ops;
 use crate::pg_sync::ops::{EntityOps, Op};
 use crate::query::{BitdexQuery, FilterClause, Value as QValue};
+
+// ---------------------------------------------------------------------------
+// DocWriter — writes field values to docstore alongside bitmap mutations
+// ---------------------------------------------------------------------------
+
+/// Writes individual field-value tuples to the docstore during WAL processing.
+/// Wraps the engine's docstore with a cached field dictionary snapshot.
+pub struct DocWriter {
+    docstore: Arc<parking_lot::Mutex<DocStore>>,
+    field_dict: HashMap<String, u16>,
+    pending: Vec<(u32, u16, Vec<u8>)>,
+}
+
+impl DocWriter {
+    /// Create a DocWriter from the engine's docstore.
+    pub fn new(docstore: Arc<parking_lot::Mutex<DocStore>>) -> Self {
+        let field_dict = docstore.lock().field_dict_snapshot();
+        Self {
+            docstore,
+            field_dict,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Write a single-value field update to the docstore.
+    fn write_set(&mut self, slot: u32, field: &str, value: &JsonValue) {
+        let idx = match self.resolve_field(field) {
+            Some(idx) => idx,
+            None => return,
+        };
+        if let Some(packed) = json_to_packed(value) {
+            if let Ok(bytes) = rmp_serde::to_vec(&packed) {
+                self.pending.push((slot, idx, bytes));
+            }
+        }
+    }
+
+    /// Write a multi-value add: read current list, append value, write back.
+    fn write_add(&mut self, slot: u32, field: &str, value: &JsonValue) {
+        let idx = match self.resolve_field(field) {
+            Some(idx) => idx,
+            None => return,
+        };
+        let add_val = match value.as_i64() {
+            Some(v) => v,
+            None => return,
+        };
+
+        // Read current doc and get existing multi-value list
+        let mut current = self.read_multi_value(slot, field);
+        if !current.contains(&add_val) {
+            current.push(add_val);
+        }
+        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
+            self.pending.push((slot, idx, bytes));
+        }
+    }
+
+    /// Write a multi-value remove: read current list, remove value, write back.
+    fn write_remove(&mut self, slot: u32, field: &str, value: &JsonValue) {
+        let idx = match self.resolve_field(field) {
+            Some(idx) => idx,
+            None => return,
+        };
+        let remove_val = match value.as_i64() {
+            Some(v) => v,
+            None => return,
+        };
+
+        let mut current = self.read_multi_value(slot, field);
+        current.retain(|&v| v != remove_val);
+        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
+            self.pending.push((slot, idx, bytes));
+        }
+    }
+
+    /// Flush pending tuples to the docstore.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let tuples = std::mem::take(&mut self.pending);
+        if let Err(e) = self.docstore.lock().append_tuples_batch(tuples) {
+            tracing::warn!("DocWriter flush failed: {e}");
+        }
+    }
+
+    fn resolve_field(&mut self, field: &str) -> Option<u16> {
+        if let Some(&idx) = self.field_dict.get(field) {
+            return Some(idx);
+        }
+        // Field not in snapshot — try to ensure it exists
+        match self.docstore.lock().ensure_field_index(field) {
+            Ok(idx) => {
+                self.field_dict.insert(field.to_string(), idx);
+                Some(idx)
+            }
+            Err(e) => {
+                tracing::warn!("DocWriter: failed to ensure field '{field}': {e}");
+                None
+            }
+        }
+    }
+
+    fn read_multi_value(&self, slot: u32, field: &str) -> Vec<i64> {
+        let doc = match self.docstore.lock().get(slot) {
+            Ok(Some(doc)) => doc,
+            _ => return Vec::new(),
+        };
+        match doc.fields.get(field) {
+            Some(crate::mutation::FieldValue::Multi(vals)) => {
+                vals.iter().filter_map(|v| {
+                    if let QValue::Integer(i) = v { Some(*i) } else { None }
+                }).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Convert a JSON value to a PackedValue for docstore storage.
+fn json_to_packed(v: &JsonValue) -> Option<PackedValue> {
+    match v {
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(PackedValue::I(i))
+            } else if let Some(f) = n.as_f64() {
+                Some(PackedValue::F(f))
+            } else {
+                None
+            }
+        }
+        JsonValue::Bool(b) => Some(PackedValue::B(*b)),
+        JsonValue::String(s) => Some(PackedValue::S(s.clone())),
+        JsonValue::Null => None,
+        JsonValue::Array(arr) => {
+            let ints: Vec<i64> = arr.iter().filter_map(|v| v.as_i64()).collect();
+            if ints.len() == arr.len() {
+                Some(PackedValue::Mi(ints))
+            } else {
+                // Mixed arrays: store as Mm (multi-packed)
+                let packed: Vec<PackedValue> = arr.iter()
+                    .filter_map(|v| json_to_packed(v))
+                    .collect();
+                Some(PackedValue::Mm(packed))
+            }
+        }
+        JsonValue::Object(_) => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Enrichment types for dump processing
@@ -325,7 +476,46 @@ fn accum_set_sort(
     }
 }
 
-/// Process a batch of entity ops, translating them into BitmapSink calls.
+/// Check if an entity's ops contain a deferred alive condition (future publishedAt).
+fn check_deferred_alive(meta: &FieldMeta, ops: &[Op]) -> bool {
+    if let Some((ref da_field, ms_to_secs)) = meta.deferred_alive_field {
+        for op in ops {
+            if let Op::Set { field, value } = op {
+                if field == da_field {
+                    if let Some(ts) = value.as_i64() {
+                        let secs = if ms_to_secs { ts / 1000 } else { ts };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        return secs > now;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract the deferred alive timestamp (seconds since epoch) from ops.
+fn get_deferred_timestamp(meta: &FieldMeta, ops: &[Op]) -> Option<u64> {
+    if let Some((ref da_field, ms_to_secs)) = meta.deferred_alive_field {
+        for op in ops {
+            if let Op::Set { field, value } = op {
+                if field == da_field {
+                    if let Some(ts) = value.as_i64() {
+                        let secs = if ms_to_secs { ts / 1000 } else { ts };
+                        return Some(secs as u64);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Process a batch of entity ops, translating them into BitmapSink calls
+/// and optionally writing field values to the docstore via DocWriter.
 ///
 /// This is the core function used by both steady-state (CoalescerSink) and
 /// dump (AccumSink) paths. The sink determines where mutations go.
@@ -333,12 +523,16 @@ fn accum_set_sort(
 /// For queryOpSet resolution, an engine reference is needed to execute queries.
 /// Pass `None` during dump mode (queryOpSets are only used in steady-state).
 ///
+/// Pass a `DocWriter` for steady-state to keep the docstore in sync with bitmap
+/// changes. Pass `None` during dump mode (dump processor handles docs separately).
+///
 /// Returns (applied, skipped, errors).
 pub fn apply_ops_batch<S: BitmapSink>(
     sink: &mut S,
     meta: &FieldMeta,
     batch: &mut Vec<EntityOps>,
     engine: Option<&ConcurrentEngine>,
+    mut doc_writer: Option<&mut DocWriter>,
 ) -> (usize, usize, usize) {
     dedup_ops(batch);
 
@@ -366,6 +560,46 @@ pub fn apply_ops_batch<S: BitmapSink>(
             continue;
         }
 
+        // [2.10] Drop ops on non-alive slots (except creates_slot=true).
+        // In steady-state, ops arriving for non-existent slots are stale or
+        // out-of-order — silently skip them.
+        if !entry.creates_slot {
+            if let Some(eng) = engine {
+                if !eng.is_slot_alive(slot) {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        // [2.4] Check deferred alive BEFORE processing any ops.
+        // If creates_slot=true and publishedAt is in the future, skip ALL bitmaps
+        // (alive + filter + sort). Only write docstore so activate_due() can
+        // rebuild bitmaps later.
+        let is_deferred = if entry.creates_slot {
+            check_deferred_alive(meta, &entry.ops)
+        } else {
+            false
+        };
+
+        if is_deferred {
+            // Schedule deferred alive + write docstore only (no bitmap ops)
+            let da_secs = get_deferred_timestamp(meta, &entry.ops).unwrap_or(0);
+            sink.deferred_alive(slot, da_secs);
+            if let Some(ref mut dw) = doc_writer {
+                for op in &entry.ops {
+                    match op {
+                        Op::Set { field, value } => dw.write_set(slot, field, value),
+                        Op::Add { field, value } => dw.write_add(slot, field, value),
+                        _ => {}
+                    }
+                }
+                // Still flush since we're skipping bitmap processing
+            }
+            applied += 1;
+            continue;
+        }
+
         // Handle queryOpSets (steady-state only — needs engine for query resolution)
         for op in &entry.ops {
             if let Op::QueryOpSet { query, ops } = op {
@@ -384,7 +618,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
             }
         }
 
-        // Process set/remove/add ops → direct bitmap mutations.
+        // Process set/remove/add ops → direct bitmap mutations + docstore writes.
         // Track sort field values for computed field recomputation.
         let mut has_any_ops = false;
         let mut sort_values: HashMap<&str, u32> = HashMap::new();
@@ -392,6 +626,9 @@ pub fn apply_ops_batch<S: BitmapSink>(
             match op {
                 Op::Set { field, value } => {
                     process_set_op(sink, meta, slot, field, value);
+                    if let Some(ref mut dw) = doc_writer {
+                        dw.write_set(slot, field, value);
+                    }
                     // Track sort value for computed field deps
                     if meta.has_computed_deps(field) || meta.sort_fields.contains_key(field.as_str()) {
                         let qval = json_to_qvalue(value);
@@ -403,10 +640,16 @@ pub fn apply_ops_batch<S: BitmapSink>(
                 }
                 Op::Remove { field, value } => {
                     process_remove_op(sink, meta, slot, field, value);
+                    if let Some(ref mut dw) = doc_writer {
+                        dw.write_remove(slot, field, value);
+                    }
                     has_any_ops = true;
                 }
                 Op::Add { field, value } => {
                     process_add_op(sink, meta, slot, field, value);
+                    if let Some(ref mut dw) = doc_writer {
+                        dw.write_add(slot, field, value);
+                    }
                     has_any_ops = true;
                 }
                 Op::Delete | Op::QueryOpSet { .. } => {
@@ -449,36 +692,9 @@ pub fn apply_ops_batch<S: BitmapSink>(
             }
         }
 
-        // Set alive only if creates_slot is true (primary entity table).
-        // Join tables (tags, tools) set creates_slot=false — they only
-        // add multi-value bitmaps to existing slots.
+        // Set alive if creates_slot is true and not deferred (deferred handled above).
         if entry.creates_slot {
-            // Check deferred alive: if the source field (e.g., publishedAt) is in
-            // the future, defer the alive bit instead of setting it immediately.
-            let mut deferred = false;
-            if let Some((ref da_field, ms_to_secs)) = meta.deferred_alive_field {
-                for op in &entry.ops {
-                    if let Op::Set { field, value } = op {
-                        if field == da_field {
-                            if let Some(ts) = value.as_i64() {
-                                let secs = if ms_to_secs { ts / 1000 } else { ts };
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs() as i64;
-                                if secs > now {
-                                    sink.deferred_alive(slot, secs as u64);
-                                    deferred = true;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            if !deferred {
-                sink.alive_insert(slot);
-            }
+            sink.alive_insert(slot);
         }
 
         if has_any_ops {
@@ -490,6 +706,11 @@ pub fn apply_ops_batch<S: BitmapSink>(
     if let Err(e) = sink.flush() {
         tracing::error!("ops processor: sink flush failed: {e}");
         errors += 1;
+    }
+
+    // Flush docstore writes
+    if let Some(dw) = doc_writer {
+        dw.flush();
     }
 
     (applied, skipped, errors)
@@ -750,7 +971,7 @@ pub(crate) fn apply_ops_batch_dump(
     batch: &mut Vec<EntityOps>,
 ) -> (usize, usize, usize) {
     let mut sink = crate::ingester::AccumSink::new(accum);
-    apply_ops_batch(&mut sink, meta, batch, None)
+    apply_ops_batch(&mut sink, meta, batch, None, None)
 }
 
 /// Process all WAL entries in dump mode: reads WAL, accumulates bitmaps, applies to engine.
@@ -1572,7 +1793,7 @@ mod tests {
             }],
         }];
 
-        let (applied, skipped, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, skipped, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(skipped, 0);
         assert_eq!(errors, 0);
@@ -1603,7 +1824,7 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1635,7 +1856,7 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1664,7 +1885,7 @@ mod tests {
             }],
         }];
 
-        apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
 
         // Should have sort_set for bits 0 and 2
         let sort_bits: Vec<usize> = sink.sort_sets.iter().map(|(_, bit, _)| *bit).collect();
@@ -1695,7 +1916,7 @@ mod tests {
             ],
         }];
 
-        apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
 
         // Clears: bits 0, 2 (from value 5)
         let clear_bits: Vec<usize> = sink.sort_clears.iter().map(|(_, bit, _)| *bit).collect();
@@ -1723,7 +1944,7 @@ mod tests {
             }],
         }];
 
-        apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
 
         // true → bitmap key 1
         assert_eq!(sink.filter_inserts.len(), 1);
@@ -1745,7 +1966,7 @@ mod tests {
             }],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1); // still counts as applied (alive set)
         assert_eq!(errors, 0);
 
@@ -1766,7 +1987,7 @@ mod tests {
             ops: vec![Op::Delete],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1803,7 +2024,7 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1828,7 +2049,7 @@ mod tests {
             }],
         }];
 
-        let (_, skipped, _) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (_, skipped, _) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(skipped, 1);
         assert!(sink.filter_inserts.is_empty());
     }
@@ -1914,7 +2135,7 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1960,7 +2181,7 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
