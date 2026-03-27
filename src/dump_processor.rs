@@ -1564,28 +1564,54 @@ pub fn process_dump_with_progress(
         }
     }
 
-    // Save to BitmapFs
-    for (field_name, values) in &merged_filters {
-        if values.is_empty() {
-            continue;
-        }
-        let saved = save_filter_field_to_disk(&bitmap_fs, field_name, values)?;
-        eprintln!(
-            "  Saved filter {}: {} values ({:.1} MB)",
-            field_name,
-            values.len(),
-            saved as f64 / (1024.0 * 1024.0)
-        );
-    }
+    // Save to BitmapFs — parallel across fields for throughput
+    {
+        let save_start = Instant::now();
 
-    for (field_name, layers) in &merged_sorts {
-        if layers.is_empty() || layers.iter().all(|bm| bm.is_empty()) {
-            continue;
+        // Pre-create all filter field directories (avoid redundant create_dir_all per bucket)
+        for field_name in merged_filters.keys() {
+            let dir = bitmap_fs.root().join("filter").join(field_name);
+            std::fs::create_dir_all(&dir).ok();
         }
-        let layer_refs: Vec<&RoaringBitmap> = layers.iter().collect();
-        bitmap_fs.write_sort_layers(field_name, &layer_refs)
-            .map_err(|e| format!("write_sort_layers({field_name}): {e}"))?;
-        eprintln!("  Saved sort {}: {} layers", field_name, layers.len());
+
+        // Parallel filter field saves
+        let filter_items: Vec<_> = merged_filters.iter()
+            .filter(|(_, values)| !values.is_empty())
+            .collect();
+        let filter_results: Vec<Result<(String, u64, usize), String>> = filter_items
+            .par_iter()
+            .map(|(field_name, values)| {
+                let saved = save_filter_field_to_disk(&bitmap_fs, field_name, values)?;
+                Ok((field_name.to_string(), saved, values.len()))
+            })
+            .collect();
+        for result in filter_results {
+            let (field_name, saved, count) = result?;
+            eprintln!(
+                "  Saved filter {}: {} values ({:.1} MB)",
+                field_name, count, saved as f64 / (1024.0 * 1024.0)
+            );
+        }
+
+        // Parallel sort field saves
+        let sort_items: Vec<_> = merged_sorts.iter()
+            .filter(|(_, layers)| !layers.is_empty() && layers.iter().any(|bm| !bm.is_empty()))
+            .collect();
+        let sort_results: Vec<Result<(String, usize), String>> = sort_items
+            .par_iter()
+            .map(|(field_name, layers)| {
+                let layer_refs: Vec<&RoaringBitmap> = layers.iter().collect();
+                bitmap_fs.write_sort_layers(field_name, &layer_refs)
+                    .map_err(|e| format!("write_sort_layers({field_name}): {e}"))?;
+                Ok((field_name.to_string(), layers.len()))
+            })
+            .collect();
+        for result in sort_results {
+            let (field_name, num_layers) = result?;
+            eprintln!("  Saved sort {}: {} layers", field_name, num_layers);
+        }
+
+        eprintln!("  Bitmap save complete in {:.1}s", save_start.elapsed().as_secs_f64());
     }
 
     if sets_alive {
@@ -1738,18 +1764,20 @@ fn process_multi_value_phase(
             })
             .collect();
 
-        // Merge Vec<RoaringBitmap>
+        // Merge Vec<RoaringBitmap> — parallel tree reduction
         let mut merged_vec = thread_results
-            .into_iter()
-            .reduce(|mut dst, src| {
-                for (i, bm) in src.into_iter().enumerate() {
-                    if !bm.is_empty() {
-                        dst[i] |= bm;
+            .into_par_iter()
+            .reduce(
+                || (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect::<Vec<_>>(),
+                |mut dst, src| {
+                    for (i, bm) in src.into_iter().enumerate() {
+                        if !bm.is_empty() {
+                            dst[i] |= bm;
+                        }
                     }
-                }
-                dst
-            })
-            .unwrap_or_default();
+                    dst
+                },
+            );
 
         // Convert to HashMap (non-empty only)
         let mut result: HashMap<u64, RoaringBitmap> = HashMap::new();
