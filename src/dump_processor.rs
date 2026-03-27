@@ -1327,7 +1327,7 @@ pub fn process_dump_with_progress(
 
     // Per-component timing counters (thread-local accumulators flushed to shared atomics)
     let timing_parse_ns = AtomicU64::new(0);
-    let timing_index_ns = AtomicU64::new(0);
+    let timing_field_loop_ns = AtomicU64::new(0);
     let timing_filter_ns = AtomicU64::new(0);
     let timing_enrich_ns = AtomicU64::new(0);
     let timing_bitmap_filter_ns = AtomicU64::new(0);
@@ -1374,7 +1374,7 @@ pub fn process_dump_with_progress(
 
             // Thread-local timing accumulators (flushed to shared atomics at end of chunk)
             let mut local_parse_ns: u64 = 0;
-            let mut local_index_ns: u64 = 0;
+            let mut local_field_loop_ns: u64 = 0;
             let mut local_filter_ns: u64 = 0;
             let mut local_enrich_ns: u64 = 0;
             let mut local_bitmap_filter_ns: u64 = 0;
@@ -1538,7 +1538,7 @@ pub fn process_dump_with_progress(
                         }
                     }
                 }
-                local_index_ns += t_index.elapsed().as_nanos() as u64;
+                local_field_loop_ns += t_index.elapsed().as_nanos() as u64;
 
                 // Build bitmaps from computed fields (Nate's ComputedFieldDef API)
                 let t_computed = Instant::now();
@@ -1624,7 +1624,7 @@ pub fn process_dump_with_progress(
 
             // Flush thread-local timing to shared atomics
             timing_parse_ns.fetch_add(local_parse_ns, Ordering::Relaxed);
-            timing_index_ns.fetch_add(local_index_ns, Ordering::Relaxed);
+            timing_field_loop_ns.fetch_add(local_field_loop_ns, Ordering::Relaxed);
             timing_filter_ns.fetch_add(local_filter_ns, Ordering::Relaxed);
             timing_enrich_ns.fetch_add(local_enrich_ns, Ordering::Relaxed);
             timing_bitmap_filter_ns.fetch_add(local_bitmap_filter_ns, Ordering::Relaxed);
@@ -1722,7 +1722,7 @@ pub fn process_dump_with_progress(
     // Component timing breakdown
     let num_threads = rayon::current_num_threads();
     let p_ns = timing_parse_ns.load(Ordering::Relaxed);
-    let i_ns = timing_index_ns.load(Ordering::Relaxed);
+    let fl_ns = timing_field_loop_ns.load(Ordering::Relaxed);
     let f_ns = timing_filter_ns.load(Ordering::Relaxed);
     let e_ns = timing_enrich_ns.load(Ordering::Relaxed);
     let bf_ns = timing_bitmap_filter_ns.load(Ordering::Relaxed);
@@ -1731,7 +1731,7 @@ pub fn process_dump_with_progress(
     let c_ns = timing_computed_ns.load(Ordering::Relaxed);
     eprintln!("  Component breakdown (thread-seconds across {} threads):", num_threads);
     eprintln!("    parse:         {:.2}s", p_ns as f64 / 1e9);
-    eprintln!("    index:         {:.2}s", i_ns as f64 / 1e9);
+    eprintln!("    field_loop:    {:.2}s (includes bitmap_filter + bitmap_sort)", fl_ns as f64 / 1e9);
     eprintln!("    filter:        {:.2}s", f_ns as f64 / 1e9);
     eprintln!("    enrich:        {:.2}s", e_ns as f64 / 1e9);
     eprintln!("    bitmap_filter: {:.2}s", bf_ns as f64 / 1e9);
@@ -1740,9 +1740,9 @@ pub fn process_dump_with_progress(
     eprintln!("    computed:      {:.2}s", c_ns as f64 / 1e9);
     // Structured JSON for monitoring
     eprintln!(
-        r#"{{"dump":"{}","stage":"component_timing","threads":{},"parse_s":{:.3},"index_s":{:.3},"filter_s":{:.3},"enrich_s":{:.3},"bitmap_filter_s":{:.3},"bitmap_sort_s":{:.3},"docstore_s":{:.3},"computed_s":{:.3}}}"#,
+        r#"{{"dump":"{}","stage":"component_timing","threads":{},"parse_s":{:.3},"field_loop_s":{:.3},"filter_s":{:.3},"enrich_s":{:.3},"bitmap_filter_s":{:.3},"bitmap_sort_s":{:.3},"docstore_s":{:.3},"computed_s":{:.3}}}"#,
         request.name, num_threads,
-        p_ns as f64 / 1e9, i_ns as f64 / 1e9, f_ns as f64 / 1e9, e_ns as f64 / 1e9,
+        p_ns as f64 / 1e9, fl_ns as f64 / 1e9, f_ns as f64 / 1e9, e_ns as f64 / 1e9,
         bf_ns as f64 / 1e9, bs_ns as f64 / 1e9, d_ns as f64 / 1e9, c_ns as f64 / 1e9,
     );
 
