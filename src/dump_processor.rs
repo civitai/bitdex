@@ -1669,9 +1669,14 @@ fn process_multi_value_phase(
                         bitmaps[value].insert(slot);
                     }
                     count += 1;
+                    if count % LOG_INTERVAL == 0 {
+                        total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
+                        if let Some(ref p) = progress_counter { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
+                    }
                 }
-                total_ref.fetch_add(count, Ordering::Relaxed);
-                if let Some(ref p) = progress_counter { p.fetch_add(count, Ordering::Relaxed); }
+                let remainder = count % LOG_INTERVAL;
+                total_ref.fetch_add(remainder, Ordering::Relaxed);
+                if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
                 bitmaps
             })
             .collect();
@@ -1767,9 +1772,14 @@ fn process_multi_value_phase(
                         .or_insert_with(RoaringBitmap::new)
                         .insert(slot);
                     count += 1;
+                    if count % LOG_INTERVAL == 0 {
+                        total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
+                        if let Some(ref p) = progress_counter { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
+                    }
                 }
-                total_ref.fetch_add(count, Ordering::Relaxed);
-                if let Some(ref p) = progress_counter { p.fetch_add(count, Ordering::Relaxed); }
+                let remainder = count % LOG_INTERVAL;
+                total_ref.fetch_add(remainder, Ordering::Relaxed);
+                if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
                 bitmaps
             })
             .collect();
