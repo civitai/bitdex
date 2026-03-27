@@ -1275,6 +1275,8 @@ pub fn process_dump_with_progress(
             let field_idx_cache: &HashMap<String, u16> = bulk_writer.field_to_idx();
             // Dereference Arc once per thread (avoid atomic ops per row)
             let col_idx_ref: &HashMap<String, usize> = col_index.as_ref();
+            // Pre-allocate serialize buffer per thread (reused across all rows)
+            let mut serialize_buf: Vec<u8> = Vec::with_capacity(64);
 
             // Thread-local accumulators
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
@@ -1380,6 +1382,7 @@ pub fn process_dump_with_progress(
                                     request_fields,
                                     &bulk_writer,
                                     &field_idx_cache,
+                                    &mut serialize_buf,
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1403,18 +1406,14 @@ pub fn process_dump_with_progress(
                     let target = field_mapping.target();
                     let column = field_mapping.column();
 
-                    if filter_field_names_ref.contains(target) {
-                        // LCS dictionary fields: resolve string→key FIRST (before i64 parse)
-                        // This fixes availability, baseModel, blockedFor, type which are
-                        // string values that would fail i64 parse and silently produce
-                        // empty bitmaps.
+                    // Filter bitmap: skip contains() check — just try get_mut directly
+                    if let Some(fm) = filter_maps.get_mut(target) {
                         let bitmap_key: Option<u64> = if let Some(dict) = dictionaries_ref.get(target) {
                             let s = row
                                 .get_str(column)
                                 .or_else(|| enriched_get(target));
                             s.map(|v| dict.get_or_insert(v) as u64)
                         } else {
-                            // Non-LCS: use i64 value from row or enrichment
                             row.get_i64(column)
                                 .or_else(|| {
                                     enriched_get(target).and_then(|s| s.parse::<i64>().ok())
@@ -1423,11 +1422,9 @@ pub fn process_dump_with_progress(
                         };
 
                         if let Some(key) = bitmap_key {
-                            if let Some(fm) = filter_maps.get_mut(target) {
-                                fm.entry(key)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(slot);
-                            }
+                            fm.entry(key)
+                                .or_insert_with(RoaringBitmap::new)
+                                .insert(slot);
                         }
                     }
 
@@ -1455,8 +1452,8 @@ pub fn process_dump_with_progress(
                     match computed_val {
                         Some(NateExprValue::Int(v)) if def.value_column.is_none() => {
                             // Regular computed field — use value directly as bitmap key
-                            if filter_field_names_ref.contains(&def.target) {
-                                if let Some(fm) = filter_maps.get_mut(&def.target) {
+                            if let Some(fm) = filter_maps.get_mut(&def.target) {
+                                {
                                     fm.entry(v as u64)
                                         .or_insert_with(RoaringBitmap::new)
                                         .insert(slot);
@@ -1489,8 +1486,8 @@ pub fn process_dump_with_progress(
                         Some(NateExprValue::Bool(b)) if def.value_column.is_none() => {
                             // Boolean computed field (e.g. hasMeta, isPublished)
                             let key = if b { 1u64 } else { 0u64 };
-                            if filter_field_names_ref.contains(&def.target) {
-                                if let Some(fm) = filter_maps.get_mut(&def.target) {
+                            if let Some(fm) = filter_maps.get_mut(&def.target) {
+                                {
                                     fm.entry(key)
                                         .or_insert_with(RoaringBitmap::new)
                                         .insert(slot);
@@ -1512,6 +1509,7 @@ pub fn process_dump_with_progress(
                     request_fields,
                     &bulk_writer,
                     &field_idx_cache,
+                    &mut serialize_buf,
                 );
 
                 count += 1;
@@ -1911,7 +1909,7 @@ fn collect_enrichment_targets(config: &EnrichmentConfig, targets: &mut Vec<Strin
 }
 
 /// Write a single row's data to the docstore via BulkWriter (indexed path).
-/// Uses cached field_idx and indexed fields — no per-row HashMap allocation.
+/// Uses cached field_idx, indexed fields, and reusable serialize buffer.
 fn write_docstore_row_indexed(
     row: &ParsedRow,
     enriched: &dump_enrichment::EnrichedFields,
@@ -1922,7 +1920,18 @@ fn write_docstore_row_indexed(
     request_fields: &[DumpFieldMapping],
     bulk_writer: &Arc<BulkWriter>,
     field_idx: &HashMap<String, u16>,
+    serialize_buf: &mut Vec<u8>,
 ) {
+    // Helper: serialize to reusable buffer and append
+    macro_rules! append_packed {
+        ($fidx:expr, $value:expr) => {
+            serialize_buf.clear();
+            if rmp_serde::encode::write(serialize_buf, $value).is_ok() {
+                bulk_writer.append_tuple_raw(slot, $fidx, serialize_buf);
+            }
+        };
+    }
+
     // Write direct fields
     for mapping in request_fields {
         let target = mapping.target();
@@ -1930,24 +1939,20 @@ fn write_docstore_row_indexed(
 
         if let Some(&fidx) = field_idx.get(target) {
             if let Some(v) = row.get_i64(column) {
-                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                append_packed!(fidx, &PackedValue::I(v));
             } else if let Some(s) = row.get_str(column) {
-                let packed = rmp_serde::to_vec(&PackedValue::S(s.to_string())).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                append_packed!(fidx, &PackedValue::S(s.to_string()));
             }
         }
     }
 
-    // Write enriched fields (from EnrichedFields, no HashMap)
+    // Write enriched fields
     for (target, value) in &enriched.fields {
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             if let Ok(v) = value.parse::<i64>() {
-                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                append_packed!(fidx, &PackedValue::I(v));
             } else {
-                let packed = rmp_serde::to_vec(&PackedValue::S(value.clone())).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
+                append_packed!(fidx, &PackedValue::S(value.clone()));
             }
         }
     }
@@ -1956,39 +1961,21 @@ fn write_docstore_row_indexed(
     for (target, value) in &enriched.computed {
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             match value {
-                NateExprValue::Int(v) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::I(*v)).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                NateExprValue::Bool(b) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::I(if *b { 1 } else { 0 })).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                NateExprValue::Str(ref s) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::S(s.clone())).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
+                NateExprValue::Int(v) => { append_packed!(fidx, &PackedValue::I(*v)); }
+                NateExprValue::Bool(b) => { append_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
+                NateExprValue::Str(ref s) => { append_packed!(fidx, &PackedValue::S(s.clone())); }
                 NateExprValue::Null => {}
             }
         }
     }
 
-    // Write computed fields via indexed eval (no double-eval — computed once here)
+    // Write computed fields via indexed eval
     for def in computed_defs {
         if let Some(&fidx) = field_idx.get(def.target.as_str()) {
             match def.eval_indexed(indexed_fields, col_idx, None) {
-                Some(NateExprValue::Int(v)) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                Some(NateExprValue::Bool(b)) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::I(if b { 1 } else { 0 })).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                Some(NateExprValue::Str(ref s)) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::S(s.clone())).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
+                Some(NateExprValue::Int(v)) => { append_packed!(fidx, &PackedValue::I(v)); }
+                Some(NateExprValue::Bool(b)) => { append_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
+                Some(NateExprValue::Str(ref s)) => { append_packed!(fidx, &PackedValue::S(s.clone())); }
                 _ => {}
             }
         }

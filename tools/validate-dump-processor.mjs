@@ -55,6 +55,7 @@ const DUMP_REQUESTS = [
     enrichment: [
       {
         csv_path: `${STAGE_DIR}/posts.csv`,
+        columns: ['id', 'publishedAtSecs', 'availability', 'modelVersionId'],
         key: 'id',
         join_on: 'postId',
         fields: [
@@ -84,12 +85,14 @@ const DUMP_REQUESTS = [
     enrichment: [
       {
         csv_path: `${STAGE_DIR}/model_versions.csv`,
+        columns: ['id', 'baseModel', 'modelId'],
         key: 'id',
         join_on: 'modelVersionId',
         fields: [{ column: 'baseModel', target: 'baseModel' }],
         enrichment: [
           {
             csv_path: `${STAGE_DIR}/models.csv`,
+            columns: ['id', 'poi', 'type'],
             key: 'id',
             join_on: 'modelId',
             fields: [{ column: 'poi', target: 'poi' }],
