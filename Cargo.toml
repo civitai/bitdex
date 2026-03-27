@@ -12,7 +12,7 @@ keywords = ["bitmap", "index", "database", "search", "roaring"]
 
 [features]
 default = []
-server = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus"]
+server = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus", "dep:serde_yaml"]
 loadtest = ["ureq"]
 replay = ["ureq"]
 pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes", "dep:serde_yaml"]
@@ -162,7 +162,7 @@ path = "src/bin/loadtest.rs"
 required-features = ["loadtest"]
 
 [[bin]]
-name = "bitdex-pg-sync"
+name = "bitdex-sync"
 path = "src/bin/pg_sync.rs"
 required-features = ["pg-sync"]
 

@@ -100,7 +100,7 @@ pub struct Config {
     /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
     /// When `None` (default), all groups are enabled (backward compatible).
     /// When `Some(vec)`, only the listed groups are enabled.
-    /// Persisted to config.json and applied on startup.
+    /// Persisted to config.yaml and applied on startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_metrics: Option<Vec<String>>,
 
@@ -190,7 +190,7 @@ impl Default for Config {
 impl Config {
     /// Load configuration from a file. Format is detected from the file extension.
     ///
-    /// Supported extensions: `.toml`, `.yaml`, `.yml`
+    /// Supported extensions: `.toml`, `.yaml`, `.yml`, `.json`
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| BitdexError::Config(format!("failed to read {}: {e}", path.display())))?;
@@ -202,10 +202,36 @@ impl Config {
 
         match ext {
             "toml" => Self::from_toml(&content),
+            "yaml" | "yml" => Self::from_yaml(&content),
+            "json" => Self::from_json(&content),
             other => Err(BitdexError::Config(format!(
                 "unsupported config file format: '{other}'"
             ))),
         }
+    }
+
+    /// Load configuration from a YAML string.
+    #[cfg(feature = "serde_yaml")]
+    pub fn from_yaml(yaml_str: &str) -> Result<Self> {
+        let config: Config = serde_yaml::from_str(yaml_str)
+            .map_err(|e| BitdexError::Config(format!("YAML parse error: {e}")))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[cfg(not(feature = "serde_yaml"))]
+    pub fn from_yaml(_yaml_str: &str) -> Result<Self> {
+        Err(BitdexError::Config(
+            "YAML support requires the 'serde_yaml' feature".to_string(),
+        ))
+    }
+
+    /// Load configuration from a JSON string.
+    pub fn from_json(json_str: &str) -> Result<Self> {
+        let config: Config = serde_json::from_str(json_str)
+            .map_err(|e| BitdexError::Config(format!("JSON parse error: {e}")))?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load configuration from a TOML string.

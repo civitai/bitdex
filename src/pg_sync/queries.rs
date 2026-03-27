@@ -410,26 +410,7 @@ pub async fn fetch_collections(
     .await
 }
 
-/// Poll the BitdexOutbox for pending changes.
-pub async fn poll_outbox(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sqlx::Error> {
-    sqlx::query_as::<_, OutboxRow>(
-        r#"SELECT id, entity_id, event FROM "BitdexOutbox"
-        ORDER BY id DESC
-        LIMIT $1"#,
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-}
-
-/// Delete processed outbox rows up to the given max ID.
-pub async fn delete_outbox(pool: &PgPool, max_id: i64) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(r#"DELETE FROM "BitdexOutbox" WHERE id <= $1"#)
-        .bind(max_id)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
-}
+// V1 poll_outbox and delete_outbox removed — V2 uses ops_poller with BitdexOps table.
 
 /// Poll outbox rows after a cursor position (FIFO — oldest first).
 pub async fn poll_outbox_from_cursor(
