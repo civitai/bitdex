@@ -1061,7 +1061,7 @@ pub fn process_dump(
     engine: &ConcurrentEngine,
     stage_dir: &Path,
 ) -> Result<PhaseResult, String> {
-    let mut result = process_dump_with_progress(request, engine, stage_dir, None)?;
+    let mut result = process_dump_with_progress(request, engine, stage_dir, None, None)?;
     let bitmap_fs = engine
         .bitmap_store()
         .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?
@@ -1074,11 +1074,16 @@ pub fn process_dump(
 /// Process a dump phase with optional external progress counter.
 /// When `progress_counter` is provided (from the task system), it's incremented
 /// per row so `GET /api/tasks/{id}` shows real-time progress.
+///
+/// When `data_schema` is provided, fields marked `filter_only: true` in the schema
+/// are excluded from docstore writes (BulkWriter will not get an index for them,
+/// so `field_to_idx().get(target)` returns None and the docstore write path is skipped).
 pub fn process_dump_with_progress(
     request: &DumpRequest,
     engine: &ConcurrentEngine,
     stage_dir: &Path,
     progress_counter: Option<Arc<AtomicU64>>,
+    data_schema: Option<&crate::config::DataSchema>,
 ) -> Result<PhaseResult, String> {
     let t = Instant::now();
 
@@ -1150,8 +1155,25 @@ pub fn process_dump_with_progress(
     // Get LCS dictionaries from engine (thread-safe DashMap-based)
     let dictionaries: Arc<HashMap<String, FieldDictionary>> = engine.dictionaries_arc();
 
-    // Prepare BulkWriter for docstore
-    let all_target_names: Vec<String> = target_fields.iter().cloned().collect();
+    // Build set of filter_only field names from data schema (config-driven).
+    // Fields marked filter_only are bitmap-indexed only — no docstore writes.
+    let filter_only_fields: HashSet<String> = data_schema
+        .map(|ds| {
+            ds.fields
+                .iter()
+                .filter(|m| m.filter_only)
+                .map(|m| m.target.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Prepare BulkWriter for docstore — exclude filter_only fields so that
+    // field_to_idx().get(target) returns None and docstore writes are skipped.
+    let all_target_names: Vec<String> = target_fields
+        .iter()
+        .filter(|t| !filter_only_fields.contains(*t))
+        .cloned()
+        .collect();
     let bulk_writer = Arc::new(
         engine
             .prepare_bulk_writer(&all_target_names)
