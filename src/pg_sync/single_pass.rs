@@ -135,7 +135,7 @@ pub fn run_single_pass_v2(
         // Save tagIds filter bitmaps to disk
         let t = Instant::now();
         let tag_map: HashMap<u64, RoaringBitmap> = tag_bitmaps;
-        let saved = save_filter_field_to_disk(&bitmap_fs, "tagIds", &tag_map)?;
+        let saved = save_filter_field_to_disk(&bitmap_fs, "tagIds", tag_map)?;
         eprintln!(
             "  Saved tagIds: {} values ({:.1} MB) in {:.1}s",
             tag_count,
@@ -162,7 +162,7 @@ pub fn run_single_pass_v2(
         );
 
         let t = Instant::now();
-        let img_result = process_images_csv(
+        let mut img_result = process_images_csv(
             stage_dir,
             &bulk_writer,
             &progress,
@@ -189,16 +189,19 @@ pub fn run_single_pass_v2(
         drop(post_map);
 
         // Save filter bitmaps (except tagIds, already saved)
+        // Move filter_maps out so each field's bitmaps are freed after save
         let t = Instant::now();
-        for (field_name, values) in &img_result.filter_maps {
+        let img_filter_maps = std::mem::take(&mut img_result.filter_maps);
+        for (field_name, values) in img_filter_maps {
             if values.is_empty() {
                 continue;
             }
-            let saved = save_filter_field_to_disk(&bitmap_fs, field_name, values)?;
+            let val_count = values.len();
+            let saved = save_filter_field_to_disk(&bitmap_fs, &field_name, values)?;
             eprintln!(
                 "  Saved filter {}: {} values ({:.1} MB)",
                 field_name,
-                values.len(),
+                val_count,
                 saved as f64 / (1024.0 * 1024.0)
             );
         }
@@ -269,7 +272,7 @@ pub fn run_single_pass_v2(
         );
 
         let t = Instant::now();
-        let res_result = process_resources_csv(
+        let mut res_result = process_resources_csv(
             stage_dir,
             &bulk_writer,
             &progress,
@@ -288,16 +291,19 @@ pub fn run_single_pass_v2(
         drop(model_map);
 
         // Save resource filter bitmaps
+        // Move filter_maps out for incremental memory release
         let t = Instant::now();
-        for (field_name, values) in &res_result.filter_maps {
+        let res_filter_maps = std::mem::take(&mut res_result.filter_maps);
+        for (field_name, values) in res_filter_maps {
             if values.is_empty() {
                 continue;
             }
-            let saved = save_filter_field_to_disk(&bitmap_fs, field_name, values)?;
+            let val_count = values.len();
+            let saved = save_filter_field_to_disk(&bitmap_fs, &field_name, values)?;
             eprintln!(
                 "  Saved filter {}: {} values ({:.1} MB)",
                 field_name,
-                values.len(),
+                val_count,
                 saved as f64 / (1024.0 * 1024.0)
             );
         }
@@ -330,7 +336,7 @@ pub fn run_single_pass_v2(
             t.elapsed().as_secs_f64()
         );
 
-        let saved = save_filter_field_to_disk(&bitmap_fs, "toolIds", &tool_bitmaps)?;
+        let saved = save_filter_field_to_disk(&bitmap_fs, "toolIds", tool_bitmaps)?;
         eprintln!(
             "  Saved toolIds: {} values ({:.1} MB)",
             tool_count,
@@ -362,7 +368,7 @@ pub fn run_single_pass_v2(
             t.elapsed().as_secs_f64()
         );
 
-        let saved = save_filter_field_to_disk(&bitmap_fs, "techniqueIds", &tech_bitmaps)?;
+        let saved = save_filter_field_to_disk(&bitmap_fs, "techniqueIds", tech_bitmaps)?;
         eprintln!(
             "  Saved techniqueIds: {} values ({:.1} MB)",
             tech_count,
@@ -420,7 +426,7 @@ pub fn run_single_pass_v2(
                 t.elapsed().as_secs_f64()
             );
 
-            let saved = save_filter_field_to_disk(&bitmap_fs, "collectionIds", &coll_bitmaps)?;
+            let saved = save_filter_field_to_disk(&bitmap_fs, "collectionIds", coll_bitmaps)?;
             eprintln!(
                 "  Saved collectionIds: {} values ({:.1} MB)",
                 coll_count,
@@ -1415,32 +1421,43 @@ fn insert_sort_bits(
 }
 
 /// Save a single filter field's bitmaps to BitmapFs using write_filter_bucket.
+///
+/// Takes ownership of the HashMap so bitmaps can be drained into per-bucket Vecs.
+/// Each bucket's bitmaps are freed after its fpack file is written, providing
+/// incremental memory release for large fields (e.g. tagIds with 31K+ values).
 pub fn save_filter_field_to_disk(
     fs: &BitmapFs,
     field_name: &str,
-    values: &HashMap<u64, RoaringBitmap>,
+    values: HashMap<u64, RoaringBitmap>,
 ) -> Result<u64, String> {
-    let mut by_bucket: HashMap<u8, Vec<(u64, &RoaringBitmap)>> = HashMap::new();
+    // Drain the source HashMap into per-bucket owned Vecs.
+    // The source HashMap is consumed here — its memory is redistributed into buckets.
+    let mut by_bucket: HashMap<u8, Vec<(u64, RoaringBitmap)>> = HashMap::new();
     for (value, bm) in values {
-        let bucket = ((*value >> 8) & 0xFF) as u8;
+        let bucket = ((value >> 8) & 0xFF) as u8;
         by_bucket
             .entry(bucket)
             .or_default()
-            .push((*value, bm));
+            .push((value, bm));
     }
     let total_bytes: u64 = by_bucket.values()
         .flat_map(|entries| entries.iter().map(|(_, bm)| bm.serialized_size() as u64))
         .sum();
 
-    // Parallel bucket writes — each bucket is an independent file
-    let buckets: Vec<_> = by_bucket.iter().collect();
+    // Parallel bucket writes with incremental drop — each bucket owns its bitmaps.
+    // After each bucket's fpack is written, its Vec<(u64, RoaringBitmap)> drops,
+    // freeing bitmap memory immediately rather than holding until all writes complete.
+    let buckets: Vec<_> = by_bucket.into_iter().collect();
     buckets
-        .par_iter()
+        .into_par_iter()
         .try_for_each(|(bucket, entries)| {
-            fs.write_filter_bucket(field_name, **bucket, entries)
-                .map_err(|e| format!("write_filter_bucket({field_name}, {:02x}): {e}", bucket))
+            let refs: Vec<(u64, &RoaringBitmap)> = entries.iter().map(|(v, bm)| (*v, bm)).collect();
+            let result = fs.write_filter_bucket(field_name, bucket, &refs)
+                .map_err(|e| format!("write_filter_bucket({field_name}, {bucket:02x}): {e}"));
+            // entries dropped here — this bucket's bitmaps freed
+            drop(entries);
+            result
         })?;
-
     Ok(total_bytes)
 }
 
