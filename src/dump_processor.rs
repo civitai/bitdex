@@ -1347,7 +1347,7 @@ pub fn process_dump_with_progress(
             // Pre-allocate serialize buffer per thread (reused across all rows)
             let mut serialize_buf: Vec<u8> = Vec::with_capacity(64);
             // Pre-allocate tuple buffer per thread (reused across all rows)
-            let mut tuple_buf: Vec<(u16, Vec<u8>)> = Vec::with_capacity(16);
+            let mut tuple_buf: Vec<(u16, u32, u32)> = Vec::with_capacity(16);
 
             // Thread-local accumulators
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
@@ -2402,16 +2402,18 @@ fn write_docstore_row_indexed(
     bulk_writer: &Arc<BulkWriter>,
     field_idx: &HashMap<String, u16>,
     serialize_buf: &mut Vec<u8>,
-    tuple_buf: &mut Vec<(u16, Vec<u8>)>,
+    tuple_buf: &mut Vec<(u16, u32, u32)>,  // (field_idx, offset, length) into serialize_buf
 ) {
+    serialize_buf.clear();
     tuple_buf.clear();
 
-    // Helper: serialize to reusable buffer and collect into tuple_buf
+    // Helper: serialize into shared buffer and record offset+length
     macro_rules! collect_packed {
         ($fidx:expr, $value:expr) => {
-            serialize_buf.clear();
+            let start = serialize_buf.len() as u32;
             if rmp_serde::encode::write(serialize_buf, $value).is_ok() {
-                tuple_buf.push(($fidx, serialize_buf.clone()));
+                let len = serialize_buf.len() as u32 - start;
+                tuple_buf.push(($fidx, start, len));
             }
         };
     }
@@ -2467,7 +2469,9 @@ fn write_docstore_row_indexed(
 
     // Batch write all tuples in one lock acquisition
     if !tuple_buf.is_empty() {
-        let refs: Vec<(u16, &[u8])> = tuple_buf.iter().map(|(idx, v)| (*idx, v.as_slice())).collect();
+        let refs: Vec<(u16, &[u8])> = tuple_buf.iter()
+            .map(|&(idx, off, len)| (idx, &serialize_buf[off as usize..(off + len) as usize]))
+            .collect();
         bulk_writer.append_tuples_raw(slot, &refs);
     }
 }
