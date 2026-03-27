@@ -57,10 +57,39 @@ pub struct EnrichmentConfig {
 }
 
 /// A row stored in the enrichment lookup table.
-/// Column name → string value. Missing/null columns are absent from the map.
+/// Compact representation: Vec indexed by column position with shared column name index.
+/// At 22.8M rows, this saves ~7GB vs HashMap<String, String> per row.
 #[derive(Debug, Clone)]
 pub struct LookupRow {
-    pub columns: HashMap<String, String>,
+    /// Column values indexed by position. None = null/empty.
+    values: Vec<Option<String>>,
+    /// Shared column name → index mapping (same across all rows in a table).
+    col_index: Arc<HashMap<String, usize>>,
+}
+
+impl LookupRow {
+    /// Get a column value by name.
+    pub fn get(&self, column: &str) -> Option<&str> {
+        let idx = self.col_index.get(column)?;
+        self.values.get(*idx)?.as_deref()
+    }
+
+    /// Convert to CsvRow for expression evaluation.
+    pub fn to_csv_row(&self) -> CsvRow {
+        let mut row = CsvRow::new();
+        for (name, &idx) in self.col_index.as_ref() {
+            let val = self.values.get(idx).and_then(|v| v.as_deref());
+            row.insert(name.as_str(), val);
+        }
+        row
+    }
+
+    /// Iterate over (column_name, value) pairs (non-null only).
+    pub fn iter_columns(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.col_index.iter().filter_map(move |(name, &idx)| {
+            self.values.get(idx)?.as_deref().map(|v| (name.as_str(), v))
+        })
+    }
 }
 
 /// A loaded enrichment lookup table — HashMap<join_key, LookupRow>.
@@ -132,6 +161,11 @@ impl EnrichmentTable {
                 )
             })?;
 
+        // Shared column index for compact LookupRow (saves ~7GB at 22.8M rows)
+        let col_index_arc = Arc::new(
+            header_names.iter().enumerate().map(|(i, name)| (name.clone(), i)).collect::<HashMap<String, usize>>()
+        );
+
         let mut row_count = 0usize;
         for line_result in lines {
             let line = line_result?;
@@ -147,17 +181,23 @@ impl EnrichmentTable {
                 Err(_) => continue, // Skip rows with non-integer keys
             };
 
-            // Build column map (only include non-empty values)
-            let mut columns = HashMap::new();
+            // Build compact row (Vec indexed by column position)
+            let mut values: Vec<Option<String>> = Vec::with_capacity(header_names.len());
             for (i, value) in fields.iter().enumerate() {
-                if !value.is_empty() {
-                    if let Some(name) = header_names.get(i) {
-                        columns.insert(name.clone(), value.to_string());
+                if i < header_names.len() {
+                    if value.is_empty() {
+                        values.push(None);
+                    } else {
+                        values.push(Some(value.to_string()));
                     }
                 }
             }
+            // Pad with None if fewer fields than headers
+            while values.len() < header_names.len() {
+                values.push(None);
+            }
 
-            data.insert(key, LookupRow { columns });
+            data.insert(key, LookupRow { values, col_index: col_index_arc.clone() });
             row_count += 1;
         }
 
@@ -212,11 +252,7 @@ impl EnrichmentTable {
             None => return result,
         };
 
-        let lookup_csv: CsvRow = lookup_row
-            .columns
-            .iter()
-            .map(|(k, v)| (k.as_str(), Some(v.as_str())))
-            .collect();
+        let lookup_csv: CsvRow = lookup_row.to_csv_row();
 
         // Check this level's filter (if any)
         if let Some(ref filter) = config.filter {
@@ -227,8 +263,8 @@ impl EnrichmentTable {
 
         // Extract direct fields
         for (csv_col, target) in &config.fields {
-            if let Some(value) = lookup_row.columns.get(csv_col.as_str()) {
-                result.fields.push((target.clone(), value.clone()));
+            if let Some(value) = lookup_row.get(csv_col) {
+                result.fields.push((target.clone(), value.to_string()));
             }
         }
 
@@ -256,11 +292,11 @@ impl EnrichmentTable {
             .values()
             .take(100)
             .map(|r| {
-                r.columns
+                r.values
                     .iter()
-                    .map(|(k, v)| k.len() + v.len() + 64)
+                    .map(|v| v.as_ref().map_or(8, |s| s.len() + 24))
                     .sum::<usize>()
-                    + 80 // HashMap overhead per entry
+                    + 24 // Vec overhead
             })
             .sum::<usize>()
             / 100.max(1);
@@ -558,13 +594,13 @@ mod tests {
 
         // Check row 100
         let row = table.get(100).unwrap();
-        assert_eq!(row.columns["publishedAtSecs"], "1700000000");
-        assert_eq!(row.columns["availability"], "Public");
+        assert_eq!(row.get("publishedAtSecs").unwrap(), "1700000000");
+        assert_eq!(row.get("availability").unwrap(), "Public");
 
         // Check row 200 (null publishedAtSecs)
         let row200 = table.get(200).unwrap();
-        assert!(!row200.columns.contains_key("publishedAtSecs")); // empty → absent
-        assert_eq!(row200.columns["availability"], "Private");
+        assert!(row200.get("publishedAtSecs").is_none()); // empty → absent
+        assert_eq!(row200.get("availability").unwrap(), "Private");
     }
 
     #[test]
