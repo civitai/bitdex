@@ -215,6 +215,120 @@ impl EnrichmentTable {
         })
     }
 
+    /// Load an enrichment table using mmap + rayon for large files (>100MB).
+    /// Falls back to sequential BufReader for small files.
+    pub fn load_fast(config: &EnrichmentConfig) -> io::Result<Self> {
+        let file_size = std::fs::metadata(&config.csv_path)?.len();
+        if file_size < 100 * 1024 * 1024 {
+            return Self::load(config); // Small file — sequential is fine
+        }
+
+        use rayon::prelude::*;
+        use dashmap::DashMap;
+
+        let file = std::fs::File::open(&config.csv_path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap: {e}")))?;
+        let raw = &mmap[..];
+
+        // Column names from config or first line
+        let (header_names, data_start) = if !config.columns.is_empty() {
+            (config.columns.clone(), 0usize)
+        } else {
+            let first_nl = raw.iter().position(|&b| b == b'\n').unwrap_or(raw.len());
+            let header_line = std::str::from_utf8(&raw[..first_nl]).unwrap_or("");
+            let names: Vec<String> = parse_csv_fields(header_line).iter().map(|s| s.to_string()).collect();
+            (names, first_nl + 1)
+        };
+
+        let key_idx = header_names.iter().position(|h| h == &config.key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
+                format!("key '{}' not in headers: {:?}", config.key, header_names)))?;
+
+        let col_index_arc = Arc::new(
+            header_names.iter().enumerate().map(|(i, name)| (name.clone(), i)).collect::<HashMap<String, usize>>()
+        );
+
+        let body = &raw[data_start..];
+
+        // Split into byte ranges for parallel processing
+        let num_threads = rayon::current_num_threads();
+        let chunk_size = body.len() / num_threads;
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(num_threads);
+        let mut start = 0;
+        for i in 0..num_threads {
+            let end = if i == num_threads - 1 {
+                body.len()
+            } else {
+                let tentative = (start + chunk_size).min(body.len());
+                match body[tentative..].iter().position(|&b| b == b'\n') {
+                    Some(offset) => tentative + offset + 1,
+                    None => body.len(),
+                }
+            }.min(body.len());
+            if start < end {
+                ranges.push((start, end));
+            }
+            start = end;
+        }
+
+        // Parallel parse into DashMap
+        let shared_data: DashMap<i64, LookupRow> = DashMap::new();
+        let row_count = std::sync::atomic::AtomicUsize::new(0);
+
+        ranges.par_iter().for_each(|&(range_start, range_end)| {
+            let chunk = &body[range_start..range_end];
+            let mut line_start = 0;
+            let mut local_count = 0usize;
+
+            for i in 0..chunk.len() {
+                if chunk[i] != b'\n' { continue; }
+                let line = &chunk[line_start..i];
+                line_start = i + 1;
+                let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
+                if line.is_empty() { continue; }
+
+                let line_str = match std::str::from_utf8(line) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let fields: Vec<&str> = parse_csv_fields(line_str);
+                let key_str = fields.get(key_idx).copied().unwrap_or("");
+                let key: i64 = match key_str.parse() {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+
+                let mut values: Vec<Option<String>> = Vec::with_capacity(header_names.len());
+                for (i, value) in fields.iter().enumerate() {
+                    if i < header_names.len() {
+                        values.push(if value.is_empty() { None } else { Some(value.to_string()) });
+                    }
+                }
+                while values.len() < header_names.len() {
+                    values.push(None);
+                }
+
+                shared_data.insert(key, LookupRow { values, col_index: col_index_arc.clone() });
+                local_count += 1;
+            }
+            row_count.fetch_add(local_count, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        // Convert DashMap to HashMap
+        let data: HashMap<i64, LookupRow> = shared_data.into_iter().collect();
+        let total_rows = row_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Load nested child
+        let child = if let Some(ref child_config) = config.child {
+            Some(Box::new(EnrichmentTable::load_fast(child_config)?))
+        } else {
+            None
+        };
+
+        Ok(Self { data, child, row_count: total_rows })
+    }
+
     /// Look up a row by key value.
     pub fn get(&self, key: i64) -> Option<&LookupRow> {
         self.data.get(&key)
@@ -391,7 +505,7 @@ impl EnrichmentManager {
     /// Call this before processing the phase's CSV.
     pub fn load(&mut self, config: EnrichmentConfig) -> io::Result<()> {
         let join_on = config.join_on.clone();
-        let table = EnrichmentTable::load(&config)?;
+        let table = EnrichmentTable::load_fast(&config)?;
         self.tables.insert(join_on, (table, config));
         Ok(())
     }
