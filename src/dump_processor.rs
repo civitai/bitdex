@@ -403,8 +403,8 @@ fn parse_expr_value(s: &str) -> Result<ExprValue, String> {
 pub struct ParsedRow<'a> {
     /// Raw field values as byte slices (zero-copy from mmap)
     fields: Vec<&'a [u8]>,
-    /// Column name → index mapping (shared across all rows)
-    col_index: Arc<HashMap<String, usize>>,
+    /// Column name → index mapping (shared reference, not cloned per row)
+    col_index: &'a HashMap<String, usize>,
 }
 
 impl<'a> ParsedRow<'a> {
@@ -455,7 +455,7 @@ impl<'a> ParsedRow<'a> {
     /// Convert to Nate's CsvRow format for expression/enrichment evaluation.
     pub fn to_csv_row<'b>(&'b self) -> CsvRow<'b> {
         let mut row = CsvRow::new();
-        for (name, &idx) in self.col_index.as_ref() {
+        for (name, &idx) in self.col_index {
             if let Some(bytes) = self.fields.get(idx) {
                 if bytes.is_empty() {
                     row.insert(name.as_str(), None);
@@ -478,21 +478,22 @@ impl<'a> ParsedRow<'a> {
     pub fn to_indexed_fields<'b>(&'b self) -> Vec<Option<&'b str>> {
         self.fields
             .iter()
-            .map(|bytes| {
-                if bytes.is_empty() {
-                    None
-                } else if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
-                    std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()
-                } else {
-                    std::str::from_utf8(bytes).ok()
-                }
-            })
+            .map(|bytes| parse_field_to_str(bytes))
             .collect()
+    }
+
+    /// Fill a pre-allocated buffer with indexed fields (reuse across rows).
+    /// Avoids Vec allocation per row — just clear and refill.
+    pub fn fill_indexed_fields<'b>(&'b self, buf: &mut Vec<Option<&'b str>>) {
+        buf.clear();
+        for bytes in &self.fields {
+            buf.push(parse_field_to_str(bytes));
+        }
     }
 
     /// Get the column index (shared across all rows).
     pub fn col_index_ref(&self) -> &HashMap<String, usize> {
-        self.col_index.as_ref()
+        self.col_index
     }
 }
 
@@ -881,6 +882,18 @@ fn detect_delimiter(_data: &[u8], format: &DumpFormat) -> u8 {
     }
 }
 
+/// Parse a byte-slice field to &str, handling quotes and empty values.
+#[inline]
+fn parse_field_to_str<'a>(bytes: &'a [u8]) -> Option<&'a str> {
+    if bytes.is_empty() {
+        None
+    } else if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()
+    } else {
+        std::str::from_utf8(bytes).ok()
+    }
+}
+
 /// Parse a single delimited line into fields. Handles quoted fields.
 fn parse_delimited_line<'a>(line: &'a [u8], delimiter: u8) -> Vec<&'a [u8]> {
     let mut fields = Vec::new();
@@ -1260,6 +1273,8 @@ pub fn process_dump_with_progress(
 
             // Cache field_to_idx() once per thread (not per row)
             let field_idx_cache: &HashMap<String, u16> = bulk_writer.field_to_idx();
+            // Dereference Arc once per thread (avoid atomic ops per row)
+            let col_idx_ref: &HashMap<String, usize> = col_index.as_ref();
 
             // Thread-local accumulators
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
@@ -1300,7 +1315,7 @@ pub fn process_dump_with_progress(
                 let fields = parse_delimited_line(line, delimiter);
                 let row = ParsedRow {
                     fields,
-                    col_index: col_index.clone(),
+                    col_index: col_idx_ref,
                 };
 
                 // Get slot ID
@@ -1312,20 +1327,20 @@ pub fn process_dump_with_progress(
                     max_slot = slot;
                 }
 
-                // Build indexed fields once per row (Vec<Option<&str>>, no HashMap)
-                let indexed_fields = row.to_indexed_fields();
+                // Build indexed fields (Vec<Option<&str>> — cheap compared to HashMap)
+                let indexed_fields_buf = row.to_indexed_fields();
                 let col_idx = row.col_index_ref();
 
                 // Apply filter via indexed path (zero-allocation)
                 if let Some(ref fexpr) = filter_expr_ref {
-                    if !fexpr.eval_indexed(&indexed_fields, col_idx, None) {
+                    if !fexpr.eval_indexed(&indexed_fields_buf, col_idx, None) {
                         continue;
                     }
                 }
 
                 // Resolve enrichment via indexed path (no CsvRow HashMap)
                 let enriched = if enrichment_mgr_ref.table_count() > 0 {
-                    Some(enrichment_mgr_ref.enrich_row_indexed(&indexed_fields, col_idx))
+                    Some(enrichment_mgr_ref.enrich_row_indexed(&indexed_fields_buf, col_idx))
                 } else {
                     None
                 };
@@ -1359,7 +1374,7 @@ pub fn process_dump_with_progress(
                                     &row,
                                     &enriched,
                                     computed_defs_ref,
-                                    &indexed_fields,
+                                    &indexed_fields_buf,
                                     col_idx,
                                     slot,
                                     request_fields,
@@ -1435,7 +1450,7 @@ pub fn process_dump_with_progress(
 
                 // Build bitmaps from computed fields (Nate's ComputedFieldDef API)
                 for def in computed_defs_ref {
-                    let computed_val = def.eval_indexed(&indexed_fields, col_idx, None);
+                    let computed_val = def.eval_indexed(&indexed_fields_buf, col_idx, None);
 
                     match computed_val {
                         Some(NateExprValue::Int(v)) if def.value_column.is_none() => {
@@ -1491,7 +1506,7 @@ pub fn process_dump_with_progress(
                     &row,
                     &enriched,
                     computed_defs_ref,
-                    &indexed_fields,
+                    &indexed_fields_buf,
                     col_idx,
                     slot,
                     request_fields,
@@ -1689,7 +1704,7 @@ fn process_multi_value_phase(
                     let fields = parse_delimited_line(line, delimiter);
                     let row = ParsedRow {
                         fields,
-                        col_index: col_index.clone(),
+                        col_index: col_index.as_ref(),
                     };
 
                     // Apply filter
@@ -1792,7 +1807,7 @@ fn process_multi_value_phase(
                     let fields = parse_delimited_line(line, delimiter);
                     let row = ParsedRow {
                         fields,
-                        col_index: col_index.clone(),
+                        col_index: col_index.as_ref(),
                     };
 
                     if let Some(ref fexpr) = filter_expr {
@@ -2218,19 +2233,19 @@ mod tests {
     #[test]
     fn test_eval_filter_bitfield() {
         let expr = parse_expression("(flags >> 10) & 1 = 0").unwrap();
-        let col_index = Arc::new(HashMap::from([("flags".to_string(), 0usize)]));
+        let col_index = HashMap::from([("flags".to_string(), 0usize)]);
 
         // flags = 0 → bit 10 = 0 → passes
         let row = ParsedRow {
             fields: vec![b"0"],
-            col_index: col_index.clone(),
+            col_index: &col_index,
         };
         assert!(eval_filter(&expr, &row, None));
 
         // flags = 1024 → bit 10 = 1 → fails
         let row = ParsedRow {
             fields: vec![b"1024"],
-            col_index: col_index.clone(),
+            col_index: &col_index,
         };
         assert!(!eval_filter(&expr, &row, None));
     }
@@ -2238,14 +2253,14 @@ mod tests {
     #[test]
     fn test_eval_computed_max() {
         let expr = parse_expression("max(a, b)").unwrap();
-        let col_index = Arc::new(HashMap::from([
+        let col_index = HashMap::from([
             ("a".to_string(), 0usize),
             ("b".to_string(), 1usize),
-        ]));
+        ]);
 
         let row = ParsedRow {
             fields: vec![b"100", b"200"],
-            col_index: col_index.clone(),
+            col_index: &col_index,
         };
         assert_eq!(eval_computed(&expr, &row, None), Some(200));
     }
