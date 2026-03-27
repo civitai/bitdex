@@ -5333,6 +5333,45 @@ impl ConcurrentEngine {
         );
     }
 
+    /// Reload the alive bitmap and slot counter from BitmapFs into the
+    /// in-memory engine snapshot. Call after dump processor writes alive
+    /// to disk — without this, queries see a stale/empty alive bitmap.
+    pub fn reload_alive_from_disk(&self) {
+        let bitmap_fs = match self.bitmap_store() {
+            Some(fs) => fs,
+            None => return,
+        };
+        let alive_bm = match bitmap_fs.load_alive() {
+            Ok(Some(bm)) => bm,
+            _ => return,
+        };
+        let counter = bitmap_fs.load_slot_counter().ok().flatten().unwrap_or(0);
+        let alive_count = alive_bm.len();
+
+        // Build new SlotAllocator with the disk state
+        let mut new_slots = crate::slot::SlotAllocator::from_state(
+            counter,
+            alive_bm,
+            RoaringBitmap::new(),
+        );
+
+        // Load deferred alive if present
+        if let Ok(Some(deferred)) = bitmap_fs.load_deferred_alive() {
+            new_slots.set_deferred(deferred);
+        }
+
+        // Update the in-memory snapshot atomically
+        let current = self.inner.load_full();
+        let mut updated: InnerEngine = (*current).clone();
+        updated.slots = new_slots;
+        self.inner.store(Arc::new(updated));
+
+        eprintln!(
+            "Reloaded alive bitmap from disk: {} alive, slot_counter={}",
+            alive_count, counter
+        );
+    }
+
     /// Get eviction stats: (field_name, evicted_total, resident_count).
     pub fn eviction_stats(&self) -> Vec<(String, u64, usize)> {
         let snap = self.snapshot();
