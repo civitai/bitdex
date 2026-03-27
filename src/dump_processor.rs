@@ -1857,14 +1857,7 @@ fn process_multi_value_phase(
     const MAX_TAG_ID: usize = 300_000;
     let use_vec = target == "tagIds"; // Only tagIds uses vec optimization
 
-    // Skip docstore collection for the Vec path (tags) — at 5.4B rows,
-    // collecting per-slot value lists uses ~42GB of memory (107M slots × 50 avg values).
-    // Tags is bitmap-only. Tools/techniques are small enough to collect.
-    let field_idx = if use_vec {
-        None // tags: bitmap-only, no docstore
-    } else {
-        bulk_writer.field_to_idx().get(&target).copied()
-    };
+    let field_idx = bulk_writer.field_to_idx().get(&target).copied();
 
     let ranges = split_mmap_ranges(body, rayon::current_num_threads());
     let total = AtomicU64::new(0);
