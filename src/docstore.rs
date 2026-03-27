@@ -1061,13 +1061,24 @@ impl DocStore {
             if slot != slot_id {
                 continue;
             }
-            if fields.contains_key(&field_idx) {
-                continue; // already have a newer value
-            }
-            // Only deserialize the target slot's fields — ~3-20 values, not 5-15K
             let value_bytes = &data[value_offset..value_offset + value_len];
             let pv: PackedValue = rmp_serde::from_slice(value_bytes)
                 .map_err(|e| BitdexError::DocStore(format!("v2 decode field {field_idx}: {e}")))?;
+            // Multi-value merge: accumulate Mi entries for the same field
+            if let Some(existing) = fields.get_mut(&field_idx) {
+                match (existing, &pv) {
+                    // Both Mi: extend the array (multi-value append pattern)
+                    (PackedValue::Mi(ref mut vec), PackedValue::Mi(other)) => {
+                        vec.extend(other.iter());
+                    }
+                    // Existing Mi + single I: append to array
+                    (PackedValue::Mi(ref mut vec), PackedValue::I(n)) => {
+                        vec.push(*n);
+                    }
+                    _ => {} // scalar fields: keep newest (LIFO dedup)
+                }
+                continue;
+            }
             fields.insert(field_idx, pv);
         }
         let unique_tuples = seen_all.map_or(total_tuples, |sa| sa.len() as u64);
