@@ -1755,7 +1755,7 @@ fn process_multi_value_phase(
     col_index: &Arc<HashMap<String, usize>>,
     filter_expr: &Option<FilterExpression>,
     bitmap_fs: &BitmapFs,
-    _bulk_writer: &Arc<BulkWriter>,
+    bulk_writer: &Arc<BulkWriter>,
     progress_counter: &Option<Arc<AtomicU64>>,
 ) -> Result<PhaseResult, String> {
     let target = request.fields[0].target().to_string();
@@ -1765,18 +1765,22 @@ fn process_multi_value_phase(
     const MAX_TAG_ID: usize = 300_000;
     let use_vec = target == "tagIds"; // Only tagIds uses vec optimization
 
+    let field_idx = bulk_writer.field_to_idx().get(&target).copied();
+
     let ranges = split_mmap_ranges(body, rayon::current_num_threads());
     let total = AtomicU64::new(0);
     let total_ref = &total;
 
     if use_vec {
         // Vec<RoaringBitmap> indexed by value_id — no hashing
-        let thread_results: Vec<Vec<RoaringBitmap>> = ranges
+        // Also collect per-slot value lists for docstore writes
+        let thread_results: Vec<(Vec<RoaringBitmap>, HashMap<u32, Vec<i64>>)> = ranges
             .par_iter()
             .map(|&(range_start, range_end)| {
                 let chunk = &body[range_start..range_end];
                 let mut bitmaps: Vec<RoaringBitmap> =
                     (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect();
+                let mut slot_values: HashMap<u32, Vec<i64>> = HashMap::new();
                 let mut count = 0u64;
                 let mut line_start = 0;
 
@@ -1817,6 +1821,9 @@ fn process_multi_value_phase(
                     if value < MAX_TAG_ID {
                         bitmaps[value].insert(slot);
                     }
+                    if field_idx.is_some() {
+                        slot_values.entry(slot).or_default().push(value as i64);
+                    }
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
                         total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
@@ -1826,13 +1833,29 @@ fn process_multi_value_phase(
                 let remainder = count % LOG_INTERVAL;
                 total_ref.fetch_add(remainder, Ordering::Relaxed);
                 if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
-                bitmaps
+                (bitmaps, slot_values)
             })
             .collect();
+
+        // Write collected multi-value arrays to docstore
+        if let Some(fidx) = field_idx {
+            let mut merged_values: HashMap<u32, Vec<i64>> = HashMap::new();
+            for (_, sv) in &thread_results {
+                for (&slot, values) in sv {
+                    merged_values.entry(slot).or_default().extend(values);
+                }
+            }
+            for (slot, values) in &merged_values {
+                let packed = rmp_serde::to_vec(&PackedValue::Mi(values.clone())).unwrap_or_default();
+                bulk_writer.append_tuple_raw(*slot, fidx, &packed);
+            }
+            eprintln!("  {target}: wrote {} multi-value docstore tuples", merged_values.len());
+        }
 
         // Merge Vec<RoaringBitmap> — parallel tree reduction
         let mut merged_vec = thread_results
             .into_par_iter()
+            .map(|(bitmaps, _)| bitmaps)
             .reduce(
                 || (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect::<Vec<_>>(),
                 |mut dst, src| {
@@ -1877,11 +1900,13 @@ fn process_multi_value_phase(
         })
     } else {
         // HashMap path for tools, techniques (smaller datasets)
-        let thread_results: Vec<HashMap<u64, RoaringBitmap>> = ranges
+        // Also collect per-slot value lists for docstore writes
+        let thread_results: Vec<(HashMap<u64, RoaringBitmap>, HashMap<u32, Vec<i64>>)> = ranges
             .par_iter()
             .map(|&(range_start, range_end)| {
                 let chunk = &body[range_start..range_end];
                 let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
+                let mut slot_values: HashMap<u32, Vec<i64>> = HashMap::new();
                 let mut count = 0u64;
                 let mut line_start = 0;
 
@@ -1922,6 +1947,9 @@ fn process_multi_value_phase(
                         .entry(value)
                         .or_insert_with(RoaringBitmap::new)
                         .insert(slot);
+                    if field_idx.is_some() {
+                        slot_values.entry(slot).or_default().push(value as i64);
+                    }
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
                         total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
@@ -1931,13 +1959,28 @@ fn process_multi_value_phase(
                 let remainder = count % LOG_INTERVAL;
                 total_ref.fetch_add(remainder, Ordering::Relaxed);
                 if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
-                bitmaps
+                (bitmaps, slot_values)
             })
             .collect();
 
+        // Write collected multi-value arrays to docstore
+        if let Some(fidx) = field_idx {
+            let mut merged_values: HashMap<u32, Vec<i64>> = HashMap::new();
+            for (_, sv) in &thread_results {
+                for (&slot, values) in sv {
+                    merged_values.entry(slot).or_default().extend(values);
+                }
+            }
+            for (slot, values) in &merged_values {
+                let packed = rmp_serde::to_vec(&PackedValue::Mi(values.clone())).unwrap_or_default();
+                bulk_writer.append_tuple_raw(*slot, fidx, &packed);
+            }
+            eprintln!("  {target}: wrote {} multi-value docstore tuples", merged_values.len());
+        }
+
         // Merge
         let mut merged: HashMap<u64, RoaringBitmap> = HashMap::new();
-        for bitmaps in thread_results {
+        for (bitmaps, _) in thread_results {
             for (val, bm) in bitmaps {
                 merged.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
             }
