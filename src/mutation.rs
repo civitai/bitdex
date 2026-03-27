@@ -1682,4 +1682,60 @@ mod tests {
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[0]), 0);
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[]), 0);
     }
+
+    #[test]
+    fn test_diff_document_partial_deferred_alive() {
+        use crate::config::{DeferredAliveConfig, FilterFieldConfig, SortFieldConfig};
+        use crate::filter::FilterFieldType;
+        use crate::write_coalescer::MutationOp;
+
+        let mut config = Config::default();
+        config.filter_fields = vec![FilterFieldConfig {
+            name: "nsfwLevel".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+        }];
+        config.sort_fields = vec![SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        }];
+        config.deferred_alive = Some(DeferredAliveConfig {
+            source_field: "publishedAt".into(),
+            ms_to_seconds: false,
+        });
+
+        let registry = FieldRegistry::from_config(&config);
+
+        // Old doc has nsfwLevel=16 and publishedAt=1000 (alive)
+        let mut old_fields = std::collections::HashMap::new();
+        old_fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(16)));
+        old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(1000)));
+        let old_doc = crate::docstore::StoredDoc { fields: old_fields, schema_version: 0 };
+
+        // PATCH changes publishedAt to far future (year 2050)
+        let future_ts = 2524608000i64;
+        let mut new_fields = std::collections::HashMap::new();
+        new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(future_ts)));
+        let new_doc = Document { fields: new_fields };
+
+        let ops = diff_document_partial(42, Some(&old_doc), &new_doc, &config, &registry);
+
+        // Should contain: filter removes (clear old nsfwLevel), sort clears,
+        // alive remove, and deferred alive
+        let has_deferred = ops.iter().any(|op| matches!(op, MutationOp::DeferredAlive { .. }));
+        let has_alive_remove = ops.iter().any(|op| matches!(op, MutationOp::AliveRemove { .. }));
+
+        assert!(has_deferred, "PATCH to future publishedAt should defer alive");
+        assert!(has_alive_remove, "PATCH to future should remove alive bit");
+
+        // Should NOT have any filter inserts or sort sets (all bitmaps cleared)
+        let has_filter_insert = ops.iter().any(|op| matches!(op, MutationOp::FilterInsert { .. }));
+        assert!(!has_filter_insert, "deferred should not insert any filter bitmaps");
+    }
 }

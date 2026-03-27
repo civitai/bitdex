@@ -36,6 +36,11 @@ use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 
 /// Writes individual field-value tuples to the docstore during WAL processing.
 /// Wraps the engine's docstore with a cached field dictionary snapshot.
+///
+/// Thread safety: DocWriter is used exclusively by the WAL reader thread,
+/// which is single-threaded. The read-modify-write in write_add/write_remove
+/// is safe because no concurrent writer can modify the same slot's doc between
+/// the read and write within a single WAL batch cycle.
 pub struct DocWriter {
     docstore: Arc<parking_lot::Mutex<DocStore>>,
     field_dict: HashMap<String, u16>,
@@ -2227,5 +2232,259 @@ mod tests {
         // Past timestamp should set alive immediately
         assert_eq!(sink.alive_inserts, vec![42]);
         assert!(sink.deferred_alive.is_empty(), "past publishedAt should NOT defer alive");
+    }
+
+    // -----------------------------------------------------------------------
+    // DocWriter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_doc_writer_write_set() {
+        use crate::docstore::{DocStore, PackedValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_index("nsfwLevel").unwrap();
+        store.ensure_field_index("userId").unwrap();
+
+        let store = Arc::new(parking_lot::Mutex::new(store));
+        let mut dw = DocWriter::new(Arc::clone(&store));
+
+        dw.write_set(10, "nsfwLevel", &json!(16));
+        dw.write_set(10, "userId", &json!(42));
+        dw.flush();
+
+        // Close writers
+        store.lock().v2_writers_handle().clear();
+
+        let doc = store.lock().get_v2(10).unwrap().unwrap();
+        match &doc.fields["nsfwLevel"] {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(16)) => {}
+            other => panic!("expected nsfwLevel=16, got: {:?}", other),
+        }
+        match &doc.fields["userId"] {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(42)) => {}
+            other => panic!("expected userId=42, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_doc_writer_write_add_remove() {
+        use crate::docstore::{DocStore, PackedValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_index("tagIds").unwrap();
+
+        let store = Arc::new(parking_lot::Mutex::new(store));
+
+        // First write an initial value
+        {
+            let mut dw = DocWriter::new(Arc::clone(&store));
+            let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100, 200])).unwrap();
+            let idx = store.lock().field_index("tagIds").unwrap();
+            store.lock().append_tuple(5, idx, &initial).unwrap();
+            store.lock().v2_writers_handle().clear();
+        }
+
+        // Add a value
+        {
+            let mut dw = DocWriter::new(Arc::clone(&store));
+            dw.write_add(5, "tagIds", &json!(300));
+            dw.flush();
+            store.lock().v2_writers_handle().clear();
+        }
+
+        let doc = store.lock().get_v2(5).unwrap().unwrap();
+        match &doc.fields["tagIds"] {
+            crate::mutation::FieldValue::Multi(vals) => {
+                let ints: Vec<i64> = vals.iter().filter_map(|v| {
+                    if let crate::query::Value::Integer(i) = v { Some(*i) } else { None }
+                }).collect();
+                assert!(ints.contains(&100));
+                assert!(ints.contains(&200));
+                assert!(ints.contains(&300));
+            }
+            other => panic!("expected multi-value tagIds, got: {:?}", other),
+        }
+
+        // Remove a value
+        {
+            let mut dw = DocWriter::new(Arc::clone(&store));
+            dw.write_remove(5, "tagIds", &json!(200));
+            dw.flush();
+            store.lock().v2_writers_handle().clear();
+        }
+
+        let doc = store.lock().get_v2(5).unwrap().unwrap();
+        match &doc.fields["tagIds"] {
+            crate::mutation::FieldValue::Multi(vals) => {
+                let ints: Vec<i64> = vals.iter().filter_map(|v| {
+                    if let crate::query::Value::Integer(i) = v { Some(*i) } else { None }
+                }).collect();
+                assert!(ints.contains(&100));
+                assert!(!ints.contains(&200), "200 should have been removed");
+                assert!(ints.contains(&300));
+            }
+            other => panic!("expected multi-value tagIds, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-alive slot filtering tests (2.10)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_non_alive_slot_ops_dropped() {
+        // Without an engine, non-alive check is skipped (dump mode).
+        // This test verifies that creates_slot=false entries are processed
+        // when no engine is provided (dump mode behavior).
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 99,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "nsfwLevel".into(), value: json!(8) }],
+        }];
+
+        let (applied, skipped, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        // Without engine, non-alive check is bypassed — ops are applied
+        assert_eq!(applied, 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(errors, 0);
+        assert!(!sink.filter_inserts.is_empty());
+    }
+
+    #[test]
+    fn test_creates_slot_bypasses_alive_check() {
+        // creates_slot=true should always process, even without alive status
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 55,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "nsfwLevel".into(), value: json!(4) }],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+        assert_eq!(sink.alive_inserts, vec![55]);
+        assert!(!sink.filter_inserts.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Computed sort old-value clearing tests (2.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_computed_sort_remove_set_clears_old_bits() {
+        use crate::config::{ComputedField, ComputedOp};
+
+        let mut config = test_config();
+        // Add existedAt and publishedAt as sort fields
+        config.sort_fields.push(SortFieldConfig {
+            name: "existedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        });
+        config.sort_fields.push(SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        });
+        // Add sortAt as computed = GREATEST(existedAt, publishedAt)
+        config.sort_fields.push(SortFieldConfig {
+            name: "sortAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: Some(ComputedField {
+                op: ComputedOp::Greatest,
+                source_fields: vec!["existedAt".into(), "publishedAt".into()],
+            }),
+        });
+
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        // Simulate a publishedAt change: remove old (1000), set new (2000)
+        // existedAt stays at 500 (only in set, no remove)
+        let mut batch = vec![EntityOps {
+            entity_id: 10,
+            creates_slot: false,
+            ops: vec![
+                Op::Remove { field: "publishedAt".into(), value: json!(1000) },
+                Op::Set { field: "publishedAt".into(), value: json!(2000) },
+                Op::Set { field: "existedAt".into(), value: json!(500) },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // sortAt should have sort_clears (old computed = max(500,1000) = 1000)
+        // and sort_sets (new computed = max(500,2000) = 2000)
+        let sort_at_clears: Vec<_> = sink.sort_clears.iter()
+            .filter(|(f, _, _)| f == "sortAt")
+            .collect();
+        let sort_at_sets: Vec<_> = sink.sort_sets.iter()
+            .filter(|(f, _, _)| f == "sortAt")
+            .collect();
+
+        assert!(!sort_at_clears.is_empty(), "should clear old sortAt bits");
+        assert!(!sort_at_sets.is_empty(), "should set new sortAt bits");
+
+        // Verify old value 1000 bits were cleared
+        let old_val: u32 = 1000;
+        for bit in 0..32 {
+            if (old_val >> bit) & 1 == 1 {
+                assert!(
+                    sort_at_clears.iter().any(|(_, b, s)| *b == bit && *s == 10),
+                    "should clear bit {bit} of old sortAt value {old_val}"
+                );
+            }
+        }
+
+        // Verify new value 2000 bits were set
+        let new_val: u32 = 2000;
+        for bit in 0..32 {
+            if (new_val >> bit) & 1 == 1 {
+                assert!(
+                    sort_at_sets.iter().any(|(_, b, s)| *b == bit && *s == 10),
+                    "should set bit {bit} of new sortAt value {new_val}"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // json_to_packed tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_to_packed_types() {
+        use crate::docstore::PackedValue;
+
+        assert_eq!(json_to_packed(&json!(42)), Some(PackedValue::I(42)));
+        assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
+        assert_eq!(json_to_packed(&json!(true)), Some(PackedValue::B(true)));
+        assert_eq!(json_to_packed(&json!("hello")), Some(PackedValue::S("hello".into())));
+        assert_eq!(json_to_packed(&json!(null)), None);
+        assert_eq!(json_to_packed(&json!([1, 2, 3])), Some(PackedValue::Mi(vec![1, 2, 3])));
     }
 }
