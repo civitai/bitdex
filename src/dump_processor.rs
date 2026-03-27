@@ -1177,6 +1177,7 @@ pub fn process_dump_with_progress(
             &filter_expr,
             &bitmap_fs,
             &bulk_writer,
+            &progress_counter,
         );
     }
 
@@ -1606,6 +1607,7 @@ fn process_multi_value_phase(
     filter_expr: &Option<FilterExpression>,
     bitmap_fs: &BitmapFs,
     _bulk_writer: &Arc<BulkWriter>,
+    progress_counter: &Option<Arc<AtomicU64>>,
 ) -> Result<PhaseResult, String> {
     let target = request.fields[0].target().to_string();
     let value_column = request.fields[0].column().to_string();
@@ -1669,6 +1671,7 @@ fn process_multi_value_phase(
                     count += 1;
                 }
                 total_ref.fetch_add(count, Ordering::Relaxed);
+                if let Some(ref p) = progress_counter { p.fetch_add(count, Ordering::Relaxed); }
                 bitmaps
             })
             .collect();
@@ -1766,6 +1769,7 @@ fn process_multi_value_phase(
                     count += 1;
                 }
                 total_ref.fetch_add(count, Ordering::Relaxed);
+                if let Some(ref p) = progress_counter { p.fetch_add(count, Ordering::Relaxed); }
                 bitmaps
             })
             .collect();
