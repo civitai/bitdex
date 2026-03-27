@@ -1866,7 +1866,7 @@ fn process_multi_value_phase(
     // Spawn docstore writer thread — rayon threads push (slot, value) to channel,
     // writer drains and writes per shard. Zero contention on parse threads.
     let (doc_tx, doc_rx) = if field_idx.is_some() {
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<(u32, i64)>>(64);
+        let (tx, rx) = crossbeam_channel::bounded::<(u32, i64)>(100_000);
         (Some(tx), Some(rx))
     } else {
         (None, None)
@@ -1877,12 +1877,10 @@ fn process_multi_value_phase(
         let fidx = field_idx.unwrap();
         std::thread::spawn(move || {
             let mut buf = Vec::with_capacity(32);
-            for batch in rx {
-                for (slot, value) in batch {
-                    buf.clear();
-                    if rmp_serde::encode::write(&mut buf, &PackedValue::Mi(vec![value])).is_ok() {
-                        bw.append_tuple_raw(slot, fidx, &buf);
-                    }
+            for (slot, value) in rx {
+                buf.clear();
+                if rmp_serde::encode::write(&mut buf, &PackedValue::Mi(vec![value])).is_ok() {
+                    bw.append_tuple_raw(slot, fidx, &buf);
                 }
             }
         })
@@ -1898,7 +1896,6 @@ fn process_multi_value_phase(
                 let chunk = &body[range_start..range_end];
                 let mut bitmaps: Vec<RoaringBitmap> =
                     (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect();
-                let mut doc_batch: Vec<(u32, i64)> = Vec::with_capacity(10_000);
                 let mut count = 0u64;
                 let mut line_start = 0;
 
@@ -1938,25 +1935,14 @@ fn process_multi_value_phase(
                     if value < MAX_TAG_ID {
                         bitmaps[value].insert(slot);
                     }
-                    // Batch for writer thread
-                    if doc_tx.is_some() {
-                        doc_batch.push((slot, value as i64));
-                        if doc_batch.len() >= 10_000 {
-                            if let Some(ref tx) = doc_tx {
-                                let _ = tx.send(std::mem::take(&mut doc_batch));
-                                doc_batch = Vec::with_capacity(10_000);
-                            }
-                        }
+                    // Send to writer thread (non-blocking with bounded channel)
+                    if let Some(ref tx) = doc_tx {
+                        let _ = tx.send((slot, value as i64));
                     }
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
                         total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
                         if let Some(ref p) = progress_counter { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
-                    }
-                }
-                if !doc_batch.is_empty() {
-                    if let Some(ref tx) = doc_tx {
-                        let _ = tx.send(doc_batch);
                     }
                 }
                 let remainder = count % LOG_INTERVAL;
@@ -2026,7 +2012,6 @@ fn process_multi_value_phase(
             .map(|&(range_start, range_end)| {
                 let chunk = &body[range_start..range_end];
                 let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
-                let mut doc_batch: Vec<(u32, i64)> = Vec::with_capacity(10_000);
                 let mut count = 0u64;
                 let mut line_start = 0;
 
@@ -2067,25 +2052,14 @@ fn process_multi_value_phase(
                         .entry(value)
                         .or_insert_with(RoaringBitmap::new)
                         .insert(slot);
-                    // Batch for writer thread
-                    if doc_tx.is_some() {
-                        doc_batch.push((slot, value as i64));
-                        if doc_batch.len() >= 10_000 {
-                            if let Some(ref tx) = doc_tx {
-                                let _ = tx.send(std::mem::take(&mut doc_batch));
-                                doc_batch = Vec::with_capacity(10_000);
-                            }
-                        }
+                    // Send to writer thread (non-blocking)
+                    if let Some(ref tx) = doc_tx {
+                        let _ = tx.send((slot, value as i64));
                     }
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
                         total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
                         if let Some(ref p) = progress_counter { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
-                    }
-                }
-                if !doc_batch.is_empty() {
-                    if let Some(ref tx) = doc_tx {
-                        let _ = tx.send(doc_batch);
                     }
                 }
                 let remainder = count % LOG_INTERVAL;
