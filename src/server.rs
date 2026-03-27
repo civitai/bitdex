@@ -4498,11 +4498,15 @@ async fn handle_register_dump(
 
         let dump_name = request.name.clone();
 
-        // Get engine and tasks from IndexState
-        let (engine, tasks) = {
+        // Get engine, tasks, and data_schema from IndexState
+        let (engine, tasks, data_schema) = {
             let guard = state.index.lock();
             match guard.as_ref() {
-                Some(idx) => (Arc::clone(&idx.engine), Arc::clone(&idx.tasks)),
+                Some(idx) => (
+                    Arc::clone(&idx.engine),
+                    Arc::clone(&idx.tasks),
+                    idx.definition.data_schema.clone(),
+                ),
                 None => {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -4560,7 +4564,7 @@ async fn handle_register_dump(
 
             let engine_for_save = Arc::clone(&engine);
             let result = tokio::task::spawn_blocking(move || {
-                crate::dump_processor::process_dump_with_progress(&request, &engine, &stage_dir, Some(progress))
+                crate::dump_processor::process_dump_with_progress(&request, &engine, &stage_dir, Some(progress), Some(&data_schema))
             })
             .await;
 
