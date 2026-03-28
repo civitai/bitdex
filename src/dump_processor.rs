@@ -3139,6 +3139,150 @@ mod tests {
         assert_eq!(req.format, DumpFormat::Tsv);
     }
 
+    /// V2 Validation Gate: Simulates a 1000-row dump across 4 threads,
+    /// then verifies silo files, index persistence, and document content.
+    #[test]
+    fn test_v2_validation_1000_rows() {
+        use crate::data_silo::{self, DataSiloReader, DocIndex};
+
+        let dir = std::env::temp_dir().join("bitdex_v2_validation_1000");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let num_threads = 4;
+        let num_rows: u32 = 1000;
+
+        // Create silo writers
+        let writers = data_silo::create_bulk_writers(&dir, num_threads).unwrap();
+        let silo_writers: Vec<std::sync::Mutex<BulkDocWriter>> = writers
+            .into_iter()
+            .map(std::sync::Mutex::new)
+            .collect();
+
+        // Fields: nsfwLevel (idx 0), userId (idx 1)
+        let mut field_idx: HashMap<String, u16> = HashMap::new();
+        field_idx.insert("nsfwLevel".to_string(), 0);
+        field_idx.insert("userId".to_string(), 1);
+
+        let fields = vec![
+            DumpFieldMapping::Expanded {
+                column: "nsfwLevel".to_string(),
+                target: "nsfwLevel".to_string(),
+            },
+            DumpFieldMapping::Expanded {
+                column: "userId".to_string(),
+                target: "userId".to_string(),
+            },
+        ];
+        let col_idx: HashMap<String, usize> =
+            [("nsfwLevel".to_string(), 0), ("userId".to_string(), 1)]
+                .into_iter()
+                .collect();
+        let empty_enriched = dump_enrichment::EnrichedFields::default();
+        let computed_defs: Vec<ComputedFieldDef> = vec![];
+
+        // Write 1000 rows distributed across 4 threads
+        let mut serialize_buf = Vec::new();
+        let mut tuple_buf = Vec::new();
+        let mut write_buf = Vec::new();
+
+        for slot in 1..=num_rows {
+            let thread_idx = (slot as usize - 1) % num_threads;
+            let nsfw = format!("{}", (slot % 5) + 1);
+            let user = format!("{}", slot * 100);
+            let row_fields: Vec<&[u8]> = vec![nsfw.as_bytes(), user.as_bytes()];
+            let row = ParsedRow { fields: row_fields, col_index: &col_idx };
+            let indexed: Vec<Option<&str>> = vec![Some(&nsfw), Some(&user)];
+            write_silo_row_indexed(
+                &row, &empty_enriched, &computed_defs, &indexed, &col_idx,
+                slot, &fields, &field_idx,
+                &mut serialize_buf, &mut tuple_buf, &mut write_buf,
+                &silo_writers[thread_idx],
+            );
+        }
+
+        // Collect and merge indexes
+        let locals: Vec<_> = silo_writers
+            .into_iter()
+            .filter_map(|m| m.into_inner().ok()?.into_local_index().ok())
+            .collect();
+        let index = data_silo::merge_indexes(locals, num_rows);
+
+        // V2.1: Verify silo files created with expected sizes
+        for i in 0..num_threads {
+            let path = dir.join(format!("silo_{:02}.dat", i));
+            assert!(path.exists(), "silo_{:02}.dat should exist", i);
+            let size = std::fs::metadata(&path).unwrap().len();
+            assert!(size > 0, "silo_{:02}.dat should be non-empty (got {} bytes)", i, size);
+            // ~250 rows per thread × ~20 bytes/row ≈ 5KB minimum
+            assert!(size > 1000, "silo_{:02}.dat too small: {} bytes", i, size);
+        }
+
+        // V2.2: Persist and reload doc_index.bin
+        let index_path = dir.join("doc_index.bin");
+        index.persist(&index_path).unwrap();
+        assert!(index_path.exists(), "doc_index.bin should exist");
+        let index_size = std::fs::metadata(&index_path).unwrap().len();
+        // Header (4 bytes) + 1001 entries × 13 bytes = ~13017 bytes
+        assert!(index_size > 10000, "doc_index.bin too small: {} bytes", index_size);
+        let reloaded = DocIndex::load(&index_path).unwrap();
+        assert_eq!(reloaded.count(), num_rows as usize, "reloaded index should have {} entries", num_rows);
+
+        // V2.3: Verify documents readable via DataSiloReader
+        let reader = DataSiloReader::open(&dir).unwrap();
+        assert_eq!(reader.count(), num_rows as usize);
+        assert_eq!(reader.silo_count(), num_threads);
+
+        // Spot-check 10 random slots
+        for &slot in &[1u32, 50, 100, 250, 500, 750, 999, 1000, 3, 777] {
+            let doc = reader.get(slot).expect(&format!("slot {} should be readable", slot));
+            assert!(doc.len() > 6, "slot {} doc too small: {} bytes", slot, doc.len());
+
+            // Parse the document blob: [u16 field_idx][u32 value_len][value_bytes]...
+            let mut offset = 0;
+            let mut found_fields = 0;
+            while offset + 6 <= doc.len() {
+                let fidx = u16::from_le_bytes([doc[offset], doc[offset + 1]]);
+                let vlen = u32::from_le_bytes([
+                    doc[offset + 2], doc[offset + 3], doc[offset + 4], doc[offset + 5],
+                ]) as usize;
+                assert!(fidx <= 1, "slot {} has unexpected field_idx {}", slot, fidx);
+                assert!(offset + 6 + vlen <= doc.len(),
+                    "slot {} blob truncated at field {}", slot, found_fields);
+
+                // Deserialize the rmp_serde value
+                let value_bytes = &doc[offset + 6..offset + 6 + vlen];
+                let packed: PackedValue = rmp_serde::from_slice(value_bytes)
+                    .expect(&format!("slot {} field {} should deserialize", slot, fidx));
+
+                // Verify values match what we wrote
+                match packed {
+                    PackedValue::I(v) => {
+                        if fidx == 0 {
+                            // nsfwLevel = (slot % 5) + 1
+                            assert_eq!(v, ((slot % 5) + 1) as i64,
+                                "slot {} nsfwLevel mismatch", slot);
+                        } else {
+                            // userId = slot * 100
+                            assert_eq!(v, slot as i64 * 100,
+                                "slot {} userId mismatch", slot);
+                        }
+                    }
+                    _ => panic!("slot {} field {} unexpected PackedValue type", slot, fidx),
+                }
+
+                offset += 6 + vlen;
+                found_fields += 1;
+            }
+            assert_eq!(found_fields, 2, "slot {} should have exactly 2 fields, got {}", slot, found_fields);
+        }
+
+        // Verify non-existent slot returns None
+        assert!(reader.get(0).is_none(), "slot 0 should not exist");
+        assert!(reader.get(num_rows + 1).is_none(), "slot beyond max should not exist");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_write_silo_row_indexed_basic() {
         // Test that write_silo_row_indexed produces a document blob
