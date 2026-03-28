@@ -1722,6 +1722,39 @@ pub fn process_dump_with_progress(
                     }
                 }
 
+                // Handle enrichment computed fields with Bool/Int values
+                // (enriched_get only returns Option<&str>, so Bool/Int values are missed above)
+                for (target, value) in &enriched.computed {
+                    match value {
+                        NateExprValue::Bool(b) => {
+                            let key = if *b { 1u64 } else { 0u64 };
+                            if let Some(fm) = filter_maps.get_mut(target.as_str()) {
+                                fm.entry(key)
+                                    .or_insert_with(RoaringBitmap::new)
+                                    .insert(slot);
+                            }
+                        }
+                        NateExprValue::Int(n) => {
+                            if let Some(fm) = filter_maps.get_mut(target.as_str()) {
+                                fm.entry(*n as u64)
+                                    .or_insert_with(RoaringBitmap::new)
+                                    .insert(slot);
+                            }
+                            if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
+                                let val32 = *n as u32;
+                                if let Some(sm) = sort_maps.get_mut(target.as_str()) {
+                                    for bit in 0..(bits as usize) {
+                                        if (val32 >> bit) & 1 == 1 {
+                                            sm[bit].insert(slot);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {} // Str already handled by enriched_get above
+                    }
+                }
+
                 // Build bitmaps from computed fields (Nate's ComputedFieldDef API)
                 for def in computed_defs_ref {
                     let computed_val = def.eval_indexed(&indexed_fields_buf, col_idx, None);
