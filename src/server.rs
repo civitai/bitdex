@@ -288,9 +288,7 @@ impl IndexDefinition {
     }
 }
 
-/// Find the index config file in a directory. Prefers config.yaml, falls back to config.json.
-/// If config.json exists but config.yaml does not, performs a one-shot migration:
-/// reads the JSON, writes config.yaml, and returns the YAML path.
+/// Find the index config file in a directory. Checks config.yaml, config.yml, config.json.
 pub fn find_index_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let yaml = dir.join("config.yaml");
     if yaml.exists() {
@@ -302,19 +300,6 @@ pub fn find_index_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     }
     let json = dir.join("config.json");
     if json.exists() {
-        // One-shot migration: convert config.json → config.yaml
-        if let Ok(content) = std::fs::read_to_string(&json) {
-            if let Ok(def) = serde_json::from_str::<IndexDefinition>(&content) {
-                if let Ok(()) = def.save_yaml(dir) {
-                    eprintln!(
-                        "Migrated {}/config.json → config.yaml",
-                        dir.file_name().unwrap_or_default().to_string_lossy()
-                    );
-                    return Some(yaml);
-                }
-            }
-        }
-        // Migration failed — fall back to reading JSON directly
         return Some(json);
     }
     None
