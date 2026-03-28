@@ -2854,7 +2854,7 @@ impl ConcurrentEngine {
             None
         };
 
-        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config);
+        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config, false);
         let creates_slot = !is_alive;
 
         let entry = crate::pg_sync::ops::EntityOps {
@@ -2884,7 +2884,7 @@ impl ConcurrentEngine {
         let old_doc = self.docstore.lock().get(id)?;
 
         // For PATCH, only emit ops for fields present in the new doc
-        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config);
+        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config, true);
 
         if ops.is_empty() {
             return Ok(());

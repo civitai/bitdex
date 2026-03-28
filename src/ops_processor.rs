@@ -189,10 +189,15 @@ fn qvalue_to_json(v: &QValue) -> JsonValue {
 /// new values on changed fields. Unchanged fields are skipped.
 ///
 /// Multi-value fields are decomposed into individual Op::Add/Op::Remove per value.
+///
+/// `is_patch`: when true (PATCH semantics), fields absent from new_doc are left
+/// untouched — no Op::Remove emitted. When false (PUT semantics), absent fields
+/// are treated as deletions and their old bitmap bits are cleared.
 pub fn document_to_ops(
     new_doc: &crate::mutation::Document,
     old_doc: Option<&crate::docstore::StoredDoc>,
     config: &crate::config::Config,
+    is_patch: bool,
 ) -> Vec<Op> {
     let mut ops = Vec::new();
     let empty_fields = std::collections::HashMap::new();
@@ -253,8 +258,9 @@ pub fn document_to_ops(
         }
     }
 
-    // For upsert: handle fields that were in old doc but removed in new doc
-    if old_doc.is_some() {
+    // For PUT upsert: handle fields that were in old doc but removed in new doc.
+    // PATCH skips this — absent fields are left untouched (partial update semantics).
+    if old_doc.is_some() && !is_patch {
         for (field_name, old_val) in old_fields {
             if !new_doc.fields.contains_key(field_name) {
                 // Field was removed
@@ -2644,7 +2650,7 @@ mod tests {
         fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(16)));
 
         let doc = Document { fields };
-        let ops = document_to_ops(&doc, None, &config);
+        let ops = document_to_ops(&doc, None, &config, false);
 
         // Should have a Set op for nsfwLevel
         assert_eq!(ops.len(), 1);
@@ -2674,7 +2680,7 @@ mod tests {
         new_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(16)));
         let new_doc = Document { fields: new_fields };
 
-        let ops = document_to_ops(&new_doc, Some(&old_doc), &config);
+        let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
 
         // Should have Remove(old=8) + Set(new=16)
         assert_eq!(ops.len(), 2);
@@ -2695,7 +2701,39 @@ mod tests {
         let old_doc = crate::docstore::StoredDoc { fields: fields.clone(), schema_version: 0 };
         let new_doc = Document { fields };
 
-        let ops = document_to_ops(&new_doc, Some(&old_doc), &config);
+        let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
         assert!(ops.is_empty(), "unchanged fields should produce no ops");
+    }
+
+    #[test]
+    fn test_document_to_ops_patch_preserves_absent_fields() {
+        use crate::mutation::{Document, FieldValue};
+        use crate::query::Value as QValue;
+
+        let config = test_config();
+
+        // Old doc has nsfwLevel=8 AND reactionCount sort field
+        let mut old_fields = std::collections::HashMap::new();
+        old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
+        let old_doc = crate::docstore::StoredDoc { fields: old_fields, schema_version: 0 };
+
+        // PATCH only sends userId=42 (nsfwLevel absent from patch)
+        let mut new_fields = std::collections::HashMap::new();
+        new_fields.insert("userId".into(), FieldValue::Single(QValue::Integer(42)));
+        let new_doc = Document { fields: new_fields };
+
+        // is_patch=true: absent fields should NOT generate Remove ops
+        let ops = document_to_ops(&new_doc, Some(&old_doc), &config, true);
+        let has_remove_nsfw = ops.iter().any(|op| matches!(op, Op::Remove { field, .. } if field == "nsfwLevel"));
+        assert!(!has_remove_nsfw, "PATCH should NOT remove absent fields (nsfwLevel)");
+
+        // Should have Set for userId (new field)
+        let has_set_user = ops.iter().any(|op| matches!(op, Op::Set { field, .. } if field == "userId"));
+        assert!(has_set_user, "PATCH should set provided fields (userId)");
+
+        // is_patch=false (PUT): absent fields SHOULD generate Remove ops
+        let ops_put = document_to_ops(&new_doc, Some(&old_doc), &config, false);
+        let has_remove_nsfw_put = ops_put.iter().any(|op| matches!(op, Op::Remove { field, .. } if field == "nsfwLevel"));
+        assert!(has_remove_nsfw_put, "PUT should remove absent fields (nsfwLevel)");
     }
 }
