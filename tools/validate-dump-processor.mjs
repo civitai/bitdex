@@ -271,6 +271,8 @@ async function main() {
     { label: 'onSite=true', filter: { onSite: true } },
     { label: 'nsfwLevel=2', filter: { nsfwLevel: 2 } },
     { label: 'tagIds $in [1,2,3]', filter: { tagIds: { '$in': [1, 2, 3] } } },
+    { label: 'availability (enriched)', filter: { availability: 'Public' } },
+    { label: 'type=image (LCS)', filter: { type: 'image' } },
   ];
   for (const c of checks) {
     try {
@@ -293,20 +295,36 @@ async function main() {
     console.log(`  sort=reactionCount desc  → ERROR: ${e.message}`);
   }
 
-  // ── V1.3: Docstore check ──────────────────────────────────────────────
+  // ── V1.3: Docstore check (GET endpoint + include_docs) ─────────────
   console.log('\n── V1.3: Docstore Check ───────────────────────────\n');
   try {
-    // Pick a known-alive slot by querying
     const probe = await query({ hasMeta: true }, '-reactionCount', 1);
     if (probe.ids?.[0]) {
+      // Test 1: GET /documents/{slot_id}
       const docRes = await fetch(`${BASE}/api/indexes/civitai/documents/${probe.ids[0]}`);
       if (docRes.ok) {
         const doc = await docRes.json();
         const fields = Object.keys(doc).sort().join(', ');
-        console.log(`  Doc ${probe.ids[0]}: ${fields}`);
-        console.log(`  Preview: ${JSON.stringify(doc).slice(0, 200)}...`);
+        console.log(`  GET /documents/${probe.ids[0]}: ✓ ${fields}`);
       } else {
-        console.log(`  Doc ${probe.ids[0]}: HTTP ${docRes.status}`);
+        console.log(`  GET /documents/${probe.ids[0]}: HTTP ${docRes.status}`);
+      }
+
+      // Test 2: include_docs via query
+      const withDocs = await query({ hasMeta: true }, '-reactionCount', 1);
+      // include_docs is set via the query body
+      const docsBody = { filter: { hasMeta: true }, sort: '-reactionCount', limit: 1, include_docs: true };
+      const docsRes = await fetch(`${BASE}/api/indexes/civitai/query?format=compact`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(docsBody),
+      });
+      const docsResult = await docsRes.json();
+      if (docsResult.documents?.[0]) {
+        const docFields = Object.keys(docsResult.documents[0]).sort().join(', ');
+        console.log(`  include_docs query:      ✓ ${docFields}`);
+      } else {
+        console.log(`  include_docs query:      no documents returned`);
       }
     } else {
       console.log('  No documents to check (query returned 0 results)');

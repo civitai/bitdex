@@ -1222,6 +1222,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/config", patch(handle_patch_config))
             .route("/api/indexes/{name}/load", post(handle_load))
             .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
+            .route("/api/indexes/{name}/documents/{slot_id}", get(handle_get_document))
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
             .route("/api/indexes/{name}/documents/patch", patch(handle_patch_documents))
             .route("/api/indexes/{name}/documents/filter-sync", post(handle_filter_sync))
@@ -2524,6 +2525,39 @@ async fn handle_document(
     match engine.get_document(req.slot_id) {
         Ok(Some(doc)) => Json(format_document(&doc, &schema, &reverse_maps, &req.fields, &schema_registry)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// GET /api/indexes/{name}/documents/{slot_id}
+async fn handle_get_document(
+    State(state): State<SharedState>,
+    AxumPath((name, slot_id)): AxumPath<(String, u32)>,
+) -> impl IntoResponse {
+    let (engine, schema, reverse_maps, schema_registry) = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => (
+                Arc::clone(&idx.engine),
+                idx.definition.data_schema.clone(),
+                Arc::clone(&idx.reverse_maps),
+                Arc::clone(&idx.schema_registry),
+            ),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    match engine.get_document(slot_id) {
+        Ok(Some(doc)) => {
+            let include = IncludeDocs::All;
+            Json(format_document(&doc, &schema, &reverse_maps, &include, &schema_registry)).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "document not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
