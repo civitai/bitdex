@@ -1090,14 +1090,139 @@ pub fn validate_dump_request(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// ShardPreCreator — background thread for progressive shard file creation
+// ---------------------------------------------------------------------------
+
+/// Progressively creates docstore shard files and bitmap dirs as the slot
+/// watermark rises during CSV processing. Run on a background thread during
+/// the first dump phase (e.g., tags) so that subsequent phases (images) find
+/// all files already on disk — eliminating lazy file creation from the hot path.
+///
+/// Microbench showed 10x write speedup when files pre-exist (1.8M rows/s vs 177K/s).
+pub struct ShardPreCreator {
+    handle: Option<std::thread::JoinHandle<u32>>,
+}
+
+impl ShardPreCreator {
+    /// Spawn a background thread that watches `watermark` and creates shard files
+    /// up to `shard_id(watermark)`. Also creates filter bitmap bucket dirs for
+    /// all configured filter fields.
+    ///
+    /// Call `watermark.fetch_max(slot, Relaxed)` from parse threads to advance.
+    /// Call `stop()` when the phase completes to join the thread.
+    pub fn spawn(
+        watermark: Arc<AtomicU64>,
+        done: Arc<std::sync::atomic::AtomicBool>,
+        docstore_root: std::path::PathBuf,
+        bitmap_path: Option<std::path::PathBuf>,
+        filter_field_names: Vec<String>,
+    ) -> Self {
+        let handle = std::thread::Builder::new()
+            .name("shard-precreator".into())
+            .spawn(move || {
+                let mut created_up_to: u32 = 0;
+                let mut files_created: u32 = 0;
+                let mut bitmap_dirs_done = false;
+
+                loop {
+                    let current_max_slot = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
+                    let target_shard = current_max_slot >> 9; // SHARD_SHIFT = 9
+
+                    // Create docstore shard files up to target
+                    while created_up_to < target_shard {
+                        created_up_to += 1;
+                        let path = crate::docstore::DocStore::shard_path(&docstore_root, created_up_to);
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Ok(f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                        {
+                            let meta = f.metadata().ok();
+                            if meta.map(|m| m.len()).unwrap_or(0) == 0 {
+                                let mut bw = std::io::BufWriter::new(f);
+                                use std::io::Write as _;
+                                let _ = bw.write_all(&0x42445832u32.to_le_bytes());
+                                let _ = bw.flush();
+                            }
+                        }
+                        files_created += 1;
+                    }
+
+                    // Create filter bitmap dirs once (first time watermark > 0)
+                    if !bitmap_dirs_done && current_max_slot > 0 {
+                        if let Some(ref bp) = bitmap_path {
+                            for field in &filter_field_names {
+                                for bucket in 0..=255u8 {
+                                    let dir = bp.join("filter").join(field).join(format!("{:02x}", bucket));
+                                    let _ = std::fs::create_dir_all(&dir);
+                                }
+                            }
+                            // Sort dirs
+                            let _ = std::fs::create_dir_all(bp.join("sort"));
+                            let _ = std::fs::create_dir_all(bp.join("system"));
+                        }
+                        bitmap_dirs_done = true;
+                    }
+
+                    if done.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Final sweep for any remaining shards
+                        let final_max = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
+                        let final_shard = final_max >> 9;
+                        while created_up_to < final_shard {
+                            created_up_to += 1;
+                            let path = crate::docstore::DocStore::shard_path(&docstore_root, created_up_to);
+                            if let Some(parent) = path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if let Ok(f) = std::fs::OpenOptions::new()
+                                .create(true).append(true).open(&path)
+                            {
+                                let meta = f.metadata().ok();
+                                if meta.map(|m| m.len()).unwrap_or(0) == 0 {
+                                    let mut bw = std::io::BufWriter::new(f);
+                                    use std::io::Write as _;
+                                    // V2 magic: "BDX2" LE
+                                    let _ = bw.write_all(&0x42445832u32.to_le_bytes());
+                                    let _ = bw.flush();
+                                }
+                            }
+                            files_created += 1;
+                        }
+                        return files_created;
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+            .expect("failed to spawn shard-precreator");
+
+        ShardPreCreator { handle: Some(handle) }
+    }
+
+    /// Signal completion and wait for the creator thread to finish.
+    /// Returns the number of shard files created.
+    pub fn stop(mut self) -> u32 {
+        if let Some(h) = self.handle.take() {
+            h.join().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+}
+
 pub fn process_dump(
     request: &DumpRequest,
     engine: &ConcurrentEngine,
     stage_dir: &Path,
     progress_counter: Option<Arc<AtomicU64>>,
     data_schema: Option<&crate::config::DataSchema>,
+    slot_watermark: Option<Arc<AtomicU64>>,
 ) -> Result<PhaseResult, String> {
-    let mut result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema)?;
+    let mut result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema, slot_watermark.as_ref())?;
     let (alive_s, filter_s, sort_s, meta_s) = engine
         .shard_stores()
         .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?;
@@ -1141,6 +1266,7 @@ pub fn process_dump_with_progress(
     stage_dir: &Path,
     progress_counter: Option<Arc<AtomicU64>>,
     data_schema: Option<&crate::config::DataSchema>,
+    slot_watermark: Option<&Arc<AtomicU64>>,
 ) -> Result<PhaseResult, String> {
     let t = Instant::now();
 
@@ -1297,6 +1423,7 @@ pub fn process_dump_with_progress(
             &filter_expr,
             &bulk_writer,
             &progress_counter,
+            slot_watermark,
         );
     }
 
@@ -1431,6 +1558,10 @@ pub fn process_dump_with_progress(
                 };
                 if slot > max_slot {
                     max_slot = slot;
+                    // Update watermark for progressive shard pre-creation
+                    if let Some(ref wm) = slot_watermark {
+                        wm.fetch_max(slot as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
 
                 // Build indexed fields (Vec<Option<&str>> — cheap compared to HashMap)
@@ -2033,6 +2164,7 @@ fn process_multi_value_phase(
     filter_expr: &Option<FilterExpression>,
     bulk_writer: &Arc<BulkWriter>,
     progress_counter: &Option<Arc<AtomicU64>>,
+    slot_watermark: Option<&Arc<AtomicU64>>,
 ) -> Result<PhaseResult, String> {
     let target = request.fields[0].target().to_string();
     let value_column = request.fields[0].column().to_string();
@@ -2091,6 +2223,7 @@ fn process_multi_value_phase(
                 let mut bitmaps: Vec<RoaringBitmap> =
                     (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect();
                 let mut doc_batch: Vec<(u32, i64)> = Vec::with_capacity(10_000);
+                let mut local_max_slot: u32 = 0;
                 let mut count = 0u64;
                 let mut line_start = 0;
 
@@ -2130,6 +2263,8 @@ fn process_multi_value_phase(
                         (s, v)
                     };
 
+                    if slot > local_max_slot { local_max_slot = slot; }
+
                     if value < MAX_TAG_ID {
                         bitmaps[value].insert(slot);
                     }
@@ -2157,6 +2292,10 @@ fn process_multi_value_phase(
                 let remainder = count % LOG_INTERVAL;
                 total_ref.fetch_add(remainder, Ordering::Relaxed);
                 if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
+                // Flush final watermark for this thread
+                if let Some(ref wm) = slot_watermark {
+                    wm.fetch_max(local_max_slot as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 bitmaps
             })
             .collect();
@@ -2224,6 +2363,7 @@ fn process_multi_value_phase(
                 let mut doc_batch: Vec<(u32, i64)> = Vec::with_capacity(10_000);
                 let mut count = 0u64;
                 let mut line_start = 0;
+                let mut local_max_slot: u32 = 0;
 
                 for i in 0..chunk.len() {
                     if chunk[i] != b'\n' {
@@ -2258,6 +2398,8 @@ fn process_multi_value_phase(
                         (s, v)
                     };
 
+                    if slot > local_max_slot { local_max_slot = slot; }
+
                     bitmaps
                         .entry(value)
                         .or_insert_with(RoaringBitmap::new)
@@ -2286,6 +2428,10 @@ fn process_multi_value_phase(
                 let remainder = count % LOG_INTERVAL;
                 total_ref.fetch_add(remainder, Ordering::Relaxed);
                 if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
+                // Flush final watermark for this thread
+                if let Some(ref wm) = slot_watermark {
+                    wm.fetch_max(local_max_slot as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 bitmaps
             })
             .collect();

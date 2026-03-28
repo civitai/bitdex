@@ -372,6 +372,16 @@ struct AppState {
     /// Dump registry for tracking table dump lifecycle.
     #[cfg(feature = "pg-sync")]
     dump_registry: Mutex<crate::pg_sync::dump::DumpRegistry>,
+    /// Shared slot watermark for progressive shard pre-creation.
+    /// Updated by dump phases as they see new max slot IDs.
+    #[cfg(feature = "pg-sync")]
+    slot_watermark: Arc<std::sync::atomic::AtomicU64>,
+    /// Pre-creator done signal — set when we want to stop the background thread.
+    #[cfg(feature = "pg-sync")]
+    precreator_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the pre-creator has been started.
+    #[cfg(feature = "pg-sync")]
+    precreator_started: std::sync::atomic::AtomicBool,
 }
 
 type SharedState = Arc<AppState>;
@@ -1083,6 +1093,12 @@ impl BitdexServer {
                 let dumps_path = self.data_dir.join("dumps.json");
                 Mutex::new(crate::pg_sync::dump::DumpRegistry::load(&dumps_path))
             },
+            #[cfg(feature = "pg-sync")]
+            slot_watermark: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "pg-sync")]
+            precreator_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "pg-sync")]
+            precreator_started: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Try to restore an existing index from disk
@@ -4534,6 +4550,26 @@ async fn handle_register_dump(
             reg.save(&dumps_path).ok();
         }
 
+        // Start shard pre-creator on first dump (progressive file creation)
+        if !state.precreator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // Derive docstore root from the index storage path
+            let idx_name = state.index.lock().as_ref().map(|e| e.definition.name.clone()).unwrap_or_else(|| "civitai".to_string());
+            let docstore_root = state.data_dir.join("indexes").join(&idx_name).join("docs");
+            let bitmap_path = engine.config().storage.bitmap_path.clone();
+            let filter_names: Vec<String> = engine.config()
+                .filter_fields.iter().map(|f| f.name.clone()).collect();
+            let _precreator = crate::dump_processor::ShardPreCreator::spawn(
+                Arc::clone(&state.slot_watermark),
+                Arc::clone(&state.precreator_done),
+                docstore_root,
+                bitmap_path,
+                filter_names,
+            );
+            eprintln!("  ShardPreCreator started (background file creation)");
+            // Note: precreator handle intentionally leaked — it runs until precreator_done is set
+        }
+        let slot_watermark = Arc::clone(&state.slot_watermark);
+
         // Spawn async processing — inline parse + save
         let state_clone = Arc::clone(&state);
         let dump_name_for_task = dump_name.clone();
@@ -4548,7 +4584,7 @@ async fn handle_register_dump(
             let dump_name_inner = dump_name_for_task;
 
             let result = tokio::task::spawn_blocking(move || {
-                crate::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema))
+                crate::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema), Some(slot_watermark))
             })
             .await;
 
