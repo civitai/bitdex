@@ -2236,7 +2236,7 @@ fn process_multi_value_phase(
         (None, None)
     };
 
-    #[cfg(not(feature = "data_silo"))]
+    #[cfg(not(feature = "data-silo"))]
     let doc_writer_handle = doc_rx.map(|rx| {
         let bw = Arc::clone(bulk_writer);
         let fidx = field_idx.unwrap();
@@ -2253,7 +2253,7 @@ fn process_multi_value_phase(
         })
     });
 
-    #[cfg(feature = "data_silo")]
+    #[cfg(feature = "data-silo")]
     let doc_writer_handle = doc_rx.map(|rx| {
         let silo_path = stage_dir
             .join("silos")
