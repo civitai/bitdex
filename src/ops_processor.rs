@@ -705,10 +705,12 @@ pub fn apply_ops_batch<S: BitmapSink>(
             continue;
         }
 
-        // [2.10] Drop ops on non-alive slots (except creates_slot=true).
+        // [2.10] Drop ops on non-alive slots (except creates_slot=true or queryOpSet).
         // In steady-state, ops arriving for non-existent slots are stale or
-        // out-of-order — silently skip them.
-        if !entry.creates_slot {
+        // out-of-order — silently skip them. queryOpSet entries are exempt because
+        // their entity_id is the source entity (e.g., Post.id), not the target slot.
+        let has_query_op_set = entry.ops.iter().any(|op| matches!(op, Op::QueryOpSet { .. }));
+        if !entry.creates_slot && !has_query_op_set {
             if let Some(eng) = engine {
                 if !eng.is_slot_alive(slot) {
                     skipped += 1;
