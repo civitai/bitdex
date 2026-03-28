@@ -17,3 +17,4 @@ pub mod trigger_gen;
 pub mod progress;
 pub mod queries;
 pub mod slot_arena;
+pub mod sync_config;

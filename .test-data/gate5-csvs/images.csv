@@ -1,0 +1,11 @@
+id,url,nsfwLevel,hash,flags,type,userId,blockedFor,scannedAtSecs,createdAtSecs,postId,width,height
+1,https://example.com/1.jpg,1,hash1,0,image,100,,1700000000,1700000100,1001,400,300
+2,https://example.com/2.jpg,16,hash2,8192,image,100,,1700000000,1700000200,1001,800,600
+3,https://example.com/3.jpg,1,hash3,16384,video,200,,1700000000,1700000300,1002,1920,1080
+4,https://example.com/4.jpg,32,hash4,24576,image,200,,1700000000,1700000400,1002,400,400
+5,https://example.com/5.jpg,1,hash5,0,image,300,,1700000000,1700000500,1003,600,400
+6,https://example.com/6.jpg,8,hash6,8192,image,300,,1700000000,1700000600,1003,800,800
+7,https://example.com/7.jpg,1,hash7,0,image,100,,1700000000,1700000700,1004,400,300
+8,https://example.com/8.jpg,16,hash8,16384,video,100,,1700000000,1700000800,1004,1920,1080
+9,https://example.com/9.jpg,1,hash9,0,image,200,,1700000000,1700000900,1005,400,300
+10,https://example.com/10.jpg,32,hash10,8192,image,200,,1700000000,1700001000,1005,800,600

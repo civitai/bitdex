@@ -261,6 +261,167 @@ impl BitdexClient {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Dump lifecycle methods (for boot sequence)
+    // -----------------------------------------------------------------------
+
+    /// Wait for BitDex to become healthy, retrying with backoff.
+    /// Returns Ok(()) when healthy, Err after max_retries.
+    pub async fn wait_for_healthy(&self, max_retries: u32, initial_delay_secs: u64) -> Result<(), String> {
+        let mut delay = initial_delay_secs;
+        for attempt in 1..=max_retries {
+            if self.is_healthy().await {
+                return Ok(());
+            }
+            eprintln!(
+                "BitDex not healthy (attempt {attempt}/{max_retries}), retrying in {delay}s..."
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            delay = (delay * 2).min(30); // exponential backoff, cap at 30s
+        }
+        Err(format!("BitDex not healthy after {max_retries} attempts"))
+    }
+
+    /// Register a new dump via PUT /dumps.
+    /// Returns the dump entry response (name + status).
+    pub async fn register_dump(
+        &self,
+        dump_request: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!("{}/dumps", self.base_url);
+        let resp = self
+            .client
+            .put(&url)
+            .json(dump_request)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| format!("register_dump request failed: {e}"))?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("register_dump response parse failed: {e}"))?;
+
+        if status.is_client_error() || status.is_server_error() {
+            return Err(format!("register_dump returned {status}: {body}"));
+        }
+
+        Ok(body)
+    }
+
+    /// Signal that a dump file is complete via POST /dumps/{name}/loaded.
+    pub async fn signal_dump_loaded(
+        &self,
+        dump_name: &str,
+        ops_written: u64,
+    ) -> Result<(), String> {
+        let url = format!("{}/dumps/{}/loaded", self.base_url, dump_name);
+        let body = serde_json::json!({ "ops_written": ops_written });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("signal_dump_loaded failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("signal_dump_loaded returned {status}: {body}"));
+        }
+        Ok(())
+    }
+
+    /// Get dump registry via GET /dumps.
+    pub async fn get_dumps(&self) -> Result<serde_json::Value, String> {
+        let url = format!("{}/dumps", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("get_dumps failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("get_dumps returned {status}: {body}"));
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| format!("get_dumps parse failed: {e}"))
+    }
+
+    /// Poll dump status until all specified dumps are complete.
+    /// Returns Ok(()) when all_complete, Err on timeout or failure.
+    pub async fn poll_dumps_until_complete(
+        &self,
+        dump_names: &[String],
+        poll_interval_secs: u64,
+        timeout_secs: u64,
+    ) -> Result<(), String> {
+        let start = std::time::Instant::now();
+        let poll_interval = std::time::Duration::from_secs(poll_interval_secs);
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            if start.elapsed() > timeout {
+                return Err(format!(
+                    "Dump processing timed out after {}s",
+                    timeout_secs
+                ));
+            }
+
+            let dumps = self.get_dumps().await?;
+            let dump_map = dumps.get("dumps").and_then(|d| d.as_object());
+
+            let mut all_complete = true;
+            let mut any_failed = false;
+
+            for name in dump_names {
+                if let Some(map) = &dump_map {
+                    if let Some(entry) = map.get(name) {
+                        let status = entry.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
+                        match status {
+                            "Complete" => {}
+                            "Failed" => {
+                                any_failed = true;
+                                let err = entry.get("status")
+                                    .and_then(|s| s.get("Failed"))
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("unknown error");
+                                return Err(format!("Dump '{name}' failed: {err}"));
+                            }
+                            _ => {
+                                all_complete = false;
+                                let ops_processed = entry.get("ops_processed").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let ops_written = entry.get("ops_written").and_then(|v| v.as_u64()).unwrap_or(0);
+                                eprintln!(
+                                    "  {name}: {status} ({ops_processed}/{ops_written} ops)"
+                                );
+                            }
+                        }
+                    } else {
+                        all_complete = false;
+                        eprintln!("  {name}: not found in dump registry");
+                    }
+                }
+            }
+
+            if all_complete && !any_failed {
+                return Ok(());
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
     pub async fn get_cursor(&self, cursor_name: &str) -> Result<Option<String>, String> {
         let url = format!("{}/cursors/{}", self.base_url, cursor_name);
         let resp = self.client

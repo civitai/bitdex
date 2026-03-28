@@ -57,6 +57,10 @@ pub struct PgSyncConfig {
     /// If set, the loader reads CSVs from here instead of downloading from PG.
     /// Defaults to `{storage_dir}/load_stage` when not specified.
     pub stage_dir: Option<PathBuf>,
+
+    /// Path to the V2 sync config YAML (triggers + dump phases).
+    /// If set, used for trigger reconciliation and dump pipeline.
+    pub sync_config_path: Option<PathBuf>,
 }
 
 fn default_index_subdir() -> String {
