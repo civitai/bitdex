@@ -16,6 +16,7 @@ server = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prom
 loadtest = ["ureq"]
 replay = ["ureq"]
 pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes", "dep:serde_yaml"]
+data-silo = []
 simd = ["roaring/simd"]
 heap-prof = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 serde_yaml = ["dep:serde_yaml"]

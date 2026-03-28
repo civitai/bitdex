@@ -25,6 +25,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
+#[cfg(feature = "data-silo")]
 use crate::data_silo::{self, BulkDocWriter};
 use crate::dictionary::FieldDictionary;
 use crate::docstore::{BulkWriter, PackedValue};
@@ -1356,14 +1357,18 @@ pub fn process_dump_with_progress(
 
     // Create per-thread silo writers for data silo integration.
     // Each rayon chunk gets its own silo file — zero contention writes.
-    let num_threads = rayon::current_num_threads();
+    #[cfg(feature = "data-silo")]
     let silo_dir = stage_dir.join("silos").join(&request.name);
-    let silo_writers: Vec<std::sync::Mutex<BulkDocWriter>> =
+    #[cfg(feature = "data-silo")]
+    let silo_writers: Vec<std::sync::Mutex<BulkDocWriter>> = {
+        let num_threads = rayon::current_num_threads();
         data_silo::create_bulk_writers(&silo_dir, num_threads)
             .map_err(|e| format!("create silo writers: {e}"))?
             .into_iter()
             .map(std::sync::Mutex::new)
-            .collect();
+            .collect()
+    };
+    #[cfg(feature = "data-silo")]
     let silo_writers_ref = &silo_writers;
 
     // Mmap the CSV/TSV file
@@ -1519,7 +1524,9 @@ pub fn process_dump_with_progress(
     let thread_results: Vec<ThreadResult> = ranges
         .par_iter()
         .enumerate()
-        .map(|(chunk_idx, &(range_start, range_end))| {
+        .map(|(_chunk_idx, &(range_start, range_end))| {
+            #[cfg(feature = "data-silo")]
+            let chunk_idx = _chunk_idx;
             let chunk = &body[range_start..range_end];
 
             let field_idx_cache: &HashMap<String, u16> = bulk_writer.field_to_idx();
@@ -1627,20 +1634,21 @@ pub fn process_dump_with_progress(
                     if let Some(pub_str) = enriched_get("publishedAt") {
                         if let Ok(pub_secs) = pub_str.parse::<u64>() {
                             if pub_secs > now_unix {
-                                // Write to silo only, skip all bitmaps
+                                // Write document — silo (feature) or docstore (fallback)
+                                #[cfg(feature = "data-silo")]
                                 write_silo_row_indexed(
-                                    &row,
-                                    &enriched,
-                                    computed_defs_ref,
-                                    &indexed_fields_buf,
-                                    col_idx,
-                                    slot,
-                                    request_fields,
-                                    &field_idx_cache,
-                                    &mut serialize_buf,
-                                    &mut tuple_buf,
-                                    &mut write_buf,
+                                    &row, &enriched, computed_defs_ref,
+                                    &indexed_fields_buf, col_idx, slot, request_fields,
+                                    &field_idx_cache, &mut serialize_buf,
+                                    &mut tuple_buf, &mut write_buf,
                                     &silo_writers_ref[chunk_idx],
+                                );
+                                #[cfg(not(feature = "data-silo"))]
+                                write_docstore_row_indexed(
+                                    &row, &enriched, computed_defs_ref,
+                                    &indexed_fields_buf, col_idx, slot, request_fields,
+                                    &bulk_writer, &field_idx_cache, &mut serialize_buf,
+                                    &mut tuple_buf, &mut write_buf,
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1790,20 +1798,21 @@ pub fn process_dump_with_progress(
                 }
 
 
-                // Write to data silo
+                // Write document — silo (feature) or docstore (fallback)
+                #[cfg(feature = "data-silo")]
                 write_silo_row_indexed(
-                    &row,
-                    &enriched,
-                    computed_defs_ref,
-                    &indexed_fields_buf,
-                    col_idx,
-                    slot,
-                    request_fields,
-                    &field_idx_cache,
-                    &mut serialize_buf,
-                    &mut tuple_buf,
-                    &mut write_buf,
+                    &row, &enriched, computed_defs_ref,
+                    &indexed_fields_buf, col_idx, slot, request_fields,
+                    &field_idx_cache, &mut serialize_buf,
+                    &mut tuple_buf, &mut write_buf,
                     &silo_writers_ref[chunk_idx],
+                );
+                #[cfg(not(feature = "data-silo"))]
+                write_docstore_row_indexed(
+                    &row, &enriched, computed_defs_ref,
+                    &indexed_fields_buf, col_idx, slot, request_fields,
+                    &bulk_writer, &field_idx_cache, &mut serialize_buf,
+                    &mut tuple_buf, &mut write_buf,
                 );
 
                 count += 1;
@@ -1828,30 +1837,32 @@ pub fn process_dump_with_progress(
     emit_stage(&request.name, "parallel_parse", "done", &t, total.load(Ordering::Relaxed));
 
     // Flush silo writers, collect local indexes, merge and persist doc_index.bin
-    emit_stage(&request.name, "silo_index", "start", &t, total.load(Ordering::Relaxed));
-    let silo_locals: Vec<(u8, Vec<(u32, u64, u32)>)> = silo_writers
-        .into_iter()
-        .filter_map(|mutex| {
-            let writer = mutex.into_inner().ok()?;
-            writer.into_local_index().ok()
-        })
-        .collect();
-    // Find max slot across all local indexes for the global index
-    let silo_max_slot = silo_locals
-        .iter()
-        .flat_map(|(_, entries)| entries.iter().map(|(slot, _, _)| *slot))
-        .max()
-        .unwrap_or(0);
-    let silo_index = data_silo::merge_indexes(silo_locals, silo_max_slot);
-    let silo_index_count = silo_index.count();
-    if let Err(e) = silo_index.persist(&silo_dir.join("doc_index.bin")) {
-        eprintln!("  WARNING: silo index persist failed: {e}");
+    #[cfg(feature = "data-silo")]
+    {
+        emit_stage(&request.name, "silo_index", "start", &t, total.load(Ordering::Relaxed));
+        let silo_locals: Vec<(u8, Vec<(u32, u64, u32)>)> = silo_writers
+            .into_iter()
+            .filter_map(|mutex| {
+                let writer = mutex.into_inner().ok()?;
+                writer.into_local_index().ok()
+            })
+            .collect();
+        let silo_max_slot = silo_locals
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|(slot, _, _)| *slot))
+            .max()
+            .unwrap_or(0);
+        let silo_index = data_silo::merge_indexes(silo_locals, silo_max_slot);
+        let silo_index_count = silo_index.count();
+        if let Err(e) = silo_index.persist(&silo_dir.join("doc_index.bin")) {
+            eprintln!("  WARNING: silo index persist failed: {e}");
+        }
+        eprintln!(
+            "  Dump {} silo index: {} entries persisted to {}",
+            request.name, silo_index_count, silo_dir.join("doc_index.bin").display()
+        );
+        emit_stage(&request.name, "silo_index", "done", &t, total.load(Ordering::Relaxed));
     }
-    eprintln!(
-        "  Dump {} silo index: {} entries persisted to {}",
-        request.name, silo_index_count, silo_dir.join("doc_index.bin").display()
-    );
-    emit_stage(&request.name, "silo_index", "done", &t, total.load(Ordering::Relaxed));
 
     emit_stage(&request.name, "merge", "start", &t, total.load(Ordering::Relaxed));
     // Merge all thread results — parallel tree reduction
@@ -2628,8 +2639,9 @@ fn write_docstore_row_indexed(
 /// Same field collection logic as write_docstore_row_indexed, but encodes all
 /// fields into a single contiguous document blob and appends to the silo file.
 ///
-/// Document blob format: [u16 field_idx][u16 value_len][value_bytes]...
+/// Document blob format: [u16 field_idx][u32 value_len][value_bytes]...
 /// No slot_id prefix (the silo index maps slot→offset).
+#[cfg(feature = "data-silo")]
 fn write_silo_row_indexed(
     row: &ParsedRow,
     enriched: &dump_enrichment::EnrichedFields,
@@ -3142,6 +3154,7 @@ mod tests {
     /// V2 Validation Gate: Simulates a 1000-row dump across 4 threads,
     /// then verifies silo files, index persistence, and document content.
     #[test]
+    #[cfg(feature = "data-silo")]
     fn test_v2_validation_1000_rows() {
         use crate::data_silo::{self, DataSiloReader, DocIndex};
 
@@ -3284,6 +3297,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-silo")]
     fn test_write_silo_row_indexed_basic() {
         // Test that write_silo_row_indexed produces a document blob
         // that can be read back from a DataSiloReader.
@@ -3421,6 +3435,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "data-silo")]
     fn test_write_silo_row_indexed_filter_only_skip() {
         // Fields not in field_idx should be silently skipped (filter_only behavior).
         use crate::data_silo;
