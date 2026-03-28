@@ -310,6 +310,12 @@ pub struct ConcurrentEngine {
     /// The WAL reader thread picks up ops and routes through apply_ops_batch.
     #[cfg(feature = "pg-sync")]
     wal_writer: Option<Arc<crate::ops_wal::WalWriter>>,
+    /// Data silo reader for mmap-based document reads (replaces DocStore V2 reads).
+    /// None until silo files are loaded after a dump or on server restart.
+    silo_reader: Option<crate::data_silo::DataSiloReader>,
+    /// Reverse mapping from silo field_idx → field name. Loaded from docstore's
+    /// idx_to_field at the time silos are initialized.
+    silo_field_names: Vec<String>,
 }
 
 impl ConcurrentEngine {
@@ -1113,6 +1119,8 @@ impl ConcurrentEngine {
                 doc_cache_eviction_handle: None,
                 #[cfg(feature = "pg-sync")]
                 wal_writer: None,
+                silo_reader: None,
+                silo_field_names: Vec::new(),
             });
         }
 
@@ -2679,6 +2687,8 @@ impl ConcurrentEngine {
             doc_cache_eviction_handle,
             #[cfg(feature = "pg-sync")]
             wal_writer: None,
+            silo_reader: None,
+            silo_field_names: Vec::new(),
         })
     }
 
@@ -5519,7 +5529,19 @@ impl ConcurrentEngine {
             }
         }
 
-        // Slow path: disk read + cache populate
+        // Silo path: mmap-based read (42ns warm, no lock)
+        if let Some(ref silo) = self.silo_reader {
+            if let Some(bytes) = silo.get(slot_id) {
+                if let Some(doc) = Self::decode_silo_doc(bytes, &self.silo_field_names) {
+                    if let (Some(ref cache), ) = (&self.doc_cache, ) {
+                        cache.insert(slot_id, doc.clone());
+                    }
+                    return Ok(Some(doc));
+                }
+            }
+        }
+
+        // Fallback: DocStore V2 disk read (coexistence during migration)
         let doc = self.docstore.lock().get(slot_id)?;
 
         if let (Some(ref cache), Some(ref doc)) = (&self.doc_cache, &doc) {
@@ -5528,6 +5550,78 @@ impl ConcurrentEngine {
         }
 
         Ok(doc)
+    }
+
+    /// Decode a raw silo document blob into a StoredDoc.
+    /// Blob format: [u16 field_idx][u32 value_len][rmp_serde bytes]...
+    fn decode_silo_doc(bytes: &[u8], field_names: &[String]) -> Option<StoredDoc> {
+        use crate::docstore::PackedValue;
+        use crate::mutation::FieldValue;
+        use crate::types::Value;
+
+        let mut fields = HashMap::new();
+        let mut offset = 0;
+        while offset + 6 <= bytes.len() {
+            let fidx = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+            let vlen = u32::from_le_bytes([
+                bytes[offset + 2], bytes[offset + 3],
+                bytes[offset + 4], bytes[offset + 5],
+            ]) as usize;
+            offset += 6;
+            if offset + vlen > bytes.len() {
+                break;
+            }
+            let value_bytes = &bytes[offset..offset + vlen];
+            offset += vlen;
+
+            if let Some(name) = field_names.get(fidx) {
+                if let Ok(packed) = rmp_serde::from_slice::<PackedValue>(value_bytes) {
+                    let fv = match packed {
+                        PackedValue::I(i) => FieldValue::Single(Value::Integer(i)),
+                        PackedValue::F(f) => FieldValue::Single(Value::Float(f)),
+                        PackedValue::B(b) => FieldValue::Single(Value::Bool(b)),
+                        PackedValue::S(s) => FieldValue::Single(Value::String(s)),
+                        PackedValue::Mi(is) => FieldValue::Multi(is.into_iter().map(Value::Integer).collect()),
+                        PackedValue::Mm(pvs) => FieldValue::Multi(
+                            pvs.into_iter()
+                                .map(|pv| match pv {
+                                    PackedValue::I(i) => Value::Integer(i),
+                                    PackedValue::F(f) => Value::Float(f),
+                                    PackedValue::B(b) => Value::Bool(b),
+                                    PackedValue::S(s) => Value::String(s),
+                                    _ => Value::Integer(0),
+                                })
+                                .collect(),
+                        ),
+                    };
+                    fields.insert(name.clone(), fv);
+                }
+            }
+        }
+        if fields.is_empty() {
+            None
+        } else {
+            Some(StoredDoc { fields, schema_version: 0 })
+        }
+    }
+
+    /// Load a DataSiloReader from a silo directory. Called after dump processing
+    /// or on server restart when silo files exist.
+    pub fn load_silo_reader(&mut self, silo_dir: &std::path::Path) -> Result<()> {
+        let index_path = silo_dir.join("doc_index.bin");
+        if !index_path.exists() {
+            return Ok(()); // No silo data yet — skip
+        }
+        let reader = crate::data_silo::DataSiloReader::open(silo_dir)
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("silo open: {e}")))?;
+        let field_names = self.docstore.lock().idx_to_field().to_vec();
+        eprintln!(
+            "  Silo reader loaded: {} docs, {} silo files, {} field names from {}",
+            reader.count(), reader.silo_count(), field_names.len(), silo_dir.display()
+        );
+        self.silo_reader = Some(reader);
+        self.silo_field_names = field_names;
+        Ok(())
     }
 
     /// Compact the docstore, reclaiming space from old write transactions.
