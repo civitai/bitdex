@@ -401,8 +401,8 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
 
     let mut body = String::from("DECLARE\n  _ops jsonb;\n  _query text;\n");
 
-    // If there's a query_source, we need a variable for its result
-    if source.query_source.is_some() {
+    // If there's a query_source or expression, we need a variable for its result
+    if source.query_source.is_some() || source.expression.is_some() {
         body.push_str("  _source_result jsonb;\n");
     }
     body.push_str("BEGIN\n");
@@ -411,7 +411,23 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
     // Build the query string with PG variable interpolation.
     // Template: "postId eq {id}" → _query := 'postId eq ' || NEW."id"::text
     // This ensures PG evaluates the column reference at runtime.
-    if let Some(ref query_source) = source.query_source {
+    if let Some(ref expr) = source.expression {
+        // Custom expression (e.g., Model's json_agg subquery).
+        // Execute the expression as a subquery, store result in a variable,
+        // then use that variable in the query template.
+        // Use EXECUTE with $1 parameter to pass NEW.column values safely.
+        let (param_sql, param_refs) = build_execute_with_params(expr, "NEW");
+        body.push_str(&format!(
+            "    EXECUTE '{}' INTO _source_result{};\n",
+            param_sql.replace('\'', "''"),
+            if param_refs.is_empty() { String::new() } else { format!(" USING {}", param_refs.join(", ")) }
+        ));
+        // The query template references the subquery result (e.g., {ids}).
+        // Replace {ids} with the _source_result variable.
+        let query_with_result = query_template
+            .replace("{ids}", "' || _source_result::text || '");
+        body.push_str(&format!("    _query := '{}';\n", query_with_result));
+    } else if let Some(ref query_source) = source.query_source {
         let source_sql = substitute_columns(query_source, "NEW");
         body.push_str(&format!(
             "    EXECUTE format('SELECT ({})') INTO _source_result;\n",
@@ -507,6 +523,36 @@ fn substitute_columns(expr: &str, prefix: &str) -> String {
         }
     }
     result
+}
+
+/// Build an EXECUTE-compatible SQL string with $N parameter placeholders.
+///
+/// Template: "SELECT json_agg(mv.id) FROM \"ModelVersion\" mv WHERE mv.\"modelId\" = {id}"
+/// with prefix "NEW"
+/// → ("SELECT json_agg(mv.id) FROM \"ModelVersion\" mv WHERE mv.\"modelId\" = $1", ["NEW.\"id\""])
+fn build_execute_with_params(template: &str, prefix: &str) -> (String, Vec<String>) {
+    let mut sql = String::new();
+    let mut params: Vec<String> = Vec::new();
+    let mut chars = template.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut col = String::new();
+            while let Some(&next) = chars.peek() {
+                if next == '}' {
+                    chars.next();
+                    break;
+                }
+                col.push(chars.next().unwrap());
+            }
+            params.push(format!("{prefix}.\"{col}\""));
+            sql.push_str(&format!("${}", params.len()));
+        } else {
+            sql.push(c);
+        }
+    }
+
+    (sql, params)
 }
 
 /// Build a PG string concatenation expression from a query template.
