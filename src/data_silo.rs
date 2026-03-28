@@ -340,6 +340,88 @@ impl DataSiloReader {
 }
 
 // ---------------------------------------------------------------------------
+// DataSiloWriter — steady-state single-doc upsert path
+// ---------------------------------------------------------------------------
+
+/// Writer for steady-state single-document upserts. Appends to the last silo
+/// file in a directory, updating the shared index so the new offset wins.
+/// The old data at the previous offset becomes dead space — compaction reclaims
+/// it eventually, but correctness is not affected because reads always use the
+/// index-tracked offset.
+pub struct DataSiloWriter {
+    file: DocDataFile,
+    file_id: u8,
+    index: DocIndex,
+    silo_dir: PathBuf,
+}
+
+impl DataSiloWriter {
+    /// Open a `DataSiloWriter` for the given silo directory.
+    ///
+    /// Loads the existing `doc_index.bin` (if present) and opens the last silo
+    /// file for appending.  If the directory is empty (first write after a
+    /// brand-new bulk-load hasn't run yet), it creates `silo_00.dat` and an
+    /// empty index.
+    pub fn open(silo_dir: &Path) -> io::Result<Self> {
+        fs::create_dir_all(silo_dir)?;
+
+        // Load existing index, or start with a fresh empty one.
+        let index_path = silo_dir.join("doc_index.bin");
+        let index = if index_path.exists() {
+            DocIndex::load(&index_path)?
+        } else {
+            DocIndex::new(0)
+        };
+
+        // Find the highest-numbered silo file that exists, or create silo_00.
+        let mut last_id = 0u8;
+        loop {
+            let next_path = silo_dir.join(format!("silo_{:02}.dat", last_id + 1));
+            if next_path.exists() {
+                last_id += 1;
+            } else {
+                break;
+            }
+        }
+
+        let silo_path = silo_dir.join(format!("silo_{:02}.dat", last_id));
+        let file = if silo_path.exists() {
+            DocDataFile::open_for_append(&silo_path)?
+        } else {
+            DocDataFile::create(&silo_path)?
+        };
+
+        Ok(Self {
+            file,
+            file_id: last_id,
+            index,
+            silo_dir: silo_dir.to_path_buf(),
+        })
+    }
+
+    /// Upsert a document for `slot`. Appends `data` to the active silo and
+    /// updates the index entry.  The previous offset (if any) becomes dead
+    /// space — it is no longer reachable via the index.
+    pub fn upsert(&mut self, slot: u32, data: &[u8]) -> io::Result<()> {
+        let (offset, length) = self.file.append(data)?;
+        self.index.set(slot, self.file_id, offset, length);
+        Ok(())
+    }
+
+    /// Flush the underlying silo file write buffer to the OS.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+
+    /// Atomically persist the in-memory index to `<silo_dir>/doc_index.bin`.
+    /// Uses a temp-file + rename so a crash mid-write never corrupts the index.
+    pub fn persist_index(&self) -> io::Result<()> {
+        let index_path = self.silo_dir.join("doc_index.bin");
+        self.index.persist(&index_path)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -523,5 +605,104 @@ mod tests {
                 other => panic!("slot {}: expected PackedValue::Mi, got {:?}", slot, other),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // DataSiloWriter tests
+    // -----------------------------------------------------------------------
+
+    /// Upsert into an empty slot, then read back via DataSiloReader.
+    #[test]
+    fn test_upsert_new_doc() {
+        let dir = std::env::temp_dir().join("bitdex_data_silo_upsert_new");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let data = b"new_document_payload";
+
+        {
+            let mut writer = DataSiloWriter::open(&dir).unwrap();
+            writer.upsert(42, data).unwrap();
+            writer.flush().unwrap();
+            writer.persist_index().unwrap();
+        }
+
+        let reader = DataSiloReader::open(&dir).unwrap();
+        assert_eq!(reader.count(), 1);
+        let got = reader.get(42).expect("slot 42 should be present");
+        assert_eq!(got, data);
+        assert!(reader.get(0).is_none());
+        assert!(reader.get(99).is_none());
+    }
+
+    /// Write a slot, then upsert the same slot with new data — latest wins.
+    #[test]
+    fn test_upsert_overwrite() {
+        let dir = std::env::temp_dir().join("bitdex_data_silo_upsert_overwrite");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let first = b"original_data";
+        let second = b"updated_data_longer";
+
+        {
+            let mut writer = DataSiloWriter::open(&dir).unwrap();
+            writer.upsert(7, first).unwrap();
+            writer.upsert(7, second).unwrap(); // same slot, new data
+            writer.flush().unwrap();
+            writer.persist_index().unwrap();
+        }
+
+        // Re-open to confirm the persisted index reflects the latest write.
+        let reader = DataSiloReader::open(&dir).unwrap();
+        // Index has exactly one entry for slot 7 (overwrite, not two separate entries).
+        assert_eq!(reader.count(), 1);
+        let got = reader.get(7).expect("slot 7 should be present");
+        assert_eq!(got, second, "latest upsert should win");
+    }
+
+    /// After overwriting a slot, the old offset is unreachable via the index.
+    #[test]
+    fn test_upsert_dead_space() {
+        let dir = std::env::temp_dir().join("bitdex_data_silo_upsert_dead");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let first = b"first_write_becomes_dead_space";
+        let second = b"second_write_is_live";
+
+        let first_offset;
+        let second_offset;
+
+        {
+            let mut writer = DataSiloWriter::open(&dir).unwrap();
+            // First write — records where old data lands.
+            writer.upsert(5, first).unwrap();
+            first_offset = writer.file.offset() - first.len() as u64;
+
+            // Second write — overwrites the index entry for slot 5.
+            writer.upsert(5, second).unwrap();
+            second_offset = writer.file.offset() - second.len() as u64;
+
+            writer.flush().unwrap();
+            writer.persist_index().unwrap();
+        }
+
+        // The live index entry should point at the second write.
+        let index_path = dir.join("doc_index.bin");
+        let index = DocIndex::load(&index_path).unwrap();
+        let entry = index.get(5).expect("slot 5 must be indexed");
+        assert_eq!(entry.offset, second_offset, "index must point to second write");
+        assert_ne!(entry.offset, first_offset, "old offset must not be in index");
+        assert_eq!(entry.length as usize, second.len());
+
+        // The first write's bytes are still physically on disk (dead space),
+        // but the index no longer references them.
+        let silo_path = dir.join("silo_00.dat");
+        let raw = fs::read(&silo_path).unwrap();
+        assert!(
+            raw.windows(first.len()).any(|w| w == first),
+            "old bytes should still be in silo file (dead space, not zeroed)"
+        );
     }
 }
