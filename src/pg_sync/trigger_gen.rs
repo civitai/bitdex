@@ -19,6 +19,77 @@ use std::hash::{Hash, Hasher};
 
 use serde::Deserialize;
 
+/// A tracked field entry in a trigger's track_fields list.
+/// Can be a simple string ("nsfwLevel") or a structured map
+/// ({ column: "type", target: "type", expression: "{type}::text" }).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TrackField {
+    /// Simple field name (column = target, no expression).
+    Simple(String),
+    /// Structured field with optional column/target/expression.
+    Mapped {
+        column: Option<String>,
+        target: Option<String>,
+        expression: Option<String>,
+    },
+}
+
+impl TrackField {
+    /// Convert to the string format expected by parse_track_field.
+    /// Simple("nsfwLevel") → "nsfwLevel"
+    /// Mapped { column: "type", expression: "{type}::text" } → "{type}::text as type"
+    pub fn to_track_string(&self) -> String {
+        match self {
+            TrackField::Simple(s) => s.clone(),
+            TrackField::Mapped { column, target, expression } => {
+                let field_name = target.as_deref()
+                    .or(column.as_deref())
+                    .unwrap_or("unknown");
+                if let Some(expr) = expression {
+                    format!("{} as {}", expr, field_name)
+                } else if let Some(col) = column {
+                    if target.is_some() && target.as_deref() != Some(col.as_str()) {
+                        // column differs from target — use "column" as expression alias
+                        format!("\"{}\" as {}", col, field_name)
+                    } else {
+                        field_name.to_string()
+                    }
+                } else {
+                    field_name.to_string()
+                }
+            }
+        }
+    }
+}
+
+/// Computed field for triggers (same shape as dump computed_fields).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TriggerComputedField {
+    pub target: String,
+    pub expression: String,
+    pub value: Option<String>,
+}
+
+/// A value that can be bool (true) or string ("delete_slot").
+/// The YAML uses `on_delete: true` but trigger_gen expects "delete_slot".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OnDeleteValue {
+    Bool(bool),
+    String(String),
+}
+
+impl OnDeleteValue {
+    /// Returns true if deletion should emit a delete op.
+    pub fn is_delete(&self) -> bool {
+        match self {
+            OnDeleteValue::Bool(b) => *b,
+            OnDeleteValue::String(s) => s == "delete_slot" || s == "true",
+        }
+    }
+}
+
 /// A sync source definition from the YAML config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SyncSource {
@@ -29,8 +100,11 @@ pub struct SyncSource {
     pub slot_field: Option<String>,
 
     /// For direct tables: list of scalar fields to track.
-    /// Can include expressions: "GREATEST({scannedAt}, {createdAt}) as existedAt"
-    pub track_fields: Option<Vec<String>>,
+    /// Can be strings ("nsfwLevel") or maps ({ column, target, expression }).
+    pub track_fields: Option<Vec<TrackField>>,
+
+    /// Computed fields for triggers (bitfield extraction, etc.)
+    pub computed_fields: Option<Vec<TriggerComputedField>>,
 
     /// For multi-value join tables: the BitDex field name (e.g., "tagIds")
     pub field: Option<String>,
@@ -45,14 +119,24 @@ pub struct SyncSource {
     #[serde(default)]
     pub sets_alive: bool,
 
-    /// If "delete_slot", emit a delete op on DELETE
-    pub on_delete: Option<String>,
+    /// Whether DELETE should emit a delete op. Can be bool or "delete_slot".
+    pub on_delete: Option<OnDeleteValue>,
 
     /// For fan-out tables: BitDex query template with {column} placeholders
     pub query: Option<String>,
 
     /// For fan-out tables: PG subquery to get values not on the triggering table
     pub query_source: Option<String>,
+
+    /// Table type: "fan_out" for fan-out tables, omit for direct/join tables.
+    #[serde(rename = "type")]
+    pub table_type: Option<String>,
+
+    /// SQL JOIN clause for fan-out triggers (e.g., Model join for Checkpoint filter).
+    pub join: Option<String>,
+
+    /// Custom SQL expression for slot resolution (e.g., Model's json_agg subquery).
+    pub expression: Option<String>,
 
     /// Tables that must be loaded before this one during dumps
     #[serde(rename = "dependsOn")]
@@ -98,10 +182,11 @@ pub fn generate_trigger_sql(source: &SyncSource) -> String {
     let trig_name = trigger_name(source);
     let body = generate_trigger_body(source);
 
+    let has_delete = source.on_delete.as_ref().map(|v| v.is_delete()).unwrap_or(false);
     let trigger_events = if source.field.is_some() {
         // Multi-value join table: INSERT and DELETE only
         "AFTER INSERT OR DELETE"
-    } else if source.on_delete.as_deref() == Some("delete_slot") {
+    } else if has_delete {
         "AFTER INSERT OR UPDATE OR DELETE"
     } else {
         "AFTER INSERT OR UPDATE"
@@ -142,8 +227,10 @@ fn generate_trigger_body(source: &SyncSource) -> String {
 /// Generate body for direct tables (e.g., Image).
 fn generate_direct_body(source: &SyncSource) -> String {
     let slot_field = source.slot_field.as_deref().unwrap_or("id");
-    let track_fields = source.track_fields.as_deref().unwrap_or(&[]);
-    let has_delete = source.on_delete.as_deref() == Some("delete_slot");
+    let track_strings: Vec<String> = source.track_fields.as_deref().unwrap_or(&[])
+        .iter().map(|tf| tf.to_track_string()).collect();
+    let track_fields: Vec<&str> = track_strings.iter().map(|s| s.as_str()).collect();
+    let has_delete = source.on_delete.as_ref().map(|v| v.is_delete()).unwrap_or(false);
 
     let mut body = String::from("DECLARE\n  _ops jsonb;\nBEGIN\n");
 
@@ -254,7 +341,9 @@ END;"#,
 /// Generate body for fan-out tables (e.g., ModelVersion, Post).
 fn generate_fan_out_body(source: &SyncSource) -> String {
     let query_template = source.query.as_deref().unwrap_or("");
-    let track_fields = source.track_fields.as_deref().unwrap_or(&[]);
+    let track_strings: Vec<String> = source.track_fields.as_deref().unwrap_or(&[])
+        .iter().map(|tf| tf.to_track_string()).collect();
+    let track_fields: Vec<&str> = track_strings.iter().map(|s| s.as_str()).collect();
 
     let mut body = String::from("DECLARE\n  _ops jsonb;\n  _query text;\n");
 
@@ -398,20 +487,34 @@ mod tests {
         assert_eq!(result, "OLD.\"nsfwLevel\"");
     }
 
-    #[test]
-    fn test_generate_multi_value_trigger() {
-        let source = SyncSource {
-            table: "TagsOnImageNew".into(),
-            slot_field: Some("imageId".into()),
+    /// Helper to build a test SyncSource with defaults for unused fields.
+    fn test_source(table: &str) -> SyncSource {
+        SyncSource {
+            table: table.into(),
+            slot_field: None,
             track_fields: None,
-            field: Some("tagIds".into()),
-            value_field: Some("tagId".into()),
+            computed_fields: None,
+            field: None,
+            value_field: None,
             filter: None,
             sets_alive: false,
             on_delete: None,
             query: None,
             query_source: None,
+            table_type: None,
+            join: None,
+            expression: None,
             depends_on: None,
+        }
+    }
+
+    #[test]
+    fn test_generate_multi_value_trigger() {
+        let source = SyncSource {
+            slot_field: Some("imageId".into()),
+            field: Some("tagIds".into()),
+            value_field: Some("tagId".into()),
+            ..test_source("TagsOnImageNew")
         };
         let sql = generate_trigger_sql(&source);
         assert!(sql.contains("CREATE OR REPLACE FUNCTION"));
@@ -424,17 +527,14 @@ mod tests {
     #[test]
     fn test_generate_direct_trigger() {
         let source = SyncSource {
-            table: "Image".into(),
             slot_field: Some("id".into()),
-            track_fields: Some(vec!["nsfwLevel".into(), "type".into()]),
-            field: None,
-            value_field: None,
-            filter: None,
+            track_fields: Some(vec![
+                TrackField::Simple("nsfwLevel".into()),
+                TrackField::Simple("type".into()),
+            ]),
             sets_alive: true,
-            on_delete: Some("delete_slot".into()),
-            query: None,
-            query_source: None,
-            depends_on: None,
+            on_delete: Some(OnDeleteValue::String("delete_slot".into())),
+            ..test_source("Image")
         };
         let sql = generate_trigger_sql(&source);
         assert!(sql.contains("IS DISTINCT FROM"));
@@ -445,17 +545,9 @@ mod tests {
     #[test]
     fn test_generate_fan_out_trigger() {
         let source = SyncSource {
-            table: "ModelVersion".into(),
-            slot_field: None,
-            track_fields: Some(vec!["baseModel".into()]),
-            field: None,
-            value_field: None,
-            filter: None,
-            sets_alive: false,
-            on_delete: None,
+            track_fields: Some(vec![TrackField::Simple("baseModel".into())]),
             query: Some("modelVersionIds eq {id}".into()),
-            query_source: None,
-            depends_on: None,
+            ..test_source("ModelVersion")
         };
         let sql = generate_trigger_sql(&source);
         assert!(sql.contains("queryOpSet"));
@@ -465,17 +557,9 @@ mod tests {
     #[test]
     fn test_trigger_name_includes_hash() {
         let source = SyncSource {
-            table: "Image".into(),
             slot_field: Some("id".into()),
-            track_fields: Some(vec!["nsfwLevel".into()]),
-            field: None,
-            value_field: None,
-            filter: None,
-            sets_alive: false,
-            on_delete: None,
-            query: None,
-            query_source: None,
-            depends_on: None,
+            track_fields: Some(vec![TrackField::Simple("nsfwLevel".into())]),
+            ..test_source("Image")
         };
         let name = trigger_name(&source);
         assert!(name.starts_with("bitdex_image_"));
@@ -485,20 +569,15 @@ mod tests {
     #[test]
     fn test_trigger_hash_changes_with_config() {
         let source1 = SyncSource {
-            table: "Image".into(),
             slot_field: Some("id".into()),
-            track_fields: Some(vec!["nsfwLevel".into()]),
-            field: None,
-            value_field: None,
-            filter: None,
-            sets_alive: false,
-            on_delete: None,
-            query: None,
-            query_source: None,
-            depends_on: None,
+            track_fields: Some(vec![TrackField::Simple("nsfwLevel".into())]),
+            ..test_source("Image")
         };
         let source2 = SyncSource {
-            track_fields: Some(vec!["nsfwLevel".into(), "type".into()]),
+            track_fields: Some(vec![
+                TrackField::Simple("nsfwLevel".into()),
+                TrackField::Simple("type".into()),
+            ]),
             ..source1.clone()
         };
         let name1 = trigger_name(&source1);
@@ -532,27 +611,77 @@ sync_sources:
     }
 
     #[test]
+    fn test_yaml_parsing_mapped_track_fields() {
+        let yaml = r#"
+sync_sources:
+  - table: Image
+    slot_field: id
+    track_fields:
+      - nsfwLevel
+      - { column: type, expression: "{type}::text" }
+      - { column: modelVersionId, target: modelVersionIds }
+"#;
+        let config = SyncConfig::from_yaml(yaml).unwrap();
+        let track = config.sync_sources[0].track_fields.as_ref().unwrap();
+        assert_eq!(track.len(), 3);
+        // Simple string
+        assert_eq!(track[0].to_track_string(), "nsfwLevel");
+        // Expression with column
+        assert_eq!(track[1].to_track_string(), "{type}::text as type");
+        // Column→target mapping
+        assert!(track[2].to_track_string().contains("modelVersionIds"));
+    }
+
+    #[test]
+    fn test_yaml_parsing_on_delete_bool() {
+        let yaml = r#"
+sync_sources:
+  - table: Image
+    slot_field: id
+    on_delete: true
+"#;
+        let config = SyncConfig::from_yaml(yaml).unwrap();
+        assert!(config.sync_sources[0].on_delete.as_ref().unwrap().is_delete());
+    }
+
+    #[test]
     fn test_expression_in_track_fields() {
         let source = SyncSource {
-            table: "Image".into(),
             slot_field: Some("id".into()),
             track_fields: Some(vec![
-                "nsfwLevel".into(),
-                "GREATEST({scannedAt}, {createdAt}) as existedAt".into(),
-                "({flags} & (1 << 13)) != 0 AND ({flags} & (1 << 2)) = 0 as hasMeta".into(),
+                TrackField::Simple("nsfwLevel".into()),
+                TrackField::Simple("GREATEST({scannedAt}, {createdAt}) as existedAt".into()),
+                TrackField::Simple("({flags} & (1 << 13)) != 0 AND ({flags} & (1 << 2)) = 0 as hasMeta".into()),
             ]),
-            field: None,
-            value_field: None,
-            filter: None,
             sets_alive: true,
-            on_delete: Some("delete_slot".into()),
-            query: None,
-            query_source: None,
-            depends_on: None,
+            on_delete: Some(OnDeleteValue::String("delete_slot".into())),
+            ..test_source("Image")
         };
         let sql = generate_trigger_sql(&source);
         assert!(sql.contains("GREATEST"));
         assert!(sql.contains("existedAt"));
         assert!(sql.contains("hasMeta"));
+    }
+
+    #[test]
+    fn test_track_field_to_string_mapped_with_expression() {
+        let tf = TrackField::Mapped {
+            column: Some("publishedAt".into()),
+            target: Some("publishedAt".into()),
+            expression: Some("extract(epoch from {publishedAt})::bigint".into()),
+        };
+        let s = tf.to_track_string();
+        assert_eq!(s, "extract(epoch from {publishedAt})::bigint as publishedAt");
+    }
+
+    #[test]
+    fn test_track_field_to_string_mapped_column_only() {
+        let tf = TrackField::Mapped {
+            column: Some("tagId".into()),
+            target: Some("tagIds".into()),
+            expression: None,
+        };
+        let s = tf.to_track_string();
+        assert!(s.contains("tagIds"), "Expected 'tagIds' in '{s}'");
     }
 }
