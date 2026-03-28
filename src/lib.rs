@@ -1,4 +1,3 @@
-#[cfg(feature = "data_silo")]
 pub mod data_silo;
 pub mod bitmap_fs;
 pub mod bound_store;
