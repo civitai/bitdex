@@ -1479,17 +1479,6 @@ pub fn process_dump_with_progress(
 
     // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
     // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
-    // Per-row component timing (general phase only — NOT on multi-value/tags path).
-    // At 107M rows × ~6 Instant::now() × 20ns ≈ 0.5s wall time. Acceptable.
-    let timing_parse_ns = AtomicU64::new(0);
-    let timing_filter_ns = AtomicU64::new(0);
-    let timing_enrich_ns = AtomicU64::new(0);
-    let timing_bitmap_ns = AtomicU64::new(0);
-    let timing_docstore_ns = AtomicU64::new(0);
-    let timing_doc_serialize_ns = AtomicU64::new(0);
-    let timing_doc_write_ns = AtomicU64::new(0);
-    let timing_computed_ns = AtomicU64::new(0);
-
     type ThreadResult = (
         HashMap<String, HashMap<u64, RoaringBitmap>>,
         HashMap<String, Vec<RoaringBitmap>>,
@@ -1508,15 +1497,6 @@ pub fn process_dump_with_progress(
             let col_idx_ref: &HashMap<String, usize> = col_index.as_ref();
             let mut serialize_buf: Vec<u8> = Vec::with_capacity(64);
 
-            // Thread-local timing accumulators
-            let mut lp: u64 = 0; // parse
-            let mut lf: u64 = 0; // filter
-            let mut le: u64 = 0; // enrich
-            let mut lb: u64 = 0; // bitmap (filter + sort)
-            let mut ld: u64 = 0; // docstore total
-            let mut lds: u64 = 0; // docstore serialize
-            let mut ldw: u64 = 0; // docstore write
-            let mut lc: u64 = 0; // computed
 
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
                 .iter()
@@ -1555,7 +1535,7 @@ pub fn process_dump_with_progress(
                     continue;
                 }
 
-                let t0 = Instant::now();
+
                 let fields = parse_delimited_line(line, delimiter);
                 let row = ParsedRow {
                     fields,
@@ -1578,27 +1558,21 @@ pub fn process_dump_with_progress(
                 // Build indexed fields (Vec<Option<&str>> — cheap compared to HashMap)
                 let indexed_fields_buf = row.to_indexed_fields();
                 let col_idx = row.col_index_ref();
-                lp += t0.elapsed().as_nanos() as u64;
 
                 // Apply filter via indexed path (zero-allocation)
-                let t1 = Instant::now();
                 if let Some(ref fexpr) = filter_expr_ref {
                     if !fexpr.eval_indexed(&indexed_fields_buf, col_idx, None) {
-                        lf += t1.elapsed().as_nanos() as u64;
                         continue;
                     }
                 }
 
-                lf += t1.elapsed().as_nanos() as u64;
 
                 // Resolve enrichment via indexed path (no CsvRow HashMap)
-                let t2 = Instant::now();
                 let enriched = if enrichment_mgr_ref.table_count() > 0 {
                     Some(enrichment_mgr_ref.enrich_row_indexed(&indexed_fields_buf, col_idx))
                 } else {
                     None
                 };
-                le += t2.elapsed().as_nanos() as u64;
 
                 // Collect enriched field values (avoid HashMap — linear scan is fine for <10 fields)
                 let enriched = enriched.unwrap_or_default();
@@ -1638,8 +1612,6 @@ pub fn process_dump_with_progress(
                                     &mut serialize_buf,
                                     &mut tuple_buf,
                                     &mut write_buf,
-                                    &mut lds,
-                                    &mut ldw,
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1659,7 +1631,6 @@ pub fn process_dump_with_progress(
                 }
 
                 // Build filter + sort bitmaps from direct fields
-                let t3 = Instant::now();
                 for field_mapping in request_fields {
                     let target = field_mapping.target();
                     let column = field_mapping.column();
@@ -1703,10 +1674,8 @@ pub fn process_dump_with_progress(
                     }
                 }
 
-                lb += t3.elapsed().as_nanos() as u64;
 
                 // Build bitmaps from computed fields (Nate's ComputedFieldDef API)
-                let t4 = Instant::now();
                 for def in computed_defs_ref {
                     let computed_val = def.eval_indexed(&indexed_fields_buf, col_idx, None);
 
@@ -1759,10 +1728,8 @@ pub fn process_dump_with_progress(
                     }
                 }
 
-                lc += t4.elapsed().as_nanos() as u64;
 
                 // Write docstore
-                let t5 = Instant::now();
                 write_docstore_row_indexed(
                     &row,
                     &enriched,
@@ -1776,10 +1743,7 @@ pub fn process_dump_with_progress(
                     &mut serialize_buf,
                     &mut tuple_buf,
                     &mut write_buf,
-                    &mut lds,
-                    &mut ldw,
                 );
-                ld += t5.elapsed().as_nanos() as u64;
 
                 count += 1;
                 if count % LOG_INTERVAL == 0 {
@@ -1795,14 +1759,6 @@ pub fn process_dump_with_progress(
             if let Some(ref p) = ext_progress { p.fetch_add(remainder, Ordering::Relaxed); }
 
             // Flush timing
-            timing_parse_ns.fetch_add(lp, Ordering::Relaxed);
-            timing_filter_ns.fetch_add(lf, Ordering::Relaxed);
-            timing_enrich_ns.fetch_add(le, Ordering::Relaxed);
-            timing_bitmap_ns.fetch_add(lb, Ordering::Relaxed);
-            timing_docstore_ns.fetch_add(ld, Ordering::Relaxed);
-            timing_doc_serialize_ns.fetch_add(lds, Ordering::Relaxed);
-            timing_doc_write_ns.fetch_add(ldw, Ordering::Relaxed);
-            timing_computed_ns.fetch_add(lc, Ordering::Relaxed);
 
             (filter_maps, sort_maps, alive, deferred, count, max_slot)
         })
@@ -1810,31 +1766,7 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "parallel_parse", "done", &t, total.load(Ordering::Relaxed));
 
-    // Component timing breakdown (thread-seconds across all threads)
-    let num_threads = rayon::current_num_threads();
-    let parsed_rows = total.load(Ordering::Relaxed);
-    eprintln!("  Component breakdown (thread-seconds across {} threads, {} rows):", num_threads, parsed_rows);
-    eprintln!("    parse:    {:.2}s", timing_parse_ns.load(Ordering::Relaxed) as f64 / 1e9);
-    eprintln!("    filter:   {:.2}s", timing_filter_ns.load(Ordering::Relaxed) as f64 / 1e9);
-    eprintln!("    enrich:   {:.2}s", timing_enrich_ns.load(Ordering::Relaxed) as f64 / 1e9);
-    eprintln!("    bitmap:   {:.2}s", timing_bitmap_ns.load(Ordering::Relaxed) as f64 / 1e9);
-    eprintln!("    computed: {:.2}s", timing_computed_ns.load(Ordering::Relaxed) as f64 / 1e9);
-    eprintln!("    docstore: {:.2}s (serialize={:.2}s write={:.2}s)",
-        timing_docstore_ns.load(Ordering::Relaxed) as f64 / 1e9,
-        timing_doc_serialize_ns.load(Ordering::Relaxed) as f64 / 1e9,
-        timing_doc_write_ns.load(Ordering::Relaxed) as f64 / 1e9);
-    eprintln!(
-        r#"{{"dump":"{}","stage":"component_timing","threads":{},"rows":{},"parse_s":{:.3},"filter_s":{:.3},"enrich_s":{:.3},"bitmap_s":{:.3},"computed_s":{:.3},"docstore_s":{:.3}}}"#,
-        request.name, num_threads, parsed_rows,
-        timing_parse_ns.load(Ordering::Relaxed) as f64 / 1e9,
-        timing_filter_ns.load(Ordering::Relaxed) as f64 / 1e9,
-        timing_enrich_ns.load(Ordering::Relaxed) as f64 / 1e9,
-        timing_bitmap_ns.load(Ordering::Relaxed) as f64 / 1e9,
-        timing_computed_ns.load(Ordering::Relaxed) as f64 / 1e9,
-        timing_docstore_ns.load(Ordering::Relaxed) as f64 / 1e9,
-    );
-
-    emit_stage(&request.name, "merge", "start", &t, parsed_rows);
+    emit_stage(&request.name, "merge", "start", &t, total.load(Ordering::Relaxed));
     // Merge all thread results — parallel tree reduction
     type MergeAccum = (
         HashMap<String, HashMap<u64, RoaringBitmap>>,
@@ -2533,10 +2465,7 @@ fn write_docstore_row_indexed(
     serialize_buf: &mut Vec<u8>,
     tuple_buf: &mut Vec<(u16, u32, u32)>,
     write_buf: &mut Vec<u8>,
-    doc_serialize_ns: &mut u64,
-    doc_write_ns: &mut u64,
 ) {
-    let t_ser = Instant::now();
     serialize_buf.clear();
     tuple_buf.clear();
 
@@ -2604,12 +2533,7 @@ fn write_docstore_row_indexed(
         let refs: Vec<(u16, &[u8])> = tuple_buf.iter()
             .map(|&(idx, off, len)| (idx, &serialize_buf[off as usize..(off + len) as usize]))
             .collect();
-        *doc_serialize_ns += t_ser.elapsed().as_nanos() as u64;
-        let tw = Instant::now();
         bulk_writer.append_tuples_raw(slot, &refs, write_buf);
-        *doc_write_ns += tw.elapsed().as_nanos() as u64;
-    } else {
-        *doc_serialize_ns += t_ser.elapsed().as_nanos() as u64;
     }
 }
 
