@@ -95,6 +95,11 @@ pub struct Config {
     #[serde(default)]
     pub doc_cache: DocCacheConfigEntry,
 
+    /// Bitmap memory scanner settings. Replaces the expensive per-scrape
+    /// bitmap_memory_report() with incremental background scanning.
+    #[serde(default)]
+    pub memory_scanner: MemoryScannerConfig,
+
     /// Enabled metric groups. Controls which expensive metric groups are
     /// collected on the Prometheus scrape endpoint.
     /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
@@ -177,6 +182,7 @@ impl Default for Config {
             eviction_sweep_interval: default_eviction_sweep_interval(),
             compact_threshold_pct: default_compact_threshold_pct(),
             doc_cache: DocCacheConfigEntry::default(),
+            memory_scanner: MemoryScannerConfig::default(),
             enabled_metrics: None,
             deferred_alive: None,
             memory_budget_bytes: None,
@@ -562,6 +568,38 @@ impl Default for DocCacheConfigEntry {
             max_bytes: default_doc_cache_max_bytes(),
             generation_interval_secs: default_doc_cache_generation_interval(),
             max_generations: default_doc_cache_max_generations(),
+        }
+    }
+}
+
+/// Bitmap memory scanner configuration.
+///
+/// The scanner runs a background thread that incrementally measures per-field
+/// bitmap memory, replacing the expensive on-scrape `bitmap_memory_report()`
+/// call (52s at 107M records).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryScannerConfig {
+    /// Whether the scanner thread is active. Default: true.
+    #[serde(default = "default_scanner_enabled")]
+    pub enabled: bool,
+    /// How often the scanner wakes to process dirty fields, in milliseconds. Default: 100.
+    #[serde(default = "default_scanner_interval_ms")]
+    pub interval_ms: u64,
+    /// Maximum number of fields to scan per tick. Default: 3.
+    #[serde(default = "default_scanner_batch_size")]
+    pub batch_size: u64,
+}
+
+fn default_scanner_enabled() -> bool { true }
+fn default_scanner_interval_ms() -> u64 { 100 }
+fn default_scanner_batch_size() -> u64 { 3 }
+
+impl Default for MemoryScannerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: 100,
+            batch_size: 3,
         }
     }
 }

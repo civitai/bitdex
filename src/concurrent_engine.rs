@@ -289,6 +289,8 @@ pub struct ConcurrentEngine {
     /// Metrics bridge: prometheus handles set by server layer, read by background threads.
     #[cfg(feature = "server")]
     metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
+    /// Amortized bitmap memory scanner cache (replaces expensive per-scrape iteration).
+    bitmap_memory_cache: Arc<crate::bitmap_memory_cache::BitmapMemoryCache>,
     /// In-memory document cache (DashMap, cache-on-read, write-through, LRU eviction).
     doc_cache: Option<Arc<crate::doc_cache::DocCache>>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
@@ -1022,6 +1024,13 @@ impl ConcurrentEngine {
             None
         };
 
+        // Bitmap memory scanner cache
+        let bitmap_memory_cache = Arc::new(crate::bitmap_memory_cache::BitmapMemoryCache::new(
+            config.memory_scanner.enabled,
+            config.memory_scanner.interval_ms,
+            config.memory_scanner.batch_size,
+        ));
+
         // Eviction state
         let eviction_stamps: Arc<DashMap<(Arc<str>, u64), AtomicU64>> = Arc::new(DashMap::new());
         let flush_cycle = Arc::new(AtomicU64::new(0));
@@ -1104,6 +1113,7 @@ impl ConcurrentEngine {
                 boundstore_entries_skipped,
                 #[cfg(feature = "server")]
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
+                bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
                 doc_cache: doc_cache.clone(),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
@@ -2600,6 +2610,25 @@ impl ConcurrentEngine {
             (None, None)
         };
 
+        // Spawn bitmap memory scanner thread (amortized per-field memory measurement)
+        {
+            let mem_cache = Arc::clone(&bitmap_memory_cache);
+            let inner_ref = Arc::clone(&inner);
+            let loading_flag = Arc::clone(&loading_mode);
+            let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
+            let sort_names: Vec<String> = config.sort_fields.iter().map(|f| f.name.clone()).collect();
+            std::thread::Builder::new()
+                .name("bitdex-mem-scanner".into())
+                .spawn(move || {
+                    loop {
+                        let interval = mem_cache.interval_ms();
+                        std::thread::sleep(std::time::Duration::from_millis(interval));
+                        mem_cache.scan_tick(&inner_ref, &loading_flag, &filter_names, &sort_names);
+                    }
+                })
+                .expect("failed to spawn memory scanner thread");
+        }
+
         // Spawn doc cache eviction thread (generational rotation + memory-pressure eviction)
         let doc_cache_eviction_handle = if let Some(ref cache) = doc_cache {
             let cache_clone = Arc::clone(cache);
@@ -2670,6 +2699,7 @@ impl ConcurrentEngine {
             boundstore_entries_skipped,
             #[cfg(feature = "server")]
             metrics_bridge,
+            bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
             doc_cache: doc_cache.clone(),
             compaction_skipped,
             compact_tx,
@@ -2698,6 +2728,11 @@ impl ConcurrentEngine {
     #[cfg(feature = "server")]
     pub fn set_metrics_bridge(&self, bridge: MetricsBridge) {
         self.metrics_bridge.store(Arc::new(Some(Arc::new(bridge))));
+    }
+
+    /// Get a reference to the bitmap memory cache (for metrics scraping).
+    pub fn bitmap_memory_cache(&self) -> &crate::bitmap_memory_cache::BitmapMemoryCache {
+        &self.bitmap_memory_cache
     }
 
     /// Get the cumulative count of compaction operations skipped due to channel backpressure.
@@ -5800,6 +5835,9 @@ impl ConcurrentEngine {
                 eprintln!("Warning: exit_loading_mode timed out waiting for flush thread publish");
             }
         }
+
+        // Trigger initial population of bitmap memory cache after load completes.
+        self.bitmap_memory_cache.mark_all_dirty();
     }
 
     /// Combined exit-loading + save + unload that avoids the memory spike.

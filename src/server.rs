@@ -4269,32 +4269,33 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(uc.prefetches as i64);
 
-            // Per-field bitmap memory gauges (EXPENSIVE: iterates all bitmaps)
-            // Gated by metrics_bitmap_memory toggle — disable at runtime via
-            // PATCH /config {"enabled_metrics": []} to avoid 52s scrape stalls.
+            // Per-field bitmap memory gauges.
+            // Uses cached scanner totals instead of iterating all bitmaps (52s at 107M).
+            // The bitmap_memory_cache is populated by a background scanner thread
+            // that processes dirty fields in small batches.
             if state.metrics_bitmap_memory.load(Ordering::Relaxed) {
-                let t1 = std::time::Instant::now();
-                let (slot_bytes, _filter_bytes, _sort_bytes, _ce, _cb, filter_details, sort_details) =
-                    engine.bitmap_memory_report();
-                let t_bitmap_mem = t1.elapsed();
-                let _ = t_bitmap_mem; // timing available for debug logging
+                let mem_cache = engine.bitmap_memory_cache();
                 m.slot_bitmap_bytes
                     .with_label_values(&[name])
-                    .set(slot_bytes as i64);
-                for (field, count, bytes) in &filter_details {
+                    .set(mem_cache.cached_slot_bytes() as i64);
+                for (field, bytes, count) in mem_cache.cached_filter_memory() {
                     m.filter_bitmap_bytes
-                        .with_label_values(&[name, field])
-                        .set(*bytes as i64);
+                        .with_label_values(&[name, &field])
+                        .set(bytes as i64);
                     m.filter_bitmap_count
-                        .with_label_values(&[name, field])
-                        .set(*count as i64);
+                        .with_label_values(&[name, &field])
+                        .set(count as i64);
                 }
-                for (field, bytes) in &sort_details {
+                for (field, bytes) in mem_cache.cached_sort_memory() {
                     m.sort_bitmap_bytes
-                        .with_label_values(&[name, field])
-                        .set(*bytes as i64);
+                        .with_label_values(&[name, &field])
+                        .set(bytes as i64);
                 }
             }
+            // NOTE: The old bitmap_memory_report() code that iterated all bitmaps
+            // synchronously on every scrape is replaced above. If you need to verify
+            // scanner accuracy, temporarily call engine.bitmap_memory_report() and
+            // compare against the cached values.
 
             // Flush pipeline stats
             let (pub_count, _cumulative_nanos, last_nanos) = engine.flush_stats();
