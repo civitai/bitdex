@@ -837,13 +837,40 @@ pub fn apply_ops_batch<S: BitmapSink>(
                 }
             }
 
+            // Read stored doc to get current values for source fields NOT in this ops batch.
+            // Without this, missing sources default to 0, breaking GREATEST/LEAST.
+            let stored_sort_values: HashMap<&str, u32> = if let Some(eng) = engine {
+                let mut stored = HashMap::new();
+                if let Ok(Some(doc)) = eng.get_document(slot) {
+                    for source_field in changed_sources.iter().flat_map(|sf| {
+                        meta.computed_deps.get(*sf).into_iter().flat_map(|deps| {
+                            deps.iter().flat_map(|d| d.source_fields.iter().map(|s| s.as_str()))
+                        })
+                    }) {
+                        if !sort_values.contains_key(source_field) && !old_sort_values.contains_key(source_field) {
+                            if let Some(fv) = doc.fields.get(source_field) {
+                                if let crate::mutation::FieldValue::Single(ref v) = fv {
+                                    if let Some(sv) = value_to_sort_u32(v) {
+                                        stored.insert(source_field, sv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                stored
+            } else {
+                HashMap::new()
+            };
+
             for source_field in &changed_sources {
                 if let Some(deps) = meta.computed_deps.get(*source_field) {
                     for dep in deps {
-                        // Clear old computed value (using old source values)
+                        // Clear old computed value (using old source values, falling back to stored)
                         let old_values: Vec<u32> = dep.source_fields.iter()
                             .map(|sf| old_sort_values.get(sf.as_str())
                                 .or_else(|| sort_values.get(sf.as_str()))
+                                .or_else(|| stored_sort_values.get(sf.as_str()))
                                 .copied()
                                 .unwrap_or(0))
                             .collect();
@@ -859,10 +886,11 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             }
                         }
 
-                        // Set new computed value (using new source values)
+                        // Set new computed value (using new source values, falling back to stored)
                         let new_values: Vec<u32> = dep.source_fields.iter()
                             .map(|sf| sort_values.get(sf.as_str())
                                 .or_else(|| old_sort_values.get(sf.as_str()))
+                                .or_else(|| stored_sort_values.get(sf.as_str()))
                                 .copied()
                                 .unwrap_or(0))
                             .collect();
