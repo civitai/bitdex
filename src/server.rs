@@ -1321,8 +1321,13 @@ impl BitdexServer {
             .with_graceful_shutdown(shutdown_signal)
             .await?;
 
-        // Signal all background threads to stop
+        // Signal all background threads + dump tasks to stop
         shutdown_state.shutting_down.store(true, Ordering::SeqCst);
+        eprintln!("Shutdown signal sent — waiting for active tasks to abort...");
+
+        // Brief wait for spawn_blocking dump tasks to notice the shutdown flag
+        // (they check every 1M rows, so <1s for most phases)
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         // Wait for the WAL reader thread to exit (it checks shutting_down)
         #[cfg(feature = "pg-sync")]
@@ -4580,12 +4585,18 @@ async fn handle_register_dump(
             .to_path_buf();
         let phase_sets_alive = request.sets_alive;
         let engine_for_reload = Arc::clone(&engine);
+        // Share shutdown flag so dump processor can abort on Ctrl+C
+        let shutdown_flag = Arc::clone(&state);
 
         tokio::spawn(async move {
             let dump_name_inner = dump_name_for_task;
 
             let result = tokio::task::spawn_blocking(move || {
-                crate::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema), Some(slot_watermark))
+                // Create a closure that checks AppState.shutting_down
+                let shutdown_check: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                    shutdown_flag.shutting_down.load(std::sync::atomic::Ordering::Relaxed)
+                });
+                crate::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema), Some(slot_watermark), Some(shutdown_check))
             })
             .await;
 

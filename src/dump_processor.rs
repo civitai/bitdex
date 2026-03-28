@@ -1221,8 +1221,9 @@ pub fn process_dump(
     progress_counter: Option<Arc<AtomicU64>>,
     data_schema: Option<&crate::config::DataSchema>,
     slot_watermark: Option<Arc<AtomicU64>>,
+    shutdown: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<PhaseResult, String> {
-    let mut result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema, slot_watermark.as_ref())?;
+    let mut result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema, slot_watermark.as_ref(), shutdown.as_ref())?;
     let (alive_s, filter_s, sort_s, meta_s) = engine
         .shard_stores()
         .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?;
@@ -1267,6 +1268,7 @@ pub fn process_dump_with_progress(
     progress_counter: Option<Arc<AtomicU64>>,
     data_schema: Option<&crate::config::DataSchema>,
     slot_watermark: Option<&Arc<AtomicU64>>,
+    shutdown: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<PhaseResult, String> {
     let t = Instant::now();
 
@@ -1424,6 +1426,7 @@ pub fn process_dump_with_progress(
             &bulk_writer,
             &progress_counter,
             slot_watermark,
+            shutdown,
         );
     }
 
@@ -1775,6 +1778,8 @@ pub fn process_dump_with_progress(
                     let t = total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed) + LOG_INTERVAL;
                     if let Some(ref p) = ext_progress { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
                     eprintln!("  dump {}: {}M rows...", request.name, t / 1_000_000);
+                    // Check shutdown flag — abort early on Ctrl+C
+                    if let Some(ref sf) = shutdown { if sf() { break; } }
                 }
             }
             let remainder = count % LOG_INTERVAL;
@@ -2165,6 +2170,7 @@ fn process_multi_value_phase(
     bulk_writer: &Arc<BulkWriter>,
     progress_counter: &Option<Arc<AtomicU64>>,
     slot_watermark: Option<&Arc<AtomicU64>>,
+    shutdown: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<PhaseResult, String> {
     let target = request.fields[0].target().to_string();
     let value_column = request.fields[0].column().to_string();
@@ -2282,6 +2288,7 @@ fn process_multi_value_phase(
                     if count % LOG_INTERVAL == 0 {
                         total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
                         if let Some(ref p) = progress_counter { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
+                        if let Some(ref sf) = shutdown { if sf() { break; } }
                     }
                 }
                 if !doc_batch.is_empty() {
@@ -2418,6 +2425,7 @@ fn process_multi_value_phase(
                     if count % LOG_INTERVAL == 0 {
                         total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
                         if let Some(ref p) = progress_counter { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
+                        if let Some(ref sf) = shutdown { if sf() { break; } }
                     }
                 }
                 if !doc_batch.is_empty() {
