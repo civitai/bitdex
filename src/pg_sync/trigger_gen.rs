@@ -240,8 +240,8 @@ fn generate_direct_body(source: &SyncSource) -> String {
     let insert_ops: Vec<String> = track_fields
         .iter()
         .map(|f| {
-            let (field_name, expr) = parse_track_field(f);
-            let new_expr = substitute_columns(&expr, "NEW");
+            let (field_name, insert_expr, template_expr) = parse_track_field(f);
+            let new_expr = substitute_columns(&template_expr, "NEW");
             format!(
                 "      jsonb_build_object('op', 'set', 'field', '{}', 'value', to_jsonb({}))",
                 field_name, new_expr
@@ -270,9 +270,9 @@ fn generate_direct_body(source: &SyncSource) -> String {
     body.push_str("  ELSE\n");
     body.push_str("    _ops := '[]'::jsonb;\n");
     for f in track_fields {
-        let (field_name, expr) = parse_track_field(f);
-        let old_expr = substitute_columns(&expr, "OLD");
-        let new_expr = substitute_columns(&expr, "NEW");
+        let (field_name, _insert_expr, template_expr) = parse_track_field(f);
+        let old_expr = substitute_columns(&template_expr, "OLD");
+        let new_expr = substitute_columns(&template_expr, "NEW");
         body.push_str(&format!(
             "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
              \x20     _ops := _ops || jsonb_build_array(\n\
@@ -377,9 +377,9 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
     // Build ops array from tracked fields that changed
     body.push_str("    _ops := '[]'::jsonb;\n");
     for f in track_fields {
-        let (field_name, expr) = parse_track_field(f);
-        let old_expr = substitute_columns(&expr, "OLD");
-        let new_expr = substitute_columns(&expr, "NEW");
+        let (field_name, _insert_expr, template_expr) = parse_track_field(f);
+        let old_expr = substitute_columns(&template_expr, "OLD");
+        let new_expr = substitute_columns(&template_expr, "NEW");
         body.push_str(&format!(
             "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
              \x20     _ops := _ops || jsonb_build_array(\n\
@@ -408,21 +408,26 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
     body
 }
 
-/// Parse a track_field entry. Returns (bitdex_field_name, sql_expression).
-/// Simple field: "nsfwLevel" → ("nsfwLevel", "\"nsfwLevel\"")
-/// Expression: "GREATEST({scannedAt}, {createdAt}) as existedAt" → ("existedAt", "GREATEST(\"scannedAt\", \"createdAt\")")
-fn parse_track_field(field: &str) -> (String, String) {
+/// Parse a track field string into (field_name, insert_expr, template_expr).
+/// - `insert_expr`: Used in INSERT (no OLD/NEW prefix), e.g. `"nsfwLevel"`.
+/// - `template_expr`: Used in UPDATE, contains `{col}` templates for substitute_columns.
+///
+/// Simple field: "nsfwLevel" → ("nsfwLevel", "\"nsfwLevel\"", "{nsfwLevel}")
+/// Expression: "GREATEST({scannedAt}, {createdAt}) as existedAt"
+///   → ("existedAt", "GREATEST(\"scannedAt\", \"createdAt\")", "GREATEST({scannedAt}, {createdAt})")
+fn parse_track_field(field: &str) -> (String, String, String) {
     if let Some(as_pos) = field.to_lowercase().rfind(" as ") {
         let expr = &field[..as_pos].trim();
         let alias = &field[as_pos + 4..].trim();
-        // Replace {col} with "col" (quoted column reference)
-        let sql = expr
-            .replace('{', "\"")
-            .replace('}', "\"");
-        (alias.to_string(), sql)
+        // insert_expr: {col} → "col"
+        let insert_sql = expr.replace('{', "\"").replace('}', "\"");
+        // template_expr: keep {col} for substitute_columns
+        (alias.to_string(), insert_sql, expr.to_string())
     } else {
         // Simple field name
-        (field.to_string(), format!("\"{}\"", field))
+        let insert_sql = format!("\"{}\"", field);
+        let template = format!("{{{}}}", field);
+        (field.to_string(), insert_sql, template)
     }
 }
 
@@ -463,16 +468,21 @@ mod tests {
 
     #[test]
     fn test_parse_track_field_simple() {
-        let (name, expr) = parse_track_field("nsfwLevel");
+        let (name, insert_expr, template_expr) = parse_track_field("nsfwLevel");
         assert_eq!(name, "nsfwLevel");
-        assert_eq!(expr, "\"nsfwLevel\"");
+        assert_eq!(insert_expr, "\"nsfwLevel\"");
+        assert_eq!(template_expr, "{nsfwLevel}");
+        assert_eq!(substitute_columns(&template_expr, "OLD"), "OLD.\"nsfwLevel\"");
+        assert_eq!(substitute_columns(&template_expr, "NEW"), "NEW.\"nsfwLevel\"");
     }
 
     #[test]
     fn test_parse_track_field_expression() {
-        let (name, expr) = parse_track_field("GREATEST({scannedAt}, {createdAt}) as existedAt");
+        let (name, insert_expr, template_expr) = parse_track_field("GREATEST({scannedAt}, {createdAt}) as existedAt");
         assert_eq!(name, "existedAt");
-        assert_eq!(expr, "GREATEST(\"scannedAt\", \"createdAt\")");
+        assert_eq!(insert_expr, "GREATEST(\"scannedAt\", \"createdAt\")");
+        assert_eq!(template_expr, "GREATEST({scannedAt}, {createdAt})");
+        assert_eq!(substitute_columns(&template_expr, "NEW"), "GREATEST(NEW.\"scannedAt\", NEW.\"createdAt\")");
     }
 
     #[test]

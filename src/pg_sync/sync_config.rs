@@ -14,7 +14,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::trigger_gen::SyncSource;
+use crate::pg_sync::trigger_gen::SyncSource;
 
 /// Top-level sync config parsed from the YAML file.
 #[derive(Debug, Clone, Deserialize)]
@@ -603,6 +603,83 @@ triggers: []
         assert_eq!(phase.source.as_deref(), Some("clickhouse"));
         assert_eq!(phase.format, "tsv");
         assert_eq!(phase.fields.len(), 3);
+    }
+
+    #[test]
+    fn generate_trigger_sql_review_file() {
+        // Generates docs/design/trigger-sql-review.sql for safety review
+        // before deploying triggers to production PG.
+        let yaml_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/design/sync-config-civitai.yaml");
+        let yaml = match std::fs::read_to_string(yaml_path) {
+            Ok(y) => y,
+            Err(_) => return, // Skip if file not found (CI)
+        };
+
+        let config = FullSyncConfig::from_yaml(&yaml).unwrap();
+        let mut sql = String::new();
+
+        sql.push_str("-- =======================================================================\n");
+        sql.push_str("-- BitDex Sync V2 — Trigger SQL Review\n");
+        sql.push_str("-- Generated from: docs/design/sync-config-civitai.yaml\n");
+        sql.push_str("-- Run `cargo test generate_trigger_sql_review_file` to regenerate\n");
+        sql.push_str("-- \n");
+        sql.push_str("-- This file is for REVIEW ONLY. Do not execute manually.\n");
+        sql.push_str("-- bitdex-sync setup will execute these statements via run_setup_v2().\n");
+        sql.push_str("-- =======================================================================\n\n");
+
+        // Part 1: SETUP_V2_SQL (tables)
+        sql.push_str("-- -----------------------------------------------------------------------\n");
+        sql.push_str("-- Part 1: V2 Tables (BitdexOps + bitdex_cursors + cleanup trigger)\n");
+        sql.push_str("-- -----------------------------------------------------------------------\n\n");
+        sql.push_str(crate::pg_sync::queries::SETUP_V2_SQL);
+        sql.push_str("\n\n");
+
+        // Part 2: Per-trigger SQL
+        sql.push_str("-- -----------------------------------------------------------------------\n");
+        sql.push_str("-- Part 2: Per-table triggers (generated from sync config YAML)\n");
+        sql.push_str("-- -----------------------------------------------------------------------\n\n");
+
+        for (i, trigger) in config.triggers.iter().enumerate() {
+            let name = crate::pg_sync::trigger_gen::trigger_name(trigger);
+            let trigger_sql = crate::pg_sync::trigger_gen::generate_trigger_sql(trigger);
+
+            sql.push_str(&format!("-- [{}/{}] Table: {} → Trigger: {}\n", i + 1, config.triggers.len(), trigger.table, name));
+            if let Some(ref tt) = trigger.table_type {
+                sql.push_str(&format!("-- Type: {}\n", tt));
+            }
+            if trigger.sets_alive {
+                sql.push_str("-- Sets alive: yes\n");
+            }
+            if trigger.on_delete.as_ref().map(|v| v.is_delete()).unwrap_or(false) {
+                sql.push_str("-- On delete: emit delete op\n");
+            }
+            sql.push('\n');
+            sql.push_str(&trigger_sql);
+            sql.push_str("\n\n");
+        }
+
+        // Part 3: Summary
+        sql.push_str("-- -----------------------------------------------------------------------\n");
+        sql.push_str("-- Summary\n");
+        sql.push_str("-- -----------------------------------------------------------------------\n");
+        sql.push_str(&format!("-- Tables created: BitdexOps, bitdex_cursors\n"));
+        sql.push_str(&format!("-- Triggers: {}\n", config.triggers.len()));
+        for trigger in &config.triggers {
+            let name = crate::pg_sync::trigger_gen::trigger_name(trigger);
+            sql.push_str(&format!("--   {} on \"{}\"\n", name, trigger.table));
+        }
+        sql.push_str("--\n");
+        sql.push_str("-- Safety notes:\n");
+        sql.push_str("-- - All triggers use CREATE OR REPLACE (idempotent)\n");
+        sql.push_str("-- - All triggers use ENABLE ALWAYS (works with replication)\n");
+        sql.push_str("-- - Trigger functions ONLY INSERT into \"BitdexOps\" (no other mutations)\n");
+        sql.push_str("-- - No table locks, no schema changes to existing tables\n");
+        sql.push_str("-- - BitdexOps cleanup trigger only DELETEs consumed ops rows\n");
+
+        let out_path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/design/trigger-sql-review.sql");
+        std::fs::write(out_path, &sql).unwrap();
+        eprintln!("Wrote trigger SQL review to: {out_path}");
+        eprintln!("SQL length: {} bytes, {} triggers", sql.len(), config.triggers.len());
     }
 
     #[test]
