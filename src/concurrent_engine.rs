@@ -10712,4 +10712,65 @@ mod tests {
 
         engine.shutdown();
     }
+
+    #[test]
+    fn test_decode_silo_doc_round_trip() {
+        use crate::docstore::PackedValue;
+
+        // Build a silo document blob: [u16 fidx][u32 vlen][rmp bytes]...
+        let field_names = vec!["nsfwLevel".to_string(), "userId".to_string()];
+        let mut blob = Vec::new();
+
+        // Field 0: nsfwLevel = 3
+        let v0 = rmp_serde::to_vec(&PackedValue::I(3)).unwrap();
+        blob.extend_from_slice(&0u16.to_le_bytes());
+        blob.extend_from_slice(&(v0.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&v0);
+
+        // Field 1: userId = 42000
+        let v1 = rmp_serde::to_vec(&PackedValue::I(42000)).unwrap();
+        blob.extend_from_slice(&1u16.to_le_bytes());
+        blob.extend_from_slice(&(v1.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&v1);
+
+        // Decode
+        let doc = ConcurrentEngine::decode_silo_doc(&blob, &field_names).unwrap();
+        assert_eq!(doc.fields.len(), 2);
+
+        // Verify nsfwLevel
+        match doc.fields.get("nsfwLevel").unwrap() {
+            crate::mutation::FieldValue::Single(crate::types::Value::Integer(v)) => assert_eq!(*v, 3),
+            other => panic!("expected Integer(3), got {:?}", other),
+        }
+
+        // Verify userId
+        match doc.fields.get("userId").unwrap() {
+            crate::mutation::FieldValue::Single(crate::types::Value::Integer(v)) => assert_eq!(*v, 42000),
+            other => panic!("expected Integer(42000), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_silo_doc_empty_returns_none() {
+        let field_names = vec!["test".to_string()];
+        assert!(ConcurrentEngine::decode_silo_doc(&[], &field_names).is_none());
+    }
+
+    #[test]
+    fn test_decode_silo_doc_string_field() {
+        use crate::docstore::PackedValue;
+
+        let field_names = vec!["baseModel".to_string()];
+        let mut blob = Vec::new();
+        let v = rmp_serde::to_vec(&PackedValue::S("SDXL".to_string())).unwrap();
+        blob.extend_from_slice(&0u16.to_le_bytes());
+        blob.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&v);
+
+        let doc = ConcurrentEngine::decode_silo_doc(&blob, &field_names).unwrap();
+        match doc.fields.get("baseModel").unwrap() {
+            crate::mutation::FieldValue::Single(crate::types::Value::String(s)) => assert_eq!(s, "SDXL"),
+            other => panic!("expected String(SDXL), got {:?}", other),
+        }
+    }
 }
