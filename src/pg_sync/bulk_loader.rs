@@ -210,6 +210,137 @@ pub async fn download_all_tables(
     Ok(())
 }
 
+/// Download CSVs using copy_query from sync config dump phases.
+///
+/// Config-driven replacement for download_all_tables — uses the exact COPY SQL
+/// from each DumpPhase (and its enrichment lookups) instead of hardcoded queries.
+/// This ensures the CSVs match what the dump processor expects.
+pub async fn download_from_sync_config(
+    pool: &PgPool,
+    stage_dir: &std::path::Path,
+    dump_phases: &[super::sync_config::DumpPhase],
+) -> Result<(), String> {
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| format!("create stage dir: {e}"))?;
+
+    eprintln!("\n=== Downloading CSVs from sync config ({} phases) ===", dump_phases.len());
+    let start = Instant::now();
+    let mut total_bytes = 0u64;
+
+    for phase in dump_phases {
+        // Skip non-PG sources (e.g., ClickHouse metrics)
+        if phase.source.as_deref() == Some("clickhouse") {
+            eprintln!("  {}: ClickHouse source — skipping PG download", phase.name);
+            continue;
+        }
+
+        // Download the main table CSV
+        if let Some(ref copy_query) = phase.copy_query {
+            let ext = if phase.format == "tsv" { "tsv" } else { "csv" };
+            let filename = format!("{}.{}", phase.name, ext);
+            let bytes = download_copy_query(pool, stage_dir, &phase.name, &filename, copy_query).await?;
+            total_bytes += bytes;
+        }
+
+        // Download enrichment lookup CSVs
+        download_enrichment_csvs(pool, stage_dir, &phase.enrichment).await?;
+    }
+
+    eprintln!(
+        "CSV download complete: {:.1} GB in {:.1}s",
+        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        start.elapsed().as_secs_f64(),
+    );
+
+    Ok(())
+}
+
+/// Recursively download enrichment lookup CSVs.
+async fn download_enrichment_csvs(
+    pool: &PgPool,
+    stage_dir: &std::path::Path,
+    enrichments: &[super::sync_config::EnrichmentDef],
+) -> Result<(), String> {
+    for enrich in enrichments {
+        if let (Some(ref lookup), Some(ref copy_query)) = (&enrich.lookup, &enrich.copy_query) {
+            let name = enrich.table.as_deref().unwrap_or(lookup.trim_end_matches(".csv"));
+            download_copy_query(pool, stage_dir, name, lookup, copy_query).await?;
+        }
+        // Recurse into nested enrichments
+        if !enrich.enrichment.is_empty() {
+            Box::pin(download_enrichment_csvs(pool, stage_dir, &enrich.enrichment)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Execute a COPY query and stream results to a CSV file.
+/// Skips if the .done marker already exists (idempotent on retry).
+async fn download_copy_query(
+    pool: &PgPool,
+    stage_dir: &std::path::Path,
+    name: &str,
+    filename: &str,
+    copy_query: &str,
+) -> Result<u64, String> {
+    use futures_util::TryStreamExt;
+    use sqlx::postgres::PgPoolCopyExt;
+    use tokio::io::AsyncWriteExt;
+
+    let csv_path = stage_dir.join(filename);
+    let done_path = stage_dir.join(format!("{}.done", filename));
+
+    // Skip if already downloaded
+    if done_path.exists() {
+        let size = std::fs::metadata(&csv_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!("  {}: already downloaded ({:.1} MB), skipping", name, size as f64 / 1048576.0);
+        return Ok(size);
+    }
+
+    eprintln!("  {}: downloading via COPY...", name);
+
+    let file = tokio::fs::File::create(&csv_path)
+        .await
+        .map_err(|e| format!("{name}: create file: {e}"))?;
+    let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
+    let mut bytes_written = 0u64;
+    let start_time = Instant::now();
+
+    // Use copy_out_raw — same API as copy_queries.rs
+    let mut stream = pool
+        .copy_out_raw(copy_query)
+        .await
+        .map_err(|e| format!("{name}: COPY start failed: {e}"))?;
+
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|e| format!("{name}: COPY stream: {e}"))?
+    {
+        writer
+            .write_all(&chunk)
+            .await
+            .map_err(|e| format!("{name}: write: {e}"))?;
+        bytes_written += chunk.len() as u64;
+    }
+    writer.flush().await.map_err(|e| format!("{name}: flush: {e}"))?;
+
+    // Write .done marker
+    std::fs::write(&done_path, b"ok")
+        .map_err(|e| format!("{name}: write done marker: {e}"))?;
+
+    let elapsed = start_time.elapsed();
+    eprintln!(
+        "  {}: {:.1} MB in {:.1}s ({:.0} MB/s)",
+        name,
+        bytes_written as f64 / 1048576.0,
+        elapsed.as_secs_f64(),
+        bytes_written as f64 / 1048576.0 / elapsed.as_secs_f64().max(0.001),
+    );
+
+    Ok(bytes_written)
+}
+
 // ---------------------------------------------------------------------------
 // Arena-free docstore finalization (used by V1 bulk loader, kept for tests)
 // ---------------------------------------------------------------------------

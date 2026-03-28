@@ -316,14 +316,25 @@ async fn run_boot_sequence(
     eprintln!("Stage dir: {}", stage_dir.display());
     std::fs::create_dir_all(stage_dir).ok();
 
-    bulk_loader::download_all_tables(pool, stage_dir)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("CSV download failed: {e}");
-            std::process::exit(1);
-        });
+    if let Some(config) = full_sync_config {
+        // V2: config-driven download using copy_query from each dump phase
+        bulk_loader::download_from_sync_config(pool, stage_dir, &config.dump_phases)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Config-driven CSV download failed: {e}");
+                std::process::exit(1);
+            });
+    } else {
+        // V1 fallback: hardcoded table list
+        bulk_loader::download_all_tables(pool, stage_dir)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("CSV download failed: {e}");
+                std::process::exit(1);
+            });
+    }
 
-    // Download ClickHouse metrics CSV
+    // Download ClickHouse metrics CSV (separate from PG COPY)
     if let Some(ref ch_url) = sync_config.clickhouse_url {
         let _ = bulk_loader::download_metrics_from_clickhouse(
             stage_dir,

@@ -50,8 +50,8 @@ impl TrackField {
                     format!("{} as {}", expr, field_name)
                 } else if let Some(col) = column {
                     if target.is_some() && target.as_deref() != Some(col.as_str()) {
-                        // column differs from target — use "column" as expression alias
-                        format!("\"{}\" as {}", col, field_name)
+                        // column differs from target — use {column} template for substitute_columns
+                        format!("{{{}}} as {}", col, field_name)
                     } else {
                         field_name.to_string()
                     }
@@ -240,8 +240,8 @@ fn generate_direct_body(source: &SyncSource) -> String {
     let insert_ops: Vec<String> = track_fields
         .iter()
         .map(|f| {
-            let (field_name, expr) = parse_track_field(f);
-            let new_expr = substitute_columns(&expr, "NEW");
+            let (field_name, insert_expr, template_expr) = parse_track_field(f);
+            let new_expr = substitute_columns(&template_expr, "NEW");
             format!(
                 "      jsonb_build_object('op', 'set', 'field', '{}', 'value', to_jsonb({}))",
                 field_name, new_expr
@@ -270,9 +270,9 @@ fn generate_direct_body(source: &SyncSource) -> String {
     body.push_str("  ELSE\n");
     body.push_str("    _ops := '[]'::jsonb;\n");
     for f in track_fields {
-        let (field_name, expr) = parse_track_field(f);
-        let old_expr = substitute_columns(&expr, "OLD");
-        let new_expr = substitute_columns(&expr, "NEW");
+        let (field_name, _insert_expr, template_expr) = parse_track_field(f);
+        let old_expr = substitute_columns(&template_expr, "OLD");
+        let new_expr = substitute_columns(&template_expr, "NEW");
         body.push_str(&format!(
             "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
              \x20     _ops := _ops || jsonb_build_array(\n\
@@ -298,44 +298,98 @@ fn generate_direct_body(source: &SyncSource) -> String {
     body
 }
 
-/// Generate body for multi-value join tables (e.g., TagsOnImageNew).
+/// Generate body for multi-value join tables (e.g., TagsOnImageNew, ImageResourceNew).
+///
+/// JOIN tables only have INSERT and DELETE (no UPDATE — rows are immutable).
+/// INSERT → emit `add` op for the field value.
+/// DELETE → emit `remove` op for the field value.
+///
+/// Also handles computed_fields (e.g., modelVersionIdsManual = value when condition).
 fn generate_multi_value_body(source: &SyncSource, field: &str) -> String {
     let slot_field = source.slot_field.as_deref().unwrap_or("imageId");
     let value_field = source.value_field.as_deref().unwrap_or("id");
-    let filter_clause = source
-        .filter
-        .as_ref()
-        .map(|f| format!("    IF {} THEN\n", f.replace("imageId", "NEW.\"imageId\"")))
-        .unwrap_or_default();
-    let filter_end = if source.filter.is_some() {
-        "    END IF;\n"
-    } else {
-        ""
-    };
 
-    format!(
-        r#"BEGIN
-  IF TG_OP = 'INSERT' THEN
-{filter_start}    INSERT INTO "BitdexOps" (entity_id, ops)
-    VALUES (NEW."{slot}", jsonb_build_array(
-      jsonb_build_object('op', 'add', 'field', '{field}', 'value', to_jsonb(NEW."{value}"))
+    // Build filter clause with {column} template substitution
+    let insert_filter = source.filter.as_ref().map(|f| {
+        let resolved = substitute_columns(f, "NEW");
+        format!("    IF {} THEN\n", resolved)
+    }).unwrap_or_default();
+    let delete_filter = source.filter.as_ref().map(|f| {
+        let resolved = substitute_columns(f, "OLD");
+        format!("    IF {} THEN\n", resolved)
+    }).unwrap_or_default();
+    let filter_end = if source.filter.is_some() { "    END IF;\n" } else { "" };
+
+    // Build computed field ops (e.g., modelVersionIdsManual when detected=false)
+    let computed = source.computed_fields.as_deref().unwrap_or(&[]);
+    let mut insert_computed = String::new();
+    let mut delete_computed = String::new();
+    for cf in computed {
+        let condition = substitute_columns(&cf.expression, "NEW");
+        let value_col = cf.value.as_ref()
+            .map(|v| substitute_columns(v, "NEW"))
+            .unwrap_or_else(|| format!("NEW.\"{}\"", value_field));
+        let old_value_col = cf.value.as_ref()
+            .map(|v| substitute_columns(v, "OLD"))
+            .unwrap_or_else(|| format!("OLD.\"{}\"", value_field));
+
+        insert_computed.push_str(&format!(
+            "    IF {} THEN\n\
+             \x20     INSERT INTO \"BitdexOps\" (entity_id, ops)\n\
+             \x20     VALUES (NEW.\"{}\", jsonb_build_array(\n\
+             \x20       jsonb_build_object('op', 'add', 'field', '{}', 'value', to_jsonb({}))\n\
+             \x20     ));\n\
+             \x20   END IF;\n",
+            condition, slot_field, cf.target, value_col
+        ));
+        // For DELETE, invert: always remove if the row had the condition
+        let del_condition = substitute_columns(&cf.expression, "OLD");
+        delete_computed.push_str(&format!(
+            "    IF {} THEN\n\
+             \x20     INSERT INTO \"BitdexOps\" (entity_id, ops)\n\
+             \x20     VALUES (OLD.\"{}\", jsonb_build_array(\n\
+             \x20       jsonb_build_object('op', 'remove', 'field', '{}', 'value', to_jsonb({}))\n\
+             \x20     ));\n\
+             \x20   END IF;\n",
+            del_condition, slot_field, cf.target, old_value_col
+        ));
+    }
+
+    let mut body = String::from("BEGIN\n");
+
+    // INSERT handler
+    body.push_str("  IF TG_OP = 'INSERT' THEN\n");
+    body.push_str(&insert_filter);
+    body.push_str(&format!(
+        "    INSERT INTO \"BitdexOps\" (entity_id, ops)\n\
+         \x20   VALUES (NEW.\"{slot}\", jsonb_build_array(\n\
+         \x20     jsonb_build_object('op', 'add', 'field', '{field}', 'value', to_jsonb(NEW.\"{value}\"))\n\
+         \x20   ));\n",
+        slot = slot_field, field = field, value = value_field,
     ));
-{filter_end}    RETURN NEW;
-  ELSIF TG_OP = 'DELETE' THEN
-    INSERT INTO "BitdexOps" (entity_id, ops)
-    VALUES (OLD."{slot}", jsonb_build_array(
-      jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb(OLD."{value}"))
+    body.push_str(filter_end);
+    body.push_str(&insert_computed);
+    body.push_str("    RETURN NEW;\n");
+
+    // DELETE handler
+    body.push_str("  ELSIF TG_OP = 'DELETE' THEN\n");
+    body.push_str(&delete_filter);
+    body.push_str(&format!(
+        "    INSERT INTO \"BitdexOps\" (entity_id, ops)\n\
+         \x20   VALUES (OLD.\"{slot}\", jsonb_build_array(\n\
+         \x20     jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb(OLD.\"{value}\"))\n\
+         \x20   ));\n",
+        slot = slot_field, field = field, value = value_field,
     ));
-    RETURN OLD;
-  END IF;
-  RETURN COALESCE(NEW, OLD);
-END;"#,
-        slot = slot_field,
-        field = field,
-        value = value_field,
-        filter_start = filter_clause,
-        filter_end = filter_end,
-    )
+    body.push_str(filter_end);
+    body.push_str(&delete_computed);
+    body.push_str("    RETURN OLD;\n");
+
+    body.push_str("  END IF;\n");
+    body.push_str("  RETURN COALESCE(NEW, OLD);\n");
+    body.push_str("END;");
+
+    body
 }
 
 /// Generate body for fan-out tables (e.g., ModelVersion, Post).
@@ -347,39 +401,55 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
 
     let mut body = String::from("DECLARE\n  _ops jsonb;\n  _query text;\n");
 
-    // If there's a query_source, we need a variable for its result
-    if source.query_source.is_some() {
+    // If there's a query_source or expression, we need a variable for its result
+    if source.query_source.is_some() || source.expression.is_some() {
         body.push_str("  _source_result jsonb;\n");
     }
     body.push_str("BEGIN\n");
     body.push_str("  IF TG_OP = 'UPDATE' THEN\n");
 
-    // Build the query string with column substitution
-    if let Some(ref query_source) = source.query_source {
+    // Build the query string with PG variable interpolation.
+    // Template: "postId eq {id}" → _query := 'postId eq ' || NEW."id"::text
+    // This ensures PG evaluates the column reference at runtime.
+    if let Some(ref expr) = source.expression {
+        // Custom expression (e.g., Model's json_agg subquery).
+        // Execute the expression as a subquery, store result in a variable,
+        // then use that variable in the query template.
+        // Use EXECUTE with $1 parameter to pass NEW.column values safely.
+        let (param_sql, param_refs) = build_execute_with_params(expr, "NEW");
+        body.push_str(&format!(
+            "    EXECUTE '{}' INTO _source_result{};\n",
+            param_sql.replace('\'', "''"),
+            if param_refs.is_empty() { String::new() } else { format!(" USING {}", param_refs.join(", ")) }
+        ));
+        // The query template references the subquery result (e.g., {ids}).
+        // Replace {ids} with the _source_result variable.
+        let query_with_result = query_template
+            .replace("{ids}", "' || _source_result::text || '");
+        body.push_str(&format!("    _query := '{}';\n", query_with_result));
+    } else if let Some(ref query_source) = source.query_source {
         let source_sql = substitute_columns(query_source, "NEW");
         body.push_str(&format!(
             "    EXECUTE format('SELECT ({})') INTO _source_result;\n",
             source_sql.replace('\'', "''")
         ));
-        // Substitute the query_source result into the query template
         body.push_str(&format!(
-            "    _query := '{}';\n",
-            query_template
+            "    _query := {};\n",
+            build_query_concatenation(query_template, "NEW")
         ));
-        // Replace placeholders with source result values
-        body.push_str("    -- Substitute source values into query template\n");
     } else {
-        // Direct substitution from NEW columns
-        let query_sql = substitute_columns(query_template, "NEW");
-        body.push_str(&format!("    _query := '{}';\n", query_sql));
+        body.push_str(&format!(
+            "    _query := {};\n",
+            build_query_concatenation(query_template, "NEW")
+        ));
     }
 
     // Build ops array from tracked fields that changed
     body.push_str("    _ops := '[]'::jsonb;\n");
     for f in track_fields {
-        let (field_name, expr) = parse_track_field(f);
-        let old_expr = substitute_columns(&expr, "OLD");
-        let new_expr = substitute_columns(&expr, "NEW");
+        let (field_name, _insert_expr, template_expr) = parse_track_field(f);
+        let old_expr = substitute_columns(&template_expr, "OLD");
+        let new_expr = substitute_columns(&template_expr, "NEW");
         body.push_str(&format!(
             "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
              \x20     _ops := _ops || jsonb_build_array(\n\
@@ -408,21 +478,26 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
     body
 }
 
-/// Parse a track_field entry. Returns (bitdex_field_name, sql_expression).
-/// Simple field: "nsfwLevel" → ("nsfwLevel", "\"nsfwLevel\"")
-/// Expression: "GREATEST({scannedAt}, {createdAt}) as existedAt" → ("existedAt", "GREATEST(\"scannedAt\", \"createdAt\")")
-fn parse_track_field(field: &str) -> (String, String) {
+/// Parse a track field string into (field_name, insert_expr, template_expr).
+/// - `insert_expr`: Used in INSERT (no OLD/NEW prefix), e.g. `"nsfwLevel"`.
+/// - `template_expr`: Used in UPDATE, contains `{col}` templates for substitute_columns.
+///
+/// Simple field: "nsfwLevel" → ("nsfwLevel", "\"nsfwLevel\"", "{nsfwLevel}")
+/// Expression: "GREATEST({scannedAt}, {createdAt}) as existedAt"
+///   → ("existedAt", "GREATEST(\"scannedAt\", \"createdAt\")", "GREATEST({scannedAt}, {createdAt})")
+fn parse_track_field(field: &str) -> (String, String, String) {
     if let Some(as_pos) = field.to_lowercase().rfind(" as ") {
         let expr = &field[..as_pos].trim();
         let alias = &field[as_pos + 4..].trim();
-        // Replace {col} with "col" (quoted column reference)
-        let sql = expr
-            .replace('{', "\"")
-            .replace('}', "\"");
-        (alias.to_string(), sql)
+        // insert_expr: {col} → "col"
+        let insert_sql = expr.replace('{', "\"").replace('}', "\"");
+        // template_expr: keep {col} for substitute_columns
+        (alias.to_string(), insert_sql, expr.to_string())
     } else {
         // Simple field name
-        (field.to_string(), format!("\"{}\"", field))
+        let insert_sql = format!("\"{}\"", field);
+        let template = format!("{{{}}}", field);
+        (field.to_string(), insert_sql, template)
     }
 }
 
@@ -450,6 +525,81 @@ fn substitute_columns(expr: &str, prefix: &str) -> String {
     result
 }
 
+/// Build an EXECUTE-compatible SQL string with $N parameter placeholders.
+///
+/// Template: "SELECT json_agg(mv.id) FROM \"ModelVersion\" mv WHERE mv.\"modelId\" = {id}"
+/// with prefix "NEW"
+/// → ("SELECT json_agg(mv.id) FROM \"ModelVersion\" mv WHERE mv.\"modelId\" = $1", ["NEW.\"id\""])
+fn build_execute_with_params(template: &str, prefix: &str) -> (String, Vec<String>) {
+    let mut sql = String::new();
+    let mut params: Vec<String> = Vec::new();
+    let mut chars = template.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut col = String::new();
+            while let Some(&next) = chars.peek() {
+                if next == '}' {
+                    chars.next();
+                    break;
+                }
+                col.push(chars.next().unwrap());
+            }
+            params.push(format!("{prefix}.\"{col}\""));
+            sql.push_str(&format!("${}", params.len()));
+        } else {
+            sql.push(c);
+        }
+    }
+
+    (sql, params)
+}
+
+/// Build a PG string concatenation expression from a query template.
+///
+/// Template: "postId eq {id}" with prefix "NEW"
+/// → `'postId eq ' || NEW."id"::text`
+///
+/// Template: "modelVersionIds in [{ids}]" with prefix "NEW"
+/// → `'modelVersionIds in [' || NEW."ids"::text || ']'`
+fn build_query_concatenation(template: &str, prefix: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current_literal = String::new();
+    let mut chars = template.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // Flush current literal
+            if !current_literal.is_empty() {
+                parts.push(format!("'{}'", current_literal.replace('\'', "''")));
+                current_literal.clear();
+            }
+            // Read column name
+            let mut col = String::new();
+            while let Some(&next) = chars.peek() {
+                if next == '}' {
+                    chars.next();
+                    break;
+                }
+                col.push(chars.next().unwrap());
+            }
+            parts.push(format!("{}.\"{col}\"::text", prefix));
+        } else {
+            current_literal.push(c);
+        }
+    }
+    // Flush remaining literal
+    if !current_literal.is_empty() {
+        parts.push(format!("'{}'", current_literal.replace('\'', "''")));
+    }
+
+    if parts.len() == 1 {
+        parts[0].clone()
+    } else {
+        parts.join(" || ")
+    }
+}
+
 /// Compute a short (8-char) hash of a string.
 fn short_hash(s: &str) -> String {
     let mut hasher = DefaultHasher::new();
@@ -463,16 +613,21 @@ mod tests {
 
     #[test]
     fn test_parse_track_field_simple() {
-        let (name, expr) = parse_track_field("nsfwLevel");
+        let (name, insert_expr, template_expr) = parse_track_field("nsfwLevel");
         assert_eq!(name, "nsfwLevel");
-        assert_eq!(expr, "\"nsfwLevel\"");
+        assert_eq!(insert_expr, "\"nsfwLevel\"");
+        assert_eq!(template_expr, "{nsfwLevel}");
+        assert_eq!(substitute_columns(&template_expr, "OLD"), "OLD.\"nsfwLevel\"");
+        assert_eq!(substitute_columns(&template_expr, "NEW"), "NEW.\"nsfwLevel\"");
     }
 
     #[test]
     fn test_parse_track_field_expression() {
-        let (name, expr) = parse_track_field("GREATEST({scannedAt}, {createdAt}) as existedAt");
+        let (name, insert_expr, template_expr) = parse_track_field("GREATEST({scannedAt}, {createdAt}) as existedAt");
         assert_eq!(name, "existedAt");
-        assert_eq!(expr, "GREATEST(\"scannedAt\", \"createdAt\")");
+        assert_eq!(insert_expr, "GREATEST(\"scannedAt\", \"createdAt\")");
+        assert_eq!(template_expr, "GREATEST({scannedAt}, {createdAt})");
+        assert_eq!(substitute_columns(&template_expr, "NEW"), "GREATEST(NEW.\"scannedAt\", NEW.\"createdAt\")");
     }
 
     #[test]
