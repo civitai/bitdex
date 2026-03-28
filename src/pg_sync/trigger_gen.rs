@@ -298,44 +298,98 @@ fn generate_direct_body(source: &SyncSource) -> String {
     body
 }
 
-/// Generate body for multi-value join tables (e.g., TagsOnImageNew).
+/// Generate body for multi-value join tables (e.g., TagsOnImageNew, ImageResourceNew).
+///
+/// JOIN tables only have INSERT and DELETE (no UPDATE — rows are immutable).
+/// INSERT → emit `add` op for the field value.
+/// DELETE → emit `remove` op for the field value.
+///
+/// Also handles computed_fields (e.g., modelVersionIdsManual = value when condition).
 fn generate_multi_value_body(source: &SyncSource, field: &str) -> String {
     let slot_field = source.slot_field.as_deref().unwrap_or("imageId");
     let value_field = source.value_field.as_deref().unwrap_or("id");
-    let filter_clause = source
-        .filter
-        .as_ref()
-        .map(|f| format!("    IF {} THEN\n", f.replace("imageId", "NEW.\"imageId\"")))
-        .unwrap_or_default();
-    let filter_end = if source.filter.is_some() {
-        "    END IF;\n"
-    } else {
-        ""
-    };
 
-    format!(
-        r#"BEGIN
-  IF TG_OP = 'INSERT' THEN
-{filter_start}    INSERT INTO "BitdexOps" (entity_id, ops)
-    VALUES (NEW."{slot}", jsonb_build_array(
-      jsonb_build_object('op', 'add', 'field', '{field}', 'value', to_jsonb(NEW."{value}"))
+    // Build filter clause with {column} template substitution
+    let insert_filter = source.filter.as_ref().map(|f| {
+        let resolved = substitute_columns(f, "NEW");
+        format!("    IF {} THEN\n", resolved)
+    }).unwrap_or_default();
+    let delete_filter = source.filter.as_ref().map(|f| {
+        let resolved = substitute_columns(f, "OLD");
+        format!("    IF {} THEN\n", resolved)
+    }).unwrap_or_default();
+    let filter_end = if source.filter.is_some() { "    END IF;\n" } else { "" };
+
+    // Build computed field ops (e.g., modelVersionIdsManual when detected=false)
+    let computed = source.computed_fields.as_deref().unwrap_or(&[]);
+    let mut insert_computed = String::new();
+    let mut delete_computed = String::new();
+    for cf in computed {
+        let condition = substitute_columns(&cf.expression, "NEW");
+        let value_col = cf.value.as_ref()
+            .map(|v| substitute_columns(v, "NEW"))
+            .unwrap_or_else(|| format!("NEW.\"{}\"", value_field));
+        let old_value_col = cf.value.as_ref()
+            .map(|v| substitute_columns(v, "OLD"))
+            .unwrap_or_else(|| format!("OLD.\"{}\"", value_field));
+
+        insert_computed.push_str(&format!(
+            "    IF {} THEN\n\
+             \x20     INSERT INTO \"BitdexOps\" (entity_id, ops)\n\
+             \x20     VALUES (NEW.\"{}\", jsonb_build_array(\n\
+             \x20       jsonb_build_object('op', 'add', 'field', '{}', 'value', to_jsonb({}))\n\
+             \x20     ));\n\
+             \x20   END IF;\n",
+            condition, slot_field, cf.target, value_col
+        ));
+        // For DELETE, invert: always remove if the row had the condition
+        let del_condition = substitute_columns(&cf.expression, "OLD");
+        delete_computed.push_str(&format!(
+            "    IF {} THEN\n\
+             \x20     INSERT INTO \"BitdexOps\" (entity_id, ops)\n\
+             \x20     VALUES (OLD.\"{}\", jsonb_build_array(\n\
+             \x20       jsonb_build_object('op', 'remove', 'field', '{}', 'value', to_jsonb({}))\n\
+             \x20     ));\n\
+             \x20   END IF;\n",
+            del_condition, slot_field, cf.target, old_value_col
+        ));
+    }
+
+    let mut body = String::from("BEGIN\n");
+
+    // INSERT handler
+    body.push_str("  IF TG_OP = 'INSERT' THEN\n");
+    body.push_str(&insert_filter);
+    body.push_str(&format!(
+        "    INSERT INTO \"BitdexOps\" (entity_id, ops)\n\
+         \x20   VALUES (NEW.\"{slot}\", jsonb_build_array(\n\
+         \x20     jsonb_build_object('op', 'add', 'field', '{field}', 'value', to_jsonb(NEW.\"{value}\"))\n\
+         \x20   ));\n",
+        slot = slot_field, field = field, value = value_field,
     ));
-{filter_end}    RETURN NEW;
-  ELSIF TG_OP = 'DELETE' THEN
-    INSERT INTO "BitdexOps" (entity_id, ops)
-    VALUES (OLD."{slot}", jsonb_build_array(
-      jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb(OLD."{value}"))
+    body.push_str(filter_end);
+    body.push_str(&insert_computed);
+    body.push_str("    RETURN NEW;\n");
+
+    // DELETE handler
+    body.push_str("  ELSIF TG_OP = 'DELETE' THEN\n");
+    body.push_str(&delete_filter);
+    body.push_str(&format!(
+        "    INSERT INTO \"BitdexOps\" (entity_id, ops)\n\
+         \x20   VALUES (OLD.\"{slot}\", jsonb_build_array(\n\
+         \x20     jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb(OLD.\"{value}\"))\n\
+         \x20   ));\n",
+        slot = slot_field, field = field, value = value_field,
     ));
-    RETURN OLD;
-  END IF;
-  RETURN COALESCE(NEW, OLD);
-END;"#,
-        slot = slot_field,
-        field = field,
-        value = value_field,
-        filter_start = filter_clause,
-        filter_end = filter_end,
-    )
+    body.push_str(filter_end);
+    body.push_str(&delete_computed);
+    body.push_str("    RETURN OLD;\n");
+
+    body.push_str("  END IF;\n");
+    body.push_str("  RETURN COALESCE(NEW, OLD);\n");
+    body.push_str("END;");
+
+    body
 }
 
 /// Generate body for fan-out tables (e.g., ModelVersion, Post).

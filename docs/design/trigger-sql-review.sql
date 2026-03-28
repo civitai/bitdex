@@ -143,140 +143,128 @@ CREATE TRIGGER bitdex_image_a48dc610 AFTER INSERT OR UPDATE OR DELETE ON "Image"
 ALTER TABLE "Image" ENABLE ALWAYS TRIGGER bitdex_image_a48dc610;
 
 
--- [2/8] Table: TagsOnImageNew → Trigger: bitdex_tagsonimagenew_47d53c08
+-- [2/8] Table: TagsOnImageNew → Trigger: bitdex_tagsonimagenew_bcbef3c3
 
-CREATE OR REPLACE FUNCTION bitdex_tagsonimagenew_ops_47d53c08() RETURNS trigger AS $$
-DECLARE
-  _ops jsonb;
+CREATE OR REPLACE FUNCTION bitdex_tagsonimagenew_ops_bcbef3c3() RETURNS trigger AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    _ops := jsonb_build_array(
-      jsonb_build_object('op', 'set', 'field', 'tagIds', 'value', to_jsonb(NEW."tagIds"))
-    );
-    INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."imageId", _ops);
-    RETURN NEW;
-  ELSE
-    _ops := '[]'::jsonb;
-    IF (OLD."tagIds") IS DISTINCT FROM (NEW."tagIds") THEN
-      _ops := _ops || jsonb_build_array(
-        jsonb_build_object('op', 'remove', 'field', 'tagIds', 'value', to_jsonb(OLD."tagIds")),
-        jsonb_build_object('op', 'set', 'field', 'tagIds', 'value', to_jsonb(NEW."tagIds"))
-      );
-    END IF;
-    IF jsonb_array_length(_ops) > 0 THEN
-      INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."imageId", _ops);
+    IF (NEW."attributes" >> 10) & 1 = 0 THEN
+    INSERT INTO "BitdexOps" (entity_id, ops)
+    VALUES (NEW."imageId", jsonb_build_array(
+      jsonb_build_object('op', 'add', 'field', 'tagIds', 'value', to_jsonb(NEW."tagId"))
+    ));
     END IF;
     RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    IF (OLD."attributes" >> 10) & 1 = 0 THEN
+    INSERT INTO "BitdexOps" (entity_id, ops)
+    VALUES (OLD."imageId", jsonb_build_array(
+      jsonb_build_object('op', 'remove', 'field', 'tagIds', 'value', to_jsonb(OLD."tagId"))
+    ));
+    END IF;
+    RETURN OLD;
   END IF;
+  RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_tagsonimagenew_47d53c08 ON "TagsOnImageNew";
-CREATE TRIGGER bitdex_tagsonimagenew_47d53c08 AFTER INSERT OR UPDATE ON "TagsOnImageNew"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_tagsonimagenew_ops_47d53c08();
-ALTER TABLE "TagsOnImageNew" ENABLE ALWAYS TRIGGER bitdex_tagsonimagenew_47d53c08;
+DROP TRIGGER IF EXISTS bitdex_tagsonimagenew_bcbef3c3 ON "TagsOnImageNew";
+CREATE TRIGGER bitdex_tagsonimagenew_bcbef3c3 AFTER INSERT OR DELETE ON "TagsOnImageNew"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_tagsonimagenew_ops_bcbef3c3();
+ALTER TABLE "TagsOnImageNew" ENABLE ALWAYS TRIGGER bitdex_tagsonimagenew_bcbef3c3;
 
 
--- [3/8] Table: ImageTool → Trigger: bitdex_imagetool_378dc25c
+-- [3/8] Table: ImageTool → Trigger: bitdex_imagetool_f87e1fc4
 
-CREATE OR REPLACE FUNCTION bitdex_imagetool_ops_378dc25c() RETURNS trigger AS $$
-DECLARE
-  _ops jsonb;
+CREATE OR REPLACE FUNCTION bitdex_imagetool_ops_f87e1fc4() RETURNS trigger AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    _ops := jsonb_build_array(
-      jsonb_build_object('op', 'set', 'field', 'toolIds', 'value', to_jsonb(NEW."toolIds"))
-    );
-    INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."imageId", _ops);
+    INSERT INTO "BitdexOps" (entity_id, ops)
+    VALUES (NEW."imageId", jsonb_build_array(
+      jsonb_build_object('op', 'add', 'field', 'toolIds', 'value', to_jsonb(NEW."toolId"))
+    ));
     RETURN NEW;
-  ELSE
-    _ops := '[]'::jsonb;
-    IF (OLD."toolIds") IS DISTINCT FROM (NEW."toolIds") THEN
-      _ops := _ops || jsonb_build_array(
-        jsonb_build_object('op', 'remove', 'field', 'toolIds', 'value', to_jsonb(OLD."toolIds")),
-        jsonb_build_object('op', 'set', 'field', 'toolIds', 'value', to_jsonb(NEW."toolIds"))
-      );
-    END IF;
-    IF jsonb_array_length(_ops) > 0 THEN
-      INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."imageId", _ops);
-    END IF;
-    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    INSERT INTO "BitdexOps" (entity_id, ops)
+    VALUES (OLD."imageId", jsonb_build_array(
+      jsonb_build_object('op', 'remove', 'field', 'toolIds', 'value', to_jsonb(OLD."toolId"))
+    ));
+    RETURN OLD;
   END IF;
+  RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_imagetool_378dc25c ON "ImageTool";
-CREATE TRIGGER bitdex_imagetool_378dc25c AFTER INSERT OR UPDATE ON "ImageTool"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_imagetool_ops_378dc25c();
-ALTER TABLE "ImageTool" ENABLE ALWAYS TRIGGER bitdex_imagetool_378dc25c;
+DROP TRIGGER IF EXISTS bitdex_imagetool_f87e1fc4 ON "ImageTool";
+CREATE TRIGGER bitdex_imagetool_f87e1fc4 AFTER INSERT OR DELETE ON "ImageTool"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_imagetool_ops_f87e1fc4();
+ALTER TABLE "ImageTool" ENABLE ALWAYS TRIGGER bitdex_imagetool_f87e1fc4;
 
 
--- [4/8] Table: ImageTechnique → Trigger: bitdex_imagetechnique_ef2d0321
+-- [4/8] Table: ImageTechnique → Trigger: bitdex_imagetechnique_ee2b2860
 
-CREATE OR REPLACE FUNCTION bitdex_imagetechnique_ops_ef2d0321() RETURNS trigger AS $$
-DECLARE
-  _ops jsonb;
+CREATE OR REPLACE FUNCTION bitdex_imagetechnique_ops_ee2b2860() RETURNS trigger AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    _ops := jsonb_build_array(
-      jsonb_build_object('op', 'set', 'field', 'techniqueIds', 'value', to_jsonb(NEW."techniqueIds"))
-    );
-    INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."imageId", _ops);
+    INSERT INTO "BitdexOps" (entity_id, ops)
+    VALUES (NEW."imageId", jsonb_build_array(
+      jsonb_build_object('op', 'add', 'field', 'techniqueIds', 'value', to_jsonb(NEW."techniqueId"))
+    ));
     RETURN NEW;
-  ELSE
-    _ops := '[]'::jsonb;
-    IF (OLD."techniqueIds") IS DISTINCT FROM (NEW."techniqueIds") THEN
-      _ops := _ops || jsonb_build_array(
-        jsonb_build_object('op', 'remove', 'field', 'techniqueIds', 'value', to_jsonb(OLD."techniqueIds")),
-        jsonb_build_object('op', 'set', 'field', 'techniqueIds', 'value', to_jsonb(NEW."techniqueIds"))
-      );
-    END IF;
-    IF jsonb_array_length(_ops) > 0 THEN
-      INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."imageId", _ops);
-    END IF;
-    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    INSERT INTO "BitdexOps" (entity_id, ops)
+    VALUES (OLD."imageId", jsonb_build_array(
+      jsonb_build_object('op', 'remove', 'field', 'techniqueIds', 'value', to_jsonb(OLD."techniqueId"))
+    ));
+    RETURN OLD;
   END IF;
+  RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_imagetechnique_ef2d0321 ON "ImageTechnique";
-CREATE TRIGGER bitdex_imagetechnique_ef2d0321 AFTER INSERT OR UPDATE ON "ImageTechnique"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_imagetechnique_ops_ef2d0321();
-ALTER TABLE "ImageTechnique" ENABLE ALWAYS TRIGGER bitdex_imagetechnique_ef2d0321;
+DROP TRIGGER IF EXISTS bitdex_imagetechnique_ee2b2860 ON "ImageTechnique";
+CREATE TRIGGER bitdex_imagetechnique_ee2b2860 AFTER INSERT OR DELETE ON "ImageTechnique"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_imagetechnique_ops_ee2b2860();
+ALTER TABLE "ImageTechnique" ENABLE ALWAYS TRIGGER bitdex_imagetechnique_ee2b2860;
 
 
--- [5/8] Table: ImageResourceNew → Trigger: bitdex_imageresourcenew_c9957318
+-- [5/8] Table: ImageResourceNew → Trigger: bitdex_imageresourcenew_d84d15a8
 
-CREATE OR REPLACE FUNCTION bitdex_imageresourcenew_ops_c9957318() RETURNS trigger AS $$
-DECLARE
-  _ops jsonb;
+CREATE OR REPLACE FUNCTION bitdex_imageresourcenew_ops_d84d15a8() RETURNS trigger AS $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
-    _ops := jsonb_build_array(
-      jsonb_build_object('op', 'set', 'field', 'modelVersionIds', 'value', to_jsonb(NEW."modelVersionId"))
-    );
-    INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."imageId", _ops);
-    RETURN NEW;
-  ELSE
-    _ops := '[]'::jsonb;
-    IF (OLD."modelVersionId") IS DISTINCT FROM (NEW."modelVersionId") THEN
-      _ops := _ops || jsonb_build_array(
-        jsonb_build_object('op', 'remove', 'field', 'modelVersionIds', 'value', to_jsonb(OLD."modelVersionId")),
-        jsonb_build_object('op', 'set', 'field', 'modelVersionIds', 'value', to_jsonb(NEW."modelVersionId"))
-      );
-    END IF;
-    IF jsonb_array_length(_ops) > 0 THEN
-      INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."imageId", _ops);
+    INSERT INTO "BitdexOps" (entity_id, ops)
+    VALUES (NEW."imageId", jsonb_build_array(
+      jsonb_build_object('op', 'add', 'field', 'modelVersionIds', 'value', to_jsonb(NEW."modelVersionId"))
+    ));
+    IF NEW."detected" = false THEN
+      INSERT INTO "BitdexOps" (entity_id, ops)
+      VALUES (NEW."imageId", jsonb_build_array(
+        jsonb_build_object('op', 'add', 'field', 'modelVersionIdsManual', 'value', to_jsonb(NEW."modelVersionId"))
+      ));
     END IF;
     RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    INSERT INTO "BitdexOps" (entity_id, ops)
+    VALUES (OLD."imageId", jsonb_build_array(
+      jsonb_build_object('op', 'remove', 'field', 'modelVersionIds', 'value', to_jsonb(OLD."modelVersionId"))
+    ));
+    IF OLD."detected" = false THEN
+      INSERT INTO "BitdexOps" (entity_id, ops)
+      VALUES (OLD."imageId", jsonb_build_array(
+        jsonb_build_object('op', 'remove', 'field', 'modelVersionIdsManual', 'value', to_jsonb(OLD."modelVersionId"))
+      ));
+    END IF;
+    RETURN OLD;
   END IF;
+  RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_imageresourcenew_c9957318 ON "ImageResourceNew";
-CREATE TRIGGER bitdex_imageresourcenew_c9957318 AFTER INSERT OR UPDATE ON "ImageResourceNew"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_imageresourcenew_ops_c9957318();
-ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_imageresourcenew_c9957318;
+DROP TRIGGER IF EXISTS bitdex_imageresourcenew_d84d15a8 ON "ImageResourceNew";
+CREATE TRIGGER bitdex_imageresourcenew_d84d15a8 AFTER INSERT OR DELETE ON "ImageResourceNew"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_imageresourcenew_ops_d84d15a8();
+ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_imageresourcenew_d84d15a8;
 
 
 -- [6/8] Table: Post → Trigger: bitdex_post_562004c5
@@ -393,10 +381,10 @@ ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_d7157ed3;
 -- Tables created: BitdexOps, bitdex_cursors
 -- Triggers: 8
 --   bitdex_image_a48dc610 on "Image"
---   bitdex_tagsonimagenew_47d53c08 on "TagsOnImageNew"
---   bitdex_imagetool_378dc25c on "ImageTool"
---   bitdex_imagetechnique_ef2d0321 on "ImageTechnique"
---   bitdex_imageresourcenew_c9957318 on "ImageResourceNew"
+--   bitdex_tagsonimagenew_bcbef3c3 on "TagsOnImageNew"
+--   bitdex_imagetool_f87e1fc4 on "ImageTool"
+--   bitdex_imagetechnique_ee2b2860 on "ImageTechnique"
+--   bitdex_imageresourcenew_d84d15a8 on "ImageResourceNew"
 --   bitdex_post_562004c5 on "Post"
 --   bitdex_modelversion_27f2c342 on "ModelVersion"
 --   bitdex_model_d7157ed3 on "Model"

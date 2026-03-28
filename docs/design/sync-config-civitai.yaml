@@ -205,21 +205,24 @@ triggers:
 
   - table: TagsOnImageNew
     slot_field: imageId
-    track_fields: [tagIds]
+    field: tagIds
+    value_field: tagId
     filter: '({attributes} >> 10) & 1 = 0'
 
   - table: ImageTool
     slot_field: imageId
-    track_fields: [toolIds]
+    field: toolIds
+    value_field: toolId
 
   - table: ImageTechnique
     slot_field: imageId
-    track_fields: [techniqueIds]
+    field: techniqueIds
+    value_field: techniqueId
 
   - table: ImageResourceNew
     slot_field: imageId
-    track_fields:
-      - { column: modelVersionId, target: modelVersionIds }
+    field: modelVersionIds
+    value_field: modelVersionId
     computed_fields:
       - target: modelVersionIdsManual
         expression: "{detected} = false"
