@@ -1282,6 +1282,7 @@ impl BitdexServer {
             .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), measure_http_roundtrip));
 
         eprintln!("BitDex server listening on http://{}", addr);
+        eprintln!("  RAYON_NUM_THREADS={}, actual={}", std::env::var("RAYON_NUM_THREADS").unwrap_or("(not set)".into()), rayon::current_num_threads());
 
         let shutdown_signal = async {
             #[cfg(unix)]
