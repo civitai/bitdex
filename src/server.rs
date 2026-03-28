@@ -270,6 +270,8 @@ struct IndexState {
 struct AppState {
     data_dir: PathBuf,
     index: Mutex<Option<IndexState>>,
+    /// Set to true during graceful shutdown to signal background threads to exit.
+    shutting_down: AtomicBool,
     metrics: Metrics,
     parser_registry: crate::parser::registry::ParserRegistry,
     enable_traces: AtomicBool,
@@ -987,6 +989,7 @@ impl BitdexServer {
         let state = Arc::new(AppState {
             data_dir: self.data_dir.clone(),
             index: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
             metrics: Metrics::new(),
             parser_registry: registry,
             enable_traces: AtomicBool::new(self.enable_traces),
@@ -1039,7 +1042,7 @@ impl BitdexServer {
 
         // Spawn WAL reader thread if pg-sync feature is enabled and index exists
         #[cfg(feature = "pg-sync")]
-        {
+        let _wal_handle: Option<std::thread::JoinHandle<()>> = {
             let wal_dir = self.data_dir.join("wal");
             let wal_path = wal_dir.join("ops.wal");
             let cursor_path = wal_dir.join("cursor");
@@ -1051,7 +1054,7 @@ impl BitdexServer {
                     let mut reader = crate::ops_wal::WalReader::new(&wal_path, cursor);
                     eprintln!("WAL reader started (cursor={cursor}, path={})", wal_path.display());
 
-                    loop {
+                    while !wal_state.shutting_down.load(Ordering::Relaxed) {
                         // Read a batch from the WAL
                         match reader.read_batch(10_000) {
                             Ok(batch) if !batch.entries.is_empty() => {
@@ -1105,9 +1108,10 @@ impl BitdexServer {
                             }
                         }
                     }
+                    eprintln!("WAL reader exiting (shutdown)");
                 })
-                .ok();
-        }
+                .ok()
+        };
 
         let shutdown_state = Arc::clone(&state);
 
@@ -1216,18 +1220,34 @@ impl BitdexServer {
             .with_graceful_shutdown(shutdown_signal)
             .await?;
 
+        // Signal all background threads to stop
+        shutdown_state.shutting_down.store(true, Ordering::SeqCst);
+
+        // Wait for the WAL reader thread to exit (it checks shutting_down)
+        #[cfg(feature = "pg-sync")]
+        if let Some(handle) = _wal_handle {
+            eprintln!("Waiting for WAL reader to exit...");
+            handle.join().ok();
+        }
+
         // After graceful shutdown: save snapshot and shut down the engine
         eprintln!("Server stopped, saving final snapshot...");
-        let guard = shutdown_state.index.lock();
-        if let Some(ref index_state) = *guard {
-            if let Err(e) = index_state.engine.save_snapshot() {
-                eprintln!("Warning: failed to save final snapshot: {e}");
+        {
+            let guard = shutdown_state.index.lock();
+            if let Some(ref index_state) = *guard {
+                if let Err(e) = index_state.engine.save_snapshot() {
+                    eprintln!("Warning: failed to save final snapshot: {e}");
+                }
+                // Signal engine background threads to stop (flush, merge, compact, etc.)
+                // Uses request_shutdown(&self) since engine is behind Arc.
+                index_state.engine.request_shutdown();
             }
         }
-        drop(guard);
         eprintln!("Shutdown complete.");
 
-        Ok(())
+        // Force exit to ensure any lingering threads or mmap handles don't
+        // keep the process alive. All data has been saved at this point.
+        std::process::exit(0);
     }
 }
 

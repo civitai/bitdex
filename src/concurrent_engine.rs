@@ -7338,6 +7338,13 @@ impl ConcurrentEngine {
         Ok(removed)
     }
 
+    /// Signal background threads to stop (non-blocking, works through Arc).
+    /// Threads will exit on their next loop iteration. Use this when you can't
+    /// get `&mut self` (e.g., engine behind Arc with multiple references).
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
     /// Shutdown the flush, merge, and compaction threads gracefully.
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
