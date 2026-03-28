@@ -1124,18 +1124,26 @@ impl ShardPreCreator {
                 let mut created_up_to: u32 = 0;
                 let mut files_created: u32 = 0;
                 let mut bitmap_dirs_done = false;
+                let mut docstore_dirs_done = false;
 
                 loop {
                     let current_max_slot = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
                     let target_shard = current_max_slot >> 9; // SHARD_SHIFT = 9
 
-                    // Create docstore shard files up to target
+                    // Pre-create all 256 hex subdirectories once (eliminates per-file create_dir_all)
+                    if !docstore_dirs_done && current_max_slot > 0 {
+                        let shards_dir = docstore_root.join("shards");
+                        for hex in 0..=255u8 {
+                            let _ = std::fs::create_dir_all(shards_dir.join(format!("{:02x}", hex)));
+                        }
+                        docstore_dirs_done = true;
+                        eprintln!("  ShardPreCreator: docstore hex dirs created");
+                    }
+
+                    // Create docstore shard files up to target (no create_dir_all per file)
                     while created_up_to < target_shard {
                         created_up_to += 1;
                         let path = crate::docstore::DocStore::shard_path(&docstore_root, created_up_to);
-                        if let Some(parent) = path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
                         if let Ok(f) = std::fs::OpenOptions::new()
                             .create(true)
                             .append(true)
@@ -1150,6 +1158,9 @@ impl ShardPreCreator {
                             }
                         }
                         files_created += 1;
+                        if files_created % 50_000 == 0 {
+                            eprintln!("  ShardPreCreator: {}K docstore files created", files_created / 1000);
+                        }
                     }
 
                     // Create filter bitmap dirs once (first time watermark > 0)
@@ -1175,9 +1186,6 @@ impl ShardPreCreator {
                         while created_up_to < final_shard {
                             created_up_to += 1;
                             let path = crate::docstore::DocStore::shard_path(&docstore_root, created_up_to);
-                            if let Some(parent) = path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
                             if let Ok(f) = std::fs::OpenOptions::new()
                                 .create(true).append(true).open(&path)
                             {
@@ -1185,13 +1193,13 @@ impl ShardPreCreator {
                                 if meta.map(|m| m.len()).unwrap_or(0) == 0 {
                                     let mut bw = std::io::BufWriter::new(f);
                                     use std::io::Write as _;
-                                    // V2 magic: "BDX2" LE
                                     let _ = bw.write_all(&0x42445832u32.to_le_bytes());
                                     let _ = bw.flush();
                                 }
                             }
                             files_created += 1;
                         }
+                        eprintln!("  ShardPreCreator: done — {} files created (max shard {})", files_created, created_up_to);
                         return files_created;
                     }
 
