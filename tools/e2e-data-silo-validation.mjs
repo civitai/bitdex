@@ -165,7 +165,7 @@ async function v5a_dump_correctness() {
   check(`Alive count > 0 (got ${alive})`, alive > 0);
 
   // V5a.5: Check silo files exist
-  const siloDir = path.join(DATA_DIR, 'load_stage', 'silos', 'images-silo');
+  const siloDir = path.join(DATA_DIR, 'indexes', INDEX, 'silos', 'images-silo');
   if (existsSync(siloDir)) {
     const siloFiles = readdirSync(siloDir).filter(f => f.endsWith('.dat'));
     check(`Silo files created (${siloFiles.length} files)`, siloFiles.length > 0);

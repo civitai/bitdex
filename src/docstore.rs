@@ -1385,6 +1385,11 @@ pub struct BulkWriter {
 }
 
 impl BulkWriter {
+    /// Root path of the docstore directory (used by data silo to derive silo output path).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Get the field name → index mapping.
     pub fn field_to_idx(&self) -> &HashMap<String, u16> {
         &self.field_to_idx

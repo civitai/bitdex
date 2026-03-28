@@ -1358,7 +1358,7 @@ pub fn process_dump_with_progress(
     // Create per-thread silo writers for data silo integration.
     // Each rayon chunk gets its own silo file — zero contention writes.
     #[cfg(feature = "data-silo")]
-    let silo_dir = stage_dir.join("silos").join(&request.name);
+    let silo_dir = bulk_writer.root().parent().unwrap_or(bulk_writer.root()).join("silos").join(&request.name);
     #[cfg(feature = "data-silo")]
     let silo_writers: Vec<std::sync::Mutex<BulkDocWriter>> = {
         let num_threads = rayon::current_num_threads();
