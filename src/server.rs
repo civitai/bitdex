@@ -1175,6 +1175,15 @@ impl BitdexServer {
                                             Some(&mut doc_writer),
                                         );
 
+                                    // Invalidate doc cache for mutated entities so
+                                    // GET /documents returns fresh data after ops.
+                                    if applied > 0 {
+                                        for entry in &entries {
+                                            let slot = entry.entity_id as u32;
+                                            engine.evict_doc_cache(slot);
+                                        }
+                                    }
+
                                     if applied > 0 || errors > 0 {
                                         eprintln!(
                                             "WAL reader: applied={applied} skipped={skipped} errors={errors} cursor={}",

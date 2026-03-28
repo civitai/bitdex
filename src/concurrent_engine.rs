@@ -5637,6 +5637,14 @@ impl ConcurrentEngine {
 
     /// Doc cache stats for Prometheus scrape: (hits, misses, entries, bytes, evictions, generations).
     /// Returns zeros if doc_cache is not configured.
+    /// Evict a slot from the doc cache so the next read fetches from disk.
+    /// Used by WAL reader after DocWriter updates a document via ops.
+    pub fn evict_doc_cache(&self, slot: u32) {
+        if let Some(ref cache) = self.doc_cache {
+            cache.remove(slot);
+        }
+    }
+
     pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64, usize) {
         match &self.doc_cache {
             Some(cache) => (
