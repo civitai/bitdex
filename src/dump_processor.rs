@@ -30,7 +30,6 @@ use crate::docstore::{BulkWriter, PackedValue};
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
 use crate::dump_expression::ExprValue as NateExprValue;
-use crate::pg_sync::single_pass::{save_filter_field_to_disk};
 
 const LOG_INTERVAL: u64 = 1_000_000;
 

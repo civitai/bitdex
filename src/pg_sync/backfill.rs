@@ -178,7 +178,7 @@ pub fn save_collection_bitmaps(
     bitmap_fs: &BitmapFs,
     bitmaps: HashMap<u64, RoaringBitmap>,
 ) -> Result<u64, String> {
-    save_filter_field_to_disk(bitmap_fs, "collectionIds", bitmaps)
+    save_filter_field_to_disk(bitmap_fs, "collectionIds", &bitmaps)
 }
 
 /// Write a HashMap<u64, RoaringBitmap> to BitmapFs as hex-bucketed fpack files.
