@@ -1,0 +1,89 @@
+name: civitai
+
+config:
+  filter_fields:
+    - { name: nsfwLevel, field_type: single_value, eager_load: true }
+    - { name: userId, field_type: single_value, eager_load: true }
+    - { name: type, field_type: single_value, eager_load: true }
+    - { name: baseModel, field_type: single_value, eager_load: true }
+    - { name: availability, field_type: single_value, eager_load: true }
+    - { name: postId, field_type: single_value }
+    - { name: postedToId, field_type: single_value }
+    - { name: remixOfId, field_type: single_value }
+    - { name: hasMeta, field_type: boolean, eager_load: true }
+    - { name: onSite, field_type: boolean, eager_load: true }
+    - { name: poi, field_type: boolean }
+    - { name: minor, field_type: boolean }
+    - { name: isPublished, field_type: boolean, eager_load: true }
+    - { name: isRemix, field_type: boolean }
+    - { name: blockedFor, field_type: single_value, eager_load: true }
+    - { name: tagIds, field_type: multi_value }
+    - { name: modelVersionIds, field_type: multi_value }
+    - { name: modelVersionIdsManual, field_type: multi_value }
+    - { name: toolIds, field_type: multi_value }
+    - { name: techniqueIds, field_type: multi_value }
+
+  sort_fields:
+    - { name: reactionCount, bits: 32, eager_load: true }
+    - name: sortAt
+      bits: 32
+      eager_load: true
+      computed:
+        op: greatest
+        source_fields: [existedAt, publishedAt]
+    - { name: commentCount, bits: 32, eager_load: true }
+    - { name: collectedCount, bits: 32, eager_load: true }
+    - { name: existedAt, bits: 32 }
+    - { name: publishedAt, bits: 32 }
+    - { name: id, bits: 32 }
+
+  max_page_size: 200
+
+  deferred_alive:
+    source_field: publishedAt
+
+  time_buckets:
+    filter_field: sortAtUnix
+    sort_field: sortAt
+    range_buckets:
+      - { name: 24h, duration_secs: 86400, refresh_interval_secs: 300 }
+      - { name: 7d, duration_secs: 604800, refresh_interval_secs: 3600 }
+      - { name: 30d, duration_secs: 2592000, refresh_interval_secs: 3600 }
+      - { name: 1y, duration_secs: 31536000, refresh_interval_secs: 86400 }
+
+data_schema:
+  id_field: id
+  schema_version: 1
+  fields:
+    - { source: nsfwLevel, target: nsfwLevel, value_type: integer, fallback: combinedNsfwLevel }
+    - { source: userId, target: userId, value_type: integer }
+    - { source: type, target: type, value_type: low_cardinality_string }
+    - { source: baseModel, target: baseModel, value_type: low_cardinality_string }
+    - { source: availability, target: availability, value_type: low_cardinality_string }
+    - { source: postId, target: postId, value_type: integer }
+    - { source: postedToId, target: postedToId, value_type: integer }
+    - { source: remixOfId, target: remixOfId, value_type: integer }
+    - { source: publishedAtUnix, target: isPublished, value_type: exists_boolean }
+    - { source: remixOfId, target: isRemix, value_type: exists_boolean }
+    - { source: blockedFor, target: blockedFor, value_type: low_cardinality_string }
+    - { source: hasMeta, target: hasMeta, value_type: boolean, default: false }
+    - { source: onSite, target: onSite, value_type: boolean, default: false }
+    - { source: poi, target: poi, value_type: boolean, default: false }
+    - { source: minor, target: minor, value_type: boolean, default: false }
+    - { source: tagIds, target: tagIds, value_type: integer_array, default: [] }
+    - { source: modelVersionIds, target: modelVersionIds, value_type: integer_array, default: [] }
+    - { source: modelVersionIdsManual, target: modelVersionIdsManual, value_type: integer_array, default: [], filter_only: true }
+    - { source: toolIds, target: toolIds, value_type: integer_array, default: [], filter_only: true }
+    - { source: techniqueIds, target: techniqueIds, value_type: integer_array, default: [], filter_only: true }
+    - { source: reactionCount, target: reactionCount, value_type: integer, default: 0 }
+    - { source: sortAtUnix, target: sortAt, value_type: integer, fallback: sortAt, ms_to_seconds: true }
+    - { source: commentCount, target: commentCount, value_type: integer, default: 0 }
+    - { source: collectedCount, target: collectedCount, value_type: integer, default: 0 }
+    - { source: publishedAtUnix, target: publishedAt, value_type: integer, ms_to_seconds: true }
+    - { source: url, target: url, value_type: string, doc_only: true }
+    - { source: hash, target: hash, value_type: string, doc_only: true }
+    - { source: width, target: width, value_type: integer, doc_only: true }
+    - { source: height, target: height, value_type: integer, doc_only: true }
+    - { source: needsReview, target: needsReview, value_type: string, doc_only: true }
+    - { source: acceptableMinor, target: acceptableMinor, value_type: boolean, doc_only: true, default: false }
+    - { source: index, target: index, value_type: integer, doc_only: true, default: 0 }
