@@ -474,4 +474,54 @@ mod tests {
         assert!(index.get(100).is_some());
         assert_eq!(index.capacity(), 101);
     }
+
+    /// Roundtrip test: write PackedValue::Mi msgpack payloads via BulkDocWriter,
+    /// persist the index, then read back via DataSiloReader and decode.
+    #[test]
+    fn test_msgpack_packed_value_roundtrip() {
+        use crate::docstore::PackedValue;
+
+        let dir = std::env::temp_dir().join("bitdex_data_silo_msgpack_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let test_cases: &[(u32, i64)] = &[
+            (1, 100), (2, 200), (3, 999), (42, 31337),
+        ];
+
+        let silo_path = dir.join("silo_00.dat");
+        let doc_file = DocDataFile::create(&silo_path).unwrap();
+        let mut writer = BulkDocWriter::new(doc_file, 0u8);
+
+        let mut buf = Vec::with_capacity(32);
+        for &(slot, value) in test_cases {
+            buf.clear();
+            rmp_serde::encode::write(&mut buf, &PackedValue::Mi(vec![value])).unwrap();
+            writer.append(slot, &buf).unwrap();
+        }
+
+        let (file_id, local_entries) = writer.into_local_index().unwrap();
+        let max_slot = local_entries.iter().map(|(s, _, _)| *s).max().unwrap_or(0);
+        let mut index = DocIndex::new(max_slot);
+        for (slot_id, offset, length) in local_entries {
+            index.set(slot_id, file_id, offset, length);
+        }
+        index.persist(&dir.join("doc_index.bin")).unwrap();
+
+        let reader = DataSiloReader::open(&dir).unwrap();
+        assert_eq!(reader.count(), test_cases.len());
+
+        for &(slot, expected_value) in test_cases {
+            let bytes = reader.get(slot).expect("slot should be present");
+            let decoded: PackedValue = rmp_serde::from_slice(bytes)
+                .unwrap_or_else(|e| panic!("slot {}: msgpack decode failed: {e}", slot));
+            match decoded {
+                PackedValue::Mi(vals) => {
+                    assert_eq!(vals.len(), 1);
+                    assert_eq!(vals[0], expected_value);
+                }
+                other => panic!("slot {}: expected PackedValue::Mi, got {:?}", slot, other),
+            }
+        }
+    }
 }

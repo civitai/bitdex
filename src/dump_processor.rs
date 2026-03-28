@@ -1452,6 +1452,8 @@ pub fn process_dump_with_progress(
             &progress_counter,
             slot_watermark,
             shutdown,
+            stage_dir,
+            &request.name.clone(),
         );
     }
 
@@ -2209,6 +2211,8 @@ fn process_multi_value_phase(
     progress_counter: &Option<Arc<AtomicU64>>,
     slot_watermark: Option<&Arc<AtomicU64>>,
     shutdown: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
+    stage_dir: &Path,
+    dump_name: &str,
 ) -> Result<PhaseResult, String> {
     let target = request.fields[0].target().to_string();
     let value_column = request.fields[0].column().to_string();
@@ -2232,6 +2236,7 @@ fn process_multi_value_phase(
         (None, None)
     };
 
+    #[cfg(not(feature = "data_silo"))]
     let doc_writer_handle = doc_rx.map(|rx| {
         let bw = Arc::clone(bulk_writer);
         let fidx = field_idx.unwrap();
@@ -2243,6 +2248,54 @@ fn process_multi_value_phase(
                     if rmp_serde::encode::write(&mut buf, &PackedValue::Mi(vec![value])).is_ok() {
                         bw.append_tuple_raw(slot, fidx, &buf);
                     }
+                }
+            }
+        })
+    });
+
+    #[cfg(feature = "data_silo")]
+    let doc_writer_handle = doc_rx.map(|rx| {
+        let silo_path = stage_dir
+            .join("silos")
+            .join(dump_name)
+            .join(&target)
+            .join("silo_00.dat");
+        std::thread::spawn(move || {
+            use crate::data_silo::{BulkDocWriter, DocDataFile, DocIndex};
+            let doc_file = match DocDataFile::create(&silo_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("data_silo: failed to create {:?}: {e}", silo_path);
+                    // drain channel so sender doesn't block
+                    for _ in rx {}
+                    return;
+                }
+            };
+            let mut writer = BulkDocWriter::new(doc_file, 0u8);
+            let mut buf = Vec::with_capacity(32);
+            for batch in rx {
+                for (slot, value) in batch {
+                    buf.clear();
+                    if rmp_serde::encode::write(&mut buf, &PackedValue::Mi(vec![value])).is_ok() {
+                        let _ = writer.append(slot, &buf);
+                    }
+                }
+            }
+            // Flush and persist the local index
+            match writer.into_local_index() {
+                Ok((file_id, local_entries)) => {
+                    let max_slot = local_entries.iter().map(|(s, _, _)| *s).max().unwrap_or(0);
+                    let mut index = DocIndex::new(max_slot);
+                    for (slot_id, offset, length) in local_entries {
+                        index.set(slot_id, file_id, offset, length);
+                    }
+                    let index_path = silo_path.parent().unwrap().join("doc_index.bin");
+                    if let Err(e) = index.persist(&index_path) {
+                        eprintln!("data_silo: failed to persist index {:?}: {e}", index_path);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("data_silo: flush error: {e}");
                 }
             }
         })
