@@ -1102,8 +1102,14 @@ impl BitdexServer {
         });
 
         // Try to restore an existing index from disk
+        let restore_start = std::time::Instant::now();
         if let Err(e) = restore_index(&state) {
             eprintln!("Warning: failed to restore index from disk: {e}");
+        }
+        let restore_elapsed = restore_start.elapsed();
+        state.metrics.startup_duration_seconds.set(restore_elapsed.as_secs() as i64);
+        if state.index.lock().is_some() {
+            eprintln!("Index restore took {:.2}s", restore_elapsed.as_secs_f64());
         }
 
         // Apply persisted enabled_metrics from restored config
@@ -1175,6 +1181,11 @@ impl BitdexServer {
                                             reader.cursor()
                                         );
                                     }
+                                    if errors > 0 {
+                                        wal_state.metrics.pgsync_errors_total
+                                            .with_label_values(&["wal-reader"])
+                                            .inc_by(errors as u64);
+                                    }
 
                                     // Persist cursor after successful processing
                                     if let Err(e) = crate::ops_processor::save_cursor(&cursor_path, reader.cursor()) {
@@ -1204,6 +1215,9 @@ impl BitdexServer {
                             }
                             Err(e) => {
                                 eprintln!("WAL reader error: {e}");
+                                wal_state.metrics.pgsync_errors_total
+                                    .with_label_values(&["wal-reader"])
+                                    .inc();
                                 std::thread::sleep(std::time::Duration::from_secs(1));
                             }
                         }
@@ -4181,6 +4195,19 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
     m.process_rss_bytes.set(rss);
     if rss > m.process_rss_peak_bytes.get() {
         m.process_rss_peak_bytes.set(rss);
+    }
+
+    // Jemalloc memory stats (only available when heap-prof feature is active)
+    #[cfg(feature = "heap-prof")]
+    {
+        if let Ok(()) = tikv_jemalloc_ctl::epoch::advance() {
+            if let Ok(allocated) = tikv_jemalloc_ctl::stats::allocated::read() {
+                m.jemalloc_allocated_bytes.set(allocated as i64);
+            }
+            if let Ok(resident) = tikv_jemalloc_ctl::stats::resident::read() {
+                m.jemalloc_resident_bytes.set(resident as i64);
+            }
+        }
     }
 
     // Collect-on-scrape: refresh all gauges from current engine state.
