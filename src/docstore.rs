@@ -1611,13 +1611,16 @@ impl BulkWriter {
 
     /// Append multiple tuples for the same slot in one lock acquisition.
     /// Avoids repeated DashMap lookups and Mutex lock/unlock per field.
-    pub fn append_tuples_raw(&self, slot: u32, tuples: &[(u16, &[u8])]) {
+    /// Append multiple tuples for the same slot as a single contiguous write.
+    /// Pre-encodes all tuples into `write_buf`, then does one `write_all` call.
+    /// Caller provides a reusable `write_buf` to avoid allocation.
+    pub fn append_tuples_raw(&self, slot: u32, tuples: &[(u16, &[u8])], write_buf: &mut Vec<u8>) {
         if tuples.is_empty() {
             return;
         }
         let sid = DocStore::shard_id(slot);
 
-        // Ensure writer exists for this shard (same logic as append_tuple_raw)
+        // Ensure writer exists for this shard
         if !self.v2_writers.contains_key(&sid) {
             let path = DocStore::shard_path(&self.root, sid);
             if let Some(parent) = path.parent() {
@@ -1645,13 +1648,21 @@ impl BulkWriter {
             self.v2_writers.insert(sid, parking_lot::Mutex::new(bw));
         }
 
-        // One lock acquisition for all tuples
+        // Pre-encode all tuples into write_buf: [slot(4) field_idx(2) len(2) value(N)] × N
+        write_buf.clear();
+        let slot_bytes = slot.to_le_bytes();
+        for &(field_idx, value_bytes) in tuples {
+            write_buf.extend_from_slice(&slot_bytes);
+            write_buf.extend_from_slice(&field_idx.to_le_bytes());
+            write_buf.extend_from_slice(&(value_bytes.len() as u16).to_le_bytes());
+            write_buf.extend_from_slice(value_bytes);
+        }
+
+        // One lock, one write_all
         let entry = self.v2_writers.get(&sid).unwrap();
         let mut w = entry.lock();
-        for &(field_idx, value_bytes) in tuples {
-            if let Err(e) = DocStore::write_v2_tuple(&mut *w, slot, field_idx, value_bytes) {
-                eprintln!("BulkWriter: v2 write tuple shard {sid}: {e}");
-            }
+        if let Err(e) = w.write_all(write_buf) {
+            eprintln!("BulkWriter: v2 batch write shard {sid}: {e}");
         }
     }
 
@@ -3087,7 +3098,8 @@ mod tests {
             (fidx["beta"], &val_b),
             (fidx["gamma"], &val_c),
         ];
-        bw.append_tuples_raw(slot, &tuples);
+        let mut wb = Vec::new();
+        bw.append_tuples_raw(slot, &tuples, &mut wb);
         bw.flush_v2_writers();
 
         // Read back and verify all three fields present
@@ -3146,7 +3158,8 @@ mod tests {
                 (fidx["score"], &v_score),
                 (fidx["active"], &v_active),
             ];
-            bw_batch.append_tuples_raw(slot, &tuples);
+            let mut wb = Vec::new();
+            bw_batch.append_tuples_raw(slot, &tuples, &mut wb);
         }
 
         bw_single.flush_v2_writers();
@@ -3179,7 +3192,8 @@ mod tests {
         let bw = store.prepare_bulk_load(&["x".to_string()]).unwrap();
 
         // Empty tuples should not create any shard files
-        bw.append_tuples_raw(42, &[]);
+        let mut wb = Vec::new();
+        bw.append_tuples_raw(42, &[], &mut wb);
         assert_eq!(bw.v2_writers.len(), 0, "empty tuples should not create writers");
     }
 }

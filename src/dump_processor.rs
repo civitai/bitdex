@@ -1348,6 +1348,8 @@ pub fn process_dump_with_progress(
     let timing_enrich_ns = AtomicU64::new(0);
     let timing_bitmap_ns = AtomicU64::new(0);
     let timing_docstore_ns = AtomicU64::new(0);
+    let timing_doc_serialize_ns = AtomicU64::new(0);
+    let timing_doc_write_ns = AtomicU64::new(0);
     let timing_computed_ns = AtomicU64::new(0);
 
     type ThreadResult = (
@@ -1373,7 +1375,9 @@ pub fn process_dump_with_progress(
             let mut lf: u64 = 0; // filter
             let mut le: u64 = 0; // enrich
             let mut lb: u64 = 0; // bitmap (filter + sort)
-            let mut ld: u64 = 0; // docstore
+            let mut ld: u64 = 0; // docstore total
+            let mut lds: u64 = 0; // docstore serialize
+            let mut ldw: u64 = 0; // docstore write
             let mut lc: u64 = 0; // computed
 
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
@@ -1397,6 +1401,7 @@ pub fn process_dump_with_progress(
             let mut alive = RoaringBitmap::new();
             let mut deferred: Vec<(u32, u64)> = Vec::new();
             let mut tuple_buf: Vec<(u16, u32, u32)> = Vec::with_capacity(20);
+            let mut write_buf: Vec<u8> = Vec::with_capacity(256);
             let mut count = 0u64;
             let mut max_slot: u32 = 0;
             let mut line_start = 0;
@@ -1490,6 +1495,9 @@ pub fn process_dump_with_progress(
                                     &field_idx_cache,
                                     &mut serialize_buf,
                                     &mut tuple_buf,
+                                    &mut write_buf,
+                                    &mut lds,
+                                    &mut ldw,
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1625,6 +1633,9 @@ pub fn process_dump_with_progress(
                     &field_idx_cache,
                     &mut serialize_buf,
                     &mut tuple_buf,
+                    &mut write_buf,
+                    &mut lds,
+                    &mut ldw,
                 );
                 ld += t5.elapsed().as_nanos() as u64;
 
@@ -1645,6 +1656,8 @@ pub fn process_dump_with_progress(
             timing_enrich_ns.fetch_add(le, Ordering::Relaxed);
             timing_bitmap_ns.fetch_add(lb, Ordering::Relaxed);
             timing_docstore_ns.fetch_add(ld, Ordering::Relaxed);
+            timing_doc_serialize_ns.fetch_add(lds, Ordering::Relaxed);
+            timing_doc_write_ns.fetch_add(ldw, Ordering::Relaxed);
             timing_computed_ns.fetch_add(lc, Ordering::Relaxed);
 
             (filter_maps, sort_maps, alive, deferred, count, max_slot)
@@ -1662,7 +1675,10 @@ pub fn process_dump_with_progress(
     eprintln!("    enrich:   {:.2}s", timing_enrich_ns.load(Ordering::Relaxed) as f64 / 1e9);
     eprintln!("    bitmap:   {:.2}s", timing_bitmap_ns.load(Ordering::Relaxed) as f64 / 1e9);
     eprintln!("    computed: {:.2}s", timing_computed_ns.load(Ordering::Relaxed) as f64 / 1e9);
-    eprintln!("    docstore: {:.2}s", timing_docstore_ns.load(Ordering::Relaxed) as f64 / 1e9);
+    eprintln!("    docstore: {:.2}s (serialize={:.2}s write={:.2}s)",
+        timing_docstore_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        timing_doc_serialize_ns.load(Ordering::Relaxed) as f64 / 1e9,
+        timing_doc_write_ns.load(Ordering::Relaxed) as f64 / 1e9);
     eprintln!(
         r#"{{"dump":"{}","stage":"component_timing","threads":{},"rows":{},"parse_s":{:.3},"filter_s":{:.3},"enrich_s":{:.3},"bitmap_s":{:.3},"computed_s":{:.3},"docstore_s":{:.3}}}"#,
         request.name, num_threads, parsed_rows,
@@ -2354,7 +2370,11 @@ fn write_docstore_row_indexed(
     field_idx: &HashMap<String, u16>,
     serialize_buf: &mut Vec<u8>,
     tuple_buf: &mut Vec<(u16, u32, u32)>,
+    write_buf: &mut Vec<u8>,
+    doc_serialize_ns: &mut u64,
+    doc_write_ns: &mut u64,
 ) {
+    let t_ser = Instant::now();
     serialize_buf.clear();
     tuple_buf.clear();
 
@@ -2422,7 +2442,12 @@ fn write_docstore_row_indexed(
         let refs: Vec<(u16, &[u8])> = tuple_buf.iter()
             .map(|&(idx, off, len)| (idx, &serialize_buf[off as usize..(off + len) as usize]))
             .collect();
-        bulk_writer.append_tuples_raw(slot, &refs);
+        *doc_serialize_ns += t_ser.elapsed().as_nanos() as u64;
+        let tw = Instant::now();
+        bulk_writer.append_tuples_raw(slot, &refs, write_buf);
+        *doc_write_ns += tw.elapsed().as_nanos() as u64;
+    } else {
+        *doc_serialize_ns += t_ser.elapsed().as_nanos() as u64;
     }
 }
 
