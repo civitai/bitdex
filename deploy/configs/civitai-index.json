@@ -65,7 +65,7 @@
       { "source": "onSite", "target": "onSite", "value_type": "boolean", "default": false },
       { "source": "poi", "target": "poi", "value_type": "boolean", "default": false },
       { "source": "minor", "target": "minor", "value_type": "boolean", "default": false },
-      { "source": "tagIds", "target": "tagIds", "value_type": "integer_array", "default": [], "filter_only": true },
+      { "source": "tagIds", "target": "tagIds", "value_type": "integer_array", "default": [] },
       { "source": "modelVersionIds", "target": "modelVersionIds", "value_type": "integer_array", "default": [] },
       { "source": "modelVersionIdsManual", "target": "modelVersionIdsManual", "value_type": "integer_array", "default": [], "filter_only": true },
       { "source": "toolIds", "target": "toolIds", "value_type": "integer_array", "default": [], "filter_only": true },
@@ -80,7 +80,8 @@
       { "source": "width", "target": "width", "value_type": "integer", "doc_only": true },
       { "source": "height", "target": "height", "value_type": "integer", "doc_only": true },
       { "source": "needsReview", "target": "needsReview", "value_type": "string", "doc_only": true, "default": null },
-      { "source": "acceptableMinor", "target": "acceptableMinor", "value_type": "boolean", "doc_only": true, "default": false }
+      { "source": "acceptableMinor", "target": "acceptableMinor", "value_type": "boolean", "doc_only": true, "default": false },
+      { "source": "index", "target": "index", "value_type": "integer", "doc_only": true, "default": 0 }
     ]
   }
 }
