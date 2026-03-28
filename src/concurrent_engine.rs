@@ -300,6 +300,11 @@ pub struct ConcurrentEngine {
     prefetch_handle: Option<JoinHandle<()>>,
     /// Background doc cache eviction thread handle.
     doc_cache_eviction_handle: Option<JoinHandle<()>>,
+    /// WAL writer for Sync V2 write path. When set, put() and patch_document()
+    /// decompose documents into ops and write to WAL instead of directly to coalescer.
+    /// The WAL reader thread picks up ops and routes through apply_ops_batch.
+    #[cfg(feature = "pg-sync")]
+    wal_writer: Option<Arc<crate::ops_wal::WalWriter>>,
 }
 
 impl ConcurrentEngine {
@@ -1125,6 +1130,8 @@ impl ConcurrentEngine {
                 prefetch_tx: None,
                 prefetch_handle: None,
                 doc_cache_eviction_handle: None,
+                #[cfg(feature = "pg-sync")]
+                wal_writer: None,
             });
         }
 
@@ -2683,6 +2690,8 @@ impl ConcurrentEngine {
             prefetch_tx,
             prefetch_handle,
             doc_cache_eviction_handle,
+            #[cfg(feature = "pg-sync")]
+            wal_writer: None,
         })
     }
 
@@ -2818,10 +2827,80 @@ impl ConcurrentEngine {
     /// 6. Enqueue doc write to docstore channel (flush thread batches these)
     /// 7. Clear in-flight
     pub fn put(&self, id: u32, doc: &Document) -> Result<()> {
+        // [2.7] WAL path: decompose to ops and write to WAL. The WAL reader
+        // thread handles bitmap mutations + docstore writes asynchronously.
+        #[cfg(feature = "pg-sync")]
+        if let Some(ref wal) = self.wal_writer {
+            return self.put_via_wal(id, doc, wal);
+        }
+
+        // Legacy direct path (when WAL writer is not configured)
         self.in_flight.mark_in_flight(id);
         let result = self.put_inner(id, doc);
         self.in_flight.clear_in_flight(id);
         result
+    }
+
+    /// PUT via WAL: decompose document into field-level ops and append to WAL.
+    /// Returns after fsync — mutations become visible when WAL reader processes them.
+    #[cfg(feature = "pg-sync")]
+    fn put_via_wal(&self, id: u32, doc: &Document, wal: &crate::ops_wal::WalWriter) -> Result<()> {
+        let is_alive = self.is_slot_alive(id);
+
+        // Read old doc for upsert diffing
+        let old_doc = if is_alive {
+            self.docstore.lock().get(id)?
+        } else {
+            None
+        };
+
+        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config);
+        let creates_slot = !is_alive;
+
+        let entry = crate::pg_sync::ops::EntityOps {
+            entity_id: id as i64,
+            ops,
+            creates_slot,
+        };
+
+        wal.append_batch(&[entry]).map_err(|e| {
+            crate::error::BitdexError::DocStore(format!("WAL write failed: {e}"))
+        })?;
+
+        Ok(())
+    }
+
+    /// PATCH via WAL: decompose partial document into field-level ops and append to WAL.
+    #[cfg(feature = "pg-sync")]
+    fn patch_document_via_wal(&self, id: u32, doc: &Document, wal: &crate::ops_wal::WalWriter) -> Result<()> {
+        let is_alive = self.is_slot_alive(id);
+
+        if !is_alive {
+            // New slot — full PUT via WAL
+            return self.put_via_wal(id, doc, wal);
+        }
+
+        // Read old doc for diffing
+        let old_doc = self.docstore.lock().get(id)?;
+
+        // For PATCH, only emit ops for fields present in the new doc
+        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config);
+
+        if ops.is_empty() {
+            return Ok(());
+        }
+
+        let entry = crate::pg_sync::ops::EntityOps {
+            entity_id: id as i64,
+            ops,
+            creates_slot: false,
+        };
+
+        wal.append_batch(&[entry]).map_err(|e| {
+            crate::error::BitdexError::DocStore(format!("WAL write failed: {e}"))
+        })?;
+
+        Ok(())
     }
 
     /// Inner PUT logic shared by put() and patch_document() (for new slots).
@@ -2904,6 +2983,12 @@ impl ConcurrentEngine {
     /// Only fields present in the doc are diffed and updated. Missing fields
     /// are left untouched in both bitmaps and docstore.
     pub fn patch_document(&self, id: u32, doc: &Document) -> Result<()> {
+        // [2.7] WAL path: decompose to ops and write to WAL.
+        #[cfg(feature = "pg-sync")]
+        if let Some(ref wal) = self.wal_writer {
+            return self.patch_document_via_wal(id, doc, wal);
+        }
+
         self.in_flight.mark_in_flight(id);
 
         let result = (|| -> Result<()> {
@@ -5405,6 +5490,13 @@ impl ConcurrentEngine {
     /// Get a clone of the Arc<Mutex<DocStore>> for external writers (e.g., DocWriter).
     pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<crate::docstore::DocStore>> {
         Arc::clone(&self.docstore)
+    }
+
+    /// Set the WAL writer for the V2 write path. When set, put() and patch_document()
+    /// decompose documents into ops and write to WAL instead of directly to coalescer.
+    #[cfg(feature = "pg-sync")]
+    pub fn set_wal_writer(&mut self, writer: Arc<crate::ops_wal::WalWriter>) {
+        self.wal_writer = Some(writer);
     }
 
     /// Check if a slot is alive (for non-alive slot filtering in ops processing).

@@ -154,6 +154,146 @@ impl DocWriter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Document → Ops decomposition (for PUT/PATCH → WAL refactor, task 2.7)
+// ---------------------------------------------------------------------------
+
+/// Convert a FieldValue to a serde_json::Value for Op serialization.
+pub fn field_value_to_json(fv: &crate::mutation::FieldValue) -> JsonValue {
+    match fv {
+        crate::mutation::FieldValue::Single(v) => qvalue_to_json(v),
+        crate::mutation::FieldValue::Multi(vals) => {
+            JsonValue::Array(vals.iter().map(qvalue_to_json).collect())
+        }
+    }
+}
+
+/// Convert a query::Value to a serde_json::Value.
+fn qvalue_to_json(v: &QValue) -> JsonValue {
+    match v {
+        QValue::Integer(i) => JsonValue::Number(serde_json::Number::from(*i)),
+        QValue::Float(f) => {
+            serde_json::Number::from_f64(*f)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
+        }
+        QValue::Bool(b) => JsonValue::Bool(*b),
+        QValue::String(s) => JsonValue::String(s.clone()),
+    }
+}
+
+/// Decompose a Document into `Vec<Op>` for WAL writing.
+///
+/// For fresh inserts (old_doc is None): emits Op::Set for each field.
+/// For upserts (old_doc is Some): emits Op::Remove for old values + Op::Set for
+/// new values on changed fields. Unchanged fields are skipped.
+///
+/// Multi-value fields are decomposed into individual Op::Add/Op::Remove per value.
+pub fn document_to_ops(
+    new_doc: &crate::mutation::Document,
+    old_doc: Option<&crate::docstore::StoredDoc>,
+    config: &crate::config::Config,
+) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let empty_fields = std::collections::HashMap::new();
+    let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
+
+    // Process all fields in the new document
+    for (field_name, new_val) in &new_doc.fields {
+        let old_val = old_fields.get(field_name);
+
+        // Check if this is a multi-value field (tagIds, toolIds, etc.)
+        let is_multi_value = config.filter_fields.iter()
+            .any(|f| f.name == *field_name && f.field_type == crate::filter::FilterFieldType::MultiValue);
+
+        if is_multi_value {
+            // Multi-value: compute add/remove sets
+            let old_ints = extract_multi_ints(old_val);
+            let new_ints = extract_multi_ints(Some(new_val));
+
+            // Remove values that were in old but not in new
+            for v in &old_ints {
+                if !new_ints.contains(v) {
+                    ops.push(Op::Remove {
+                        field: field_name.clone(),
+                        value: JsonValue::Number(serde_json::Number::from(*v)),
+                    });
+                }
+            }
+            // Add values that are in new but not in old
+            for v in &new_ints {
+                if !old_ints.contains(v) {
+                    ops.push(Op::Add {
+                        field: field_name.clone(),
+                        value: JsonValue::Number(serde_json::Number::from(*v)),
+                    });
+                }
+            }
+        } else {
+            // Single-value field: remove old + set new if changed
+            if let Some(old) = old_val {
+                if old != new_val {
+                    ops.push(Op::Remove {
+                        field: field_name.clone(),
+                        value: field_value_to_json(old),
+                    });
+                    ops.push(Op::Set {
+                        field: field_name.clone(),
+                        value: field_value_to_json(new_val),
+                    });
+                }
+                // else: unchanged, skip
+            } else {
+                // New field (not in old doc)
+                ops.push(Op::Set {
+                    field: field_name.clone(),
+                    value: field_value_to_json(new_val),
+                });
+            }
+        }
+    }
+
+    // For upsert: handle fields that were in old doc but removed in new doc
+    if old_doc.is_some() {
+        for (field_name, old_val) in old_fields {
+            if !new_doc.fields.contains_key(field_name) {
+                // Field was removed
+                let is_multi_value = config.filter_fields.iter()
+                    .any(|f| f.name == *field_name && f.field_type == crate::filter::FilterFieldType::MultiValue);
+
+                if is_multi_value {
+                    for v in extract_multi_ints(Some(old_val)) {
+                        ops.push(Op::Remove {
+                            field: field_name.clone(),
+                            value: JsonValue::Number(serde_json::Number::from(v)),
+                        });
+                    }
+                } else {
+                    ops.push(Op::Remove {
+                        field: field_name.clone(),
+                        value: field_value_to_json(old_val),
+                    });
+                }
+            }
+        }
+    }
+
+    ops
+}
+
+/// Extract integer values from a multi-value FieldValue.
+fn extract_multi_ints(fv: Option<&crate::mutation::FieldValue>) -> Vec<i64> {
+    match fv {
+        Some(crate::mutation::FieldValue::Multi(vals)) => {
+            vals.iter().filter_map(|v| {
+                if let QValue::Integer(i) = v { Some(*i) } else { None }
+            }).collect()
+        }
+        Some(crate::mutation::FieldValue::Single(QValue::Integer(i))) => vec![*i],
+        _ => Vec::new(),
+    }
+}
+
 /// Convert a JSON value to a PackedValue for docstore storage.
 fn json_to_packed(v: &JsonValue) -> Option<PackedValue> {
     match v {
@@ -2486,5 +2626,74 @@ mod tests {
         assert_eq!(json_to_packed(&json!("hello")), Some(PackedValue::S("hello".into())));
         assert_eq!(json_to_packed(&json!(null)), None);
         assert_eq!(json_to_packed(&json!([1, 2, 3])), Some(PackedValue::Mi(vec![1, 2, 3])));
+    }
+
+    // -----------------------------------------------------------------------
+    // document_to_ops tests (2.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_document_to_ops_fresh_insert() {
+        use crate::mutation::{Document, FieldValue};
+        use crate::query::Value as QValue;
+
+        let config = test_config();
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(16)));
+
+        let doc = Document { fields };
+        let ops = document_to_ops(&doc, None, &config);
+
+        // Should have a Set op for nsfwLevel
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            Op::Set { field, value } => {
+                assert_eq!(field, "nsfwLevel");
+                assert_eq!(value, &json!(16));
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_document_to_ops_upsert_changed_field() {
+        use crate::mutation::{Document, FieldValue};
+        use crate::query::Value as QValue;
+
+        let config = test_config();
+
+        // Old doc: nsfwLevel=8
+        let mut old_fields = std::collections::HashMap::new();
+        old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
+        let old_doc = crate::docstore::StoredDoc { fields: old_fields, schema_version: 0 };
+
+        // New doc: nsfwLevel=16
+        let mut new_fields = std::collections::HashMap::new();
+        new_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(16)));
+        let new_doc = Document { fields: new_fields };
+
+        let ops = document_to_ops(&new_doc, Some(&old_doc), &config);
+
+        // Should have Remove(old=8) + Set(new=16)
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().any(|op| matches!(op, Op::Remove { field, value } if field == "nsfwLevel" && value == &json!(8))));
+        assert!(ops.iter().any(|op| matches!(op, Op::Set { field, value } if field == "nsfwLevel" && value == &json!(16))));
+    }
+
+    #[test]
+    fn test_document_to_ops_unchanged_field_skipped() {
+        use crate::mutation::{Document, FieldValue};
+        use crate::query::Value as QValue;
+
+        let config = test_config();
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
+
+        let old_doc = crate::docstore::StoredDoc { fields: fields.clone(), schema_version: 0 };
+        let new_doc = Document { fields };
+
+        let ops = document_to_ops(&new_doc, Some(&old_doc), &config);
+        assert!(ops.is_empty(), "unchanged fields should produce no ops");
     }
 }
