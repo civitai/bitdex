@@ -36,7 +36,7 @@ impl DocDataFile {
         }
         let file = File::create(path)?;
         Ok(Self {
-            writer: BufWriter::with_capacity(256 * 1024, file), // 256KB buffer
+            writer: BufWriter::with_capacity(8 * 1024 * 1024, file), // 8MB buffer (benchmark-validated)
             offset: 0,
             path: path.to_path_buf(),
         })
