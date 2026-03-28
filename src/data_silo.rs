@@ -68,15 +68,17 @@ impl DocDataFile {
     }
 }
 
-/// Open an existing silo file for appending (steady-state upserts).
-pub fn open_for_append(path: &Path) -> io::Result<DocDataFile> {
-    let file = OpenOptions::new().append(true).open(path)?;
-    let offset = file.metadata()?.len();
-    Ok(DocDataFile {
-        writer: BufWriter::with_capacity(64 * 1024, file),
-        offset,
-        path: path.to_path_buf(),
-    })
+impl DocDataFile {
+    /// Open an existing silo file for appending (steady-state upserts).
+    pub fn open_for_append(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().append(true).open(path)?;
+        let offset = file.metadata()?.len();
+        Ok(Self {
+            writer: BufWriter::with_capacity(64 * 1024, file),
+            offset,
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 /// Memory-map a silo file for reads.
@@ -94,7 +96,6 @@ pub fn mmap_silo(path: &Path) -> io::Result<Mmap> {
 
 /// Entry in the document index: where to find a slot's document data.
 #[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
 pub struct IndexEntry {
     pub file_id: u8,
     pub offset: u64,
@@ -131,10 +132,10 @@ pub struct DocIndex {
 }
 
 impl DocIndex {
-    /// Create an empty index with capacity for `max_slot` entries.
+    /// Create an empty index with capacity for slots 0..=max_slot.
     pub fn new(max_slot: u32) -> Self {
         Self {
-            entries: vec![IndexEntry::default(); max_slot as usize],
+            entries: vec![IndexEntry::default(); max_slot as usize + 1],
         }
     }
 
@@ -271,6 +272,9 @@ pub fn create_bulk_writers(silo_dir: &Path, count: usize) -> io::Result<Vec<Bulk
 }
 
 /// Merge per-thread local indexes into a single DocIndex.
+/// Note: if multiple threads wrote the same slot_id, the last one wins.
+/// This is correct for single-phase bulk loads where each slot is processed
+/// by exactly one thread. For cross-phase merging, use read-merge-write instead.
 pub fn merge_indexes(locals: Vec<(u8, Vec<(u32, u64, u32)>)>, max_slot: u32) -> DocIndex {
     let mut index = DocIndex::new(max_slot);
     for (file_id, entries) in locals {
@@ -366,6 +370,9 @@ mod tests {
         assert_eq!(off2, 5);
         assert_eq!(len2, 5);
 
+        // Drop the file handle before mmap (Windows requires exclusive access)
+        drop(file);
+
         // Read back via mmap
         let mmap = mmap_silo(&path).unwrap();
         assert_eq!(&mmap[0..5], b"hello");
@@ -385,7 +392,7 @@ mod tests {
 
         index.persist(&path).unwrap();
         let loaded = DocIndex::load(&path).unwrap();
-        assert_eq!(loaded.capacity(), 100);
+        assert_eq!(loaded.capacity(), 101); // new(100) creates slots 0..=100
         assert_eq!(loaded.count(), 3);
 
         let e0 = loaded.get(0).unwrap();
