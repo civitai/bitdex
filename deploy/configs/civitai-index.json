@@ -25,9 +25,10 @@
     ],
     "sort_fields": [
       { "name": "reactionCount", "bits": 32, "eager_load": true },
-      { "name": "sortAt", "bits": 32, "eager_load": true },
+      { "name": "sortAt", "bits": 32, "eager_load": true, "computed": { "op": "greatest", "source_fields": ["existedAt", "publishedAt"] } },
       { "name": "commentCount", "bits": 32, "eager_load": true },
       { "name": "collectedCount", "bits": 32, "eager_load": true },
+      { "name": "existedAt", "bits": 32 },
       { "name": "publishedAt", "bits": 32 },
       { "name": "id", "bits": 32 }
     ],
