@@ -1456,19 +1456,35 @@ pub fn process_dump_with_progress(
     let request_fields = &request.fields;
     let sets_alive = request.sets_alive;
 
-    // Collect filter target names from request fields
-    let filter_targets: Vec<String> = request_fields
+    // Collect filter target names from request fields + enrichment targets
+    let mut filter_targets: Vec<String> = request_fields
         .iter()
         .map(|f| f.target().to_string())
         .filter(|t| filter_field_names.contains(t))
         .collect();
-    let sort_targets: Vec<(String, u8)> = request_fields
+    let mut sort_targets: Vec<(String, u8)> = request_fields
         .iter()
         .filter_map(|f| {
             let t = f.target().to_string();
             sort_bits.get(&t).map(|&b| (t, b))
         })
         .collect();
+    // Also include enrichment-derived fields (availability, baseModel, etc.)
+    let mut enrichment_targets: Vec<String> = Vec::new();
+    for ec in &request.enrichment {
+        collect_enrichment_targets(ec, &mut enrichment_targets);
+    }
+    for t in &enrichment_targets {
+        if filter_field_names.contains(t) && !filter_targets.contains(t) {
+            filter_targets.push(t.clone());
+        }
+        if let Some(&b) = sort_bits.get(t.as_str()) {
+            if !sort_targets.iter().any(|(n, _)| n == t) {
+                sort_targets.push((t.clone(), b));
+            }
+        }
+    }
+    let enrichment_targets_ref = &enrichment_targets;
     // Also include computed fields that are sort fields
     let computed_sort_targets: Vec<(String, u8)> = computed_defs
         .iter()
@@ -1674,6 +1690,38 @@ pub fn process_dump_with_progress(
                     }
                 }
 
+                // Build filter + sort bitmaps from enrichment-only fields
+                // (fields that appear in enrichment targets but not in request.fields)
+                for target in enrichment_targets_ref {
+                    if let Some(val_str) = enriched_get(target) {
+                        // Filter bitmap
+                        if let Some(fm) = filter_maps.get_mut(target.as_str()) {
+                            let bitmap_key: Option<u64> = if let Some(dict) = dictionaries_ref.get(target.as_str()) {
+                                Some(dict.get_or_insert(val_str) as u64)
+                            } else {
+                                val_str.parse::<i64>().ok().map(|v| v as u64)
+                            };
+                            if let Some(key) = bitmap_key {
+                                fm.entry(key)
+                                    .or_insert_with(RoaringBitmap::new)
+                                    .insert(slot);
+                            }
+                        }
+                        // Sort bitmap
+                        if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
+                            if let Some(v) = val_str.parse::<i64>().ok() {
+                                let val32 = v as u32;
+                                if let Some(sm) = sort_maps.get_mut(target.as_str()) {
+                                    for bit in 0..(bits as usize) {
+                                        if (val32 >> bit) & 1 == 1 {
+                                            sm[bit].insert(slot);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Build bitmaps from computed fields (Nate's ComputedFieldDef API)
                 for def in computed_defs_ref {
