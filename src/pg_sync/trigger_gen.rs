@@ -408,24 +408,24 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
     body.push_str("BEGIN\n");
     body.push_str("  IF TG_OP = 'UPDATE' THEN\n");
 
-    // Build the query string with column substitution
+    // Build the query string with PG variable interpolation.
+    // Template: "postId eq {id}" → _query := 'postId eq ' || NEW."id"::text
+    // This ensures PG evaluates the column reference at runtime.
     if let Some(ref query_source) = source.query_source {
         let source_sql = substitute_columns(query_source, "NEW");
         body.push_str(&format!(
             "    EXECUTE format('SELECT ({})') INTO _source_result;\n",
             source_sql.replace('\'', "''")
         ));
-        // Substitute the query_source result into the query template
         body.push_str(&format!(
-            "    _query := '{}';\n",
-            query_template
+            "    _query := {};\n",
+            build_query_concatenation(query_template, "NEW")
         ));
-        // Replace placeholders with source result values
-        body.push_str("    -- Substitute source values into query template\n");
     } else {
-        // Direct substitution from NEW columns
-        let query_sql = substitute_columns(query_template, "NEW");
-        body.push_str(&format!("    _query := '{}';\n", query_sql));
+        body.push_str(&format!(
+            "    _query := {};\n",
+            build_query_concatenation(query_template, "NEW")
+        ));
     }
 
     // Build ops array from tracked fields that changed
@@ -507,6 +507,51 @@ fn substitute_columns(expr: &str, prefix: &str) -> String {
         }
     }
     result
+}
+
+/// Build a PG string concatenation expression from a query template.
+///
+/// Template: "postId eq {id}" with prefix "NEW"
+/// → `'postId eq ' || NEW."id"::text`
+///
+/// Template: "modelVersionIds in [{ids}]" with prefix "NEW"
+/// → `'modelVersionIds in [' || NEW."ids"::text || ']'`
+fn build_query_concatenation(template: &str, prefix: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current_literal = String::new();
+    let mut chars = template.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // Flush current literal
+            if !current_literal.is_empty() {
+                parts.push(format!("'{}'", current_literal.replace('\'', "''")));
+                current_literal.clear();
+            }
+            // Read column name
+            let mut col = String::new();
+            while let Some(&next) = chars.peek() {
+                if next == '}' {
+                    chars.next();
+                    break;
+                }
+                col.push(chars.next().unwrap());
+            }
+            parts.push(format!("{}.\"{col}\"::text", prefix));
+        } else {
+            current_literal.push(c);
+        }
+    }
+    // Flush remaining literal
+    if !current_literal.is_empty() {
+        parts.push(format!("'{}'", current_literal.replace('\'', "''")));
+    }
+
+    if parts.len() == 1 {
+        parts[0].clone()
+    } else {
+        parts.join(" || ")
+    }
 }
 
 /// Compute a short (8-char) hash of a string.

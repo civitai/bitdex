@@ -267,16 +267,16 @@ CREATE TRIGGER bitdex_imageresourcenew_d84d15a8 AFTER INSERT OR DELETE ON "Image
 ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_imageresourcenew_d84d15a8;
 
 
--- [6/8] Table: Post → Trigger: bitdex_post_562004c5
+-- [6/8] Table: Post → Trigger: bitdex_post_9f9a49a6
 -- Type: fan_out
 
-CREATE OR REPLACE FUNCTION bitdex_post_ops_562004c5() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_post_ops_9f9a49a6() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
   _query text;
 BEGIN
   IF TG_OP = 'UPDATE' THEN
-    _query := 'postId eq NEW."id"';
+    _query := 'postId eq ' || NEW."id"::text;
     _ops := '[]'::jsonb;
     IF (extract(epoch from OLD."publishedAt")::bigint) IS DISTINCT FROM (extract(epoch from NEW."publishedAt")::bigint) THEN
       _ops := _ops || jsonb_build_array(
@@ -301,22 +301,22 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_post_562004c5 ON "Post";
-CREATE TRIGGER bitdex_post_562004c5 AFTER INSERT OR UPDATE ON "Post"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_post_ops_562004c5();
-ALTER TABLE "Post" ENABLE ALWAYS TRIGGER bitdex_post_562004c5;
+DROP TRIGGER IF EXISTS bitdex_post_9f9a49a6 ON "Post";
+CREATE TRIGGER bitdex_post_9f9a49a6 AFTER INSERT OR UPDATE ON "Post"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_post_ops_9f9a49a6();
+ALTER TABLE "Post" ENABLE ALWAYS TRIGGER bitdex_post_9f9a49a6;
 
 
--- [7/8] Table: ModelVersion → Trigger: bitdex_modelversion_27f2c342
+-- [7/8] Table: ModelVersion → Trigger: bitdex_modelversion_897e66cf
 -- Type: fan_out
 
-CREATE OR REPLACE FUNCTION bitdex_modelversion_ops_27f2c342() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_modelversion_ops_897e66cf() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
   _query text;
 BEGIN
   IF TG_OP = 'UPDATE' THEN
-    _query := 'modelVersionIds eq NEW."id"';
+    _query := 'modelVersionIds eq ' || NEW."id"::text;
     _ops := '[]'::jsonb;
     IF (OLD."baseModel") IS DISTINCT FROM (NEW."baseModel") THEN
       _ops := _ops || jsonb_build_array(
@@ -335,22 +335,22 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_modelversion_27f2c342 ON "ModelVersion";
-CREATE TRIGGER bitdex_modelversion_27f2c342 AFTER INSERT OR UPDATE ON "ModelVersion"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_modelversion_ops_27f2c342();
-ALTER TABLE "ModelVersion" ENABLE ALWAYS TRIGGER bitdex_modelversion_27f2c342;
+DROP TRIGGER IF EXISTS bitdex_modelversion_897e66cf ON "ModelVersion";
+CREATE TRIGGER bitdex_modelversion_897e66cf AFTER INSERT OR UPDATE ON "ModelVersion"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_modelversion_ops_897e66cf();
+ALTER TABLE "ModelVersion" ENABLE ALWAYS TRIGGER bitdex_modelversion_897e66cf;
 
 
--- [8/8] Table: Model → Trigger: bitdex_model_d7157ed3
+-- [8/8] Table: Model → Trigger: bitdex_model_5f778a86
 -- Type: fan_out
 
-CREATE OR REPLACE FUNCTION bitdex_model_ops_d7157ed3() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_model_ops_5f778a86() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
   _query text;
 BEGIN
   IF TG_OP = 'UPDATE' THEN
-    _query := 'modelVersionIds in [NEW."ids"]';
+    _query := 'modelVersionIds in [' || NEW."ids"::text || ']';
     _ops := '[]'::jsonb;
     IF (OLD."poi") IS DISTINCT FROM (NEW."poi") THEN
       _ops := _ops || jsonb_build_array(
@@ -369,10 +369,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_model_d7157ed3 ON "Model";
-CREATE TRIGGER bitdex_model_d7157ed3 AFTER INSERT OR UPDATE ON "Model"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_model_ops_d7157ed3();
-ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_d7157ed3;
+DROP TRIGGER IF EXISTS bitdex_model_5f778a86 ON "Model";
+CREATE TRIGGER bitdex_model_5f778a86 AFTER INSERT OR UPDATE ON "Model"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_model_ops_5f778a86();
+ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_5f778a86;
 
 
 -- -----------------------------------------------------------------------
@@ -385,9 +385,9 @@ ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_d7157ed3;
 --   bitdex_imagetool_f87e1fc4 on "ImageTool"
 --   bitdex_imagetechnique_ee2b2860 on "ImageTechnique"
 --   bitdex_imageresourcenew_d84d15a8 on "ImageResourceNew"
---   bitdex_post_562004c5 on "Post"
---   bitdex_modelversion_27f2c342 on "ModelVersion"
---   bitdex_model_d7157ed3 on "Model"
+--   bitdex_post_9f9a49a6 on "Post"
+--   bitdex_modelversion_897e66cf on "ModelVersion"
+--   bitdex_model_5f778a86 on "Model"
 --
 -- Safety notes:
 -- - All triggers use CREATE OR REPLACE (idempotent)
