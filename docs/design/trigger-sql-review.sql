@@ -245,24 +245,24 @@ CREATE TRIGGER bitdex_imagetechnique_ef2d0321 AFTER INSERT OR UPDATE ON "ImageTe
 ALTER TABLE "ImageTechnique" ENABLE ALWAYS TRIGGER bitdex_imagetechnique_ef2d0321;
 
 
--- [5/8] Table: ImageResourceNew → Trigger: bitdex_imageresourcenew_2e963907
+-- [5/8] Table: ImageResourceNew → Trigger: bitdex_imageresourcenew_c9957318
 
-CREATE OR REPLACE FUNCTION bitdex_imageresourcenew_ops_2e963907() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION bitdex_imageresourcenew_ops_c9957318() RETURNS trigger AS $$
 DECLARE
   _ops jsonb;
 BEGIN
   IF TG_OP = 'INSERT' THEN
     _ops := jsonb_build_array(
-      jsonb_build_object('op', 'set', 'field', 'modelVersionIds', 'value', to_jsonb("modelVersionId"))
+      jsonb_build_object('op', 'set', 'field', 'modelVersionIds', 'value', to_jsonb(NEW."modelVersionId"))
     );
     INSERT INTO "BitdexOps" (entity_id, ops) VALUES (NEW."imageId", _ops);
     RETURN NEW;
   ELSE
     _ops := '[]'::jsonb;
-    IF ("modelVersionId") IS DISTINCT FROM ("modelVersionId") THEN
+    IF (OLD."modelVersionId") IS DISTINCT FROM (NEW."modelVersionId") THEN
       _ops := _ops || jsonb_build_array(
-        jsonb_build_object('op', 'remove', 'field', 'modelVersionIds', 'value', to_jsonb("modelVersionId")),
-        jsonb_build_object('op', 'set', 'field', 'modelVersionIds', 'value', to_jsonb("modelVersionId"))
+        jsonb_build_object('op', 'remove', 'field', 'modelVersionIds', 'value', to_jsonb(OLD."modelVersionId")),
+        jsonb_build_object('op', 'set', 'field', 'modelVersionIds', 'value', to_jsonb(NEW."modelVersionId"))
       );
     END IF;
     IF jsonb_array_length(_ops) > 0 THEN
@@ -273,10 +273,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS bitdex_imageresourcenew_2e963907 ON "ImageResourceNew";
-CREATE TRIGGER bitdex_imageresourcenew_2e963907 AFTER INSERT OR UPDATE ON "ImageResourceNew"
-  FOR EACH ROW EXECUTE FUNCTION bitdex_imageresourcenew_ops_2e963907();
-ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_imageresourcenew_2e963907;
+DROP TRIGGER IF EXISTS bitdex_imageresourcenew_c9957318 ON "ImageResourceNew";
+CREATE TRIGGER bitdex_imageresourcenew_c9957318 AFTER INSERT OR UPDATE ON "ImageResourceNew"
+  FOR EACH ROW EXECUTE FUNCTION bitdex_imageresourcenew_ops_c9957318();
+ALTER TABLE "ImageResourceNew" ENABLE ALWAYS TRIGGER bitdex_imageresourcenew_c9957318;
 
 
 -- [6/8] Table: Post → Trigger: bitdex_post_562004c5
@@ -396,7 +396,7 @@ ALTER TABLE "Model" ENABLE ALWAYS TRIGGER bitdex_model_d7157ed3;
 --   bitdex_tagsonimagenew_47d53c08 on "TagsOnImageNew"
 --   bitdex_imagetool_378dc25c on "ImageTool"
 --   bitdex_imagetechnique_ef2d0321 on "ImageTechnique"
---   bitdex_imageresourcenew_2e963907 on "ImageResourceNew"
+--   bitdex_imageresourcenew_c9957318 on "ImageResourceNew"
 --   bitdex_post_562004c5 on "Post"
 --   bitdex_modelversion_27f2c342 on "ModelVersion"
 --   bitdex_model_d7157ed3 on "Model"

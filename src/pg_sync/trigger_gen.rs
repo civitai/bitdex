@@ -50,8 +50,8 @@ impl TrackField {
                     format!("{} as {}", expr, field_name)
                 } else if let Some(col) = column {
                     if target.is_some() && target.as_deref() != Some(col.as_str()) {
-                        // column differs from target — use "column" as expression alias
-                        format!("\"{}\" as {}", col, field_name)
+                        // column differs from target — use {column} template for substitute_columns
+                        format!("{{{}}} as {}", col, field_name)
                     } else {
                         field_name.to_string()
                     }
