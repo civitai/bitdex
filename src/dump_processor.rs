@@ -25,6 +25,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
+use crate::data_silo::{self, BulkDocWriter};
 use crate::dictionary::FieldDictionary;
 use crate::docstore::{BulkWriter, PackedValue};
 use crate::dump_enrichment;
@@ -1353,6 +1354,18 @@ pub fn process_dump_with_progress(
             .map_err(|e| format!("prepare_bulk_writer: {e}"))?,
     );
 
+    // Create per-thread silo writers for data silo integration.
+    // Each rayon chunk gets its own silo file — zero contention writes.
+    let num_threads = rayon::current_num_threads();
+    let silo_dir = stage_dir.join("silos").join(&request.name);
+    let silo_writers: Vec<std::sync::Mutex<BulkDocWriter>> =
+        data_silo::create_bulk_writers(&silo_dir, num_threads)
+            .map_err(|e| format!("create silo writers: {e}"))?
+            .into_iter()
+            .map(std::sync::Mutex::new)
+            .collect();
+    let silo_writers_ref = &silo_writers;
+
     // Mmap the CSV/TSV file
     let csv_path = std::path::Path::new(&request.csv_path);
     let file = std::fs::File::open(csv_path)
@@ -1505,7 +1518,8 @@ pub fn process_dump_with_progress(
 
     let thread_results: Vec<ThreadResult> = ranges
         .par_iter()
-        .map(|&(range_start, range_end)| {
+        .enumerate()
+        .map(|(chunk_idx, &(range_start, range_end))| {
             let chunk = &body[range_start..range_end];
 
             let field_idx_cache: &HashMap<String, u16> = bulk_writer.field_to_idx();
@@ -1613,8 +1627,8 @@ pub fn process_dump_with_progress(
                     if let Some(pub_str) = enriched_get("publishedAt") {
                         if let Ok(pub_secs) = pub_str.parse::<u64>() {
                             if pub_secs > now_unix {
-                                // Write docstore only, skip all bitmaps
-                                write_docstore_row_indexed(
+                                // Write to silo only, skip all bitmaps
+                                write_silo_row_indexed(
                                     &row,
                                     &enriched,
                                     computed_defs_ref,
@@ -1622,11 +1636,11 @@ pub fn process_dump_with_progress(
                                     col_idx,
                                     slot,
                                     request_fields,
-                                    &bulk_writer,
                                     &field_idx_cache,
                                     &mut serialize_buf,
                                     &mut tuple_buf,
                                     &mut write_buf,
+                                    &silo_writers_ref[chunk_idx],
                                 );
                                 deferred.push((slot, pub_secs));
                                 count += 1;
@@ -1776,8 +1790,8 @@ pub fn process_dump_with_progress(
                 }
 
 
-                // Write docstore
-                write_docstore_row_indexed(
+                // Write to data silo
+                write_silo_row_indexed(
                     &row,
                     &enriched,
                     computed_defs_ref,
@@ -1785,11 +1799,11 @@ pub fn process_dump_with_progress(
                     col_idx,
                     slot,
                     request_fields,
-                    &bulk_writer,
                     &field_idx_cache,
                     &mut serialize_buf,
                     &mut tuple_buf,
                     &mut write_buf,
+                    &silo_writers_ref[chunk_idx],
                 );
 
                 count += 1;
@@ -1812,6 +1826,32 @@ pub fn process_dump_with_progress(
         .collect();
 
     emit_stage(&request.name, "parallel_parse", "done", &t, total.load(Ordering::Relaxed));
+
+    // Flush silo writers, collect local indexes, merge and persist doc_index.bin
+    emit_stage(&request.name, "silo_index", "start", &t, total.load(Ordering::Relaxed));
+    let silo_locals: Vec<(u8, Vec<(u32, u64, u32)>)> = silo_writers
+        .into_iter()
+        .filter_map(|mutex| {
+            let writer = mutex.into_inner().ok()?;
+            writer.into_local_index().ok()
+        })
+        .collect();
+    // Find max slot across all local indexes for the global index
+    let silo_max_slot = silo_locals
+        .iter()
+        .flat_map(|(_, entries)| entries.iter().map(|(slot, _, _)| *slot))
+        .max()
+        .unwrap_or(0);
+    let silo_index = data_silo::merge_indexes(silo_locals, silo_max_slot);
+    let silo_index_count = silo_index.count();
+    if let Err(e) = silo_index.persist(&silo_dir.join("doc_index.bin")) {
+        eprintln!("  WARNING: silo index persist failed: {e}");
+    }
+    eprintln!(
+        "  Dump {} silo index: {} entries persisted to {}",
+        request.name, silo_index_count, silo_dir.join("doc_index.bin").display()
+    );
+    emit_stage(&request.name, "silo_index", "done", &t, total.load(Ordering::Relaxed));
 
     emit_stage(&request.name, "merge", "start", &t, total.load(Ordering::Relaxed));
     // Merge all thread results — parallel tree reduction
@@ -2584,6 +2624,102 @@ fn write_docstore_row_indexed(
     }
 }
 
+/// Write a single row's data to a data silo via BulkDocWriter.
+/// Same field collection logic as write_docstore_row_indexed, but encodes all
+/// fields into a single contiguous document blob and appends to the silo file.
+///
+/// Document blob format: [u16 field_idx][u16 value_len][value_bytes]...
+/// No slot_id prefix (the silo index maps slot→offset).
+fn write_silo_row_indexed(
+    row: &ParsedRow,
+    enriched: &dump_enrichment::EnrichedFields,
+    computed_defs: &[ComputedFieldDef],
+    indexed_fields: &[Option<&str>],
+    col_idx: &HashMap<String, usize>,
+    slot: u32,
+    request_fields: &[DumpFieldMapping],
+    field_idx: &HashMap<String, u16>,
+    serialize_buf: &mut Vec<u8>,
+    tuple_buf: &mut Vec<(u16, u32, u32)>,
+    write_buf: &mut Vec<u8>,
+    silo_writer: &std::sync::Mutex<BulkDocWriter>,
+) {
+    serialize_buf.clear();
+    tuple_buf.clear();
+
+    // Collect all fields into serialize_buf, track (field_idx, offset, len) in tuple_buf
+    macro_rules! collect_packed {
+        ($fidx:expr, $value:expr) => {
+            let start = serialize_buf.len() as u32;
+            if rmp_serde::encode::write(serialize_buf, $value).is_ok() {
+                let len = serialize_buf.len() as u32 - start;
+                tuple_buf.push(($fidx, start, len));
+            }
+        };
+    }
+
+    // Direct fields
+    for mapping in request_fields {
+        let target = mapping.target();
+        let column = mapping.column();
+        if let Some(&fidx) = field_idx.get(target) {
+            if let Some(v) = row.get_i64(column) {
+                collect_packed!(fidx, &PackedValue::I(v));
+            } else if let Some(s) = row.get_str(column) {
+                collect_packed!(fidx, &PackedValue::S(s.to_string()));
+            }
+        }
+    }
+
+    // Enriched fields
+    for (target, value) in &enriched.fields {
+        if let Some(&fidx) = field_idx.get(target.as_str()) {
+            if let Ok(v) = value.parse::<i64>() {
+                collect_packed!(fidx, &PackedValue::I(v));
+            } else {
+                collect_packed!(fidx, &PackedValue::S(value.clone()));
+            }
+        }
+    }
+
+    // Enriched computed fields
+    for (target, value) in &enriched.computed {
+        if let Some(&fidx) = field_idx.get(target.as_str()) {
+            match value {
+                NateExprValue::Int(v) => { collect_packed!(fidx, &PackedValue::I(*v)); }
+                NateExprValue::Bool(b) => { collect_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
+                NateExprValue::Str(ref s) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
+                NateExprValue::Null => {}
+            }
+        }
+    }
+
+    // Computed fields via indexed eval
+    for def in computed_defs {
+        if let Some(&fidx) = field_idx.get(def.target.as_str()) {
+            match def.eval_indexed(indexed_fields, col_idx, None) {
+                Some(NateExprValue::Int(v)) => { collect_packed!(fidx, &PackedValue::I(v)); }
+                Some(NateExprValue::Bool(b)) => { collect_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
+                Some(NateExprValue::Str(ref s)) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
+                _ => {}
+            }
+        }
+    }
+
+    // Encode document blob and write to silo
+    if !tuple_buf.is_empty() {
+        write_buf.clear();
+        for &(fidx, off, len) in tuple_buf.iter() {
+            write_buf.extend_from_slice(&fidx.to_le_bytes());
+            write_buf.extend_from_slice(&len.to_le_bytes());    // u32 value_len (not u16 — values can exceed 64KB)
+            write_buf.extend_from_slice(&serialize_buf[off as usize..(off + len) as usize]);
+        }
+        if let Ok(mut writer) = silo_writer.lock() {
+            let _ = writer.append(slot, write_buf);
+        }
+    }
+}
+
 /// Write a single row's data to the docstore via BulkWriter (legacy HashMap path).
 fn write_docstore_row(
     row: &ParsedRow,
@@ -3001,5 +3137,221 @@ mod tests {
         }"#;
         let req: DumpRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.format, DumpFormat::Tsv);
+    }
+
+    #[test]
+    fn test_write_silo_row_indexed_basic() {
+        // Test that write_silo_row_indexed produces a document blob
+        // that can be read back from a DataSiloReader.
+        use crate::data_silo::{self, DataSiloReader};
+
+        let dir = std::env::temp_dir().join("bitdex_silo_integration_test");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Create 2 silo writers (simulating 2 threads)
+        let writers = data_silo::create_bulk_writers(&dir, 2).unwrap();
+        let silo_writers: Vec<std::sync::Mutex<BulkDocWriter>> = writers
+            .into_iter()
+            .map(std::sync::Mutex::new)
+            .collect();
+
+        // Set up field index (simulating bulk_writer.field_to_idx())
+        let mut field_idx: HashMap<String, u16> = HashMap::new();
+        field_idx.insert("nsfwLevel".to_string(), 0);
+        field_idx.insert("userId".to_string(), 1);
+
+        // Simulate writing 4 rows across 2 "threads"
+        let fields = vec![
+            DumpFieldMapping::Expanded {
+                column: "nsfwLevel".to_string(),
+                target: "nsfwLevel".to_string(),
+            },
+            DumpFieldMapping::Expanded {
+                column: "userId".to_string(),
+                target: "userId".to_string(),
+            },
+        ];
+        let col_idx: HashMap<String, usize> =
+            [("nsfwLevel".to_string(), 0), ("userId".to_string(), 1)]
+                .into_iter()
+                .collect();
+
+        let empty_enriched = dump_enrichment::EnrichedFields::default();
+        let computed_defs: Vec<ComputedFieldDef> = vec![];
+
+        let mut serialize_buf = Vec::new();
+        let mut tuple_buf = Vec::new();
+        let mut write_buf = Vec::new();
+
+        // Thread 0: write slots 10, 20
+        for &slot in &[10u32, 20] {
+            let nsfw_val = b"3";
+            let user_val_str = format!("{}", slot as i64 * 100);
+            let user_val = user_val_str.as_bytes();
+            let row_fields: Vec<&[u8]> = vec![nsfw_val, user_val];
+            let row = ParsedRow { fields: row_fields, col_index: &col_idx };
+            let indexed: Vec<Option<&str>> = vec![Some("3"), Some(&user_val_str)];
+            write_silo_row_indexed(
+                &row,
+                &empty_enriched,
+                &computed_defs,
+                &indexed,
+                &col_idx,
+                slot,
+                &fields,
+                &field_idx,
+                &mut serialize_buf,
+                &mut tuple_buf,
+                &mut write_buf,
+                &silo_writers[0],
+            );
+        }
+
+        // Thread 1: write slots 15, 25
+        for &slot in &[15u32, 25] {
+            let nsfw_val = b"1";
+            let user_val_str = format!("{}", slot as i64 * 200);
+            let user_val = user_val_str.as_bytes();
+            let row_fields: Vec<&[u8]> = vec![nsfw_val, user_val];
+            let row = ParsedRow { fields: row_fields, col_index: &col_idx };
+            let indexed: Vec<Option<&str>> = vec![Some("1"), Some(&user_val_str)];
+            write_silo_row_indexed(
+                &row,
+                &empty_enriched,
+                &computed_defs,
+                &indexed,
+                &col_idx,
+                slot,
+                &fields,
+                &field_idx,
+                &mut serialize_buf,
+                &mut tuple_buf,
+                &mut write_buf,
+                &silo_writers[1],
+            );
+        }
+
+        // Collect local indexes and merge
+        let locals: Vec<_> = silo_writers
+            .into_iter()
+            .filter_map(|m| {
+                let w = m.into_inner().ok()?;
+                w.into_local_index().ok()
+            })
+            .collect();
+        let index = data_silo::merge_indexes(locals, 25);
+        assert_eq!(index.count(), 4);
+
+        // Persist index
+        index.persist(&dir.join("doc_index.bin")).unwrap();
+
+        // Read back via DataSiloReader
+        let reader = DataSiloReader::open(&dir).unwrap();
+        assert_eq!(reader.count(), 4);
+        assert_eq!(reader.silo_count(), 2);
+
+        // Verify all 4 slots have non-empty data
+        assert!(reader.get(10).is_some());
+        assert!(reader.get(15).is_some());
+        assert!(reader.get(20).is_some());
+        assert!(reader.get(25).is_some());
+        assert!(reader.get(99).is_none()); // non-existent slot
+
+        // Verify document blobs are non-empty and contain field data
+        let doc10 = reader.get(10).unwrap();
+        assert!(doc10.len() > 4, "doc should contain at least one field tuple");
+
+        // Parse the first field tuple: [u16 field_idx][u32 value_len][value_bytes]
+        let fidx = u16::from_le_bytes([doc10[0], doc10[1]]);
+        let vlen = u32::from_le_bytes([doc10[2], doc10[3], doc10[4], doc10[5]]);
+        assert!(fidx <= 1, "field_idx should be 0 or 1");
+        assert!(vlen > 0 && vlen < 100, "value_len should be reasonable");
+        assert_eq!(doc10.len(), 6 + vlen as usize + 6 + {
+            // Second field
+            let off2 = 6 + vlen as usize;
+            let vlen2 = u32::from_le_bytes([doc10[off2+2], doc10[off2+3], doc10[off2+4], doc10[off2+5]]);
+            vlen2 as usize
+        }, "doc should contain exactly 2 field tuples");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_silo_row_indexed_filter_only_skip() {
+        // Fields not in field_idx should be silently skipped (filter_only behavior).
+        use crate::data_silo;
+
+        let dir = std::env::temp_dir().join("bitdex_silo_filter_only_test");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let writers = data_silo::create_bulk_writers(&dir, 1).unwrap();
+        let silo_writers: Vec<std::sync::Mutex<BulkDocWriter>> = writers
+            .into_iter()
+            .map(std::sync::Mutex::new)
+            .collect();
+
+        // Only userId is in the field index — nsfwLevel is "filter_only"
+        let mut field_idx: HashMap<String, u16> = HashMap::new();
+        field_idx.insert("userId".to_string(), 0);
+
+        let fields = vec![
+            DumpFieldMapping::Expanded {
+                column: "nsfwLevel".to_string(),
+                target: "nsfwLevel".to_string(),
+            },
+            DumpFieldMapping::Expanded {
+                column: "userId".to_string(),
+                target: "userId".to_string(),
+            },
+        ];
+        let col_idx: HashMap<String, usize> =
+            [("nsfwLevel".to_string(), 0), ("userId".to_string(), 1)]
+                .into_iter()
+                .collect();
+
+        let empty_enriched = dump_enrichment::EnrichedFields::default();
+        let computed_defs: Vec<ComputedFieldDef> = vec![];
+
+        let row_fields: Vec<&[u8]> = vec![b"5", b"42"];
+        let row = ParsedRow { fields: row_fields, col_index: &col_idx };
+        let indexed: Vec<Option<&str>> = vec![Some("5"), Some("42")];
+        let mut serialize_buf = Vec::new();
+        let mut tuple_buf = Vec::new();
+        let mut write_buf = Vec::new();
+
+        write_silo_row_indexed(
+            &row,
+            &empty_enriched,
+            &computed_defs,
+            &indexed,
+            &col_idx,
+            1,
+            &fields,
+            &field_idx,
+            &mut serialize_buf,
+            &mut tuple_buf,
+            &mut write_buf,
+            &silo_writers[0],
+        );
+
+        let locals: Vec<_> = silo_writers
+            .into_iter()
+            .filter_map(|m| m.into_inner().ok()?.into_local_index().ok())
+            .collect();
+        let index = data_silo::merge_indexes(locals, 1);
+        assert_eq!(index.count(), 1);
+
+        index.persist(&dir.join("doc_index.bin")).unwrap();
+        let reader = data_silo::DataSiloReader::open(&dir).unwrap();
+        let doc = reader.get(1).unwrap();
+
+        // Only 1 field (userId) should be written — nsfwLevel was filter_only
+        let fidx = u16::from_le_bytes([doc[0], doc[1]]);
+        assert_eq!(fidx, 0, "only field_idx 0 (userId) should be present");
+        // Doc should contain exactly 1 field tuple
+        let vlen = u32::from_le_bytes([doc[2], doc[3], doc[4], doc[5]]);
+        assert_eq!(doc.len(), 6 + vlen as usize, "doc should have exactly 1 field");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
