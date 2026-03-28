@@ -1,4 +1,11 @@
+---
+status: ACTIVE
+updated: 2026-03-28
+---
+
 # BitDex System Map
+
+> **WARNING:** This system map is incomplete as of 2026-03-28. Missing: caching (unified_cache, doc_cache, bound_store), storage (shard_store, docstore, ops_wal), query execution (planner, executor, query_metrics), and dump processing modules. See CLAUDE.md Architecture Overview for the current complete picture.
 
 Current system paths, showing where logic is duplicated.
 
