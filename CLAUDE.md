@@ -64,7 +64,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 - **MetaStore** (`src/shard_store_meta.rs`): Simple atomic files for metadata that doesn't need generations (slot_counter, deferred_alive, time_buckets, cursors).
 - **Generation pinning**: `pin_generation()` freezes current gen, new writes go to gen N+1. Used by capture start/stop to bracket time windows for replay.
 - **Compaction**: per-shard, triggered when ops count exceeds threshold (default 1,000). Reads snapshot + ops → writes fresh snapshot.
-- **BitmapFs** (`src/bitmap_fs.rs`): Legacy persistence layer. Still exists in code but all ConcurrentEngine I/O now routes through ShardStore.
+- **BitmapFs** (`src/bitmap_fs.rs`): Legacy persistence layer. All ConcurrentEngine and dump processor I/O now routes through ShardStore. BitmapFs is still imported by backfill.rs for live field updates; full removal is post-V2 work.
 
 ### Bitmap Categories
 
@@ -93,13 +93,44 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 - **Persistent via BoundStore** (`src/bound_store.rs`): meta.bin loaded eagerly on startup, bitmap shards lazy-loaded on first query per sort field. Tombstoning invalidates unloaded entries on mutations. Purge via `DELETE /cache/persistent`.
 - Sort queries 2-13x faster at 104M scale via pre-filtered working sets
 
+### Sync V2 Pipeline (feat/sync-v2 branch)
+
+The sync-v2 rewrite replaces the hardcoded V1 bulk loader and outbox poller with a config-driven pipeline.
+
+**Dump Path (bulk load):**
+- `src/dump_processor.rs` — Config-driven CSV/TSV processor. Receives dump instructions via `PUT /dumps` request body (D3 schema). Processes CSVs sequentially per phase (tags → images → resources → tools → techniques → metrics). Mmaps large files, parallel row processing via rayon. Writes bitmaps to ShardStore, docstore tuples via BulkWriter.
+- `src/dump_expression.rs` — Expression evaluator for filter predicates (`(flags >> 10) & 1 = 0`) and computed fields (`max(scannedAt, createdAt)`). Supports bitfield extraction, equality, null check, boolean inversion, identity, lookup_key.
+- `src/dump_enrichment.rs` — HashMap-based enrichment with nested lookups (e.g., Resources → ModelVersion → Model chain). Loaded per-phase, dropped after use.
+
+**Steady-State Path (real-time sync):**
+- PG triggers write ops to `BitdexOps` table → `bitdex-sync` (`src/pg_sync/ops_poller.rs`) polls and POSTs to BitDex
+- `POST /ops` → `src/ops_wal.rs` (append-only WAL with CRC32, fsync per batch)
+- WAL reader thread tails the WAL → `src/ops_processor.rs` applies batches via BitmapSink + DocSink
+- `src/write_coalescer.rs` — Coalesces bitmap writes for flush efficiency
+- LIFO dedup handles re-delivered ops from crash recovery
+
+**Sync Sidecar (`bitdex-sync`):**
+- Renamed from `bitdex-pg-sync`. Subcommands: `pg` (dump + ops poll), `ch` (ClickHouse metrics), `all` (both)
+- `src/pg_sync/sync_config.rs` — YAML-based sync config (replaces hardcoded field mappings)
+- `src/pg_sync/trigger_gen.rs` — Generates PG trigger SQL from sync config
+- `src/pg_sync/ops_poller.rs` — Polls BitdexOps table, POSTs ops to BitDex server
+- Two cursors: WAL byte-offset (MetaStore, used by WAL reader) and BitdexOps row-ID (PG `bitdex_cursors` table, used by ops_poller)
+
 ---
 
 ## Reference Materials
 
 Run `/architecture` for the full guide — design docs, learnings, known gaps, and expectations for updating docs when changing architecture.
 
-Key guides: `docs/guide/api.md` (HTTP API), `docs/guide/query-formats.md` (query syntax), `docs/guide/config-schema.md` (config), `docs/guide/testing.md` (tests), `docs/guide/bitdex-civitai-schema.md` (Civitai fields).
+Key guides: `docs/guide/api.md` (HTTP API), `docs/guide/query-formats.md` (query syntax), `docs/guide/config-schema.md` (config), `docs/guide/testing.md` (tests), `docs/guide/bitdex-civitai-schema.md` (Civitai fields), `docs/guide/team-standards.md` (verification, proof requirements, design process).
+
+Key design docs (in `docs/design/`):
+- **Architecture:** `storage.md` (ShardStore + DocStore V2), `concurrency.md` (ArcSwap, flush/merge), `unified-cache.md` (cache + persistence)
+- **Sync V2:** `pg-sync-v2-final.md` (design spec), `sync-v2-final-implementation-plan.md` (task tracker), `trigger-deployment-process.md`
+- **Data Silos:** `data-silo-architecture.md` (proposed DocStore replacement), `data-silo-implementation-plan.md`
+- **Field Requirements:** `civitai-field-requirements.md` (ground truth for what BitDex serves)
+- **Operations:** `production-readiness-checklist.md` (gate tracker), `runtime-config-reference.md` (all config knobs)
+- **Archived docs** are in `docs/design/archive/` — historical V1 designs, superseded proposals
 
 **New to the project?** Read `docs/HANDOFF.md` for operational context, common pitfalls, and what agents get wrong.
 
@@ -109,7 +140,7 @@ Key guides: `docs/guide/api.md` (HTTP API), `docs/guide/query-formats.md` (query
 
 Run `/dev-guide` for full phase details, workflow expectations, and what's built vs not.
 
-**Summary:** Phases 1-3 COMPLETE. Phase 4 partial (server/metrics/UI done, cache persistence COMPLETE, autovac/admin not started). Phase 5 in progress (shadow mode comparison).
+**Summary:** Core engine phases 1-3 COMPLETE. Phase 4 partial (server/metrics/UI done, cache persistence COMPLETE, autovac/admin not started). Phase 5 in progress (shadow mode comparison). **Sync V2** (feat/sync-v2): Phase 1 (dump pipeline) and Phase 2 (WAL reader) code complete and validated. Phase 3 (activation) 60% built. See `docs/design/production-readiness-checklist.md` for gate status.
 
 ---
 

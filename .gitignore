@@ -21,3 +21,5 @@ tools/perf-reports.jsonl
 # Benchmark and test results — keep only latest per-suite, ignore timestamped history
 docs/test-results/e2e-2*.json
 docs/benchmarks/results/history/
+server.log
+server.stdout.log

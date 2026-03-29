@@ -1,3 +1,8 @@
+---
+status: ACTIVE
+updated: 2026-03-28
+---
+
 # Performance Tuning Roadmap
 
 Current state after the March 13-16 optimization sessions. These are the remaining opportunities ordered by estimated impact.
@@ -13,7 +18,9 @@ Current state after the March 13-16 optimization sessions. These are the remaini
 
 ## High Impact
 
-### 1. staging.clone() cascade on lazy load publish
+### 1. ~~staging.clone() cascade on lazy load publish~~ REVERTED
+
+**Status:** REVERTED (2026-03-26, commit 66323f5). Inter-phase save+unload loses alive bitmap due to flush thread staging/snapshot interaction. Needs careful staging lifecycle management before reattempting.
 
 **Problem:** When a lazy-loaded field is published via ArcSwap, the `staging.clone()` triggers an Arc refcount cascade. `Arc::make_mut()` on the next mutation deep-clones all FilterField HashMaps. Single lazy field load can cost 5+ seconds in publish overhead.
 
@@ -28,7 +35,9 @@ Current state after the March 13-16 optimization sessions. These are the remaini
 
 **Complexity:** High — touches the core concurrency architecture.
 
-### 2. Dynamic cache warming
+### 2. ~~Dynamic cache warming~~ DONE (partially)
+
+**Status:** Endpoint implemented (`POST /api/indexes/{name}/warm`). External analysis agent not yet built.
 
 **Problem:** First query for any new filter+sort combination pays 37-70ms cold miss.
 
@@ -38,7 +47,9 @@ Current state after the March 13-16 optimization sessions. These are the remaini
 
 **Complexity:** Low for the endpoint (done). Medium for the analysis agent.
 
-### 3. Config serialization roundtrip
+### 3. ~~Config serialization roundtrip~~ DONE
+
+**Status:** Fixed (commit 3e4e2d6). Config roundtrip verified: eager_load flags survive PATCH save cycle.
 
 **Problem:** The server rewrites `config.json` and drops fields with default values (like `eager_load: false`) because `#[serde(default)]` is set without `#[serde(skip_serializing_if)]`. Manual config edits get lost on next save.
 
@@ -50,7 +61,9 @@ Current state after the March 13-16 optimization sessions. These are the remaini
 
 ## Medium Impact
 
-### 4. fused() clone on first Eq clause
+### 4. ~~fused() clone on first Eq clause~~ DONE
+
+**Status:** Fixed (commit 5df3d87). `fused_cow()` method now used throughout executor.rs for Or clause evaluation.
 
 **Problem:** The first filter clause in `compute_filters` needs an owned bitmap for the accumulator. `fused()` clones the base bitmap (~11ms for nsfwLevel at 28M bits). Subsequent clauses use the reference-AND fast path and avoid cloning.
 
@@ -60,7 +73,9 @@ Current state after the March 13-16 optimization sessions. These are the remaini
 
 **Complexity:** Medium — requires changing the accumulator pattern in `compute_filters`.
 
-### 5. Parallel existence set loading
+### 5. ~~Parallel existence set loading~~ DONE
+
+**Status:** Fixed (commit 3e4e2d6). Multi-value fields now use rayon par_iter when 2+ fields.
 
 **Problem:** Existence sets for multi_value fields load sequentially on startup (~2s for 5 fields). Each reads fpack headers to build a HashSet of known keys.
 
@@ -102,7 +117,9 @@ Current state after the March 13-16 optimization sessions. These are the remaini
 
 **Complexity:** Low (config change), but tradeoff: more disk writes.
 
-### 9. Parallel preload batch
+### 9. ~~Parallel preload batch~~ DONE
+
+**Status:** Fixed (commit 3e4e2d6). Combined sort + filter field loading into single parallel batch via `ensure_fields_loaded()`.
 
 **Problem:** `preload_eager_fields` loads sort fields first, then filter fields. Could load both in one parallel batch.
 

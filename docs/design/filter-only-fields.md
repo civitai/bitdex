@@ -1,3 +1,8 @@
+---
+status: ACTIVE
+updated: 2026-03-28
+---
+
 # Filter-Only Fields
 
 **Status:** Implemented (branch `feature/collection-ids-filter-only`)

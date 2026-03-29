@@ -32,14 +32,14 @@ Add a configurable idle timeout to multi-value filter fields. Values untouched f
   "name": "tagIds",
   "field_type": "multi_value",
   "eviction": {
-    "idle_cycles": 50000
+    "idle_seconds": 30
   }
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `idle_cycles` | `u32` | Evict values untouched for this many flush cycles. At 100us flush interval with adaptive backoff, 50,000 cycles is roughly 5-50 seconds of wall time depending on load. |
+| `idle_seconds` | `f64` | Evict values untouched for this many seconds of wall-clock time. Internally tracked via millisecond timestamps. |
 
 Fields without an `eviction` block never evict (current behavior). Only meaningful on `multi_value` fields — `single_value` and `boolean` fields have low cardinality and should always stay resident.
 
@@ -56,8 +56,8 @@ Store access stamps in a separate `Arc<DashMap<(Arc<str>, u64), AtomicU64>>` on 
 ```rust
 pub struct ConcurrentEngine {
     // ... existing fields ...
-    /// Per-value last-accessed flush cycle. Shared between readers and flush thread.
-    /// Key: (field_name, value_id). Value: flush cycle when last touched.
+    /// Per-value last-accessed wall-clock millisecond. Shared between readers and flush thread.
+    /// Key: (field_name, value_id). Value: wall-clock ms when last touched.
     /// Only contains entries for eviction-enabled fields.
     eviction_stamps: Arc<DashMap<(Arc<str>, u64), AtomicU64>>,
     /// Global flush cycle counter, incremented by flush thread.
@@ -80,11 +80,11 @@ pub struct FilterField {
 ```rust
 // In the query path, after looking up a filter value:
 if field.config.eviction.is_some() {
-    let cycle = self.flush_cycle.load(Ordering::Relaxed);
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).as_millis() as u64;
     self.eviction_stamps
         .entry((field_name.clone(), value_id))
-        .or_insert_with(|| AtomicU64::new(cycle))
-        .store(cycle, Ordering::Relaxed);
+        .or_insert_with(|| AtomicU64::new(now_ms))
+        .store(now_ms, Ordering::Relaxed);
 }
 ```
 
@@ -93,17 +93,18 @@ DashMap provides lock-free concurrent reads and sharded writes — no contention
 **Eviction sweep:** The flush thread reads from the same DashMap:
 
 ```rust
-fn evict_idle(&mut self, field_name: &str, field: &mut FilterField, current_cycle: u64) {
-    let idle_cycles = match &field.config.eviction {
-        Some(e) => e.idle_cycles as u64,
+fn evict_idle(&mut self, field_name: &str, field: &mut FilterField, now_ms: u64) {
+    let idle_ms = match &field.config.eviction {
+        Some(e) => (e.idle_seconds * 1000.0) as u64,
         None => return,
     };
+    let cutoff_ms = now_ms.saturating_sub(idle_ms);
 
     let to_evict: Vec<u64> = field.bitmaps.keys()
         .filter(|&&value| {
             self.eviction_stamps
                 .get(&(field_name.into(), value))
-                .map(|entry| current_cycle - entry.load(Ordering::Relaxed) > idle_cycles)
+                .map(|entry| entry.load(Ordering::Relaxed) < cutoff_ms)
                 .unwrap_or(true) // no stamp = never touched = evict
         })
         .copied()
@@ -251,9 +252,9 @@ Add gauges to track eviction behavior:
 |---|---|---|
 | `bitdex_eviction_total` | Counter (per field) | Total values evicted since startup |
 | `bitdex_eviction_resident_values` | Gauge (per field) | Currently resident value count |
-| `bitdex_eviction_reloads_total` | Counter (per field) | Times a value was re-loaded after eviction |
+| `bitdex_eviction_reloads_total` | Counter (per field) | Times a value was re-loaded after eviction (**not yet implemented**) |
 
-These let operators tune `idle_cycles` per field based on actual eviction/reload rates.
+These let operators tune `idle_seconds` per field based on actual eviction/reload rates.
 
 ## Worked Example: Civitai tagIds
 

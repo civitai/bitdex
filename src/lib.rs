@@ -1,6 +1,9 @@
 pub mod bitmap_fs;
+pub mod bitmap_memory_cache;
 pub mod bound_store;
 pub mod bucket_diff_log;
+pub mod dump_enrichment;
+pub mod dump_expression;
 #[cfg(feature = "pg-sync")]
 pub mod ops_processor;
 #[cfg(feature = "pg-sync")]
@@ -46,5 +49,7 @@ pub mod types;
 pub mod unified_cache;
 pub mod versioned_bitmap;
 pub mod write_coalescer;
+#[cfg(feature = "pg-sync")]
+pub mod dump_processor;
 #[cfg(feature = "pg-sync")]
 pub mod pg_sync;

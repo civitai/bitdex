@@ -51,6 +51,13 @@ pub struct Metrics {
     pub process_rss_bytes: IntGauge,
     pub process_rss_peak_bytes: IntGauge,
 
+    // -- Jemalloc memory (populated when heap-prof feature is active) --
+    pub jemalloc_allocated_bytes: IntGauge,
+    pub jemalloc_resident_bytes: IntGauge,
+
+    // -- Startup --
+    pub startup_duration_seconds: IntGauge,
+
     // -- Write pipeline --
     pub flush_last_duration_seconds: IntGaugeVec,
     pub snapshot_publish_total: IntGaugeVec,
@@ -117,12 +124,16 @@ pub struct Metrics {
     pub pgsync_rows_fetched_total: IntCounterVec,
     pub pgsync_cursor_position: IntGaugeVec,
 
+    pub pgsync_errors_total: IntCounterVec,
+
     // V2 sync metrics (unified namespace with source label)
     pub sync_cursor_position: IntGaugeVec,
     pub sync_max_id: IntGaugeVec,
     pub sync_lag_rows: IntGaugeVec,
     pub sync_ops_total: IntCounterVec,
     pub sync_wal_bytes: IntGaugeVec,
+    pub sync_cycle_duration_seconds: HistogramVec,
+    pub sync_wal_pending_bytes: IntGaugeVec,
 }
 
 impl Metrics {
@@ -338,6 +349,19 @@ impl Metrics {
         ).unwrap();
         let process_rss_peak_bytes = IntGauge::new(
             "bitdex_process_rss_peak_bytes", "Peak process RSS in bytes since startup",
+        ).unwrap();
+
+        // Jemalloc memory (refreshed on scrape when heap-prof feature is active)
+        let jemalloc_allocated_bytes = IntGauge::new(
+            "bitdex_jemalloc_allocated_bytes", "Jemalloc stats.allocated — total bytes allocated by the application",
+        ).unwrap();
+        let jemalloc_resident_bytes = IntGauge::new(
+            "bitdex_jemalloc_resident_bytes", "Jemalloc stats.resident — RSS bytes accounted for by jemalloc",
+        ).unwrap();
+
+        // Startup duration (set once after index restore completes)
+        let startup_duration_seconds = IntGauge::new(
+            "bitdex_startup_duration_seconds", "Time spent loading bitmap indexes at startup",
         ).unwrap();
 
         let flush_apply_nanos = IntGaugeVec::new(
@@ -576,6 +600,11 @@ impl Metrics {
             &["replica"],
         )
         .unwrap();
+        let pgsync_errors_total = IntCounterVec::new(
+            Opts::new("bitdex_pgsync_errors_total", "Total sync errors (poll failures, WAL read errors)"),
+            &["source"],
+        )
+        .unwrap();
 
         // V2 sync metrics (unified namespace)
         let sync_cursor_position = IntGaugeVec::new(
@@ -596,6 +625,17 @@ impl Metrics {
         ).unwrap();
         let sync_wal_bytes = IntGaugeVec::new(
             Opts::new("bitdex_sync_wal_bytes", "Current WAL file size in bytes"),
+            &["source"],
+        ).unwrap();
+        let sync_cycle_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_sync_cycle_duration_seconds",
+                "WAL reader cycle processing duration",
+            ).buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]),
+            &["source"],
+        ).unwrap();
+        let sync_wal_pending_bytes = IntGaugeVec::new(
+            Opts::new("bitdex_sync_wal_pending_bytes", "Unprocessed WAL bytes (file size - cursor)"),
             &["source"],
         ).unwrap();
 
@@ -651,6 +691,9 @@ impl Metrics {
             .unwrap();
         registry.register(Box::new(process_rss_bytes.clone())).unwrap();
         registry.register(Box::new(process_rss_peak_bytes.clone())).unwrap();
+        registry.register(Box::new(jemalloc_allocated_bytes.clone())).unwrap();
+        registry.register(Box::new(jemalloc_resident_bytes.clone())).unwrap();
+        registry.register(Box::new(startup_duration_seconds.clone())).unwrap();
         registry.register(Box::new(flush_apply_nanos.clone())).unwrap();
         registry.register(Box::new(flush_cache_nanos.clone())).unwrap();
         registry.register(Box::new(flush_publish_nanos.clone())).unwrap();
@@ -700,11 +743,14 @@ impl Metrics {
         registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
         registry.register(Box::new(pgsync_rows_fetched_total.clone())).unwrap();
         registry.register(Box::new(pgsync_cursor_position.clone())).unwrap();
+        registry.register(Box::new(pgsync_errors_total.clone())).unwrap();
         registry.register(Box::new(sync_cursor_position.clone())).unwrap();
         registry.register(Box::new(sync_max_id.clone())).unwrap();
         registry.register(Box::new(sync_lag_rows.clone())).unwrap();
         registry.register(Box::new(sync_ops_total.clone())).unwrap();
         registry.register(Box::new(sync_wal_bytes.clone())).unwrap();
+        registry.register(Box::new(sync_cycle_duration_seconds.clone())).unwrap();
+        registry.register(Box::new(sync_wal_pending_bytes.clone())).unwrap();
 
         Self {
             registry,
@@ -739,6 +785,9 @@ impl Metrics {
             snapshot_publish_total,
             process_rss_bytes,
             process_rss_peak_bytes,
+            jemalloc_allocated_bytes,
+            jemalloc_resident_bytes,
+            startup_duration_seconds,
             flush_apply_nanos,
             flush_cache_nanos,
             flush_publish_nanos,
@@ -780,11 +829,14 @@ impl Metrics {
             pgsync_cycle_seconds,
             pgsync_rows_fetched_total,
             pgsync_cursor_position,
+            pgsync_errors_total,
             sync_cursor_position,
             sync_max_id,
             sync_lag_rows,
             sync_ops_total,
             sync_wal_bytes,
+            sync_cycle_duration_seconds,
+            sync_wal_pending_bytes,
         }
     }
 

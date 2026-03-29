@@ -18,9 +18,13 @@
 //!   --default-format <FMT>        Default query format: bitdex, compact, meilisearch (default: bitdex)
 //!   --max-query-concurrency <N>   Max concurrent queries; 0 = unlimited (default: 0)
 
-#[cfg(not(feature = "heap-prof"))]
-#[global_allocator]
-static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
+// rpmalloc disabled — causes fragmentation-induced OOM during dump processing
+// (107M rows × per-row Vec allocation churn exhausts rpmalloc's free lists).
+// System allocator (Windows HeapAlloc) handles this pattern correctly.
+// Production K8s uses jemalloc via heap-prof feature.
+// #[cfg(not(feature = "heap-prof"))]
+// #[global_allocator]
+// static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
 
 #[cfg(feature = "heap-prof")]
 #[global_allocator]

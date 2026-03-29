@@ -15,7 +15,7 @@
 //!   ...
 //! ```
 //!
-//! Reuses proven patterns from BitmapFs: atomic tmp→fsync→rename writes,
+//! Reuses proven patterns: atomic tmp→fsync→rename writes,
 //! pack file format with index+data sections, lazy loading.
 
 use std::path::{Path, PathBuf};

@@ -299,6 +299,59 @@ pub fn diff_document_partial(
     config: &Config,
     registry: &FieldRegistry,
 ) -> Vec<MutationOp> {
+    // [2.5] Deferred alive check: if the PATCH changes publishedAt to a future
+    // date, defer this slot. Same logic as diff_document — clear old bitmaps
+    // and defer the alive bit.
+    if let Some(ref da_config) = config.deferred_alive {
+        if let Some(fv) = new_doc.fields.get(&da_config.source_field) {
+            if let FieldValue::Single(Value::Integer(ts)) = fv {
+                let mut activate_at = *ts as u64;
+                if da_config.ms_to_seconds {
+                    activate_at /= 1000;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if activate_at > now {
+                    let mut ops = Vec::new();
+                    let empty_fields = HashMap::new();
+                    let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
+
+                    // Clear old bitmaps if this was a live slot
+                    for filter_config in &config.filter_fields {
+                        if let Some(old_val) = old_fields.get(&filter_config.name) {
+                            let arc_name = registry.get(&filter_config.name);
+                            collect_filter_remove_ops(&mut ops, &arc_name, slot, old_val);
+                        }
+                    }
+                    for sort_config in &config.sort_fields {
+                        if let Some(old_val) = old_fields.get(&sort_config.name) {
+                            if let FieldValue::Single(val) = old_val {
+                                if let Some(old_s) = value_to_sort_u32(val) {
+                                    let arc_name = registry.get(&sort_config.name);
+                                    let num_bits = sort_config.bits as usize;
+                                    for bit in 0..num_bits {
+                                        if (old_s >> bit) & 1 == 1 {
+                                            ops.push(MutationOp::SortClear {
+                                                field: arc_name.clone(),
+                                                bit_layer: bit,
+                                                slots: vec![slot],
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ops.push(MutationOp::AliveRemove { slots: vec![slot] });
+                    ops.push(MutationOp::DeferredAlive { slot, activate_at });
+                    return ops;
+                }
+            }
+        }
+    }
+
     let mut ops = Vec::new();
     let empty_fields = HashMap::new();
     let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
@@ -1628,5 +1681,61 @@ mod tests {
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[10, 20, 5]), 5);
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[0]), 0);
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[]), 0);
+    }
+
+    #[test]
+    fn test_diff_document_partial_deferred_alive() {
+        use crate::config::{DeferredAliveConfig, FilterFieldConfig, SortFieldConfig};
+        use crate::filter::FilterFieldType;
+        use crate::write_coalescer::MutationOp;
+
+        let mut config = Config::default();
+        config.filter_fields = vec![FilterFieldConfig {
+            name: "nsfwLevel".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+        }];
+        config.sort_fields = vec![SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        }];
+        config.deferred_alive = Some(DeferredAliveConfig {
+            source_field: "publishedAt".into(),
+            ms_to_seconds: false,
+        });
+
+        let registry = FieldRegistry::from_config(&config);
+
+        // Old doc has nsfwLevel=16 and publishedAt=1000 (alive)
+        let mut old_fields = std::collections::HashMap::new();
+        old_fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(16)));
+        old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(1000)));
+        let old_doc = crate::docstore::StoredDoc { fields: old_fields, schema_version: 0 };
+
+        // PATCH changes publishedAt to far future (year 2050)
+        let future_ts = 2524608000i64;
+        let mut new_fields = std::collections::HashMap::new();
+        new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(future_ts)));
+        let new_doc = Document { fields: new_fields };
+
+        let ops = diff_document_partial(42, Some(&old_doc), &new_doc, &config, &registry);
+
+        // Should contain: filter removes (clear old nsfwLevel), sort clears,
+        // alive remove, and deferred alive
+        let has_deferred = ops.iter().any(|op| matches!(op, MutationOp::DeferredAlive { .. }));
+        let has_alive_remove = ops.iter().any(|op| matches!(op, MutationOp::AliveRemove { .. }));
+
+        assert!(has_deferred, "PATCH to future publishedAt should defer alive");
+        assert!(has_alive_remove, "PATCH to future should remove alive bit");
+
+        // Should NOT have any filter inserts or sort sets (all bitmaps cleared)
+        let has_filter_insert = ops.iter().any(|op| matches!(op, MutationOp::FilterInsert { .. }));
+        assert!(!has_filter_insert, "deferred should not insert any filter bitmaps");
     }
 }

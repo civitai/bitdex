@@ -549,7 +549,7 @@ pub fn create_package(
                     }
                 }
 
-                // Include bitmaps/ (legacy BitmapFs, if present)
+                // Include bitmaps/ directory (if present)
                 let bitmaps = index_path.join("bitmaps");
                 if bitmaps.is_dir() {
                     for file in walkdir(&bitmaps).map_err(|e| format!("walk bitmaps: {e}"))? {

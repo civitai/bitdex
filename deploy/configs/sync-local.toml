@@ -1,0 +1,30 @@
+# Sync V2 — Local E2E Testing Config
+# Used with: bitdex-sync --config deploy/configs/sync-local.toml pg
+
+# PG connection — needs kubectl port-forward to PG replica
+# Override with DATABASE_URL env var if preferred
+postgres_url = "postgresql://bitdex:0ZuY2sURJTuc1AiQVmoSi9EB07ZVw49F@localhost:5433/civitai"
+
+# BitDex server (must be running separately)
+bitdex_url = "http://localhost:3001"
+
+# Data directory (where indexes are stored)
+data_dir = "data/gate5-e2e"
+
+# Index config directory (contains civitai-index.json)
+index_dir = "data/gate5-e2e/indexes/civitai"
+
+# Where CSVs are stored / downloaded to
+stage_dir = "data/load_stage"
+
+# Sync config YAML — defines dump phases, triggers, ops mappings
+sync_config_path = "docs/design/reference/sync-config-civitai.yaml"
+
+# PG pool size for COPY queries
+pg_pool_size = 4
+
+# Ops polling interval (seconds)
+poll_interval_secs = 5
+
+# Replica ID for cursor naming
+replica_id = "local-gate5"

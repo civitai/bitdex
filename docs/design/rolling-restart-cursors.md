@@ -161,7 +161,7 @@ On startup, `ConcurrentEngine` loads all cursor files from the cursors directory
    - If not found (fresh instance): start from 0 (full catch-up from outbox, or trigger bulk load)
 3. Begins polling
 
-### Poll Loop (outbox_poller.rs)
+### Poll Loop (ops_poller.rs — V2 upgrade)
 
 Current flow:
 ```
@@ -642,7 +642,7 @@ containers:
             key: DATABASE_URL
 ```
 
-The sidecar waits for BitDex to be healthy before polling. On boot, the outbox poller loops on `GET /api/health` until it returns 200, then reads the cursor. During steady-state, every poll cycle checks health first — if BitDex is unreachable, the PG fetch is skipped entirely to avoid wasted work. The metrics poller has the same health gate.
+The sidecar waits for BitDex to be healthy before polling. On boot, the ops poller (V2 upgrade from outbox poller) loops on `GET /api/health` until it returns 200, then reads the cursor. During steady-state, every poll cycle checks health first — if BitDex is unreachable, the PG fetch is skipped entirely to avoid wasted work. The metrics poller has the same health gate.
 
 On K8s 1.28+, native sidecars (`restartPolicy: Always` in `initContainers`) guarantee ordering. Check cluster K8s version — the current cluster runs v1.33-1.35 so this is available.
 
