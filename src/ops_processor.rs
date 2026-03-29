@@ -887,10 +887,11 @@ pub fn apply_ops_batch<S: BitmapSink>(
             for source_field in &changed_sources {
                 if let Some(deps) = meta.computed_deps.get(*source_field) {
                     for dep in deps {
-                        // Clear old computed value (using old source values, falling back to stored)
+                        // Clear old computed value (using old source values, falling back to stored).
+                        // Do NOT fall through to sort_values — it has the NEW values, which would
+                        // make old_computed = new_computed and corrupt the bitmap clear.
                         let old_values: Vec<u32> = dep.source_fields.iter()
                             .map(|sf| old_sort_values.get(sf.as_str())
-                                .or_else(|| sort_values.get(sf.as_str()))
                                 .or_else(|| stored_sort_values.get(sf.as_str()))
                                 .copied()
                                 .unwrap_or(0))
@@ -907,10 +908,11 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             }
                         }
 
-                        // Set new computed value (using new source values, falling back to stored)
+                        // Set new computed value (using new source values, falling back to stored).
+                        // Do NOT fall through to old_sort_values — for unchanged fields, the
+                        // stored value IS the current (and thus new) value.
                         let new_values: Vec<u32> = dep.source_fields.iter()
                             .map(|sf| sort_values.get(sf.as_str())
-                                .or_else(|| old_sort_values.get(sf.as_str()))
                                 .or_else(|| stored_sort_values.get(sf.as_str()))
                                 .copied()
                                 .unwrap_or(0))
