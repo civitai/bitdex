@@ -16,7 +16,7 @@ ARG TARGET_CPU=native
 ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 
 RUN cargo build --release --features server,pg-sync --bin bitdex-server && \
-    cargo build --release --features pg-sync --bin bitdex-pg-sync
+    cargo build --release --features pg-sync --bin bitdex-sync
 
 # --- Runtime ---
 FROM debian:bookworm-slim
@@ -26,7 +26,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/bitdex-server /usr/local/bin/bitdex-server
-COPY --from=builder /build/target/release/bitdex-pg-sync /usr/local/bin/bitdex-pg-sync
+COPY --from=builder /build/target/release/bitdex-sync /usr/local/bin/bitdex-sync
 COPY --from=builder /build/static /opt/bitdex/static
 
 VOLUME /data
