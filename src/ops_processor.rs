@@ -687,6 +687,18 @@ pub fn apply_ops_batch<S: BitmapSink>(
 ) -> (usize, usize, usize) {
     dedup_ops(batch);
 
+    // One-time diagnostic: log computed_deps status
+    if !batch.is_empty() && !meta.computed_deps.is_empty() {
+        eprintln!(
+            "apply_ops_batch: {} entries, computed_deps has {} source fields: {:?}",
+            batch.len(),
+            meta.computed_deps.len(),
+            meta.computed_deps.keys().collect::<Vec<_>>(),
+        );
+    } else if !batch.is_empty() && meta.computed_deps.is_empty() {
+        eprintln!("apply_ops_batch: {} entries, computed_deps is EMPTY", batch.len());
+    }
+
     let mut applied = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
@@ -824,6 +836,15 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // First clear old computed value bits, then set new ones.
         // PG triggers emit remove+set pairs, so we have both old and new values.
         if !meta.computed_deps.is_empty() {
+            // Diagnostic: log computed_deps trigger for first batch entry with sort changes
+            if !sort_values.is_empty() || !old_sort_values.is_empty() {
+                eprintln!(
+                    "  computed_deps: slot={} sort_vals={:?} old_sort_vals={:?} deps_keys={:?}",
+                    slot, sort_values.keys().collect::<Vec<_>>(),
+                    old_sort_values.keys().collect::<Vec<_>>(),
+                    meta.computed_deps.keys().collect::<Vec<_>>(),
+                );
+            }
             // Determine which source fields changed (have either old or new value)
             let mut changed_sources: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for k in sort_values.keys() {
