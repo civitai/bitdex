@@ -57,6 +57,10 @@ pub struct PgSyncConfig {
     /// If set, the loader reads CSVs from here instead of downloading from PG.
     /// Defaults to `{storage_dir}/load_stage` when not specified.
     pub stage_dir: Option<PathBuf>,
+
+    /// Path to the V2 sync config YAML (triggers + dump phases).
+    /// If set, used for trigger reconciliation and dump pipeline.
+    pub sync_config_path: Option<PathBuf>,
 }
 
 fn default_index_subdir() -> String {
@@ -140,16 +144,33 @@ pub struct IndexDefinition {
 }
 
 impl IndexDefinition {
-    /// Load an `IndexDefinition` from a JSON file path.
+    /// Load an `IndexDefinition` from a config file (YAML or JSON).
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
-        serde_json::from_str(&contents)
-            .map_err(|e| format!("failed to parse {}: {}", path.display(), e))
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        match ext {
+            "yaml" | "yml" => serde_yaml::from_str(&contents)
+                .map_err(|e| format!("failed to parse YAML {}: {}", path.display(), e)),
+            _ => serde_json::from_str(&contents)
+                .map_err(|e| format!("failed to parse JSON {}: {}", path.display(), e)),
+        }
     }
 
-    /// Load an `IndexDefinition` from the `config.json` file inside `dir`.
+    /// Load an `IndexDefinition` from config.yaml (preferred) or config.json inside `dir`.
     pub fn from_dir(dir: &Path) -> Result<Self, String> {
-        Self::from_file(&dir.join("config.json"))
+        let yaml = dir.join("config.yaml");
+        if yaml.exists() {
+            return Self::from_file(&yaml);
+        }
+        let yml = dir.join("config.yml");
+        if yml.exists() {
+            return Self::from_file(&yml);
+        }
+        let json = dir.join("config.json");
+        if json.exists() {
+            return Self::from_file(&json);
+        }
+        Err(format!("no config.yaml or config.json found in {}", dir.display()))
     }
 }

@@ -46,6 +46,7 @@ pub enum TaskType {
     Rebuild,
     AddFields,
     RemoveFields,
+    Dump,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -241,12 +242,67 @@ impl Drop for TaskGuard {
     }
 }
 
-/// Persisted index definition (saved as config.json in the index directory).
+/// Persisted index definition (saved as config.yaml or config.json in the index directory).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDefinition {
     pub name: String,
     pub config: Config,
     pub data_schema: DataSchema,
+}
+
+impl IndexDefinition {
+    /// Load an index definition from a file, auto-detecting format from extension.
+    pub fn from_file(path: &std::path::Path) -> std::result::Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        match ext {
+            "yaml" | "yml" => {
+                serde_yaml::from_str(&content)
+                    .map_err(|e| format!("YAML parse error in {}: {e}", path.display()))
+            }
+            "json" => {
+                serde_json::from_str(&content)
+                    .map_err(|e| format!("JSON parse error in {}: {e}", path.display()))
+            }
+            other => Err(format!("unsupported index config format: '{other}'")),
+        }
+    }
+
+    /// Save the index definition to a YAML file in the given directory.
+    pub fn save_yaml(&self, dir: &std::path::Path) -> std::result::Result<(), String> {
+        let yaml = serde_yaml::to_string(self)
+            .map_err(|e| format!("Failed to serialize config to YAML: {e}"))?;
+        let path = dir.join("config.yaml");
+        let tmp = dir.join("config.yaml.tmp");
+        std::fs::write(&tmp, &yaml)
+            .map_err(|e| format!("Failed to write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("Failed to rename to {}: {e}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Find the index config file in a directory. Checks config.yaml, config.yml, config.json.
+pub fn find_index_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let yaml = dir.join("config.yaml");
+    if yaml.exists() {
+        return Some(yaml);
+    }
+    let yml = dir.join("config.yml");
+    if yml.exists() {
+        return Some(yml);
+    }
+    let json = dir.join("config.json");
+    if json.exists() {
+        return Some(json);
+    }
+    None
 }
 
 /// Reverse string maps for MappedString fields: field_name → (int → original_string).
@@ -270,6 +326,8 @@ struct IndexState {
 struct AppState {
     data_dir: PathBuf,
     index: Mutex<Option<IndexState>>,
+    /// Set to true during graceful shutdown to signal background threads to exit.
+    shutting_down: AtomicBool,
     metrics: Metrics,
     parser_registry: crate::parser::registry::ParserRegistry,
     enable_traces: AtomicBool,
@@ -299,6 +357,16 @@ struct AppState {
     /// Dump registry for tracking table dump lifecycle.
     #[cfg(feature = "pg-sync")]
     dump_registry: Mutex<crate::pg_sync::dump::DumpRegistry>,
+    /// Shared slot watermark for progressive shard pre-creation.
+    /// Updated by dump phases as they see new max slot IDs.
+    #[cfg(feature = "pg-sync")]
+    slot_watermark: Arc<std::sync::atomic::AtomicU64>,
+    /// Pre-creator done signal — set when we want to stop the background thread.
+    #[cfg(feature = "pg-sync")]
+    precreator_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the pre-creator has been started.
+    #[cfg(feature = "pg-sync")]
+    precreator_started: std::sync::atomic::AtomicBool,
 }
 
 type SharedState = Arc<AppState>;
@@ -987,6 +1055,7 @@ impl BitdexServer {
         let state = Arc::new(AppState {
             data_dir: self.data_dir.clone(),
             index: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
             metrics: Metrics::new(),
             parser_registry: registry,
             enable_traces: AtomicBool::new(self.enable_traces),
@@ -1009,11 +1078,23 @@ impl BitdexServer {
                 let dumps_path = self.data_dir.join("dumps.json");
                 Mutex::new(crate::pg_sync::dump::DumpRegistry::load(&dumps_path))
             },
+            #[cfg(feature = "pg-sync")]
+            slot_watermark: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "pg-sync")]
+            precreator_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "pg-sync")]
+            precreator_started: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Try to restore an existing index from disk
+        let restore_start = std::time::Instant::now();
         if let Err(e) = restore_index(&state) {
             eprintln!("Warning: failed to restore index from disk: {e}");
+        }
+        let restore_elapsed = restore_start.elapsed();
+        state.metrics.startup_duration_seconds.set(restore_elapsed.as_secs() as i64);
+        if state.index.lock().is_some() {
+            eprintln!("Index restore took {:.2}s", restore_elapsed.as_secs_f64());
         }
 
         // Apply persisted enabled_metrics from restored config
@@ -1039,7 +1120,7 @@ impl BitdexServer {
 
         // Spawn WAL reader thread if pg-sync feature is enabled and index exists
         #[cfg(feature = "pg-sync")]
-        {
+        let _wal_handle: Option<std::thread::JoinHandle<()>> = {
             let wal_dir = self.data_dir.join("wal");
             let wal_path = wal_dir.join("ops.wal");
             let cursor_path = wal_dir.join("cursor");
@@ -1051,7 +1132,7 @@ impl BitdexServer {
                     let mut reader = crate::ops_wal::WalReader::new(&wal_path, cursor);
                     eprintln!("WAL reader started (cursor={cursor}, path={})", wal_path.display());
 
-                    loop {
+                    while !wal_state.shutting_down.load(Ordering::Relaxed) {
                         // Read a batch from the WAL
                         match reader.read_batch(10_000) {
                             Ok(batch) if !batch.entries.is_empty() => {
@@ -1062,16 +1143,31 @@ impl BitdexServer {
                                 };
 
                                 if let Some(engine) = engine {
-                                    // Build FieldMeta and CoalescerSink for the ops processor
+                                    let cycle_start = std::time::Instant::now();
+
+                                    // Build FieldMeta, CoalescerSink, and DocWriter for the ops processor
                                     let meta = crate::ops_processor::FieldMeta::from_config(engine.config());
                                     let sender = engine.mutation_sender();
                                     let mut sink = crate::ingester::CoalescerSink::new(sender);
+                                    let mut doc_writer = crate::ops_processor::DocWriter::new(
+                                        engine.docstore_arc(),
+                                    );
 
                                     let mut entries = batch.entries;
                                     let (applied, skipped, errors) =
                                         crate::ops_processor::apply_ops_batch(
                                             &mut sink, &meta, &mut entries, Some(&engine),
+                                            Some(&mut doc_writer),
                                         );
+
+                                    // Invalidate doc cache for mutated entities so
+                                    // GET /documents returns fresh data after ops.
+                                    if applied > 0 {
+                                        for entry in &entries {
+                                            let slot = entry.entity_id as u32;
+                                            engine.evict_doc_cache(slot);
+                                        }
+                                    }
 
                                     if applied > 0 || errors > 0 {
                                         eprintln!(
@@ -1079,17 +1175,29 @@ impl BitdexServer {
                                             reader.cursor()
                                         );
                                     }
+                                    if errors > 0 {
+                                        wal_state.metrics.pgsync_errors_total
+                                            .with_label_values(&["wal-reader"])
+                                            .inc_by(errors as u64);
+                                    }
 
                                     // Persist cursor after successful processing
                                     if let Err(e) = crate::ops_processor::save_cursor(&cursor_path, reader.cursor()) {
                                         eprintln!("WAL reader: failed to save cursor: {e}");
                                     }
 
-                                    // Update WAL bytes metric
+                                    // Update metrics
                                     let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-                                    wal_state.metrics.sync_wal_bytes
+                                    let m = &wal_state.metrics;
+                                    m.sync_wal_bytes
                                         .with_label_values(&["wal-reader"])
                                         .set(wal_size as i64);
+                                    m.sync_cycle_duration_seconds
+                                        .with_label_values(&["wal-reader"])
+                                        .observe(cycle_start.elapsed().as_secs_f64());
+                                    m.sync_wal_pending_bytes
+                                        .with_label_values(&["wal-reader"])
+                                        .set((wal_size as i64) - (reader.cursor() as i64));
                                 } else {
                                     // No index loaded yet — sleep and retry
                                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1101,13 +1209,17 @@ impl BitdexServer {
                             }
                             Err(e) => {
                                 eprintln!("WAL reader error: {e}");
+                                wal_state.metrics.pgsync_errors_total
+                                    .with_label_values(&["wal-reader"])
+                                    .inc();
                                 std::thread::sleep(std::time::Duration::from_secs(1));
                             }
                         }
                     }
+                    eprintln!("WAL reader exiting (shutdown)");
                 })
-                .ok();
-        }
+                .ok()
+        };
 
         let shutdown_state = Arc::clone(&state);
 
@@ -1118,6 +1230,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/config", patch(handle_patch_config))
             .route("/api/indexes/{name}/load", post(handle_load))
             .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
+            .route("/api/indexes/{name}/documents/{slot_id}", get(handle_get_document))
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
             .route("/api/indexes/{name}/documents/patch", patch(handle_patch_documents))
             .route("/api/indexes/{name}/documents/filter-sync", post(handle_filter_sync))
@@ -1178,6 +1291,7 @@ impl BitdexServer {
             .layer(axum::middleware::from_fn_with_state(Arc::clone(&state), measure_http_roundtrip));
 
         eprintln!("BitDex server listening on http://{}", addr);
+        eprintln!("  RAYON_NUM_THREADS={}, actual={}", std::env::var("RAYON_NUM_THREADS").unwrap_or("(not set)".into()), rayon::current_num_threads());
 
         let shutdown_signal = async {
             #[cfg(unix)]
@@ -1216,18 +1330,39 @@ impl BitdexServer {
             .with_graceful_shutdown(shutdown_signal)
             .await?;
 
+        // Signal all background threads + dump tasks to stop
+        shutdown_state.shutting_down.store(true, Ordering::SeqCst);
+        eprintln!("Shutdown signal sent — waiting for active tasks to abort...");
+
+        // Brief wait for spawn_blocking dump tasks to notice the shutdown flag
+        // (they check every 1M rows, so <1s for most phases)
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Wait for the WAL reader thread to exit (it checks shutting_down)
+        #[cfg(feature = "pg-sync")]
+        if let Some(handle) = _wal_handle {
+            eprintln!("Waiting for WAL reader to exit...");
+            handle.join().ok();
+        }
+
         // After graceful shutdown: save snapshot and shut down the engine
         eprintln!("Server stopped, saving final snapshot...");
-        let guard = shutdown_state.index.lock();
-        if let Some(ref index_state) = *guard {
-            if let Err(e) = index_state.engine.save_snapshot() {
-                eprintln!("Warning: failed to save final snapshot: {e}");
+        {
+            let guard = shutdown_state.index.lock();
+            if let Some(ref index_state) = *guard {
+                if let Err(e) = index_state.engine.save_snapshot() {
+                    eprintln!("Warning: failed to save final snapshot: {e}");
+                }
+                // Signal engine background threads to stop (flush, merge, compact, etc.)
+                // Uses request_shutdown(&self) since engine is behind Arc.
+                index_state.engine.request_shutdown();
             }
         }
-        drop(guard);
         eprintln!("Shutdown complete.");
 
-        Ok(())
+        // Force exit to ensure any lingering threads or mmap handles don't
+        // keep the process alive. All data has been saved at this point.
+        std::process::exit(0);
     }
 }
 
@@ -1241,7 +1376,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         return Ok(());
     }
 
-    // Scan for index directories with config.json
+    // Scan for index directories with config.yaml or config.json
     let entries = std::fs::read_dir(&indexes_dir).map_err(|e| e.to_string())?;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -1250,13 +1385,12 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             continue;
         }
 
-        let config_path = path.join("config.json");
-        if !config_path.exists() {
-            continue;
-        }
+        let config_path = match find_index_config(&path) {
+            Some(p) => p,
+            None => continue,
+        };
 
-        let json = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
-        let mut def: IndexDefinition = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        let mut def: IndexDefinition = IndexDefinition::from_file(&config_path)?;
 
         // Load LowCardinalityString dictionaries from disk
         let bitmap_path = path.join("bitmaps");
@@ -1343,14 +1477,14 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 
 /// Delete existing bitmap indexes and rebuild all bitmaps from the docstore.
 ///
-/// Requires an index to already be restored (config.json + docstore must exist).
+/// Requires an index to already be restored (config.yaml/json + docstore must exist).
 /// Deletes the bitmaps directory, runs `build_all_from_docstore`, then
 /// `save_and_unload` to persist and free memory.
 fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
     use crate::concurrent_engine::get_rss_bytes;
 
     let guard = state.index.lock();
-    let idx = guard.as_ref().ok_or("No index found — cannot rebuild without config.json")?;
+    let idx = guard.as_ref().ok_or("No index found — cannot rebuild without config")?;
 
     let engine = Arc::clone(&idx.engine);
     let index_name = idx.definition.name.clone();
@@ -1553,9 +1687,7 @@ async fn handle_create_index(
         config: req.config.clone(),
         data_schema,
     };
-    let config_json = serde_json::to_string_pretty(&definition).unwrap();
-    let config_path = index_dir.join("config.json");
-    if let Err(e) = std::fs::write(&config_path, &config_json) {
+    if let Err(e) = definition.save_yaml(&index_dir) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to write config: {e}")})),
@@ -1863,7 +1995,7 @@ async fn handle_patch_config(
                     eprintln!("Config patch: trace_buffer_size set to {v}");
                 }
 
-                // Toggle metric groups and persist to config.json
+                // Toggle metric groups and persist to config
                 if let Some(ref groups) = patch.enabled_metrics {
                     let bm = groups.iter().any(|g| g == "bitmap_memory");
                     let ev = groups.iter().any(|g| g == "eviction_stats");
@@ -1875,10 +2007,9 @@ async fn handle_patch_config(
                     eprintln!("Config patch: enabled_metrics = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
                 }
 
-                // Persist updated config.json
+                // Persist updated config
                 let index_dir = state.data_dir.join("indexes").join(&name);
-                let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
-                if let Err(e) = std::fs::write(index_dir.join("config.json"), &config_json) {
+                if let Err(e) = idx.definition.save_yaml(&index_dir) {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({
@@ -2402,6 +2533,39 @@ async fn handle_document(
     match engine.get_document(req.slot_id) {
         Ok(Some(doc)) => Json(format_document(&doc, &schema, &reverse_maps, &req.fields, &schema_registry)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// GET /api/indexes/{name}/documents/{slot_id}
+async fn handle_get_document(
+    State(state): State<SharedState>,
+    AxumPath((name, slot_id)): AxumPath<(String, u32)>,
+) -> impl IntoResponse {
+    let (engine, schema, reverse_maps, schema_registry) = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => (
+                Arc::clone(&idx.engine),
+                idx.definition.data_schema.clone(),
+                Arc::clone(&idx.reverse_maps),
+                Arc::clone(&idx.schema_registry),
+            ),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    match engine.get_document(slot_id) {
+        Ok(Some(doc)) => {
+            let include = IncludeDocs::All;
+            Json(format_document(&doc, &schema, &reverse_maps, &include, &schema_registry)).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "document not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -3137,10 +3301,9 @@ async fn handle_add_fields(
                 idx.definition.config.filter_fields.extend(req.filter_fields.clone());
                 idx.definition.config.sort_fields.extend(req.sort_fields.clone());
 
-                // Save updated config.json
+                // Save updated config
                 let index_dir = state.data_dir.join("indexes").join(&name);
-                let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
-                if let Err(e) = std::fs::write(index_dir.join("config.json"), &config_json) {
+                if let Err(e) = idx.definition.save_yaml(&index_dir) {
                     // Rollback config changes
                     for fc in &req.filter_fields {
                         idx.definition.config.filter_fields.retain(|f| f.name != fc.name);
@@ -3253,7 +3416,7 @@ async fn handle_add_fields(
 // Handlers: Remove Fields
 // ---------------------------------------------------------------------------
 
-/// Reload a field's existence set from BitmapFs after external bulk writes.
+/// Reload a field's existence set after external bulk writes.
 async fn handle_reload_field(
     State(state): State<SharedState>,
     AxumPath((name, field)): AxumPath<(String, String)>,
@@ -3322,10 +3485,9 @@ async fn handle_remove_fields(
                     idx.definition.config.sort_fields.retain(|f| &f.name != sname);
                 }
 
-                // Save updated config.json
+                // Save updated config
                 let index_dir = state.data_dir.join("indexes").join(&name);
-                let config_json = serde_json::to_string_pretty(&idx.definition).unwrap();
-                if let Err(e) = std::fs::write(index_dir.join("config.json"), &config_json) {
+                if let Err(e) = idx.definition.save_yaml(&index_dir) {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": format!("Failed to persist config: {e}")})),
@@ -4029,6 +4191,19 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
         m.process_rss_peak_bytes.set(rss);
     }
 
+    // Jemalloc memory stats (only available when heap-prof feature is active)
+    #[cfg(feature = "heap-prof")]
+    {
+        if let Ok(()) = tikv_jemalloc_ctl::epoch::advance() {
+            if let Ok(allocated) = tikv_jemalloc_ctl::stats::allocated::read() {
+                m.jemalloc_allocated_bytes.set(allocated as i64);
+            }
+            if let Ok(resident) = tikv_jemalloc_ctl::stats::resident::read() {
+                m.jemalloc_resident_bytes.set(resident as i64);
+            }
+        }
+    }
+
     // Collect-on-scrape: refresh all gauges from current engine state.
     {
         let guard = state.index.lock();
@@ -4088,32 +4263,33 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(uc.prefetches as i64);
 
-            // Per-field bitmap memory gauges (EXPENSIVE: iterates all bitmaps)
-            // Gated by metrics_bitmap_memory toggle — disable at runtime via
-            // PATCH /config {"enabled_metrics": []} to avoid 52s scrape stalls.
+            // Per-field bitmap memory gauges.
+            // Uses cached scanner totals instead of iterating all bitmaps (52s at 107M).
+            // The bitmap_memory_cache is populated by a background scanner thread
+            // that processes dirty fields in small batches.
             if state.metrics_bitmap_memory.load(Ordering::Relaxed) {
-                let t1 = std::time::Instant::now();
-                let (slot_bytes, _filter_bytes, _sort_bytes, _ce, _cb, filter_details, sort_details) =
-                    engine.bitmap_memory_report();
-                let t_bitmap_mem = t1.elapsed();
-                let _ = t_bitmap_mem; // timing available for debug logging
+                let mem_cache = engine.bitmap_memory_cache();
                 m.slot_bitmap_bytes
                     .with_label_values(&[name])
-                    .set(slot_bytes as i64);
-                for (field, count, bytes) in &filter_details {
+                    .set(mem_cache.cached_slot_bytes() as i64);
+                for (field, bytes, count) in mem_cache.cached_filter_memory() {
                     m.filter_bitmap_bytes
-                        .with_label_values(&[name, field])
-                        .set(*bytes as i64);
+                        .with_label_values(&[name, &field])
+                        .set(bytes as i64);
                     m.filter_bitmap_count
-                        .with_label_values(&[name, field])
-                        .set(*count as i64);
+                        .with_label_values(&[name, &field])
+                        .set(count as i64);
                 }
-                for (field, bytes) in &sort_details {
+                for (field, bytes) in mem_cache.cached_sort_memory() {
                     m.sort_bitmap_bytes
-                        .with_label_values(&[name, field])
-                        .set(*bytes as i64);
+                        .with_label_values(&[name, &field])
+                        .set(bytes as i64);
                 }
             }
+            // NOTE: The old bitmap_memory_report() code that iterated all bitmaps
+            // synchronously on every scrape is replaced above. If you need to verify
+            // scanner accuracy, temporarily call engine.bitmap_memory_report() and
+            // compare against the cached values.
 
             // Flush pipeline stats
             let (pub_count, _cumulative_nanos, last_nanos) = engine.flush_stats();
@@ -4367,28 +4543,194 @@ async fn handle_list_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoRespon
     Json(serde_json::json!({"dumps": {}}))
 }
 
-/// PUT /api/indexes/{name}/dumps — Register a new dump.
+/// PUT /api/indexes/{name}/dumps — Register and process a dump.
+///
+/// Accepts either:
+/// - V2 DumpRequest (has csv_path, slot_field) → async dump processing via dump_processor
+/// - V1 legacy body (has wal_path) → register in dump registry only
 #[cfg(feature = "pg-sync")]
 async fn handle_register_dump(
     State(state): State<SharedState>,
     AxumPath(_name): AxumPath<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let dump_name = body["name"].as_str().unwrap_or("unknown").to_string();
-    let wal_path = body["wal_path"].as_str().map(|s| s.to_string());
+    // Detect V2 DumpRequest by presence of csv_path
+    if body.get("csv_path").is_some() {
+        // V2: parse DumpRequest and process asynchronously
+        let request: crate::dump_processor::DumpRequest = match serde_json::from_value(body) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid dump request: {e}")})),
+                )
+                    .into_response();
+            }
+        };
 
-    let mut reg = state.dump_registry.lock();
-    reg.register(dump_name.clone(), wal_path);
+        let dump_name = request.name.clone();
 
-    let dumps_path = state.data_dir.join("dumps.json");
-    if let Err(e) = reg.save(&dumps_path) {
-        eprintln!("Warning: failed to save dump registry: {e}");
+        // Get engine, tasks, and data_schema from IndexState
+        let (engine, tasks, data_schema) = {
+            let guard = state.index.lock();
+            match guard.as_ref() {
+                Some(idx) => (
+                    Arc::clone(&idx.engine),
+                    Arc::clone(&idx.tasks),
+                    idx.definition.data_schema.clone(),
+                ),
+                None => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": "Index not loaded"})),
+                    )
+                        .into_response();
+                }
+            }
+        };
+
+        // Try to start a task
+        let (task_id, progress) = match tasks.try_start(TaskType::Dump) {
+            Ok(v) => v,
+            Err(active) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "Another task is already running",
+                        "active_task": serde_json::to_value(&active).unwrap_or_default(),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+        // Register in dump registry
+        {
+            let mut reg = state.dump_registry.lock();
+            reg.register(dump_name.clone(), None);
+            let dumps_path = state.data_dir.join("dumps.json");
+            reg.save(&dumps_path).ok();
+        }
+
+        // Start shard pre-creator on first dump (progressive file creation)
+        if !state.precreator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // Derive docstore root from the index storage path
+            let idx_name = state.index.lock().as_ref().map(|e| e.definition.name.clone()).unwrap_or_else(|| "civitai".to_string());
+            let docstore_root = state.data_dir.join("indexes").join(&idx_name).join("docs");
+            let bitmap_path = engine.config().storage.bitmap_path.clone();
+            let filter_names: Vec<String> = engine.config()
+                .filter_fields.iter().map(|f| f.name.clone()).collect();
+            let _precreator = crate::dump_processor::ShardPreCreator::spawn(
+                Arc::clone(&state.slot_watermark),
+                Arc::clone(&state.precreator_done),
+                docstore_root,
+                bitmap_path,
+                filter_names,
+            );
+            eprintln!("  ShardPreCreator started (background file creation)");
+            // Note: precreator handle intentionally leaked — it runs until precreator_done is set
+        }
+        let slot_watermark = Arc::clone(&state.slot_watermark);
+
+        // Spawn async processing — inline parse + save
+        let state_clone = Arc::clone(&state);
+        let dump_name_for_task = dump_name.clone();
+        let stage_dir = std::path::Path::new(&request.csv_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/data/load_stage"))
+            .to_path_buf();
+        let phase_sets_alive = request.sets_alive;
+        let engine_for_reload = Arc::clone(&engine);
+        // Share shutdown flag so dump processor can abort on Ctrl+C
+        let shutdown_flag = Arc::clone(&state);
+
+        tokio::spawn(async move {
+            let dump_name_inner = dump_name_for_task;
+
+            let result = tokio::task::spawn_blocking(move || {
+                // Create a closure that checks AppState.shutting_down
+                let shutdown_check: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                    shutdown_flag.shutting_down.load(std::sync::atomic::Ordering::Relaxed)
+                });
+                crate::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema), Some(slot_watermark), Some(shutdown_check))
+            })
+            .await;
+
+            match result {
+                Ok(Ok(phase_result)) => {
+                    let row_count = phase_result.row_count;
+
+                    // Reload fields only for the alive phase (images).
+                    // Other phases just save to disk — fields get loaded lazily on first query.
+                    if phase_sets_alive {
+                        crate::dump_processor::reload_after_dumps(&engine_for_reload, true);
+                    }
+
+                    tasks.set_complete(
+                        task_id,
+                        Some(serde_json::json!({
+                            "rows_processed": row_count,
+                            "dump_name": dump_name_inner,
+                        })),
+                    );
+
+                    // Mark dump as complete in registry
+                    let mut reg = state_clone.dump_registry.lock();
+                    if let Some(entry) = reg.dumps.get_mut(&dump_name_inner) {
+                        entry.status = crate::pg_sync::dump::DumpStatus::Complete;
+                        entry.ops_processed = row_count;
+                        entry.completed_at = Some(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        );
+                    }
+                    let dumps_path = state_clone.data_dir.join("dumps.json");
+                    reg.save(&dumps_path).ok();
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Dump failed: {e}");
+                    tasks.set_error(task_id, e);
+                }
+                Err(e) => {
+                    eprintln!("Dump panicked: {e}");
+                    tasks.set_error(task_id, format!("Task panicked: {e}"));
+                }
+            }
+        });
+
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "name": dump_name,
+                "task_id": task_id,
+                "status": "running",
+            })),
+        )
+            .into_response()
+    } else {
+        // V1 legacy: just register the dump name
+        let dump_name = body["name"].as_str().unwrap_or("unknown").to_string();
+        let wal_path = body["wal_path"].as_str().map(|s| s.to_string());
+
+        let mut reg = state.dump_registry.lock();
+        reg.register(dump_name.clone(), wal_path);
+
+        let dumps_path = state.data_dir.join("dumps.json");
+        if let Err(e) = reg.save(&dumps_path) {
+            eprintln!("Warning: failed to save dump registry: {e}");
+        }
+
+        (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "name": dump_name,
+                "status": "writing",
+            })),
+        )
+            .into_response()
     }
-
-    (StatusCode::CREATED, Json(serde_json::json!({
-        "name": dump_name,
-        "status": "writing",
-    })))
 }
 
 #[cfg(not(feature = "pg-sync"))]

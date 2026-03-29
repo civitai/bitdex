@@ -1,7 +1,7 @@
 #![allow(unexpected_cfgs)]
 //! ShardStore — Unified storage engine for BitDex.
 //!
-//! Replaces DocStore V2 and BitmapFs with a single generic system that supports:
+//! Unified storage engine. Replaces DocStore V2 with a single generic system that supports:
 //! - Shard-local ops logs (append-only mutations)
 //! - Materialized snapshots (compacted state)
 //! - Generation management (LIFO fall-through reads)
@@ -88,7 +88,7 @@ pub trait ShardingStrategy: Send + Sync + 'static {
 const SHARD_MAGIC: [u8; 4] = *b"BDSS"; // BitDex ShardStore
 
 /// Current shard file format version.
-const SHARD_VERSION: u32 = 1;
+pub(crate) const SHARD_VERSION: u32 = 1;
 
 /// Shard file header size in bytes.
 /// Layout:
@@ -99,7 +99,7 @@ const SHARD_VERSION: u32 = 1;
 ///   [4] ops_count (u32 LE) — number of ops entries in the log
 ///   [4] flags (u32 LE) — reserved for future use
 ///   = 28 bytes total
-const HEADER_SIZE: usize = 28;
+pub(crate) const HEADER_SIZE: usize = 28;
 
 /// Per-op entry overhead: [4] length + [4] crc32 = 8 bytes wrapping each op.
 #[allow(dead_code)]
@@ -233,6 +233,12 @@ fn read_op_entries<O: OpCodec>(data: &[u8]) -> Vec<O::Op> {
     ops
 }
 
+/// Public wrapper around `read_op_entries` for use by sibling modules
+/// (e.g., `shard_store_bitmap` reading packed sort shard ops).
+pub fn read_op_entries_pub<O: OpCodec>(data: &[u8]) -> Vec<O::Op> {
+    read_op_entries::<O>(data)
+}
+
 /// Simple CRC32 (IEEE / CRC-32C via software). We use a basic lookup table.
 fn crc32_of(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
@@ -301,7 +307,7 @@ fn read_shard_file_raw(path: &Path) -> io::Result<(ShardHeader, Vec<u8>, Vec<u8>
 }
 
 /// Write a complete shard file atomically (tmp → fsync → rename).
-fn write_shard_file_atomic(
+pub(crate) fn write_shard_file_atomic(
     path: &Path,
     header: &ShardHeader,
     snapshot_bytes: &[u8],

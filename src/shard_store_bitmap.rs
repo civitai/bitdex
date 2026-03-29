@@ -1,20 +1,25 @@
 //! Bitmap codecs and sharding strategies for ShardStore.
 //!
-//! Three codec pairs for three storage patterns:
+//! Codec pairs for storage patterns:
 //!
 //! 1. **Filter bitmaps** (packed bucket): `BucketSnapshotCodec` + `FilterOpCodec`
 //!    One shard file per hex bucket, containing multiple values with an index table.
 //!    Ops are tagged with value_id to identify which bitmap within the bucket.
 //!
-//! 2. **Sort/Alive bitmaps** (single): `BitmapSnapshotCodec` + `BitmapOpCodec`
+//! 2. **Alive bitmaps** (single): `BitmapSnapshotCodec` + `BitmapOpCodec`
 //!    One shard file per bitmap. Simple set/clear operations.
+//!
+//! 3. **Sort bitmaps** (packed field): `SortFieldSnapshotCodec` + `SortLayerOpCodec`
+//!    One shard file per sort field, containing all bit layers in a packed index.
+//!    Ops are tagged with bit_position to target individual layers.
 //!
 //! Sharding strategies:
 //! - `FieldValueBucketShard` — filter: (field, bucket) → `filter/{field}/{xx}.shard`
-//! - `SortLayerShard` — sort: (field, bit_position) → `sort/{field}/bit{NN}.shard`
+//! - `SortFieldShard` — sort: field → `sort/{field}.shard` (all layers packed)
+//! - `SortLayerShard` — sort (legacy per-layer ops): (field, bit_position) → `sort/{field}/bit{NN}.shard`
 //! - `SingletonShard` — alive: single file → `system/alive.shard`
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -422,7 +427,228 @@ impl OpCodec for BitmapOpCodec {
 }
 
 // ===========================================================================
-// SECTION 3: Sharding strategies
+// SECTION 3: Sort field packed codecs (all bit layers in one shard per field)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// SortFieldSnapshot — packed multi-layer bitmap container
+// ---------------------------------------------------------------------------
+
+/// A sort field snapshot contains all bit-layer bitmaps for one sort field.
+/// Maps bit_position → RoaringBitmap. Only non-empty layers are stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortFieldSnapshot {
+    pub layers: BTreeMap<u8, RoaringBitmap>,
+}
+
+impl SortFieldSnapshot {
+    pub fn new() -> Self {
+        SortFieldSnapshot { layers: BTreeMap::new() }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SortLayerOp — bit-position-tagged sort layer operations
+// ---------------------------------------------------------------------------
+
+/// Operations on a specific bit layer's bitmap within a sort field shard.
+#[derive(Debug, Clone)]
+pub enum SortLayerOp {
+    /// Set a slot bit on a specific layer's bitmap.
+    SetBit { bit_position: u8, slot: u32 },
+    /// Clear a slot bit from a specific layer's bitmap.
+    ClearBit { bit_position: u8, slot: u32 },
+}
+
+const SORT_LAYER_OP_SET: u8 = 0x21;
+const SORT_LAYER_OP_CLEAR: u8 = 0x22;
+
+// ---------------------------------------------------------------------------
+// SortFieldSnapshotCodec
+// ---------------------------------------------------------------------------
+
+/// Encodes/decodes packed sort field snapshots containing all bit layers.
+///
+/// Format:
+/// ```text
+/// [u8 num_layers]
+/// [index: N × (u8 bit_position, u32 offset, u32 length)]  // 9 bytes per layer
+/// [packed serialized roaring bitmaps]
+/// ```
+///
+/// Only non-empty layers are stored. On decode, missing layers are treated
+/// as empty bitmaps (not inserted into the BTreeMap).
+pub struct SortFieldSnapshotCodec;
+
+impl SnapshotCodec for SortFieldSnapshotCodec {
+    type Snapshot = SortFieldSnapshot;
+
+    fn encode(snapshot: &SortFieldSnapshot, buf: &mut Vec<u8>) {
+        Self::encode_from_layers(snapshot.layers.iter().map(|(&pos, bm)| (pos, bm)), buf);
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<SortFieldSnapshot> {
+        if bytes.is_empty() {
+            return Ok(SortFieldSnapshot::new());
+        }
+
+        let num_layers = bytes[0] as usize;
+        if num_layers == 0 {
+            return Ok(SortFieldSnapshot::new());
+        }
+
+        let index_start = 1;
+        let index_size = num_layers * 9; // 9 bytes per entry (u8 + u32 + u32)
+        let data_start = index_start + index_size;
+
+        if bytes.len() < data_start {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "sort field snapshot index truncated",
+            ));
+        }
+
+        let mut layers = BTreeMap::new();
+
+        for i in 0..num_layers {
+            let entry_offset = index_start + i * 9;
+            let bit_position = bytes[entry_offset];
+            let bm_offset = u32::from_le_bytes(
+                bytes[entry_offset + 1..entry_offset + 5].try_into().unwrap(),
+            ) as usize;
+            let bm_length = u32::from_le_bytes(
+                bytes[entry_offset + 5..entry_offset + 9].try_into().unwrap(),
+            ) as usize;
+
+            let bm_start = data_start + bm_offset;
+            let bm_end = bm_start + bm_length;
+
+            if bm_end > bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("sort layer bitmap truncated for bit_position {}", bit_position),
+                ));
+            }
+
+            let bm = RoaringBitmap::deserialize_from(&bytes[bm_start..bm_end])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bitmap: {e}")))?;
+            layers.insert(bit_position, bm);
+        }
+
+        Ok(SortFieldSnapshot { layers })
+    }
+
+    fn empty() -> SortFieldSnapshot {
+        SortFieldSnapshot::new()
+    }
+}
+
+impl SortFieldSnapshotCodec {
+    /// Encode from an iterator of (bit_position, &bitmap) pairs.
+    /// Used by write_sort_layers to avoid constructing a SortFieldSnapshot.
+    pub fn encode_from_layers<'a>(
+        layers: impl Iterator<Item = (u8, &'a RoaringBitmap)>,
+        buf: &mut Vec<u8>,
+    ) {
+        // Serialize all non-empty bitmaps first to know their sizes
+        let mut bitmap_data: Vec<(u8, Vec<u8>)> = Vec::new();
+        for (pos, bm) in layers {
+            if bm.is_empty() {
+                continue;
+            }
+            let mut bm_buf = Vec::with_capacity(bm.serialized_size());
+            bm.serialize_into(&mut bm_buf).expect("bitmap serialize");
+            bitmap_data.push((pos, bm_buf));
+        }
+
+        // Write number of non-empty layers
+        buf.push(bitmap_data.len() as u8);
+
+        // Write index: (bit_position, offset, length) per entry
+        let mut offset: u32 = 0;
+        for (pos, bm_buf) in &bitmap_data {
+            buf.push(*pos);
+            buf.extend_from_slice(&offset.to_le_bytes());
+            buf.extend_from_slice(&(bm_buf.len() as u32).to_le_bytes());
+            offset += bm_buf.len() as u32;
+        }
+
+        // Write packed bitmap data
+        for (_, bm_buf) in &bitmap_data {
+            buf.extend_from_slice(bm_buf);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SortLayerOpCodec
+// ---------------------------------------------------------------------------
+
+/// Codec for bit-position-tagged sort layer operations.
+///
+/// Each op is 6 bytes: [u8 op_type][u8 bit_position][u32 slot]
+pub struct SortLayerOpCodec;
+
+impl OpCodec for SortLayerOpCodec {
+    type Op = SortLayerOp;
+    type Snapshot = SortFieldSnapshot;
+
+    fn encode_op(op: &SortLayerOp, buf: &mut Vec<u8>) {
+        match op {
+            SortLayerOp::SetBit { bit_position, slot } => {
+                buf.push(SORT_LAYER_OP_SET);
+                buf.push(*bit_position);
+                buf.extend_from_slice(&slot.to_le_bytes());
+            }
+            SortLayerOp::ClearBit { bit_position, slot } => {
+                buf.push(SORT_LAYER_OP_CLEAR);
+                buf.push(*bit_position);
+                buf.extend_from_slice(&slot.to_le_bytes());
+            }
+        }
+    }
+
+    fn decode_op(bytes: &[u8]) -> io::Result<SortLayerOp> {
+        if bytes.len() < 6 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "sort layer op too short"));
+        }
+
+        let tag = bytes[0];
+        let bit_position = bytes[1];
+        let slot = u32::from_le_bytes(
+            bytes[2..6].try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "truncated slot")
+            })?,
+        );
+
+        match tag {
+            SORT_LAYER_OP_SET => Ok(SortLayerOp::SetBit { bit_position, slot }),
+            SORT_LAYER_OP_CLEAR => Ok(SortLayerOp::ClearBit { bit_position, slot }),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown sort layer op tag: 0x{:02x}", other),
+            )),
+        }
+    }
+
+    fn apply(snapshot: &mut SortFieldSnapshot, op: &SortLayerOp) {
+        match op {
+            SortLayerOp::SetBit { bit_position, slot } => {
+                snapshot.layers.entry(*bit_position)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(*slot);
+            }
+            SortLayerOp::ClearBit { bit_position, slot } => {
+                if let Some(bm) = snapshot.layers.get_mut(bit_position) {
+                    bm.remove(*slot);
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// SECTION 4: Sharding strategies
 // ===========================================================================
 
 /// Shard key for filter bitmaps: (field_name, bucket).
@@ -535,6 +761,43 @@ impl ShardingStrategy for SortLayerShard {
     }
 }
 
+/// Shard key for packed sort field bitmaps (one file per sort field).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SortFieldShardKey {
+    pub field: String,
+}
+
+/// Maps field name to a single packed sort shard file.
+/// Layout: `{gen_root}/sort/{field}.shard`
+///
+/// All bit layers for the field are packed into one file using SortFieldSnapshotCodec.
+pub struct SortFieldShard;
+
+impl ShardingStrategy for SortFieldShard {
+    type Key = SortFieldShardKey;
+
+    fn shard_path(&self, key: &SortFieldShardKey, gen_root: &Path) -> PathBuf {
+        gen_root.join("sort").join(format!("{}.shard", key.field))
+    }
+
+    fn list_shards(&self, gen_root: &Path) -> io::Result<Vec<SortFieldShardKey>> {
+        let sort_dir = gen_root.join("sort");
+        let mut keys = Vec::new();
+        if !sort_dir.exists() { return Ok(keys); }
+        for entry in std::fs::read_dir(&sort_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Only match files (not directories — those are legacy per-layer layout)
+            if entry.file_type()?.is_file() {
+                if let Some(field) = name.strip_suffix(".shard") {
+                    keys.push(SortFieldShardKey { field: field.to_string() });
+                }
+            }
+        }
+        Ok(keys)
+    }
+}
+
 /// Alive bitmap shard key (singleton).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AliveShardKey;
@@ -600,7 +863,7 @@ impl FilterBitmapStore {
 
     /// Load all bitmaps for a field, merging all buckets into a flat map.
     ///
-    /// Equivalent to BitmapFs::load_field(). Reads all bucket shards for the
+    /// Replaces legacy BitmapFs::load_field(). Reads all bucket shards for the
     /// field and collects value→bitmap entries into a single HashMap.
     pub fn load_field(&self, field: &str) -> io::Result<HashMap<u64, RoaringBitmap>> {
         let mut result = HashMap::new();
@@ -633,7 +896,7 @@ impl FilterBitmapStore {
     /// Load specific values for a field. Only reads the bucket shards that
     /// contain the requested values, then extracts just those entries.
     ///
-    /// Equivalent to BitmapFs::load_field_values().
+    /// Replaces legacy BitmapFs::load_field_values().
     pub fn load_field_values(&self, field: &str, values: &[u64]) -> io::Result<HashMap<u64, RoaringBitmap>> {
         // Group requested values by bucket
         let mut by_bucket: HashMap<u8, Vec<u64>> = HashMap::new();
@@ -659,7 +922,7 @@ impl FilterBitmapStore {
 
     /// Read a single filter bucket as a vec of (value, bitmap) pairs.
     ///
-    /// Equivalent to BitmapFs::read_filter_bucket().
+    /// Replaces legacy BitmapFs::read_filter_bucket().
     pub fn read_filter_bucket(&self, field: &str, bucket: u8) -> io::Result<Vec<(u64, RoaringBitmap)>> {
         let key = FilterBucketKey { field: field.to_string(), bucket };
         match self.read(&key)? {
@@ -670,7 +933,7 @@ impl FilterBitmapStore {
 
     /// Write a filter bucket from (value, bitmap) pairs.
     ///
-    /// Equivalent to BitmapFs::write_filter_bucket().
+    /// Replaces legacy BitmapFs::write_filter_bucket().
     pub fn write_filter_bucket(&self, field: &str, bucket: u8, entries: &[(u64, &RoaringBitmap)]) -> io::Result<()> {
         let key = FilterBucketKey { field: field.to_string(), bucket };
         let mut snap = BucketSnapshot::new();
@@ -694,56 +957,248 @@ impl FilterBitmapStore {
                 .push((value, bm));
         }
         for ((field, bucket), entries) in by_bucket {
-            let key = FilterBucketKey { field, bucket };
-            let mut snap = BucketSnapshot::new();
-            for (value, bm) in entries {
-                snap.values.insert(value, bm.clone());
+            self.write_filter_bucket_raw(&field, bucket, &entries)?;
+        }
+        Ok(())
+    }
+
+    /// Write a filter bucket directly from (value, &bitmap) refs — zero clones.
+    ///
+    /// Encodes the bucket snapshot format inline without constructing a
+    /// BucketSnapshot or cloning any bitmaps.
+    pub fn write_filter_bucket_raw(&self, field: &str, bucket: u8, entries: &[(u64, &RoaringBitmap)]) -> io::Result<()> {
+        let key = FilterBucketKey { field: field.to_string(), bucket };
+        let gen = self.current_generation();
+        let shard_path = self.shard_path_in_gen(&key, gen);
+
+        // Encode bucket snapshot format directly from references:
+        // [u32 num_values]
+        // [index: N × (u64 value_id, u32 bitmap_offset, u32 bitmap_length)]
+        // [packed serialized roaring bitmaps]
+        let count = entries.len() as u32;
+        let mut snapshot_bytes = Vec::new();
+        snapshot_bytes.extend_from_slice(&count.to_le_bytes());
+
+        // Serialize bitmaps to get sizes for index table
+        let mut bitmap_data: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
+        for &(value, bm) in entries {
+            let mut bm_buf = Vec::with_capacity(bm.serialized_size());
+            bm.serialize_into(&mut bm_buf).expect("bitmap serialize");
+            bitmap_data.push((value, bm_buf));
+        }
+
+        // Write index table
+        let mut offset: u32 = 0;
+        for (value_id, bm_buf) in &bitmap_data {
+            snapshot_bytes.extend_from_slice(&value_id.to_le_bytes());
+            snapshot_bytes.extend_from_slice(&offset.to_le_bytes());
+            snapshot_bytes.extend_from_slice(&(bm_buf.len() as u32).to_le_bytes());
+            offset += bm_buf.len() as u32;
+        }
+
+        // Write packed bitmap data
+        for (_, bm_buf) in &bitmap_data {
+            snapshot_bytes.extend_from_slice(bm_buf);
+        }
+
+        // Write shard file
+        let ops_offset = crate::shard_store::HEADER_SIZE as u64 + snapshot_bytes.len() as u64;
+        let header = crate::shard_store::ShardHeader {
+            version: crate::shard_store::SHARD_VERSION,
+            ops_section_offset: ops_offset,
+            snapshot_len: snapshot_bytes.len() as u32,
+            ops_count: 0,
+            flags: 0,
+        };
+        crate::shard_store::write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])
+    }
+
+    /// Pre-create shard directories for a field's filter buckets.
+    /// Avoids per-write `create_dir_all` overhead during parallel writes.
+    pub fn ensure_filter_dirs(&self, field: &str, buckets: &[u8]) -> io::Result<()> {
+        let gen = self.current_generation();
+        for &bucket in buckets {
+            let key = FilterBucketKey { field: field.to_string(), bucket };
+            let shard_path = self.shard_path_in_gen(&key, gen);
+            if let Some(parent) = shard_path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-            self.write_snapshot(&key, &snap)?;
         }
         Ok(())
     }
 }
 
-/// ShardStore for sort layer bitmaps.
+/// ShardStore for sort layer bitmaps (legacy per-layer sharding).
+///
+/// This type alias is used by `concurrent_engine.rs` for per-layer ops via
+/// `append_op(&SortLayerShardKey, &BitmapOp)`. The per-layer shard files are
+/// a secondary ops path — `write_sort_layers` and `load_sort_layers` use the
+/// packed format (one file per field) for snapshot I/O.
 pub type SortBitmapStore = crate::shard_store::ShardStore<BitmapSnapshotCodec, BitmapOpCodec, SortLayerShard>;
 
+/// ShardStore for packed sort field bitmaps (all layers in one shard per field).
+///
+/// Used for snapshot reads/writes and sort-layer ops that embed bit_position.
+pub type PackedSortBitmapStore = crate::shard_store::ShardStore<SortFieldSnapshotCodec, SortLayerOpCodec, SortFieldShard>;
+
 impl SortBitmapStore {
-    /// Load all sort layers for a field.
+    /// Load all sort layers for a field from the packed format.
     ///
-    /// Equivalent to BitmapFs::load_sort_layers(). Reads bit00..bit{N-1} shards
-    /// and returns them as a Vec<RoaringBitmap> ordered by bit position.
-    /// Returns None if no layers exist on disk.
+    /// Reads a single `sort/{field}.shard` file containing all bit layers,
+    /// and unpacks into a Vec<RoaringBitmap> ordered by bit position.
+    /// Returns None if no packed shard exists on disk.
     pub fn load_sort_layers(&self, field: &str, bits: usize) -> io::Result<Option<Vec<RoaringBitmap>>> {
-        let mut layers = Vec::with_capacity(bits);
-        let mut any_found = false;
-
-        for bit in 0..bits {
-            let key = SortLayerShardKey { field: field.to_string(), bit_position: bit as u8 };
-            match self.read(&key)? {
-                Some(bm) => {
-                    any_found = true;
-                    layers.push(bm);
+        // Fall through generations to find the packed shard
+        let gen = self.current_generation();
+        let snapshot = {
+            let mut found = None;
+            for g in (0..=gen).rev() {
+                let path = self.gen_dir(g).join("sort").join(format!("{}.shard", field));
+                if path.exists() {
+                    let data = std::fs::read(&path)?;
+                    let header = crate::shard_store::ShardHeader::decode(&data)?;
+                    let snap_start = crate::shard_store::HEADER_SIZE;
+                    let snap_end = snap_start + header.snapshot_len as usize;
+                    let mut snap = if header.snapshot_len > 0 {
+                        SortFieldSnapshotCodec::decode(&data[snap_start..snap_end])?
+                    } else {
+                        SortFieldSnapshot::new()
+                    };
+                    // Apply any ops
+                    if header.ops_count > 0 {
+                        let ops_start = header.ops_section_offset as usize;
+                        let ops_data = &data[ops_start..];
+                        let ops = crate::shard_store::read_op_entries_pub::<SortLayerOpCodec>(ops_data);
+                        for op in &ops {
+                            SortLayerOpCodec::apply(&mut snap, op);
+                        }
+                    }
+                    found = Some(snap);
+                    break;
                 }
-                None => layers.push(RoaringBitmap::new()),
             }
-        }
+            found
+        };
 
-        if any_found {
-            Ok(Some(layers))
-        } else {
-            Ok(None)
+        match snapshot {
+            Some(snap) => {
+                let mut layers = Vec::with_capacity(bits);
+                for bit in 0..bits {
+                    layers.push(
+                        snap.layers.get(&(bit as u8)).cloned().unwrap_or_default()
+                    );
+                }
+                Ok(Some(layers))
+            }
+            None => {
+                // Fall back to legacy per-layer format
+                let mut layers = Vec::with_capacity(bits);
+                let mut any_found = false;
+                for bit in 0..bits {
+                    let key = SortLayerShardKey { field: field.to_string(), bit_position: bit as u8 };
+                    match self.read(&key)? {
+                        Some(bm) => {
+                            any_found = true;
+                            layers.push(bm);
+                        }
+                        None => layers.push(RoaringBitmap::new()),
+                    }
+                }
+                if any_found { Ok(Some(layers)) } else { Ok(None) }
+            }
         }
     }
 
-    /// Write sort layers for a field.
+    /// Write sort layers for a field in the packed format.
     ///
-    /// Equivalent to BitmapFs::write_sort_layers().
+    /// Encodes all layers into a single `sort/{field}.shard` file using
+    /// the SortFieldSnapshotCodec packed format (index + packed bitmaps).
     pub fn write_sort_layers(&self, field: &str, layers: &[&RoaringBitmap]) -> io::Result<()> {
-        for (bit, bm) in layers.iter().enumerate() {
-            let key = SortLayerShardKey { field: field.to_string(), bit_position: bit as u8 };
-            self.write_snapshot(&key, bm)?;
+        let gen = self.current_generation();
+        let shard_path = self.gen_dir(gen).join("sort").join(format!("{}.shard", field));
+
+        // Encode packed snapshot directly from layer refs
+        let mut snapshot_bytes = Vec::new();
+        SortFieldSnapshotCodec::encode_from_layers(
+            layers.iter().enumerate().map(|(i, bm)| (i as u8, *bm)),
+            &mut snapshot_bytes,
+        );
+
+        let ops_offset = crate::shard_store::HEADER_SIZE as u64 + snapshot_bytes.len() as u64;
+        let header = crate::shard_store::ShardHeader {
+            version: crate::shard_store::SHARD_VERSION,
+            ops_section_offset: ops_offset,
+            snapshot_len: snapshot_bytes.len() as u32,
+            ops_count: 0,
+            flags: 0,
+        };
+        crate::shard_store::write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])
+    }
+
+    /// Pre-create the sort directory.
+    /// Ensures `sort/` exists for packed shard writes.
+    pub fn ensure_sort_dir(&self, field: &str) -> io::Result<()> {
+        let _ = field; // field name used for API compat; we just need sort/ dir
+        let gen = self.current_generation();
+        let sort_dir = self.gen_dir(gen).join("sort");
+        std::fs::create_dir_all(&sort_dir)?;
+        Ok(())
+    }
+}
+
+impl PackedSortBitmapStore {
+    /// Append a sort layer op to the packed shard for a field.
+    ///
+    /// This is the packed-format equivalent of `SortBitmapStore::append_op` —
+    /// the op includes the bit_position, targeting a specific layer within
+    /// the packed shard file.
+    pub fn append_sort_op(&self, field: &str, bit_position: u8, slot: u32, set: bool) -> io::Result<()> {
+        let key = SortFieldShardKey { field: field.to_string() };
+        let op = if set {
+            SortLayerOp::SetBit { bit_position, slot }
+        } else {
+            SortLayerOp::ClearBit { bit_position, slot }
+        };
+        self.append_op(&key, &op)
+    }
+
+    /// Load all sort layers for a field from the packed store.
+    ///
+    /// Reads the single packed shard (snapshot + ops) and unpacks into
+    /// a Vec<RoaringBitmap> ordered by bit position.
+    pub fn load_sort_layers(&self, field: &str, bits: usize) -> io::Result<Option<Vec<RoaringBitmap>>> {
+        let key = SortFieldShardKey { field: field.to_string() };
+        match self.read(&key)? {
+            Some(snap) => {
+                let mut layers = Vec::with_capacity(bits);
+                for bit in 0..bits {
+                    layers.push(
+                        snap.layers.get(&(bit as u8)).cloned().unwrap_or_default()
+                    );
+                }
+                Ok(Some(layers))
+            }
+            None => Ok(None),
         }
+    }
+
+    /// Write sort layers for a field as a packed snapshot.
+    pub fn write_sort_layers(&self, field: &str, layers: &[&RoaringBitmap]) -> io::Result<()> {
+        let key = SortFieldShardKey { field: field.to_string() };
+        let mut snap = SortFieldSnapshot::new();
+        for (i, bm) in layers.iter().enumerate() {
+            if !bm.is_empty() {
+                snap.layers.insert(i as u8, (*bm).clone());
+            }
+        }
+        self.write_snapshot(&key, &snap)
+    }
+
+    /// Pre-create the sort directory for packed shard writes.
+    pub fn ensure_sort_dir(&self, _field: &str) -> io::Result<()> {
+        let gen = self.current_generation();
+        let sort_dir = self.gen_dir(gen).join("sort");
+        std::fs::create_dir_all(&sort_dir)?;
         Ok(())
     }
 }
@@ -754,14 +1209,14 @@ pub type AliveBitmapStore = crate::shard_store::ShardStore<BitmapSnapshotCodec, 
 impl AliveBitmapStore {
     /// Load the alive bitmap.
     ///
-    /// Equivalent to BitmapFs::load_alive().
+    /// Replaces legacy BitmapFs::load_alive().
     pub fn load_alive(&self) -> io::Result<Option<RoaringBitmap>> {
         self.read(&AliveShardKey)
     }
 
     /// Write the alive bitmap.
     ///
-    /// Equivalent to BitmapFs::write_alive().
+    /// Replaces legacy BitmapFs::write_alive().
     pub fn write_alive(&self, bitmap: &RoaringBitmap) -> io::Result<()> {
         self.write_snapshot(&AliveShardKey, bitmap)
     }
@@ -1015,5 +1470,254 @@ mod tests {
         let result = store.read(&AliveShardKey).unwrap().unwrap();
         assert_eq!(result.len(), 998);
         assert!(!result.contains(42));
+    }
+
+    // --- Packed sort field tests ---
+
+    #[test]
+    fn test_sort_field_snapshot_roundtrip() {
+        let mut snap = SortFieldSnapshot::new();
+        let mut bm0 = RoaringBitmap::new();
+        bm0.insert_range(0..100);
+        let mut bm5 = RoaringBitmap::new();
+        bm5.insert_range(500..600);
+        let mut bm31 = RoaringBitmap::new();
+        bm31.insert(42);
+        bm31.insert(9999);
+        snap.layers.insert(0, bm0.clone());
+        snap.layers.insert(5, bm5.clone());
+        snap.layers.insert(31, bm31.clone());
+
+        let mut buf = Vec::new();
+        SortFieldSnapshotCodec::encode(&snap, &mut buf);
+        let decoded = SortFieldSnapshotCodec::decode(&buf).unwrap();
+
+        assert_eq!(decoded.layers.len(), 3);
+        assert_eq!(decoded.layers[&0], bm0);
+        assert_eq!(decoded.layers[&5], bm5);
+        assert_eq!(decoded.layers[&31], bm31);
+    }
+
+    #[test]
+    fn test_sort_field_snapshot_empty_and_sparse() {
+        // All empty layers should produce a snapshot with 0 stored layers
+        let snap = SortFieldSnapshot::new();
+        let mut buf = Vec::new();
+        SortFieldSnapshotCodec::encode(&snap, &mut buf);
+        let decoded = SortFieldSnapshotCodec::decode(&buf).unwrap();
+        assert!(decoded.layers.is_empty());
+
+        // Sparse: only layers 3 and 28 have data
+        let mut snap2 = SortFieldSnapshot::new();
+        let mut bm3 = RoaringBitmap::new();
+        bm3.insert(1);
+        snap2.layers.insert(3, bm3.clone());
+        // Insert an empty bitmap for layer 10 — should NOT be stored
+        snap2.layers.insert(10, RoaringBitmap::new());
+        let mut bm28 = RoaringBitmap::new();
+        bm28.insert(999);
+        snap2.layers.insert(28, bm28.clone());
+
+        let mut buf2 = Vec::new();
+        SortFieldSnapshotCodec::encode(&snap2, &mut buf2);
+        let decoded2 = SortFieldSnapshotCodec::decode(&buf2).unwrap();
+
+        // Only 2 non-empty layers stored
+        assert_eq!(decoded2.layers.len(), 2);
+        assert_eq!(decoded2.layers[&3], bm3);
+        assert_eq!(decoded2.layers[&28], bm28);
+        assert!(!decoded2.layers.contains_key(&10));
+    }
+
+    #[test]
+    fn test_sort_layer_op_roundtrip() {
+        let op1 = SortLayerOp::SetBit { bit_position: 7, slot: 42 };
+        let mut buf = Vec::new();
+        SortLayerOpCodec::encode_op(&op1, &mut buf);
+        let decoded = SortLayerOpCodec::decode_op(&buf).unwrap();
+        match decoded {
+            SortLayerOp::SetBit { bit_position, slot } => {
+                assert_eq!(bit_position, 7);
+                assert_eq!(slot, 42);
+            }
+            _ => panic!("expected SetBit"),
+        }
+
+        let op2 = SortLayerOp::ClearBit { bit_position: 31, slot: 999999 };
+        let mut buf2 = Vec::new();
+        SortLayerOpCodec::encode_op(&op2, &mut buf2);
+        let decoded2 = SortLayerOpCodec::decode_op(&buf2).unwrap();
+        match decoded2 {
+            SortLayerOp::ClearBit { bit_position, slot } => {
+                assert_eq!(bit_position, 31);
+                assert_eq!(slot, 999999);
+            }
+            _ => panic!("expected ClearBit"),
+        }
+    }
+
+    #[test]
+    fn test_sort_layer_op_apply() {
+        let mut snap = SortFieldSnapshot::new();
+
+        // Set bit on layer 0
+        SortLayerOpCodec::apply(&mut snap, &SortLayerOp::SetBit { bit_position: 0, slot: 42 });
+        assert!(snap.layers[&0].contains(42));
+
+        // Set another bit on layer 0
+        SortLayerOpCodec::apply(&mut snap, &SortLayerOp::SetBit { bit_position: 0, slot: 43 });
+        assert_eq!(snap.layers[&0].len(), 2);
+
+        // Set bit on different layer
+        SortLayerOpCodec::apply(&mut snap, &SortLayerOp::SetBit { bit_position: 5, slot: 100 });
+        assert_eq!(snap.layers.len(), 2);
+        assert!(snap.layers[&5].contains(100));
+
+        // Clear bit from layer 0
+        SortLayerOpCodec::apply(&mut snap, &SortLayerOp::ClearBit { bit_position: 0, slot: 42 });
+        assert!(!snap.layers[&0].contains(42));
+        assert!(snap.layers[&0].contains(43));
+
+        // Clear bit from nonexistent layer — no panic
+        SortLayerOpCodec::apply(&mut snap, &SortLayerOp::ClearBit { bit_position: 31, slot: 1 });
+        assert!(!snap.layers.contains_key(&31));
+    }
+
+    #[test]
+    fn test_sort_field_shard_path() {
+        let shard = SortFieldShard;
+        let key = SortFieldShardKey { field: "reactionCount".into() };
+        let path = shard.shard_path(&key, Path::new("/data/gen_000"));
+        assert_eq!(path, PathBuf::from("/data/gen_000/sort/reactionCount.shard"));
+    }
+
+    #[test]
+    fn test_packed_sort_store_write_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SortBitmapStore::new(dir.path().to_path_buf(), SortLayerShard).unwrap();
+
+        // Create 32 layers, only some with data
+        let mut layers: Vec<RoaringBitmap> = (0..32).map(|_| RoaringBitmap::new()).collect();
+        layers[0].insert_range(0..100);
+        layers[5].insert(42);
+        layers[5].insert(999);
+        layers[31].insert_range(1000..1100);
+
+        let layer_refs: Vec<&RoaringBitmap> = layers.iter().collect();
+        store.ensure_sort_dir("reactionCount").unwrap();
+        store.write_sort_layers("reactionCount", &layer_refs).unwrap();
+
+        // Read back
+        let loaded = store.load_sort_layers("reactionCount", 32).unwrap().unwrap();
+        assert_eq!(loaded.len(), 32);
+        assert_eq!(loaded[0].len(), 100);
+        assert_eq!(loaded[5].len(), 2);
+        assert!(loaded[5].contains(42));
+        assert!(loaded[5].contains(999));
+        assert_eq!(loaded[31].len(), 100);
+
+        // Empty layers should be empty
+        assert!(loaded[1].is_empty());
+        assert!(loaded[15].is_empty());
+    }
+
+    #[test]
+    fn test_packed_sort_store_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackedSortBitmapStore::new(dir.path().to_path_buf(), SortFieldShard).unwrap();
+
+        // Write initial snapshot
+        let mut snap = SortFieldSnapshot::new();
+        let mut bm0 = RoaringBitmap::new();
+        bm0.insert_range(0..50);
+        snap.layers.insert(0, bm0);
+
+        let key = SortFieldShardKey { field: "reactionCount".into() };
+        store.write_snapshot(&key, &snap).unwrap();
+
+        // Append some ops
+        store.append_sort_op("reactionCount", 0, 100, true).unwrap();
+        store.append_sort_op("reactionCount", 5, 42, true).unwrap();
+        store.append_sort_op("reactionCount", 0, 10, false).unwrap(); // clear
+
+        assert_eq!(store.ops_count(&key).unwrap(), Some(3));
+
+        // Compact
+        store.compact_current(&key).unwrap();
+        assert_eq!(store.ops_count(&key).unwrap(), Some(0));
+
+        // Verify result
+        let result = store.read(&key).unwrap().unwrap();
+        assert_eq!(result.layers[&0].len(), 50); // 0..50 - 10 + 100 = 50
+        assert!(result.layers[&0].contains(100));
+        assert!(!result.layers[&0].contains(10));
+        assert!(result.layers[&5].contains(42));
+    }
+
+    #[test]
+    fn test_packed_sort_store_append_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackedSortBitmapStore::new(dir.path().to_path_buf(), SortFieldShard).unwrap();
+
+        // Append ops without a snapshot first
+        store.append_sort_op("sortAt", 0, 1, true).unwrap();
+        store.append_sort_op("sortAt", 0, 2, true).unwrap();
+        store.append_sort_op("sortAt", 15, 99, true).unwrap();
+        store.append_sort_op("sortAt", 0, 1, false).unwrap(); // clear
+
+        let key = SortFieldShardKey { field: "sortAt".into() };
+        let result = store.read(&key).unwrap().unwrap();
+
+        assert_eq!(result.layers[&0].len(), 1); // only slot 2 remains
+        assert!(result.layers[&0].contains(2));
+        assert!(!result.layers[&0].contains(1));
+        assert!(result.layers[&15].contains(99));
+    }
+
+    #[test]
+    fn test_packed_sort_load_via_packed_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackedSortBitmapStore::new(dir.path().to_path_buf(), SortFieldShard).unwrap();
+
+        let mut bm0 = RoaringBitmap::new();
+        bm0.insert_range(0..50);
+        let mut bm7 = RoaringBitmap::new();
+        bm7.insert(42);
+        let layers = vec![&bm0, &bm7];
+
+        // Use the PackedSortBitmapStore write path
+        store.write_sort_layers("testField", &layers).unwrap();
+
+        // Load via packed store
+        let loaded = store.load_sort_layers("testField", 8).unwrap().unwrap();
+        assert_eq!(loaded.len(), 8);
+        assert_eq!(loaded[0].len(), 50);
+        assert_eq!(loaded[1].len(), 1);
+        assert!(loaded[1].contains(42));
+        // Remaining should be empty
+        for i in 2..8 {
+            assert!(loaded[i].is_empty());
+        }
+    }
+
+    #[test]
+    fn test_sort_field_shard_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let gen_root = dir.path();
+
+        // Create sort directory with packed shard files
+        let sort_dir = gen_root.join("sort");
+        std::fs::create_dir_all(&sort_dir).unwrap();
+        std::fs::write(sort_dir.join("reactionCount.shard"), b"dummy").unwrap();
+        std::fs::write(sort_dir.join("sortAt.shard"), b"dummy").unwrap();
+        // Legacy directory should NOT appear in packed list
+        std::fs::create_dir_all(sort_dir.join("legacyField")).unwrap();
+
+        let shard = SortFieldShard;
+        let mut keys = shard.list_shards(gen_root).unwrap();
+        keys.sort_by(|a, b| a.field.cmp(&b.field));
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].field, "reactionCount");
+        assert_eq!(keys[1].field, "sortAt");
     }
 }

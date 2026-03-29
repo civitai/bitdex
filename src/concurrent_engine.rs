@@ -164,6 +164,11 @@ enum LazyLoad {
         name: String,
         layers: Vec<RoaringBitmap>,
     },
+    /// Reload the alive bitmap + slot counter from disk.
+    /// Used by the dump processor after writing alive to BitmapFs.
+    Slots {
+        slots: crate::slot::SlotAllocator,
+    },
 }
 
 /// Inner bitmap state published as immutable snapshots via ArcSwap.
@@ -284,6 +289,8 @@ pub struct ConcurrentEngine {
     /// Metrics bridge: prometheus handles set by server layer, read by background threads.
     #[cfg(feature = "server")]
     metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
+    /// Amortized bitmap memory scanner cache (replaces expensive per-scrape iteration).
+    bitmap_memory_cache: Arc<crate::bitmap_memory_cache::BitmapMemoryCache>,
     /// In-memory document cache (DashMap, cache-on-read, write-through, LRU eviction).
     doc_cache: Option<Arc<crate::doc_cache::DocCache>>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
@@ -300,6 +307,11 @@ pub struct ConcurrentEngine {
     prefetch_handle: Option<JoinHandle<()>>,
     /// Background doc cache eviction thread handle.
     doc_cache_eviction_handle: Option<JoinHandle<()>>,
+    /// WAL writer for Sync V2 write path. When set, put() and patch_document()
+    /// decompose documents into ops and write to WAL instead of directly to coalescer.
+    /// The WAL reader thread picks up ops and routes through apply_ops_batch.
+    #[cfg(feature = "pg-sync")]
+    wal_writer: Option<Arc<crate::ops_wal::WalWriter>>,
 }
 
 impl ConcurrentEngine {
@@ -338,31 +350,7 @@ impl ConcurrentEngine {
             None
         };
 
-        // One-time migration: if BitmapFs data exists but ShardStore doesn't,
-        // migrate all bitmap data from BitmapFs → ShardStore format.
-        if let Some(ref path) = config.storage.bitmap_path {
-            use crate::shard_store_migrate::{has_bitmapfs_data, has_shardstore_data, migrate_bitmapfs_to_shardstore};
-            if has_bitmapfs_data(path) && !has_shardstore_data(path) {
-                let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
-                let sort_configs: Vec<(String, usize)> = config.sort_fields.iter()
-                    .map(|s| (s.name.clone(), s.bits as usize))
-                    .collect();
-                match migrate_bitmapfs_to_shardstore(path, &filter_names, &sort_configs) {
-                    Ok((alive, filters, sorts)) => {
-                        eprintln!(
-                            "Migration complete: {} alive records, {} filter fields, {} sort fields",
-                            alive, filters, sorts,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("WARNING: BitmapFs → ShardStore migration failed: {e}");
-                        eprintln!("Continuing with empty ShardStore — data will repopulate via pg-sync");
-                    }
-                }
-            }
-        }
-
-        // Construct ShardStore instances (will find migrated data if migration ran above)
+        // Construct ShardStore instances
         let (alive_store, filter_store, sort_store, meta_store) = if let Some(ref path) = config.storage.bitmap_path {
             let ss_root = path.join("shardstore");
             use crate::error::BitdexError;
@@ -1036,6 +1024,13 @@ impl ConcurrentEngine {
             None
         };
 
+        // Bitmap memory scanner cache
+        let bitmap_memory_cache = Arc::new(crate::bitmap_memory_cache::BitmapMemoryCache::new(
+            config.memory_scanner.enabled,
+            config.memory_scanner.interval_ms,
+            config.memory_scanner.batch_size,
+        ));
+
         // Eviction state
         let eviction_stamps: Arc<DashMap<(Arc<str>, u64), AtomicU64>> = Arc::new(DashMap::new());
         let flush_cycle = Arc::new(AtomicU64::new(0));
@@ -1060,7 +1055,7 @@ impl ConcurrentEngine {
         let boundstore_entries_skipped = Arc::new(AtomicU64::new(0));
 
         // Headless mode: skip all background threads.
-        // The engine provides config, BitmapFs, and docstore access but
+        // The engine provides config, bitmap store, and docstore access but
         // no flush/merge/eviction threads run.
         if config.headless {
             eprintln!("Engine starting in headless mode (no background threads)");
@@ -1118,6 +1113,7 @@ impl ConcurrentEngine {
                 boundstore_entries_skipped,
                 #[cfg(feature = "server")]
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
+                bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
                 doc_cache: doc_cache.clone(),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
@@ -1125,6 +1121,8 @@ impl ConcurrentEngine {
                 prefetch_tx: None,
                 prefetch_handle: None,
                 doc_cache_eviction_handle: None,
+                #[cfg(feature = "pg-sync")]
+                wal_writer: None,
             });
         }
 
@@ -1220,6 +1218,9 @@ impl ConcurrentEngine {
                                         }
                                     }
                                 }
+                            }
+                            LazyLoad::Slots { slots } => {
+                                staging.slots = slots;
                             }
                         }
                         lazy_loaded = true;
@@ -1637,6 +1638,9 @@ impl ConcurrentEngine {
                                             if let Some(sf) = staging.sorts.get_field_mut(&name) {
                                                 sf.load_layers(layers);
                                             }
+                                        }
+                                        LazyLoad::Slots { slots } => {
+                                            staging.slots = slots;
                                         }
                                     }
                                 }
@@ -2606,6 +2610,25 @@ impl ConcurrentEngine {
             (None, None)
         };
 
+        // Spawn bitmap memory scanner thread (amortized per-field memory measurement)
+        {
+            let mem_cache = Arc::clone(&bitmap_memory_cache);
+            let inner_ref = Arc::clone(&inner);
+            let loading_flag = Arc::clone(&loading_mode);
+            let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
+            let sort_names: Vec<String> = config.sort_fields.iter().map(|f| f.name.clone()).collect();
+            std::thread::Builder::new()
+                .name("bitdex-mem-scanner".into())
+                .spawn(move || {
+                    loop {
+                        let interval = mem_cache.interval_ms();
+                        std::thread::sleep(std::time::Duration::from_millis(interval));
+                        mem_cache.scan_tick(&inner_ref, &loading_flag, &filter_names, &sort_names);
+                    }
+                })
+                .expect("failed to spawn memory scanner thread");
+        }
+
         // Spawn doc cache eviction thread (generational rotation + memory-pressure eviction)
         let doc_cache_eviction_handle = if let Some(ref cache) = doc_cache {
             let cache_clone = Arc::clone(cache);
@@ -2676,6 +2699,7 @@ impl ConcurrentEngine {
             boundstore_entries_skipped,
             #[cfg(feature = "server")]
             metrics_bridge,
+            bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
             doc_cache: doc_cache.clone(),
             compaction_skipped,
             compact_tx,
@@ -2683,6 +2707,8 @@ impl ConcurrentEngine {
             prefetch_tx,
             prefetch_handle,
             doc_cache_eviction_handle,
+            #[cfg(feature = "pg-sync")]
+            wal_writer: None,
         })
     }
 
@@ -2702,6 +2728,11 @@ impl ConcurrentEngine {
     #[cfg(feature = "server")]
     pub fn set_metrics_bridge(&self, bridge: MetricsBridge) {
         self.metrics_bridge.store(Arc::new(Some(Arc::new(bridge))));
+    }
+
+    /// Get a reference to the bitmap memory cache (for metrics scraping).
+    pub fn bitmap_memory_cache(&self) -> &crate::bitmap_memory_cache::BitmapMemoryCache {
+        &self.bitmap_memory_cache
     }
 
     /// Get the cumulative count of compaction operations skipped due to channel backpressure.
@@ -2818,10 +2849,80 @@ impl ConcurrentEngine {
     /// 6. Enqueue doc write to docstore channel (flush thread batches these)
     /// 7. Clear in-flight
     pub fn put(&self, id: u32, doc: &Document) -> Result<()> {
+        // [2.7] WAL path: decompose to ops and write to WAL. The WAL reader
+        // thread handles bitmap mutations + docstore writes asynchronously.
+        #[cfg(feature = "pg-sync")]
+        if let Some(ref wal) = self.wal_writer {
+            return self.put_via_wal(id, doc, wal);
+        }
+
+        // Legacy direct path (when WAL writer is not configured)
         self.in_flight.mark_in_flight(id);
         let result = self.put_inner(id, doc);
         self.in_flight.clear_in_flight(id);
         result
+    }
+
+    /// PUT via WAL: decompose document into field-level ops and append to WAL.
+    /// Returns after fsync — mutations become visible when WAL reader processes them.
+    #[cfg(feature = "pg-sync")]
+    fn put_via_wal(&self, id: u32, doc: &Document, wal: &crate::ops_wal::WalWriter) -> Result<()> {
+        let is_alive = self.is_slot_alive(id);
+
+        // Read old doc for upsert diffing
+        let old_doc = if is_alive {
+            self.docstore.lock().get(id)?
+        } else {
+            None
+        };
+
+        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config, false);
+        let creates_slot = !is_alive;
+
+        let entry = crate::pg_sync::ops::EntityOps {
+            entity_id: id as i64,
+            ops,
+            creates_slot,
+        };
+
+        wal.append_batch(&[entry]).map_err(|e| {
+            crate::error::BitdexError::DocStore(format!("WAL write failed: {e}"))
+        })?;
+
+        Ok(())
+    }
+
+    /// PATCH via WAL: decompose partial document into field-level ops and append to WAL.
+    #[cfg(feature = "pg-sync")]
+    fn patch_document_via_wal(&self, id: u32, doc: &Document, wal: &crate::ops_wal::WalWriter) -> Result<()> {
+        let is_alive = self.is_slot_alive(id);
+
+        if !is_alive {
+            // New slot — full PUT via WAL
+            return self.put_via_wal(id, doc, wal);
+        }
+
+        // Read old doc for diffing
+        let old_doc = self.docstore.lock().get(id)?;
+
+        // For PATCH, only emit ops for fields present in the new doc
+        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config, true);
+
+        if ops.is_empty() {
+            return Ok(());
+        }
+
+        let entry = crate::pg_sync::ops::EntityOps {
+            entity_id: id as i64,
+            ops,
+            creates_slot: false,
+        };
+
+        wal.append_batch(&[entry]).map_err(|e| {
+            crate::error::BitdexError::DocStore(format!("WAL write failed: {e}"))
+        })?;
+
+        Ok(())
     }
 
     /// Inner PUT logic shared by put() and patch_document() (for new slots).
@@ -2904,6 +3005,12 @@ impl ConcurrentEngine {
     /// Only fields present in the doc are diffed and updated. Missing fields
     /// are left untouched in both bitmaps and docstore.
     pub fn patch_document(&self, id: u32, doc: &Document) -> Result<()> {
+        // [2.7] WAL path: decompose to ops and write to WAL.
+        #[cfg(feature = "pg-sync")]
+        if let Some(ref wal) = self.wal_writer {
+            return self.patch_document_via_wal(id, doc, wal);
+        }
+
         self.in_flight.mark_in_flight(id);
 
         let result = (|| -> Result<()> {
@@ -3096,9 +3203,9 @@ impl ConcurrentEngine {
         result
     }
 
-    /// Reload a field's positive existence set from BitmapFs.
+    /// Reload a field's positive existence set from the filter store.
     ///
-    /// Called after external bulk writes to BitmapFs (e.g., backfill) so that
+    /// Called after external bulk writes (e.g., backfill) so that
     /// lazy per-value loading picks up the new data. The existence set is stored
     /// behind an ArcSwap so the update is atomic and lock-free.
     pub fn reload_existence_set(&self, field_name: &str) -> Result<()> {
@@ -3320,7 +3427,7 @@ impl ConcurrentEngine {
 
         if total_tasks > 1 {
             // --- Parallel loading via std::thread::scope ---
-            // Each thread reads from BitmapFs (Arc, safe to share). Results collected
+            // Each thread reads from ShardStore (Arc, safe to share). Results collected
             // into thread-safe containers, then applied sequentially.
             use std::sync::Mutex;
             let par_filters: Mutex<Vec<(String, HashMap<u64, RoaringBitmap>)>> = Mutex::new(Vec::new());
@@ -5310,6 +5417,78 @@ impl ConcurrentEngine {
         self.pending_filter_loads.lock().len() + self.pending_sort_loads.lock().len()
     }
 
+    /// Mark fields as pending for lazy loading from disk.
+    /// Call after dump processor writes bitmaps — this tells the engine
+    /// to reload them on the next query.
+    pub fn mark_fields_pending_reload(&self, filter_fields: &[String], sort_fields: &[String]) {
+        {
+            let mut pending = self.pending_filter_loads.lock();
+            for name in filter_fields {
+                pending.insert(name.clone());
+            }
+        }
+        {
+            let mut pending = self.pending_sort_loads.lock();
+            for name in sort_fields {
+                pending.insert(name.clone());
+            }
+        }
+        eprintln!(
+            "Marked {} filter + {} sort fields for lazy reload",
+            filter_fields.len(),
+            sort_fields.len()
+        );
+    }
+
+    /// Reload the alive bitmap and slot counter from ShardStore into the
+    /// in-memory engine snapshot. Sends via the lazy load channel so the
+    /// flush thread's staging stays in sync — same path as filter/sort
+    /// lazy loading. Without this, the flush thread's next publish would
+    /// overwrite the alive bitmap with its stale empty copy.
+    pub fn reload_alive_from_disk(&self) {
+        let alive_store = match self.alive_store.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let meta_store = match self.meta_store.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let alive_bm = match alive_store.load_alive() {
+            Ok(Some(bm)) => bm,
+            _ => return,
+        };
+        let counter = meta_store.load_slot_counter().ok().flatten().unwrap_or(0);
+        let alive_count = alive_bm.len();
+
+        // Build new SlotAllocator with the disk state
+        let mut new_slots = crate::slot::SlotAllocator::from_state(
+            counter,
+            alive_bm,
+            RoaringBitmap::new(),
+        );
+
+        // Load deferred alive if present
+        if let Some(deferred) = meta_store.load_deferred_alive().ok().flatten() {
+            new_slots.set_deferred(deferred);
+        }
+
+        // Send to flush thread via lazy load channel — same pattern as
+        // ensure_fields_loaded for filter/sort bitmaps.
+        let _ = self.lazy_tx.send(LazyLoad::Slots { slots: new_slots });
+
+        // Ask the flush thread to drain the lazy channel and publish.
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        if self.cmd_tx.send(FlushCommand::ForcePublish { done: done_tx }).is_ok() {
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        }
+
+        eprintln!(
+            "Reloaded alive bitmap from disk: {} alive, slot_counter={}",
+            alive_count, counter
+        );
+    }
+
     /// Get eviction stats: (field_name, evicted_total, resident_count).
     pub fn eviction_stats(&self) -> Vec<(String, u64, usize)> {
         let snap = self.snapshot();
@@ -5402,6 +5581,24 @@ impl ConcurrentEngine {
         self.docstore.lock().schema_version()
     }
 
+    /// Get a clone of the Arc<Mutex<DocStore>> for external writers (e.g., DocWriter).
+    pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<crate::docstore::DocStore>> {
+        Arc::clone(&self.docstore)
+    }
+
+    /// Set the WAL writer for the V2 write path. When set, put() and patch_document()
+    /// decompose documents into ops and write to WAL instead of directly to coalescer.
+    #[cfg(feature = "pg-sync")]
+    pub fn set_wal_writer(&mut self, writer: Arc<crate::ops_wal::WalWriter>) {
+        self.wal_writer = Some(writer);
+    }
+
+    /// Check if a slot is alive (for non-alive slot filtering in ops processing).
+    pub fn is_slot_alive(&self, slot: u32) -> bool {
+        let snap = self.snapshot();
+        snap.slots.is_alive(slot)
+    }
+
     /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> std::collections::HashMap<u8, std::collections::HashMap<String, serde_json::Value>> {
         self.docstore.lock().build_schema_registry()
@@ -5440,6 +5637,14 @@ impl ConcurrentEngine {
 
     /// Doc cache stats for Prometheus scrape: (hits, misses, entries, bytes, evictions, generations).
     /// Returns zeros if doc_cache is not configured.
+    /// Evict a slot from the doc cache so the next read fetches from disk.
+    /// Used by WAL reader after DocWriter updates a document via ops.
+    pub fn evict_doc_cache(&self, slot: u32) {
+        if let Some(ref cache) = self.doc_cache {
+            cache.remove(slot);
+        }
+    }
+
     pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64, usize) {
         match &self.doc_cache {
             Some(cache) => (
@@ -5638,6 +5843,9 @@ impl ConcurrentEngine {
                 eprintln!("Warning: exit_loading_mode timed out waiting for flush thread publish");
             }
         }
+
+        // Trigger initial population of bitmap memory cache after load completes.
+        self.bitmap_memory_cache.mark_all_dirty();
     }
 
     /// Combined exit-loading + save + unload that avoids the memory spike.
@@ -6073,9 +6281,25 @@ impl ConcurrentEngine {
         self.sender.clone()
     }
 
-    /// Get a reference to the BitmapFs store, if configured.
+    /// Get a reference to the legacy BitmapFs store, if configured.
+    /// Used by dump_processor for bitmap persistence.
     pub fn bitmap_store(&self) -> Option<&Arc<BitmapFs>> {
         self.bitmap_store.as_ref()
+    }
+
+    /// Get the ShardStore instances for direct bitmap I/O (dump processor, etc.).
+    pub fn shard_stores(&self) -> Option<(
+        Arc<crate::shard_store_bitmap::AliveBitmapStore>,
+        Arc<crate::shard_store_bitmap::FilterBitmapStore>,
+        Arc<crate::shard_store_bitmap::SortBitmapStore>,
+        Arc<crate::shard_store_meta::MetaStore>,
+    )> {
+        Some((
+            Arc::clone(self.alive_store.as_ref()?),
+            Arc::clone(self.filter_store.as_ref()?),
+            Arc::clone(self.sort_store.as_ref()?),
+            Arc::clone(self.meta_store.as_ref()?),
+        ))
     }
 
     /// Pin ShardStore generations across alive, filter, and sort stores.
@@ -7063,7 +7287,7 @@ impl ConcurrentEngine {
     /// 3. Scans all alive documents to build bitmaps for the new fields
     /// 4. Publishes the updated snapshot
     ///
-    /// The caller (server) is responsible for updating the persisted config.json.
+    /// The caller (server) is responsible for updating the persisted config.
     /// Returns (slots_processed, field_names_added).
     pub fn add_fields_from_docstore(
         &self,
@@ -7310,7 +7534,7 @@ impl ConcurrentEngine {
     /// Removes the fields from the in-memory staging snapshot and publishes.
     /// Does NOT delete bitmap files on disk — orphaned files are overwritten
     /// on next `save_snapshot` or ignored on boot (field not in config = not loaded).
-    /// The caller (server) is responsible for updating the persisted config.json.
+    /// The caller (server) is responsible for updating the persisted config.
     pub fn remove_fields(
         &self,
         filter_names: &[String],
@@ -7336,6 +7560,13 @@ impl ConcurrentEngine {
         }
 
         Ok(removed)
+    }
+
+    /// Signal background threads to stop (non-blocking, works through Arc).
+    /// Threads will exit on their next loop iteration. Use this when you can't
+    /// get `&mut self` (e.g., engine behind Arc with multiple references).
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
     }
 
     /// Shutdown the flush, merge, and compaction threads gracefully.
@@ -10138,8 +10369,6 @@ mod tests {
     /// when the engine has only partial (lazy-loaded) data in memory.
     #[test]
     fn test_snapshot_save_preserves_bulk_loaded_lazy_value_field() {
-        use crate::bitmap_fs::BitmapFs;
-
         let dir = tempfile::tempdir().unwrap();
         let bitmap_path = dir.path().join("bitmaps");
         let docstore_path = dir.path().join("docs");

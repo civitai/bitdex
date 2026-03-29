@@ -95,19 +95,24 @@ pub struct Config {
     #[serde(default)]
     pub doc_cache: DocCacheConfigEntry,
 
+    /// Bitmap memory scanner settings. Replaces the expensive per-scrape
+    /// bitmap_memory_report() with incremental background scanning.
+    #[serde(default)]
+    pub memory_scanner: MemoryScannerConfig,
+
     /// Enabled metric groups. Controls which expensive metric groups are
     /// collected on the Prometheus scrape endpoint.
     /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
     /// When `None` (default), all groups are enabled (backward compatible).
     /// When `Some(vec)`, only the listed groups are enabled.
-    /// Persisted to config.json and applied on startup.
+    /// Persisted to config.yaml and applied on startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_metrics: Option<Vec<String>>,
 
     /// Headless mode: skip all background threads (flush, merge, eviction).
-    /// Used by bulk loaders that write directly to BitmapFs and don't need
-    /// the engine's write pipeline. The engine still provides config, BitmapFs
-    /// access, and docstore, but no background work runs.
+    /// Used by bulk loaders that write directly to disk and don't need
+    /// the engine's write pipeline. The engine still provides config, bitmap
+    /// store access, and docstore, but no background work runs.
     #[serde(default)]
     pub headless: bool,
 }
@@ -177,6 +182,7 @@ impl Default for Config {
             eviction_sweep_interval: default_eviction_sweep_interval(),
             compact_threshold_pct: default_compact_threshold_pct(),
             doc_cache: DocCacheConfigEntry::default(),
+            memory_scanner: MemoryScannerConfig::default(),
             enabled_metrics: None,
             deferred_alive: None,
             memory_budget_bytes: None,
@@ -190,7 +196,7 @@ impl Default for Config {
 impl Config {
     /// Load configuration from a file. Format is detected from the file extension.
     ///
-    /// Supported extensions: `.toml`, `.yaml`, `.yml`
+    /// Supported extensions: `.toml`, `.yaml`, `.yml`, `.json`
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| BitdexError::Config(format!("failed to read {}: {e}", path.display())))?;
@@ -202,10 +208,36 @@ impl Config {
 
         match ext {
             "toml" => Self::from_toml(&content),
+            "yaml" | "yml" => Self::from_yaml(&content),
+            "json" => Self::from_json(&content),
             other => Err(BitdexError::Config(format!(
                 "unsupported config file format: '{other}'"
             ))),
         }
+    }
+
+    /// Load configuration from a YAML string.
+    #[cfg(feature = "serde_yaml")]
+    pub fn from_yaml(yaml_str: &str) -> Result<Self> {
+        let config: Config = serde_yaml::from_str(yaml_str)
+            .map_err(|e| BitdexError::Config(format!("YAML parse error: {e}")))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[cfg(not(feature = "serde_yaml"))]
+    pub fn from_yaml(_yaml_str: &str) -> Result<Self> {
+        Err(BitdexError::Config(
+            "YAML support requires the 'serde_yaml' feature".to_string(),
+        ))
+    }
+
+    /// Load configuration from a JSON string.
+    pub fn from_json(json_str: &str) -> Result<Self> {
+        let config: Config = serde_json::from_str(json_str)
+            .map_err(|e| BitdexError::Config(format!("JSON parse error: {e}")))?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load configuration from a TOML string.
@@ -540,6 +572,38 @@ impl Default for DocCacheConfigEntry {
     }
 }
 
+/// Bitmap memory scanner configuration.
+///
+/// The scanner runs a background thread that incrementally measures per-field
+/// bitmap memory, replacing the expensive on-scrape `bitmap_memory_report()`
+/// call (52s at 107M records).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryScannerConfig {
+    /// Whether the scanner thread is active. Default: true.
+    #[serde(default = "default_scanner_enabled")]
+    pub enabled: bool,
+    /// How often the scanner wakes to process dirty fields, in milliseconds. Default: 100.
+    #[serde(default = "default_scanner_interval_ms")]
+    pub interval_ms: u64,
+    /// Maximum number of fields to scan per tick. Default: 3.
+    #[serde(default = "default_scanner_batch_size")]
+    pub batch_size: u64,
+}
+
+fn default_scanner_enabled() -> bool { true }
+fn default_scanner_interval_ms() -> u64 { 100 }
+fn default_scanner_batch_size() -> u64 { 3 }
+
+impl Default for MemoryScannerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_ms: 100,
+            batch_size: 3,
+        }
+    }
+}
+
 /// Configuration for a single filter field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterFieldConfig {
@@ -550,7 +614,7 @@ pub struct FilterFieldConfig {
     pub behaviors: Option<FieldBehaviors>,
     /// Idle eviction config. Only meaningful on `multi_value` fields.
     /// Values untouched for `idle_seconds` are evicted from memory and
-    /// re-loaded from BitmapFs on the next query.
+    /// re-loaded from disk on the next query.
     #[serde(default)]
     pub eviction: Option<EvictionConfig>,
     /// If true, load this field's bitmaps eagerly on startup instead of

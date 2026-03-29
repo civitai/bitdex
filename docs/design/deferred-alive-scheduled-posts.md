@@ -1,3 +1,8 @@
+---
+status: ACTIVE
+updated: 2026-03-28
+---
+
 # Design: Scheduled Posts Visibility Fix
 
 **Author:** Ollie (perf eng)

@@ -1,0 +1,123 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: bitdex-alerts
+  namespace: bitdex
+  labels:
+    app: bitdex
+    prometheus: kube-prometheus-stack
+spec:
+  groups:
+    - name: bitdex.critical
+      rules:
+        # Gate 7: RSS approaching pod memory limit (32GB)
+        # Pod limit is 32GB. Alert at 87% (28GB) — historically where OOM starts.
+        - alert: BitdexRSSHigh
+          expr: bitdex_process_rss_bytes > 28000000000
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "BitDex RSS memory is above 87% of pod limit"
+            description: "RSS is {{ $value | humanize1024 }} (pod limit 32GB). Risk of OOM kill. Check cache eviction, doc cache, and bitmap memory."
+            runbook: "Check `node .claude/skills/monitoring/cli.mjs memory --prod` for breakdown."
+
+        # Gate 7: Query latency p99 spike
+        # Production baseline p99 = 36ms. Alert if sustained above 100ms.
+        - alert: BitdexQueryLatencyHigh
+          expr: histogram_quantile(0.99, sum(rate(bitdex_query_duration_seconds_bucket[5m])) by (le)) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "BitDex query p99 latency above 100ms"
+            description: "Query p99 is {{ $value | humanizeDuration }}. Baseline is ~36ms. Check cache hit rate and lazy loading stalls."
+
+        # Gate 7: Query latency p99 critical (>500ms sustained)
+        - alert: BitdexQueryLatencyCritical
+          expr: histogram_quantile(0.99, sum(rate(bitdex_query_duration_seconds_bucket[5m])) by (le)) > 0.5
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "BitDex query p99 latency above 500ms"
+            description: "Query p99 is {{ $value | humanizeDuration }}. This indicates a major performance issue — lazy load stall, cache miss storm, or memory pressure."
+
+    - name: bitdex.sync
+      rules:
+        # Gate 7: PG-Sync cursor stalled (V1 outbox poller)
+        - alert: BitdexPGSyncStalled
+          expr: changes(bitdex_pgsync_cursor_position[10m]) == 0 and bitdex_pgsync_cursor_position > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "BitDex PG-Sync cursor has not advanced in 15 minutes"
+            description: "Cursor at {{ $value }}. Outbox poller may be stuck. Check pg-sync logs."
+
+        # Gate 7: Sync V2 lag growing
+        - alert: BitdexSyncV2LagHigh
+          expr: bitdex_sync_lag_rows > 10000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "BitDex Sync V2 lag exceeds 10K rows"
+            description: "Sync lag is {{ $value }} rows. WAL reader may be falling behind. Check `node .claude/skills/monitoring/cli.mjs sync-health --prod`."
+
+        # Sync V2 lag critical
+        - alert: BitdexSyncV2LagCritical
+          expr: bitdex_sync_lag_rows > 100000
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "BitDex Sync V2 lag exceeds 100K rows"
+            description: "Sync lag is {{ $value }} rows. Data freshness severely impacted."
+
+    - name: bitdex.cache
+      rules:
+        # Cache hit rate drop
+        - alert: BitdexCacheHitRateLow
+          expr: |
+            sum(rate(bitdex_cache_hits_total[5m]))
+            / clamp_min(sum(rate(bitdex_cache_hits_total[5m])) + sum(rate(bitdex_cache_misses_total[5m])), 1)
+            < 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "BitDex cache hit rate below 50%"
+            description: "Cache hit rate is {{ $value | humanizePercentage }}. High miss rate increases query latency and memory pressure."
+
+        # Query rejection (backpressure active)
+        - alert: BitdexQueriesRejected
+          expr: rate(bitdex_queries_rejected_total[5m]) > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "BitDex is rejecting queries due to backpressure"
+            description: "Queries are being rejected at {{ $value }}/s. max_query_concurrency limit may be too low, or queries are stalling."
+
+    - name: bitdex.memory
+      rules:
+        # RSS warning threshold (80%)
+        - alert: BitdexRSSWarning
+          expr: bitdex_process_rss_bytes > 25600000000
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "BitDex RSS memory above 80% of pod limit"
+            description: "RSS is {{ $value | humanize1024 }} (80% of 32GB). Monitor for continued growth."
+
+        # Lazy load stall (field loading taking too long)
+        - alert: BitdexLazyLoadSlow
+          expr: histogram_quantile(0.95, sum(rate(bitdex_lazy_load_duration_seconds_bucket[5m])) by (le)) > 5
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "BitDex lazy load p95 exceeds 5 seconds"
+            description: "Field loading is taking {{ $value | humanizeDuration }} at p95. First queries after startup will stall."

@@ -22,12 +22,314 @@ use serde_json::Value as JsonValue;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
+use crate::docstore::{DocStore, PackedValue};
 use crate::filter::FilterFieldType;
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
 use crate::pg_sync::op_dedup::dedup_ops;
 use crate::pg_sync::ops::{EntityOps, Op};
 use crate::query::{BitdexQuery, FilterClause, Value as QValue};
+
+// ---------------------------------------------------------------------------
+// DocWriter — writes field values to docstore alongside bitmap mutations
+// ---------------------------------------------------------------------------
+
+/// Writes individual field-value tuples to the docstore during WAL processing.
+/// Wraps the engine's docstore with a cached field dictionary snapshot.
+///
+/// Thread safety: DocWriter is used exclusively by the WAL reader thread,
+/// which is single-threaded. The read-modify-write in write_add/write_remove
+/// is safe because no concurrent writer can modify the same slot's doc between
+/// the read and write within a single WAL batch cycle.
+pub struct DocWriter {
+    docstore: Arc<parking_lot::Mutex<DocStore>>,
+    field_dict: HashMap<String, u16>,
+    pending: Vec<(u32, u16, Vec<u8>)>,
+}
+
+impl DocWriter {
+    /// Create a DocWriter from the engine's docstore.
+    pub fn new(docstore: Arc<parking_lot::Mutex<DocStore>>) -> Self {
+        let field_dict = docstore.lock().field_dict_snapshot();
+        Self {
+            docstore,
+            field_dict,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Write a single-value field update to the docstore.
+    fn write_set(&mut self, slot: u32, field: &str, value: &JsonValue) {
+        let idx = match self.resolve_field(field) {
+            Some(idx) => idx,
+            None => return,
+        };
+        if let Some(packed) = json_to_packed(value) {
+            if let Ok(bytes) = rmp_serde::to_vec(&packed) {
+                self.pending.push((slot, idx, bytes));
+            }
+        }
+    }
+
+    /// Write a multi-value add: read current list, append value, write back.
+    fn write_add(&mut self, slot: u32, field: &str, value: &JsonValue) {
+        let idx = match self.resolve_field(field) {
+            Some(idx) => idx,
+            None => return,
+        };
+        let add_val = match value.as_i64() {
+            Some(v) => v,
+            None => return,
+        };
+
+        // Read current doc and get existing multi-value list
+        let mut current = self.read_multi_value(slot, field);
+        if !current.contains(&add_val) {
+            current.push(add_val);
+        }
+        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
+            self.pending.push((slot, idx, bytes));
+        }
+    }
+
+    /// Write a multi-value remove: read current list, remove value, write back.
+    fn write_remove(&mut self, slot: u32, field: &str, value: &JsonValue) {
+        let idx = match self.resolve_field(field) {
+            Some(idx) => idx,
+            None => return,
+        };
+        let remove_val = match value.as_i64() {
+            Some(v) => v,
+            None => return,
+        };
+
+        let mut current = self.read_multi_value(slot, field);
+        current.retain(|&v| v != remove_val);
+        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
+            self.pending.push((slot, idx, bytes));
+        }
+    }
+
+    /// Flush pending tuples to the docstore.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let tuples = std::mem::take(&mut self.pending);
+        if let Err(e) = self.docstore.lock().append_tuples_batch(tuples) {
+            tracing::warn!("DocWriter flush failed: {e}");
+        }
+    }
+
+    fn resolve_field(&mut self, field: &str) -> Option<u16> {
+        if let Some(&idx) = self.field_dict.get(field) {
+            return Some(idx);
+        }
+        // Field not in snapshot — try to ensure it exists
+        match self.docstore.lock().ensure_field_index(field) {
+            Ok(idx) => {
+                self.field_dict.insert(field.to_string(), idx);
+                Some(idx)
+            }
+            Err(e) => {
+                tracing::warn!("DocWriter: failed to ensure field '{field}': {e}");
+                None
+            }
+        }
+    }
+
+    fn read_multi_value(&self, slot: u32, field: &str) -> Vec<i64> {
+        let doc = match self.docstore.lock().get(slot) {
+            Ok(Some(doc)) => doc,
+            _ => return Vec::new(),
+        };
+        match doc.fields.get(field) {
+            Some(crate::mutation::FieldValue::Multi(vals)) => {
+                vals.iter().filter_map(|v| {
+                    if let QValue::Integer(i) = v { Some(*i) } else { None }
+                }).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Document → Ops decomposition (for PUT/PATCH → WAL refactor, task 2.7)
+// ---------------------------------------------------------------------------
+
+/// Convert a FieldValue to a serde_json::Value for Op serialization.
+pub fn field_value_to_json(fv: &crate::mutation::FieldValue) -> JsonValue {
+    match fv {
+        crate::mutation::FieldValue::Single(v) => qvalue_to_json(v),
+        crate::mutation::FieldValue::Multi(vals) => {
+            JsonValue::Array(vals.iter().map(qvalue_to_json).collect())
+        }
+    }
+}
+
+/// Convert a query::Value to a serde_json::Value.
+fn qvalue_to_json(v: &QValue) -> JsonValue {
+    match v {
+        QValue::Integer(i) => JsonValue::Number(serde_json::Number::from(*i)),
+        QValue::Float(f) => {
+            serde_json::Number::from_f64(*f)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
+        }
+        QValue::Bool(b) => JsonValue::Bool(*b),
+        QValue::String(s) => JsonValue::String(s.clone()),
+    }
+}
+
+/// Decompose a Document into `Vec<Op>` for WAL writing.
+///
+/// For fresh inserts (old_doc is None): emits Op::Set for each field.
+/// For upserts (old_doc is Some): emits Op::Remove for old values + Op::Set for
+/// new values on changed fields. Unchanged fields are skipped.
+///
+/// Multi-value fields are decomposed into individual Op::Add/Op::Remove per value.
+///
+/// `is_patch`: when true (PATCH semantics), fields absent from new_doc are left
+/// untouched — no Op::Remove emitted. When false (PUT semantics), absent fields
+/// are treated as deletions and their old bitmap bits are cleared.
+pub fn document_to_ops(
+    new_doc: &crate::mutation::Document,
+    old_doc: Option<&crate::docstore::StoredDoc>,
+    config: &crate::config::Config,
+    is_patch: bool,
+) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let empty_fields = std::collections::HashMap::new();
+    let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
+
+    // Process all fields in the new document
+    for (field_name, new_val) in &new_doc.fields {
+        let old_val = old_fields.get(field_name);
+
+        // Check if this is a multi-value field (tagIds, toolIds, etc.)
+        let is_multi_value = config.filter_fields.iter()
+            .any(|f| f.name == *field_name && f.field_type == crate::filter::FilterFieldType::MultiValue);
+
+        if is_multi_value {
+            // Multi-value: compute add/remove sets
+            let old_ints = extract_multi_ints(old_val);
+            let new_ints = extract_multi_ints(Some(new_val));
+
+            // Remove values that were in old but not in new
+            for v in &old_ints {
+                if !new_ints.contains(v) {
+                    ops.push(Op::Remove {
+                        field: field_name.clone(),
+                        value: JsonValue::Number(serde_json::Number::from(*v)),
+                    });
+                }
+            }
+            // Add values that are in new but not in old
+            for v in &new_ints {
+                if !old_ints.contains(v) {
+                    ops.push(Op::Add {
+                        field: field_name.clone(),
+                        value: JsonValue::Number(serde_json::Number::from(*v)),
+                    });
+                }
+            }
+        } else {
+            // Single-value field: remove old + set new if changed
+            if let Some(old) = old_val {
+                if old != new_val {
+                    ops.push(Op::Remove {
+                        field: field_name.clone(),
+                        value: field_value_to_json(old),
+                    });
+                    ops.push(Op::Set {
+                        field: field_name.clone(),
+                        value: field_value_to_json(new_val),
+                    });
+                }
+                // else: unchanged, skip
+            } else {
+                // New field (not in old doc)
+                ops.push(Op::Set {
+                    field: field_name.clone(),
+                    value: field_value_to_json(new_val),
+                });
+            }
+        }
+    }
+
+    // For PUT upsert: handle fields that were in old doc but removed in new doc.
+    // PATCH skips this — absent fields are left untouched (partial update semantics).
+    if old_doc.is_some() && !is_patch {
+        for (field_name, old_val) in old_fields {
+            if !new_doc.fields.contains_key(field_name) {
+                // Field was removed
+                let is_multi_value = config.filter_fields.iter()
+                    .any(|f| f.name == *field_name && f.field_type == crate::filter::FilterFieldType::MultiValue);
+
+                if is_multi_value {
+                    for v in extract_multi_ints(Some(old_val)) {
+                        ops.push(Op::Remove {
+                            field: field_name.clone(),
+                            value: JsonValue::Number(serde_json::Number::from(v)),
+                        });
+                    }
+                } else {
+                    ops.push(Op::Remove {
+                        field: field_name.clone(),
+                        value: field_value_to_json(old_val),
+                    });
+                }
+            }
+        }
+    }
+
+    ops
+}
+
+/// Extract integer values from a multi-value FieldValue.
+fn extract_multi_ints(fv: Option<&crate::mutation::FieldValue>) -> Vec<i64> {
+    match fv {
+        Some(crate::mutation::FieldValue::Multi(vals)) => {
+            vals.iter().filter_map(|v| {
+                if let QValue::Integer(i) = v { Some(*i) } else { None }
+            }).collect()
+        }
+        Some(crate::mutation::FieldValue::Single(QValue::Integer(i))) => vec![*i],
+        _ => Vec::new(),
+    }
+}
+
+/// Convert a JSON value to a PackedValue for docstore storage.
+fn json_to_packed(v: &JsonValue) -> Option<PackedValue> {
+    match v {
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(PackedValue::I(i))
+            } else if let Some(f) = n.as_f64() {
+                Some(PackedValue::F(f))
+            } else {
+                None
+            }
+        }
+        JsonValue::Bool(b) => Some(PackedValue::B(*b)),
+        JsonValue::String(s) => Some(PackedValue::S(s.clone())),
+        JsonValue::Null => None,
+        JsonValue::Array(arr) => {
+            let ints: Vec<i64> = arr.iter().filter_map(|v| v.as_i64()).collect();
+            if ints.len() == arr.len() {
+                Some(PackedValue::Mi(ints))
+            } else {
+                // Mixed arrays: store as Mm (multi-packed)
+                let packed: Vec<PackedValue> = arr.iter()
+                    .filter_map(|v| json_to_packed(v))
+                    .collect();
+                Some(PackedValue::Mm(packed))
+            }
+        }
+        JsonValue::Object(_) => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Enrichment types for dump processing
@@ -325,7 +627,46 @@ fn accum_set_sort(
     }
 }
 
-/// Process a batch of entity ops, translating them into BitmapSink calls.
+/// Check if an entity's ops contain a deferred alive condition (future publishedAt).
+fn check_deferred_alive(meta: &FieldMeta, ops: &[Op]) -> bool {
+    if let Some((ref da_field, ms_to_secs)) = meta.deferred_alive_field {
+        for op in ops {
+            if let Op::Set { field, value } = op {
+                if field == da_field {
+                    if let Some(ts) = value.as_i64() {
+                        let secs = if ms_to_secs { ts / 1000 } else { ts };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        return secs > now;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract the deferred alive timestamp (seconds since epoch) from ops.
+fn get_deferred_timestamp(meta: &FieldMeta, ops: &[Op]) -> Option<u64> {
+    if let Some((ref da_field, ms_to_secs)) = meta.deferred_alive_field {
+        for op in ops {
+            if let Op::Set { field, value } = op {
+                if field == da_field {
+                    if let Some(ts) = value.as_i64() {
+                        let secs = if ms_to_secs { ts / 1000 } else { ts };
+                        return Some(secs as u64);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Process a batch of entity ops, translating them into BitmapSink calls
+/// and optionally writing field values to the docstore via DocWriter.
 ///
 /// This is the core function used by both steady-state (CoalescerSink) and
 /// dump (AccumSink) paths. The sink determines where mutations go.
@@ -333,14 +674,30 @@ fn accum_set_sort(
 /// For queryOpSet resolution, an engine reference is needed to execute queries.
 /// Pass `None` during dump mode (queryOpSets are only used in steady-state).
 ///
+/// Pass a `DocWriter` for steady-state to keep the docstore in sync with bitmap
+/// changes. Pass `None` during dump mode (dump processor handles docs separately).
+///
 /// Returns (applied, skipped, errors).
 pub fn apply_ops_batch<S: BitmapSink>(
     sink: &mut S,
     meta: &FieldMeta,
     batch: &mut Vec<EntityOps>,
     engine: Option<&ConcurrentEngine>,
+    mut doc_writer: Option<&mut DocWriter>,
 ) -> (usize, usize, usize) {
     dedup_ops(batch);
+
+    // One-time diagnostic: log computed_deps status
+    if !batch.is_empty() && !meta.computed_deps.is_empty() {
+        eprintln!(
+            "apply_ops_batch: {} entries, computed_deps has {} source fields: {:?}",
+            batch.len(),
+            meta.computed_deps.len(),
+            meta.computed_deps.keys().collect::<Vec<_>>(),
+        );
+    } else if !batch.is_empty() && meta.computed_deps.is_empty() {
+        eprintln!("apply_ops_batch: {} entries, computed_deps is EMPTY", batch.len());
+    }
 
     let mut applied = 0usize;
     let mut skipped = 0usize;
@@ -366,6 +723,48 @@ pub fn apply_ops_batch<S: BitmapSink>(
             continue;
         }
 
+        // [2.10] Drop ops on non-alive slots (except creates_slot=true or queryOpSet).
+        // In steady-state, ops arriving for non-existent slots are stale or
+        // out-of-order — silently skip them. queryOpSet entries are exempt because
+        // their entity_id is the source entity (e.g., Post.id), not the target slot.
+        let has_query_op_set = entry.ops.iter().any(|op| matches!(op, Op::QueryOpSet { .. }));
+        if !entry.creates_slot && !has_query_op_set {
+            if let Some(eng) = engine {
+                if !eng.is_slot_alive(slot) {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        // [2.4] Check deferred alive BEFORE processing any ops.
+        // If creates_slot=true and publishedAt is in the future, skip ALL bitmaps
+        // (alive + filter + sort). Only write docstore so activate_due() can
+        // rebuild bitmaps later.
+        let is_deferred = if entry.creates_slot {
+            check_deferred_alive(meta, &entry.ops)
+        } else {
+            false
+        };
+
+        if is_deferred {
+            // Schedule deferred alive + write docstore only (no bitmap ops)
+            let da_secs = get_deferred_timestamp(meta, &entry.ops).unwrap_or(0);
+            sink.deferred_alive(slot, da_secs);
+            if let Some(ref mut dw) = doc_writer {
+                for op in &entry.ops {
+                    match op {
+                        Op::Set { field, value } => dw.write_set(slot, field, value),
+                        Op::Add { field, value } => dw.write_add(slot, field, value),
+                        _ => {}
+                    }
+                }
+                // Still flush since we're skipping bitmap processing
+            }
+            applied += 1;
+            continue;
+        }
+
         // Handle queryOpSets (steady-state only — needs engine for query resolution)
         for op in &entry.ops {
             if let Op::QueryOpSet { query, ops } = op {
@@ -384,14 +783,19 @@ pub fn apply_ops_batch<S: BitmapSink>(
             }
         }
 
-        // Process set/remove/add ops → direct bitmap mutations.
+        // Process set/remove/add ops → direct bitmap mutations + docstore writes.
         // Track sort field values for computed field recomputation.
+        // old_sort_values tracks removed values, sort_values tracks new (set) values.
         let mut has_any_ops = false;
         let mut sort_values: HashMap<&str, u32> = HashMap::new();
+        let mut old_sort_values: HashMap<&str, u32> = HashMap::new();
         for op in &entry.ops {
             match op {
                 Op::Set { field, value } => {
                     process_set_op(sink, meta, slot, field, value);
+                    if let Some(ref mut dw) = doc_writer {
+                        dw.write_set(slot, field, value);
+                    }
                     // Track sort value for computed field deps
                     if meta.has_computed_deps(field) || meta.sort_fields.contains_key(field.as_str()) {
                         let qval = json_to_qvalue(value);
@@ -403,10 +807,23 @@ pub fn apply_ops_batch<S: BitmapSink>(
                 }
                 Op::Remove { field, value } => {
                     process_remove_op(sink, meta, slot, field, value);
+                    if let Some(ref mut dw) = doc_writer {
+                        dw.write_remove(slot, field, value);
+                    }
+                    // [2.3] Track old sort values for computed field recomputation
+                    if meta.has_computed_deps(field) || meta.sort_fields.contains_key(field.as_str()) {
+                        let qval = json_to_qvalue(value);
+                        if let Some(sv) = value_to_sort_u32(&qval) {
+                            old_sort_values.insert(field.as_str(), sv);
+                        }
+                    }
                     has_any_ops = true;
                 }
                 Op::Add { field, value } => {
                     process_add_op(sink, meta, slot, field, value);
+                    if let Some(ref mut dw) = doc_writer {
+                        dw.write_add(slot, field, value);
+                    }
                     has_any_ops = true;
                 }
                 Op::Delete | Op::QueryOpSet { .. } => {
@@ -415,70 +832,122 @@ pub fn apply_ops_batch<S: BitmapSink>(
             }
         }
 
-        // Recompute any computed sort fields whose source fields were set.
-        // For GREATEST(existedAt, publishedAt): if existedAt was set, compute
-        // sortAt = max(existedAt, current_publishedAt). If only one source is
-        // available, use it directly (the other defaults to 0).
+        // [2.3] Recompute computed sort fields when source fields change.
+        // First clear old computed value bits, then set new ones.
+        // PG triggers emit remove+set pairs, so we have both old and new values.
         if !meta.computed_deps.is_empty() {
-            for (source_field, deps) in &meta.computed_deps {
-                if let Some(&source_val) = sort_values.get(source_field.as_str()) {
+            // Diagnostic: log computed_deps trigger for first batch entry with sort changes
+            if !sort_values.is_empty() || !old_sort_values.is_empty() {
+                eprintln!(
+                    "  computed_deps: slot={} sort_vals={:?} old_sort_vals={:?} deps_keys={:?}",
+                    slot, sort_values.keys().collect::<Vec<_>>(),
+                    old_sort_values.keys().collect::<Vec<_>>(),
+                    meta.computed_deps.keys().collect::<Vec<_>>(),
+                );
+            }
+            // Determine which source fields changed (have either old or new value)
+            let mut changed_sources: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for k in sort_values.keys() {
+                if meta.computed_deps.contains_key(*k) {
+                    changed_sources.insert(k);
+                }
+            }
+            for k in old_sort_values.keys() {
+                if meta.computed_deps.contains_key(*k) {
+                    changed_sources.insert(k);
+                }
+            }
+
+            // Read stored doc to get current values for source fields NOT in this ops batch.
+            // Without this, missing sources default to 0, breaking GREATEST/LEAST.
+            let stored_sort_values: HashMap<&str, u32> = if let Some(eng) = engine {
+                let mut stored = HashMap::new();
+                if let Ok(Some(doc)) = eng.get_document(slot) {
+                    for source_field in changed_sources.iter().flat_map(|sf| {
+                        meta.computed_deps.get(*sf).into_iter().flat_map(|deps| {
+                            deps.iter().flat_map(|d| d.source_fields.iter().map(|s| s.as_str()))
+                        })
+                    }) {
+                        if !sort_values.contains_key(source_field) && !old_sort_values.contains_key(source_field) {
+                            if let Some(fv) = doc.fields.get(source_field) {
+                                if let crate::mutation::FieldValue::Single(ref v) = fv {
+                                    if let Some(sv) = value_to_sort_u32(v) {
+                                        stored.insert(source_field, sv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                stored
+            } else {
+                HashMap::new()
+            };
+
+            for source_field in &changed_sources {
+                if let Some(deps) = meta.computed_deps.get(*source_field) {
                     for dep in deps {
-                        // Gather all source values — use tracked values from this
-                        // batch, or 0 if not available (source not in this entity's ops)
-                        let values: Vec<u32> = dep.source_fields.iter()
-                            .map(|sf| sort_values.get(sf.as_str()).copied().unwrap_or(0))
+                        // Clear old computed value (using old source values, falling back to stored).
+                        // Do NOT fall through to sort_values — it has the NEW values, which would
+                        // make old_computed = new_computed and corrupt the bitmap clear.
+                        let old_values: Vec<u32> = dep.source_fields.iter()
+                            .map(|sf| old_sort_values.get(sf.as_str())
+                                .or_else(|| stored_sort_values.get(sf.as_str()))
+                                .copied()
+                                .unwrap_or(0))
                             .collect();
 
-                        let computed_val = match dep.op {
-                            crate::config::ComputedOp::Greatest => *values.iter().max().unwrap_or(&0),
-                            crate::config::ComputedOp::Least => *values.iter().min().unwrap_or(&0),
+                        let old_computed = match dep.op {
+                            crate::config::ComputedOp::Greatest => *old_values.iter().max().unwrap_or(&0),
+                            crate::config::ComputedOp::Least => *old_values.iter().min().unwrap_or(&0),
                         };
 
-                        // Set sort layers for the computed field
                         for bit in 0..dep.target_bits {
-                            if (computed_val >> bit) & 1 == 1 {
+                            if (old_computed >> bit) & 1 == 1 {
+                                sink.sort_clear(dep.target_arc.clone(), bit, slot);
+                            }
+                        }
+
+                        // Set new computed value (using new source values, falling back to stored).
+                        // Do NOT fall through to old_sort_values — for unchanged fields, the
+                        // stored value IS the current (and thus new) value.
+                        let new_values: Vec<u32> = dep.source_fields.iter()
+                            .map(|sf| sort_values.get(sf.as_str())
+                                .or_else(|| stored_sort_values.get(sf.as_str()))
+                                .copied()
+                                .unwrap_or(0))
+                            .collect();
+
+                        let new_computed = match dep.op {
+                            crate::config::ComputedOp::Greatest => *new_values.iter().max().unwrap_or(&0),
+                            crate::config::ComputedOp::Least => *new_values.iter().min().unwrap_or(&0),
+                        };
+
+                        eprintln!(
+                            "  computed sort recomp: target={} slot={} old_vals={:?}→{} new_vals={:?}→{} stored={:?}",
+                            dep.target, slot, old_values, old_computed, new_values, new_computed,
+                            stored_sort_values.keys().collect::<Vec<_>>(),
+                        );
+
+                        for bit in 0..dep.target_bits {
+                            if (new_computed >> bit) & 1 == 1 {
                                 sink.sort_set(dep.target_arc.clone(), bit, slot);
                             }
-                            // Note: we don't clear old bits here because during dump,
-                            // the computed field starts at 0 (all bits clear).
-                            // For steady-state, the remove op on the source field
-                            // should be paired with clearing the old computed value.
+                        }
+
+                        // Write computed sort value to docstore so future reads
+                        // (and GET /documents) reflect the recomputed value.
+                        if let Some(ref mut dw) = doc_writer {
+                            dw.write_set(slot, &dep.target, &serde_json::json!(new_computed));
                         }
                     }
                 }
             }
         }
 
-        // Set alive only if creates_slot is true (primary entity table).
-        // Join tables (tags, tools) set creates_slot=false — they only
-        // add multi-value bitmaps to existing slots.
+        // Set alive if creates_slot is true and not deferred (deferred handled above).
         if entry.creates_slot {
-            // Check deferred alive: if the source field (e.g., publishedAt) is in
-            // the future, defer the alive bit instead of setting it immediately.
-            let mut deferred = false;
-            if let Some((ref da_field, ms_to_secs)) = meta.deferred_alive_field {
-                for op in &entry.ops {
-                    if let Op::Set { field, value } = op {
-                        if field == da_field {
-                            if let Some(ts) = value.as_i64() {
-                                let secs = if ms_to_secs { ts / 1000 } else { ts };
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs() as i64;
-                                if secs > now {
-                                    sink.deferred_alive(slot, secs as u64);
-                                    deferred = true;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            if !deferred {
-                sink.alive_insert(slot);
-            }
+            sink.alive_insert(slot);
         }
 
         if has_any_ops {
@@ -490,6 +959,11 @@ pub fn apply_ops_batch<S: BitmapSink>(
     if let Err(e) = sink.flush() {
         tracing::error!("ops processor: sink flush failed: {e}");
         errors += 1;
+    }
+
+    // Flush docstore writes
+    if let Some(dw) = doc_writer {
+        dw.flush();
     }
 
     (applied, skipped, errors)
@@ -750,7 +1224,7 @@ pub(crate) fn apply_ops_batch_dump(
     batch: &mut Vec<EntityOps>,
 ) -> (usize, usize, usize) {
     let mut sink = crate::ingester::AccumSink::new(accum);
-    apply_ops_batch(&mut sink, meta, batch, None)
+    apply_ops_batch(&mut sink, meta, batch, None, None)
 }
 
 /// Process all WAL entries in dump mode: reads WAL, accumulates bitmaps, applies to engine.
@@ -806,612 +1280,8 @@ pub fn process_wal_dump(
     (total_applied, total_errors, start.elapsed().as_secs_f64())
 }
 
-/// Generic multi-value CSV processor: reads a CSV, parses (slot_id, value) pairs,
-/// accumulates into BitmapAccum filter maps, and applies to engine.
-/// Skips silently if the file doesn't exist.
-fn process_multi_value_csv(
-    csv_path: &Path,
-    field_name: &str,
-    engine: &ConcurrentEngine,
-    record_limit: usize,
-    filter_names: &[String],
-    sort_configs: &[(String, u8)],
-    total_applied: &mut u64,
-    total_errors: &mut u64,
-    parser: impl Fn(&[u8]) -> Option<(i64, u64)> + Sync,
-) {
-    use crate::loader::BitmapAccum;
-    use rayon::prelude::*;
-    use std::io::BufRead;
-    use std::time::Instant;
-
-    if !csv_path.exists() {
-        return;
-    }
-
-    let table_name = csv_path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-
-    let phase_start = Instant::now();
-    let file = std::fs::File::open(csv_path).expect("open csv");
-    let mut reader = std::io::BufReader::with_capacity(8 * 1024 * 1024, file);
-    let mut phase_total = 0usize;
-    let mut phase_errors = 0u64;
-
-    const CHUNK_SIZE: usize = 2_000_000;
-    let mut chunk_buf: Vec<Vec<u8>> = Vec::with_capacity(CHUNK_SIZE);
-
-    loop {
-        let remaining = record_limit.saturating_sub(phase_total);
-        if remaining == 0 { break; }
-
-        // Inline read_chunk since we can't reference the inner fn
-        chunk_buf.clear();
-        let mut count = 0;
-        let mut line_buf = Vec::new();
-        while count < remaining.min(CHUNK_SIZE) {
-            line_buf.clear();
-            match reader.read_until(b'\n', &mut line_buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if line_buf.last() == Some(&b'\n') { line_buf.pop(); }
-                    if line_buf.last() == Some(&b'\r') { line_buf.pop(); }
-                    if !line_buf.is_empty() {
-                        chunk_buf.push(std::mem::take(&mut line_buf));
-                        line_buf = Vec::new();
-                        count += 1;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        if count == 0 { break; }
-
-        let accum = chunk_buf
-            .par_iter()
-            .fold(
-                || BitmapAccum::new(filter_names, sort_configs),
-                |mut acc, line| {
-                    let (slot_id, value) = match parser(line) {
-                        Some(pair) => pair,
-                        None => { acc.errors += 1; return acc; }
-                    };
-                    let slot = slot_id as u32;
-                    if let Some(m) = acc.filter_maps.get_mut(field_name) {
-                        m.entry(value)
-                            .or_insert_with(roaring::RoaringBitmap::new)
-                            .insert(slot);
-                    }
-                    acc.count += 1;
-                    acc
-                },
-            )
-            .reduce(
-                || BitmapAccum::new(filter_names, sort_configs),
-                |a, b| a.merge(b),
-            );
-
-        phase_total += accum.count;
-        phase_errors += accum.errors;
-        engine.apply_accum(&accum);
-    }
-    *total_applied += phase_total as u64;
-    *total_errors += phase_errors;
-
-    if phase_total > 0 {
-        eprintln!("  {}: {} rows, {:.1}s ({:.0}/s)",
-            table_name,
-            phase_total,
-            phase_start.elapsed().as_secs_f64(),
-            phase_total as f64 / phase_start.elapsed().as_secs_f64().max(0.001));
-    }
-}
-
-/// Direct dump pipeline: CSV → chunked reader → rayon parallel parse → BitmapAccum → apply.
-///
-/// Bypasses WAL entirely. Uses a reader thread + rayon fold+reduce for parallel
-/// CSV parsing, matching the single-pass loader's throughput pattern. Memory-safe
-/// at any scale — reads in ~300MB blocks, never loads the full file.
-///
-/// Processes ALL CSV tables: images (with post enrichment), tags, tools, techniques,
-/// resources (with MV/model enrichment for baseModel/poi), metrics, collection_items.
-///
-/// Returns (total_applied, total_errors, elapsed_secs).
-pub fn process_csv_dump_direct(
-    engine: &ConcurrentEngine,
-    csv_dir: &Path,
-    _batch_size: usize,
-    limit: Option<u64>,
-) -> (u64, u64, f64) {
-    use crate::loader::BitmapAccum;
-    use crate::pg_sync::copy_queries::{
-        parse_image_row, parse_tag_row, parse_tool_row, parse_technique_row,
-        parse_resource_row, parse_metric_row, parse_collection_item_row,
-    };
-    use rayon::prelude::*;
-    use std::io::BufRead;
-    use std::time::Instant;
-
-    let config = engine.config();
-    let meta = FieldMeta::from_config(config);
-
-    let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
-    let sort_configs: Vec<(String, u8)> = config.sort_fields.iter().map(|s| (s.name.clone(), s.bits)).collect();
-
-    // Get string dictionaries for LCS fields (type, blockedFor, availability, baseModel)
-    let dicts = engine.dictionaries_arc();
-
-    let start = Instant::now();
-    let mut total_applied = 0u64;
-    let mut total_errors = 0u64;
-    let record_limit = limit.map(|l| l as usize).unwrap_or(usize::MAX);
-
-    // Enter loading mode ONCE for the entire dump — avoids Arc clone cascade.
-    engine.enter_loading_mode();
-
-    // Chunk size for reading CSV lines. 2M lines per chunk keeps memory bounded
-    // while giving rayon enough work for parallelism. Enriched images produce
-    // ~16 bitmap ops each (sort + filter + enrichment). At 107M scale, the
-    // staging engine holds ~6-8GB of bitmaps, so chunk overhead must be low.
-    const CHUNK_SIZE: usize = 2_000_000;
-
-    /// Helper: read up to `chunk` lines from a BufReader, returns lines read.
-    fn read_chunk(
-        reader: &mut impl BufRead,
-        chunk: usize,
-        buf: &mut Vec<Vec<u8>>,
-    ) -> usize {
-        buf.clear();
-        let mut count = 0;
-        let mut line_buf = Vec::new();
-        while count < chunk {
-            line_buf.clear();
-            match reader.read_until(b'\n', &mut line_buf) {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    // Trim trailing newline
-                    if line_buf.last() == Some(&b'\n') { line_buf.pop(); }
-                    if line_buf.last() == Some(&b'\r') { line_buf.pop(); }
-                    if !line_buf.is_empty() {
-                        buf.push(std::mem::take(&mut line_buf));
-                        line_buf = Vec::new();
-                        count += 1;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        count
-    }
-
-    // ---------------------------------------------------------------------------
-    // Phase 0: Load enrichment tables into memory (small tables)
-    // ---------------------------------------------------------------------------
-    eprintln!("--- Phase 0: Loading enrichment tables ---");
-    let posts = load_posts_enrichment(csv_dir);
-    let mvs = load_mv_enrichment(csv_dir);
-    let models = load_model_enrichment(csv_dir);
-
-    // Build sort field num_bits lookup
-    let sort_bits: HashMap<&str, usize> = config.sort_fields.iter()
-        .map(|s| (s.name.as_str(), s.bits as usize))
-        .collect();
-
-    // Collect deferred alive entries across all image chunks.
-    // Scheduled after loading mode exits (needs flush thread).
-    let mut all_deferred_alive: Vec<(u32, u64)> = Vec::new();
-
-    // ---------------------------------------------------------------------------
-    // Phase 1: Images (creates alive slots) — with post enrichment + string dict
-    // ---------------------------------------------------------------------------
-    let images_csv = csv_dir.join("images.csv");
-    if images_csv.exists() {
-        let img_start = Instant::now();
-        let file = std::fs::File::open(&images_csv).expect("open images.csv");
-        let mut reader = std::io::BufReader::with_capacity(8 * 1024 * 1024, file);
-        let mut phase_total = 0usize;
-        let mut phase_errors = 0u64;
-        let mut chunk_buf = Vec::with_capacity(CHUNK_SIZE);
-
-        let f_names = &filter_names;
-        let s_configs = &sort_configs;
-        let meta_ref = &meta;
-        let posts_ref = &posts;
-        let dicts_ref = &*dicts;
-        let sort_bits_ref = &sort_bits;
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let deferred_alive_enabled = config.deferred_alive.is_some();
-
-        loop {
-            let remaining = record_limit.saturating_sub(phase_total);
-            if remaining == 0 { break; }
-            let n = read_chunk(&mut reader, remaining.min(CHUNK_SIZE), &mut chunk_buf);
-            if n == 0 { break; }
-
-            let accum = chunk_buf
-                .par_iter()
-                .fold(
-                    || BitmapAccum::new(f_names, s_configs),
-                    |mut acc, line| {
-                        let row = match parse_image_row(line) {
-                            Some(r) => r,
-                            None => { acc.errors += 1; return acc; }
-                        };
-                        let slot = row.id as u32;
-                        // alive is set after enrichment (deferred alive check needs publishedAt)
-
-                        // --- Direct bitmap writes from CopyImageRow fields ---
-                        // Bypasses Op/Json/QValue allocation chain for dump perf.
-                        // Integer filter fields: direct u64 cast
-                        macro_rules! filter_int {
-                            ($field:expr, $val:expr) => {
-                                if let Some(m) = acc.filter_maps.get_mut($field) {
-                                    m.entry($val as u64).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
-                                }
-                            }
-                        }
-                        macro_rules! filter_bool {
-                            ($field:expr, $val:expr) => {
-                                if let Some(m) = acc.filter_maps.get_mut($field) {
-                                    m.entry(if $val { 1u64 } else { 0u64 }).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
-                                }
-                            }
-                        }
-                        macro_rules! filter_str {
-                            ($field:expr, $val:expr) => {
-                                if let Some(key) = resolve_string_dict(dicts_ref, $field, $val) {
-                                    if let Some(m) = acc.filter_maps.get_mut($field) {
-                                        m.entry(key).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
-                                    }
-                                }
-                            }
-                        }
-
-                        filter_int!("nsfwLevel", row.nsfw_level);
-                        filter_str!("type", &row.image_type);
-                        filter_int!("userId", row.user_id);
-                        if let Some(post_id) = row.post_id {
-                            filter_int!("postId", post_id);
-                        }
-                        filter_bool!("hasMeta", row.has_meta());
-                        filter_bool!("onSite", row.on_site());
-                        filter_bool!("minor", row.minor());
-                        filter_bool!("poi", row.poi());
-                        if let Some(ref bf) = row.blocked_for {
-                            filter_str!("blockedFor", bf);
-                        }
-
-                        // existedAt sort field
-                        let existed_at = match (row.scanned_at_secs, row.created_at_secs) {
-                            (Some(s), Some(c)) => s.max(c),
-                            (Some(s), None) => s,
-                            (None, Some(c)) => c,
-                            (None, None) => 0,
-                        };
-                        let existed_at_u32 = existed_at.max(0) as u32;
-                        if let Some(&bits) = sort_bits_ref.get("existedAt") {
-                            accum_set_sort(&mut acc.sort_maps, "existedAt", bits, existed_at_u32, slot);
-                        }
-
-                        // --- Post enrichment ---
-                        let mut published_at_secs: Option<i64> = None;
-                        if let Some(post_id) = row.post_id {
-                            if let Some(post) = posts_ref.get(&post_id) {
-                                // publishedAt sort field
-                                if let Some(pub_secs) = post.published_at_secs {
-                                    published_at_secs = Some(pub_secs);
-                                    let pub_u32 = pub_secs.max(0) as u32;
-                                    if let Some(&bits) = sort_bits_ref.get("publishedAt") {
-                                        accum_set_sort(&mut acc.sort_maps, "publishedAt", bits, pub_u32, slot);
-                                    }
-                                    // isPublished = publishedAt is not null
-                                    if let Some(m) = acc.filter_maps.get_mut("isPublished") {
-                                        m.entry(1).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
-                                    }
-                                }
-
-                                // availability filter (LCS string)
-                                if !post.availability.is_empty() {
-                                    if let Some(key) = resolve_string_dict(dicts_ref, "availability", &post.availability) {
-                                        if let Some(m) = acc.filter_maps.get_mut("availability") {
-                                            m.entry(key).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
-                                        }
-                                    }
-                                }
-
-                                // postedToId = post_id (the post itself is the "posted to" entity)
-                                if let Some(m) = acc.filter_maps.get_mut("postedToId") {
-                                    m.entry(post_id as u64).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
-                                }
-                            }
-                        }
-
-                        // --- Computed sortAt = GREATEST(existedAt, publishedAt) ---
-                        let sort_at = existed_at.max(published_at_secs.unwrap_or(0)).max(0) as u32;
-                        if let Some(&bits) = sort_bits_ref.get("sortAt") {
-                            accum_set_sort(&mut acc.sort_maps, "sortAt", bits, sort_at, slot);
-                        }
-
-                        // --- id sort field ---
-                        if let Some(&bits) = sort_bits_ref.get("id") {
-                            accum_set_sort(&mut acc.sort_maps, "id", bits, slot, slot);
-                        }
-
-                        // --- Alive or deferred alive ---
-                        // If publishedAt is in the future, defer alive activation.
-                        let is_future = deferred_alive_enabled
-                            && published_at_secs.map_or(false, |ps| ps > now_secs);
-                        if is_future {
-                            acc.deferred_alive.push((slot, published_at_secs.unwrap() as u64));
-                        } else {
-                            acc.alive.insert(slot);
-                        }
-
-                        acc.count += 1;
-                        acc
-                    },
-                )
-                .reduce(
-                    || BitmapAccum::new(f_names, s_configs),
-                    |a, b| a.merge(b),
-                );
-
-            phase_total += accum.count;
-            phase_errors += accum.errors;
-            // Collect deferred alive entries before apply_accum consumes the accum
-            let mut accum = accum;
-            let chunk_deferred: Vec<(u32, u64)> = accum.deferred_alive.drain(..).collect();
-            engine.apply_accum(&accum);
-            all_deferred_alive.extend(chunk_deferred);
-
-            eprintln!("  images: chunk {}..{} ({:.0}/s cumulative)",
-                phase_total - accum.count, phase_total,
-                phase_total as f64 / img_start.elapsed().as_secs_f64().max(0.001));
-        }
-        total_applied += phase_total as u64;
-        total_errors += phase_errors;
-
-        eprintln!("  images: {} rows total, {:.1}s ({:.0}/s)",
-            phase_total,
-            img_start.elapsed().as_secs_f64(),
-            phase_total as f64 / img_start.elapsed().as_secs_f64().max(0.001));
-    }
-
-    // Free enrichment data — no longer needed after image phase.
-    // Posts HashMap at 22.8M entries uses ~1.5GB.
-    drop(posts);
-    eprintln!("  Freed enrichment tables");
-
-    // TODO: Inter-phase save+unload to reduce peak memory.
-    // The old bulk_loader saves + unloads bitmaps between CSV phases so
-    // only one phase's bitmaps are in memory at a time. This needs careful
-    // staging/snapshot lifecycle management with the flush thread.
-    // For now, all phases accumulate in memory. 107M scale requires ~20GB
-    // (production K8s pod). The 50M test validates correctness on 16GB.
-
-    // ---------------------------------------------------------------------------
-    // Phase 2: Tags (chunked rayon) — same as before
-    // ---------------------------------------------------------------------------
-    process_multi_value_csv(
-        &csv_dir.join("tags.csv"), "tagIds", engine, record_limit,
-        &filter_names, &sort_configs, &mut total_applied, &mut total_errors,
-        |line| parse_tag_row(line).map(|(tag_id, image_id)| (image_id, tag_id as u64)),
-    );
-
-    // ---------------------------------------------------------------------------
-    // Phase 3: Tools (chunked rayon)
-    // ---------------------------------------------------------------------------
-    process_multi_value_csv(
-        &csv_dir.join("tools.csv"), "toolIds", engine, record_limit,
-        &filter_names, &sort_configs, &mut total_applied, &mut total_errors,
-        |line| parse_tool_row(line).map(|(tool_id, image_id)| (image_id, tool_id as u64)),
-    );
-
-    // ---------------------------------------------------------------------------
-    // Phase 4: Techniques (chunked rayon) — same pattern as tags/tools
-    // ---------------------------------------------------------------------------
-    process_multi_value_csv(
-        &csv_dir.join("techniques.csv"), "techniqueIds", engine, record_limit,
-        &filter_names, &sort_configs, &mut total_applied, &mut total_errors,
-        |line| parse_technique_row(line).map(|(tech_id, image_id)| (image_id, tech_id as u64)),
-    );
-
-    // ---------------------------------------------------------------------------
-    // Phase 5: Resources → modelVersionIds + baseModel + poi enrichment
-    // ---------------------------------------------------------------------------
-    let resources_csv = csv_dir.join("resources.csv");
-    if resources_csv.exists() {
-        let res_start = Instant::now();
-        let file = std::fs::File::open(&resources_csv).expect("open resources.csv");
-        let mut reader = std::io::BufReader::with_capacity(8 * 1024 * 1024, file);
-        let mut phase_total = 0usize;
-        let mut phase_errors = 0u64;
-        let mut chunk_buf = Vec::with_capacity(CHUNK_SIZE);
-
-        let f_names = &filter_names;
-        let s_configs = &sort_configs;
-        let mvs_ref = &mvs;
-        let models_ref = &models;
-        let dicts_ref = &*dicts;
-
-        loop {
-            let remaining = record_limit.saturating_sub(phase_total);
-            if remaining == 0 { break; }
-            let n = read_chunk(&mut reader, remaining.min(CHUNK_SIZE), &mut chunk_buf);
-            if n == 0 { break; }
-
-            let accum = chunk_buf
-                .par_iter()
-                .fold(
-                    || BitmapAccum::new(f_names, s_configs),
-                    |mut acc, line| {
-                        let row = match parse_resource_row(line) {
-                            Some(r) => r,
-                            None => { acc.errors += 1; return acc; }
-                        };
-                        let slot = row.image_id as u32;
-                        let mv_id = row.model_version_id;
-
-                        // modelVersionIds (all resources)
-                        if let Some(m) = acc.filter_maps.get_mut("modelVersionIds") {
-                            m.entry(mv_id as u64)
-                                .or_insert_with(roaring::RoaringBitmap::new)
-                                .insert(slot);
-                        }
-
-                        // modelVersionIdsManual (detected=false means manual)
-                        if !row.detected {
-                            if let Some(m) = acc.filter_maps.get_mut("modelVersionIdsManual") {
-                                m.entry(mv_id as u64)
-                                    .or_insert_with(roaring::RoaringBitmap::new)
-                                    .insert(slot);
-                            }
-                        }
-
-                        // Enrich: baseModel from ModelVersion
-                        if let Some(mv) = mvs_ref.get(&mv_id) {
-                            if let Some(ref base_model) = mv.base_model {
-                                if let Some(key) = resolve_string_dict(dicts_ref, "baseModel", base_model) {
-                                    if let Some(m) = acc.filter_maps.get_mut("baseModel") {
-                                        m.entry(key).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
-                                    }
-                                }
-                            }
-
-                            // Enrich: poi from Model (resource-level)
-                            if let Some(model) = models_ref.get(&mv.model_id) {
-                                if model.poi {
-                                    if let Some(m) = acc.filter_maps.get_mut("poi") {
-                                        m.entry(1).or_insert_with(roaring::RoaringBitmap::new).insert(slot);
-                                    }
-                                }
-                            }
-                        }
-
-                        acc.count += 1;
-                        acc
-                    },
-                )
-                .reduce(
-                    || BitmapAccum::new(f_names, s_configs),
-                    |a, b| a.merge(b),
-                );
-
-            phase_total += accum.count;
-            phase_errors += accum.errors;
-            engine.apply_accum(&accum);
-        }
-        total_applied += phase_total as u64;
-        total_errors += phase_errors;
-
-        eprintln!("  resources: {} rows, {:.1}s ({:.0}/s)",
-            phase_total,
-            res_start.elapsed().as_secs_f64(),
-            phase_total as f64 / res_start.elapsed().as_secs_f64().max(0.001));
-    }
-
-    // ---------------------------------------------------------------------------
-    // Phase 6: Metrics (reactionCount, commentCount, collectedCount sort fields)
-    // ---------------------------------------------------------------------------
-    let metrics_csv = csv_dir.join("metrics.csv");
-    if metrics_csv.exists() {
-        let met_start = Instant::now();
-        let file = std::fs::File::open(&metrics_csv).expect("open metrics.csv");
-        let mut reader = std::io::BufReader::with_capacity(8 * 1024 * 1024, file);
-        let mut phase_total = 0usize;
-        let mut phase_errors = 0u64;
-        let mut chunk_buf = Vec::with_capacity(CHUNK_SIZE);
-
-        let f_names = &filter_names;
-        let s_configs = &sort_configs;
-        let sort_bits_ref = &sort_bits;
-
-        loop {
-            let remaining = record_limit.saturating_sub(phase_total);
-            if remaining == 0 { break; }
-            let n = read_chunk(&mut reader, remaining.min(CHUNK_SIZE), &mut chunk_buf);
-            if n == 0 { break; }
-
-            let accum = chunk_buf
-                .par_iter()
-                .fold(
-                    || BitmapAccum::new(f_names, s_configs),
-                    |mut acc, line| {
-                        let row = match parse_metric_row(line) {
-                            Some(r) => r,
-                            None => { acc.errors += 1; return acc; }
-                        };
-                        let slot = row.image_id as u32;
-
-                        if let Some(&bits) = sort_bits_ref.get("reactionCount") {
-                            accum_set_sort(&mut acc.sort_maps, "reactionCount", bits, row.reaction_count.max(0) as u32, slot);
-                        }
-                        if let Some(&bits) = sort_bits_ref.get("commentCount") {
-                            accum_set_sort(&mut acc.sort_maps, "commentCount", bits, row.comment_count.max(0) as u32, slot);
-                        }
-                        if let Some(&bits) = sort_bits_ref.get("collectedCount") {
-                            accum_set_sort(&mut acc.sort_maps, "collectedCount", bits, row.collected_count.max(0) as u32, slot);
-                        }
-
-                        acc.count += 1;
-                        acc
-                    },
-                )
-                .reduce(
-                    || BitmapAccum::new(f_names, s_configs),
-                    |a, b| a.merge(b),
-                );
-
-            phase_total += accum.count;
-            phase_errors += accum.errors;
-            engine.apply_accum(&accum);
-        }
-        total_applied += phase_total as u64;
-        total_errors += phase_errors;
-
-        eprintln!("  metrics: {} rows, {:.1}s ({:.0}/s)",
-            phase_total,
-            met_start.elapsed().as_secs_f64(),
-            phase_total as f64 / met_start.elapsed().as_secs_f64().max(0.001));
-    }
-
-    // ---------------------------------------------------------------------------
-    // Phase 7: Collection items (collectionIds multi-value, if CSV exists)
-    // ---------------------------------------------------------------------------
-    process_multi_value_csv(
-        &csv_dir.join("collection_items.csv"), "collectionIds", engine, record_limit,
-        &filter_names, &sort_configs, &mut total_applied, &mut total_errors,
-        |line| parse_collection_item_row(line).map(|(coll_id, image_id)| (image_id, coll_id as u64)),
-    );
-
-    // Exit loading mode. On headless, this will timeout (no flush thread) but
-    // that's OK — the warning is harmless and the flag gets cleared.
-    engine.exit_loading_mode();
-
-    // Schedule deferred alive entries via mutation channel.
-    // This runs after loading mode exits so the flush thread is active.
-    if !all_deferred_alive.is_empty() {
-        use crate::write_coalescer::MutationOp;
-        let sender = engine.mutation_sender();
-        for (slot, activate_at) in &all_deferred_alive {
-            let _ = sender.send(MutationOp::DeferredAlive {
-                slot: *slot,
-                activate_at: *activate_at,
-            });
-        }
-        eprintln!("  Scheduled {} deferred alive entries", all_deferred_alive.len());
-    }
-
-    eprintln!("  Total: {total_applied} ops in {:.1}s ({:.0}/s)",
-        start.elapsed().as_secs_f64(),
-        total_applied as f64 / start.elapsed().as_secs_f64().max(0.001));
-
-    (total_applied, total_errors, start.elapsed().as_secs_f64())
-}
+// V1 dump functions removed: apply_accum_to_staging, process_multi_value_csv,
+// process_csv_dump_direct. Use V2 ops pipeline (ops_poller + /ops endpoint) instead.
 
 /// Persist cursor position to disk.
 pub fn save_cursor(path: &Path, cursor: u64) -> std::io::Result<()> {
@@ -1545,7 +1415,7 @@ mod tests {
             }],
         }];
 
-        let (applied, skipped, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, skipped, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(skipped, 0);
         assert_eq!(errors, 0);
@@ -1576,7 +1446,7 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1608,7 +1478,7 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1637,7 +1507,7 @@ mod tests {
             }],
         }];
 
-        apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
 
         // Should have sort_set for bits 0 and 2
         let sort_bits: Vec<usize> = sink.sort_sets.iter().map(|(_, bit, _)| *bit).collect();
@@ -1668,7 +1538,7 @@ mod tests {
             ],
         }];
 
-        apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
 
         // Clears: bits 0, 2 (from value 5)
         let clear_bits: Vec<usize> = sink.sort_clears.iter().map(|(_, bit, _)| *bit).collect();
@@ -1696,7 +1566,7 @@ mod tests {
             }],
         }];
 
-        apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
 
         // true → bitmap key 1
         assert_eq!(sink.filter_inserts.len(), 1);
@@ -1718,7 +1588,7 @@ mod tests {
             }],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1); // still counts as applied (alive set)
         assert_eq!(errors, 0);
 
@@ -1739,7 +1609,7 @@ mod tests {
             ops: vec![Op::Delete],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1776,7 +1646,7 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1801,7 +1671,7 @@ mod tests {
             }],
         }];
 
-        let (_, skipped, _) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (_, skipped, _) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(skipped, 1);
         assert!(sink.filter_inserts.is_empty());
     }
@@ -1887,7 +1757,7 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
@@ -1896,9 +1766,11 @@ mod tests {
         assert_eq!(sink.deferred_alive.len(), 1);
         assert_eq!(sink.deferred_alive[0], (42, future_ts as u64));
 
-        // But filter/sort bitmaps should still be set
-        assert!(!sink.filter_inserts.is_empty(), "filter bitmaps should still be set");
-        assert!(!sink.sort_sets.is_empty(), "sort layers should still be set");
+        // [2.4] ALL bitmaps should be skipped for deferred alive —
+        // filter/sort bitmaps are NOT set. Only docstore gets written.
+        // activate_due() rebuilds bitmaps from stored doc when the time comes.
+        assert!(sink.filter_inserts.is_empty(), "deferred should skip ALL bitmaps including filter");
+        assert!(sink.sort_sets.is_empty(), "deferred should skip ALL bitmaps including sort");
     }
 
     #[test]
@@ -1933,12 +1805,422 @@ mod tests {
             ],
         }];
 
-        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None);
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert_eq!(applied, 1);
         assert_eq!(errors, 0);
 
         // Past timestamp should set alive immediately
         assert_eq!(sink.alive_inserts, vec![42]);
         assert!(sink.deferred_alive.is_empty(), "past publishedAt should NOT defer alive");
+    }
+
+    // -----------------------------------------------------------------------
+    // DocWriter tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_doc_writer_write_set() {
+        use crate::docstore::{DocStore, PackedValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_index("nsfwLevel").unwrap();
+        store.ensure_field_index("userId").unwrap();
+
+        let store = Arc::new(parking_lot::Mutex::new(store));
+        let mut dw = DocWriter::new(Arc::clone(&store));
+
+        dw.write_set(10, "nsfwLevel", &json!(16));
+        dw.write_set(10, "userId", &json!(42));
+        dw.flush();
+
+        // Close writers
+        store.lock().v2_writers_handle().clear();
+
+        let doc = store.lock().get_v2(10).unwrap().unwrap();
+        match &doc.fields["nsfwLevel"] {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(16)) => {}
+            other => panic!("expected nsfwLevel=16, got: {:?}", other),
+        }
+        match &doc.fields["userId"] {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(42)) => {}
+            other => panic!("expected userId=42, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_doc_writer_write_add_remove() {
+        use crate::docstore::{DocStore, PackedValue};
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStore::open(&docs_dir).unwrap();
+        store.ensure_field_index("tagIds").unwrap();
+
+        let store = Arc::new(parking_lot::Mutex::new(store));
+
+        // First write an initial value
+        {
+            let mut dw = DocWriter::new(Arc::clone(&store));
+            let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100, 200])).unwrap();
+            let idx = store.lock().field_index("tagIds").unwrap();
+            store.lock().append_tuple(5, idx, &initial).unwrap();
+            store.lock().v2_writers_handle().clear();
+        }
+
+        // Add a value
+        {
+            let mut dw = DocWriter::new(Arc::clone(&store));
+            dw.write_add(5, "tagIds", &json!(300));
+            dw.flush();
+            store.lock().v2_writers_handle().clear();
+        }
+
+        let doc = store.lock().get_v2(5).unwrap().unwrap();
+        match &doc.fields["tagIds"] {
+            crate::mutation::FieldValue::Multi(vals) => {
+                let ints: Vec<i64> = vals.iter().filter_map(|v| {
+                    if let crate::query::Value::Integer(i) = v { Some(*i) } else { None }
+                }).collect();
+                assert!(ints.contains(&100));
+                assert!(ints.contains(&200));
+                assert!(ints.contains(&300));
+            }
+            other => panic!("expected multi-value tagIds, got: {:?}", other),
+        }
+
+        // Remove a value
+        {
+            let mut dw = DocWriter::new(Arc::clone(&store));
+            dw.write_remove(5, "tagIds", &json!(200));
+            dw.flush();
+            store.lock().v2_writers_handle().clear();
+        }
+
+        let doc = store.lock().get_v2(5).unwrap().unwrap();
+        match &doc.fields["tagIds"] {
+            crate::mutation::FieldValue::Multi(vals) => {
+                let ints: Vec<i64> = vals.iter().filter_map(|v| {
+                    if let crate::query::Value::Integer(i) = v { Some(*i) } else { None }
+                }).collect();
+                assert!(ints.contains(&100));
+                assert!(!ints.contains(&200), "200 should have been removed");
+                assert!(ints.contains(&300));
+            }
+            other => panic!("expected multi-value tagIds, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-alive slot filtering tests (2.10)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_non_alive_slot_ops_dropped() {
+        // Without an engine, non-alive check is skipped (dump mode).
+        // This test verifies that creates_slot=false entries are processed
+        // when no engine is provided (dump mode behavior).
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 99,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "nsfwLevel".into(), value: json!(8) }],
+        }];
+
+        let (applied, skipped, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        // Without engine, non-alive check is bypassed — ops are applied
+        assert_eq!(applied, 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(errors, 0);
+        assert!(!sink.filter_inserts.is_empty());
+    }
+
+    #[test]
+    fn test_creates_slot_bypasses_alive_check() {
+        // creates_slot=true should always process, even without alive status
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 55,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "nsfwLevel".into(), value: json!(4) }],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+        assert_eq!(sink.alive_inserts, vec![55]);
+        assert!(!sink.filter_inserts.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Computed sort old-value clearing tests (2.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_computed_sort_remove_set_clears_old_bits() {
+        use crate::config::{ComputedField, ComputedOp};
+
+        let mut config = test_config();
+        // Add existedAt and publishedAt as sort fields
+        config.sort_fields.push(SortFieldConfig {
+            name: "existedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        });
+        config.sort_fields.push(SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        });
+        // Add sortAt as computed = GREATEST(existedAt, publishedAt)
+        config.sort_fields.push(SortFieldConfig {
+            name: "sortAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: Some(ComputedField {
+                op: ComputedOp::Greatest,
+                source_fields: vec!["existedAt".into(), "publishedAt".into()],
+            }),
+        });
+
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        // Simulate a publishedAt change: remove old (1000), set new (2000)
+        // existedAt stays at 500 (only in set, no remove)
+        let mut batch = vec![EntityOps {
+            entity_id: 10,
+            creates_slot: false,
+            ops: vec![
+                Op::Remove { field: "publishedAt".into(), value: json!(1000) },
+                Op::Set { field: "publishedAt".into(), value: json!(2000) },
+                Op::Set { field: "existedAt".into(), value: json!(500) },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // sortAt should have sort_clears (old computed = max(500,1000) = 1000)
+        // and sort_sets (new computed = max(500,2000) = 2000)
+        let sort_at_clears: Vec<_> = sink.sort_clears.iter()
+            .filter(|(f, _, _)| f == "sortAt")
+            .collect();
+        let sort_at_sets: Vec<_> = sink.sort_sets.iter()
+            .filter(|(f, _, _)| f == "sortAt")
+            .collect();
+
+        assert!(!sort_at_clears.is_empty(), "should clear old sortAt bits");
+        assert!(!sort_at_sets.is_empty(), "should set new sortAt bits");
+
+        // Verify old value 1000 bits were cleared
+        let old_val: u32 = 1000;
+        for bit in 0..32 {
+            if (old_val >> bit) & 1 == 1 {
+                assert!(
+                    sort_at_clears.iter().any(|(_, b, s)| *b == bit && *s == 10),
+                    "should clear bit {bit} of old sortAt value {old_val}"
+                );
+            }
+        }
+
+        // Verify new value 2000 bits were set
+        let new_val: u32 = 2000;
+        for bit in 0..32 {
+            if (new_val >> bit) & 1 == 1 {
+                assert!(
+                    sort_at_sets.iter().any(|(_, b, s)| *b == bit && *s == 10),
+                    "should set bit {bit} of new sortAt value {new_val}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_computed_deps_from_real_config() {
+        // Load the actual production config (IndexDefinition wrapper) and verify computed_deps
+        let config_json = std::fs::read_to_string("deploy/configs/civitai-index.json")
+            .expect("civitai-index.json should exist");
+        let idx_def: serde_json::Value = serde_json::from_str(&config_json)
+            .expect("should parse JSON");
+        let config: crate::config::Config = serde_json::from_value(idx_def["config"].clone())
+            .expect("should parse config section");
+
+        let meta = FieldMeta::from_config(&config);
+
+        // Verify computed_deps has entries for both source fields of sortAt
+        assert!(
+            meta.computed_deps.contains_key("publishedAt"),
+            "computed_deps should have 'publishedAt' as source for sortAt. \
+             Keys: {:?}", meta.computed_deps.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            meta.computed_deps.contains_key("existedAt"),
+            "computed_deps should have 'existedAt' as source for sortAt. \
+             Keys: {:?}", meta.computed_deps.keys().collect::<Vec<_>>()
+        );
+
+        // Verify the dep targets sortAt
+        let deps = &meta.computed_deps["publishedAt"];
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].target, "sortAt");
+        assert_eq!(deps[0].source_fields, vec!["existedAt", "publishedAt"]);
+
+        // Test that a publishedAt-only ops batch triggers sortAt recomputation
+        let mut sink = RecordingSink::new();
+        let mut batch = vec![EntityOps {
+            entity_id: 100,
+            creates_slot: false,
+            ops: vec![
+                Op::Set { field: "publishedAt".into(), value: json!(1700000000) },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // sortAt should have sort_sets for the new computed value
+        // Without engine (stored doc fallback), existedAt defaults to 0
+        // So sortAt = GREATEST(0, 1700000000) = 1700000000
+        let sort_at_sets: Vec<_> = sink.sort_sets.iter()
+            .filter(|(f, _, _)| f == "sortAt")
+            .collect();
+        assert!(!sort_at_sets.is_empty(),
+            "publishedAt-only op should trigger sortAt recomputation. \
+             sort_sets: {:?}", sink.sort_sets);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_to_packed tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_to_packed_types() {
+        use crate::docstore::PackedValue;
+
+        assert_eq!(json_to_packed(&json!(42)), Some(PackedValue::I(42)));
+        assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
+        assert_eq!(json_to_packed(&json!(true)), Some(PackedValue::B(true)));
+        assert_eq!(json_to_packed(&json!("hello")), Some(PackedValue::S("hello".into())));
+        assert_eq!(json_to_packed(&json!(null)), None);
+        assert_eq!(json_to_packed(&json!([1, 2, 3])), Some(PackedValue::Mi(vec![1, 2, 3])));
+    }
+
+    // -----------------------------------------------------------------------
+    // document_to_ops tests (2.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_document_to_ops_fresh_insert() {
+        use crate::mutation::{Document, FieldValue};
+        use crate::query::Value as QValue;
+
+        let config = test_config();
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(16)));
+
+        let doc = Document { fields };
+        let ops = document_to_ops(&doc, None, &config, false);
+
+        // Should have a Set op for nsfwLevel
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            Op::Set { field, value } => {
+                assert_eq!(field, "nsfwLevel");
+                assert_eq!(value, &json!(16));
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_document_to_ops_upsert_changed_field() {
+        use crate::mutation::{Document, FieldValue};
+        use crate::query::Value as QValue;
+
+        let config = test_config();
+
+        // Old doc: nsfwLevel=8
+        let mut old_fields = std::collections::HashMap::new();
+        old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
+        let old_doc = crate::docstore::StoredDoc { fields: old_fields, schema_version: 0 };
+
+        // New doc: nsfwLevel=16
+        let mut new_fields = std::collections::HashMap::new();
+        new_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(16)));
+        let new_doc = Document { fields: new_fields };
+
+        let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
+
+        // Should have Remove(old=8) + Set(new=16)
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().any(|op| matches!(op, Op::Remove { field, value } if field == "nsfwLevel" && value == &json!(8))));
+        assert!(ops.iter().any(|op| matches!(op, Op::Set { field, value } if field == "nsfwLevel" && value == &json!(16))));
+    }
+
+    #[test]
+    fn test_document_to_ops_unchanged_field_skipped() {
+        use crate::mutation::{Document, FieldValue};
+        use crate::query::Value as QValue;
+
+        let config = test_config();
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
+
+        let old_doc = crate::docstore::StoredDoc { fields: fields.clone(), schema_version: 0 };
+        let new_doc = Document { fields };
+
+        let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
+        assert!(ops.is_empty(), "unchanged fields should produce no ops");
+    }
+
+    #[test]
+    fn test_document_to_ops_patch_preserves_absent_fields() {
+        use crate::mutation::{Document, FieldValue};
+        use crate::query::Value as QValue;
+
+        let config = test_config();
+
+        // Old doc has nsfwLevel=8 AND reactionCount sort field
+        let mut old_fields = std::collections::HashMap::new();
+        old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
+        let old_doc = crate::docstore::StoredDoc { fields: old_fields, schema_version: 0 };
+
+        // PATCH only sends userId=42 (nsfwLevel absent from patch)
+        let mut new_fields = std::collections::HashMap::new();
+        new_fields.insert("userId".into(), FieldValue::Single(QValue::Integer(42)));
+        let new_doc = Document { fields: new_fields };
+
+        // is_patch=true: absent fields should NOT generate Remove ops
+        let ops = document_to_ops(&new_doc, Some(&old_doc), &config, true);
+        let has_remove_nsfw = ops.iter().any(|op| matches!(op, Op::Remove { field, .. } if field == "nsfwLevel"));
+        assert!(!has_remove_nsfw, "PATCH should NOT remove absent fields (nsfwLevel)");
+
+        // Should have Set for userId (new field)
+        let has_set_user = ops.iter().any(|op| matches!(op, Op::Set { field, .. } if field == "userId"));
+        assert!(has_set_user, "PATCH should set provided fields (userId)");
+
+        // is_patch=false (PUT): absent fields SHOULD generate Remove ops
+        let ops_put = document_to_ops(&new_doc, Some(&old_doc), &config, false);
+        let has_remove_nsfw_put = ops_put.iter().any(|op| matches!(op, Op::Remove { field, .. } if field == "nsfwLevel"));
+        assert!(has_remove_nsfw_put, "PUT should remove absent fields (nsfwLevel)");
     }
 }
