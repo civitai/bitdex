@@ -5645,15 +5645,6 @@ impl ConcurrentEngine {
         }
     }
 
-    /// Read a sort field's current bitmap value for a given slot.
-    /// Reconstructs the u32 from bit layers in the current snapshot.
-    /// Used as fallback when docstore doesn't have the field (e.g. existedAt
-    /// was set during dump but not persisted to docstore tuples).
-    pub fn read_sort_value(&self, field_name: &str, slot: u32) -> Option<u32> {
-        let snap = self.inner.load();
-        snap.sorts.get_field(field_name).map(|sf| sf.reconstruct_value(slot))
-    }
-
     pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64, usize) {
         match &self.doc_cache {
             Some(cache) => (

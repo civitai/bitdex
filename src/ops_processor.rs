@@ -839,37 +839,21 @@ pub fn apply_ops_batch<S: BitmapSink>(
 
             // Read stored doc to get current values for source fields NOT in this ops batch.
             // Without this, missing sources default to 0, breaking GREATEST/LEAST.
-            let needed_source_fields: Vec<&str> = changed_sources.iter().flat_map(|sf| {
-                meta.computed_deps.get(*sf).into_iter().flat_map(|deps| {
-                    deps.iter().flat_map(|d| d.source_fields.iter().map(|s| s.as_str()))
-                })
-            })
-            .filter(|sf| !sort_values.contains_key(*sf) && !old_sort_values.contains_key(*sf))
-            .collect();
-
             let stored_sort_values: HashMap<&str, u32> = if let Some(eng) = engine {
                 let mut stored = HashMap::new();
-                // Try docstore first
                 if let Ok(Some(doc)) = eng.get_document(slot) {
-                    for &source_field in &needed_source_fields {
-                        if let Some(fv) = doc.fields.get(source_field) {
-                            if let crate::mutation::FieldValue::Single(ref v) = fv {
-                                if let Some(sv) = value_to_sort_u32(v) {
-                                    stored.insert(source_field, sv);
+                    for source_field in changed_sources.iter().flat_map(|sf| {
+                        meta.computed_deps.get(*sf).into_iter().flat_map(|deps| {
+                            deps.iter().flat_map(|d| d.source_fields.iter().map(|s| s.as_str()))
+                        })
+                    }) {
+                        if !sort_values.contains_key(source_field) && !old_sort_values.contains_key(source_field) {
+                            if let Some(fv) = doc.fields.get(source_field) {
+                                if let crate::mutation::FieldValue::Single(ref v) = fv {
+                                    if let Some(sv) = value_to_sort_u32(v) {
+                                        stored.insert(source_field, sv);
+                                    }
                                 }
-                            }
-                        }
-                    }
-                }
-                // Bitmap fallback: for source fields still missing from docstore,
-                // reconstruct the value from sort bit layers. This handles fields
-                // like existedAt that were computed during dump but not persisted
-                // to docstore tuples.
-                for &source_field in &needed_source_fields {
-                    if !stored.contains_key(source_field) {
-                        if let Some(val) = eng.read_sort_value(source_field, slot) {
-                            if val != 0 {
-                                stored.insert(source_field, val);
                             }
                         }
                     }
