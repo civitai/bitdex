@@ -69,6 +69,20 @@ impl BitdexClient {
         }
     }
 
+    /// Get the alive document count from the server's stats endpoint.
+    /// Returns 0 if the server is unreachable or the index isn't loaded.
+    pub async fn get_alive_count(&self) -> u64 {
+        let url = format!("{}/stats", self.base_url);
+        match self.client.get(&url).timeout(Duration::from_secs(5)).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                resp.json::<serde_json::Value>().await.ok()
+                    .and_then(|v| v.get("alive_count")?.as_u64())
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
     /// Upsert a batch of documents, optionally advancing a named cursor.
     pub async fn upsert_batch(
         &self,

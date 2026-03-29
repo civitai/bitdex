@@ -277,6 +277,19 @@ async fn run_boot_sequence(
         });
     eprintln!("BitDex is healthy.");
 
+    // Step 1b: Check if server is already populated — skip dump if so.
+    // This prevents re-dumping 4.5B rows on every sidecar restart.
+    let alive_count = bitdex_client.get_alive_count().await;
+    if alive_count > 0 {
+        eprintln!(
+            "Server already populated ({alive_count} alive docs) — skipping dump pipeline. \
+             Transitioning directly to steady-state ops polling."
+        );
+        // Still run setup (triggers/tables) and seed cursor
+        run_setup(pool, full_sync_config).await;
+        return;
+    }
+
     // Step 2: V2 setup (triggers + tables)
     run_setup(pool, full_sync_config).await;
 
