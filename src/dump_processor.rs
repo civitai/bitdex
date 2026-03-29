@@ -3035,4 +3035,89 @@ mod tests {
         let req: DumpRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.format, DumpFormat::Tsv);
     }
+
+    #[test]
+    fn test_computed_field_written_to_docstore() {
+        use crate::config::{Config, SortFieldConfig};
+
+        // Create temp dir and engine with existedAt as a sort field
+        let dir = tempfile::tempdir().unwrap();
+        let docs_path = dir.path().join("docs");
+        let bitmap_path = dir.path().join("bitmaps");
+
+        let mut config = Config {
+            sort_fields: vec![
+                SortFieldConfig {
+                    name: "existedAt".to_string(),
+                    source_type: "uint32".to_string(),
+                    encoding: "linear".to_string(),
+                    bits: 32,
+                    eager_load: false,
+                    computed: None,
+                },
+            ],
+            flush_interval_us: 50,
+            merge_interval_ms: 100,
+            channel_capacity: 10_000,
+            ..Default::default()
+        };
+        config.storage.bitmap_path = Some(bitmap_path.clone());
+
+        let engine = crate::concurrent_engine::ConcurrentEngine::new_with_path(
+            config, docs_path.as_path(),
+        ).unwrap();
+
+        // Create a small CSV: id,scannedAtSecs,createdAtSecs
+        let csv_path = dir.path().join("images.csv");
+        std::fs::write(&csv_path, "id,scannedAtSecs,createdAtSecs\n1,1000,2000\n2,3000,1500\n").unwrap();
+
+        // Build dump request with existedAt = max(scannedAtSecs, createdAtSecs)
+        let request: DumpRequest = serde_json::from_value(serde_json::json!({
+            "name": "test-images",
+            "csv_path": csv_path.to_str().unwrap(),
+            "format": "csv",
+            "slot_field": "id",
+            "sets_alive": true,
+            "fields": [],
+            "computed_fields": [
+                { "target": "existedAt", "expression": "max(scannedAtSecs, createdAtSecs)" }
+            ]
+        })).unwrap();
+
+        // Verify collect_target_fields includes existedAt
+        let targets = collect_target_fields(&request);
+        assert!(targets.contains(&"existedAt".to_string()),
+            "collect_target_fields should include existedAt, got: {:?}", targets);
+
+        // Run the dump
+        let result = process_dump(&request, &engine, dir.path(), None, None, None, None);
+        assert!(result.is_ok(), "process_dump failed: {:?}", result.err());
+        let phase = result.unwrap();
+        assert_eq!(phase.row_count, 2, "Should process 2 rows");
+
+        // Read document from docstore and verify existedAt is present
+        let doc1 = engine.get_document(1).unwrap();
+        assert!(doc1.is_some(), "Document for slot 1 should exist");
+        let doc1 = doc1.unwrap();
+        let existed_at = doc1.fields.get("existedAt");
+        assert!(existed_at.is_some(),
+            "existedAt should be in docstore. Fields present: {:?}", doc1.fields.keys().collect::<Vec<_>>());
+
+        // Verify correct values: slot 1 = max(1000, 2000) = 2000
+        match existed_at.unwrap() {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(v)) => {
+                assert_eq!(*v, 2000, "existedAt for slot 1 should be max(1000, 2000) = 2000");
+            }
+            other => panic!("Expected Single(Integer), got {:?}", other),
+        }
+
+        // Verify slot 2: max(3000, 1500) = 3000
+        let doc2 = engine.get_document(2).unwrap().unwrap();
+        match doc2.fields.get("existedAt").unwrap() {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(v)) => {
+                assert_eq!(*v, 3000, "existedAt for slot 2 should be max(3000, 1500) = 3000");
+            }
+            other => panic!("Expected Single(Integer), got {:?}", other),
+        }
+    }
 }
