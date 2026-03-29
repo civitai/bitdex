@@ -19,13 +19,28 @@ BitDex is a bitmap index engine for Civitai. It takes filter predicates + sort p
 
 **Production scale:** 107M+ images, 2 replicas, 8 CPU each, serving live traffic via shadow mode comparison with Meilisearch.
 
-**The pipeline:**
+**The V1 pipeline (production today):**
 ```
-PG tables → CSV dump → bulk loader → bitmaps + docstore on disk
+PG tables → CSV dump → single_pass bulk loader → bitmaps + docstore on disk
                                           ↓
                               server loads from disk on startup
                                           ↓
                           pg-sync sidecar keeps data current via outbox polling
+```
+
+**The V2 pipeline (feat/sync-v2, replacing V1):**
+```
+PG tables → COPY → CSV files → dump_processor.rs (config-driven, per-phase)
+                                          ↓
+                        ShardStore bitmaps + DocStore V2 tuples on disk
+                                          ↓
+                              server loads from disk on startup
+                                          ↓
+          PG triggers → BitdexOps table → bitdex-sync ops_poller → POST /ops
+                                          ↓
+                    ops_wal.rs (WAL append + fsync) → WAL reader thread
+                                          ↓
+              ops_processor.rs (BitmapSink + DocSink) → flush → ArcSwap publish
 ```
 
 ---
@@ -35,13 +50,14 @@ PG tables → CSV dump → bulk loader → bitmaps + docstore on disk
 ### DocStore V2 — NOT compressed msgpack
 `CLAUDE.md` says "zstd-compressed msgpack." That's the V1 format. **Production uses V2:** append-only tuple logs, no compression, LIFO scan for reads. V2 is 215x faster at p50. The V1 format is still referenced in code comments but V2 is what runs. See `src/docstore.rs`.
 
-### Three Docstore Write Paths — Must Stay In Sync
-These all write to the docstore and must produce identical field names/types:
-1. **`src/pg_sync/single_pass.rs`** — bulk loader (CSV → bitmaps + docstore). Production path.
-2. **`src/pg_sync/bulk_loader.rs`** — older loader, not used in production
-3. **`src/pg_sync/row_assembler.rs`** — outbox poller (PG → PATCH/PUT)
+### Docstore Write Paths (V2)
+In sync-v2, there are two write paths that must stay in sync:
+1. **`src/dump_processor.rs`** — V2 bulk loader (CSV → bitmaps + docstore). Config-driven via dump request body.
+2. **`src/ops_processor.rs`** — V2 steady-state (ops → WAL → BitmapSink + DocSink).
 
-If you change field names, conversions (ms_to_seconds), or types (exists_boolean) in one path, you MUST update all three.
+Both paths produce docstore tuples. Field names and conversions come from the sync config, not hardcoded.
+
+**V1 paths (removed on feat/sync-v2):** `single_pass.rs`, `outbox_poller.rs`, `row_assembler.rs` were deleted as part of Phase 3 V1 code cleanup.
 
 ### Source vs Target Field Names
 Schema mappings have `source` (PG column name, e.g. `publishedAtUnix`) and `target` (BitDex field name, e.g. `publishedAt`). The bulk loader stores under target names with conversions applied (as of v1.0.55+). The outbox poller stores under target names via `json_to_document_with_dicts`. The doc serving path (`format_document` in `server.rs`) looks up by target name first, then source name, and only applies ms_to_seconds when found by source name.
@@ -67,7 +83,7 @@ The BitDex StatefulSet is managed by Flux CD from the `talos-infra` repo. Any `k
 ## Production Operations
 
 ### Deployed Versions
-- **Server + pg-sync:** `ghcr.io/civitai/bitdex:1.0.57` (as of 2026-03-17)
+- **Server + pg-sync:** `ghcr.io/civitai/bitdex:1.0.97` (as of 2026-03-26)
 - **K8s namespace:** `bitdex`
 - **StatefulSet:** 2 replicas, each with `bitdex` (server) + `pg-sync` (sidecar) containers
 - **Node:** `talos-fq9-f3k`
@@ -86,8 +102,22 @@ The BitDex StatefulSet is managed by Flux CD from the `talos-infra` repo. Any `k
 - **Pod status:** `node .claude/skills/deploy/cli.mjs status`
 - **Logs:** `node .claude/skills/deploy/cli.mjs pg-sync-logs [pod] [lines]`
 
+### CSV Dump Source (Justin Directive, 2026-03-28)
+CSV dumps should use `bitdex-sync` bulk_loader which reads COPY queries from the sync config YAML — NOT manual agent-issued COPY commands. This ensures field names, column ordering, and table schemas match the sync config. Manual COPY queries risk divergence from the config-driven pipeline.
+
+### File Downloads Endpoint (Implemented, 2026-03-28)
+The `/downloads/` endpoint on BitDex serves files via K8s ingress at `https://bitdex.civitai.com/downloads/`. This avoids `kubectl cp` corruption issues when transferring files between pods.
+
+**Download method priority** (deploy skill `csv-download`):
+1. Ingress (`https://bitdex.civitai.com/downloads/`) with Bearer token (`BITDEX_DL_TOKEN` env or `--token` flag)
+2. Falls back to `kubectl port-forward` if ingress unavailable
+
+**Parallel chunked download:** Files >1GB are auto-split into 8 parallel HTTP Range request chunks. Override with `--chunks N`. Implementation: `lib/multipart-download.mjs` in the deploy skill.
+
+Connection strings stored in `data/.env.bitdex`.
+
 ### Bulk Reload
-See `docs/bulk-load-handoff.md` for the full procedure. Key points:
+See `docs/archive/bulk-load-handoff.md` for the V1 procedure (archived). Key points:
 - Suspend Flux via git push FIRST (not kubectl)
 - Dump CSVs directly on the PG pod (not via COPY TO STDOUT over network)
 - The bulk loader seeds the wrong cursor — must be manually reset after load
@@ -101,6 +131,25 @@ node .claude/skills/deploy/cli.mjs watch-build  # wait for Docker build
 node .claude/skills/deploy/cli.mjs rollout X.Y.Z  # update K8s image + rolling restart
 ```
 
+### Deploy CLI Quick Reference
+
+The deploy skill (`.claude/skills/deploy/`) has CLI tools agents should use instead of manual kubectl/psql. Run `/deploy` to see the full skill docs.
+
+**Tunnels** (use these, don't set up port-forwards manually):
+```bash
+node .claude/skills/deploy/cli.mjs tunnel pg       # PG tunnel on localhost:5432 (auto password + .env)
+node .claude/skills/deploy/cli.mjs tunnel bitdex   # BitDex server tunnel on localhost:3099
+```
+
+**CSV operations:**
+```bash
+node .claude/skills/deploy/cli.mjs csv-dump-tables  # list available tables with sizes
+node .claude/skills/deploy/cli.mjs csv-download      # download CSVs (ingress + parallel chunks)
+node .claude/skills/deploy/cli.mjs csv-full-pipeline  # end-to-end: dump → serve → download → verify
+```
+
+**Common mistake:** Do NOT port-forward to `bitdex-0:5432` — that's the BitDex server, not PG. The PG replica is `cnpg-cluster-nvme0-1` in `cnpg-database` namespace. The CLI handles the correct target automatically.
+
 ---
 
 ## Key Files
@@ -112,9 +161,15 @@ node .claude/skills/deploy/cli.mjs rollout X.Y.Z  # update K8s image + rolling r
 | `src/concurrent_engine.rs` | ArcSwap snapshot reads, flush/merge threads, cursor management |
 | `src/docstore.rs` | V2 append-only tuple store (LIFO scan, field dictionaries) |
 | `src/server.rs` | HTTP server (axum), query handling, doc serving, admin endpoints |
-| `src/pg_sync/single_pass.rs` | Production bulk loader (CSV → bitmaps + docstore) |
-| `src/pg_sync/outbox_poller.rs` | Steady-state sync from PG outbox |
-| `src/pg_sync/row_assembler.rs` | Assembles documents from PG rows for outbox path |
+| `src/dump_processor.rs` | V2 dump pipeline — config-driven CSV → bitmaps + docstore |
+| `src/dump_expression.rs` | Expression evaluator for dump filters and computed fields |
+| `src/dump_enrichment.rs` | HashMap-based enrichment with nested lookups for dump |
+| `src/ops_wal.rs` | Write-ahead log for ops (append, fsync, LIFO dedup) |
+| `src/ops_processor.rs` | Applies ops batches to BitmapSink + DocSink |
+| `src/write_coalescer.rs` | Coalesces bitmap writes for flush efficiency |
+| `src/pg_sync/ops_poller.rs` | V2 steady-state: polls BitdexOps table → POST /ops |
+| `src/pg_sync/trigger_gen.rs` | Generates PG trigger SQL from sync config |
+| `src/pg_sync/sync_config.rs` | Sync config parsing (YAML-based) |
 | `src/pg_sync/copy_queries.rs` | COPY TO STDOUT queries for CSV download |
 | `src/config.rs` | Schema mapping (source→target, ms_to_seconds, exists_boolean) |
 | `src/loader.rs` | JSON→Document conversion with null handling |
@@ -166,7 +221,7 @@ These are configurable via `PATCH /api/indexes/{name}/config` (hot config) or in
 
 ## Common Pitfalls
 
-1. **Editing schema mappings without updating all three write paths.** The bulk loader, outbox assembler, and doc serving path must agree on field names and conversions.
+1. **Editing schema mappings without updating both write paths.** The dump processor (`dump_processor.rs`) and ops processor (`ops_processor.rs`) must agree on field names and conversions. In V2, field names come from the sync config, not hardcoded.
 
 2. **Assuming kubectl changes persist.** Flux reverts everything. Push to talos-infra.
 
@@ -178,18 +233,25 @@ These are configurable via `PATCH /api/indexes/{name}/config` (hot config) or in
 
 6. **Referencing V1 docstore (compressed msgpack).** Production uses V2 (append-only tuples, no compression).
 
+8. **Referencing deleted V1 sync files.** `single_pass.rs`, `outbox_poller.rs`, `row_assembler.rs` were removed in sync-v2 Phase 3. The V2 equivalents are `dump_processor.rs` (bulk), `ops_processor.rs` (steady-state), and `ops_poller.rs` (PG polling).
+
 7. **Mmap in pg-sync sidecar.** The sidecar has a 1Gi memory limit. Large CSV mmaps (collection_items at 1.2GB) cause OOM. Backfill was moved to the bulk loader to avoid this.
 
 ---
 
 ## Team & Contacts
 
-- **Justin** — Project lead, architecture decisions
-- **Donovan** — model-share (shadow mode integration), K8s config
-- **Charlie** — pg-sync, bulk loader, collectionIds, backfill
-- **Adam** — doc serving, format_document, schema audit
+- **Justin** — Project lead, architecture decisions, final approval on sync-v2 merges
+- **Tom** — CTO oversight for sync-v2 production push
+- **Scarlet** — Team lead for sync-v2 implementation (manages Josh, Nate, Lucy)
+- **Josh** — Phase 1: dump processor implementation
+- **Nate** — Enrichment engine, Phase 3 partial (3.1-3.3, 3.7 V1 removal)
+- **Lucy** — Phase 2: WAL reader, steady-state pipeline
+- **Adam** — Design architect, code reviewer, QA oversight
+- **Aidan** — Infra/monitoring, Grafana/Prometheus, K8s deploys, PG access, deploy skill
+- **Donovan** — model-share (shadow mode integration) — currently offline
 - **Arabella** — talos-infra (Flux, K8s manifests, Grafana)
-- **Aidan** — long-term context holder, deploy skill, production ops
+- **Dakota** — Doc Keeper (documentation, CLAUDE.md, memory curation)
 
 Reach agents via mailbox: `node ~/.claude/skills/mailbox/query.mjs send <name> "message"`
 
@@ -197,8 +259,16 @@ Reach agents via mailbox: `node ~/.claude/skills/mailbox/query.mjs send <name> "
 
 ## What's In Progress / Known Gaps
 
-- **Shadow mode comparison** — BitDex runs alongside Meilisearch, results compared. Donovan manages the model-share side.
+### Sync V2 (Active — feat/sync-v2 branch)
+- **Phase 1 (Dump Pipeline):** Code complete, Gate 1 CLEAR (107M validation passed)
+- **Phase 2 (WAL Reader):** Code complete, Gate 2 CLEAR (17 tests passing, 2 skipped)
+- **Phase 2.5 (Trigger Validation):** PARTIAL — crafted tests pass but real PG triggers NOT deployed or tested
+- **Phase 3 (Activation):** 60% built — 3.1-3.3 done (rename, subcommands, CH polling), 3.7 done (V1 removal). 3.4 (trigger reconciliation), 3.5 (boot sequence), 3.6 (config hash) NOT YET IMPLEMENTED
+- **Gate 5 (Local Integration):** PARTIAL — crafted data tests pass, real PG integration NOT done
+- **Production readiness:** See `docs/design/production-readiness-checklist.md`
+
+### Other
+- **Shadow mode comparison** — BitDex runs alongside Meilisearch, results compared. Donovan manages the model-share side (currently offline).
 - **Autovac** — Not started. Slot recycling for deleted documents.
 - **Admin dashboard** — Not started.
-- **Deferred alive activation doesn't update docstore** — Known behavior. Activation reads stored doc and replays mutations but doesn't update docstore publishedAt. Not a production issue as long as the bulk loader sets correct values.
-- **Cursor override for bulk loader** — No `--cursor` CLI flag yet. Manual file write required after load.
+- **Deferred alive activation doesn't update docstore** — Known behavior. Not a production issue as long as the bulk loader sets correct values.
