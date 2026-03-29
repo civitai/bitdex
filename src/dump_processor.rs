@@ -1342,11 +1342,18 @@ pub fn process_dump_with_progress(
 
     // Prepare BulkWriter for docstore — exclude filter_only fields so that
     // field_to_idx().get(target) returns None and docstore writes are skipped.
-    let all_target_names: Vec<String> = target_fields
+    let mut all_target_names: Vec<String> = target_fields
         .iter()
         .filter(|t| !filter_only_fields.contains(*t))
         .cloned()
         .collect();
+    // Also include config-computed sort field targets (e.g., sortAt) so the
+    // BulkWriter can write their values to docstore.
+    for sc in &config.sort_fields {
+        if sc.computed.is_some() && !all_target_names.contains(&sc.name) {
+            all_target_names.push(sc.name.clone());
+        }
+    }
     let bulk_writer = Arc::new(
         engine
             .prepare_bulk_writer(&all_target_names)
@@ -1506,6 +1513,29 @@ pub fn process_dump_with_progress(
         })
         .collect();
 
+    // Config-driven computed sort fields (e.g., sortAt = GREATEST(existedAt, publishedAt)).
+    // These are defined in the index config's sort_fields, NOT in the dump request.
+    // After all per-row sort values are collected, we evaluate these and set the bitmaps.
+    struct ConfigComputedSort {
+        target: String,
+        bits: u8,
+        op: crate::config::ComputedOp,
+        source_fields: Vec<String>,
+    }
+    let config_computed_sorts: Vec<ConfigComputedSort> = config
+        .sort_fields
+        .iter()
+        .filter_map(|sc| {
+            sc.computed.as_ref().map(|c| ConfigComputedSort {
+                target: sc.name.clone(),
+                bits: sc.bits,
+                op: c.op.clone(),
+                source_fields: c.source_fields.clone(),
+            })
+        })
+        .collect();
+    let config_computed_sorts_ref = &config_computed_sorts;
+
     // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
     // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
     type ThreadResult = (
@@ -1545,6 +1575,12 @@ pub fn process_dump_with_progress(
                     (n.clone(), layers)
                 })
                 .collect();
+            // Also init sort_maps for config-computed sort targets (e.g., sortAt)
+            for ccs in config_computed_sorts_ref {
+                sort_maps.entry(ccs.target.clone()).or_insert_with(|| {
+                    (0..ccs.bits as usize).map(|_| RoaringBitmap::new()).collect()
+                });
+            }
             let mut alive = RoaringBitmap::new();
             let mut deferred: Vec<(u32, u64)> = Vec::new();
             let mut tuple_buf: Vec<(u16, u32, u32)> = Vec::with_capacity(20);
@@ -1823,7 +1859,72 @@ pub fn process_dump_with_progress(
                 }
 
 
-                // Write docstore
+                // Evaluate config-driven computed sort fields (e.g., sortAt = GREATEST(existedAt, publishedAt)).
+                // These use the per-row sort values already set above.
+                if !config_computed_sorts_ref.is_empty() {
+                    // Collect per-row sort values from direct fields, enrichment, and dump computed fields.
+                    // We need the u32 values that were just set in sort_maps.
+                    let mut row_sort_vals: HashMap<&str, u32> = HashMap::new();
+
+                    // Direct fields
+                    for field_mapping in request_fields {
+                        let target = field_mapping.target();
+                        let column = field_mapping.column();
+                        if sort_bits_ref.contains_key(target) {
+                            if let Some(v) = row.get_i64(column).or_else(|| {
+                                enriched_get(target).and_then(|s| s.parse::<i64>().ok())
+                            }) {
+                                row_sort_vals.insert(target, v as u32);
+                            }
+                        }
+                    }
+                    // Enrichment-only sort fields
+                    for target in enrichment_targets_ref {
+                        if sort_bits_ref.contains_key(target.as_str()) {
+                            if let Some(val_str) = enriched_get(target) {
+                                if let Ok(v) = val_str.parse::<i64>() {
+                                    row_sort_vals.insert(target.as_str(), v as u32);
+                                }
+                            }
+                        }
+                    }
+                    // Enrichment computed Int sort fields
+                    for (target, value) in &enriched.computed {
+                        if sort_bits_ref.contains_key(target.as_str()) {
+                            if let NateExprValue::Int(n) = value {
+                                row_sort_vals.insert(target.as_str(), *n as u32);
+                            }
+                        }
+                    }
+                    // Dump computed sort fields (e.g., existedAt)
+                    for def in computed_defs_ref {
+                        if sort_bits_ref.contains_key(&def.target) {
+                            if let Some(NateExprValue::Int(v)) = def.eval_indexed(&indexed_fields_buf, col_idx, None) {
+                                row_sort_vals.insert(&def.target, v as u32);
+                            }
+                        }
+                    }
+
+                    // Now evaluate each config-computed sort field
+                    for ccs in config_computed_sorts_ref {
+                        let values: Vec<u32> = ccs.source_fields.iter()
+                            .map(|sf| row_sort_vals.get(sf.as_str()).copied().unwrap_or(0))
+                            .collect();
+                        let computed_val = match ccs.op {
+                            crate::config::ComputedOp::Greatest => *values.iter().max().unwrap_or(&0),
+                            crate::config::ComputedOp::Least => *values.iter().min().unwrap_or(&0),
+                        };
+                        if let Some(sm) = sort_maps.get_mut(&ccs.target) {
+                            for bit in 0..(ccs.bits as usize) {
+                                if (computed_val >> bit) & 1 == 1 {
+                                    sm[bit].insert(slot);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Write docstore (direct + enriched + dump computed fields)
                 write_docstore_row_indexed(
                     &row,
                     &enriched,
@@ -1838,6 +1939,62 @@ pub fn process_dump_with_progress(
                     &mut tuple_buf,
                     &mut write_buf,
                 );
+
+                // Write config-computed sort values to docstore (e.g., sortAt).
+                // Reuses the computed values from the bitmap section above.
+                if !config_computed_sorts_ref.is_empty() {
+                    // Re-derive (fast — just re-evaluates the GREATEST/LEAST over cached source values)
+                    let mut row_sv: HashMap<&str, u32> = HashMap::new();
+                    for fm in request_fields {
+                        let t = fm.target();
+                        if sort_bits_ref.contains_key(t) {
+                            if let Some(v) = row.get_i64(fm.column()).or_else(|| enriched_get(t).and_then(|s| s.parse::<i64>().ok())) {
+                                row_sv.insert(t, v as u32);
+                            }
+                        }
+                    }
+                    for t in enrichment_targets_ref {
+                        if sort_bits_ref.contains_key(t.as_str()) {
+                            if let Some(s) = enriched_get(t) { if let Ok(v) = s.parse::<i64>() { row_sv.insert(t, v as u32); } }
+                        }
+                    }
+                    for (t, value) in &enriched.computed {
+                        if sort_bits_ref.contains_key(t.as_str()) {
+                            if let NateExprValue::Int(n) = value { row_sv.insert(t, *n as u32); }
+                        }
+                    }
+                    for def in computed_defs_ref {
+                        if sort_bits_ref.contains_key(&def.target) {
+                            if let Some(NateExprValue::Int(v)) = def.eval_indexed(&indexed_fields_buf, col_idx, None) {
+                                row_sv.insert(&def.target, v as u32);
+                            }
+                        }
+                    }
+                    serialize_buf.clear();
+                    tuple_buf.clear();
+                    for ccs in config_computed_sorts_ref {
+                        if let Some(&fidx) = field_idx_cache.get(ccs.target.as_str()) {
+                            let vals: Vec<u32> = ccs.source_fields.iter()
+                                .map(|sf| row_sv.get(sf.as_str()).copied().unwrap_or(0))
+                                .collect();
+                            let cv = match ccs.op {
+                                crate::config::ComputedOp::Greatest => *vals.iter().max().unwrap_or(&0),
+                                crate::config::ComputedOp::Least => *vals.iter().min().unwrap_or(&0),
+                            };
+                            let start = serialize_buf.len() as u32;
+                            if rmp_serde::encode::write(&mut serialize_buf, &crate::docstore::PackedValue::I(cv as i64)).is_ok() {
+                                let len = serialize_buf.len() as u32 - start;
+                                tuple_buf.push((fidx, start, len));
+                            }
+                        }
+                    }
+                    if !tuple_buf.is_empty() {
+                        let refs: Vec<(u16, &[u8])> = tuple_buf.iter()
+                            .map(|&(idx, off, len)| (idx, &serialize_buf[off as usize..(off + len) as usize]))
+                            .collect();
+                        bulk_writer.append_tuples_raw(slot, &refs, &mut write_buf);
+                    }
+                }
 
                 count += 1;
                 if count % LOG_INTERVAL == 0 {
@@ -3052,9 +3209,9 @@ mod tests {
 
     #[test]
     fn test_computed_field_written_to_docstore() {
-        use crate::config::{Config, SortFieldConfig};
+        use crate::config::{Config, SortFieldConfig, ComputedField as CfgComputedField, ComputedOp};
 
-        // Create temp dir and engine with existedAt as a sort field
+        // Create temp dir and engine with existedAt, publishedAt, and sortAt sort fields
         let dir = tempfile::tempdir().unwrap();
         let docs_path = dir.path().join("docs");
         let bitmap_path = dir.path().join("bitmaps");
@@ -3069,6 +3226,25 @@ mod tests {
                     eager_load: false,
                     computed: None,
                 },
+                SortFieldConfig {
+                    name: "publishedAt".to_string(),
+                    source_type: "uint32".to_string(),
+                    encoding: "linear".to_string(),
+                    bits: 32,
+                    eager_load: false,
+                    computed: None,
+                },
+                SortFieldConfig {
+                    name: "sortAt".to_string(),
+                    source_type: "uint32".to_string(),
+                    encoding: "linear".to_string(),
+                    bits: 32,
+                    eager_load: false,
+                    computed: Some(CfgComputedField {
+                        op: ComputedOp::Greatest,
+                        source_fields: vec!["existedAt".into(), "publishedAt".into()],
+                    }),
+                },
             ],
             flush_interval_us: 50,
             merge_interval_ms: 100,
@@ -3081,9 +3257,11 @@ mod tests {
             config, docs_path.as_path(),
         ).unwrap();
 
-        // Create a small CSV: id,scannedAtSecs,createdAtSecs
+        // Create a small CSV: id,scannedAtSecs,createdAtSecs,publishedAt
+        // Slot 1: existedAt=max(1000,2000)=2000, publishedAt=1500, sortAt=GREATEST(2000,1500)=2000
+        // Slot 2: existedAt=max(3000,1500)=3000, publishedAt=4000, sortAt=GREATEST(3000,4000)=4000
         let csv_path = dir.path().join("images.csv");
-        std::fs::write(&csv_path, "id,scannedAtSecs,createdAtSecs\n1,1000,2000\n2,3000,1500\n").unwrap();
+        std::fs::write(&csv_path, "id,scannedAtSecs,createdAtSecs,publishedAt\n1,1000,2000,1500\n2,3000,1500,4000\n").unwrap();
 
         // Build dump request with existedAt = max(scannedAtSecs, createdAtSecs)
         let request: DumpRequest = serde_json::from_value(serde_json::json!({
@@ -3092,7 +3270,7 @@ mod tests {
             "format": "csv",
             "slot_field": "id",
             "sets_alive": true,
-            "fields": [],
+            "fields": ["publishedAt"],
             "computed_fields": [
                 { "target": "existedAt", "expression": "max(scannedAtSecs, createdAtSecs)" }
             ]
@@ -3130,6 +3308,26 @@ mod tests {
         match doc2.fields.get("existedAt").unwrap() {
             crate::mutation::FieldValue::Single(crate::query::Value::Integer(v)) => {
                 assert_eq!(*v, 3000, "existedAt for slot 2 should be max(3000, 1500) = 3000");
+            }
+            other => panic!("Expected Single(Integer), got {:?}", other),
+        }
+
+        // Verify sortAt = GREATEST(existedAt, publishedAt) computed from config
+        // Slot 1: GREATEST(2000, 1500) = 2000
+        let sort_at_1 = doc1.fields.get("sortAt");
+        assert!(sort_at_1.is_some(),
+            "sortAt should be in docstore for slot 1. Fields: {:?}", doc1.fields.keys().collect::<Vec<_>>());
+        match sort_at_1.unwrap() {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(v)) => {
+                assert_eq!(*v, 2000, "sortAt for slot 1 should be GREATEST(2000, 1500) = 2000");
+            }
+            other => panic!("Expected Single(Integer), got {:?}", other),
+        }
+
+        // Slot 2: GREATEST(3000, 4000) = 4000
+        match doc2.fields.get("sortAt").unwrap() {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(v)) => {
+                assert_eq!(*v, 4000, "sortAt for slot 2 should be GREATEST(3000, 4000) = 4000");
             }
             other => panic!("Expected Single(Integer), got {:?}", other),
         }
