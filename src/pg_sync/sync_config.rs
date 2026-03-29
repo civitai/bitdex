@@ -89,6 +89,13 @@ pub struct DumpPhase {
     #[serde(default)]
     pub sets_alive: bool,
 
+    /// Explicit column names for headerless CSVs (PG COPY output).
+    /// When present, a header line is prepended during CSV download and
+    /// included in the dump request so the dump processor can map columns
+    /// by name instead of relying on a header row in the CSV.
+    #[serde(default)]
+    pub columns: Vec<String>,
+
     /// Field mappings from CSV columns to BitDex fields.
     /// Can be a simple string (column = target) or { column, target }.
     #[serde(default)]
@@ -157,6 +164,9 @@ pub struct EnrichmentDef {
     pub table: Option<String>,
     /// SQL COPY query to download the lookup CSV.
     pub copy_query: Option<String>,
+    /// Explicit column names for headerless CSVs (PG COPY output).
+    #[serde(default)]
+    pub columns: Vec<String>,
     /// Column in the lookup CSV used as the join key.
     pub key: String,
     /// Column in the main CSV used to look up into the enrichment.
@@ -265,6 +275,10 @@ impl DumpPhase {
 
         if let Some(ref filter) = self.filter {
             req["filter"] = serde_json::json!(filter);
+        }
+
+        if !self.columns.is_empty() {
+            req["columns"] = serde_json::json!(self.columns);
         }
 
         req
