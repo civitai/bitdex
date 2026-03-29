@@ -2017,6 +2017,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_computed_deps_from_real_config() {
+        // Load the actual production config (IndexDefinition wrapper) and verify computed_deps
+        let config_json = std::fs::read_to_string("deploy/configs/civitai-index.json")
+            .expect("civitai-index.json should exist");
+        let idx_def: serde_json::Value = serde_json::from_str(&config_json)
+            .expect("should parse JSON");
+        let config: crate::config::Config = serde_json::from_value(idx_def["config"].clone())
+            .expect("should parse config section");
+
+        let meta = FieldMeta::from_config(&config);
+
+        // Verify computed_deps has entries for both source fields of sortAt
+        assert!(
+            meta.computed_deps.contains_key("publishedAt"),
+            "computed_deps should have 'publishedAt' as source for sortAt. \
+             Keys: {:?}", meta.computed_deps.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            meta.computed_deps.contains_key("existedAt"),
+            "computed_deps should have 'existedAt' as source for sortAt. \
+             Keys: {:?}", meta.computed_deps.keys().collect::<Vec<_>>()
+        );
+
+        // Verify the dep targets sortAt
+        let deps = &meta.computed_deps["publishedAt"];
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].target, "sortAt");
+        assert_eq!(deps[0].source_fields, vec!["existedAt", "publishedAt"]);
+
+        // Test that a publishedAt-only ops batch triggers sortAt recomputation
+        let mut sink = RecordingSink::new();
+        let mut batch = vec![EntityOps {
+            entity_id: 100,
+            creates_slot: false,
+            ops: vec![
+                Op::Set { field: "publishedAt".into(), value: json!(1700000000) },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // sortAt should have sort_sets for the new computed value
+        // Without engine (stored doc fallback), existedAt defaults to 0
+        // So sortAt = GREATEST(0, 1700000000) = 1700000000
+        let sort_at_sets: Vec<_> = sink.sort_sets.iter()
+            .filter(|(f, _, _)| f == "sortAt")
+            .collect();
+        assert!(!sort_at_sets.is_empty(),
+            "publishedAt-only op should trigger sortAt recomputation. \
+             sort_sets: {:?}", sink.sort_sets);
+    }
+
     // -----------------------------------------------------------------------
     // json_to_packed tests
     // -----------------------------------------------------------------------
