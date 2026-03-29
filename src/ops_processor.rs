@@ -923,10 +923,22 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             crate::config::ComputedOp::Least => *new_values.iter().min().unwrap_or(&0),
                         };
 
+                        eprintln!(
+                            "  computed sort recomp: target={} slot={} old_vals={:?}→{} new_vals={:?}→{} stored={:?}",
+                            dep.target, slot, old_values, old_computed, new_values, new_computed,
+                            stored_sort_values.keys().collect::<Vec<_>>(),
+                        );
+
                         for bit in 0..dep.target_bits {
                             if (new_computed >> bit) & 1 == 1 {
                                 sink.sort_set(dep.target_arc.clone(), bit, slot);
                             }
+                        }
+
+                        // Write computed sort value to docstore so future reads
+                        // (and GET /documents) reflect the recomputed value.
+                        if let Some(ref mut dw) = doc_writer {
+                            dw.write_set(slot, &dep.target, &serde_json::json!(new_computed));
                         }
                     }
                 }
