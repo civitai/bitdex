@@ -1353,6 +1353,20 @@ pub fn process_dump_with_progress(
             .map_err(|e| format!("prepare_bulk_writer: {e}"))?,
     );
 
+    // Log docstore field dictionary for debugging computed field persistence
+    {
+        let field_idx = bulk_writer.field_to_idx();
+        let computed_targets: Vec<&str> = computed_defs.iter().map(|d| d.target.as_str()).collect();
+        for ct in &computed_targets {
+            if !field_idx.contains_key(*ct) {
+                eprintln!("  WARNING: computed field '{}' NOT in BulkWriter field_idx — will NOT be written to docstore", ct);
+            }
+        }
+        if !computed_targets.is_empty() {
+            eprintln!("  Docstore field_idx has {} fields, computed targets: {:?}", field_idx.len(), computed_targets);
+        }
+    }
+
     // Mmap the CSV/TSV file
     let csv_path = std::path::Path::new(&request.csv_path);
     let file = std::fs::File::open(csv_path)
