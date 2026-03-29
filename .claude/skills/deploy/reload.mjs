@@ -19,6 +19,7 @@
  * checklist-style report when done.
  */
 import { execSync } from 'child_process';
+import { loadDumpQueries } from './lib/sync-config.mjs';
 
 const NS = 'bitdex';
 const STS = 'bitdex';
@@ -65,9 +66,13 @@ function pgExec(sql, opts) {
 }
 
 function pgCopy(query, outFile) {
-  const sql = `SET statement_timeout = 0; COPY (${query}) TO '${PG_DUMP_DIR}/${outFile}' CSV;`;
+  // CRITICAL: Use -q (--quiet) to suppress "SET" output from psql.
+  // Without -q, psql writes "SET\n" to stdout even with separate -c flags.
+  // Confirmed by Aidan — all 9 CSVs had SET prefix without -q.
+  const setCmd = 'SET statement_timeout = 0';
+  const copyCmd = `COPY (${query}) TO '${PG_DUMP_DIR}/${outFile}' CSV`;
   return run(
-    `MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- psql -U postgres -d civitai -c "${sql}" 2>/dev/null`,
+    `MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- psql -q -U postgres -d civitai -c "${setCmd}" -c "${copyCmd}" 2>/dev/null`,
     { timeout: 600000 },
   );
 }
@@ -99,18 +104,31 @@ function log(msg) { console.log(`  ✓ ${msg}`); }
 function err(msg) { console.error(`  ✗ ${msg}`); }
 function heading(msg) { console.log(`\n=== ${msg} ===`); }
 
-// --- The actual COPY queries from copy_queries.rs ---
-const TABLES = {
-  'images.csv': `SELECT id, url, "nsfwLevel", hash, flags, type::text, "userId", "blockedFor", extract(epoch from "scannedAt")::bigint, extract(epoch from "createdAt")::bigint, "postId" FROM "Image"`,
-  'posts.csv': `SELECT id, extract(epoch from "publishedAt")::bigint, availability::text, "modelVersionId" FROM "Post"`,
-  'tags.csv': `SELECT "tagId", "imageId" FROM "TagsOnImageDetails" WHERE disabled = false`,
-  'tools.csv': `SELECT "toolId", "imageId" FROM "ImageTool"`,
-  'techniques.csv': `SELECT "techniqueId", "imageId" FROM "ImageTechnique"`,
-  'resources.csv': `SELECT "imageId", "modelVersionId", detected FROM "ImageResourceNew"`,
-  'model_versions.csv': `SELECT id, "baseModel", "modelId" FROM "ModelVersion"`,
-  'models.csv': `SELECT id, poi, type::text FROM "Model"`,
-  'collection_items.csv': `SELECT "collectionId", "imageId" FROM "CollectionItem" WHERE "imageId" IS NOT NULL AND status = 'ACCEPTED'`,
-};
+// --- COPY queries from V2 sync config (config/sync-civitai.yaml) ---
+// Loaded dynamically to stay in sync with the dump processor.
+// Falls back to hardcoded V2 queries if config isn't available.
+let TABLES;
+try {
+  const queries = loadDumpQueries();
+  TABLES = {};
+  for (const q of queries) {
+    // Extract the SELECT portion from the COPY query
+    const selectMatch = q.query.match(/COPY\s*\(([\s\S]+?)\)\s*TO\s+STDOUT/i);
+    TABLES[q.file] = selectMatch ? selectMatch[1].trim() : q.query;
+  }
+} catch {
+  // Fallback: V2 queries hardcoded (keep in sync with sync-civitai.yaml)
+  TABLES = {
+    'tags.csv': `SELECT "tagId", "imageId", "attributes" FROM "TagsOnImageNew"`,
+    'images.csv': `SELECT id, url, "nsfwLevel", hash, flags, type::text, "userId", "blockedFor", extract(epoch from "scannedAt")::bigint, extract(epoch from "createdAt")::bigint, "postId", width, height FROM "Image"`,
+    'posts.csv': `SELECT id, extract(epoch from "publishedAt")::bigint, availability::text, "modelVersionId" FROM "Post"`,
+    'resources.csv': `SELECT "imageId", "modelVersionId", detected FROM "ImageResourceNew"`,
+    'model_versions.csv': `SELECT id, "baseModel", "modelId" FROM "ModelVersion"`,
+    'models.csv': `SELECT id, poi, type::text FROM "Model"`,
+    'tools.csv': `SELECT "toolId", "imageId" FROM "ImageTool"`,
+    'techniques.csv': `SELECT "techniqueId", "imageId" FROM "ImageTechnique"`,
+  };
+}
 
 // =========================================================================
 // STEPS

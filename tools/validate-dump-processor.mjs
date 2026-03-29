@@ -14,20 +14,21 @@ const STAGE_DIR = 'C:/Dev/Repos/open-source/bitdex-v2/data/load_stage';
 
 const DUMP_REQUESTS = [
   {
-    name: 'tags-v1',
+    name: 'tags-v2',
     csv_path: `${STAGE_DIR}/tags.csv`,
     format: 'csv',
     slot_field: 'imageId',
-    columns: ['tagId', 'imageId'],
+    columns: ['tagId', 'imageId', 'attributes'],
     sets_alive: false,
     fields: [{ column: 'tagId', target: 'tagIds' }],
+    filter: '(attributes >> 10) & 1 = 0',
   },
   {
-    name: 'images-v1',
+    name: 'images-v2',
     csv_path: `${STAGE_DIR}/images.csv`,
     format: 'csv',
     slot_field: 'id',
-    columns: ['id', 'url', 'nsfwLevel', 'hash', 'flags', 'type', 'userId', 'blockedFor', 'scannedAtSecs', 'createdAtSecs', 'postId'],
+    columns: ['id', 'url', 'nsfwLevel', 'hash', 'flags', 'type', 'userId', 'blockedFor', 'scannedAtSecs', 'createdAtSecs', 'postId', 'width', 'height'],
     sets_alive: true,
     fields: [
       'nsfwLevel',
@@ -37,6 +38,8 @@ const DUMP_REQUESTS = [
       'blockedFor',
       { column: 'url', target: 'url' },
       { column: 'hash', target: 'hash' },
+      { column: 'width', target: 'width' },
+      { column: 'height', target: 'height' },
     ],
     computed_fields: [
       { target: 'hasMeta', expression: '(flags >> 13) & 1 == 1 && (flags >> 2) & 1 == 0' },
@@ -64,7 +67,7 @@ const DUMP_REQUESTS = [
     ],
   },
   {
-    name: 'resources-v1',
+    name: 'resources-v2',
     csv_path: `${STAGE_DIR}/resources.csv`,
     format: 'csv',
     slot_field: 'imageId',
@@ -95,24 +98,24 @@ const DUMP_REQUESTS = [
     ],
   },
   {
-    name: 'tools-v1',
+    name: 'tools-v2',
     csv_path: `${STAGE_DIR}/tools.csv`,
     format: 'csv',
     slot_field: 'imageId',
-    columns: ['toolIds', 'imageId'],
-    fields: ['toolIds'],
+    columns: ['toolId', 'imageId'],
+    fields: [{ column: 'toolId', target: 'toolIds' }],
   },
   {
-    name: 'techniques-v1',
+    name: 'techniques-v2',
     csv_path: `${STAGE_DIR}/techniques.csv`,
     format: 'csv',
     slot_field: 'imageId',
-    columns: ['techniqueIds', 'imageId'],
-    fields: ['techniqueIds'],
+    columns: ['techniqueId', 'imageId'],
+    fields: [{ column: 'techniqueId', target: 'techniqueIds' }],
   },
   {
-    name: 'metrics-v1',
-    csv_path: `${STAGE_DIR}/metrics.csv`,
+    name: 'metrics-v2',
+    csv_path: `${STAGE_DIR}/metrics.tsv`,
     format: 'tsv',
     slot_field: 'imageId',
     columns: ['imageId', 'reactionCount', 'commentCount', 'collectedCount'],
@@ -120,7 +123,7 @@ const DUMP_REQUESTS = [
   },
 ];
 
-const PHASE_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes per phase
+const PHASE_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes per phase (tags alone is ~3.3B rows)
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
