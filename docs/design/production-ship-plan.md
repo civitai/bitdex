@@ -54,7 +54,16 @@ If queries return incorrect results or memory exceeds 28GB during validation: st
 
 ---
 
-## Phase 2: Data Silo Integration (Edward's Team)
+## Phase 2: Data Silo Integration — DEFERRED (2026-03-29)
+
+**Status:** DEFERRED — shipping sync-v2 from main directly without data silos.
+
+**Reason:** Edward's team investigating bugs (resources phase hang, performance gap between microbenchmarks and full-scale runs). Data silos will be a follow-up project after sync-v2 is stable in production.
+
+**Original plan preserved below for when work resumes:**
+
+<details>
+<summary>Original Phase 2 plan (click to expand)</summary>
 
 **Owner:** Edward (team lead) | **Engineers:** Mark, Ollie, Josh
 **Dependency:** Phase 1 must be merged to main first
@@ -78,12 +87,14 @@ If queries return incorrect results or memory exceeds 28GB during validation: st
 ### Rollback trigger
 If data silo reads return different results than DocStore V2 for the same queries: revert to DocStore V2 path, investigate.
 
+</details>
+
 ---
 
 ## Phase 3: Production Deploy (Aidan + Tom Coordination)
 
 **Owner:** Aidan (infra) + Tom (coordination)
-**Dependency:** Phase 2 must be merged to main
+**Dependency:** Phase 1 must be merged to main (Phase 2 deferred)
 **Coordination:** Donovan (shadow mode), Arabella (Flux/K8s)
 
 ### Pre-deploy checklist
