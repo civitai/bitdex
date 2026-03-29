@@ -38,6 +38,7 @@ dump_phases:
       COPY (SELECT "tagId", "imageId", "attributes"
             FROM "TagsOnImageNew")
       TO STDOUT WITH (FORMAT csv)
+    columns: [tagId, imageId, attributes]
     slot_field: imageId
     fields:
       - { column: tagId, target: tagIds }
@@ -55,6 +56,7 @@ dump_phases:
                    "postId", width, height
             FROM "Image")
       TO STDOUT WITH (FORMAT csv)
+    columns: [id, url, nsfwLevel, hash, flags, type, userId, blockedFor, scannedAtSecs, createdAtSecs, postId, width, height]
     slot_field: id
     sets_alive: true
     fields:
@@ -92,6 +94,7 @@ dump_phases:
                        "modelVersionId"
                 FROM "Post")
           TO STDOUT WITH (FORMAT csv)
+        columns: [id, publishedAtSecs, availability, modelVersionId]
         key: id
         join_on: postId
         fields:
@@ -112,6 +115,7 @@ dump_phases:
       COPY (SELECT "imageId", "modelVersionId", detected
             FROM "ImageResourceNew")
       TO STDOUT WITH (FORMAT csv)
+    columns: [imageId, modelVersionId, detected]
     slot_field: imageId
     fields:
       - { column: modelVersionId, target: modelVersionIds }
@@ -126,6 +130,7 @@ dump_phases:
           COPY (SELECT id, "baseModel", "modelId"
                 FROM "ModelVersion")
           TO STDOUT WITH (FORMAT csv)
+        columns: [id, baseModel, modelId]
         key: id
         join_on: modelVersionId
         fields:
@@ -137,6 +142,7 @@ dump_phases:
               COPY (SELECT id, poi, type::text
                     FROM "Model")
               TO STDOUT WITH (FORMAT csv)
+            columns: [id, poi, type]
             key: id
             join_on: modelId
             fields:
@@ -149,6 +155,7 @@ dump_phases:
     copy_query: >
       COPY (SELECT "toolId", "imageId" FROM "ImageTool")
       TO STDOUT WITH (FORMAT csv)
+    columns: [toolId, imageId]
     slot_field: imageId
     fields: [toolIds]
 
@@ -158,6 +165,7 @@ dump_phases:
     copy_query: >
       COPY (SELECT "techniqueId", "imageId" FROM "ImageTechnique")
       TO STDOUT WITH (FORMAT csv)
+    columns: [techniqueId, imageId]
     slot_field: imageId
     fields: [techniqueIds]
 

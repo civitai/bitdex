@@ -3,13 +3,33 @@
  * BitDex Production Deploy CLI
  *
  * Usage: node .claude/skills/deploy/cli.mjs <command> [args]
+ *
+ * Modules:
+ *   lib/kubectl.mjs     — K8s helpers, transfer pods, port-forward
+ *   lib/prometheus.mjs   — PromQL queries, metrics
+ *   lib/sync-config.mjs  — V2 sync config YAML parser
+ *   lib/csv-dump.mjs     — Config-driven CSV dump with progress tracking
  */
-import { execSync, spawnSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, createWriteStream, statSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { spawnSync } from 'child_process';
 import http from 'http';
 import https from 'https';
+
+import {
+  run, kubectl, kubectlExec, kubectlExecPod,
+  runEphemeralPod, createTransferPod, deletePod,
+  portForward, killPortForward,
+  K8S_CONTEXT, NS, STS, NODE, INDEX_PATH, PG_NS, PG_POD, PG_SVC,
+} from './lib/kubectl.mjs';
+
+import {
+  ensurePromPortForward, promQuery, promQueryRange,
+  extractScalar, parseDuration,
+} from './lib/prometheus.mjs';
+
+import { csvDump, csvDumpProgress, csvDumpCleanup, csvDumpTables, csvServe, csvServeStop, csvDownload, csvVerify, csvDownloadWatch, csvFullPipeline } from './lib/csv-dump.mjs';
 
 // Load .env from dev-server skill dir (shared admin token)
 const __d = dirname(fileURLToPath(import.meta.url));
@@ -29,38 +49,13 @@ try {
 
 const ADMIN_TOKEN = process.env.BITDEX_ADMIN_TOKEN || null;
 const BITDEX_URL = process.env.BITDEX_PROD_URL || 'https://bitdex.civitai.com';
-
-const NS = 'bitdex';
-const STS = 'bitdex';
 const GHCR = 'ghcr.io/civitai/bitdex';
 const DOCKER_WORKFLOW = 'docker.yml';
-const NODE = 'talos-fq9-f3k';
-const PG_POD = 'cnpg-cluster-nvme0-1';
-const PG_NS = 'cnpg-database';
-const INDEX_PATH = '/data/indexes/civitai';
 
-function run(cmd, opts = {}) {
-  try {
-    return execSync(cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...opts }).trim();
-  } catch (e) {
-    if (opts.throws !== false) throw e;
-    return e.stderr?.trim() || e.message;
-  }
-}
+function json(data) { console.log(JSON.stringify(data, null, 2)); }
+function err(msg) { console.error(msg); }
 
-function kubectl(args) {
-  return run(`kubectl ${args} -n ${NS} 2>/dev/null`);
-}
-
-function json(data) {
-  console.log(JSON.stringify(data, null, 2));
-}
-
-function err(msg) {
-  console.error(msg);
-}
-
-// --- Commands ---
+// --- Release & Deploy ---
 
 function release() {
   const cargoPath = resolve('Cargo.toml');
@@ -82,7 +77,6 @@ function release() {
   run(`git push origin main --tags`);
   run(`gh workflow run ${DOCKER_WORKFLOW} --ref ${tag}`);
 
-  // Find the run ID
   const runs = JSON.parse(run(`gh run list --workflow ${DOCKER_WORKFLOW} --limit 3 --json databaseId,headBranch,status`));
   const runId = runs.find(r => r.headBranch === tag)?.databaseId || runs[0]?.databaseId;
 
@@ -96,12 +90,38 @@ function watchBuild() {
   err(`Watching build ${runId}...`);
   while (true) {
     const result = JSON.parse(run(`gh run view ${runId} --json status,conclusion`));
-    if (result.status === 'completed') {
-      json({ runId, ...result });
-      return;
-    }
+    if (result.status === 'completed') { json({ runId, ...result }); return; }
     spawnSync('sleep', ['15']);
   }
+}
+
+function watchBuildNotify() {
+  const runId = process.argv[3] || findLatestBuildRunId();
+  const notifyAgent = process.argv.includes('--notify') ? process.argv[process.argv.indexOf('--notify') + 1] : null;
+  if (!runId) { json({ error: 'No run ID found' }); process.exit(1); }
+
+  err(`Watching build ${runId} (non-blocking, will notify when done)...`);
+  const poll = () => {
+    try {
+      const result = JSON.parse(run(`gh run view ${runId} --json status,conclusion`));
+      if (result.status === 'completed') {
+        const msg = `Docker build ${runId} ${result.conclusion}`;
+        err(msg);
+        json({ runId, ...result });
+
+        if (notifyAgent) {
+          run(`node ~/.claude/skills/mailbox/query.mjs send ${notifyAgent} "${msg}. Ready to deploy."`, { throws: false });
+          err(`Notified ${notifyAgent}`);
+        }
+        return;
+      }
+      err(`  Build ${runId}: ${result.status}...`);
+    } catch (e) {
+      err(`  Poll error: ${e.message}`);
+    }
+    setTimeout(poll, 30000); // poll every 30s
+  };
+  poll();
 }
 
 function buildStatus() {
@@ -128,12 +148,67 @@ function rollout(version) {
 
 function deploy(version) {
   if (!version) { json({ error: 'Usage: deploy <version>' }); process.exit(1); }
+
+  // Store previous version for rollback
+  const prevImage = run(`kubectl get statefulset -n ${NS} ${STS} -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null`, { throws: false });
+  const prevVersion = prevImage?.split(':')[1] || null;
+
   rollout(version);
 
-  // Wait a few seconds for pg-sync to start
+  // Pre-rollout health checks
+  err('Running post-deploy health checks...');
+  spawnSync('sleep', ['10']);
+
+  const checks = { pgSync: false, memory: false, pods: false };
+
+  // Check pg-sync health
+  const health = pgSyncHealthRaw();
+  const hasCursor = Object.values(health).some(h => h.lastCursor);
+  const hasErrors = Object.values(health).some(h => h.errors > 5);
+  checks.pgSync = hasCursor && !hasErrors;
+  if (!checks.pgSync) err('  WARNING: pg-sync health check failed');
+  else err('  pg-sync: OK');
+
+  // Check pods are ready
+  const podsJson = run(`kubectl get pods -n ${NS} -o json 2>/dev/null`, { throws: false });
+  try {
+    const pods = JSON.parse(podsJson).items;
+    checks.pods = pods.every(p => p.status.containerStatuses?.every(c => c.ready));
+  } catch {}
+  if (!checks.pods) err('  WARNING: not all pods ready');
+  else err('  pods: OK');
+
+  // Check memory
+  const top = run(`kubectl top pod -n ${NS} 2>/dev/null`, { throws: false });
+  if (top) {
+    const memLine = top.split('\n').find(l => l.includes('bitdex-0'));
+    if (memLine) {
+      const mem = memLine.trim().split(/\s+/)[2];
+      err(`  memory: ${mem}`);
+      checks.memory = true;
+    }
+  }
+
+  json({
+    version,
+    previousVersion: prevVersion,
+    image: `${GHCR}:${version}`,
+    deployed: true,
+    healthChecks: checks,
+    rollbackCmd: prevVersion ? `deploy rollback ${prevVersion}` : null,
+  });
+}
+
+function rollback(version) {
+  version = version || process.argv[3];
+  if (!version) { json({ error: 'Usage: rollback <version>' }); process.exit(1); }
+  err(`Rolling back to ${version}...`);
+  rollout(version);
   spawnSync('sleep', ['10']);
   pgSyncHealth();
 }
+
+// --- Status & Health ---
 
 function status() {
   const pods = run(`kubectl get pods -n ${NS} -o json 2>/dev/null`, { throws: false });
@@ -151,7 +226,6 @@ function status() {
   } catch {}
 
   const stsImage = run(`kubectl get statefulset -n ${NS} ${STS} -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null`, { throws: false });
-
   json({ statefulsetImage: stsImage, pods: podInfo });
 }
 
@@ -170,11 +244,42 @@ function scale(replicas) {
   json({ replicas, scaled: true });
 }
 
+function health() {
+  err('Checking pod health...');
+  const podsJson = run(`kubectl get pods -n ${NS} -o json 2>/dev/null`, { throws: false });
+  let pods = [];
+  try {
+    pods = JSON.parse(podsJson).items.map(p => {
+      const containers = (p.status.containerStatuses || []).map(c => ({
+        name: c.name, ready: c.ready, restarts: c.restartCount, state: Object.keys(c.state || {})[0] || 'unknown',
+      }));
+      return { name: p.metadata.name, status: p.status.phase, age: p.metadata.creationTimestamp, image: p.spec.containers[0]?.image, containers };
+    });
+  } catch {}
+  const top = run(`kubectl top pod -n ${NS} 2>/dev/null`, { throws: false });
+  if (top) for (const line of top.split('\n').filter(l => l.includes('bitdex'))) {
+    const parts = line.trim().split(/\s+/);
+    const pod = pods.find(p => p.name === parts[0]);
+    if (pod) { pod.cpu = parts[1]; pod.memory = parts[2]; }
+  }
+  let pgSyncCursor = null;
+  const logs = run(`kubectl logs -n ${NS} bitdex-0 -c pg-sync --tail=10 2>/dev/null`, { throws: false });
+  if (logs) { const m = logs.match(/cursor=(\d+)/g); if (m) pgSyncCursor = m[m.length - 1].replace('cursor=', ''); }
+  for (const p of pods) {
+    const ready = p.containers.every(c => c.ready) ? 'READY' : 'NOT READY';
+    const restarts = p.containers.reduce((s, c) => s + c.restarts, 0);
+    err(`  ${p.name}: ${p.status} (${ready}), restarts=${restarts}, cpu=${p.cpu || '?'}, mem=${p.memory || '?'}`);
+  }
+  if (pgSyncCursor) err(`  pg-sync cursor: ${pgSyncCursor}`);
+  json({ pods, pgSyncCursor });
+}
+
+// --- Cursors ---
+
 function cursorReset(value) {
   value = value || process.argv[3];
   if (!value) { json({ error: 'Usage: cursor-reset <value>' }); process.exit(1); }
 
-  // Check pods are down
   const pods = run(`kubectl get pods -n ${NS} -l app=bitdex --no-headers 2>/dev/null`, { throws: false });
   if (pods && !pods.includes('No resources')) {
     json({ error: 'Pods must be scaled to 0 before resetting cursors. Run: deploy scale 0' });
@@ -182,29 +287,14 @@ function cursorReset(value) {
   }
 
   err(`Resetting cursors to ${value}...`);
-
-  // Reset on both PVCs via transfer pods
   for (const i of [0, 1]) {
-    const podName = `cursor-reset-${i}`;
     const cmd = `echo -n ${value} > ${INDEX_PATH}/bitmaps/cursors/pg-sync-bitdex-${i} && cat ${INDEX_PATH}/bitmaps/cursors/pg-sync-bitdex-${i}`;
-    const overrides = JSON.stringify({
-      spec: {
-        containers: [{ name: 'fix', image: 'busybox', command: ['sh', '-c', cmd],
-          volumeMounts: [{ name: 'data', mountPath: '/data' }] }],
-        volumes: [{ name: 'data', persistentVolumeClaim: { claimName: `data-bitdex-${i}` } }],
-        nodeSelector: { 'kubernetes.io/hostname': NODE },
-      }
-    });
-    run(`kubectl run ${podName} -n ${NS} --image=busybox --overrides='${overrides}' --restart=Never 2>/dev/null`);
-    run(`kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/${podName} -n ${NS} --timeout=30s 2>/dev/null`);
-    const result = run(`kubectl logs -n ${NS} ${podName} 2>/dev/null`);
-    err(`  PVC ${i}: ${result}`);
-    run(`kubectl delete pod -n ${NS} ${podName} 2>/dev/null`);
+    const { logs, success } = runEphemeralPod(`cursor-reset-${i}`, { command: cmd, pvcIndex: i });
+    err(`  PVC ${i}: ${logs}`);
   }
 
-  // Reset in PG
   const pgCmd = `UPDATE bitdex_cursors SET last_outbox_id = ${value} WHERE replica_id IN ('pg-sync-bitdex-0', 'pg-sync-bitdex-1');`;
-  run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- psql -U postgres -d civitai -c "${pgCmd}" 2>/dev/null`);
+  run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} --context ${K8S_CONTEXT} -- psql -U postgres -d civitai -c "${pgCmd}" 2>/dev/null`);
   err(`  PG: updated`);
 
   json({ cursor: value, pvc0: true, pvc1: true, pg: true });
@@ -214,25 +304,23 @@ function cursorRead() {
   const cursors = {};
   for (const i of [0, 1]) {
     try {
-      const val = run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${NS} bitdex-${i} -c bitdex -- cat ${INDEX_PATH}/bitmaps/cursors/pg-sync-bitdex-${i} 2>/dev/null`);
+      const val = kubectlExec(`cat ${INDEX_PATH}/bitmaps/cursors/pg-sync-bitdex-${i}`, { pod: `bitdex-${i}` });
       cursors[`bitdex-${i}`] = val;
-    } catch {
-      cursors[`bitdex-${i}`] = null;
-    }
+    } catch { cursors[`bitdex-${i}`] = null; }
   }
   json(cursors);
 }
 
 function cursorCsv() {
   try {
-    const val = run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${NS} bitdex-0 -c bitdex -- cat ${INDEX_PATH}/load_stage/cursor.txt 2>/dev/null`);
+    const val = kubectlExec(`cat ${INDEX_PATH}/load_stage/cursor.txt`);
     json({ csvCursor: val });
-  } catch {
-    json({ csvCursor: null, error: 'Could not read cursor.txt' });
-  }
+  } catch { json({ csvCursor: null, error: 'Could not read cursor.txt' }); }
 }
 
-function pgSyncHealth() {
+// --- PG-Sync ---
+
+function pgSyncHealthRaw() {
   const health = {};
   for (const i of [0, 1]) {
     const logs = run(`kubectl logs -n ${NS} bitdex-${i} -c pg-sync --tail=50 2>/dev/null`, { throws: false });
@@ -246,6 +334,11 @@ function pgSyncHealth() {
 
     health[`bitdex-${i}`] = { lastCursor, errors, lastProcessed, lastMetrics };
   }
+  return health;
+}
+
+function pgSyncHealth() {
+  const health = pgSyncHealthRaw();
   json(health);
 }
 
@@ -253,7 +346,6 @@ function pgSyncLogs() {
   const pod = process.argv[3] || '0';
   const lines = process.argv[4] || '30';
   const logs = run(`kubectl logs -n ${NS} bitdex-${pod} -c pg-sync --tail=${lines} 2>/dev/null`, { throws: false });
-  // Filter out noisy slot-not-found lines
   const filtered = logs.split('\n').filter(l => !l.includes('slot not found') && !l.includes('slow statement')).join('\n');
   console.log(filtered);
 }
@@ -265,6 +357,8 @@ function serverLogs() {
   console.log(logs);
 }
 
+// --- Operations ---
+
 function resources() {
   const top = run(`kubectl top pod -n ${NS} 2>/dev/null`, { throws: false });
   console.log(top);
@@ -273,30 +367,176 @@ function resources() {
 function wipe() {
   err('Wiping bitmap/docstore data on both PVCs (keeping CSVs)...');
   for (const i of [0, 1]) {
-    const podName = `bitdex-wipe-${i}`;
     const cmd = `rm -rf ${INDEX_PATH}/bitmaps ${INDEX_PATH}/docs ${INDEX_PATH}/bounds ${INDEX_PATH}/slot_arena.bin ${INDEX_PATH}/snapshot.meta && echo wiped-${i}`;
-    const overrides = JSON.stringify({
-      spec: {
-        containers: [{ name: 'wipe', image: 'busybox', command: ['sh', '-c', cmd],
-          volumeMounts: [{ name: 'data', mountPath: '/data' }] }],
-        volumes: [{ name: 'data', persistentVolumeClaim: { claimName: `data-bitdex-${i}` } }],
-        nodeSelector: { 'kubernetes.io/hostname': NODE },
-      }
-    });
-    run(`kubectl run ${podName} -n ${NS} --image=busybox --overrides='${overrides}' --restart=Never 2>/dev/null`);
-    run(`kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/${podName} -n ${NS} --timeout=60s 2>/dev/null`);
-    err(`  PVC ${i}: ${run(`kubectl logs -n ${NS} ${podName} 2>/dev/null`)}`);
-    run(`kubectl delete pod -n ${NS} ${podName} 2>/dev/null`);
+    const { logs } = runEphemeralPod(`bitdex-wipe-${i}`, { command: cmd, pvcIndex: i, timeout: 60 });
+    err(`  PVC ${i}: ${logs}`);
   }
   json({ wiped: true });
 }
 
 function configRead() {
-  const config = run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${NS} bitdex-0 -c bitdex -- cat ${INDEX_PATH}/config.json 2>/dev/null`, { throws: false });
+  const config = kubectlExec(`cat ${INDEX_PATH}/config.json`);
+  try { json(JSON.parse(config)); } catch { json({ error: 'Could not read config', raw: config }); }
+}
+
+function configPatch(jsonStr) {
+  jsonStr = jsonStr || process.argv[3];
+  if (!jsonStr) { json({ error: 'Usage: config-patch \'{"key": "value"}\'' }); process.exit(1); }
+  if (!ADMIN_TOKEN) { json({ error: 'BITDEX_ADMIN_TOKEN not set' }); process.exit(1); }
+  try { JSON.parse(jsonStr); } catch { json({ error: 'Invalid JSON', input: jsonStr }); process.exit(1); }
+  const localPort = 3098;
+  portForward({ target: 'pod/bitdex-0', localPort, remotePort: 3000 });
+  run('sleep 2', { throws: false });
+  const result = run(`curl -sf -X PATCH -H "Content-Type: application/json" -H "Authorization: Bearer ${ADMIN_TOKEN}" -d '${jsonStr}' http://localhost:${localPort}/api/indexes/civitai/config`, { throws: false });
+  killPortForward(localPort, 3000);
+  try { json(JSON.parse(result)); } catch { json({ raw: result }); }
+}
+
+function memory() {
+  err('Checking pod memory...');
+  const top = run(`kubectl top pod -n ${NS} 2>/dev/null`, { throws: false });
+  let topParsed = null;
+  if (top && !top.includes('error')) {
+    topParsed = top.split('\n').filter(l => l.includes('bitdex')).map(l => {
+      const parts = l.trim().split(/\s+/);
+      return { pod: parts[0], cpu: parts[1], memory: parts[2] };
+    });
+  }
+
+  let debugMemory = null;
+  const localPort = 3098;
+  portForward({ target: 'pod/bitdex-0', localPort, remotePort: 3000 });
+  run('sleep 2', { throws: false });
   try {
-    json(JSON.parse(config));
-  } catch {
-    json({ error: 'Could not read config', raw: config });
+    const headers = ADMIN_TOKEN ? `-H "Authorization: Bearer ${ADMIN_TOKEN}"` : '';
+    const result = run(`curl -sf ${headers} http://localhost:${localPort}/debug/memory`, { throws: false });
+    if (result && result.startsWith('{')) debugMemory = JSON.parse(result);
+  } catch {}
+  killPortForward(localPort, 3000);
+
+  if (topParsed) for (const p of topParsed) err(`  ${p.pod}: CPU=${p.cpu}, Memory=${p.memory}`);
+  if (debugMemory?.human) {
+    err(`  RSS: ${debugMemory.human.rss}, Headroom: ${debugMemory.human.headroom}, Tracked: ${debugMemory.human.tracked}`);
+  }
+  json({ kubectl_top: topParsed, debug_memory: debugMemory });
+}
+
+function disk() {
+  err('Checking PVC disk usage...');
+  const dfOut = kubectlExec('df -h /data');
+  const duOut = kubectlExec('du -h --max-depth=2 /data/indexes');
+  let dfParsed = null;
+  if (dfOut) {
+    const line = dfOut.split('\n').find(l => l && !l.startsWith('Filesystem'));
+    if (line) { const p = line.trim().split(/\s+/); dfParsed = { total: p[1], used: p[2], available: p[3], percent: p[4] }; }
+  }
+  const directories = (duOut || '').split('\n').filter(Boolean).map(l => {
+    const p = l.trim().split(/\s+/); return { size: p[0], path: p.slice(1).join(' ') };
+  });
+  if (dfParsed) err(`  Disk: ${dfParsed.used} / ${dfParsed.total} (${dfParsed.percent} used, ${dfParsed.available} free)`);
+  json({ df: dfParsed, directories });
+}
+
+function cleanup(target) {
+  target = target || process.argv[3];
+  const targets = {
+    captures:   { paths: ['/data/captures/*'], label: 'capture snapshots' },
+    load_stage: { paths: ['/data/indexes/civitai/load_stage', '/data/indexes/load_stage'], label: 'load stage CSVs' },
+    legacy:     { paths: ['/data/indexes/civitai/bitmaps/_legacy_bitmapfs'], label: 'legacy BitmapFs' },
+    bounds:     { paths: ['/data/indexes/civitai/bitmaps/shardstore/bounds/*'], label: 'bound cache shards' },
+  };
+  if (!target || !targets[target]) { json({ error: `Usage: cleanup <target>. Targets: ${Object.keys(targets).join(', ')}` }); process.exit(1); }
+  const t = targets[target];
+  err(`Cleaning ${t.label}...`);
+  for (const p of t.paths) kubectlExec(`rm -rf ${p}`);
+  const dfOut = kubectlExec('df -h /data');
+  let used = null;
+  if (dfOut) { const line = dfOut.split('\n').find(l => l && !l.startsWith('Filesystem')); if (line) used = line.trim().split(/\s+/)[2]; }
+  err(`  Done. Disk now: ${used || '?'}`);
+  json({ target, label: t.label, cleaned: true, disk_used: used });
+}
+
+// --- Tunnels ---
+
+// bitdex user credentials — NOT cnpg-cluster-nvme0-app (that's the civitai user with 120s timeout)
+const PG_SECRET_NAME = 'bitdex-credentials';
+const PG_SECRET_NS = 'cnpg-database';
+const ENV_FILE = resolve('data', '.env.bitdex');
+
+function fetchPgPassword() {
+  const b64 = run(
+    `MSYS_NO_PATHCONV=1 kubectl get secret ${PG_SECRET_NAME} -n ${PG_SECRET_NS} --context ${K8S_CONTEXT} -o jsonpath='{.data.password}' 2>/dev/null`,
+    { throws: false }
+  );
+  if (!b64) return null;
+  return Buffer.from(b64, 'base64').toString('utf8').trim();
+}
+
+function writeEnvFile(pgUrl) {
+  const dir = resolve('data');
+  run(`mkdir -p "${dir}"`, { throws: false });
+  const content = [
+    `# Generated by deploy CLI tunnel — do not commit`,
+    `# Password fetched from K8s secret ${PG_SECRET_NAME}`,
+    `DATABASE_URL=${pgUrl}`,
+    `BITDEX_URL=http://localhost:3000`,
+    `BITDEX_PROD_URL=https://bitdex.civitai.com`,
+    '',
+  ].join('\n');
+  writeFileSync(ENV_FILE, content);
+  err(`  .env written: ${ENV_FILE}`);
+}
+
+function tunnel(target, action) {
+  action = action || 'start';
+  const targets = {
+    pg: { ns: PG_NS, svc: PG_SVC, localPort: 5433, remotePort: 5432, healthCmd: `pg_isready -h localhost -p 5433 2>/dev/null`, label: 'PostgreSQL (CNPG, bitdex user)' },
+    bitdex: { ns: NS, svc: 'pod/bitdex-0', localPort: 3000, remotePort: 3000, healthCmd: 'curl -sf http://localhost:3000/api/health 2>/dev/null', label: 'BitDex server (pod 0)' },
+  };
+  const t = targets[target];
+  if (!t) { json({ error: `Unknown tunnel target: ${target}. Available: ${Object.keys(targets).join(', ')}` }); process.exit(1); }
+
+  if (action === 'stop') {
+    killPortForward(t.localPort, t.remotePort);
+    json({ status: 'stopped', target, label: t.label });
+    return;
+  }
+
+  if (action === 'status') {
+    try {
+      const check = run(t.healthCmd, { throws: false });
+      const running = check && !check.includes('refused') && !check.includes('error');
+      json({ status: running ? 'running' : 'not_running', target, label: t.label, port: t.localPort });
+    } catch { json({ status: 'not_running', target, label: t.label }); }
+    return;
+  }
+
+  const ready = portForward({
+    namespace: t.ns, target: t.svc,
+    localPort: t.localPort, remotePort: t.remotePort,
+    healthCmd: t.healthCmd,
+  });
+
+  if (ready) {
+    if (target === 'pg') {
+      // Fetch password from K8s secret and build full DATABASE_URL
+      const password = fetchPgPassword();
+      const pgUrl = password
+        ? `postgresql://bitdex:${password}@localhost:${t.localPort}/civitai`
+        : `postgresql://bitdex@localhost:${t.localPort}/civitai`;
+      if (!password) err('  WARNING: Could not fetch password from K8s secret');
+
+      // Write .env file
+      writeEnvFile(pgUrl);
+
+      json({ status: 'started', target, label: t.label, port: t.localPort, connection: pgUrl, envFile: ENV_FILE });
+    } else {
+      const conn = `http://localhost:${t.localPort}`;
+      json({ status: 'started', target, label: t.label, port: t.localPort, connection: conn });
+    }
+  } else {
+    json({ status: 'failed', target, label: t.label, message: 'Could not establish port-forward after 10s' });
+    process.exit(1);
   }
 }
 
@@ -315,23 +555,20 @@ async function snapshotDownload(sessionId) {
 
   const outputIdx = process.argv.indexOf('--output');
   const outputPath = outputIdx !== -1 ? process.argv[outputIdx + 1] : `data/snapshots/snapshot-${sessionId}.tar.gz`;
-
-  // Ensure output dir exists
   const outputDir = resolve(dirname(outputPath));
   run(`mkdir -p "${outputDir}"`, { throws: false });
 
   const url = `${BITDEX_URL}/debug/snapshot/${sessionId}/download`;
   const fullPath = resolve(outputPath);
 
-  // Check for existing partial download (resume support)
   let startByte = 0;
   if (existsSync(fullPath)) {
     startByte = statSync(fullPath).size;
-    console.error(`Resuming from byte ${startByte} (${(startByte / 1073741824).toFixed(2)} GB)`);
+    err(`Resuming from byte ${startByte} (${(startByte / 1073741824).toFixed(2)} GB)`);
   }
 
-  console.error(`Downloading snapshot ${sessionId} from ${BITDEX_URL}`);
-  console.error(`Output: ${fullPath}`);
+  err(`Downloading snapshot ${sessionId} from ${BITDEX_URL}`);
+  err(`Output: ${fullPath}`);
 
   const urlObj = new URL(url);
   const client = urlObj.protocol === 'https:' ? https : http;
@@ -342,7 +579,7 @@ async function snapshotDownload(sessionId) {
 
     const req = client.get(urlObj, { headers }, (res) => {
       if (res.statusCode === 401 || res.statusCode === 403) {
-        console.error(`Auth error: ${res.statusCode}`);
+        err(`Auth error: ${res.statusCode}`);
         json({ error: `Auth failed (${res.statusCode})`, hint: 'Check BITDEX_ADMIN_TOKEN in .env' });
         process.exit(1);
       }
@@ -375,29 +612,24 @@ async function snapshotDownload(sessionId) {
       res.on('end', () => {
         file.end();
         const gb = (downloaded / 1073741824).toFixed(2);
-        console.error(`\nDownload complete: ${gb} GB → ${fullPath}`);
+        err(`\nDownload complete: ${gb} GB → ${fullPath}`);
         json({ downloaded_bytes: downloaded, path: fullPath, session_id: sessionId });
         resolveP();
       });
 
       res.on('error', (e) => {
         file.end();
-        console.error(`\nDownload error at ${(downloaded / 1073741824).toFixed(2)} GB: ${e.message}`);
-        console.error('Re-run the same command to resume.');
+        err(`\nDownload error at ${(downloaded / 1073741824).toFixed(2)} GB: ${e.message}`);
+        err('Re-run the same command to resume.');
         json({ error: e.message, downloaded_bytes: downloaded, path: fullPath, resumable: true });
         rejectP(e);
       });
     });
 
-    req.on('error', (e) => {
-      console.error(`Connection error: ${e.message}`);
-      json({ error: e.message });
-      rejectP(e);
-    });
-
+    req.on('error', (e) => { err(`Connection error: ${e.message}`); json({ error: e.message }); rejectP(e); });
     req.on('timeout', () => {
       req.destroy();
-      console.error('Connection timed out. Re-run to resume.');
+      err('Connection timed out. Re-run to resume.');
       json({ error: 'timeout', downloaded_bytes: startByte, resumable: true });
       rejectP(new Error('timeout'));
     });
@@ -405,58 +637,6 @@ async function snapshotDownload(sessionId) {
 }
 
 // --- Prometheus Metrics ---
-
-const PROM_CONTEXT = 'civit-datapacket';
-const PROM_NS = 'monitoring';
-const PROM_SVC = 'svc/kube-prometheus-stack-prometheus';
-const PROM_PORT = 9090;
-const PROM_URL = `http://localhost:${PROM_PORT}`;
-
-function ensurePromPortForward() {
-  // Check if port-forward is already running
-  try {
-    const check = run(`curl -sf ${PROM_URL}/api/v1/status/runtimeinfo 2>/dev/null | head -c 20`, { throws: false });
-    if (check && check.includes('{')) return true;
-  } catch {}
-
-  // Start port-forward in background
-  console.error(`Starting port-forward to Prometheus (${PROM_SVC})...`);
-  try {
-    spawnSync('kubectl', ['--context', PROM_CONTEXT, 'port-forward', '-n', PROM_NS, PROM_SVC, `${PROM_PORT}:${PROM_PORT}`], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-      shell: process.platform === 'win32',
-    });
-    // Wait for it to be ready
-    for (let i = 0; i < 15; i++) {
-      try {
-        const check = run(`curl -sf ${PROM_URL}/api/v1/status/runtimeinfo 2>/dev/null | head -c 20`, { throws: false });
-        if (check && check.includes('{')) { console.error('Port-forward ready.'); return true; }
-      } catch {}
-      run('sleep 0.5', { throws: false });
-    }
-  } catch {}
-  console.error('Warning: could not verify Prometheus port-forward. Queries may fail.');
-  return false;
-}
-
-function promQuery(query) {
-  const encoded = encodeURIComponent(query);
-  const result = run(`curl -sf "${PROM_URL}/api/v1/query?query=${encoded}"`, { throws: false });
-  try { return JSON.parse(result); } catch { return { error: 'Failed to parse response', raw: result }; }
-}
-
-function promQueryRange(query, start, end, step) {
-  const encoded = encodeURIComponent(query);
-  const result = run(`curl -sf "${PROM_URL}/api/v1/query_range?query=${encoded}&start=${start}&end=${end}&step=${step}"`, { throws: false });
-  try { return JSON.parse(result); } catch { return { error: 'Failed to parse response', raw: result }; }
-}
-
-function extractScalar(promResult) {
-  if (promResult?.data?.result?.[0]?.value?.[1]) return parseFloat(promResult.data.result[0].value[1]);
-  return null;
-}
 
 function metricsNow() {
   ensurePromPortForward();
@@ -478,20 +658,19 @@ function metricsNow() {
     results[name] = v != null ? (name.includes('_ms') ? Math.round(v * 100) / 100 : name === 'qps' ? Math.round(v * 10) / 10 : v) : null;
   }
 
-  // Compute cache hit rate
   if (results.cache_hits != null && results.cache_misses != null) {
     const total = results.cache_hits + results.cache_misses;
     results.cache_hit_rate = total > 0 ? `${((results.cache_hits / total) * 100).toFixed(1)}%` : '—';
   }
 
-  console.error(`BitDex Production Metrics (5m window)`);
-  console.error(`  QPS:          ${results.qps ?? '—'}`);
-  console.error(`  Query p50:    ${results.query_p50_ms ?? '—'} ms`);
-  console.error(`  Query p95:    ${results.query_p95_ms ?? '—'} ms`);
-  console.error(`  Query p99:    ${results.query_p99_ms ?? '—'} ms`);
-  console.error(`  Docs p95:     ${results.docs_p95_ms ?? '—'} ms`);
-  console.error(`  HTTP p95:     ${results.http_p95_ms ?? '—'} ms`);
-  console.error(`  Cache:        ${results.cache_hit_rate ?? '—'} (${results.cache_hits ?? 0} hits, ${results.cache_misses ?? 0} misses)`);
+  err(`BitDex Production Metrics (5m window)`);
+  err(`  QPS:          ${results.qps ?? '—'}`);
+  err(`  Query p50:    ${results.query_p50_ms ?? '—'} ms`);
+  err(`  Query p95:    ${results.query_p95_ms ?? '—'} ms`);
+  err(`  Query p99:    ${results.query_p99_ms ?? '—'} ms`);
+  err(`  Docs p95:     ${results.docs_p95_ms ?? '—'} ms`);
+  err(`  HTTP p95:     ${results.http_p95_ms ?? '—'} ms`);
+  err(`  Cache:        ${results.cache_hit_rate ?? '—'} (${results.cache_hits ?? 0} hits, ${results.cache_misses ?? 0} misses)`);
   json(results);
 }
 
@@ -520,12 +699,12 @@ function metricsTrend(window) {
   }
 
   if (results.qps) {
-    console.error(`QPS trend (${win}):`);
-    for (const p of results.qps) console.error(`  ${p.time}  ${p.value}`);
+    err(`QPS trend (${win}):`);
+    for (const p of results.qps) err(`  ${p.time}  ${p.value}`);
   }
   if (results.query_p95_ms) {
-    console.error(`p95 latency trend (${win}):`);
-    for (const p of results.query_p95_ms) console.error(`  ${p.time}  ${p.value} ms`);
+    err(`p95 latency trend (${win}):`);
+    for (const p of results.query_p95_ms) err(`  ${p.time}  ${p.value} ms`);
   }
   json(results);
 }
@@ -538,58 +717,116 @@ function metricsQuery(query) {
     for (const r of result.data.result) {
       const labels = Object.entries(r.metric || {}).map(([k, v]) => `${k}="${v}"`).join(', ');
       const val = r.value?.[1] ?? '—';
-      console.error(`  {${labels}} => ${val}`);
+      err(`  {${labels}} => ${val}`);
     }
   }
   json(result);
 }
 
-function parseDuration(s) {
-  const m = s.match(/^(\d+)(s|m|h|d)$/);
-  if (!m) return 900; // default 15m
-  const n = parseInt(m[1], 10);
-  switch (m[2]) {
-    case 's': return n;
-    case 'm': return n * 60;
-    case 'h': return n * 3600;
-    case 'd': return n * 86400;
-    default: return 900;
-  }
-}
-
-// --- Router ---
+// --- Command Router ---
 
 const command = process.argv[2];
 switch (command) {
+  // Release & Deploy
   case 'release': release(); break;
   case 'watch-build': watchBuild(); break;
+  case 'watch-build-notify': watchBuildNotify(); break;
   case 'build-status': buildStatus(); break;
   case 'rollout': rollout(process.argv[3]); break;
   case 'deploy': deploy(process.argv[3]); break;
+  case 'rollback': rollback(); break;
   case 'status': status(); break;
   case 'scale': scale(); break;
+
+  // Cursors
   case 'cursor-reset': cursorReset(); break;
   case 'cursor-read': cursorRead(); break;
   case 'cursor-csv': cursorCsv(); break;
+
+  // PG-Sync
   case 'pg-sync-health': pgSyncHealth(); break;
   case 'pg-sync-logs': pgSyncLogs(); break;
   case 'server-logs': serverLogs(); break;
+
+  // Operations
   case 'resources': resources(); break;
   case 'wipe': wipe(); break;
   case 'config-read': configRead(); break;
+  case 'config-patch': configPatch(); break;
+  case 'memory': memory(); break;
+  case 'disk': disk(); break;
+  case 'cleanup': cleanup(); break;
+  case 'health': health(); break;
+
+  // Tunnels
+  case 'tunnel': tunnel(process.argv[3], process.argv[4]); break;
+
+  // Snapshots
   case 'snapshot-status': snapshotStatus(process.argv[3]); break;
   case 'snapshot-download': await snapshotDownload(process.argv[3]); break;
+
+  // Prometheus Metrics
   case 'metrics-now': metricsNow(); break;
   case 'metrics-trend': metricsTrend(process.argv[3]); break;
   case 'metrics-query': metricsQuery(process.argv.slice(3).join(' ')); break;
+
+  // CSV Dump (V2 — config-driven)
+  case 'csv-dump': {
+    const tables = process.argv[3] ? process.argv[3].split(',') : undefined;
+    const gzip = process.argv.includes('--gzip');
+    csvDump({ tables, gzip });
+    break;
+  }
+  case 'csv-dump-progress': csvDumpProgress(); break;
+  case 'csv-dump-cleanup': csvDumpCleanup(); break;
+  case 'csv-dump-tables': csvDumpTables(); break;
+  case 'csv-full-pipeline': {
+    const pipeTables = process.argv[3] && !process.argv[3].startsWith('-') ? process.argv[3].split(',') : undefined;
+    const pipeNotify = process.argv.includes('--notify') ? process.argv[process.argv.indexOf('--notify') + 1] : undefined;
+    const pipeOut = process.argv.includes('--output') ? process.argv[process.argv.indexOf('--output') + 1] : undefined;
+    const skipDump = process.argv.includes('--skip-dump');
+    csvFullPipeline({ tables: pipeTables, notifyAgent: pipeNotify, outputDir: pipeOut, skipDump });
+    break;
+  }
+  case 'csv-serve': csvServe(); break;
+  case 'csv-serve-stop': csvServeStop(); break;
+  case 'csv-download': {
+    const dlTables = process.argv[3] && !process.argv[3].startsWith('-') ? process.argv[3].split(',') : undefined;
+    const keepServer = process.argv.includes('--keep-server');
+    const outDir = process.argv.includes('--output') ? process.argv[process.argv.indexOf('--output') + 1] : undefined;
+    const dlToken = process.argv.includes('--token') ? process.argv[process.argv.indexOf('--token') + 1] : undefined;
+    const dlChunks = process.argv.includes('--chunks') ? parseInt(process.argv[process.argv.indexOf('--chunks') + 1]) : 8;
+    await csvDownload({ tables: dlTables, outputDir: outDir, keepServer, token: dlToken, chunks: dlChunks });
+    break;
+  }
+  case 'csv-verify': csvVerify(process.argv[3]); break;
+  case 'csv-download-watch': {
+    const watchFile = process.argv[3];
+    if (!watchFile) { json({ error: 'Usage: csv-download-watch <filename> [--poll <seconds>] [--notify <agent>]' }); process.exit(1); }
+    const pollIdx = process.argv.indexOf('--poll');
+    const pollSec = pollIdx !== -1 ? parseInt(process.argv[pollIdx + 1]) : 10;
+    const notifyIdx = process.argv.indexOf('--notify');
+    const notifyAgent = notifyIdx !== -1 ? process.argv[notifyIdx + 1] : undefined;
+    csvDownloadWatch(watchFile, { pollInterval: pollSec, notifyAgent });
+    break;
+  }
+
   default:
     json({
       error: `Unknown command: ${command}`,
-      commands: ['release', 'watch-build', 'build-status', 'rollout', 'deploy', 'status', 'scale',
-                 'cursor-reset', 'cursor-read', 'cursor-csv', 'pg-sync-health', 'pg-sync-logs',
-                 'server-logs', 'resources', 'wipe', 'config-read',
-                 'snapshot-status', 'snapshot-download',
-                 'metrics-now', 'metrics-trend', 'metrics-query'],
+      commands: {
+        'Release & Deploy': ['release', 'watch-build', 'watch-build-notify [run-id] [--notify <agent>]', 'build-status', 'rollout <version>', 'deploy <version>', 'rollback <version>'],
+        'Status': ['status', 'health', 'resources', 'memory', 'disk'],
+        'Cursors': ['cursor-reset <value>', 'cursor-read', 'cursor-csv'],
+        'PG-Sync': ['pg-sync-health', 'pg-sync-logs [pod] [lines]', 'server-logs [pod] [lines]'],
+        'Config': ['config-read', 'config-patch <json>'],
+        'CSV Dump': ['csv-dump [tables] [--gzip]', 'csv-dump-progress', 'csv-dump-cleanup', 'csv-dump-tables', 'csv-full-pipeline [tables] [--notify <agent>] [--skip-dump]'],
+        'CSV Download': ['csv-serve', 'csv-serve-stop', 'csv-download [tables] [--token <t>] [--chunks N] [--output <dir>]', 'csv-download-watch <file> [--poll <sec>] [--notify <agent>]', 'csv-verify [local-dir]'],
+        'Tunnels': ['tunnel pg [start|stop|status]', 'tunnel bitdex [start|stop|status]'],
+        'Snapshots': ['snapshot-status <session_id>', 'snapshot-download <session_id> [--output <path>]'],
+        'Metrics': ['metrics-now', 'metrics-trend [window]', 'metrics-query <promql>'],
+        'Data': ['wipe', 'cleanup <captures|load_stage|legacy|bounds>'],
+      },
     });
     process.exit(1);
 }

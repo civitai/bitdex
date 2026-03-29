@@ -238,7 +238,8 @@ pub async fn download_from_sync_config(
         if let Some(ref copy_query) = phase.copy_query {
             let ext = if phase.format == "tsv" { "tsv" } else { "csv" };
             let filename = format!("{}.{}", phase.name, ext);
-            let bytes = download_copy_query(pool, stage_dir, &phase.name, &filename, copy_query).await?;
+            let header = if !phase.columns.is_empty() { Some(&phase.columns) } else { None };
+            let bytes = download_copy_query(pool, stage_dir, &phase.name, &filename, copy_query, header).await?;
             total_bytes += bytes;
         }
 
@@ -264,7 +265,8 @@ async fn download_enrichment_csvs(
     for enrich in enrichments {
         if let (Some(ref lookup), Some(ref copy_query)) = (&enrich.lookup, &enrich.copy_query) {
             let name = enrich.table.as_deref().unwrap_or(lookup.trim_end_matches(".csv"));
-            download_copy_query(pool, stage_dir, name, lookup, copy_query).await?;
+            let header = if !enrich.columns.is_empty() { Some(&enrich.columns) } else { None };
+            download_copy_query(pool, stage_dir, name, lookup, copy_query, header).await?;
         }
         // Recurse into nested enrichments
         if !enrich.enrichment.is_empty() {
@@ -282,6 +284,7 @@ async fn download_copy_query(
     name: &str,
     filename: &str,
     copy_query: &str,
+    columns: Option<&Vec<String>>,
 ) -> Result<u64, String> {
     use futures_util::TryStreamExt;
     use sqlx::postgres::PgPoolCopyExt;
@@ -305,6 +308,15 @@ async fn download_copy_query(
     let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
     let mut bytes_written = 0u64;
     let start_time = Instant::now();
+
+    // Prepend CSV header line when columns are specified (PG COPY TO STDOUT
+    // doesn't support HEADER — we add it ourselves from the sync config).
+    if let Some(cols) = columns {
+        let header_line = format!("{}\n", cols.join(","));
+        writer.write_all(header_line.as_bytes()).await
+            .map_err(|e| format!("{name}: write header: {e}"))?;
+        bytes_written += header_line.len() as u64;
+    }
 
     // Use copy_out_raw — same API as copy_queries.rs
     let mut stream = pool

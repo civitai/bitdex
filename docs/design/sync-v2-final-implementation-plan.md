@@ -1,3 +1,8 @@
+---
+status: ACTIVE
+updated: 2026-03-28
+---
+
 # Sync V2 — Final Implementation Plan
 
 > Consolidated from the working design review (2026-03-26). All architecture
@@ -243,34 +248,48 @@ Single pipeline: ops → WAL → WAL reader → apply_ops_batch with BitmapSink 
 
 ### Task List
 
-- [ ] **2.1** WAL reader background thread — spawn on server startup, tail WAL file
+- [x] **2.1** `[Lucy]` WAL reader background thread ✅ *pre-existing, verified*
   - Read batch (10K), dedup (D5), apply via BitmapSink + DocSink, save WAL cursor to MetaStore
   - Sleep 50ms when empty
-- [ ] **2.2** Wire DocSink into apply_ops_batch — each set/add/remove op also writes docstore tuple
-- [ ] **2.3** Computed sort field recomputation — when source field (existedAt, publishedAt) changes via ops, recompute sortAt via FieldMeta deps. If only one source is available, use it (other defaults to 0).
-- [ ] **2.4** Deferred alive in ops path — fix current bug: skip filter+sort for future publishedAt (not just alive)
-- [ ] **2.5** Fix diff_document_partial bypass — add deferred alive check (mutation.rs:295, per Ollie's audit)
-- [ ] **2.6** WAL cursor persistence — byte-offset cursor saved to MetaStore, restore on restart. Separate from BitdexOps row-ID cursor in PG.
-- [ ] **2.7** Refactor PUT/PATCH HTTP endpoints — `engine.put()` and `engine.patch_document()` become thin wrappers: decompose document into `Vec<Op>`, write to WAL. No longer directly mutate staging. See D4.
-- [ ] **2.8** Op dedup in WAL reader — call `dedup_ops()` on each batch. LIFO semantics, queryOpSet dedup by (entity_id, query). See D5.
-- [ ] **2.9** POST /ops endpoint — verify existing endpoint (server.rs) appends to WAL with fsync. Returns 200 only after fsync. Request body schema in D4.
-- [ ] **2.10** Ops on non-alive slots — silently drop set/add/remove ops on non-alive slots (except creates_slot=true). See D6.
-- [ ] **2.11** Delete docstore read — delete ops read stored doc to discover which bitmaps to clear (clean delete). See D6.
-- [ ] **2.12** Prometheus metrics — `bitdex_sync_cursor_position`, `bitdex_sync_lag_rows`, `bitdex_sync_cycle_duration_seconds`, `bitdex_sync_wal_pending_bytes`. Add `GET /api/internal/sync-lag` endpoint.
+- [x] **2.2** `[Lucy]` Wire DocSink into apply_ops_batch ✅ *new code: DocWriter struct*
+- [x] **2.3** `[Lucy]` Computed sort field recomputation ✅ *new code: old bit clearing + new bit setting*
+- [x] **2.4** `[Lucy]` Deferred alive in ops path ✅ *new code: skip ALL bitmaps*
+- [x] **2.5** `[Lucy]` Fix diff_document_partial bypass ✅ *new code: 53 lines in mutation.rs*
+- [x] **2.6** `[Lucy]` WAL cursor persistence ✅ *pre-existing, verified*
+- [x] **2.7** `[Lucy]` Refactor PUT/PATCH HTTP endpoints ✅ *document_to_ops with is_patch parameter*
+- [x] **2.8** `[Lucy]` Op dedup in WAL reader ✅ *pre-existing, verified*
+- [x] **2.9** `[Lucy]` POST /ops endpoint ✅ *pre-existing, verified*
+- [x] **2.10** `[Lucy]` Ops on non-alive slots ✅ *new code: is_slot_alive check*
+- [x] **2.11** `[Lucy]` Delete docstore read ✅ *pre-existing, verified*
+- [x] **2.12** `[Lucy]` Prometheus metrics ✅ *2 new (cycle_duration, wal_pending), 2 pre-existing*
+
+**Dakota (Doc Keeper) independent verification (2026-03-28):** All 12 tasks confirmed in code via Explorer agents:
+- 2.1: server.rs:1130-1214 (WAL reader thread spawn, batch read, dedup, CoalescerSink + DocWriter)
+- 2.2: ops_processor.rs:44-122 (DocWriter struct, write_set/add/remove per op, flush)
+- 2.3: ops_processor.rs:823-883 (FieldMeta.computed_deps, GREATEST/LEAST recomputation)
+- 2.4: ops_processor.rs:728-754 (check_deferred_alive, skips ALL bitmaps for future publishedAt)
+- 2.5: mutation.rs:302-350 (deferred check in diff_document_partial, clears old bitmaps)
+- 2.6: ops_processor.rs:1224-1234 (save_cursor/load_cursor, byte-offset persistence)
+- 2.7: concurrent_engine.rs:2816-2891 (put_via_wal, patch_document_via_wal, document_to_ops)
+- 2.8: pg_sync/op_dedup.rs:22-52 (dedup_ops, two-layer: ops_processor.rs:688 + ops_poller.rs:126)
+- 2.9: server.rs:4410-4494 (handle_ops → spawn_blocking → append_batch → sync_all → OK)
+- 2.10: ops_processor.rs:714-726 (!creates_slot && !has_query_op_set → is_slot_alive → skip)
+- 2.11: ops_processor.rs:995-1016 → concurrent_engine.rs:3039-3080 (docstore.get reads old doc)
+- 2.12: metrics.rs:584-611 (all 4 metrics), server.rs:1267+4790-4795 (sync-lag endpoint)
 
 ### Phase 2 Validation
 
-- [ ] **V2.1** Single op roundtrip — POST /ops set op → query shows change → docstore updated
-- [ ] **V2.2** Multi-value add/remove — add tagIds, query matches, remove, query no longer matches
-- [ ] **V2.3** Delete — clean delete clears all filter+sort bits, reads stored doc
-- [ ] **V2.4** queryOpSet — fan-out to 1000+ slots, verify bitmap bulk update + batched docstore
-- [ ] **V2.5** Deferred alive via ops — future publishedAt creates_slot → not queryable until timestamp
-- [ ] **V2.6** WAL cursor restart — kill server, restart, no duplicate processing
-- [ ] **V2.7** PUT/PATCH → WAL — verify PUT endpoint generates ops in WAL (not direct staging write)
-- [ ] **V2.8** Op dedup — verify duplicate ops in same batch are deduped (LIFO, last wins)
-- [ ] **V2.9** Non-alive slot ops — verify set/add ops on non-alive slots are silently dropped
-- [ ] **V2.10** Delete docstore read — verify delete reads stored doc and clears correct bitmaps
-- [ ] **V2.11** Prometheus metrics — /api/internal/sync-lag returns cursor/lag data
+- [x] **V2.1** Single op roundtrip — POST /ops set op → query shows change → docstore updated ✅
+- [x] **V2.2** Multi-value add/remove — add tagIds, query matches, remove, query no longer matches ✅
+- [x] **V2.3** Delete — clean delete clears all filter+sort bits, reads stored doc ✅
+- [x] **V2.4** queryOpSet — fan-out to 1000+ slots, verify bitmap bulk update + batched docstore ✅
+- [x] **V2.5** Deferred alive via ops — future publishedAt creates_slot → not queryable until timestamp ✅
+- [x] **V2.6** WAL cursor restart — kill server, restart, no duplicate processing ✅
+- [x] **V2.7** PUT/PATCH → WAL — verify PUT endpoint generates ops in WAL (not direct staging write) ✅
+- [x] **V2.8** Op dedup — verify duplicate ops in same batch are deduped (LIFO, last wins) ✅
+- [x] **V2.9** Non-alive slot ops — verify set/add ops on non-alive slots are silently dropped ✅
+- [x] **V2.10** Delete docstore read — verify delete reads stored doc and clears correct bitmaps ✅
+- [x] **V2.11** Prometheus metrics — /api/internal/sync-lag returns cursor/lag data ✅
 
 ---
 
@@ -306,11 +325,11 @@ Test the trigger → BitdexOps → ops processing chain before full activation.
 
 ### Task List
 
-- [ ] **3.1** Rename binary: `bitdex-pg-sync` → `bitdex-sync`
-- [ ] **3.2** New subcommands: `pg` (dump + ops poll), `ch` (ClickHouse poll), `all` (both, default)
-- [ ] **3.3** Implement `ch` subcommand — ClickHouse metrics polling. Each CH row becomes three set ops (reactionCount, commentCount, collectedCount) posted to /ops. Poll interval configurable (default 60s). Goes through the WAL like everything else.
-- [ ] **3.4** Trigger reconciliation — read sync config, generate SQL via trigger_gen, CREATE OR REPLACE on boot, DROP stale triggers (hash mismatch)
-- [ ] **3.5** Boot sequence implementation:
+- [x] **3.1** `[Nate]` Rename binary: `bitdex-pg-sync` → `bitdex-sync` ✅
+- [x] **3.2** `[Nate]` New subcommands: `pg` (dump + ops poll), `ch` (ClickHouse poll), `all` (both, default) ✅ *Also added: setup, validate*
+- [x] **3.3** `[Nate]` Implement `ch` subcommand — ClickHouse metrics polling. Each CH row becomes three set ops (reactionCount, commentCount, collectedCount) posted to /ops. Poll interval configurable (default 60s). Goes through the WAL like everything else. ✅
+- [x] **3.4** `[Nate]` Trigger reconciliation — read sync config, generate SQL via trigger_gen, CREATE OR REPLACE on boot, DROP stale triggers (hash mismatch) ✅ *QA verified: 28 tests*
+- [x] **3.5** `[Nate]` Boot sequence implementation (10-step autonomous, QA verified): ✅
   - [ ] 3.5a Wait for BitDex health check
   - [ ] 3.5b Capture/create pre_dump_cursor from BitdexOps (if table empty, seed at 0). Stored in `bitdex_cursors` PG table.
   - [ ] 3.5c Check dump history (GET /dumps)
@@ -319,8 +338,8 @@ Test the trigger → BitdexOps → ops processing chain before full activation.
   - [ ] 3.5f Seed BitdexOps cursor at pre_dump_cursor (catches dump-window ops)
   - [ ] 3.5g Transition to steady-state ops polling (BitdexOps → POST /ops)
   - [ ] 3.5h K8s readiness probe → 200
-- [ ] **3.6** Config hash change detection — dump names include `{table}-{hash8}` where hash is of the table's sync config YAML block. Mismatch triggers re-dump.
-- [ ] **3.7** V1 code removal:
+- [x] **3.6** `[Nate]` Config hash change detection — dump names include `{table}-{hash8}` where hash is of the table's sync config YAML block. Mismatch triggers re-dump. ✅ *QA verified: 2 tests*
+- [x] **3.7** `[Nate]` V1 code removal (-5,274 lines): ✅
   - [ ] 3.7a Delete copy_streams.rs (830 lines, unused)
   - [ ] 3.7b Delete table_streams.rs (551 lines, unused)
   - [ ] 3.7c Delete outbox_poller.rs (219 lines, replaced by ops_poller)

@@ -277,6 +277,19 @@ async fn run_boot_sequence(
         });
     eprintln!("BitDex is healthy.");
 
+    // Step 1b: Check if server is already populated — skip dump if so.
+    // This prevents re-dumping 4.5B rows on every sidecar restart.
+    let alive_count = bitdex_client.get_alive_count().await;
+    if alive_count > 0 {
+        eprintln!(
+            "Server already populated ({alive_count} alive docs) — skipping dump pipeline. \
+             Transitioning directly to steady-state ops polling."
+        );
+        // Still run setup (triggers/tables) and seed cursor
+        run_setup(pool, full_sync_config).await;
+        return;
+    }
+
     // Step 2: V2 setup (triggers + tables)
     run_setup(pool, full_sync_config).await;
 
@@ -399,13 +412,16 @@ async fn run_dump_pipeline(
         })
         .unwrap_or_default();
 
-    let mut dump_names = Vec::new();
+    let mut completed = 0;
+    let total = config.dump_phases.len();
 
+    // Process dumps SEQUENTIALLY — server only handles one task at a time
     for phase in &config.dump_phases {
         let name = phase.dump_name();
 
         if completed_set.contains(&name) {
-            eprintln!("Dump '{name}' already complete — skipping");
+            eprintln!("[{}/{}] Dump '{name}' already complete — skipping", completed + 1, total);
+            completed += 1;
             continue;
         }
 
@@ -415,22 +431,21 @@ async fn run_dump_pipeline(
         let csv_path = stage_dir.join(&csv_filename);
 
         if !csv_path.exists() {
-            // Check for enrichment-only phases (like metrics from ClickHouse)
             if phase.source.as_deref() == Some("clickhouse") {
                 let tsv_path = stage_dir.join(format!("{}.tsv", phase.name));
                 if !tsv_path.exists() {
-                    eprintln!("WARNING: Skipping dump '{name}' — {} not found", tsv_path.display());
+                    eprintln!("[{}/{}] WARNING: Skipping dump '{name}' — {} not found", completed + 1, total, tsv_path.display());
                     continue;
                 }
             } else {
-                eprintln!("WARNING: Skipping dump '{name}' — {} not found", csv_path.display());
+                eprintln!("[{}/{}] WARNING: Skipping dump '{name}' — {} not found", completed + 1, total, csv_path.display());
                 continue;
             }
         }
 
-        // Build dump request body from phase config
+        // Register this dump
         let dump_request = phase.to_dump_request(stage_dir);
-        eprintln!("Registering dump '{name}'...");
+        eprintln!("[{}/{}] Registering dump '{name}'...", completed + 1, total);
 
         match bitdex_client.register_dump(&dump_request).await {
             Ok(resp) => {
@@ -442,8 +457,7 @@ async fn run_dump_pipeline(
             }
         }
 
-        // Signal that the CSV file is ready for processing
-        // (CSVs are already downloaded by bulk_loader)
+        // Signal CSV is ready
         match bitdex_client.signal_dump_loaded(&name, 0).await {
             Ok(_) => eprintln!("  Signaled loaded: {name}"),
             Err(e) => {
@@ -452,34 +466,24 @@ async fn run_dump_pipeline(
             }
         }
 
-        dump_names.push(name);
+        // Wait for THIS dump to complete before registering the next one
+        eprintln!("  Waiting for '{name}' to complete...");
+        bitdex_client
+            .poll_dumps_until_complete(
+                &[name.clone()],
+                5,       // poll every 5s
+                3600,    // 1 hour timeout per dump
+            )
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("FATAL: Dump '{name}' failed: {e}");
+                std::process::exit(1);
+            });
+        eprintln!("  Dump '{name}' complete.");
+        completed += 1;
     }
 
-    if dump_names.is_empty() {
-        eprintln!("All dumps already complete — no new dumps to process.");
-        return;
-    }
-
-    // Poll until all registered dumps are complete
-    eprintln!(
-        "Waiting for {} dump(s) to complete: {}",
-        dump_names.len(),
-        dump_names.join(", ")
-    );
-
-    bitdex_client
-        .poll_dumps_until_complete(
-            &dump_names,
-            5,       // poll every 5s
-            3600,    // 1 hour timeout
-        )
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("FATAL: Dump pipeline failed: {e}");
-            std::process::exit(1);
-        });
-
-    eprintln!("=== All dumps complete ===");
+    eprintln!("=== All {completed}/{total} dumps complete ===");
 }
 
 // ---------------------------------------------------------------------------

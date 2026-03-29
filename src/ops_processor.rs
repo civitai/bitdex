@@ -687,6 +687,18 @@ pub fn apply_ops_batch<S: BitmapSink>(
 ) -> (usize, usize, usize) {
     dedup_ops(batch);
 
+    // One-time diagnostic: log computed_deps status
+    if !batch.is_empty() && !meta.computed_deps.is_empty() {
+        eprintln!(
+            "apply_ops_batch: {} entries, computed_deps has {} source fields: {:?}",
+            batch.len(),
+            meta.computed_deps.len(),
+            meta.computed_deps.keys().collect::<Vec<_>>(),
+        );
+    } else if !batch.is_empty() && meta.computed_deps.is_empty() {
+        eprintln!("apply_ops_batch: {} entries, computed_deps is EMPTY", batch.len());
+    }
+
     let mut applied = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
@@ -824,6 +836,15 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // First clear old computed value bits, then set new ones.
         // PG triggers emit remove+set pairs, so we have both old and new values.
         if !meta.computed_deps.is_empty() {
+            // Diagnostic: log computed_deps trigger for first batch entry with sort changes
+            if !sort_values.is_empty() || !old_sort_values.is_empty() {
+                eprintln!(
+                    "  computed_deps: slot={} sort_vals={:?} old_sort_vals={:?} deps_keys={:?}",
+                    slot, sort_values.keys().collect::<Vec<_>>(),
+                    old_sort_values.keys().collect::<Vec<_>>(),
+                    meta.computed_deps.keys().collect::<Vec<_>>(),
+                );
+            }
             // Determine which source fields changed (have either old or new value)
             let mut changed_sources: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for k in sort_values.keys() {
@@ -837,13 +858,41 @@ pub fn apply_ops_batch<S: BitmapSink>(
                 }
             }
 
+            // Read stored doc to get current values for source fields NOT in this ops batch.
+            // Without this, missing sources default to 0, breaking GREATEST/LEAST.
+            let stored_sort_values: HashMap<&str, u32> = if let Some(eng) = engine {
+                let mut stored = HashMap::new();
+                if let Ok(Some(doc)) = eng.get_document(slot) {
+                    for source_field in changed_sources.iter().flat_map(|sf| {
+                        meta.computed_deps.get(*sf).into_iter().flat_map(|deps| {
+                            deps.iter().flat_map(|d| d.source_fields.iter().map(|s| s.as_str()))
+                        })
+                    }) {
+                        if !sort_values.contains_key(source_field) && !old_sort_values.contains_key(source_field) {
+                            if let Some(fv) = doc.fields.get(source_field) {
+                                if let crate::mutation::FieldValue::Single(ref v) = fv {
+                                    if let Some(sv) = value_to_sort_u32(v) {
+                                        stored.insert(source_field, sv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                stored
+            } else {
+                HashMap::new()
+            };
+
             for source_field in &changed_sources {
                 if let Some(deps) = meta.computed_deps.get(*source_field) {
                     for dep in deps {
-                        // Clear old computed value (using old source values)
+                        // Clear old computed value (using old source values, falling back to stored).
+                        // Do NOT fall through to sort_values — it has the NEW values, which would
+                        // make old_computed = new_computed and corrupt the bitmap clear.
                         let old_values: Vec<u32> = dep.source_fields.iter()
                             .map(|sf| old_sort_values.get(sf.as_str())
-                                .or_else(|| sort_values.get(sf.as_str()))
+                                .or_else(|| stored_sort_values.get(sf.as_str()))
                                 .copied()
                                 .unwrap_or(0))
                             .collect();
@@ -859,10 +908,12 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             }
                         }
 
-                        // Set new computed value (using new source values)
+                        // Set new computed value (using new source values, falling back to stored).
+                        // Do NOT fall through to old_sort_values — for unchanged fields, the
+                        // stored value IS the current (and thus new) value.
                         let new_values: Vec<u32> = dep.source_fields.iter()
                             .map(|sf| sort_values.get(sf.as_str())
-                                .or_else(|| old_sort_values.get(sf.as_str()))
+                                .or_else(|| stored_sort_values.get(sf.as_str()))
                                 .copied()
                                 .unwrap_or(0))
                             .collect();
@@ -872,10 +923,22 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             crate::config::ComputedOp::Least => *new_values.iter().min().unwrap_or(&0),
                         };
 
+                        eprintln!(
+                            "  computed sort recomp: target={} slot={} old_vals={:?}→{} new_vals={:?}→{} stored={:?}",
+                            dep.target, slot, old_values, old_computed, new_values, new_computed,
+                            stored_sort_values.keys().collect::<Vec<_>>(),
+                        );
+
                         for bit in 0..dep.target_bits {
                             if (new_computed >> bit) & 1 == 1 {
                                 sink.sort_set(dep.target_arc.clone(), bit, slot);
                             }
+                        }
+
+                        // Write computed sort value to docstore so future reads
+                        // (and GET /documents) reflect the recomputed value.
+                        if let Some(ref mut dw) = doc_writer {
+                            dw.write_set(slot, &dep.target, &serde_json::json!(new_computed));
                         }
                     }
                 }
@@ -1987,6 +2050,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_computed_deps_from_real_config() {
+        // Load the actual production config (IndexDefinition wrapper) and verify computed_deps
+        let config_json = std::fs::read_to_string("deploy/configs/civitai-index.json")
+            .expect("civitai-index.json should exist");
+        let idx_def: serde_json::Value = serde_json::from_str(&config_json)
+            .expect("should parse JSON");
+        let config: crate::config::Config = serde_json::from_value(idx_def["config"].clone())
+            .expect("should parse config section");
+
+        let meta = FieldMeta::from_config(&config);
+
+        // Verify computed_deps has entries for both source fields of sortAt
+        assert!(
+            meta.computed_deps.contains_key("publishedAt"),
+            "computed_deps should have 'publishedAt' as source for sortAt. \
+             Keys: {:?}", meta.computed_deps.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            meta.computed_deps.contains_key("existedAt"),
+            "computed_deps should have 'existedAt' as source for sortAt. \
+             Keys: {:?}", meta.computed_deps.keys().collect::<Vec<_>>()
+        );
+
+        // Verify the dep targets sortAt
+        let deps = &meta.computed_deps["publishedAt"];
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].target, "sortAt");
+        assert_eq!(deps[0].source_fields, vec!["existedAt", "publishedAt"]);
+
+        // Test that a publishedAt-only ops batch triggers sortAt recomputation
+        let mut sink = RecordingSink::new();
+        let mut batch = vec![EntityOps {
+            entity_id: 100,
+            creates_slot: false,
+            ops: vec![
+                Op::Set { field: "publishedAt".into(), value: json!(1700000000) },
+            ],
+        }];
+
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // sortAt should have sort_sets for the new computed value
+        // Without engine (stored doc fallback), existedAt defaults to 0
+        // So sortAt = GREATEST(0, 1700000000) = 1700000000
+        let sort_at_sets: Vec<_> = sink.sort_sets.iter()
+            .filter(|(f, _, _)| f == "sortAt")
+            .collect();
+        assert!(!sort_at_sets.is_empty(),
+            "publishedAt-only op should trigger sortAt recomputation. \
+             sort_sets: {:?}", sink.sort_sets);
     }
 
     // -----------------------------------------------------------------------

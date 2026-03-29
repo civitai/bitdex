@@ -288,9 +288,7 @@ impl IndexDefinition {
     }
 }
 
-/// Find the index config file in a directory. Prefers config.yaml, falls back to config.json.
-/// If config.json exists but config.yaml does not, performs a one-shot migration:
-/// reads the JSON, writes config.yaml, and returns the YAML path.
+/// Find the index config file in a directory. Checks config.yaml, config.yml, config.json.
 pub fn find_index_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let yaml = dir.join("config.yaml");
     if yaml.exists() {
@@ -302,19 +300,6 @@ pub fn find_index_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     }
     let json = dir.join("config.json");
     if json.exists() {
-        // One-shot migration: convert config.json → config.yaml
-        if let Ok(content) = std::fs::read_to_string(&json) {
-            if let Ok(def) = serde_json::from_str::<IndexDefinition>(&content) {
-                if let Ok(()) = def.save_yaml(dir) {
-                    eprintln!(
-                        "Migrated {}/config.json → config.yaml",
-                        dir.file_name().unwrap_or_default().to_string_lossy()
-                    );
-                    return Some(yaml);
-                }
-            }
-        }
-        // Migration failed — fall back to reading JSON directly
         return Some(json);
     }
     None
@@ -1174,6 +1159,15 @@ impl BitdexServer {
                                             &mut sink, &meta, &mut entries, Some(&engine),
                                             Some(&mut doc_writer),
                                         );
+
+                                    // Invalidate doc cache for mutated entities so
+                                    // GET /documents returns fresh data after ops.
+                                    if applied > 0 {
+                                        for entry in &entries {
+                                            let slot = entry.entity_id as u32;
+                                            engine.evict_doc_cache(slot);
+                                        }
+                                    }
 
                                     if applied > 0 || errors > 0 {
                                         eprintln!(
@@ -4269,32 +4263,33 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(uc.prefetches as i64);
 
-            // Per-field bitmap memory gauges (EXPENSIVE: iterates all bitmaps)
-            // Gated by metrics_bitmap_memory toggle — disable at runtime via
-            // PATCH /config {"enabled_metrics": []} to avoid 52s scrape stalls.
+            // Per-field bitmap memory gauges.
+            // Uses cached scanner totals instead of iterating all bitmaps (52s at 107M).
+            // The bitmap_memory_cache is populated by a background scanner thread
+            // that processes dirty fields in small batches.
             if state.metrics_bitmap_memory.load(Ordering::Relaxed) {
-                let t1 = std::time::Instant::now();
-                let (slot_bytes, _filter_bytes, _sort_bytes, _ce, _cb, filter_details, sort_details) =
-                    engine.bitmap_memory_report();
-                let t_bitmap_mem = t1.elapsed();
-                let _ = t_bitmap_mem; // timing available for debug logging
+                let mem_cache = engine.bitmap_memory_cache();
                 m.slot_bitmap_bytes
                     .with_label_values(&[name])
-                    .set(slot_bytes as i64);
-                for (field, count, bytes) in &filter_details {
+                    .set(mem_cache.cached_slot_bytes() as i64);
+                for (field, bytes, count) in mem_cache.cached_filter_memory() {
                     m.filter_bitmap_bytes
-                        .with_label_values(&[name, field])
-                        .set(*bytes as i64);
+                        .with_label_values(&[name, &field])
+                        .set(bytes as i64);
                     m.filter_bitmap_count
-                        .with_label_values(&[name, field])
-                        .set(*count as i64);
+                        .with_label_values(&[name, &field])
+                        .set(count as i64);
                 }
-                for (field, bytes) in &sort_details {
+                for (field, bytes) in mem_cache.cached_sort_memory() {
                     m.sort_bitmap_bytes
-                        .with_label_values(&[name, field])
-                        .set(*bytes as i64);
+                        .with_label_values(&[name, &field])
+                        .set(bytes as i64);
                 }
             }
+            // NOTE: The old bitmap_memory_report() code that iterated all bitmaps
+            // synchronously on every scrape is replaced above. If you need to verify
+            // scanner accuracy, temporarily call engine.bitmap_memory_report() and
+            // compare against the cached values.
 
             // Flush pipeline stats
             let (pub_count, _cumulative_nanos, last_nanos) = engine.flush_stats();

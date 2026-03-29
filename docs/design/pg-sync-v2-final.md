@@ -1,3 +1,8 @@
+---
+status: ACTIVE
+updated: 2026-03-28
+---
+
 # BitDex Sync V2 — Final Design
 
 > Distilled from the [working design doc](pg-sync-v2.md) (Justin + Adam, 2026-03-25).

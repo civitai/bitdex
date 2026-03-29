@@ -25,9 +25,10 @@
     ],
     "sort_fields": [
       { "name": "reactionCount", "bits": 32, "eager_load": true },
-      { "name": "sortAt", "bits": 32, "eager_load": true },
+      { "name": "sortAt", "bits": 32, "eager_load": true, "computed": { "op": "greatest", "source_fields": ["existedAt", "publishedAt"] } },
       { "name": "commentCount", "bits": 32, "eager_load": true },
       { "name": "collectedCount", "bits": 32, "eager_load": true },
+      { "name": "existedAt", "bits": 32 },
       { "name": "publishedAt", "bits": 32 },
       { "name": "id", "bits": 32 }
     ],
@@ -75,6 +76,7 @@
       { "source": "commentCount", "target": "commentCount", "value_type": "integer", "default": 0 },
       { "source": "collectedCount", "target": "collectedCount", "value_type": "integer", "default": 0 },
       { "source": "publishedAtUnix", "target": "publishedAt", "value_type": "integer", "ms_to_seconds": true },
+      { "source": "existedAt", "target": "existedAt", "value_type": "integer" },
       { "source": "url", "target": "url", "value_type": "string", "doc_only": true },
       { "source": "hash", "target": "hash", "value_type": "string", "doc_only": true },
       { "source": "width", "target": "width", "value_type": "integer", "doc_only": true },
