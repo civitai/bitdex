@@ -1378,10 +1378,15 @@ pub fn process_dump_with_progress(
 
     // Create per-thread silo writers for data silo integration.
     // Each rayon chunk gets its own silo file — zero contention writes.
+    // Skip for filter_only phases — no documents to write.
+    #[cfg(feature = "data-silo")]
+    let phase_is_filter_only = target_fields.iter().all(|t| filter_only_fields.contains(t));
     #[cfg(feature = "data-silo")]
     let silo_dir = bulk_writer.root().parent().unwrap_or(bulk_writer.root()).join("silos").join(&request.name);
     #[cfg(feature = "data-silo")]
-    let silo_writers: Vec<std::sync::Mutex<BulkDocWriter>> = {
+    let silo_writers: Vec<std::sync::Mutex<BulkDocWriter>> = if phase_is_filter_only {
+        Vec::new()
+    } else {
         let num_threads = rayon::current_num_threads();
         data_silo::create_bulk_writers(&silo_dir, num_threads)
             .map_err(|e| format!("create silo writers: {e}"))?
@@ -1688,13 +1693,15 @@ pub fn process_dump_with_progress(
                             if pub_secs > now_unix {
                                 // Write document — silo (feature) or docstore (fallback)
                                 #[cfg(feature = "data-silo")]
-                                write_silo_row_indexed(
-                                    &row, &enriched, computed_defs_ref,
-                                    &indexed_fields_buf, col_idx, slot, request_fields,
-                                    &field_idx_cache, &mut serialize_buf,
-                                    &mut tuple_buf, &mut write_buf,
-                                    &silo_writers_ref[chunk_idx],
-                                );
+                                if !phase_is_filter_only {
+                                    write_silo_row_indexed(
+                                        &row, &enriched, computed_defs_ref,
+                                        &indexed_fields_buf, col_idx, slot, request_fields,
+                                        &field_idx_cache, &mut serialize_buf,
+                                        &mut tuple_buf, &mut write_buf,
+                                        &silo_writers_ref[chunk_idx],
+                                    );
+                                }
                                 #[cfg(not(feature = "data-silo"))]
                                 write_docstore_row_indexed(
                                     &row, &enriched, computed_defs_ref,
@@ -1950,13 +1957,15 @@ pub fn process_dump_with_progress(
 
                 // Write document — silo (feature) or docstore (fallback)
                 #[cfg(feature = "data-silo")]
-                write_silo_row_indexed(
-                    &row, &enriched, computed_defs_ref,
-                    &indexed_fields_buf, col_idx, slot, request_fields,
-                    &field_idx_cache, &mut serialize_buf,
-                    &mut tuple_buf, &mut write_buf,
-                    &silo_writers_ref[chunk_idx],
-                );
+                if !phase_is_filter_only {
+                    write_silo_row_indexed(
+                        &row, &enriched, computed_defs_ref,
+                        &indexed_fields_buf, col_idx, slot, request_fields,
+                        &field_idx_cache, &mut serialize_buf,
+                        &mut tuple_buf, &mut write_buf,
+                        &silo_writers_ref[chunk_idx],
+                    );
+                }
                 #[cfg(not(feature = "data-silo"))]
                 write_docstore_row_indexed(
                     &row, &enriched, computed_defs_ref,
@@ -1967,6 +1976,8 @@ pub fn process_dump_with_progress(
 
                 // Write config-computed sort values to docstore (e.g., sortAt).
                 // Reuses the computed values from the bitmap section above.
+                // When data-silo is active, write_silo_row_indexed handles these.
+                #[cfg(not(feature = "data-silo"))]
                 if !config_computed_sorts_ref.is_empty() {
                     // Re-derive (fast — just re-evaluates the GREATEST/LEAST over cached source values)
                     let mut row_sv: HashMap<&str, u32> = HashMap::new();
@@ -2044,7 +2055,7 @@ pub fn process_dump_with_progress(
 
     // Flush silo writers, collect local indexes, merge and persist doc_index.bin
     #[cfg(feature = "data-silo")]
-    {
+    if !phase_is_filter_only {
         emit_stage(&request.name, "silo_index", "start", &t, total.load(Ordering::Relaxed));
         let silo_locals: Vec<(u8, Vec<(u32, u64, u32)>)> = silo_writers
             .into_iter()
@@ -2470,19 +2481,26 @@ fn process_multi_value_phase(
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("data_silo: failed to create {:?}: {e}", silo_path);
-                    // drain channel so sender doesn't block
                     for _ in rx {}
                     return;
                 }
             };
             let mut writer = BulkDocWriter::new(doc_file, 0u8);
-            let mut buf = Vec::with_capacity(32);
+            let mut buf = Vec::with_capacity(256);
+            // Accumulate all values per slot_id before writing.
+            // Multi-value fields (tagIds) have many rows per slot — we must
+            // collect them into a single Mi(vec![...]) document per slot.
+            let mut acc: HashMap<u32, Vec<i64>> = HashMap::new();
             for batch in rx {
                 for (slot, value) in batch {
-                    buf.clear();
-                    if rmp_serde::encode::write(&mut buf, &PackedValue::Mi(vec![value])).is_ok() {
-                        let _ = writer.append(slot, &buf);
-                    }
+                    acc.entry(slot).or_insert_with(|| Vec::with_capacity(8)).push(value);
+                }
+            }
+            // Write one combined document per slot
+            for (slot, values) in &acc {
+                buf.clear();
+                if rmp_serde::encode::write(&mut buf, &PackedValue::Mi(values.clone())).is_ok() {
+                    let _ = writer.append(*slot, &buf);
                 }
             }
             // Flush and persist the local index
