@@ -4634,8 +4634,22 @@ async fn handle_list_dumps(
     AxumPath(_name): AxumPath<String>,
 ) -> impl IntoResponse {
     let reg = state.dump_registry.lock();
+    // Enrich dump entries with live progress from task registry
+    let mut dumps = serde_json::Map::new();
+    let tasks = state.index.lock().as_ref().map(|idx| Arc::clone(&idx.tasks));
+    for (name, entry) in &reg.dumps {
+        let mut val = serde_json::to_value(entry).unwrap_or_default();
+        // If dump has an active task, inject live records_processed
+        if let (Some(tid), Some(ref tasks)) = (entry.task_id, &tasks) {
+            if let Some(task_info) = tasks.get(tid) {
+                val["records_processed"] = serde_json::json!(task_info.progress.records_processed);
+                val["elapsed_secs"] = serde_json::json!(task_info.elapsed_secs);
+            }
+        }
+        dumps.insert(name.clone(), val);
+    }
     Json(serde_json::json!({
-        "dumps": reg.dumps,
+        "dumps": dumps,
         "all_complete": reg.all_complete(),
     }))
 }
@@ -4706,10 +4720,13 @@ async fn handle_register_dump(
             }
         };
 
-        // Register in dump registry
+        // Register in dump registry with task_id for live progress tracking
         {
             let mut reg = state.dump_registry.lock();
             reg.register(dump_name.clone(), None);
+            if let Some(entry) = reg.dumps.get_mut(&dump_name) {
+                entry.task_id = Some(task_id);
+            }
             let dumps_path = state.data_dir.join("dumps.json");
             reg.save(&dumps_path).ok();
         }

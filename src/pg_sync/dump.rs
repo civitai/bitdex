@@ -29,6 +29,10 @@ pub struct DumpEntry {
     pub ops_written: u64,
     /// Number of ops processed by WAL reader
     pub ops_processed: u64,
+    /// Task ID for live progress tracking via GET /tasks/{id}.
+    /// V2 dumps set this so the sidecar can poll records_processed during loading.
+    #[serde(default)]
+    pub task_id: Option<u64>,
     /// When the dump was registered
     pub created_at: u64,
     /// When the dump completed processing
@@ -89,6 +93,7 @@ impl DumpRegistry {
                 status: DumpStatus::Writing,
                 ops_written: 0,
                 ops_processed: 0,
+                task_id: None,
                 created_at: now,
                 completed_at: None,
             },
