@@ -1160,6 +1160,7 @@ impl ConcurrentEngine {
             let flush_meta_store = meta_store.clone();
             let flush_config = Arc::clone(&config);
             let flush_field_registry = field_registry.clone();
+            let flush_lazy_value_fields = lazy_value_fields.clone();
             let eviction_sweep_interval = config.eviction_sweep_interval;
             let flush_tombstones_created = Arc::clone(&boundstore_tombstones_created);
             // Build eviction config map: field_name → idle_seconds
@@ -1438,6 +1439,53 @@ impl ConcurrentEngine {
                                     .filter(|(_, field)| field.has_dirty())
                                     .map(|(name, _)| name.clone())
                                     .collect();
+                                // For lazy_value_fields with dirty+unloaded entries, auto-load
+                                // bases from disk so merge can compact them. Without this, ops
+                                // mutations create unloaded dirty entries that can never be merged
+                                // or evicted, causing unbounded memory growth.
+                                let lvf = flush_lazy_value_fields.lock();
+                                for name in &dirty_fields {
+                                    if !lvf.contains(name) {
+                                        continue;
+                                    }
+                                    if let Some(ref fs) = flush_filter_store {
+                                        // Collect unloaded dirty value keys
+                                        let unloaded_dirty: Vec<u64> = staging.filters.get_field(name)
+                                            .map(|field| {
+                                                field.bitmap_keys()
+                                                    .filter(|&v| {
+                                                        field.get_versioned(*v)
+                                                            .map(|vb| vb.is_dirty() && !vb.is_loaded())
+                                                            .unwrap_or(false)
+                                                    })
+                                                    .copied()
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+
+                                        if !unloaded_dirty.is_empty() {
+                                            // Load bases from disk for these values
+                                            match fs.load_field_values(name, &unloaded_dirty) {
+                                                Ok(loaded) => {
+                                                    if let Some(field) = staging.filters.get_field_mut(name) {
+                                                        field.load_values(loaded, &unloaded_dirty);
+                                                    }
+                                                    if !unloaded_dirty.is_empty() {
+                                                        eprintln!(
+                                                            "Compaction: auto-loaded {} bases for '{}' (dirty+unloaded)",
+                                                            unloaded_dirty.len(), name
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("WARNING: Failed to auto-load bases for '{}': {e}", name);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                drop(lvf);
+
                                 // Only make_mut + merge on fields that actually have dirty diffs
                                 for name in &dirty_fields {
                                     if let Some(field) = staging.filters.get_field_mut(name) {
@@ -1596,6 +1644,71 @@ impl ConcurrentEngine {
                                 if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
                                     eprintln!("Warning: failed to persist deferred alive map: {e}");
                                 }
+                            }
+                        }
+                    }
+
+                    // Idle compaction: compact dirty+unloaded entries even when no new
+                    // mutations arrive. Ops bursts create dirty entries; compaction only
+                    // ran inside `if bitmap_count > 0` which requires active mutations.
+                    // Without this, dirty entries from a finished ops burst never compact.
+                    // Check for unmerged diffs in lazy_value_fields even when staging
+                    // isn't "dirty" (no new mutations). staging_dirty only tracks whether
+                    // new mutations arrived — not whether old diffs were compacted.
+                    let has_lazy_dirty = !is_loading && {
+                        let lvf = flush_lazy_value_fields.lock();
+                        !lvf.is_empty() && staging.filters.fields()
+                            .any(|(name, field)| lvf.contains(name.as_str()) && field.has_dirty())
+                    };
+                    if bitmap_count == 0 && has_lazy_dirty {
+                        // Use a slower interval since there's no active write pressure.
+                        // flush_cycle is only bumped inside bitmap_count > 0, so track
+                        // idle ticks separately.
+                        static IDLE_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let tick = IDLE_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+                        if tick % COMPACTION_INTERVAL == 0 {
+                            let dirty_fields: Vec<String> = staging.filters.fields()
+                                .filter(|(_, field)| field.has_dirty())
+                                .map(|(name, _)| name.clone())
+                                .collect();
+
+                            if !dirty_fields.is_empty() {
+                                eprintln!("  Idle compaction (tick {}): {} dirty fields: {:?}", tick, dirty_fields.len(), dirty_fields);
+                                let lvf = flush_lazy_value_fields.lock();
+                                for name in &dirty_fields {
+                                    if !lvf.contains(name) { continue; }
+                                    if let Some(ref fs) = flush_filter_store {
+                                        let unloaded_dirty: Vec<u64> = staging.filters.get_field(name)
+                                            .map(|field| {
+                                                field.bitmap_keys()
+                                                    .filter(|&v| field.get_versioned(*v)
+                                                        .map(|vb| vb.is_dirty() && !vb.is_loaded())
+                                                        .unwrap_or(false))
+                                                    .copied().collect()
+                                            }).unwrap_or_default();
+                                        if !unloaded_dirty.is_empty() {
+                                            match fs.load_field_values(name, &unloaded_dirty) {
+                                                Ok(loaded) => {
+                                                    if let Some(field) = staging.filters.get_field_mut(name) {
+                                                        field.load_values(loaded, &unloaded_dirty);
+                                                    }
+                                                    eprintln!("  Idle compaction: auto-loaded {} bases for '{}'", unloaded_dirty.len(), name);
+                                                }
+                                                Err(e) => eprintln!("WARNING: Failed to auto-load bases for '{}': {e}", name),
+                                            }
+                                        }
+                                    }
+                                }
+                                drop(lvf);
+                                for name in &dirty_fields {
+                                    if let Some(field) = staging.filters.get_field_mut(name) {
+                                        field.merge_dirty();
+                                    }
+                                }
+                                // Publish the compacted staging
+                                inner.store(Arc::new(staging.clone()));
+                                staging_dirty = false;
+                                eprintln!("  Idle compaction: published clean staging");
                             }
                         }
                     }
