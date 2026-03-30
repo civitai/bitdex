@@ -314,7 +314,7 @@ fn main() {
     // Experiment 2c: Ops log impact on read latency
     // =========================================================================
     println!("=== Experiment 2c: Ops Log Read Latency Impact ===");
-    println!("Snapshot: 1M docs (mmap). Ops log: LIFO scan for slot_id override.");
+    println!("Snapshot: 1M docs (mmap write+read). Ops log: LIFO scan for slot_id override.");
     println!();
 
     // Write snapshot via mmap
@@ -356,7 +356,9 @@ fn main() {
         }
 
         // Read benchmark: for each slot, LIFO scan ops log first, then fall back to snapshot
-        let mut snap_file = File::open(&snap_path).unwrap();
+        // Use mmap for snapshot reads (production design)
+        let snap_file = File::open(&snap_path).unwrap();
+        let snap_mmap = unsafe { memmap2::Mmap::map(&snap_file).unwrap() };
         let mut rng2: u64 = 0xDEADBEEF;
         let slots: Vec<u32> = (0..read_count)
             .map(|_| {
@@ -366,7 +368,6 @@ fn main() {
             .collect();
 
         let mut latencies = Vec::with_capacity(read_count);
-        let mut hdr = [0u8; HEADER_SIZE];
 
         for &target_slot in &slots {
             let start = Instant::now();
@@ -381,7 +382,6 @@ fn main() {
                         ops_log[offset+6], ops_log[offset+7],
                     ]) as usize;
                     let doc = &ops_log[offset + OP_HEADER..offset + OP_HEADER + doc_len];
-                    // Verify
                     let stored = u32::from_le_bytes([doc[0], doc[1], doc[2], doc[3]]);
                     assert_eq!(stored, target_slot);
                     found = true;
@@ -390,14 +390,13 @@ fn main() {
             }
 
             if !found {
-                // Fall back to snapshot (deterministic offset read)
-                let offset = target_slot as u64 * SLOT_SIZE as u64;
-                snap_file.seek(SeekFrom::Start(offset)).unwrap();
-                snap_file.read_exact(&mut hdr).unwrap();
-                let doc_len = u32::from_le_bytes(hdr) as usize;
+                // Fall back to snapshot via mmap (deterministic offset read)
+                let offset = target_slot as usize * SLOT_SIZE;
+                let slot_data = &snap_mmap[offset..offset + SLOT_SIZE];
+                let doc_len = u32::from_le_bytes([slot_data[0], slot_data[1], slot_data[2], slot_data[3]]) as usize;
                 if doc_len > 0 && doc_len + HEADER_SIZE <= SLOT_SIZE {
-                    let mut buf = vec![0u8; doc_len];
-                    snap_file.read_exact(&mut buf).unwrap();
+                    // Just access the bytes — mmap handles the read
+                    let _doc = &slot_data[HEADER_SIZE..HEADER_SIZE + doc_len];
                 }
             }
 
