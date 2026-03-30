@@ -256,32 +256,17 @@ pub async fn run_setup_v2(
         }
     }
 
-    // 5. Elevate to table owner role for trigger creation.
-    // Triggers on civitai-owned tables require the civitai role.
-    // This requires GRANT civitai TO bitdex on the PG server.
-    // If SET ROLE fails (no grant), fall back to current user and hope it works.
-    let role_set = sqlx::raw_sql("SET ROLE civitai")
-        .execute(pool)
-        .await;
-    match &role_set {
-        Ok(_) => eprintln!("SET ROLE civitai for trigger creation"),
-        Err(e) => eprintln!("WARNING: SET ROLE civitai failed ({e}), trying with current user"),
-    }
-
-    // 6. Create/update triggers from config
+    // 5. Create/update triggers from config.
+    // The bitdex user should have direct TRIGGER privilege on the tables
+    // (via GRANT TRIGGER ON TABLE ... TO bitdex). No SET ROLE needed.
     for (name, sql) in &expected_triggers {
         match sqlx::raw_sql(sql).execute(pool).await {
             Ok(_) => eprintln!("Created trigger: {name}"),
             Err(e) => {
-                // Reset role before returning error
-                let _ = sqlx::raw_sql("RESET ROLE").execute(pool).await;
                 return Err(format!("Failed to create trigger {name}: {e}"));
             }
         }
     }
-
-    // 7. Reset role back to original user
-    let _ = sqlx::raw_sql("RESET ROLE").execute(pool).await;
 
     let existing_count = existing.len();
     let stale_count = existing.iter()
