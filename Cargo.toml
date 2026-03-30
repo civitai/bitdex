@@ -156,6 +156,10 @@ harness = false
 name = "frozen_concurrent"
 harness = false
 
+[[bench]]
+name = "frozen_replay"
+harness = false
+
 [[bin]]
 name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"
