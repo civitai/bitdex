@@ -311,6 +311,103 @@ fn main() {
     println!();
 
     // =========================================================================
+    // Experiment 2d: Sharded mmap write contention test
+    // =========================================================================
+    println!("=== Experiment 2d: Sharded mmap Write Contention ===");
+    let num_shards: usize = 32;
+    println!("Shards: {}  Threads: {}  Sharding: slot_id % {}",
+        num_shards, rayon::current_num_threads(), num_shards);
+    println!("Each thread writes to ALL shards (modulo distribution).");
+    println!();
+
+    {
+        let shard_dir = dir.join("sharded_test");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // Calculate slots per shard: count / num_shards (round up)
+        let slots_per_shard = (count + num_shards - 1) / num_shards;
+        let shard_file_size = slots_per_shard as u64 * SLOT_SIZE as u64;
+
+        // Create and mmap all shard files
+        let shard_files: Vec<File> = (0..num_shards)
+            .map(|i| {
+                let p = shard_dir.join(format!("silo_{:02}.dat", i));
+                let f = OpenOptions::new()
+                    .read(true).write(true).create(true).truncate(true)
+                    .open(&p).unwrap();
+                f.set_len(shard_file_size).unwrap();
+                f
+            })
+            .collect();
+        let shard_mmaps: Vec<memmap2::MmapMut> = shard_files.iter()
+            .map(|f| unsafe { memmap2::MmapMut::map_mut(f).unwrap() })
+            .collect();
+
+        // Get raw pointers for each shard
+        let shard_ptrs: Vec<(usize, usize)> = shard_mmaps.iter()
+            .map(|m| (m.as_ptr() as usize, m.len()))
+            .collect();
+        let shard_ptrs_ref = &shard_ptrs;
+
+        let num_threads = rayon::current_num_threads();
+        let chunk_size = (count + num_threads - 1) / num_threads;
+
+        let start = Instant::now();
+        rayon::scope(|s| {
+            for thread_idx in 0..num_threads {
+                let start_slot = thread_idx * chunk_size;
+                let end_slot = ((thread_idx + 1) * chunk_size).min(count);
+
+                s.spawn(move |_| {
+                    for slot in start_slot..end_slot {
+                        let doc = generate_doc(slot as u32);
+                        let shard = slot % num_shards;
+                        let slot_within_shard = slot / num_shards;
+                        let offset = slot_within_shard * SLOT_SIZE;
+                        let (ptr, len) = shard_ptrs_ref[shard];
+                        if offset + SLOT_SIZE <= len {
+                            unsafe {
+                                let dest = (ptr as *mut u8).add(offset);
+                                std::ptr::copy_nonoverlapping(
+                                    (doc.len() as u32).to_le_bytes().as_ptr(),
+                                    dest,
+                                    4,
+                                );
+                                std::ptr::copy_nonoverlapping(
+                                    doc.as_ptr(),
+                                    dest.add(4),
+                                    doc.len(),
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // Flush all shards
+        for mmap in &shard_mmaps {
+            mmap.flush().unwrap();
+        }
+        let elapsed = start.elapsed();
+        let total_size: u64 = (0..num_shards)
+            .map(|i| fs::metadata(shard_dir.join(format!("silo_{:02}.dat", i))).unwrap().len())
+            .sum();
+
+        let docs_per_sec = count as f64 / elapsed.as_secs_f64();
+        let mb_per_sec = (count as f64 * DOC_SIZE as f64) / elapsed.as_secs_f64() / 1e6;
+        println!("  Sharded (32 files, {} threads): {:.0} docs/s  {:.0} MB/s  {:.2}s  {:.2} GB total",
+            num_threads, docs_per_sec, mb_per_sec, elapsed.as_secs_f64(), total_size as f64 / 1e9);
+        println!("  vs single-file mmap (32 threads): 6.49M docs/s");
+        let ratio = docs_per_sec / 6_490_000.0;
+        println!("  Ratio: {:.2}x (>0.9 = no contention)", ratio);
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&shard_dir);
+    }
+    println!();
+
+    // =========================================================================
     // Experiment 2c: Ops log impact on read latency
     // =========================================================================
     println!("=== Experiment 2c: Ops Log Read Latency Impact ===");
