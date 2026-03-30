@@ -1391,16 +1391,25 @@ pub fn process_dump_with_progress(
         request.format
     );
 
-    // Build column index: from explicit columns (headerless CSV) or first row (header CSV)
+    // Build column index: from explicit columns (headerless CSV) or first row (header CSV).
+    // Auto-detect: if columns are in config AND the first row matches them, skip it as a header.
     let (col_index, data_start) = if !request.columns.is_empty() {
-        // Headerless CSV (PG COPY output) — columns provided in dump request
         let index: HashMap<String, usize> = request
             .columns
             .iter()
             .enumerate()
             .map(|(i, name)| (name.clone(), i))
             .collect();
-        (Arc::new(index), 0usize) // Data starts at byte 0
+        // Check if first row is a header that matches config columns — skip it if so
+        let first_newline = data.iter().position(|&b| b == b'\n').unwrap_or(data.len());
+        let first_row = parse_delimited_line(&data[..first_newline], delimiter);
+        let is_header = first_row.len() == request.columns.len()
+            && first_row.iter().zip(&request.columns).all(|(a, b)| {
+                let a_str = std::str::from_utf8(a).unwrap_or("").trim().trim_matches('"');
+                a_str == b
+            });
+        let skip = if is_header { first_newline + 1 } else { 0 };
+        (Arc::new(index), skip)
     } else {
         // Header CSV — parse first row as column names
         let first_newline = data
