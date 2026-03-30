@@ -134,6 +134,7 @@ pub struct Metrics {
     pub sync_wal_bytes: IntGaugeVec,
     pub sync_cycle_duration_seconds: HistogramVec,
     pub sync_wal_pending_bytes: IntGaugeVec,
+    pub sync_batch_size: IntGaugeVec,
 }
 
 impl Metrics {
@@ -638,6 +639,10 @@ impl Metrics {
             Opts::new("bitdex_sync_wal_pending_bytes", "Unprocessed WAL bytes (file size - cursor)"),
             &["source"],
         ).unwrap();
+        let sync_batch_size = IntGaugeVec::new(
+            Opts::new("bitdex_sync_batch_size", "Number of ops in most recent sync batch"),
+            &["source"],
+        ).unwrap();
 
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
@@ -751,6 +756,7 @@ impl Metrics {
         registry.register(Box::new(sync_wal_bytes.clone())).unwrap();
         registry.register(Box::new(sync_cycle_duration_seconds.clone())).unwrap();
         registry.register(Box::new(sync_wal_pending_bytes.clone())).unwrap();
+        registry.register(Box::new(sync_batch_size.clone())).unwrap();
 
         Self {
             registry,
@@ -837,6 +843,7 @@ impl Metrics {
             sync_wal_bytes,
             sync_cycle_duration_seconds,
             sync_wal_pending_bytes,
+            sync_batch_size,
         }
     }
 
