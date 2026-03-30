@@ -136,16 +136,27 @@ impl EnrichmentTable {
 
         let mut lines = reader.lines();
 
-        // Column names: from explicit config (headerless CSV) or first row (header CSV)
-        let header_names: Vec<String> = if !config.columns.is_empty() {
-            config.columns.clone()
-        } else {
-            let header_line = lines
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty CSV file"))??;
-            let headers: Vec<&str> = parse_csv_fields(&header_line);
-            headers.iter().map(|h| h.to_string()).collect()
-        };
+        // Read first line — could be a header or data
+        let first_line = lines
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty CSV file"))??;
+        let first_fields: Vec<&str> = parse_csv_fields(&first_line);
+
+        // Determine column names and whether first line is data
+        let (header_names, first_data_line): (Vec<String>, Option<String>) =
+            if !config.columns.is_empty() {
+                // Config provides column names — check if first row is a header to skip
+                let is_header = first_fields.len() == config.columns.len()
+                    && first_fields.iter().zip(&config.columns).all(|(a, b)| *a == b);
+                if is_header {
+                    (config.columns.clone(), None) // header consumed
+                } else {
+                    (config.columns.clone(), Some(first_line)) // first line is data
+                }
+            } else {
+                // No config columns — first row IS the header
+                (first_fields.iter().map(|h| h.to_string()).collect(), None)
+            };
 
         // Find key column index
         let key_idx = header_names
@@ -167,7 +178,9 @@ impl EnrichmentTable {
         );
 
         let mut row_count = 0usize;
-        for line_result in lines {
+        // Chain first_data_line (if it was data, not a header) with remaining lines
+        let first_iter = first_data_line.into_iter().map(Ok);
+        for line_result in first_iter.chain(lines) {
             let line = line_result?;
             if line.is_empty() {
                 continue;
