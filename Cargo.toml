@@ -160,6 +160,10 @@ harness = false
 name = "frozen_replay"
 harness = false
 
+[[bench]]
+name = "frozen_sort"
+harness = false
+
 [[bin]]
 name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"
