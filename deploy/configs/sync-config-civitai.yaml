@@ -158,7 +158,8 @@ dump_phases:
       TO STDOUT WITH (FORMAT csv)
     columns: [toolId, imageId]
     slot_field: imageId
-    fields: [toolIds]
+    fields:
+      - { column: toolId, target: toolIds }
 
   # Phase 5: Techniques (71MB)
   - name: techniques
@@ -168,7 +169,8 @@ dump_phases:
       TO STDOUT WITH (FORMAT csv)
     columns: [techniqueId, imageId]
     slot_field: imageId
-    fields: [techniqueIds]
+    fields:
+      - { column: techniqueId, target: techniqueIds }
 
   # Phase 6: Metrics (1.4GB, from ClickHouse, TAB-separated)
   - name: metrics

@@ -288,7 +288,7 @@ impl IndexDefinition {
     }
 }
 
-/// Find the index config file in a directory. Checks config.yaml, config.yml, config.json.
+/// Find the index config file in a directory. Checks config.yaml, then config.yml.
 pub fn find_index_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let yaml = dir.join("config.yaml");
     if yaml.exists() {
@@ -297,10 +297,6 @@ pub fn find_index_config(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let yml = dir.join("config.yml");
     if yml.exists() {
         return Some(yml);
-    }
-    let json = dir.join("config.json");
-    if json.exists() {
-        return Some(json);
     }
     None
 }
@@ -325,6 +321,9 @@ struct IndexState {
 /// Shared application state.
 struct AppState {
     data_dir: PathBuf,
+    /// External index config directory (ConfigMap mount). Configs read from here,
+    /// runtime data (bitmaps, docstore) still under data_dir/indexes/.
+    index_dir: Option<PathBuf>,
     index: Mutex<Option<IndexState>>,
     /// Set to true during graceful shutdown to signal background threads to exit.
     shutting_down: AtomicBool,
@@ -985,6 +984,10 @@ struct CachePatch {
 /// The BitDex HTTP server. Starts blank and creates indexes via API.
 pub struct BitdexServer {
     data_dir: PathBuf,
+    /// External index config directory (e.g. K8s ConfigMap mount).
+    /// When set, index configs are read from here instead of data_dir/indexes/.
+    /// Runtime data (bitmaps, docstore) still lives under data_dir/indexes/.
+    index_dir: Option<PathBuf>,
     rebuild: bool,
     default_query_format: Option<String>,
     enable_traces: bool,
@@ -995,7 +998,14 @@ pub struct BitdexServer {
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0, trace_buffer_size: 1000 }
+        Self { data_dir, index_dir: None, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0, trace_buffer_size: 1000 }
+    }
+
+    /// Set external index config directory (e.g. ConfigMap mount path).
+    /// Configs read from here; runtime data stays under data_dir.
+    pub fn with_index_dir(mut self, dir: PathBuf) -> Self {
+        self.index_dir = Some(dir);
+        self
     }
 
     /// Enable rebuild mode: on startup, delete existing bitmap indexes and
@@ -1059,6 +1069,7 @@ impl BitdexServer {
 
         let state = Arc::new(AppState {
             data_dir: self.data_dir.clone(),
+            index_dir: self.index_dir.clone(),
             index: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             metrics: Metrics::new(),
@@ -1401,13 +1412,18 @@ impl BitdexServer {
 // ---------------------------------------------------------------------------
 
 fn restore_index(state: &SharedState) -> Result<(), String> {
-    let indexes_dir = state.data_dir.join("indexes");
-    if !indexes_dir.exists() {
+    // When index_dir is set, scan it for configs (ConfigMap mount).
+    // Runtime data (bitmaps, docstore) always lives under data_dir/indexes/.
+    let config_source_dir = state.index_dir.clone()
+        .unwrap_or_else(|| state.data_dir.join("indexes"));
+    let data_indexes_dir = state.data_dir.join("indexes");
+
+    if !config_source_dir.exists() {
         return Ok(());
     }
 
-    // Scan for index directories with config.yaml or config.json
-    let entries = std::fs::read_dir(&indexes_dir).map_err(|e| e.to_string())?;
+    // Scan for index directories with config.yaml
+    let entries = std::fs::read_dir(&config_source_dir).map_err(|e| e.to_string())?;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
@@ -1430,9 +1446,19 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             .set(phase1_elapsed.as_secs() as i64);
 
         // Phase 2: Engine creation
+        // Runtime data lives under data_dir/indexes/<name>, even when config
+        // is loaded from an external index_dir (ConfigMap mount).
         let phase_start = std::time::Instant::now();
-        let bitmap_path = path.join("bitmaps");
-        let docstore_path = path.join("docs");
+        let index_name = path.file_name().unwrap().to_string_lossy();
+        let runtime_dir = if state.index_dir.is_some() {
+            let d = data_indexes_dir.join(&*index_name);
+            std::fs::create_dir_all(&d).ok();
+            d
+        } else {
+            path.clone()
+        };
+        let bitmap_path = runtime_dir.join("bitmaps");
+        let docstore_path = runtime_dir.join("docs");
         let mut config = def.config.clone();
         config.storage.bitmap_path = Some(bitmap_path.clone());
 
@@ -1534,7 +1560,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 
 /// Delete existing bitmap indexes and rebuild all bitmaps from the docstore.
 ///
-/// Requires an index to already be restored (config.yaml/json + docstore must exist).
+/// Requires an index to already be restored (config.yaml + docstore must exist).
 /// Deletes the bitmaps directory, runs `build_all_from_docstore`, then
 /// `save_and_unload` to persist and free memory.
 fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
@@ -1620,7 +1646,7 @@ fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Build string maps with optional dictionaries for LowCardinalityString fields.
-fn build_string_maps_with_dicts(
+pub fn build_string_maps_with_dicts(
     schema: &DataSchema,
     dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
 ) -> (StringMaps, CaseSensitiveFields) {

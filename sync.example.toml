@@ -14,7 +14,7 @@ clickhouse_url = "http://localhost:8123"
 # Bitdex server URL (used by sync mode to push upserts/deletes)
 bitdex_url = "http://localhost:3000"
 
-# Path to the index definition directory (must contain config.json)
+# Path to the index definition directory (must contain config.yaml)
 index_dir = "data/indexes/civitai"
 
 # Data directory for engine storage (bitmaps + docstore)

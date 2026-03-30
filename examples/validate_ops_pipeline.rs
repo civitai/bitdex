@@ -78,22 +78,23 @@ fn main() {
     // Phase 2: WAL → Engine
     eprintln!("\n--- Phase 2: WAL → Engine ---");
 
-    // Load index config
-    let config_path = PathBuf::from(&csv_dir).parent().unwrap().join("indexes/civitai/config.json");
-    let alt_config = PathBuf::from("data/indexes/civitai/config.json");
-    let config_path = if config_path.exists() {
-        config_path
-    } else if alt_config.exists() {
-        alt_config
-    } else {
-        eprintln!("ERROR: Could not find config.json. Skipping engine validation.");
-        print_summary(&csv_results, None, None);
-        return;
+    // Load index config (checks config.yaml first)
+    let index_dir_1 = PathBuf::from(&csv_dir).parent().unwrap().join("indexes/civitai");
+    let index_dir_2 = PathBuf::from("data/indexes/civitai");
+    let config_path = bitdex_v2::server::find_index_config(&index_dir_1)
+        .or_else(|| bitdex_v2::server::find_index_config(&index_dir_2));
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            eprintln!("ERROR: Could not find config.yaml. Skipping engine validation.");
+            print_summary(&csv_results, None, None);
+            return;
+        }
     };
 
-    let config_str = std::fs::read_to_string(&config_path).expect("Failed to read config.json");
-    let index_def: serde_json::Value = serde_json::from_str(&config_str).expect("Failed to parse config.json");
-    let config: Config = serde_json::from_value(index_def["config"].clone()).expect("Failed to parse engine config");
+    let index_def = bitdex_v2::server::IndexDefinition::from_file(&config_path)
+        .expect("Failed to parse index config");
+    let config: Config = index_def.config;
 
     let meta = FieldMeta::from_config(&config);
 

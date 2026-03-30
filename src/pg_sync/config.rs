@@ -15,7 +15,7 @@ pub struct PgSyncConfig {
     pub clickhouse_password: Option<String>,
     /// Bitdex HTTP server URL (for sync mode, e.g. "http://localhost:3000").
     pub bitdex_url: Option<String>,
-    /// Path to the index definition directory (contains config.json).
+    /// Path to the index definition directory (contains config.yaml).
     /// e.g. "data/indexes/civitai"
     pub index_dir: PathBuf,
     /// Data directory for engine storage (bitmaps + docstore).
