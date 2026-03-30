@@ -33,7 +33,7 @@ struct OpsRow {
 pub async fn run_ops_poller(
     pool: &PgPool,
     client: &BitdexClient,
-    poll_interval_secs: u64,
+    poll_interval: Duration,
     batch_limit: i64,
     cursor_name: &str,
     replica_id: Option<&str>,
@@ -53,11 +53,11 @@ pub async fn run_ops_poller(
         .await
         .unwrap_or(0);
     eprintln!(
-        "Ops poller started (interval={}s, batch_limit={}, cursor_name={}, starting_cursor={})",
-        poll_interval_secs, batch_limit, cursor_name, cursor
+        "Ops poller started (interval={}ms, batch_limit={}, cursor_name={}, starting_cursor={})",
+        poll_interval.as_millis(), batch_limit, cursor_name, cursor
     );
 
-    let mut ticker = interval(Duration::from_secs(poll_interval_secs));
+    let mut ticker = interval(poll_interval);
     let mut bitdex_was_down = false;
 
     loop {

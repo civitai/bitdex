@@ -36,7 +36,9 @@ pub struct PgSyncConfig {
     /// Batch size for bulk loading (number of image IDs per batch).
     #[serde(default = "default_batch_size")]
     pub batch_size: i64,
-    /// Outbox poll interval in seconds.
+    /// Outbox poll interval in milliseconds. Preferred over `poll_interval_secs`.
+    pub poll_interval_ms: Option<u64>,
+    /// Legacy: outbox poll interval in seconds. Use `poll_interval_ms` instead.
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
     /// Outbox batch limit per poll.
@@ -95,6 +97,12 @@ fn default_progress_port() -> Option<u16> {
 }
 
 impl PgSyncConfig {
+    /// Resolved poll interval: `poll_interval_ms` if set, else `poll_interval_secs * 1000`.
+    pub fn poll_interval(&self) -> std::time::Duration {
+        let ms = self.poll_interval_ms.unwrap_or(self.poll_interval_secs * 1000);
+        std::time::Duration::from_millis(ms)
+    }
+
     /// Load a `PgSyncConfig` from a TOML file on disk.
     ///
     /// After loading, environment variables override config values:

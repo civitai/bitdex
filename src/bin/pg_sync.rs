@@ -179,7 +179,7 @@ async fn main() {
             let ops_fut = ops_poller::run_ops_poller(
                 &pool,
                 &bitdex_client,
-                sync_config.poll_interval_secs,
+                sync_config.poll_interval(),
                 sync_config.outbox_batch_limit,
                 &cursor_name,
                 Some(sync_config.replica_id.as_str()),
@@ -503,7 +503,7 @@ async fn run_sync_pg(
     if let Err(e) = ops_poller::run_ops_poller(
         pool,
         bitdex_client,
-        sync_config.poll_interval_secs,
+        sync_config.poll_interval(),
         sync_config.outbox_batch_limit,
         &cursor_name,
         Some(sync_config.replica_id.as_str()),
