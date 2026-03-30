@@ -17,7 +17,7 @@ config:
     - { name: isPublished, field_type: boolean, eager_load: true }
     - { name: isRemix, field_type: boolean }
     - { name: blockedFor, field_type: single_value, eager_load: true }
-    - { name: tagIds, field_type: multi_value }
+    - { name: tagIds, field_type: multi_value, eager_load: true }
     - { name: modelVersionIds, field_type: multi_value }
     - { name: modelVersionIdsManual, field_type: multi_value }
     - { name: toolIds, field_type: multi_value }
