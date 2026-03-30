@@ -152,6 +152,10 @@ harness = false
 name = "deterministic_offset"
 harness = false
 
+[[bench]]
+name = "frozen_concurrent"
+harness = false
+
 [[bin]]
 name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"
