@@ -115,9 +115,9 @@ fn main() {
     let frozen_views_ref = &frozen_views;
     let heap_bitmaps_ref = &heap_bitmaps;
 
-    println!("  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
-        "ANDs", "Frz p50", "Frz p95", "Frz p99", "Heap p50", "Heap p95", "Heap p99");
-    println!("  {}", "-".repeat(78));
+    println!("  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "ANDs", "Frz p50", "Frz p95", "Frz p99", "Direct p50", "Direct p95", "Direct p99", "Heap p50", "Heap p95", "Heap p99");
+    println!("  {}", "-".repeat(114));
 
     for bitmaps_per_query in [3usize, 6, 8] {
         // Build query plans
@@ -155,6 +155,31 @@ fn main() {
             results.into_iter().flatten().collect()
         };
 
+        // Frozen direct ops test (no to_owned — uses BitAnd directly on frozen bitmaps)
+        let direct_latencies: Vec<Duration> = {
+            let num_threads = cold_queries_per_sec.min(rayon::current_num_threads());
+            let chunk = (total_queries + num_threads - 1) / num_threads;
+            let results: Vec<Vec<Duration>> = (0..num_threads).into_iter().map(|t| {
+                let start_q = t * chunk;
+                let end_q = ((t + 1) * chunk).min(total_queries);
+                let mut lats = Vec::with_capacity(end_q - start_q);
+                for q in start_q..end_q {
+                    let plan = &query_plans[q];
+                    let start = Instant::now();
+                    // First AND: frozen & frozen -> owned
+                    let mut result = &frozen_views_ref[plan[0]] & &frozen_views_ref[plan[1]];
+                    // Subsequent ANDs: frozen & owned -> owned
+                    for &idx in &plan[2..] {
+                        result = &frozen_views_ref[idx] & &result;
+                    }
+                    let _ = result.len();
+                    lats.push(start.elapsed());
+                }
+                lats
+            }).collect();
+            results.into_iter().flatten().collect()
+        };
+
         // Heap test
         let heap_latencies: Vec<Duration> = {
             let num_threads = cold_queries_per_sec.min(rayon::current_num_threads());
@@ -179,13 +204,17 @@ fn main() {
         };
 
         let mut sf = frozen_latencies.clone(); sf.sort();
+        let mut sd = direct_latencies.clone(); sd.sort();
         let mut sh = heap_latencies.clone(); sh.sort();
 
-        println!("  {:>6}  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs",
+        println!("  {:>6}  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs",
             bitmaps_per_query,
             percentile(&sf, 50.0).as_nanos() as f64 / 1000.0,
             percentile(&sf, 95.0).as_nanos() as f64 / 1000.0,
             percentile(&sf, 99.0).as_nanos() as f64 / 1000.0,
+            percentile(&sd, 50.0).as_nanos() as f64 / 1000.0,
+            percentile(&sd, 95.0).as_nanos() as f64 / 1000.0,
+            percentile(&sd, 99.0).as_nanos() as f64 / 1000.0,
             percentile(&sh, 50.0).as_nanos() as f64 / 1000.0,
             percentile(&sh, 95.0).as_nanos() as f64 / 1000.0,
             percentile(&sh, 99.0).as_nanos() as f64 / 1000.0,
