@@ -1122,15 +1122,14 @@ impl BitdexServer {
         #[cfg(feature = "pg-sync")]
         let _wal_handle: Option<std::thread::JoinHandle<()>> = {
             let wal_dir = self.data_dir.join("wal");
-            let wal_path = wal_dir.join("ops.wal");
             let cursor_path = wal_dir.join("cursor");
             let wal_state = Arc::clone(&state);
             std::thread::Builder::new()
                 .name("wal-reader".into())
                 .spawn(move || {
-                    let cursor = crate::ops_processor::load_cursor(&cursor_path);
-                    let mut reader = crate::ops_wal::WalReader::new(&wal_path, cursor);
-                    eprintln!("WAL reader started (cursor={cursor}, path={})", wal_path.display());
+                    let cursor = crate::ops_wal::load_cursor(&cursor_path);
+                    let mut reader = crate::ops_wal::WalReader::new(&wal_dir, cursor);
+                    eprintln!("WAL reader started (cursor={}:{}, dir={})", cursor.generation, cursor.offset, wal_dir.display());
 
                     while !wal_state.shutting_down.load(Ordering::Relaxed) {
                         // Read a batch from the WAL
@@ -1210,7 +1209,8 @@ impl BitdexServer {
                                 }
                             }
                             Ok(_) => {
-                                // No new records — sleep briefly
+                                // No new records — still update cursor metric so it's not stuck at 0
+                                wal_state.metrics.wal_read_cursor_bytes.set(reader.cursor() as i64);
                                 std::thread::sleep(std::time::Duration::from_millis(50));
                             }
                             Err(e) => {
