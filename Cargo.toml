@@ -23,7 +23,7 @@ serde_yaml = ["dep:serde_yaml"]
 
 [dependencies]
 # Bitmap indexes
-roaring = "0.10"
+roaring = { path = "C:/Dev/Repos/open-source/roaring-rs/roaring" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

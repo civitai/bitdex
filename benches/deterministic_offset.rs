@@ -590,6 +590,195 @@ fn main() {
     }
     println!();
 
+    // =========================================================================
+    // Experiment 3: Frozen bitmap zero-copy mmap benchmark
+    // =========================================================================
+    println!("=== Experiment 3: Frozen Bitmap Zero-Copy mmap ===");
+    {
+        use roaring::RoaringBitmap;
+        use roaring::bitmap::frozen::FrozenRoaringBitmap;
+
+        // Build a realistic bitmap: ~50M set bits out of 107M range (mixed containers)
+        println!("Building bitmap: 107M range, ~50% density...");
+        let mut bm = RoaringBitmap::new();
+        let mut rng: u64 = 0xDEADBEEF_CAFEBABE;
+        for i in 0..107_000_000u32 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng >> 63) == 0 { // ~50%
+                bm.insert(i);
+            }
+        }
+        let bm_len = bm.len();
+        println!("  Bitmap: {} values, {} containers",
+            bm_len, bm.serialized_size());
+
+        // Frozen serialization
+        let frozen_size = bm.frozen_serialized_size();
+        let standard_size = bm.serialized_size();
+        println!("  Frozen size:   {} MB", frozen_size / (1024 * 1024));
+        println!("  Standard size: {} MB", standard_size / (1024 * 1024));
+
+        // Write frozen to file (with 32-byte alignment padding at start)
+        let frozen_path = dir.join("bench_frozen.bin");
+        {
+            let mut buf = vec![0u8; frozen_size + 32]; // extra for alignment
+            let align_offset = (32 - (buf.as_ptr() as usize % 32)) % 32;
+            let aligned_buf = &mut buf[align_offset..align_offset + frozen_size];
+            bm.serialize_frozen_into(aligned_buf).unwrap();
+
+            // Write to file at page-aligned offset (mmap pages are 4K aligned, so 32B alignment is guaranteed)
+            let mut f = File::create(&frozen_path).unwrap();
+            f.write_all(aligned_buf).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Write standard format for comparison
+        let standard_path = dir.join("bench_standard.bin");
+        {
+            let mut f = File::create(&standard_path).unwrap();
+            bm.serialize_into(&mut f).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        println!();
+        println!("  {:>35}  {:>12}  {:>12}", "Operation", "Frozen", "Standard");
+        println!("  {}", "-".repeat(62));
+
+        // 1. View/Deserialize time
+        let frozen_view_times: Vec<Duration> = (0..50).map(|_| {
+            let f = File::open(&frozen_path).unwrap();
+            let mmap = unsafe { memmap2::Mmap::map(&f).unwrap() };
+            let start = Instant::now();
+            let _frozen = FrozenRoaringBitmap::view(&mmap[..]).unwrap();
+            start.elapsed()
+        }).collect();
+        let frozen_view_median = {
+            let mut t = frozen_view_times.clone();
+            t.sort();
+            t[t.len() / 2]
+        };
+
+        let standard_deser_times: Vec<Duration> = (0..50).map(|_| {
+            let data = fs::read(&standard_path).unwrap();
+            let start = Instant::now();
+            let _bm = RoaringBitmap::deserialize_from(data.as_slice()).unwrap();
+            start.elapsed()
+        }).collect();
+        let standard_deser_median = {
+            let mut t = standard_deser_times.clone();
+            t.sort();
+            t[t.len() / 2]
+        };
+
+        let speedup1 = standard_deser_median.as_nanos() as f64 / frozen_view_median.as_nanos().max(1) as f64;
+        println!("  {:>35}  {:>10.0}μs  {:>10.0}μs  ({:.0}x faster)",
+            "view() / deserialize_from()",
+            frozen_view_median.as_nanos() as f64 / 1000.0,
+            standard_deser_median.as_nanos() as f64 / 1000.0,
+            speedup1,
+        );
+
+        // 2. contains() on frozen vs heap
+        let f = File::open(&frozen_path).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&f).unwrap() };
+        let frozen = FrozenRoaringBitmap::view(&mmap[..]).unwrap();
+
+        let test_values: Vec<u32> = {
+            let mut rng: u64 = 0xAAAA;
+            (0..100_000).map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (rng >> 32) as u32 % 107_000_000
+            }).collect()
+        };
+
+        let frozen_contains_time = {
+            let start = Instant::now();
+            let mut count = 0u64;
+            for &v in &test_values {
+                if frozen.contains(v) { count += 1; }
+            }
+            let _ = count;
+            start.elapsed()
+        };
+
+        let heap_contains_time = {
+            let start = Instant::now();
+            let mut count = 0u64;
+            for &v in &test_values {
+                if bm.contains(v) { count += 1; }
+            }
+            let _ = count;
+            start.elapsed()
+        };
+
+        let speedup2 = heap_contains_time.as_nanos() as f64 / frozen_contains_time.as_nanos().max(1) as f64;
+        println!("  {:>35}  {:>10.0}μs  {:>10.0}μs  ({:.1}x)",
+            "100K contains()",
+            frozen_contains_time.as_nanos() as f64 / 1000.0,
+            heap_contains_time.as_nanos() as f64 / 1000.0,
+            speedup2,
+        );
+
+        // 3. to_owned() time (copy-on-write when mutation needed)
+        let to_owned_times: Vec<Duration> = (0..10).map(|_| {
+            let start = Instant::now();
+            let _owned = frozen.to_owned();
+            start.elapsed()
+        }).collect();
+        let to_owned_median = {
+            let mut t = to_owned_times.clone();
+            t.sort();
+            t[t.len() / 2]
+        };
+        println!("  {:>35}  {:>10.0}μs  {:>12}",
+            "to_owned() (copy for mutation)",
+            to_owned_median.as_nanos() as f64 / 1000.0,
+            "N/A",
+        );
+
+        // 4. AND: to_owned + AND vs heap AND
+        let mut bm2 = RoaringBitmap::new();
+        let mut rng2: u64 = 0x12345678;
+        for i in 0..107_000_000u32 {
+            rng2 = rng2.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if (rng2 >> 63) == 0 {
+                bm2.insert(i);
+            }
+        }
+
+        let frozen_and_time = {
+            let start = Instant::now();
+            let owned = frozen.to_owned();
+            let _result = owned & &bm2;
+            start.elapsed()
+        };
+
+        let heap_and_time = {
+            let start = Instant::now();
+            let _result = &bm & &bm2;
+            start.elapsed()
+        };
+
+        let speedup4 = frozen_and_time.as_nanos() as f64 / heap_and_time.as_nanos().max(1) as f64;
+        println!("  {:>35}  {:>10.0}μs  {:>10.0}μs  ({:.1}x)",
+            "AND (to_owned+AND vs heap AND)",
+            frozen_and_time.as_nanos() as f64 / 1000.0,
+            heap_and_time.as_nanos() as f64 / 1000.0,
+            speedup4,
+        );
+
+        // Memory summary
+        println!();
+        println!("  Memory implications at 107M / 6.5GB bitmap heap:");
+        println!("    Frozen mmap: 0 bytes heap, ~{} MB on disk (OS manages pages)",
+            frozen_size / (1024 * 1024));
+        println!("    Current:     6.5 GB heap (all bitmaps resident)");
+
+        let _ = fs::remove_file(&frozen_path);
+        let _ = fs::remove_file(&standard_path);
+    }
+    println!();
+
     // Summary
     println!("--- Projections at 107M scale ---");
     println!("  Disk: {:.1} GB (256B slots)", 107_000_000u64 as f64 * 256.0 / 1e9);
