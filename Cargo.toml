@@ -168,6 +168,10 @@ harness = false
 name = "slot_table"
 harness = false
 
+[[bench]]
+name = "bitmap_size_drift"
+harness = false
+
 [[bin]]
 name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"
