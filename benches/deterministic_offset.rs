@@ -514,6 +514,82 @@ fn main() {
     let _ = fs::remove_file(&snap_path);
     println!();
 
+    // =========================================================================
+    // Experiment 2e: mmap'd bitmap deserialization
+    // =========================================================================
+    println!("=== Experiment 2e: Bitmap mmap Deserialization ===");
+    {
+        use roaring::RoaringBitmap;
+
+        // Create bitmaps of varying sizes (simulating filter/sort bitmaps at scale)
+        let sizes = [1_000u32, 10_000, 100_000, 1_000_000, 10_000_000];
+
+        println!("  {:>12}  {:>12}  {:>12}  {:>12}  {:>10}",
+            "Bitmap size", "File bytes", "Vec+deser", "mmap+deser", "Speedup");
+        println!("  {}", "-".repeat(65));
+
+        for &n in &sizes {
+            // Build a bitmap with n set bits (scattered for realism)
+            let mut bm = RoaringBitmap::new();
+            let mut rng: u64 = 0xBEEF;
+            for _ in 0..n {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                bm.insert((rng >> 32) as u32);
+            }
+
+            // Serialize to file
+            let bm_path = dir.join(format!("bench_bitmap_{}.bin", n));
+            {
+                let mut f = File::create(&bm_path).unwrap();
+                bm.serialize_into(&mut f).unwrap();
+                f.sync_all().unwrap();
+            }
+            let file_size = fs::metadata(&bm_path).unwrap().len();
+
+            // Drop page cache hint (best effort — won't work on Windows but harmless)
+            // On Windows, just reopen the file fresh each time.
+
+            // Method 1: Read into Vec, then deserialize
+            let vec_times: Vec<Duration> = (0..100).map(|_| {
+                let start = Instant::now();
+                let data = fs::read(&bm_path).unwrap();
+                let _bm = RoaringBitmap::deserialize_from(data.as_slice()).unwrap();
+                start.elapsed()
+            }).collect();
+            let vec_median = {
+                let mut t = vec_times.clone();
+                t.sort();
+                t[t.len() / 2]
+            };
+
+            // Method 2: mmap, then deserialize from mmap'd slice
+            let mmap_times: Vec<Duration> = (0..100).map(|_| {
+                let start = Instant::now();
+                let f = File::open(&bm_path).unwrap();
+                let mmap = unsafe { memmap2::Mmap::map(&f).unwrap() };
+                let _bm = RoaringBitmap::deserialize_from(&mmap[..]).unwrap();
+                start.elapsed()
+            }).collect();
+            let mmap_median = {
+                let mut t = mmap_times.clone();
+                t.sort();
+                t[t.len() / 2]
+            };
+
+            let speedup = vec_median.as_nanos() as f64 / mmap_median.as_nanos().max(1) as f64;
+            println!("  {:>12}  {:>10} B  {:>10.0}μs  {:>10.0}μs  {:>9.2}x",
+                format!("{}K", n / 1000),
+                file_size,
+                vec_median.as_nanos() as f64 / 1000.0,
+                mmap_median.as_nanos() as f64 / 1000.0,
+                speedup,
+            );
+
+            let _ = fs::remove_file(&bm_path);
+        }
+    }
+    println!();
+
     // Summary
     println!("--- Projections at 107M scale ---");
     println!("  Disk: {:.1} GB (256B slots)", 107_000_000u64 as f64 * 256.0 / 1e9);
