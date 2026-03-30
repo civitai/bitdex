@@ -771,22 +771,16 @@ fn run_full_build(data_dir: &Path, index_name: &str) {
     use bitdex_v2::concurrent_engine::{ConcurrentEngine, get_rss_bytes};
 
     let index_dir = data_dir.join("indexes").join(index_name);
-    let config_path = index_dir.join("config.json");
+    let config_path = bitdex_v2::server::find_index_config(&index_dir)
+        .unwrap_or_else(|| { eprintln!("No config found in {}", index_dir.display()); std::process::exit(1); });
     let docs_path = index_dir.join("docs");
 
     eprintln!("\n=== FULL BUILD: build_all_from_docstore ===");
     eprintln!("Index: {}", index_name);
     eprintln!("Docs:  {}", docs_path.display());
 
-    // Load index config (same structure as server uses)
-    #[derive(serde::Deserialize)]
-    struct IndexDef {
-        config: bitdex_v2::config::Config,
-    }
-    let config_json = std::fs::read_to_string(&config_path)
-        .expect("read config.json");
-    let index_def: IndexDef = serde_json::from_str(&config_json)
-        .expect("parse config.json");
+    let index_def = bitdex_v2::server::IndexDefinition::from_file(&config_path)
+        .unwrap_or_else(|e| { eprintln!("Failed to parse config: {e}"); std::process::exit(1); });
     let mut config = index_def.config;
 
     // Set bitmap_path so save_and_unload() can persist to disk

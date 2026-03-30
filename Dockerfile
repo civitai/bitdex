@@ -1,6 +1,6 @@
 # Bitdex V2 — Multi-stage build
 # Produces two binaries: server (HTTP API) and pg-sync (PG loader/poller)
-# Config (config.json, sync.toml) is mounted at runtime via K8s ConfigMap/PVC.
+# Config (config.yaml, sync.toml) is mounted at runtime via K8s ConfigMap/PVC.
 
 # ---- Build stage ----
 FROM rust:1.88-bookworm AS builder
@@ -31,14 +31,14 @@ COPY --from=builder /app/target/release/pg-sync /usr/local/bin/bitdex-pg-sync
 # Copy static assets (web UI)
 COPY --from=builder /app/static/ /app/static/
 
-# Data directory (mount PVC here — contains bitmaps, docstore, config.json)
+# Data directory (mount PVC here — contains bitmaps, docstore, config.yaml)
 VOLUME ["/data"]
 
 # Bitdex server default port
 EXPOSE 3000
 
 # Default: run the server
-# Config (config.json) expected at /data/indexes/<name>/config.json (from PVC)
-# Override with: bitdex-pg-sync load --config /etc/sync/sync.toml
+# Config: use --index-dir for ConfigMap mount, or config.yaml at /data/indexes/<name>/
+# Override with: bitdex-sync pg --config /etc/sync/sync.toml
 ENV MALLOC_CONF="prof:true,prof_prefix:/data/captures/jeprof"
 CMD ["bitdex-server", "--port", "3000", "--data-dir", "/data"]

@@ -38,10 +38,10 @@ fn main() {
         std::process::exit(1);
     });
 
-    // --index overrides the output index name (defaults to the name in config.json)
+    // --index overrides the output index name (defaults to the name in config.yaml)
     let index_name = arg_value(&args, "--index").unwrap_or_else(|| index_def.name.clone());
 
-    // Server layout: {data}/indexes/{index}/bitmaps, docs, config.json
+    // Server layout: {data}/indexes/{index}/bitmaps, docs, config.yaml
     let index_dir = data_dir.join("indexes").join(&index_name);
     let bitmap_dir = index_dir.join("bitmaps");
     let docs_dir = index_dir.join("docs");
@@ -51,7 +51,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&docs_dir);
     std::fs::create_dir_all(&bitmap_dir).unwrap();
     std::fs::create_dir_all(&docs_dir).unwrap();
-    let _ = std::fs::copy(&config_path, index_dir.join("config.json"));
+    let _ = std::fs::copy(&config_path, index_dir.join("config.yaml"));
 
     eprintln!("Stage:   {}", stage_dir.display());
     eprintln!("Config:  {}", config_path.display());

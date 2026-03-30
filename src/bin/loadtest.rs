@@ -542,21 +542,16 @@ fn restore_engine(data_dir: &str, index_name: &str) -> bitdex_v2::concurrent_eng
     use std::path::Path;
 
     let index_path = Path::new(data_dir).join("indexes").join(index_name);
-    let config_path = index_path.join("config.json");
+    let config_path = match bitdex_v2::server::find_index_config(&index_path) {
+        Some(p) => p,
+        None => {
+            eprintln!("Config not found in: {}", index_path.display());
+            std::process::exit(1);
+        }
+    };
 
-    if !config_path.exists() {
-        eprintln!("Config not found at: {}", config_path.display());
-        std::process::exit(1);
-    }
-
-    let json = std::fs::read_to_string(&config_path).expect("read config");
-
-    // Parse the index definition to get the config
-    #[derive(serde::Deserialize)]
-    struct IndexDef {
-        config: bitdex_v2::config::Config,
-    }
-    let def: IndexDef = serde_json::from_str(&json).expect("parse config");
+    let def = bitdex_v2::server::IndexDefinition::from_file(&config_path)
+        .unwrap_or_else(|e| { eprintln!("Failed to parse config: {e}"); std::process::exit(1); });
 
     let docstore_path = index_path.join("docs");
     let mut config = def.config;
@@ -565,42 +560,13 @@ fn restore_engine(data_dir: &str, index_name: &str) -> bitdex_v2::concurrent_eng
     let mut engine = ConcurrentEngine::new_with_path(config, &docstore_path)
         .expect("restore engine");
 
-    // Set up string maps if needed
-    let full_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-    if let Some(schema) = full_json.get("data_schema") {
-        if let Some(fields) = schema.get("fields").and_then(|f| f.as_array()) {
-            let mut string_maps = std::collections::HashMap::new();
-            let mut cs_fields = std::collections::HashSet::new();
-            for field in fields {
-                if let (Some(name), Some(sm)) = (
-                    field.get("name").and_then(|n| n.as_str()),
-                    field.get("string_map").and_then(|s| s.as_object()),
-                ) {
-                    let case_sensitive = field.get("case_sensitive")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let mut map = std::collections::HashMap::new();
-                    for (k, v) in sm {
-                        if let Some(n) = v.as_i64() {
-                            let key = if case_sensitive { k.clone() } else { k.to_lowercase() };
-                            map.insert(key, n);
-                        }
-                    }
-                    if !map.is_empty() {
-                        string_maps.insert(name.to_string(), map);
-                    }
-                    if case_sensitive {
-                        cs_fields.insert(name.to_string());
-                    }
-                }
-            }
-            if !string_maps.is_empty() {
-                engine.set_string_maps(string_maps);
-            }
-            if !cs_fields.is_empty() {
-                engine.set_case_sensitive_fields(cs_fields);
-            }
-        }
+    // Set up string maps from data schema
+    let (string_maps, cs_fields) = bitdex_v2::server::build_string_maps_with_dicts(&def.data_schema, None);
+    if !string_maps.is_empty() {
+        engine.set_string_maps(string_maps);
+    }
+    if !cs_fields.is_empty() {
+        engine.set_case_sensitive_fields(cs_fields);
     }
 
     engine

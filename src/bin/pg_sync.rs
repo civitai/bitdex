@@ -317,18 +317,16 @@ async fn run_boot_sequence(
     };
     eprintln!("Pre-dump cursor: {pre_dump_cursor}");
 
-    // Step 4: Copy index config to storage dir
+    // Step 4: Copy index config to storage dir (optional — skipped when server uses --index-dir)
     std::fs::create_dir_all(index_storage_dir).ok();
     let config_dest = index_storage_dir.join("config.yaml");
     if !config_dest.exists() {
         let yaml_src = sync_config.index_dir.join("config.yaml");
-        let json_src = sync_config.index_dir.join("config.json");
         if yaml_src.exists() {
             std::fs::copy(&yaml_src, &config_dest).ok();
             eprintln!("Copied config.yaml to {}", config_dest.display());
-        } else if json_src.exists() {
-            std::fs::copy(&json_src, &index_storage_dir.join("config.json")).ok();
-            eprintln!("Copied config.json to {}", index_storage_dir.display());
+        } else {
+            eprintln!("No config.yaml in {} — server should use --index-dir for ConfigMap", sync_config.index_dir.display());
         }
     }
 
@@ -448,21 +446,24 @@ async fn run_dump_pipeline(
             }
         }
 
-        // Wait for THIS dump to complete before registering the next one
+        // Wait for THIS dump to complete before moving to next phase
         eprintln!("  Waiting for '{name}' to complete...");
-        bitdex_client
+        match bitdex_client
             .poll_dumps_until_complete(
                 &[name.clone()],
                 5,       // poll every 5s
                 3600,    // 1 hour timeout per dump
             )
             .await
-            .unwrap_or_else(|e| {
-                eprintln!("FATAL: Dump '{name}' failed: {e}");
-                std::process::exit(1);
-            });
-        eprintln!("  Dump '{name}' complete.");
-        completed += 1;
+        {
+            Ok(()) => {
+                eprintln!("  Dump '{name}' complete.");
+                completed += 1;
+            }
+            Err(e) => {
+                eprintln!("ERROR: Dump '{name}' failed: {e} — continuing to next phase");
+            }
+        }
     }
 
     eprintln!("=== All {completed}/{total} dumps complete ===");
@@ -588,14 +589,16 @@ async fn run_streaming_pipeline(
 
         // Wait for this dump to complete
         eprintln!("  Waiting for '{name}' to complete...");
-        bitdex_client
+        match bitdex_client
             .poll_dumps_until_complete(&[name.clone()], 5, 3600)
             .await
-            .unwrap_or_else(|e| {
-                eprintln!("FATAL: Dump '{name}' failed: {e}");
-                std::process::exit(1);
-            });
-        eprintln!("  Dump '{name}' complete.");
+        {
+            Ok(()) => eprintln!("  Dump '{name}' complete."),
+            Err(e) => {
+                eprintln!("ERROR: Dump '{name}' failed: {e} — continuing to next phase");
+                continue;
+            }
+        }
         completed += 1;
     }
 
@@ -730,11 +733,11 @@ fn run_validate(
         }
     }
 
-    // Check for config file (YAML preferred, JSON fallback)
+    // Check for config file
     let has_config = sync_config.index_dir.join("config.yaml").exists()
-        || sync_config.index_dir.join("config.json").exists();
+        || sync_config.index_dir.join("config.yml").exists();
     if !has_config {
-        eprintln!("\nERROR: No config.yaml or config.json found in {}", sync_config.index_dir.display());
+        eprintln!("\nERROR: No config.yaml found in {}", sync_config.index_dir.display());
         ok = false;
     }
 

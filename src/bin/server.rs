@@ -13,6 +13,7 @@
 //! Options:
 //!   --port <N>                    HTTP port (default: 3000)
 //!   --data-dir <PATH>             Data directory for index storage (default: data/ next to exe)
+//!   --index-dir <PATH>            External index config directory (e.g. ConfigMap mount)
 //!   --rebuild                     Rebuild bitmap indexes from docstore on startup
 //!   --config <PATH>               Path to config file (default: bitdex.toml next to exe)
 //!   --default-format <FMT>        Default query format: bitdex, compact, meilisearch (default: bitdex)
@@ -44,6 +45,7 @@ struct Config {
     port: u16,
     data_dir: PathBuf,
     index: Option<String>,
+    index_dir: Option<PathBuf>,
     rebuild: bool,
     default_query_format: Option<String>,
     log_level: String,
@@ -89,6 +91,7 @@ fn parse_config() -> Config {
     let mut cli_port: Option<u16> = None;
     let mut cli_data_dir: Option<PathBuf> = None;
     let mut cli_index: Option<String> = None;
+    let mut cli_index_dir: Option<PathBuf> = None;
     let mut cli_rebuild = false;
     let mut cli_config: Option<PathBuf> = None;
     let mut cli_default_query_format: Option<String> = None;
@@ -111,6 +114,10 @@ fn parse_config() -> Config {
             "--index" => {
                 i += 1;
                 cli_index = Some(cli_args[i].clone());
+            }
+            "--index-dir" => {
+                i += 1;
+                cli_index_dir = Some(PathBuf::from(&cli_args[i]));
             }
             "--rebuild" => {
                 cli_rebuild = true;
@@ -149,6 +156,7 @@ fn parse_config() -> Config {
     // --- Defaults (relative to exe) ---
     let mut port: u16 = 3000;
     let mut data_dir = exe_dir.join("data");
+    let mut index_dir: Option<PathBuf> = None;
     let mut rebuild = false;
     let mut default_query_format: Option<String> = None;
     let mut log_level = "warn".to_string();
@@ -159,7 +167,7 @@ fn parse_config() -> Config {
 
     // --- Config file ---
     // Only auto-generate bitdex.toml if no CLI args were passed at all
-    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_index.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some() || cli_log_level.is_some() || cli_enable_traces || cli_max_query_concurrency.is_some() || cli_trace_buffer_size.is_some();
+    let has_cli_args = cli_port.is_some() || cli_data_dir.is_some() || cli_index.is_some() || cli_index_dir.is_some() || cli_rebuild || cli_config.is_some() || cli_default_query_format.is_some() || cli_log_level.is_some() || cli_enable_traces || cli_max_query_concurrency.is_some() || cli_trace_buffer_size.is_some();
     let config_path = match &cli_config {
         Some(path) => path.clone(),
         None => {
@@ -181,6 +189,10 @@ fn parse_config() -> Config {
         if let Some(v) = table.get("data_dir").and_then(|v| v.as_str()) {
             let p = PathBuf::from(v);
             data_dir = if p.is_absolute() { p } else { config_dir.join(p) };
+        }
+        if let Some(v) = table.get("index_dir").and_then(|v| v.as_str()) {
+            let p = PathBuf::from(v);
+            index_dir = Some(if p.is_absolute() { p } else { config_dir.join(p) });
         }
         if let Some(v) = table.get("rebuild").and_then(|v| v.as_bool()) {
             rebuild = v;
@@ -212,6 +224,9 @@ fn parse_config() -> Config {
     if let Some(d) = cli_data_dir {
         data_dir = if d.is_absolute() { d } else { exe_dir.join(d) };
     }
+    if let Some(d) = cli_index_dir {
+        index_dir = Some(if d.is_absolute() { d } else { exe_dir.join(d) });
+    }
     if cli_rebuild {
         rebuild = true;
     }
@@ -238,7 +253,7 @@ fn parse_config() -> Config {
         }
     }
 
-    Config { port, data_dir, index: cli_index, rebuild, default_query_format, log_level, enable_traces, admin_token, max_query_concurrency, trace_buffer_size }
+    Config { port, data_dir, index: cli_index, index_dir, rebuild, default_query_format, log_level, enable_traces, admin_token, max_query_concurrency, trace_buffer_size }
 }
 
 #[tokio::main]
@@ -270,6 +285,9 @@ async fn main() {
     eprintln!("BitDex V2 Server");
     eprintln!("  port: {}", config.port);
     eprintln!("  data-dir: {}", config.data_dir.display());
+    if let Some(ref dir) = config.index_dir {
+        eprintln!("  index-dir: {}", dir.display());
+    }
     if let Some(ref fmt) = config.default_query_format {
         eprintln!("  default-format: {fmt}");
     }
@@ -278,6 +296,9 @@ async fn main() {
     }
 
     let mut server = BitdexServer::new(config.data_dir);
+    if let Some(dir) = config.index_dir {
+        server = server.with_index_dir(dir);
+    }
     if config.rebuild {
         server = server.with_rebuild(true);
     }
