@@ -854,14 +854,14 @@ pub async fn download_metrics_from_clickhouse(
     eprintln!("Downloading ClickHouse metrics to {} ...", csv_path.display());
 
     let query = r#"SELECT
-        entityId,
+        entityId as imageId,
         sumIf(total, metricType IN ('ReactionLike','ReactionHeart','ReactionLaugh','ReactionCry')) as reactionCount,
         sumIf(total, metricType = 'Comment') as commentCount,
         sumIf(total, metricType = 'Collection') as collectedCount
     FROM entityMetricDailyAgg
     WHERE entityType = 'Image'
     GROUP BY entityId
-    FORMAT TSV"#;
+    FORMAT TSVWithNames"#;
 
     let http = reqwest::Client::new();
     let mut req = http.post(ch_url).body(query.to_string());
