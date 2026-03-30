@@ -330,6 +330,10 @@ fn enrichment_to_json(e: &EnrichmentDef, stage_dir: &Path) -> serde_json::Value 
         obj["filter"] = serde_json::json!(filter);
     }
 
+    if !e.columns.is_empty() {
+        obj["columns"] = serde_json::json!(e.columns);
+    }
+
     obj
 }
 
