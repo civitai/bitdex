@@ -164,6 +164,10 @@ harness = false
 name = "frozen_sort"
 harness = false
 
+[[bench]]
+name = "slot_table"
+harness = false
+
 [[bin]]
 name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"
