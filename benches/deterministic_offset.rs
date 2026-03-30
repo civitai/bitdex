@@ -310,6 +310,114 @@ fn main() {
     let _ = fs::remove_file(&path);
     println!();
 
+    // =========================================================================
+    // Experiment 2c: Ops log impact on read latency
+    // =========================================================================
+    println!("=== Experiment 2c: Ops Log Read Latency Impact ===");
+    println!("Snapshot: 1M docs (mmap). Ops log: LIFO scan for slot_id override.");
+    println!();
+
+    // Write snapshot via mmap
+    let snap_path = dir.join("bench_ops_snapshot.dat");
+    bench_mmap_write(&snap_path, count);
+
+    // Ops log entry: [slot_id: u32][doc_len: u32][doc_bytes]
+    const OP_HEADER: usize = 8; // slot_id(4) + doc_len(4)
+
+    println!("  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "Ops", "p50 (μs)", "p95 (μs)", "p99 (μs)", "mean (μs)", "log size");
+    println!("  {}", "-".repeat(65));
+
+    for num_ops in [0usize, 10, 100, 1000, 10000] {
+        // Build ops log in memory (simulating append-only file)
+        let mut ops_log: Vec<u8> = Vec::new();
+        // Track which slots have ops for realistic hit rate
+        let mut rng_state: u64 = 0xCAFEBABE;
+        for _ in 0..num_ops {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let slot = (rng_state >> 33) as u32 % count as u32;
+            let doc = generate_doc(slot);
+            ops_log.extend_from_slice(&slot.to_le_bytes());
+            ops_log.extend_from_slice(&(doc.len() as u32).to_le_bytes());
+            ops_log.extend_from_slice(&doc);
+        }
+
+        // Build reverse index of ops log entries for LIFO lookup
+        // (offset, slot_id) pairs scanned from end
+        let mut ops_entries: Vec<(usize, u32)> = Vec::new();
+        {
+            let mut pos = 0;
+            while pos + OP_HEADER <= ops_log.len() {
+                let slot = u32::from_le_bytes([ops_log[pos], ops_log[pos+1], ops_log[pos+2], ops_log[pos+3]]);
+                let doc_len = u32::from_le_bytes([ops_log[pos+4], ops_log[pos+5], ops_log[pos+6], ops_log[pos+7]]) as usize;
+                ops_entries.push((pos, slot));
+                pos += OP_HEADER + doc_len;
+            }
+        }
+
+        // Read benchmark: for each slot, LIFO scan ops log first, then fall back to snapshot
+        let mut snap_file = File::open(&snap_path).unwrap();
+        let mut rng2: u64 = 0xDEADBEEF;
+        let slots: Vec<u32> = (0..read_count)
+            .map(|_| {
+                rng2 = rng2.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (rng2 >> 33) as u32 % count as u32
+            })
+            .collect();
+
+        let mut latencies = Vec::with_capacity(read_count);
+        let mut hdr = [0u8; HEADER_SIZE];
+
+        for &target_slot in &slots {
+            let start = Instant::now();
+
+            // LIFO scan: search ops log from end for matching slot_id
+            let mut found = false;
+            for &(offset, slot) in ops_entries.iter().rev() {
+                if slot == target_slot {
+                    // Found in ops log — read doc from ops_log bytes
+                    let doc_len = u32::from_le_bytes([
+                        ops_log[offset+4], ops_log[offset+5],
+                        ops_log[offset+6], ops_log[offset+7],
+                    ]) as usize;
+                    let doc = &ops_log[offset + OP_HEADER..offset + OP_HEADER + doc_len];
+                    // Verify
+                    let stored = u32::from_le_bytes([doc[0], doc[1], doc[2], doc[3]]);
+                    assert_eq!(stored, target_slot);
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                // Fall back to snapshot (deterministic offset read)
+                let offset = target_slot as u64 * SLOT_SIZE as u64;
+                snap_file.seek(SeekFrom::Start(offset)).unwrap();
+                snap_file.read_exact(&mut hdr).unwrap();
+                let doc_len = u32::from_le_bytes(hdr) as usize;
+                if doc_len > 0 && doc_len + HEADER_SIZE <= SLOT_SIZE {
+                    let mut buf = vec![0u8; doc_len];
+                    snap_file.read_exact(&mut buf).unwrap();
+                }
+            }
+
+            latencies.push(start.elapsed());
+        }
+
+        latencies.sort();
+        println!("  {:>8}  {:>10.1}  {:>10.1}  {:>10.1}  {:>10.1}  {:>10}",
+            num_ops,
+            percentile(&latencies, 50.0).as_nanos() as f64 / 1000.0,
+            percentile(&latencies, 95.0).as_nanos() as f64 / 1000.0,
+            percentile(&latencies, 99.0).as_nanos() as f64 / 1000.0,
+            latencies.iter().map(|d| d.as_nanos()).sum::<u128>() as f64 / latencies.len() as f64 / 1000.0,
+            if ops_log.len() > 1024 { format!("{} KB", ops_log.len() / 1024) } else { format!("{} B", ops_log.len()) },
+        );
+    }
+
+    let _ = fs::remove_file(&snap_path);
+    println!();
+
     // Summary
     println!("--- Projections at 107M scale ---");
     println!("  Disk: {:.1} GB (256B slots)", 107_000_000u64 as f64 * 256.0 / 1e9);
