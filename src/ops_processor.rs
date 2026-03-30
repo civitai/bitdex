@@ -1252,7 +1252,7 @@ pub fn process_wal_dump(
     let mut accum = BitmapAccum::new(&filter_names, &sort_configs);
 
     let start = Instant::now();
-    let mut reader = WalReader::new(wal_path, 0);
+    let mut reader = WalReader::from_legacy(wal_path, 0);
     let mut total_applied = 0u64;
     let mut total_errors = 0u64;
 

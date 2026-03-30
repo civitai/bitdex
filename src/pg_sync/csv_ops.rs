@@ -405,7 +405,7 @@ mod tests {
         assert!(stats.bytes_written > 0);
 
         // Read back from WAL
-        let mut reader = crate::ops_wal::WalReader::new(&wal_path, 0);
+        let mut reader = crate::ops_wal::WalReader::from_legacy(&wal_path, 0);
         let batch = reader.read_batch(100).unwrap();
         assert_eq!(batch.entries.len(), 2);
         assert_eq!(batch.entries[0].entity_id, 1);

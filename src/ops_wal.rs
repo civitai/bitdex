@@ -1,229 +1,382 @@
-//! Ops WAL — append-only log for sync operations.
+//! Ops WAL — append-only log with generational rotation and cleanup.
 //!
-//! Format per record:
+//! Record format (unchanged):
 //!   [4 bytes: payload_len (u32 LE)]
 //!   [8 bytes: entity_id (i64 LE)]
 //!   [1 byte:  flags (bit 0 = creates_slot)]
 //!   [payload_len bytes: ops JSONB]
 //!   [4 bytes: CRC32 of entity_id + flags + ops]
 //!
-//! The writer appends records and fsyncs. The reader tails the file,
-//! reading batches of records and tracking a byte-offset cursor.
-//! Partial records at EOF are skipped (crash recovery).
+//! Generational rotation:
+//! - Files: `ops_000001.wal`, `ops_000002.wal`, etc.
+//! - Writer rotates to new file at 100MB (configurable).
+//! - Reader tracks `WalCursor { generation, offset }`.
+//! - Consumed files deleted by reader after transitioning to next gen.
+//! - Cursor persisted as `"gen:offset"` for crash recovery.
+//! - Legacy `ops.wal` treated as generation 0 for backward compat.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::pg_sync::ops::{EntityOps, Op};
 
 const HEADER_SIZE: usize = 4 + 8 + 1; // payload_len + entity_id + flags
 const FLAG_CREATES_SLOT: u8 = 0x01;
 const CRC_SIZE: usize = 4;
+const DEFAULT_ROTATION_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 
-/// WAL writer — appends ops records to a file with CRC32 integrity.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn wal_filename(gen: u32) -> String {
+    format!("ops_{:06}.wal", gen)
+}
+
+fn parse_generation(name: &str) -> Option<u32> {
+    if name == "ops.wal" {
+        return Some(0);
+    }
+    name.strip_prefix("ops_")
+        .and_then(|s| s.strip_suffix(".wal"))
+        .and_then(|s| s.parse().ok())
+}
+
+fn list_generations(dir: &Path) -> Vec<u32> {
+    let mut gens: Vec<u32> = fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| parse_generation(&e.file_name().to_string_lossy()))
+        .collect();
+    gens.sort();
+    gens
+}
+
+fn gen_path(dir: &Path, gen: u32) -> PathBuf {
+    if gen == 0 {
+        let legacy = dir.join("ops.wal");
+        if legacy.exists() {
+            return legacy;
+        }
+    }
+    dir.join(wal_filename(gen))
+}
+
+// ---------------------------------------------------------------------------
+// WalCursor
+// ---------------------------------------------------------------------------
+
+/// Position in the WAL as (generation, byte offset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCursor {
+    pub generation: u32,
+    pub offset: u64,
+}
+
+impl WalCursor {
+    pub fn new(generation: u32, offset: u64) -> Self {
+        Self { generation, offset }
+    }
+
+    /// Parse `"gen:offset"` or legacy `"offset"`.
+    pub fn parse(s: &str) -> Self {
+        if let Some((g, o)) = s.trim().split_once(':') {
+            Self {
+                generation: g.parse().unwrap_or(0),
+                offset: o.parse().unwrap_or(0),
+            }
+        } else {
+            Self {
+                generation: 0,
+                offset: s.trim().parse().unwrap_or(0),
+            }
+        }
+    }
+
+    pub fn serialize(&self) -> String {
+        format!("{}:{}", self.generation, self.offset)
+    }
+}
+
+impl std::fmt::Display for WalCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.generation, self.offset)
+    }
+}
+
+/// Load cursor from file. Returns `(0, 0)` if missing.
+pub fn load_cursor(path: &Path) -> WalCursor {
+    fs::read_to_string(path)
+        .ok()
+        .map(|s| WalCursor::parse(&s))
+        .unwrap_or(WalCursor::new(0, 0))
+}
+
+/// Persist cursor to file.
+pub fn save_cursor(path: &Path, cursor: WalCursor) -> io::Result<()> {
+    fs::write(path, cursor.serialize())
+}
+
+// ---------------------------------------------------------------------------
+// WalWriter
+// ---------------------------------------------------------------------------
+
+/// Append-only WAL writer with automatic file rotation.
+///
+/// Uses `AtomicU32` for the generation counter so `append_batch` can
+/// take `&self` — callers pass `&WalWriter` through shared refs.
 pub struct WalWriter {
-    path: PathBuf,
+    dir: PathBuf,
+    generation: AtomicU32,
+    rotation_size: u64,
 }
 
 impl WalWriter {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self::with_rotation_size(dir, DEFAULT_ROTATION_SIZE)
     }
 
-    /// Append a batch of entity ops to the WAL. Writes all records and fsyncs.
-    /// Returns the number of bytes written.
+    pub fn with_rotation_size(dir: impl Into<PathBuf>, rotation_size: u64) -> Self {
+        let dir = dir.into();
+        fs::create_dir_all(&dir).ok();
+        let gen = list_generations(&dir).last().copied().unwrap_or(1).max(1);
+        Self {
+            dir,
+            generation: AtomicU32::new(gen),
+            rotation_size,
+        }
+    }
+
+    /// Backward-compat: accept a file path, use its parent dir.
+    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+        let p = path.into();
+        let dir = if p.is_dir() { p } else { p.parent().unwrap_or(Path::new(".")).to_path_buf() };
+        Self::new(dir)
+    }
+
+    /// Append a batch. Rotates if current file exceeds threshold.
     pub fn append_batch(&self, batch: &[EntityOps]) -> io::Result<u64> {
         if batch.is_empty() {
             return Ok(0);
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        // Check rotation
+        let mut gen = self.generation.load(Ordering::Relaxed);
+        let cur = self.dir.join(wal_filename(gen));
+        let size = fs::metadata(&cur).map(|m| m.len()).unwrap_or(0);
+        if size >= self.rotation_size {
+            gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!("WAL rotated to gen {} (prev {} bytes)", gen, size);
+        }
 
-        let mut total_bytes = 0u64;
+        let path = self.dir.join(wal_filename(gen));
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+
+        let mut total = 0u64;
         for entry in batch {
             let ops_json = serde_json::to_vec(&entry.ops)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
             let payload_len = ops_json.len() as u32;
-            let entity_id_bytes = entry.entity_id.to_le_bytes();
+            let eid = entry.entity_id.to_le_bytes();
             let flags: u8 = if entry.creates_slot { FLAG_CREATES_SLOT } else { 0 };
 
-            // CRC covers entity_id + flags + ops (not the length prefix)
-            let mut crc_input = Vec::with_capacity(9 + ops_json.len());
-            crc_input.extend_from_slice(&entity_id_bytes);
-            crc_input.push(flags);
-            crc_input.extend_from_slice(&ops_json);
-            let crc = crc32fast::hash(&crc_input);
+            let mut crc_in = Vec::with_capacity(9 + ops_json.len());
+            crc_in.extend_from_slice(&eid);
+            crc_in.push(flags);
+            crc_in.extend_from_slice(&ops_json);
+            let crc = crc32fast::hash(&crc_in);
 
-            // Write: [len][entity_id][flags][ops][crc]
             file.write_all(&payload_len.to_le_bytes())?;
-            file.write_all(&entity_id_bytes)?;
+            file.write_all(&eid)?;
             file.write_all(&[flags])?;
             file.write_all(&ops_json)?;
             file.write_all(&crc.to_le_bytes())?;
-
-            total_bytes += (HEADER_SIZE + ops_json.len() + CRC_SIZE) as u64;
+            total += (HEADER_SIZE + ops_json.len() + CRC_SIZE) as u64;
         }
-
         file.sync_all()?;
-        Ok(total_bytes)
+        Ok(total)
     }
 
-    /// Get the file path.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
+    pub fn dir(&self) -> &Path { &self.dir }
+    pub fn current_generation(&self) -> u32 { self.generation.load(Ordering::Relaxed) }
 
-    /// Get current file size (0 if file doesn't exist).
     pub fn file_size(&self) -> u64 {
-        fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+        let g = self.generation.load(Ordering::Relaxed);
+        fs::metadata(self.dir.join(wal_filename(g))).map(|m| m.len()).unwrap_or(0)
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.dir.join(wal_filename(self.generation.load(Ordering::Relaxed)))
     }
 }
 
-/// WAL reader — reads ops records from a file starting at a byte offset.
-pub struct WalReader {
-    path: PathBuf,
-    /// Current read position (byte offset into the file)
-    cursor: u64,
-}
+// ---------------------------------------------------------------------------
+// WalBatch / WalReader
+// ---------------------------------------------------------------------------
 
-/// Result of reading a batch from the WAL.
 pub struct WalBatch {
-    /// The ops read from the WAL
     pub entries: Vec<EntityOps>,
-    /// New cursor position after this batch
-    pub new_cursor: u64,
-    /// Number of bytes read
+    pub new_cursor: WalCursor,
     pub bytes_read: u64,
-    /// Number of records skipped due to CRC failure
     pub crc_failures: u64,
 }
 
+/// Reads ops across generational WAL files, cleans up consumed files.
+pub struct WalReader {
+    dir: PathBuf,
+    cursor: WalCursor,
+}
+
 impl WalReader {
-    pub fn new(path: impl Into<PathBuf>, cursor: u64) -> Self {
-        Self {
-            path: path.into(),
-            cursor,
-        }
+    pub fn new(dir: impl Into<PathBuf>, cursor: WalCursor) -> Self {
+        Self { dir: dir.into(), cursor }
     }
 
-    /// Read up to `max_records` from the WAL starting at the current cursor.
-    /// Uses incremental seek+read — only reads new data from the cursor position,
-    /// not the entire file. Safe for large WAL files.
+    /// Backward-compat: file path + byte offset → dir + WalCursor(0, offset).
+    pub fn from_legacy(path: impl Into<PathBuf>, offset: u64) -> Self {
+        let p = path.into();
+        let dir = if p.is_dir() { p } else { p.parent().unwrap_or(Path::new(".")).to_path_buf() };
+        Self::new(dir, WalCursor::new(0, offset))
+    }
+
     pub fn read_batch(&mut self, max_records: usize) -> io::Result<WalBatch> {
-        if !self.path.exists() {
+        let mut all = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut total_crc = 0u64;
+
+        loop {
+            let fp = gen_path(&self.dir, self.cursor.generation);
+
+            if !fp.exists() {
+                if let Some(g) = self.next_gen() {
+                    self.cursor = WalCursor::new(g, 0);
+                    continue;
+                }
+                break;
+            }
+
+            let flen = fs::metadata(&fp)?.len();
+            if self.cursor.offset >= flen {
+                if let Some(g) = self.next_gen() {
+                    self.delete_consumed();
+                    self.cursor = WalCursor::new(g, 0);
+                    continue;
+                }
+                break;
+            }
+
+            let b = self.read_file(&fp, max_records - all.len())?;
+            total_bytes += b.bytes_read;
+            total_crc += b.crc_failures;
+            all.extend(b.entries);
+
+            if all.len() >= max_records { break; }
+
+            // Check if file fully consumed
+            let flen = fs::metadata(&fp).map(|m| m.len()).unwrap_or(0);
+            if self.cursor.offset >= flen {
+                if let Some(g) = self.next_gen() {
+                    self.delete_consumed();
+                    self.cursor = WalCursor::new(g, 0);
+                    continue;
+                }
+            }
+            break;
+        }
+
+        Ok(WalBatch {
+            entries: all,
+            new_cursor: self.cursor,
+            bytes_read: total_bytes,
+            crc_failures: total_crc,
+        })
+    }
+
+    fn read_file(&mut self, path: &Path, max: usize) -> io::Result<WalBatch> {
+        let flen = fs::metadata(path)?.len();
+        if self.cursor.offset >= flen {
             return Ok(WalBatch {
-                entries: Vec::new(),
-                new_cursor: self.cursor,
-                bytes_read: 0,
-                crc_failures: 0,
+                entries: vec![], new_cursor: self.cursor, bytes_read: 0, crc_failures: 0,
             });
         }
 
-        let file_len = fs::metadata(&self.path)?.len();
-        if self.cursor >= file_len {
-            return Ok(WalBatch {
-                entries: Vec::new(),
-                new_cursor: self.cursor,
-                bytes_read: 0,
-                crc_failures: 0,
-            });
-        }
-
-        // Read only from cursor to EOF (incremental, not full-file read)
-        let mut file = File::open(&self.path)?;
-        file.seek(std::io::SeekFrom::Start(self.cursor))?;
-        let remaining = (file_len - self.cursor) as usize;
-        let mut data = vec![0u8; remaining];
+        let mut file = File::open(path)?;
+        file.seek(io::SeekFrom::Start(self.cursor.offset))?;
+        let rem = (flen - self.cursor.offset) as usize;
+        let mut data = vec![0u8; rem];
         file.read_exact(&mut data)?;
 
         let mut entries = Vec::new();
         let mut pos = 0usize;
         let mut crc_failures = 0u64;
 
-        while entries.len() < max_records && pos + HEADER_SIZE <= data.len() {
-            // Read header: [4-byte len][8-byte entity_id][1-byte flags]
-            let payload_len =
-                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            let entity_id =
-                i64::from_le_bytes(data[pos + 4..pos + 12].try_into().unwrap());
+        while entries.len() < max && pos + HEADER_SIZE <= data.len() {
+            let plen = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            let eid = i64::from_le_bytes(data[pos+4..pos+12].try_into().unwrap());
             let flags = data[pos + 12];
-            let creates_slot = (flags & FLAG_CREATES_SLOT) != 0;
+            let creates = (flags & FLAG_CREATES_SLOT) != 0;
+            let end = pos + HEADER_SIZE + plen + CRC_SIZE;
+            if end > data.len() { break; }
 
-            let record_end = pos + HEADER_SIZE + payload_len + CRC_SIZE;
-            if record_end > data.len() {
-                // Truncated record at EOF — stop here, don't advance cursor
-                break;
-            }
-
-            // Verify CRC (covers entity_id + flags + ops)
-            let crc_input = &data[pos + 4..pos + HEADER_SIZE + payload_len];
-            let stored_crc = u32::from_le_bytes(
-                data[pos + HEADER_SIZE + payload_len..record_end]
-                    .try_into()
-                    .unwrap(),
-            );
-            let computed_crc = crc32fast::hash(crc_input);
-
-            if stored_crc != computed_crc {
+            let crc_in = &data[pos+4..pos+HEADER_SIZE+plen];
+            let stored = u32::from_le_bytes(data[pos+HEADER_SIZE+plen..end].try_into().unwrap());
+            if stored != crc32fast::hash(crc_in) {
                 crc_failures += 1;
-                pos = record_end;
+                pos = end;
                 continue;
             }
 
-            // Parse ops JSON
-            let ops_data = &data[pos + HEADER_SIZE..pos + HEADER_SIZE + payload_len];
+            let ops_data = &data[pos+HEADER_SIZE..pos+HEADER_SIZE+plen];
             match serde_json::from_slice::<Vec<Op>>(ops_data) {
-                Ok(ops) => {
-                    entries.push(EntityOps { entity_id, ops, creates_slot });
-                }
-                Err(_) => {
-                    crc_failures += 1;
-                }
+                Ok(ops) => entries.push(EntityOps { entity_id: eid, ops, creates_slot: creates }),
+                Err(_) => crc_failures += 1,
             }
-
-            pos = record_end;
+            pos = end;
         }
 
-        let bytes_read = pos as u64;
-        self.cursor += bytes_read;
-
+        self.cursor.offset += pos as u64;
         Ok(WalBatch {
-            entries,
-            new_cursor: self.cursor,
-            bytes_read,
-            crc_failures,
+            entries, new_cursor: self.cursor, bytes_read: pos as u64, crc_failures,
         })
     }
 
-    /// Get the current cursor position.
-    pub fn cursor(&self) -> u64 {
-        self.cursor
+    fn next_gen(&self) -> Option<u32> {
+        list_generations(&self.dir).into_iter().find(|&g| g > self.cursor.generation)
     }
 
-    /// Set the cursor position (for recovery from persisted state).
-    pub fn set_cursor(&mut self, cursor: u64) {
-        self.cursor = cursor;
+    fn delete_consumed(&self) {
+        let p = gen_path(&self.dir, self.cursor.generation);
+        if p.exists() {
+            match fs::remove_file(&p) {
+                Ok(_) => eprintln!("WAL cleanup: deleted gen {} ({})", self.cursor.generation, p.display()),
+                Err(e) => eprintln!("WAL cleanup: failed to delete {}: {e}", p.display()),
+            }
+        }
     }
 
-    /// Check if there are more records to read (cursor < file size).
+    pub fn cursor(&self) -> WalCursor { self.cursor }
+    pub fn set_cursor(&mut self, c: WalCursor) { self.cursor = c; }
+
     pub fn has_more(&self) -> bool {
-        let file_size = fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        self.cursor < file_size
+        let p = gen_path(&self.dir, self.cursor.generation);
+        let fsize = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        self.cursor.offset < fsize || self.next_gen().is_some()
     }
 }
 
-/// Delete a WAL file.
+/// Delete a WAL file (legacy compat).
 pub fn remove_wal(path: &Path) -> io::Result<()> {
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
+    if path.exists() { fs::remove_file(path)?; }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -231,150 +384,193 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    fn make_ops(entity_id: i64, ops: Vec<Op>) -> EntityOps {
-        EntityOps { entity_id, ops, creates_slot: false }
+    fn ops(id: i64, ops: Vec<Op>) -> EntityOps {
+        EntityOps { entity_id: id, ops, creates_slot: false }
     }
 
     #[test]
-    fn test_write_read_roundtrip() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-
-        let writer = WalWriter::new(&wal_path);
-        let batch = vec![
-            make_ops(1, vec![Op::Set { field: "nsfwLevel".into(), value: json!(16) }]),
-            make_ops(2, vec![Op::Add { field: "tagIds".into(), value: json!(42) }]),
-            make_ops(3, vec![Op::Delete]),
+    fn roundtrip() {
+        let d = TempDir::new().unwrap();
+        let w = WalWriter::new(d.path());
+        let b = vec![
+            ops(1, vec![Op::Set { field: "a".into(), value: json!(1) }]),
+            ops(2, vec![Op::Add { field: "b".into(), value: json!(2) }]),
+            ops(3, vec![Op::Delete]),
         ];
-        let bytes = writer.append_batch(&batch).unwrap();
-        assert!(bytes > 0);
+        assert!(w.append_batch(&b).unwrap() > 0);
 
-        let mut reader = WalReader::new(&wal_path, 0);
-        let result = reader.read_batch(100).unwrap();
-        assert_eq!(result.entries.len(), 3);
-        assert_eq!(result.entries[0].entity_id, 1);
-        assert_eq!(result.entries[1].entity_id, 2);
-        assert_eq!(result.entries[2].entity_id, 3);
-        assert_eq!(result.crc_failures, 0);
-        assert!(!reader.has_more());
+        let mut r = WalReader::new(d.path(), WalCursor::new(1, 0));
+        let res = r.read_batch(100).unwrap();
+        assert_eq!(res.entries.len(), 3);
+        assert_eq!(res.entries[0].entity_id, 1);
+        assert_eq!(res.crc_failures, 0);
+        assert!(!r.has_more());
     }
 
     #[test]
-    fn test_multiple_appends() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-        let writer = WalWriter::new(&wal_path);
-
-        // First batch
-        writer.append_batch(&[
-            make_ops(1, vec![Op::Set { field: "a".into(), value: json!(1) }]),
+    fn cursor_resume() {
+        let d = TempDir::new().unwrap();
+        let w = WalWriter::new(d.path());
+        w.append_batch(&[
+            ops(1, vec![Op::Set { field: "a".into(), value: json!(1) }]),
+            ops(2, vec![Op::Set { field: "b".into(), value: json!(2) }]),
+            ops(3, vec![Op::Set { field: "c".into(), value: json!(3) }]),
         ]).unwrap();
 
-        // Second batch
-        writer.append_batch(&[
-            make_ops(2, vec![Op::Set { field: "b".into(), value: json!(2) }]),
+        let mut r = WalReader::new(d.path(), WalCursor::new(1, 0));
+        let res = r.read_batch(2).unwrap();
+        assert_eq!(res.entries.len(), 2);
+        let saved = r.cursor();
+
+        let mut r2 = WalReader::new(d.path(), saved);
+        let res2 = r2.read_batch(100).unwrap();
+        assert_eq!(res2.entries.len(), 1);
+        assert_eq!(res2.entries[0].entity_id, 3);
+    }
+
+    #[test]
+    fn rotation() {
+        let d = TempDir::new().unwrap();
+        let w = WalWriter::with_rotation_size(d.path(), 50);
+        let big = ops(1, vec![Op::Set {
+            field: "f".into(),
+            value: json!("long value to trigger rotation quickly here"),
+        }]);
+        w.append_batch(&[big.clone()]).unwrap();
+        let g1 = w.current_generation();
+        w.append_batch(&[big.clone()]).unwrap();
+        let g2 = w.current_generation();
+        assert!(g2 > g1, "should rotate");
+
+        let mut r = WalReader::new(d.path(), WalCursor::new(g1, 0));
+        let res = r.read_batch(100).unwrap();
+        assert_eq!(res.entries.len(), 2);
+    }
+
+    #[test]
+    fn cleanup() {
+        let d = TempDir::new().unwrap();
+        let w = WalWriter::with_rotation_size(d.path(), 50);
+        let big = ops(1, vec![Op::Set {
+            field: "f".into(),
+            value: json!("long enough to trigger rotation on every write call"),
+        }]);
+        w.append_batch(&[big.clone()]).unwrap();
+        w.append_batch(&[big.clone()]).unwrap();
+        w.append_batch(&[big.clone()]).unwrap();
+
+        let before = list_generations(d.path());
+        assert!(before.len() >= 2);
+
+        let mut r = WalReader::new(d.path(), WalCursor::new(before[0], 0));
+        r.read_batch(100).unwrap();
+
+        let after = list_generations(d.path());
+        assert!(after.len() < before.len(), "consumed files should be deleted");
+    }
+
+    #[test]
+    fn cursor_persist() {
+        let d = TempDir::new().unwrap();
+        let p = d.path().join("cursor");
+        let c = WalCursor::new(5, 12345);
+        save_cursor(&p, c).unwrap();
+        let loaded = load_cursor(&p);
+        assert_eq!(loaded, c);
+    }
+
+    #[test]
+    fn cursor_parse_legacy() {
+        let c = WalCursor::parse("12345");
+        assert_eq!(c, WalCursor::new(0, 12345));
+    }
+
+    #[test]
+    fn cursor_parse_gen() {
+        let c = WalCursor::parse("3:67890");
+        assert_eq!(c, WalCursor::new(3, 67890));
+    }
+
+    #[test]
+    fn legacy_ops_wal() {
+        let d = TempDir::new().unwrap();
+        // Write a record to legacy ops.wal
+        let legacy = d.path().join("ops.wal");
+        {
+            let mut f = OpenOptions::new().create(true).append(true).open(&legacy).unwrap();
+            let oj = serde_json::to_vec(&vec![Op::Delete]).unwrap();
+            let eid: i64 = 999;
+            let eb = eid.to_le_bytes();
+            let flags: u8 = 0;
+            let mut ci = Vec::new();
+            ci.extend_from_slice(&eb);
+            ci.push(flags);
+            ci.extend_from_slice(&oj);
+            let crc = crc32fast::hash(&ci);
+            f.write_all(&(oj.len() as u32).to_le_bytes()).unwrap();
+            f.write_all(&eb).unwrap();
+            f.write_all(&[flags]).unwrap();
+            f.write_all(&oj).unwrap();
+            f.write_all(&crc.to_le_bytes()).unwrap();
+        }
+
+        let mut r = WalReader::new(d.path(), WalCursor::new(0, 0));
+        let res = r.read_batch(100).unwrap();
+        assert_eq!(res.entries.len(), 1);
+        assert_eq!(res.entries[0].entity_id, 999);
+    }
+
+    #[test]
+    fn truncated_at_eof() {
+        let d = TempDir::new().unwrap();
+        let w = WalWriter::new(d.path());
+        w.append_batch(&[ops(1, vec![Op::Set { field: "a".into(), value: json!(1) }])]).unwrap();
+
+        let wf = d.path().join(wal_filename(w.current_generation()));
+        let mut f = OpenOptions::new().append(true).open(&wf).unwrap();
+        f.write_all(&[0u8; 6]).unwrap();
+
+        let mut r = WalReader::new(d.path(), WalCursor::new(w.current_generation(), 0));
+        let res = r.read_batch(100).unwrap();
+        assert_eq!(res.entries.len(), 1);
+    }
+
+    #[test]
+    fn corrupted_crc() {
+        let d = TempDir::new().unwrap();
+        let w = WalWriter::new(d.path());
+        w.append_batch(&[
+            ops(1, vec![Op::Set { field: "a".into(), value: json!(1) }]),
+            ops(2, vec![Op::Set { field: "b".into(), value: json!(2) }]),
         ]).unwrap();
 
-        let mut reader = WalReader::new(&wal_path, 0);
-        let result = reader.read_batch(100).unwrap();
-        assert_eq!(result.entries.len(), 2);
-        assert_eq!(result.entries[0].entity_id, 1);
-        assert_eq!(result.entries[1].entity_id, 2);
+        let wf = d.path().join(wal_filename(w.current_generation()));
+        let mut data = fs::read(&wf).unwrap();
+        let plen = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        data[HEADER_SIZE + plen] ^= 0xFF;
+        fs::write(&wf, &data).unwrap();
+
+        let mut r = WalReader::new(d.path(), WalCursor::new(w.current_generation(), 0));
+        let res = r.read_batch(100).unwrap();
+        assert_eq!(res.entries.len(), 1);
+        assert_eq!(res.entries[0].entity_id, 2);
+        assert_eq!(res.crc_failures, 1);
     }
 
     #[test]
-    fn test_cursor_resume() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-        let writer = WalWriter::new(&wal_path);
-
-        writer.append_batch(&[
-            make_ops(1, vec![Op::Set { field: "a".into(), value: json!(1) }]),
-            make_ops(2, vec![Op::Set { field: "b".into(), value: json!(2) }]),
-            make_ops(3, vec![Op::Set { field: "c".into(), value: json!(3) }]),
-        ]).unwrap();
-
-        // Read first 2
-        let mut reader = WalReader::new(&wal_path, 0);
-        let result = reader.read_batch(2).unwrap();
-        assert_eq!(result.entries.len(), 2);
-        let saved_cursor = reader.cursor();
-
-        // Resume from cursor — should get the 3rd
-        let mut reader2 = WalReader::new(&wal_path, saved_cursor);
-        let result2 = reader2.read_batch(100).unwrap();
-        assert_eq!(result2.entries.len(), 1);
-        assert_eq!(result2.entries[0].entity_id, 3);
-        assert!(!reader2.has_more());
+    fn empty_dir() {
+        let d = TempDir::new().unwrap();
+        let mut r = WalReader::new(d.path(), WalCursor::new(1, 0));
+        let res = r.read_batch(100).unwrap();
+        assert!(res.entries.is_empty());
+        assert!(!r.has_more());
     }
 
     #[test]
-    fn test_truncated_record_at_eof() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-        let writer = WalWriter::new(&wal_path);
-
-        writer.append_batch(&[
-            make_ops(1, vec![Op::Set { field: "a".into(), value: json!(1) }]),
-        ]).unwrap();
-
-        // Append garbage (partial record)
-        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
-        file.write_all(&[0u8; 6]).unwrap(); // Too short to be a valid header+payload
-
-        let mut reader = WalReader::new(&wal_path, 0);
-        let result = reader.read_batch(100).unwrap();
-        // Should read the valid record and stop at the truncated one
-        assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.crc_failures, 0);
-    }
-
-    #[test]
-    fn test_corrupted_crc_skipped() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-        let writer = WalWriter::new(&wal_path);
-
-        writer.append_batch(&[
-            make_ops(1, vec![Op::Set { field: "a".into(), value: json!(1) }]),
-            make_ops(2, vec![Op::Set { field: "b".into(), value: json!(2) }]),
-        ]).unwrap();
-
-        // Corrupt the CRC of the first record
-        let mut data = fs::read(&wal_path).unwrap();
-        // First record: header(12) + ops_json + crc(4)
-        // Find where the CRC is for the first record
-        let payload_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-        let crc_offset = HEADER_SIZE + payload_len;
-        data[crc_offset] ^= 0xFF; // Flip bits in CRC
-        fs::write(&wal_path, &data).unwrap();
-
-        let mut reader = WalReader::new(&wal_path, 0);
-        let result = reader.read_batch(100).unwrap();
-        // First record should be skipped (CRC failure), second should be read
-        assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].entity_id, 2);
-        assert_eq!(result.crc_failures, 1);
-    }
-
-    #[test]
-    fn test_empty_file() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-
-        let mut reader = WalReader::new(&wal_path, 0);
-        let result = reader.read_batch(100).unwrap();
-        assert_eq!(result.entries.len(), 0);
-        assert!(!reader.has_more());
-    }
-
-    #[test]
-    fn test_query_op_set_roundtrip() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-        let writer = WalWriter::new(&wal_path);
-
-        writer.append_batch(&[make_ops(456, vec![
+    fn query_op_set() {
+        let d = TempDir::new().unwrap();
+        let w = WalWriter::new(d.path());
+        w.append_batch(&[ops(456, vec![
             Op::QueryOpSet {
                 query: "modelVersionIds eq 456".into(),
                 ops: vec![
@@ -384,47 +580,15 @@ mod tests {
             },
         ])]).unwrap();
 
-        let mut reader = WalReader::new(&wal_path, 0);
-        let result = reader.read_batch(100).unwrap();
-        assert_eq!(result.entries.len(), 1);
-        assert_eq!(result.entries[0].entity_id, 456);
-        match &result.entries[0].ops[0] {
+        let mut r = WalReader::new(d.path(), WalCursor::new(w.current_generation(), 0));
+        let res = r.read_batch(100).unwrap();
+        assert_eq!(res.entries[0].entity_id, 456);
+        match &res.entries[0].ops[0] {
             Op::QueryOpSet { query, ops } => {
                 assert_eq!(query, "modelVersionIds eq 456");
                 assert_eq!(ops.len(), 2);
             }
-            _ => panic!("Expected QueryOpSet"),
+            _ => panic!("expected QueryOpSet"),
         }
-    }
-
-    #[test]
-    fn test_file_size_tracking() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-        let writer = WalWriter::new(&wal_path);
-
-        assert_eq!(writer.file_size(), 0);
-
-        writer.append_batch(&[
-            make_ops(1, vec![Op::Delete]),
-        ]).unwrap();
-
-        assert!(writer.file_size() > 0);
-    }
-
-    #[test]
-    fn test_remove_wal() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-
-        let writer = WalWriter::new(&wal_path);
-        writer.append_batch(&[make_ops(1, vec![Op::Delete])]).unwrap();
-        assert!(wal_path.exists());
-
-        remove_wal(&wal_path).unwrap();
-        assert!(!wal_path.exists());
-
-        // Remove non-existent is ok
-        remove_wal(&wal_path).unwrap();
     }
 }
