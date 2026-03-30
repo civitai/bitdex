@@ -837,20 +837,20 @@ mod tests {
 
 /// Download all-time aggregate metrics from ClickHouse to a TSV file.
 /// Query: entityMetricDailyAgg grouped by entityId for entityType='Image'.
-/// Output: metrics.csv in stage_dir (id\treactionCount\tcommentCount\tcollectedCount).
+/// Output: metrics.tsv in stage_dir (id\treactionCount\tcommentCount\tcollectedCount).
 pub async fn download_metrics_from_clickhouse(
     stage_dir: &std::path::Path,
     ch_url: &str,
     ch_username: Option<&str>,
     ch_password: Option<&str>,
 ) -> Result<u64, String> {
-    let done_path = stage_dir.join("metrics.csv.done");
+    let done_path = stage_dir.join("metrics.tsv.done");
     if done_path.exists() {
-        eprintln!("metrics.csv already downloaded (found .done marker)");
+        eprintln!("metrics.tsv already downloaded (found .done marker)");
         return Ok(0);
     }
 
-    let csv_path = stage_dir.join("metrics.csv");
+    let csv_path = stage_dir.join("metrics.tsv");
     eprintln!("Downloading ClickHouse metrics to {} ...", csv_path.display());
 
     let query = r#"SELECT
@@ -885,20 +885,20 @@ pub async fn download_metrics_from_clickhouse(
     // Stream response to disk — don't buffer in memory (OOMKilled at 107M rows).
     let mut file = tokio::fs::File::create(&csv_path)
         .await
-        .map_err(|e| format!("create metrics.csv: {e}"))?;
+        .map_err(|e| format!("create metrics.tsv: {e}"))?;
     let mut bytes_written = 0u64;
     let mut row_count = 0u64;
     let mut stream = resp;
     while let Some(chunk) = stream.chunk().await.map_err(|e| format!("read CH chunk: {e}"))? {
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
             .await
-            .map_err(|e| format!("write metrics.csv: {e}"))?;
+            .map_err(|e| format!("write metrics.tsv: {e}"))?;
         row_count += chunk.iter().filter(|&&b| b == b'\n').count() as u64;
         bytes_written += chunk.len() as u64;
     }
     tokio::io::AsyncWriteExt::flush(&mut file)
         .await
-        .map_err(|e| format!("flush metrics.csv: {e}"))?;
+        .map_err(|e| format!("flush metrics.tsv: {e}"))?;
     eprintln!(
         "Downloaded {} metric rows from ClickHouse ({:.1} MB)",
         row_count,
