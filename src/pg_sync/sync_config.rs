@@ -713,4 +713,32 @@ triggers: []
         }
         // Skip test if file not found (CI)
     }
+
+    #[test]
+    fn test_parse_deploy_sync_config() {
+        // This test validates the DEPLOY config — the one actually used in production.
+        // Must always pass; never silently skip.
+        let yaml = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/configs/sync-config-civitai.yaml")
+        ).expect("deploy/configs/sync-config-civitai.yaml must exist");
+
+        let config = FullSyncConfig::from_yaml(&yaml)
+            .expect("deploy sync config must parse without errors");
+
+        assert_eq!(config.index, "civitai");
+        assert!(!config.dump_phases.is_empty(), "Must have dump phases");
+
+        // Verify images phase exists with correct fields
+        let images = config.dump_phases.iter().find(|p| p.name == "images")
+            .expect("Must have images dump phase");
+        assert!(images.sets_alive);
+        assert!(!images.fields.is_empty());
+        assert!(!images.computed_fields.is_empty());
+        assert!(!images.columns.is_empty(), "images must have explicit columns");
+
+        // Verify enrichment has columns
+        if let Some(enrich) = images.enrichment.first() {
+            assert!(!enrich.columns.is_empty(), "posts enrichment must have explicit columns");
+        }
+    }
 }

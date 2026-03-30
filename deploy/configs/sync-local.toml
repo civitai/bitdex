@@ -18,7 +18,7 @@ index_dir = "data/gate5-e2e/indexes/civitai"
 stage_dir = "data/load_stage"
 
 # Sync config YAML — defines dump phases, triggers, ops mappings
-sync_config_path = "docs/design/reference/sync-config-civitai.yaml"
+sync_config_path = "deploy/configs/sync-config-civitai.yaml"
 
 # PG pool size for COPY queries
 pg_pool_size = 4
