@@ -303,26 +303,43 @@ impl BitdexClient {
         dump_request: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let url = format!("{}/dumps", self.base_url);
-        let resp = self
-            .client
-            .put(&url)
-            .json(dump_request)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| format!("register_dump request failed: {e}"))?;
 
-        let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("register_dump response parse failed: {e}"))?;
+        // Retry with backoff for 503 (index not loaded yet after health check passes)
+        let mut attempts = 0u32;
+        let max_retries = 30; // up to ~5 minutes with backoff
+        loop {
+            let resp = self
+                .client
+                .put(&url)
+                .json(dump_request)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| format!("register_dump request failed: {e}"))?;
 
-        if status.is_client_error() || status.is_server_error() {
-            return Err(format!("register_dump returned {status}: {body}"));
+            let status = resp.status();
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("register_dump response parse failed: {e}"))?;
+
+            if status.as_u16() == 503 && attempts < max_retries {
+                attempts += 1;
+                let delay = std::cmp::min(2u64.pow(attempts.min(5)), 30);
+                eprintln!(
+                    "register_dump: 503 (index not loaded), retry {}/{} in {}s",
+                    attempts, max_retries, delay
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                continue;
+            }
+
+            if status.is_client_error() || status.is_server_error() {
+                return Err(format!("register_dump returned {status}: {body}"));
+            }
+
+            return Ok(body);
         }
-
-        Ok(body)
     }
 
     /// Signal that a dump file is complete via POST /dumps/{name}/loaded.

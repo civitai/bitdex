@@ -287,6 +287,26 @@ pub async fn download_phase_csvs(
     Ok(total_bytes)
 }
 
+/// Clear all .done markers in the stage directory.
+/// Called at boot to prevent stale markers from a previous run (e.g., after PVC wipe)
+/// from causing downloads to be skipped.
+pub fn clear_done_markers(stage_dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(stage_dir) {
+        let mut cleared = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("done") {
+                if std::fs::remove_file(&path).is_ok() {
+                    cleared += 1;
+                }
+            }
+        }
+        if cleared > 0 {
+            eprintln!("Cleared {cleared} stale .done markers from {}", stage_dir.display());
+        }
+    }
+}
+
 /// Recursively download enrichment lookup CSVs.
 async fn download_enrichment_csvs(
     pool: &PgPool,
