@@ -1189,12 +1189,12 @@ impl BitdexServer {
                                     if applied > 0 {
                                         wal_state.metrics.wal_ops_processed_total.inc_by(applied as u64);
                                     }
-                                    wal_state.metrics.wal_read_cursor_bytes.set(reader.cursor() as i64);
+                                    let cursor = reader.cursor();
+                                    wal_state.metrics.wal_read_cursor_bytes.set(cursor.offset as i64);
 
                                     if applied > 0 || errors > 0 {
                                         eprintln!(
-                                            "WAL reader: applied={applied} skipped={skipped} errors={errors} cursor={}",
-                                            reader.cursor()
+                                            "WAL reader: applied={applied} skipped={skipped} errors={errors} cursor={cursor}"
                                         );
                                     }
                                     if errors > 0 {
@@ -1204,22 +1204,15 @@ impl BitdexServer {
                                     }
 
                                     // Persist cursor after successful processing
-                                    if let Err(e) = crate::ops_processor::save_cursor(&cursor_path, reader.cursor()) {
+                                    if let Err(e) = crate::ops_wal::save_cursor(&cursor_path, cursor) {
                                         eprintln!("WAL reader: failed to save cursor: {e}");
                                     }
 
                                     // Update metrics
-                                    let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
                                     let m = &wal_state.metrics;
-                                    m.sync_wal_bytes
-                                        .with_label_values(&["wal-reader"])
-                                        .set(wal_size as i64);
                                     m.sync_cycle_duration_seconds
                                         .with_label_values(&["wal-reader"])
                                         .observe(cycle_start.elapsed().as_secs_f64());
-                                    m.sync_wal_pending_bytes
-                                        .with_label_values(&["wal-reader"])
-                                        .set((wal_size as i64) - (reader.cursor() as i64));
                                 } else {
                                     // No index loaded yet — sleep and retry
                                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1227,7 +1220,7 @@ impl BitdexServer {
                             }
                             Ok(_) => {
                                 // No new records — still update cursor metric so it's not stuck at 0
-                                wal_state.metrics.wal_read_cursor_bytes.set(reader.cursor() as i64);
+                                wal_state.metrics.wal_read_cursor_bytes.set(reader.cursor().offset as i64);
                                 std::thread::sleep(std::time::Duration::from_millis(50));
                             }
                             Err(e) => {
