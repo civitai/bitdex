@@ -925,10 +925,15 @@ struct ConfigPatch {
     trace_buffer_size: Option<usize>,
     /// Toggle expensive metric groups at runtime. Array of group names to enable.
     /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
+    /// DEPRECATED: Use disabled_metrics instead.
     /// If provided, ONLY listed groups are enabled (others disabled).
-    /// Omit to leave current state unchanged.
     #[serde(default)]
     enabled_metrics: Option<Vec<String>>,
+
+    /// Metric groups to DISABLE (opt-out). Default: all ON.
+    /// Takes precedence over enabled_metrics.
+    #[serde(default)]
+    disabled_metrics: Option<Vec<String>>,
 }
 
 /// Patchable fields for a filter field.
@@ -1097,17 +1102,29 @@ impl BitdexServer {
             eprintln!("Index restore took {:.2}s", restore_elapsed.as_secs_f64());
         }
 
-        // Apply persisted enabled_metrics from restored config
+        // Apply persisted metric config — disabled_metrics takes precedence over enabled_metrics
         if let Some(ref idx) = *state.index.lock() {
-            if let Some(ref groups) = idx.definition.config.enabled_metrics {
+            let config = &idx.definition.config;
+            if let Some(ref disabled) = config.disabled_metrics {
+                // Opt-out model: everything ON except what's listed
+                let bm = !disabled.iter().any(|g| g == "bitmap_memory");
+                let ev = !disabled.iter().any(|g| g == "eviction_stats");
+                let bd = !disabled.iter().any(|g| g == "boundstore_disk");
+                state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
+                state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
+                state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
+                eprintln!("Restored disabled_metrics from config: {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", disabled);
+            } else if let Some(ref groups) = config.enabled_metrics {
+                // Legacy opt-in model (deprecated)
                 let bm = groups.iter().any(|g| g == "bitmap_memory");
                 let ev = groups.iter().any(|g| g == "eviction_stats");
                 let bd = groups.iter().any(|g| g == "boundstore_disk");
                 state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
                 state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
                 state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
-                eprintln!("Restored enabled_metrics from config: {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
+                eprintln!("Restored enabled_metrics (legacy) from config: {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
             }
+            // If neither is set: all metrics default to ON (AtomicBool defaults true)
         }
 
         // Rebuild mode: delete existing bitmaps and rebuild from docstore
@@ -2042,8 +2059,19 @@ async fn handle_patch_config(
                     eprintln!("Config patch: trace_buffer_size set to {v}");
                 }
 
-                // Toggle metric groups and persist to config
-                if let Some(ref groups) = patch.enabled_metrics {
+                // Toggle metric groups — disabled_metrics takes precedence
+                if let Some(ref disabled) = patch.disabled_metrics {
+                    let bm = !disabled.iter().any(|g| g == "bitmap_memory");
+                    let ev = !disabled.iter().any(|g| g == "eviction_stats");
+                    let bd = !disabled.iter().any(|g| g == "boundstore_disk");
+                    state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
+                    state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
+                    state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
+                    idx.definition.config.disabled_metrics = Some(disabled.clone());
+                    idx.definition.config.enabled_metrics = None; // clear legacy
+                    eprintln!("Config patch: disabled_metrics = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", disabled);
+                } else if let Some(ref groups) = patch.enabled_metrics {
+                    // Legacy opt-in (deprecated)
                     let bm = groups.iter().any(|g| g == "bitmap_memory");
                     let ev = groups.iter().any(|g| g == "eviction_stats");
                     let bd = groups.iter().any(|g| g == "boundstore_disk");
@@ -2051,7 +2079,7 @@ async fn handle_patch_config(
                     state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
                     state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
                     idx.definition.config.enabled_metrics = Some(groups.clone());
-                    eprintln!("Config patch: enabled_metrics = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
+                    eprintln!("Config patch: enabled_metrics (legacy) = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
                 }
 
                 // Persist updated config

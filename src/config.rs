@@ -102,12 +102,18 @@ pub struct Config {
 
     /// Enabled metric groups. Controls which expensive metric groups are
     /// collected on the Prometheus scrape endpoint.
+    /// DEPRECATED: Use `disabled_metrics` (opt-out model) instead.
     /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
     /// When `None` (default), all groups are enabled (backward compatible).
     /// When `Some(vec)`, only the listed groups are enabled.
-    /// Persisted to config.yaml and applied on startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_metrics: Option<Vec<String>>,
+
+    /// Metric groups to DISABLE (opt-out model). Default: None = all ON.
+    /// Takes precedence over `enabled_metrics` when present.
+    /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_metrics: Option<Vec<String>>,
 
     /// Headless mode: skip all background threads (flush, merge, eviction).
     /// Used by bulk loaders that write directly to disk and don't need
@@ -184,6 +190,7 @@ impl Default for Config {
             doc_cache: DocCacheConfigEntry::default(),
             memory_scanner: MemoryScannerConfig::default(),
             enabled_metrics: None,
+            disabled_metrics: None,
             deferred_alive: None,
             memory_budget_bytes: None,
             memory_pressure_threshold: default_memory_pressure_threshold(),
