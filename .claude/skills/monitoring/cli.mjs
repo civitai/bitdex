@@ -415,18 +415,24 @@ async function syncHealth() {
   const v1Cursor = getVal(m, 'bitdex_pgsync_cursor_position');
   const v1RowsFetched = getVal(m, 'bitdex_pgsync_rows_fetched_total');
 
-  // V2 Sync
+  // V2 Sync — ingest side (PG → WAL)
   const v2Cursor = getVal(m, 'bitdex_sync_cursor_position');
   const v2MaxId = getVal(m, 'bitdex_sync_max_id');
   const v2Lag = getVal(m, 'bitdex_sync_lag_rows');
   const v2Ops = getVal(m, 'bitdex_sync_ops_total');
-  const v2WalBytes = getVal(m, 'bitdex_sync_wal_bytes');
-  const v2WalPending = getVal(m, 'bitdex_sync_wal_pending_bytes');
   const v2BatchSize = getVal(m, 'bitdex_sync_batch_size');
+
+  // V2 Sync — WAL (storage)
+  const walBytes = getVal(m, 'bitdex_sync_wal_bytes');
+  const walPending = getVal(m, 'bitdex_sync_wal_pending_bytes');
+
+  // V2 Sync — processing side (WAL → engine)
+  const walOpsProcessed = getVal(m, 'bitdex_wal_ops_processed_total');
+  const walReadCursor = getVal(m, 'bitdex_wal_read_cursor_bytes');
   const v2Errors = getVal(m, 'bitdex_pgsync_errors_total');
 
-  // V2 is active if ANY of its metrics have been set (cursor, ops, or WAL)
-  const v2Active = (v2Cursor !== null && v2Cursor > 0) || (v2Ops !== null && v2Ops > 0) || (v2WalBytes !== null && v2WalBytes > 0);
+  // V2 is active if ANY of its metrics have been set
+  const v2Active = (v2Cursor !== null && v2Cursor > 0) || (v2Ops !== null && v2Ops > 0) || (walBytes !== null && walBytes > 0);
 
   json({
     v1_pgsync: {
@@ -434,16 +440,24 @@ async function syncHealth() {
       rows_fetched: fmtNum(v1RowsFetched),
       status: v1Cursor ? 'ACTIVE' : 'INACTIVE',
     },
-    v2_sync: {
+    v2_ingest: {
       status: v2Active ? 'ACTIVE' : 'INACTIVE',
-      cursor_position: fmtNum(v2Cursor),
-      max_id: fmtNum(v2MaxId),
-      lag_rows: fmtNum(v2Lag),
+      pg_cursor: fmtNum(v2Cursor),
+      pg_max_id: fmtNum(v2MaxId),
+      pg_lag_rows: fmtNum(v2Lag),
       lag_status: v2Lag !== null ? status(v2Lag, 1000, 10000) : (v2Active ? 'OK' : 'INACTIVE'),
-      ops_processed: fmtNum(v2Ops),
+      ops_pulled: fmtNum(v2Ops),
       last_batch_size: v2BatchSize,
-      wal_size: fmt(v2WalBytes),
-      wal_pending: fmt(v2WalPending),
+    },
+    v2_wal: {
+      wal_size: fmt(walBytes),
+      wal_pending: fmt(walPending),
+      read_cursor: fmt(walReadCursor),
+      lag_status: walPending !== null ? status(walPending, 1048576, 10485760) : 'N/A',
+    },
+    v2_processing: {
+      ops_processed: fmtNum(walOpsProcessed),
+      pipeline_complete: (walOpsProcessed !== null && walOpsProcessed > 0) ? 'YES' : 'NO',
       errors: v2Errors,
     },
   });
@@ -603,6 +617,26 @@ async function backpressure() {
   });
 }
 
+async function bootTime() {
+  const m = parseMetrics(await fetchMetrics());
+
+  const totalBoot = getVal(m, 'bitdex_startup_duration_seconds');
+  const phases = getAllByLabel(m, 'bitdex_boot_phase_seconds', 'phase');
+
+  json({
+    total_boot_seconds: totalBoot,
+    total_boot: totalBoot ? fmtMs(totalBoot) : 'N/A',
+    phases: Object.fromEntries(
+      Object.entries(phases)
+        .sort(([,a], [,b]) => b - a)
+        .map(([phase, secs]) => [phase, { seconds: secs, formatted: fmtMs(secs) }])
+    ),
+    note: phases && Object.keys(phases).length > 0
+      ? 'Phases from last boot. Largest phases are optimization targets.'
+      : 'Boot phase breakdown not available (requires v1.1.x+)',
+  });
+}
+
 // --- Main ---
 
 const cmd = filteredArgs[0];
@@ -610,6 +644,7 @@ const commands = {
   overview, 'cache-health': cacheHealth, 'doc-cache': docCache,
   memory, 'query-perf': queryPerf, 'sync-health': syncHealth,
   config: configCmd, alerts, boundstore, backpressure,
+  'health-report': healthReport, 'boot-time': bootTime,
 };
 
 if (!cmd || cmd === 'help' || cmd === '--help') {
@@ -628,6 +663,8 @@ Commands:
   alerts           Threshold checks (RSS, cache, sync lag)
   boundstore       Cache persistence health
   backpressure     Concurrency, rejection, queue depth
+  health-report    Full health report (RSS, caches, sync, queries — one command)
+  boot-time        Boot phase breakdown (where the 85s goes)
 
 Flags:
   --prod           Query production (default: local on port 3001)`);
