@@ -862,14 +862,28 @@ pub async fn download_metrics_from_clickhouse(
         return Err(format!("ClickHouse returned {status}: {body}"));
     }
 
-    let mut file = std::fs::File::create(&csv_path)
+    // Stream response to disk — don't buffer in memory (OOMKilled at 107M rows).
+    let mut file = tokio::fs::File::create(&csv_path)
+        .await
         .map_err(|e| format!("create metrics.csv: {e}"))?;
-    let body = resp.bytes().await.map_err(|e| format!("read CH body: {e}"))?;
-    std::io::Write::write_all(&mut file, &body)
-        .map_err(|e| format!("write metrics.csv: {e}"))?;
-
-    let row_count = body.iter().filter(|&&b| b == b'\n').count() as u64;
-    eprintln!("Downloaded {} metric rows from ClickHouse", row_count);
+    let mut bytes_written = 0u64;
+    let mut row_count = 0u64;
+    let mut stream = resp;
+    while let Some(chunk) = stream.chunk().await.map_err(|e| format!("read CH chunk: {e}"))? {
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+            .await
+            .map_err(|e| format!("write metrics.csv: {e}"))?;
+        row_count += chunk.iter().filter(|&&b| b == b'\n').count() as u64;
+        bytes_written += chunk.len() as u64;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file)
+        .await
+        .map_err(|e| format!("flush metrics.csv: {e}"))?;
+    eprintln!(
+        "Downloaded {} metric rows from ClickHouse ({:.1} MB)",
+        row_count,
+        bytes_written as f64 / 1048576.0
+    );
 
     std::fs::write(&done_path, format!("{row_count}"))
         .map_err(|e| format!("write .done marker: {e}"))?;
