@@ -335,8 +335,11 @@ async fn run_boot_sequence(
     eprintln!("Stage dir: {}", stage_dir.display());
     std::fs::create_dir_all(stage_dir).ok();
 
-    // Clear stale .done markers from previous runs (survives PVC wipes)
-    bulk_loader::clear_done_markers(stage_dir);
+    // Clear stale .done markers from previous runs (only if configured)
+    if sync_config.clear_done_markers {
+        eprintln!("Clearing .done markers (clear_done_markers=true)");
+        bulk_loader::clear_done_markers(stage_dir);
+    }
 
     if let Some(config) = full_sync_config {
         run_streaming_pipeline(pool, sync_config, bitdex_client, config, stage_dir).await;

@@ -1092,7 +1092,20 @@ impl BitdexServer {
             #[cfg(feature = "pg-sync")]
             dump_registry: {
                 let dumps_path = self.data_dir.join("dumps.json");
-                Mutex::new(crate::pg_sync::dump::DumpRegistry::load(&dumps_path))
+                let mut reg = crate::pg_sync::dump::DumpRegistry::load(&dumps_path);
+                // Auto-clear stale dump state after PVC wipe: if dumps.json has
+                // Complete entries but no bitmaps exist, the PVC was wiped.
+                let indexes_dir = self.data_dir.join("indexes");
+                let has_bitmaps = indexes_dir.exists() && std::fs::read_dir(&indexes_dir).ok()
+                    .map(|entries| entries.filter_map(|e| e.ok())
+                        .any(|e| e.path().join("bitmaps").exists()))
+                    .unwrap_or(false);
+                if !has_bitmaps && reg.dumps.values().any(|d| d.status == crate::pg_sync::dump::DumpStatus::Complete) {
+                    eprintln!("WARNING: dumps.json has Complete entries but no bitmaps found — clearing stale dump state (PVC wipe detected)");
+                    reg = crate::pg_sync::dump::DumpRegistry::default();
+                    reg.save(&dumps_path).ok();
+                }
+                Mutex::new(reg)
             },
             #[cfg(feature = "pg-sync")]
             slot_watermark: Arc::new(std::sync::atomic::AtomicU64::new(0)),

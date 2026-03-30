@@ -63,6 +63,11 @@ pub struct PgSyncConfig {
     /// Path to the V2 sync config YAML (triggers + dump phases).
     /// If set, used for trigger reconciliation and dump pipeline.
     pub sync_config_path: Option<PathBuf>,
+
+    /// Clear .done markers from stage_dir at boot (default: false).
+    /// Set true only for fresh wipe scenarios — production can't re-download 80GB on every restart.
+    #[serde(default)]
+    pub clear_done_markers: bool,
 }
 
 fn default_index_subdir() -> String {
