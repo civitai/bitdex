@@ -277,17 +277,24 @@ async fn run_boot_sequence(
         });
     eprintln!("BitDex is healthy.");
 
-    // Step 1b: Check if server is already populated — skip dump if so.
-    // This prevents re-dumping 4.5B rows on every sidecar restart.
-    let alive_count = bitdex_client.get_alive_count().await;
-    if alive_count > 0 {
-        eprintln!(
-            "Server already populated ({alive_count} alive docs) — skipping dump pipeline. \
-             Transitioning directly to steady-state ops polling."
-        );
-        // Still run setup (triggers/tables) and seed cursor
-        run_setup(pool, full_sync_config).await;
-        return;
+    // Step 1b: Check if ALL dump phases are already complete — skip dump if so.
+    // Uses per-phase completion check via GET /dumps to avoid skipping incomplete phases.
+    // Previous alive_count > 0 check was too aggressive (skipped tools/techniques when
+    // images loaded but other phases hadn't run yet).
+    if let Some(config) = full_sync_config {
+        let all_complete = match bitdex_client.get_dumps().await {
+            Ok(resp) => resp.get("all_complete").and_then(|v| v.as_bool()).unwrap_or(false),
+            Err(_) => false,
+        };
+        if all_complete && !config.dump_phases.is_empty() {
+            let alive_count = bitdex_client.get_alive_count().await;
+            eprintln!(
+                "All dump phases complete ({alive_count} alive docs) — skipping dump pipeline. \
+                 Transitioning directly to steady-state ops polling."
+            );
+            run_setup(pool, full_sync_config).await;
+            return;
+        }
     }
 
     // Step 2: V2 setup (triggers + tables)
