@@ -2414,6 +2414,7 @@ async fn handle_query(
     }
 
     tracing::info!("[{name}] {query}");
+    state.metrics.query_filter_clause_count.observe(query.filters.len() as f64);
     let start = Instant::now();
     let m = &state.metrics;
     match engine.execute_query_traced(&query, &name) {
