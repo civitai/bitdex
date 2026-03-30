@@ -986,12 +986,17 @@ fn process_set_op<S: BitmapSink>(
         }
     }
 
-    // Check if this is a sort field
+    // Check if this is a sort field.
+    // Clear ALL bits first, then set new ones. Without clearing, a value decrease
+    // (e.g. reactionCount 100→50) would leave stale high bits from the old value.
+    // This is essential for the CH metrics poller which sends Set-only ops (no Remove).
     if let Some((arc_name, num_bits)) = meta.sort_fields.get(field) {
         if let Some(sort_val) = value_to_sort_u32(&qval) {
             for bit in 0..*num_bits {
                 if (sort_val >> bit) & 1 == 1 {
                     sink.sort_set(arc_name.clone(), bit, slot);
+                } else {
+                    sink.sort_clear(arc_name.clone(), bit, slot);
                 }
             }
         }
