@@ -135,6 +135,13 @@ pub struct Metrics {
     pub sync_cycle_duration_seconds: HistogramVec,
     pub sync_wal_pending_bytes: IntGaugeVec,
     pub sync_batch_size: IntGaugeVec,
+
+    // -- WAL read-side observability --
+    pub wal_ops_processed_total: IntCounter,
+    pub wal_read_cursor_bytes: IntGauge,
+
+    // -- Boot phase breakdown --
+    pub boot_phase_seconds: IntGaugeVec,
 }
 
 impl Metrics {
@@ -644,6 +651,20 @@ impl Metrics {
             &["source"],
         ).unwrap();
 
+        // WAL read-side observability
+        let wal_ops_processed_total = IntCounter::new(
+            "bitdex_wal_ops_processed_total", "Total ops successfully applied from WAL reader",
+        ).unwrap();
+        let wal_read_cursor_bytes = IntGauge::new(
+            "bitdex_wal_read_cursor_bytes", "WAL reader cursor position in bytes",
+        ).unwrap();
+
+        // Boot phase breakdown
+        let boot_phase_seconds = IntGaugeVec::new(
+            Opts::new("bitdex_boot_phase_seconds", "Duration of each boot phase in seconds"),
+            &["phase"],
+        ).unwrap();
+
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
         registry.register(Box::new(slot_high_water.clone())).unwrap();
@@ -757,6 +778,9 @@ impl Metrics {
         registry.register(Box::new(sync_cycle_duration_seconds.clone())).unwrap();
         registry.register(Box::new(sync_wal_pending_bytes.clone())).unwrap();
         registry.register(Box::new(sync_batch_size.clone())).unwrap();
+        registry.register(Box::new(wal_ops_processed_total.clone())).unwrap();
+        registry.register(Box::new(wal_read_cursor_bytes.clone())).unwrap();
+        registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
 
         Self {
             registry,
@@ -844,6 +868,9 @@ impl Metrics {
             sync_cycle_duration_seconds,
             sync_wal_pending_bytes,
             sync_batch_size,
+            wal_ops_processed_total,
+            wal_read_cursor_bytes,
+            boot_phase_seconds,
         }
     }
 

@@ -1169,6 +1169,12 @@ impl BitdexServer {
                                         }
                                     }
 
+                                    // WAL read-side metrics
+                                    if applied > 0 {
+                                        wal_state.metrics.wal_ops_processed_total.inc_by(applied as u64);
+                                    }
+                                    wal_state.metrics.wal_read_cursor_bytes.set(reader.cursor() as i64);
+
                                     if applied > 0 || errors > 0 {
                                         eprintln!(
                                             "WAL reader: applied={applied} skipped={skipped} errors={errors} cursor={}",
@@ -1317,10 +1323,23 @@ impl BitdexServer {
                 .as_ref()
                 .map(|s| Arc::clone(&s.engine));
             if let Some(ref engine) = engine_arc {
-                // Eager fields first (bitmaps needed for queries)
+                // Phase 5: Eager fields (bitmaps needed for queries)
+                let phase_start = std::time::Instant::now();
                 engine.preload_eager_fields();
-                // Bound cache shards (persisted cache entries)
+                let phase5_elapsed = phase_start.elapsed();
+                eprintln!("  Boot phase: eager_fields completed in {}ms", phase5_elapsed.as_millis());
+                state.metrics.boot_phase_seconds
+                    .with_label_values(&["eager_fields"])
+                    .set(phase5_elapsed.as_secs() as i64);
+
+                // Phase 6: Bound cache shards (persisted cache entries)
+                let phase_start = std::time::Instant::now();
                 engine.preload_bound_cache();
+                let phase6_elapsed = phase_start.elapsed();
+                eprintln!("  Boot phase: bound_cache completed in {}ms", phase6_elapsed.as_millis());
+                state.metrics.boot_phase_seconds
+                    .with_label_values(&["bound_cache"])
+                    .set(phase6_elapsed.as_secs() as i64);
             }
         }
 
@@ -1390,26 +1409,41 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             None => continue,
         };
 
+        // Phase 1: Config loading
+        let phase_start = std::time::Instant::now();
         let mut def: IndexDefinition = IndexDefinition::from_file(&config_path)?;
+        let phase1_elapsed = phase_start.elapsed();
+        eprintln!("  Boot phase: config_load completed in {}ms", phase1_elapsed.as_millis());
+        state.metrics.boot_phase_seconds
+            .with_label_values(&["config_load"])
+            .set(phase1_elapsed.as_secs() as i64);
 
-        // Load LowCardinalityString dictionaries from disk
+        // Phase 2: Engine creation
+        let phase_start = std::time::Instant::now();
         let bitmap_path = path.join("bitmaps");
+        let docstore_path = path.join("docs");
+        let mut config = def.config.clone();
+        config.storage.bitmap_path = Some(bitmap_path.clone());
+
+        // Always use new_with_path so bitmaps restore from bitmap_path even if
+        // docstore doesn't exist yet (it will be created fresh).
+        let mut engine = ConcurrentEngine::new_with_path(config, &docstore_path)
+            .map_err(|e| e.to_string())?;
+        let phase2_elapsed = phase_start.elapsed();
+        eprintln!("  Boot phase: engine_create completed in {}ms", phase2_elapsed.as_millis());
+        state.metrics.boot_phase_seconds
+            .with_label_values(&["engine_create"])
+            .set(phase2_elapsed.as_secs() as i64);
+
+        // Phase 3: Dictionary loading
+        let phase_start = std::time::Instant::now();
+        // Load LowCardinalityString dictionaries from disk
         let lcs_dicts = ConcurrentEngine::load_dictionaries(&def.data_schema, &bitmap_path)
             .map_err(|e| e.to_string())?;
 
         // Build reverse maps BEFORE normalization to preserve original casing
         let reverse_maps = build_reverse_string_maps_with_dicts(&def.data_schema, Some(&lcs_dicts));
         def.data_schema.normalize_string_maps();
-
-        // Create engine from persisted config
-        let docstore_path = path.join("docs");
-        let mut config = def.config.clone();
-        config.storage.bitmap_path = Some(bitmap_path);
-
-        // Always use new_with_path so bitmaps restore from bitmap_path even if
-        // docstore doesn't exist yet (it will be created fresh).
-        let mut engine = ConcurrentEngine::new_with_path(config, &docstore_path)
-            .map_err(|e| e.to_string())?;
 
         // Set docstore field defaults for write-side elision
         engine.set_docstore_defaults(&def.data_schema);
@@ -1427,7 +1461,14 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         if !cs_fields.is_empty() {
             engine.set_case_sensitive_fields(cs_fields);
         }
+        let phase3_elapsed = phase_start.elapsed();
+        eprintln!("  Boot phase: dictionary_load completed in {}ms", phase3_elapsed.as_millis());
+        state.metrics.boot_phase_seconds
+            .with_label_values(&["dictionary_load"])
+            .set(phase3_elapsed.as_secs() as i64);
 
+        // Phase 4: Metrics bridge wiring
+        let phase_start = std::time::Instant::now();
         // Wire Prometheus metrics bridge into the engine's background threads.
         engine.set_metrics_bridge(crate::concurrent_engine::MetricsBridge {
             lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
@@ -1435,6 +1476,11 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             compaction_duration: state.metrics.compaction_duration_seconds.clone(),
             index_name: def.name.clone(),
         });
+        let phase4_elapsed = phase_start.elapsed();
+        eprintln!("  Boot phase: metrics_bridge completed in {}ms", phase4_elapsed.as_millis());
+        state.metrics.boot_phase_seconds
+            .with_label_values(&["metrics_bridge"])
+            .set(phase4_elapsed.as_secs() as i64);
 
         let alive = engine.alive_count();
         eprintln!(
