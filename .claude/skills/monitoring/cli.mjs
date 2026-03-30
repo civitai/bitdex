@@ -422,6 +422,11 @@ async function syncHealth() {
   const v2Ops = getVal(m, 'bitdex_sync_ops_total');
   const v2WalBytes = getVal(m, 'bitdex_sync_wal_bytes');
   const v2WalPending = getVal(m, 'bitdex_sync_wal_pending_bytes');
+  const v2BatchSize = getVal(m, 'bitdex_sync_batch_size');
+  const v2Errors = getVal(m, 'bitdex_pgsync_errors_total');
+
+  // V2 is active if ANY of its metrics have been set (cursor, ops, or WAL)
+  const v2Active = (v2Cursor !== null && v2Cursor > 0) || (v2Ops !== null && v2Ops > 0) || (v2WalBytes !== null && v2WalBytes > 0);
 
   json({
     v1_pgsync: {
@@ -430,13 +435,16 @@ async function syncHealth() {
       status: v1Cursor ? 'ACTIVE' : 'INACTIVE',
     },
     v2_sync: {
+      status: v2Active ? 'ACTIVE' : 'INACTIVE',
       cursor_position: fmtNum(v2Cursor),
       max_id: fmtNum(v2MaxId),
       lag_rows: fmtNum(v2Lag),
-      lag_status: v2Lag !== null ? status(v2Lag, 1000, 10000) : 'INACTIVE',
+      lag_status: v2Lag !== null ? status(v2Lag, 1000, 10000) : (v2Active ? 'OK' : 'INACTIVE'),
       ops_processed: fmtNum(v2Ops),
+      last_batch_size: v2BatchSize,
       wal_size: fmt(v2WalBytes),
       wal_pending: fmt(v2WalPending),
+      errors: v2Errors,
     },
   });
 }
