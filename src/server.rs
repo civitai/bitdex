@@ -4470,6 +4470,14 @@ async fn handle_ops(
     }
 
     let ops_count = batch.ops.len();
+
+    // Record batch size metric
+    if let Some(meta) = &batch.meta {
+        state.metrics.sync_batch_size
+            .with_label_values(&[meta.source.as_str()])
+            .set(ops_count as i64);
+    }
+
     if ops_count == 0 {
         return (StatusCode::OK, Json(serde_json::json!({"accepted": 0}))).into_response();
     }
