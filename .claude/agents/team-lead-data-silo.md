@@ -79,3 +79,19 @@ Only after benchmarks validate the design:
 - **Done with proof** — every benchmark has goal vs actual, every task has evidence
 - **Send results to Dakota** — benchmark data, design changes, session IDs for review
 - Read `docs/guide/team-standards.md` for the full design process
+
+## Lessons Learned (V3 Session, 2026-03-30)
+
+These rules come from a post-mortem where 30+ commits and 130+ tests passed per-component review, but the 107M dump ran 82% slower than V2 because of integration-level mistakes.
+
+1. **Run an integration benchmark at 10M before committing to 107M.** Unit tests and per-component benchmarks don't catch API mismatch at the seam between components. A 10M integration run would have caught the put() vs bulk_load() mistake in minutes instead of hours.
+
+2. **When reviewing a sink/adapter, explicitly verify which API the callsite uses.** `V3BitmapLoadSink.flush_to()` called `silo.put()` (single-entry steady-state path) instead of `silo.bulk_load()` (parallel multi-threaded dump path). The design doc benchmarked bulk_load at 5.53M/s. The dump pipeline never called it. Always ask: "does this sink call the fast path or the slow path?"
+
+3. **V3-only means zero V2 writes.** Dual-write wrappers (V3 first, then V2 runs normally) double I/O and make performance comparison impossible. When validating V3, disable V2 writes entirely. This is a pre-validation checklist item.
+
+4. **Document V2 baseline numbers in the plan before validation begins.** Without a baseline recorded before the run, you can't objectively compare. Measure V2 dump time first, record it, then run V3.
+
+5. **Cancel any long run where the save phase is longer than the row-processing phase.** If CSV parsing runs at 375K/s but save-to-disk is catastrophically slower, something is fundamentally wrong. Don't wait for 107M to finish — kill it, diagnose, fix.
+
+**Source:** `docs/reviews/edward-v3-session-review.md`
