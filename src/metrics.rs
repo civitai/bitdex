@@ -6,8 +6,8 @@
 //! on each scrape (collect-on-scrape pattern).
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 /// All BitDex Prometheus metrics.
@@ -26,6 +26,7 @@ pub struct Metrics {
     pub query_filter_seconds: HistogramVec,
     pub query_sort_seconds: HistogramVec,
     pub query_docs_seconds: HistogramVec,
+    pub query_filter_clause_count: Histogram,
 
     // -- Cache --
     pub cache_hits_total: IntGaugeVec,
@@ -223,6 +224,14 @@ impl Metrics {
             HistogramOpts::new("bitdex_query_docs_seconds", "Document fetch from disk time")
                 .buckets(phase_buckets),
             &["index"],
+        ).unwrap();
+
+        let query_filter_clause_count = Histogram::with_opts(
+            HistogramOpts::new(
+                "bitdex_query_filter_clause_count",
+                "Number of filter clauses (ANDs) per query",
+            )
+            .buckets(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]),
         ).unwrap();
 
         let cache_hits_total = IntGaugeVec::new(
@@ -680,6 +689,7 @@ impl Metrics {
         registry.register(Box::new(query_filter_seconds.clone())).unwrap();
         registry.register(Box::new(query_sort_seconds.clone())).unwrap();
         registry.register(Box::new(query_docs_seconds.clone())).unwrap();
+        registry.register(Box::new(query_filter_clause_count.clone())).unwrap();
         registry
             .register(Box::new(cache_hits_total.clone()))
             .unwrap();
@@ -794,6 +804,7 @@ impl Metrics {
             query_filter_seconds,
             query_sort_seconds,
             query_docs_seconds,
+            query_filter_clause_count,
             cache_hits_total,
             cache_misses_total,
             cache_inserts_total,
