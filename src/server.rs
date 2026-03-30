@@ -4779,6 +4779,21 @@ async fn handle_register_dump(
                 Ok(Ok(phase_result)) => {
                     let row_count = phase_result.row_count;
 
+                    // Fail if 0 rows processed — likely a header/column mismatch bug.
+                    // Don't mark as complete so the sidecar can retry.
+                    if row_count == 0 {
+                        let msg = format!("dump '{}' processed 0 rows — possible CSV header/column mismatch", dump_name_inner);
+                        eprintln!("WARNING: {msg}");
+                        tasks.set_error(task_id, msg.clone());
+                        let mut reg = state_clone.dump_registry.lock();
+                        if let Some(entry) = reg.dumps.get_mut(&dump_name_inner) {
+                            entry.status = crate::pg_sync::dump::DumpStatus::Failed(msg);
+                        }
+                        let dumps_path = state_clone.data_dir.join("dumps.json");
+                        reg.save(&dumps_path).ok();
+                        return;
+                    }
+
                     // Reload fields only for the alive phase (images).
                     // Other phases just save to disk — fields get loaded lazily on first query.
                     if phase_sets_alive {
