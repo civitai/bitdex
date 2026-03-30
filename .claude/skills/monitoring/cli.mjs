@@ -617,6 +617,46 @@ async function backpressure() {
   });
 }
 
+async function healthReport() {
+  const m = parseMetrics(await fetchMetrics());
+
+  const POD_LIMIT = 32e9;
+  const rss = getVal(m, 'bitdex_process_rss_bytes');
+  const rssPeak = getVal(m, 'bitdex_process_rss_peak_bytes');
+  const alive = getVal(m, 'bitdex_alive_documents');
+  const queryTotal = getVal(m, 'bitdex_query_total');
+  const inFlight = getVal(m, 'bitdex_queries_in_flight');
+  const rejected = getVal(m, 'bitdex_queries_rejected_total');
+  const cacheHits = getVal(m, 'bitdex_cache_hits_total');
+  const cacheMisses = getVal(m, 'bitdex_cache_misses_total');
+  const cacheEntries = getVal(m, 'bitdex_cache_entries');
+  const cacheBytes = getVal(m, 'bitdex_cache_bytes');
+  const cacheHitRate = (cacheHits && cacheMisses != null) ? cacheHits / (cacheHits + cacheMisses) : null;
+  const docHits = getVal(m, 'bitdex_doc_cache_hit_total');
+  const docMisses = getVal(m, 'bitdex_doc_cache_miss_total');
+  const docEntries = getVal(m, 'bitdex_doc_cache_entries');
+  const docBytes = getVal(m, 'bitdex_doc_cache_bytes');
+  const docEvictions = getVal(m, 'bitdex_doc_cache_evictions_total');
+  const docHitRate = (docHits && docMisses != null) ? docHits / (docHits + docMisses) : null;
+  const evictions = getVal(m, 'bitdex_cache_evictions_total');
+  const v1Cursor = getVal(m, 'bitdex_pgsync_cursor_position');
+  const v2Cursor = getVal(m, 'bitdex_sync_cursor_position');
+  const v2Lag = getVal(m, 'bitdex_sync_lag_rows');
+  const walOpsProcessed = getVal(m, 'bitdex_wal_ops_processed_total');
+  const rssPercent = rss ? rss / POD_LIMIT : null;
+
+  json({
+    timestamp: new Date().toISOString(),
+    source: isProd ? 'production' : 'local',
+    pod: { rss: fmt(rss), rss_peak: fmt(rssPeak), rss_percent: pct(rssPercent), rss_status: status(rssPercent, 0.80, 0.87), pod_limit: fmt(POD_LIMIT) },
+    documents: { alive: fmtNum(alive) },
+    queries: { total: fmtNum(queryTotal), in_flight: inFlight, rejected: rejected },
+    unified_cache: { hit_rate: pct(cacheHitRate), entries: fmtNum(cacheEntries), memory: fmt(cacheBytes), evictions: fmtNum(evictions) },
+    doc_cache: { hit_rate: pct(docHitRate), entries: fmtNum(docEntries), memory: fmt(docBytes), evictions: fmtNum(docEvictions) },
+    sync: { v1_cursor: fmtNum(v1Cursor), v2_cursor: fmtNum(v2Cursor), v2_lag: fmtNum(v2Lag), wal_ops_processed: fmtNum(walOpsProcessed) },
+  });
+}
+
 async function bootTime() {
   const m = parseMetrics(await fetchMetrics());
 
