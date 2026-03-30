@@ -148,6 +148,10 @@ harness = false
 name = "bound_store_bench"
 harness = false
 
+[[bench]]
+name = "deterministic_offset"
+harness = false
+
 [[bin]]
 name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"
