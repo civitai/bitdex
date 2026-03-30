@@ -109,119 +109,91 @@ fn main() {
         .map(|m| FrozenRoaringBitmap::view(&m[..]).unwrap())
         .collect();
 
-    // Build query plan: random selection of 3 bitmaps per query
+    // Run tests with varying query complexity
     let cold_queries_per_sec = (QUERIES_PER_SEC as f64 * CACHE_MISS_RATE) as usize;
     let total_queries = cold_queries_per_sec * TEST_DURATION_SECS as usize;
-
-    let query_plans: Vec<[usize; BITMAPS_PER_QUERY]> = {
-        let mut rng: u64 = 0xCAFE;
-        (0..total_queries).map(|_| {
-            let mut plan = [0usize; BITMAPS_PER_QUERY];
-            for slot in &mut plan {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                *slot = (rng >> 32) as usize % NUM_BITMAPS;
-            }
-            plan
-        }).collect()
-    };
-    let query_plans = Arc::new(query_plans);
-
-    // -----------------------------------------------------------------------
-    // Test 1: Frozen mmap'd bitmaps (to_owned + AND per query)
-    // -----------------------------------------------------------------------
-    println!("--- Test 1: Frozen mmap (to_owned + AND) ---");
     let frozen_views_ref = &frozen_views;
-    let plans1 = Arc::clone(&query_plans);
-
-    let frozen_latencies: Vec<Duration> = {
-        let num_threads = cold_queries_per_sec.min(rayon::current_num_threads());
-        let chunk = (total_queries + num_threads - 1) / num_threads;
-
-        let results: Vec<Vec<Duration>> = (0..num_threads).into_iter().map(|t| {
-            let start_q = t * chunk;
-            let end_q = ((t + 1) * chunk).min(total_queries);
-            let mut lats = Vec::with_capacity(end_q - start_q);
-            for q in start_q..end_q {
-                let plan = &plans1[q];
-                let start = Instant::now();
-                // to_owned + AND chain (simulates cache-miss query)
-                let mut result = frozen_views_ref[plan[0]].to_owned();
-                for &idx in &plan[1..] {
-                    let owned = frozen_views_ref[idx].to_owned();
-                    result &= owned;
-                }
-                let _ = result.len(); // force evaluation
-                lats.push(start.elapsed());
-            }
-            lats
-        }).collect();
-
-        results.into_iter().flatten().collect()
-    };
-
-    let mut sorted_frozen = frozen_latencies.clone();
-    sorted_frozen.sort();
-    println!("  Queries: {}  Threads: {}", total_queries, cold_queries_per_sec.min(rayon::current_num_threads()));
-    println!("  p50:  {:>8.0}μs", percentile(&sorted_frozen, 50.0).as_nanos() as f64 / 1000.0);
-    println!("  p95:  {:>8.0}μs", percentile(&sorted_frozen, 95.0).as_nanos() as f64 / 1000.0);
-    println!("  p99:  {:>8.0}μs", percentile(&sorted_frozen, 99.0).as_nanos() as f64 / 1000.0);
-    println!("  mean: {:>8.0}μs", sorted_frozen.iter().map(|d| d.as_nanos()).sum::<u128>() as f64 / sorted_frozen.len() as f64 / 1000.0);
-    println!();
-
-    // -----------------------------------------------------------------------
-    // Test 2: Heap-resident bitmaps (current approach — AND via reference)
-    // -----------------------------------------------------------------------
-    println!("--- Test 2: Heap-resident bitmaps (AND by ref) ---");
     let heap_bitmaps_ref = &heap_bitmaps;
-    let plans2 = Arc::clone(&query_plans);
 
-    let heap_latencies: Vec<Duration> = {
-        let num_threads = cold_queries_per_sec.min(rayon::current_num_threads());
-        let chunk = (total_queries + num_threads - 1) / num_threads;
+    println!("  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "ANDs", "Frz p50", "Frz p95", "Frz p99", "Heap p50", "Heap p95", "Heap p99");
+    println!("  {}", "-".repeat(78));
 
-        let results: Vec<Vec<Duration>> = (0..num_threads).into_iter().map(|t| {
-            let start_q = t * chunk;
-            let end_q = ((t + 1) * chunk).min(total_queries);
-            let mut lats = Vec::with_capacity(end_q - start_q);
-            for q in start_q..end_q {
-                let plan = &plans2[q];
-                let start = Instant::now();
-                // AND by reference (current BitDex approach via Arc<RoaringBitmap>)
-                let mut result = heap_bitmaps_ref[plan[0]].clone();
-                for &idx in &plan[1..] {
-                    result &= &heap_bitmaps_ref[idx];
+    for bitmaps_per_query in [3usize, 6, 8] {
+        // Build query plans
+        let query_plans: Vec<Vec<usize>> = {
+            let mut rng: u64 = 0xCAFE + bitmaps_per_query as u64;
+            (0..total_queries).map(|_| {
+                (0..bitmaps_per_query).map(|_| {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (rng >> 32) as usize % NUM_BITMAPS
+                }).collect()
+            }).collect()
+        };
+
+        // Frozen test
+        let frozen_latencies: Vec<Duration> = {
+            let num_threads = cold_queries_per_sec.min(rayon::current_num_threads());
+            let chunk = (total_queries + num_threads - 1) / num_threads;
+            let results: Vec<Vec<Duration>> = (0..num_threads).into_iter().map(|t| {
+                let start_q = t * chunk;
+                let end_q = ((t + 1) * chunk).min(total_queries);
+                let mut lats = Vec::with_capacity(end_q - start_q);
+                for q in start_q..end_q {
+                    let plan = &query_plans[q];
+                    let start = Instant::now();
+                    let mut result = frozen_views_ref[plan[0]].to_owned();
+                    for &idx in &plan[1..] {
+                        let owned = frozen_views_ref[idx].to_owned();
+                        result &= owned;
+                    }
+                    let _ = result.len();
+                    lats.push(start.elapsed());
                 }
-                let _ = result.len();
-                lats.push(start.elapsed());
-            }
-            lats
-        }).collect();
+                lats
+            }).collect();
+            results.into_iter().flatten().collect()
+        };
 
-        results.into_iter().flatten().collect()
-    };
+        // Heap test
+        let heap_latencies: Vec<Duration> = {
+            let num_threads = cold_queries_per_sec.min(rayon::current_num_threads());
+            let chunk = (total_queries + num_threads - 1) / num_threads;
+            let results: Vec<Vec<Duration>> = (0..num_threads).into_iter().map(|t| {
+                let start_q = t * chunk;
+                let end_q = ((t + 1) * chunk).min(total_queries);
+                let mut lats = Vec::with_capacity(end_q - start_q);
+                for q in start_q..end_q {
+                    let plan = &query_plans[q];
+                    let start = Instant::now();
+                    let mut result = heap_bitmaps_ref[plan[0]].clone();
+                    for &idx in &plan[1..] {
+                        result &= &heap_bitmaps_ref[idx];
+                    }
+                    let _ = result.len();
+                    lats.push(start.elapsed());
+                }
+                lats
+            }).collect();
+            results.into_iter().flatten().collect()
+        };
 
-    let mut sorted_heap = heap_latencies.clone();
-    sorted_heap.sort();
-    println!("  Queries: {}  Threads: {}", total_queries, cold_queries_per_sec.min(rayon::current_num_threads()));
-    println!("  p50:  {:>8.0}μs", percentile(&sorted_heap, 50.0).as_nanos() as f64 / 1000.0);
-    println!("  p95:  {:>8.0}μs", percentile(&sorted_heap, 95.0).as_nanos() as f64 / 1000.0);
-    println!("  p99:  {:>8.0}μs", percentile(&sorted_heap, 99.0).as_nanos() as f64 / 1000.0);
-    println!("  mean: {:>8.0}μs", sorted_heap.iter().map(|d| d.as_nanos()).sum::<u128>() as f64 / sorted_heap.len() as f64 / 1000.0);
+        let mut sf = frozen_latencies.clone(); sf.sort();
+        let mut sh = heap_latencies.clone(); sh.sort();
+
+        println!("  {:>6}  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs  {:>8.0}μs",
+            bitmaps_per_query,
+            percentile(&sf, 50.0).as_nanos() as f64 / 1000.0,
+            percentile(&sf, 95.0).as_nanos() as f64 / 1000.0,
+            percentile(&sf, 99.0).as_nanos() as f64 / 1000.0,
+            percentile(&sh, 50.0).as_nanos() as f64 / 1000.0,
+            percentile(&sh, 95.0).as_nanos() as f64 / 1000.0,
+            percentile(&sh, 99.0).as_nanos() as f64 / 1000.0,
+        );
+    }
+
     println!();
-
-    // -----------------------------------------------------------------------
-    // Comparison
-    // -----------------------------------------------------------------------
-    println!("--- Comparison ---");
-    let frozen_p50 = percentile(&sorted_frozen, 50.0).as_nanos() as f64 / 1000.0;
-    let heap_p50 = percentile(&sorted_heap, 50.0).as_nanos() as f64 / 1000.0;
-    let frozen_p99 = percentile(&sorted_frozen, 99.0).as_nanos() as f64 / 1000.0;
-    let heap_p99 = percentile(&sorted_heap, 99.0).as_nanos() as f64 / 1000.0;
-    println!("  {:>20}  {:>10}  {:>10}  {:>8}", "", "Frozen", "Heap", "Ratio");
-    println!("  {:>20}  {:>8.0}μs  {:>8.0}μs  {:>7.2}x", "p50", frozen_p50, heap_p50, frozen_p50 / heap_p50.max(0.001));
-    println!("  {:>20}  {:>8.0}μs  {:>8.0}μs  {:>7.2}x", "p99", frozen_p99, heap_p99, frozen_p99 / heap_p99.max(0.001));
-    println!("  {:>20}  {:>10}  {:>10}", "Heap memory", "0 bytes", "6.5 GB");
-    println!("  {:>20}  {:>10}  {:>10}", "Startup cost", "~200μs", "seconds");
+    println!("  Memory: Frozen=0 bytes  Heap=6.5 GB  Startup: Frozen=~200μs  Heap=seconds");
     println!();
 
     // Cleanup
