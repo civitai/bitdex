@@ -256,6 +256,37 @@ pub async fn download_from_sync_config(
     Ok(())
 }
 
+/// Download CSVs for a single dump phase (main table + enrichment lookups).
+/// Used by the streaming pipeline to download per-phase instead of all-at-once.
+pub async fn download_phase_csvs(
+    pool: &PgPool,
+    stage_dir: &std::path::Path,
+    phase: &super::sync_config::DumpPhase,
+) -> Result<u64, String> {
+    std::fs::create_dir_all(stage_dir)
+        .map_err(|e| format!("create stage dir: {e}"))?;
+
+    let mut total_bytes = 0u64;
+
+    if phase.source.as_deref() == Some("clickhouse") {
+        return Ok(0); // ClickHouse handled separately
+    }
+
+    // Download the main table CSV
+    if let Some(ref copy_query) = phase.copy_query {
+        let ext = if phase.format == "tsv" { "tsv" } else { "csv" };
+        let filename = format!("{}.{}", phase.name, ext);
+        let header = if !phase.columns.is_empty() { Some(&phase.columns) } else { None };
+        let bytes = download_copy_query(pool, stage_dir, &phase.name, &filename, copy_query, header).await?;
+        total_bytes += bytes;
+    }
+
+    // Download enrichment lookup CSVs
+    download_enrichment_csvs(pool, stage_dir, &phase.enrichment).await?;
+
+    Ok(total_bytes)
+}
+
 /// Recursively download enrichment lookup CSVs.
 async fn download_enrichment_csvs(
     pool: &PgPool,

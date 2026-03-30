@@ -325,49 +325,21 @@ async fn run_boot_sequence(
         }
     }
 
-    // Step 5: Download CSVs from PG
+    // Step 5+6: Per-phase streaming — download CSV then immediately process each phase.
+    // This overlaps the next phase's download with the current phase's dump processing.
     eprintln!("Stage dir: {}", stage_dir.display());
     std::fs::create_dir_all(stage_dir).ok();
 
     if let Some(config) = full_sync_config {
-        // V2: config-driven download using copy_query from each dump phase
-        bulk_loader::download_from_sync_config(pool, stage_dir, &config.dump_phases)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("Config-driven CSV download failed: {e}");
-                std::process::exit(1);
-            });
+        run_streaming_pipeline(pool, sync_config, bitdex_client, config, stage_dir).await;
     } else {
-        // V1 fallback: hardcoded table list
+        // V1 fallback: download all then process manually
         bulk_loader::download_all_tables(pool, stage_dir)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("CSV download failed: {e}");
                 std::process::exit(1);
             });
-    }
-
-    // Download ClickHouse metrics CSV (separate from PG COPY)
-    if let Some(ref ch_url) = sync_config.clickhouse_url {
-        let _ = bulk_loader::download_metrics_from_clickhouse(
-            stage_dir,
-            ch_url,
-            sync_config.clickhouse_username.as_deref(),
-            sync_config.clickhouse_password.as_deref(),
-        )
-        .await
-        .map_err(|e| {
-            eprintln!("WARNING: ClickHouse metrics download failed: {e}");
-            eprintln!("Continuing without metrics — sort by reactionCount will use zeros");
-        });
-    }
-
-    eprintln!("=== CSV download complete ===");
-
-    // Steps 6-9: Register dumps with BitDex and poll for completion
-    if let Some(config) = full_sync_config {
-        run_dump_pipeline(bitdex_client, config, stage_dir).await;
-    } else {
         eprintln!("No sync config YAML — skipping dump pipeline.");
         eprintln!("CSVs staged at: {}. Use /dumps endpoint manually.", stage_dir.display());
     }
@@ -484,6 +456,152 @@ async fn run_dump_pipeline(
     }
 
     eprintln!("=== All {completed}/{total} dumps complete ===");
+}
+
+/// Streaming pipeline: download + process each phase immediately.
+/// Prefetches the next phase's CSVs while the current dump is processing.
+async fn run_streaming_pipeline(
+    pool: &sqlx::PgPool,
+    sync_config: &PgSyncConfig,
+    bitdex_client: &BitdexClient,
+    config: &FullSyncConfig,
+    stage_dir: &Path,
+) {
+    let total = config.dump_phases.len();
+    let start = std::time::Instant::now();
+
+    // Download ClickHouse metrics CSV in background (separate from PG COPY)
+    let ch_handle = if let Some(ref ch_url) = sync_config.clickhouse_url {
+        let ch_url = ch_url.clone();
+        let stage = stage_dir.to_path_buf();
+        let user = sync_config.clickhouse_username.clone();
+        let pass = sync_config.clickhouse_password.clone();
+        Some(tokio::spawn(async move {
+            let _ = bulk_loader::download_metrics_from_clickhouse(
+                &stage, &ch_url, user.as_deref(), pass.as_deref(),
+            ).await.map_err(|e| {
+                eprintln!("WARNING: ClickHouse metrics download failed: {e}");
+            });
+        }))
+    } else {
+        None
+    };
+
+    // Check existing dump status for skip logic
+    let existing_dumps = bitdex_client.get_dumps().await.ok();
+    let completed_set: std::collections::HashSet<String> = existing_dumps
+        .as_ref()
+        .and_then(|d| d.get("dumps"))
+        .and_then(|d| d.as_object())
+        .map(|map| {
+            map.iter()
+                .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) == Some("Complete"))
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut completed = 0;
+    let mut prefetch_handle: Option<tokio::task::JoinHandle<Result<u64, String>>> = None;
+
+    for (i, phase) in config.dump_phases.iter().enumerate() {
+        let name = phase.dump_name();
+
+        if completed_set.contains(&name) {
+            eprintln!("[{}/{}] Dump '{name}' already complete — skipping", i + 1, total);
+            completed += 1;
+            continue;
+        }
+
+        // Wait for prefetch from previous iteration (if any)
+        if let Some(handle) = prefetch_handle.take() {
+            match handle.await {
+                Ok(Ok(bytes)) => eprintln!("  Prefetch complete: {:.1} MB", bytes as f64 / 1048576.0),
+                Ok(Err(e)) => eprintln!("  Prefetch failed: {e}"),
+                Err(e) => eprintln!("  Prefetch task panicked: {e}"),
+            }
+        }
+
+        // Download this phase's CSVs (if not already prefetched)
+        eprintln!("[{}/{}] Downloading '{}'...", i + 1, total, phase.name);
+        match bulk_loader::download_phase_csvs(pool, stage_dir, phase).await {
+            Ok(bytes) => eprintln!("  Downloaded {:.1} MB", bytes as f64 / 1048576.0),
+            Err(e) => {
+                eprintln!("FATAL: CSV download for '{}' failed: {e}", phase.name);
+                std::process::exit(1);
+            }
+        }
+
+        // Start prefetching the NEXT phase's CSVs while this dump processes
+        if i + 1 < config.dump_phases.len() {
+            let next_phase = config.dump_phases[i + 1].clone();
+            let pool_clone = pool.clone();
+            let stage = stage_dir.to_path_buf();
+            prefetch_handle = Some(tokio::spawn(async move {
+                bulk_loader::download_phase_csvs(&pool_clone, &stage, &next_phase).await
+            }));
+        }
+
+        // Check CSV exists
+        let csv_ext = if phase.format == "tsv" { "tsv" } else { "csv" };
+        let csv_path = stage_dir.join(format!("{}.{}", phase.name, csv_ext));
+        if !csv_path.exists() {
+            if phase.source.as_deref() == Some("clickhouse") {
+                let tsv_path = stage_dir.join(format!("{}.tsv", phase.name));
+                if !tsv_path.exists() {
+                    eprintln!("[{}/{}] WARNING: Skipping '{name}' — CSV not found", i + 1, total);
+                    continue;
+                }
+            } else {
+                eprintln!("[{}/{}] WARNING: Skipping '{name}' — {} not found", i + 1, total, csv_path.display());
+                continue;
+            }
+        }
+
+        // Register dump with BitDex
+        let dump_request = phase.to_dump_request(stage_dir);
+        eprintln!("[{}/{}] Registering dump '{name}'...", i + 1, total);
+        match bitdex_client.register_dump(&dump_request).await {
+            Ok(resp) => eprintln!("  Registered: {}", serde_json::to_string(&resp).unwrap_or_default()),
+            Err(e) => {
+                eprintln!("FATAL: Failed to register dump '{name}': {e}");
+                std::process::exit(1);
+            }
+        }
+        match bitdex_client.signal_dump_loaded(&name, 0).await {
+            Ok(_) => eprintln!("  Signaled loaded: {name}"),
+            Err(e) => {
+                eprintln!("FATAL: Failed to signal dump loaded '{name}': {e}");
+                std::process::exit(1);
+            }
+        }
+
+        // Wait for this dump to complete
+        eprintln!("  Waiting for '{name}' to complete...");
+        bitdex_client
+            .poll_dumps_until_complete(&[name.clone()], 5, 3600)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("FATAL: Dump '{name}' failed: {e}");
+                std::process::exit(1);
+            });
+        eprintln!("  Dump '{name}' complete.");
+        completed += 1;
+    }
+
+    // Wait for any remaining prefetch
+    if let Some(handle) = prefetch_handle {
+        let _ = handle.await;
+    }
+    // Wait for ClickHouse download
+    if let Some(handle) = ch_handle {
+        let _ = handle.await;
+    }
+
+    eprintln!(
+        "=== Streaming pipeline complete: {completed}/{total} dumps in {:.1}s ===",
+        start.elapsed().as_secs_f64(),
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -31,21 +31,9 @@ bitdex:
 
 dump_phases:
 
-  # Phase 1: Tags (63GB, largest — process first, free memory)
-  - name: tags
-    table: TagsOnImageNew
-    copy_query: >
-      COPY (SELECT "tagId", "imageId", "attributes"
-            FROM "TagsOnImageNew")
-      TO STDOUT WITH (FORMAT csv)
-    columns: [tagId, imageId, attributes]
-    slot_field: imageId
-    fields:
-      - { column: tagId, target: tagIds }
-    filter: "(attributes >> 10) & 1 = 0"  # skip disabled tags
-    # Note: filter is optional — if column missing from CSV, skip filter (include all)
-
-  # Phase 2: Images (14GB, primary entity)
+  # Phase 1: Images (14GB, primary entity — loaded first for earliest query readiness)
+  # NOTE: Images before tags so the server can serve real queries while
+  # the 63GB tags phase is still downloading/processing.
   - name: images
     table: Image
     copy_query: >
@@ -107,6 +95,19 @@ dump_phases:
             expression: "publishedAtSecs != null"
     # sortAt = GREATEST(existedAt, publishedAt) is defined in index config
     # as a computed sort field — BitDex resolves it automatically.
+
+  # Phase 2: Tags (63GB, largest — loaded after images so server can serve queries)
+  - name: tags
+    table: TagsOnImageNew
+    copy_query: >
+      COPY (SELECT "tagId", "imageId", "attributes"
+            FROM "TagsOnImageNew")
+      TO STDOUT WITH (FORMAT csv)
+    columns: [tagId, imageId, attributes]
+    slot_field: imageId
+    fields:
+      - { column: tagId, target: tagIds }
+    filter: "(attributes >> 10) & 1 = 0"  # skip disabled tags
 
   # Phase 3: Resources (820MB)
   - name: resources
