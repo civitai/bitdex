@@ -4257,8 +4257,8 @@ async fn handle_heap_dump(
 }
 
 /// POST /debug/rescan-memory — Trigger a full bitmap memory rescan.
-/// Marks all fields dirty so the background scanner processes them in batches.
-/// Does NOT scan everything at once — uses the existing dirty set + batch system.
+/// Marks all fields stale so the background scanner processes them in batches.
+/// Does NOT scan everything at once — uses the existing stale set + batch system.
 /// Safe to call at any time. Useful after enabling bitmap_memory metrics at runtime.
 async fn handle_rescan_memory(
     State(state): State<SharedState>,
@@ -4266,10 +4266,10 @@ async fn handle_rescan_memory(
     let guard = state.index.lock();
     match guard.as_ref() {
         Some(idx) => {
-            idx.engine.bitmap_memory_cache().mark_all_dirty();
+            idx.engine.bitmap_memory_cache().mark_all_stale();
             Json(serde_json::json!({
                 "status": "ok",
-                "message": "All fields marked dirty. Scanner will process them in batches.",
+                "message": "All fields marked stale. Scanner will process them in batches.",
                 "scanner_interval_ms": idx.engine.bitmap_memory_cache().interval_ms(),
                 "scanner_batch_size": idx.engine.bitmap_memory_cache().batch_size(),
             }))

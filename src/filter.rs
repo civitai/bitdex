@@ -448,6 +448,7 @@ mod tests {
             behaviors: None,
             eviction: None,
             eager_load: false,
+            per_value_lazy: false,
         }
     }
 
@@ -458,6 +459,7 @@ mod tests {
             behaviors: None,
             eviction: None,
             eager_load: false,
+            per_value_lazy: false,
         }
     }
 
@@ -468,6 +470,7 @@ mod tests {
             behaviors: None,
             eviction: None,
             eager_load: false,
+            per_value_lazy: false,
         }
     }
 

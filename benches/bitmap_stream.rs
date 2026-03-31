@@ -31,6 +31,7 @@ fn bench_config() -> Config {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
             FilterFieldConfig {
                 name: "userId".into(),
@@ -38,6 +39,7 @@ fn bench_config() -> Config {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
             FilterFieldConfig {
                 name: "type".into(),
@@ -45,6 +47,7 @@ fn bench_config() -> Config {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
             FilterFieldConfig {
                 name: "tagIds".into(),
@@ -52,6 +55,7 @@ fn bench_config() -> Config {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
         ],
         sort_fields: vec![

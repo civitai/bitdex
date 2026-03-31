@@ -23,6 +23,7 @@ fn test_config() -> Config {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
@@ -30,6 +31,7 @@ fn test_config() -> Config {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
             FilterFieldConfig {
                 name: "active".to_string(),
@@ -37,6 +39,7 @@ fn test_config() -> Config {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
         ],
         sort_fields: vec![SortFieldConfig {

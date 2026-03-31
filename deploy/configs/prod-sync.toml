@@ -1,0 +1,11 @@
+# Bitdex pg-sync configuration
+postgres_url = "postgres://placeholder:placeholder@localhost/placeholder"
+bitdex_url = "http://localhost:3000/api/indexes/civitai"
+index_dir = "/etc/bitdex/index"
+data_dir = "/data"
+pg_pool_size = 10
+batch_size = 100000
+poll_interval_ms = 250
+outbox_batch_limit = 50000
+metrics_poll_interval_secs = 5
+sync_config_path = "/etc/sync-v2/sync-config-civitai.yaml"

@@ -628,6 +628,12 @@ pub struct FilterFieldConfig {
     /// deferring to first query (lazy loading). Default: false.
     #[serde(default)]
     pub eager_load: bool,
+    /// If true, use per-value lazy loading instead of full-field loading.
+    /// Use for high-cardinality single_value fields (e.g. postId with 22M+
+    /// values) where loading all bitmaps at once would spike RSS. Only the
+    /// specific values needed by each query are loaded from disk.
+    #[serde(default)]
+    pub per_value_lazy: bool,
 }
 
 /// Per-value idle eviction configuration.
@@ -1035,6 +1041,7 @@ max_entries = 999
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
                 FilterFieldConfig {
                     name: "status".to_string(),
@@ -1042,6 +1049,7 @@ max_entries = 999
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
             ],
             ..Default::default()
@@ -1084,6 +1092,7 @@ max_entries = 999
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             }],
             ..Default::default()
         };
@@ -1226,6 +1235,7 @@ bits = 32
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             }],
             ..Config::default()
         };
@@ -1373,6 +1383,7 @@ ms_to_seconds = true
                 }),
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             }],
             ..Config::default()
         };
@@ -1396,6 +1407,7 @@ ms_to_seconds = true
                 }),
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             }],
             ..Config::default()
         };
@@ -1419,6 +1431,7 @@ ms_to_seconds = true
                 }),
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             }],
             ..Config::default()
         };
@@ -1442,6 +1455,7 @@ ms_to_seconds = true
                 }),
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             }],
             deferred_alive: Some(DeferredAliveConfig {
                 source_field: "scheduledAt".into(),
@@ -1504,6 +1518,7 @@ ms_to_seconds = true
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
@@ -1511,6 +1526,7 @@ ms_to_seconds = true
                     behaviors: None,
                     eviction: None,
                     eager_load: true,
+                    per_value_lazy: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {

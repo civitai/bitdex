@@ -1,0 +1,296 @@
+# Sync V2 — Civitai Sync Config (Draft v2)
+#
+# Read by bitdex-sync (sidecar). Defines PG tables, dump phases, and triggers.
+# BitDex server does NOT read this file — it receives dump instructions
+# via PUT /dumps request body, populated by bitdex-sync from this config.
+#
+# Conventions:
+# - Fields reference column names from COPY query (not indices)
+# - When source column name == target field name, use shorthand: `fields: [fieldName]`
+# - sets_alive defaults to false (omit when false)
+# - computed_fields: any derived/computed value (from expressions, lookups, bitfields)
+# - Trigger expressions use {column} templates: {publishedAt} resolves to
+#   OLD."publishedAt" / NEW."publishedAt" for remove/set ops respectively
+
+index: civitai
+
+postgres:
+  connection_string: "${DATABASE_URL}"
+  stage_dir: /data/load_stage
+
+clickhouse:
+  connection_string: "${CLICKHOUSE_URL}"
+
+bitdex:
+  url: "http://localhost:3000"
+  index: civitai
+
+# -----------------------------------------------------------------------
+# Dump phases — processed in order during boot
+# -----------------------------------------------------------------------
+
+dump_phases:
+
+  # Phase 1: Images (14GB, primary entity — loaded first for earliest query readiness)
+  # NOTE: Images before tags so the server can serve real queries while
+  # the 63GB tags phase is still downloading/processing.
+  - name: images
+    table: Image
+    copy_query: >
+      COPY (SELECT id, url, "nsfwLevel", hash, flags, type::text,
+                   "userId", "blockedFor",
+                   extract(epoch from "scannedAt")::bigint as "scannedAtSecs",
+                   extract(epoch from "createdAt")::bigint as "createdAtSecs",
+                   "postId", width, height
+            FROM "Image")
+      TO STDOUT WITH (FORMAT csv)
+    columns: [id, url, nsfwLevel, hash, flags, type, userId, blockedFor, scannedAtSecs, createdAtSecs, postId, width, height]
+    slot_field: id
+    sets_alive: true
+    fields:
+      - nsfwLevel
+      - { column: type, target: type }
+      - userId
+      - postId
+      - blockedFor
+      - { column: url, target: url }          # doc-only
+      - { column: hash, target: hash }        # doc-only
+      - width                                  # doc-only
+      - height                                 # doc-only
+    computed_fields:
+      # From flags bitfield:
+      - target: hasMeta
+        expression: "(flags >> 13) & 1 == 1 && (flags >> 2) & 1 == 0"
+      - target: onSite
+        expression: "(flags >> 14) & 1 == 1"
+      - target: minor
+        expression: "(flags >> 3) & 1 == 1"
+      - target: poi
+        expression: "(flags >> 4) & 1 == 1"
+      # Sort fields computed from CSV columns:
+      - target: existedAt
+        expression: "max(scannedAtSecs, createdAtSecs)"
+      - target: id
+        expression: "id"  # slot ID as sort value
+    enrichment:
+      - lookup: posts.csv
+        table: Post
+        copy_query: >
+          COPY (SELECT id,
+                       extract(epoch from "publishedAt")::bigint as "publishedAtSecs",
+                       availability::text,
+                       "modelVersionId"
+                FROM "Post")
+          TO STDOUT WITH (FORMAT csv)
+        columns: [id, publishedAtSecs, availability, modelVersionId]
+        key: id
+        join_on: postId
+        fields:
+          - { column: publishedAtSecs, target: publishedAt }
+          - { column: availability, target: availability }
+        computed_fields:
+          - target: postedToId
+            expression: "lookup_key"           # the Post.id itself
+          - target: isPublished
+            expression: "publishedAtSecs != null"
+    # sortAt = GREATEST(existedAt, publishedAt) is defined in index config
+    # as a computed sort field — BitDex resolves it automatically.
+
+  # Phase 2: Tags (63GB, largest — loaded after images so server can serve queries)
+  - name: tags
+    table: TagsOnImageNew
+    copy_query: >
+      COPY (SELECT "tagId", "imageId", "attributes"
+            FROM "TagsOnImageNew")
+      TO STDOUT WITH (FORMAT csv)
+    columns: [tagId, imageId, attributes]
+    slot_field: imageId
+    fields:
+      - { column: tagId, target: tagIds }
+    filter: "(attributes >> 10) & 1 = 0"  # skip disabled tags
+
+  # Phase 3: Resources (820MB)
+  - name: resources
+    table: ImageResourceNew
+    copy_query: >
+      COPY (SELECT "imageId", "modelVersionId", detected
+            FROM "ImageResourceNew")
+      TO STDOUT WITH (FORMAT csv)
+    columns: [imageId, modelVersionId, detected]
+    slot_field: imageId
+    fields:
+      - { column: modelVersionId, target: modelVersionIds }
+    computed_fields:
+      - target: modelVersionIdsManual
+        expression: "detected == false"
+        value: modelVersionId
+    enrichment:
+      - lookup: model_versions.csv
+        table: ModelVersion
+        copy_query: >
+          COPY (SELECT id, "baseModel", "modelId"
+                FROM "ModelVersion")
+          TO STDOUT WITH (FORMAT csv)
+        columns: [id, baseModel, modelId]
+        key: id
+        join_on: modelVersionId
+        fields:
+          - { column: baseModel, target: baseModel }
+        enrichment:
+          - lookup: models.csv
+            table: Model
+            copy_query: >
+              COPY (SELECT id, poi, type::text
+                    FROM "Model")
+              TO STDOUT WITH (FORMAT csv)
+            columns: [id, poi, type]
+            key: id
+            join_on: modelId
+            fields:
+              - { column: poi, target: poi }
+            filter: "type = 'Checkpoint'"
+
+  # Phase 4: Tools (50MB)
+  - name: tools
+    table: ImageTool
+    copy_query: >
+      COPY (SELECT "toolId", "imageId" FROM "ImageTool")
+      TO STDOUT WITH (FORMAT csv)
+    columns: [toolId, imageId]
+    slot_field: imageId
+    fields:
+      - { column: toolId, target: toolIds }
+
+  # Phase 5: Techniques (71MB)
+  - name: techniques
+    table: ImageTechnique
+    copy_query: >
+      COPY (SELECT "techniqueId", "imageId" FROM "ImageTechnique")
+      TO STDOUT WITH (FORMAT csv)
+    columns: [techniqueId, imageId]
+    slot_field: imageId
+    fields:
+      - { column: techniqueId, target: techniqueIds }
+
+  # Phase 6: Metrics (1.4GB, from ClickHouse, TAB-separated)
+  - name: metrics
+    source: clickhouse
+    query: >
+      SELECT imageId, reactionCount, commentCount, collectedCount
+      FROM image_metrics
+    format: tsv
+    slot_field: imageId
+    fields: [reactionCount, commentCount, collectedCount]
+
+# -----------------------------------------------------------------------
+# Steady-state triggers — PG triggers that write to BitdexOps
+# -----------------------------------------------------------------------
+# Trigger name: bitdex_{table}_{config_hash8}
+# Expressions use {column} templates that resolve to OLD/NEW for remove/set ops.
+
+triggers:
+
+  - table: Image
+    slot_field: id
+    sets_alive: true
+    on_delete: true
+    track_fields:
+      - nsfwLevel
+      - { column: type, expression: "{type}::text" }
+      - userId
+      - postId
+      - blockedFor
+      - url
+      - hash
+      - width
+      - height
+    computed_fields:
+      - target: hasMeta
+        expression: "({flags} >> 13) & 1 = 1 AND ({flags} >> 2) & 1 = 0"
+      - target: onSite
+        expression: "({flags} >> 14) & 1 = 1"
+      - target: minor
+        expression: "({flags} >> 3) & 1 = 1"
+      - target: poi
+        expression: "({flags} >> 4) & 1 = 1"
+
+  - table: TagsOnImageNew
+    slot_field: imageId
+    field: tagIds
+    value_field: tagId
+    filter: '({attributes} >> 10) & 1 = 0'
+
+  - table: ImageTool
+    slot_field: imageId
+    field: toolIds
+    value_field: toolId
+
+  - table: ImageTechnique
+    slot_field: imageId
+    field: techniqueIds
+    value_field: techniqueId
+
+  - table: ImageResourceNew
+    slot_field: imageId
+    field: modelVersionIds
+    value_field: modelVersionId
+    computed_fields:
+      - target: modelVersionIdsManual
+        expression: "{detected} = false"
+        value: "{modelVersionId}"
+
+  # Fan-out triggers (queryOpSet):
+  - table: Post
+    type: fan_out
+    query: "postId eq {id}"
+    track_fields:
+      - { column: publishedAt, target: publishedAt, expression: "extract(epoch from {publishedAt})::bigint" }
+      # Null handling: if {publishedAt} is NULL, trigger emits remove op (clears the field).
+      # The {field} template resolves to OLD.field for remove ops, NEW.field for set ops.
+      # When OLD is not null and NEW is null → remove. When NEW is not null → set.
+      - { column: availability, target: availability, expression: "{availability}::text" }
+
+  - table: ModelVersion
+    type: fan_out
+    query: "modelVersionIds eq {id}"
+    track_fields:
+      - { column: baseModel, target: baseModel }
+    join: 'INNER JOIN "Model" ON "Model".id = "ModelVersion"."modelId"'
+    filter: '"Model".type = ''Checkpoint'''
+
+  - table: Model
+    type: fan_out
+    expression: 'SELECT json_agg(mv.id) as ids FROM "ModelVersion" mv WHERE mv."modelId" = {id}' # @justin: added the missing cast to the correct name to be used inside of the query. I guess we'll have to correctly parse JSON or whatever in our query handler before handing it to the BitdexOps endpoint.
+    # @adam:* Right — the trigger function parses the json_agg result array and constructs the queryOpSet with `modelVersionIds in [id1, id2, ...]`. The trigger_gen code handles this: it detects the expression returns JSON, parses it to i64 array, formats into the query template. Straightforward since we control the SQL.
+    # expression replaces the default slot resolution. {id} → NEW.id.
+    # Result is an array of MV ids, used in query below.
+    query: "modelVersionIds in [{ids}]"
+    track_fields:
+      - poi
+
+# -----------------------------------------------------------------------
+# Dump request body schema (what bitdex-sync sends to BitDex)
+# -----------------------------------------------------------------------
+# PUT /api/indexes/{index}/dumps
+# {
+#   "name": "tags-a1b2c3d4",
+#   "csv_path": "/data/load_stage/tags.csv",
+#   "format": "csv",
+#   "slot_field": "imageId",
+#   "sets_alive": false,
+#   "fields": [
+#     { "column": "tagId", "target": "tagIds" }
+#   ],
+#   "filter": "(attributes >> 10) & 1 = 0",
+#   "computed_fields": [],
+#   "enrichment": [
+#     {
+#       "csv_path": "/data/load_stage/posts.csv",
+#       "key": "id",
+#       "join_on": "postId",
+#       "fields": [...],
+#       "computed_fields": [...],
+#       "enrichment": [...]
+#     }
+#   ]
+# }

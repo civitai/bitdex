@@ -1371,6 +1371,7 @@ mod tests {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
             FilterFieldConfig {
                 name: "type".into(),
@@ -1378,6 +1379,7 @@ mod tests {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
             FilterFieldConfig {
                 name: "tagIds".into(),
@@ -1385,6 +1387,7 @@ mod tests {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
             FilterFieldConfig {
                 name: "hasMeta".into(),
@@ -1392,6 +1395,7 @@ mod tests {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
+                per_value_lazy: false,
             },
         ];
         config.sort_fields = vec![SortFieldConfig {

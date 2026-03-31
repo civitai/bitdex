@@ -4,7 +4,7 @@
 //! thread, replacing the expensive on-scrape `bitmap_memory_report()` call
 //! that takes 52s at 107M records.
 //!
-//! The scanner processes dirty fields in small batches, dropping the ArcSwap
+//! The scanner processes stale fields in small batches, dropping the ArcSwap
 //! guard between each field to avoid pinning old snapshot memory.
 
 use std::collections::HashSet;
@@ -24,9 +24,9 @@ pub struct BitmapMemoryCache {
     slot_bytes: AtomicU64,
 
     /// Fields that have been mutated since last scan.
-    dirty_fields: Mutex<HashSet<String>>,
+    stale_fields: Mutex<HashSet<String>>,
     /// When true, ALL fields need scanning (post-restore or bulk load).
-    all_dirty: AtomicBool,
+    all_stale: AtomicBool,
 
     /// Scanner enabled flag (runtime toggle).
     enabled: AtomicBool,
@@ -43,8 +43,8 @@ impl BitmapMemoryCache {
             filter_cache: DashMap::new(),
             sort_cache: DashMap::new(),
             slot_bytes: AtomicU64::new(0),
-            dirty_fields: Mutex::new(HashSet::new()),
-            all_dirty: AtomicBool::new(false),
+            stale_fields: Mutex::new(HashSet::new()),
+            all_stale: AtomicBool::new(false),
             enabled: AtomicBool::new(enabled),
             interval_ms: AtomicU64::new(interval_ms),
             batch_size: AtomicU64::new(batch_size),
@@ -53,13 +53,13 @@ impl BitmapMemoryCache {
 
     /// Mark a specific field as needing a memory rescan.
     /// Called by the flush thread after applying mutations.
-    pub fn mark_dirty(&self, field_name: &str) {
-        self.dirty_fields.lock().insert(field_name.to_string());
+    pub fn mark_stale(&self, field_name: &str) {
+        self.stale_fields.lock().insert(field_name.to_string());
     }
 
-    /// Mark all fields as dirty. Called after bulk load or initial restore.
-    pub fn mark_all_dirty(&self) {
-        self.all_dirty.store(true, Ordering::Release);
+    /// Mark all fields as stale. Called after bulk load or initial restore.
+    pub fn mark_all_stale(&self) {
+        self.all_stale.store(true, Ordering::Release);
     }
 
     /// Return cached filter memory: Vec of (field_name, bytes, count).
@@ -120,20 +120,20 @@ impl BitmapMemoryCache {
         self.batch_size.load(Ordering::Relaxed)
     }
 
-    /// Drain up to `batch_size` dirty fields. Returns them for scanning.
-    /// If `all_dirty` is set, populates from the provided field name lists instead.
-    fn drain_dirty(
+    /// Drain up to `batch_size` stale fields. Returns them for scanning.
+    /// If `all_stale` is set, populates from the provided field name lists instead.
+    fn drain_stale(
         &self,
         all_filter_names: &[String],
         all_sort_names: &[String],
     ) -> Vec<String> {
         let batch = self.batch_size.load(Ordering::Relaxed) as usize;
 
-        // If all_dirty is set, swap it to false and enqueue everything.
-        if self.all_dirty.compare_exchange(
+        // If all_stale is set, swap it to false and enqueue everything.
+        if self.all_stale.compare_exchange(
             true, false, Ordering::AcqRel, Ordering::Relaxed,
         ).is_ok() {
-            let mut set = self.dirty_fields.lock();
+            let mut set = self.stale_fields.lock();
             for name in all_filter_names {
                 set.insert(name.clone());
             }
@@ -144,7 +144,7 @@ impl BitmapMemoryCache {
             set.insert("__slots__".to_string());
         }
 
-        let mut set = self.dirty_fields.lock();
+        let mut set = self.stale_fields.lock();
         let mut result = Vec::with_capacity(batch.min(set.len()));
         let drain: Vec<String> = set.iter().take(batch).cloned().collect();
         for f in &drain {
@@ -174,12 +174,12 @@ impl BitmapMemoryCache {
             return;
         }
 
-        let dirty = self.drain_dirty(all_filter_names, all_sort_names);
-        if dirty.is_empty() {
+        let stale = self.drain_stale(all_filter_names, all_sort_names);
+        if stale.is_empty() {
             return;
         }
 
-        for field_name in &dirty {
+        for field_name in &stale {
             if field_name == "__slots__" {
                 // Update slot bytes (always cheap).
                 let snap = inner.load();
@@ -235,32 +235,32 @@ mod bitmap_memory_cache_tests {
     use super::*;
 
     #[test]
-    fn test_mark_dirty_and_drain() {
+    fn test_mark_stale_and_drain() {
         let cache = BitmapMemoryCache::new(true, 100, 2);
-        cache.mark_dirty("field_a");
-        cache.mark_dirty("field_b");
-        cache.mark_dirty("field_c");
+        cache.mark_stale("field_a");
+        cache.mark_stale("field_b");
+        cache.mark_stale("field_c");
 
         let filter_names = vec![];
         let sort_names = vec![];
-        let batch = cache.drain_dirty(&filter_names, &sort_names);
+        let batch = cache.drain_stale(&filter_names, &sort_names);
         assert_eq!(batch.len(), 2, "should drain up to batch_size");
 
-        let batch2 = cache.drain_dirty(&filter_names, &sort_names);
+        let batch2 = cache.drain_stale(&filter_names, &sort_names);
         assert_eq!(batch2.len(), 1, "should drain remaining");
 
-        let batch3 = cache.drain_dirty(&filter_names, &sort_names);
+        let batch3 = cache.drain_stale(&filter_names, &sort_names);
         assert!(batch3.is_empty(), "should be empty after draining all");
     }
 
     #[test]
-    fn test_mark_all_dirty() {
+    fn test_mark_all_stale() {
         let cache = BitmapMemoryCache::new(true, 100, 100);
-        cache.mark_all_dirty();
+        cache.mark_all_stale();
 
         let filter_names = vec!["f1".to_string(), "f2".to_string()];
         let sort_names = vec!["s1".to_string()];
-        let batch = cache.drain_dirty(&filter_names, &sort_names);
+        let batch = cache.drain_stale(&filter_names, &sort_names);
         // Should contain f1, f2, s1, and __slots__
         assert_eq!(batch.len(), 4);
         assert!(batch.contains(&"f1".to_string()));
