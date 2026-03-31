@@ -1227,9 +1227,10 @@ pub(crate) fn apply_ops_batch_dump(
     accum: &mut crate::loader::BitmapAccum,
     meta: &FieldMeta,
     batch: &mut Vec<EntityOps>,
+    doc_writer: Option<&mut DocWriter>,
 ) -> (usize, usize, usize) {
     let mut sink = crate::ingester::AccumSink::new(accum);
-    apply_ops_batch(&mut sink, meta, batch, None, None)
+    apply_ops_batch(&mut sink, meta, batch, None, doc_writer)
 }
 
 /// Process all WAL entries in dump mode: reads WAL, accumulates bitmaps, applies to engine.
@@ -1261,6 +1262,10 @@ pub fn process_wal_dump(
     let mut total_applied = 0u64;
     let mut total_errors = 0u64;
 
+    // Create DocWriter so computed sort fields (sortAt = GREATEST) are written
+    // to docstore during dump. Without this, only bitmaps get the computed value.
+    let mut doc_writer = DocWriter::new(engine.docstore_arc());
+
     loop {
         let batch = match reader.read_batch(batch_size) {
             Ok(b) => b,
@@ -1274,10 +1279,13 @@ pub fn process_wal_dump(
             break;
         }
         let mut entries = batch.entries;
-        let (applied, _skipped, errors) = apply_ops_batch_dump(&mut accum, &meta, &mut entries);
+        let (applied, _skipped, errors) = apply_ops_batch_dump(&mut accum, &meta, &mut entries, Some(&mut doc_writer));
         total_applied += applied as u64;
         total_errors += errors as u64;
     }
+
+    // Flush any pending docstore writes
+    doc_writer.flush();
 
     // Apply accumulated bitmaps to engine staging
     engine.apply_accum(&accum);
