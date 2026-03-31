@@ -2807,7 +2807,13 @@ fn write_docstore_row_indexed(
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             match value {
                 NateExprValue::Int(v) => { collect_packed!(fidx, &PackedValue::I(*v)); }
-                NateExprValue::Bool(b) => { collect_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
+                NateExprValue::Bool(b) => {
+                    if boolean_fields.contains(target.as_str()) {
+                        collect_packed!(fidx, &PackedValue::B(*b));
+                    } else {
+                        collect_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 }));
+                    }
+                }
                 NateExprValue::Str(ref s) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
                 NateExprValue::Null => {}
             }
@@ -2819,7 +2825,13 @@ fn write_docstore_row_indexed(
         if let Some(&fidx) = field_idx.get(def.target.as_str()) {
             match def.eval_indexed(indexed_fields, col_idx, None) {
                 Some(NateExprValue::Int(v)) => { collect_packed!(fidx, &PackedValue::I(v)); }
-                Some(NateExprValue::Bool(b)) => { collect_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
+                Some(NateExprValue::Bool(b)) => {
+                    if boolean_fields.contains(def.target.as_str()) {
+                        collect_packed!(fidx, &PackedValue::B(b));
+                    } else {
+                        collect_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 }));
+                    }
+                }
                 Some(NateExprValue::Str(ref s)) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
                 _ => {}
             }
