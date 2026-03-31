@@ -1361,9 +1361,15 @@ pub fn process_dump_with_progress(
         .collect();
     // Also include config-computed sort field targets (e.g., sortAt) so the
     // BulkWriter can write their values to docstore.
-    for sc in &config.sort_fields {
-        if sc.computed.is_some() && !all_target_names.contains(&sc.name) {
-            all_target_names.push(sc.name.clone());
+    // ONLY for the sets_alive phase (images) — later phases (resources, tools,
+    // techniques, metrics) lack the source fields (existedAt, publishedAt) and
+    // would write sortAt=GREATEST(0,0)=0, which overwrites the correct value
+    // from the images phase via DocStore V2 LIFO scan.
+    if request.sets_alive {
+        for sc in &config.sort_fields {
+            if sc.computed.is_some() && !all_target_names.contains(&sc.name) {
+                all_target_names.push(sc.name.clone());
+            }
         }
     }
     let bulk_writer = Arc::new(
@@ -2859,8 +2865,6 @@ fn write_docstore_row_indexed(
     for &(target, value) in extra_i64_fields {
         if let Some(&fidx) = field_idx.get(target) {
             collect_packed!(fidx, &PackedValue::I(value));
-        } else if slot < 5 {
-            eprintln!("  [DIAG] slot={slot} extra_i64 target={target} value={value} NOT in field_idx! keys={:?}", field_idx.keys().collect::<Vec<_>>());
         }
     }
 
