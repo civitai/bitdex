@@ -1346,7 +1346,7 @@ pub fn process_dump_with_progress(
         .map(|ds| {
             ds.fields
                 .iter()
-                .filter(|m| m.value_type == crate::config::FieldValueType::Boolean)
+                .filter(|m| matches!(m.value_type, crate::config::FieldValueType::Boolean | crate::config::FieldValueType::ExistsBoolean))
                 .map(|m| m.target.clone())
                 .collect()
         })
@@ -2859,6 +2859,8 @@ fn write_docstore_row_indexed(
     for &(target, value) in extra_i64_fields {
         if let Some(&fidx) = field_idx.get(target) {
             collect_packed!(fidx, &PackedValue::I(value));
+        } else if slot < 5 {
+            eprintln!("  [DIAG] slot={slot} extra_i64 target={target} value={value} NOT in field_idx! keys={:?}", field_idx.keys().collect::<Vec<_>>());
         }
     }
 
