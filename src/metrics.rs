@@ -141,6 +141,10 @@ pub struct Metrics {
     pub wal_ops_processed_total: IntCounter,
     pub wal_read_cursor_bytes: IntGauge,
 
+    // -- WAL write-side observability --
+    pub wal_ops_written_total: IntCounter,
+    pub wal_last_applied_timestamp_seconds: IntGauge,
+
     // -- Boot phase breakdown --
     pub boot_phase_seconds: IntGaugeVec,
 }
@@ -668,6 +672,14 @@ impl Metrics {
             "bitdex_wal_read_cursor_bytes", "WAL reader cursor position in bytes",
         ).unwrap();
 
+        // WAL write-side observability
+        let wal_ops_written_total = IntCounter::new(
+            "bitdex_wal_ops_written_total", "Total ops written to WAL via POST /ops",
+        ).unwrap();
+        let wal_last_applied_timestamp_seconds = IntGauge::new(
+            "bitdex_wal_last_applied_timestamp_seconds", "Unix epoch of last successful WAL op application",
+        ).unwrap();
+
         // Boot phase breakdown
         let boot_phase_seconds = IntGaugeVec::new(
             Opts::new("bitdex_boot_phase_seconds", "Duration of each boot phase in seconds"),
@@ -790,6 +802,8 @@ impl Metrics {
         registry.register(Box::new(sync_batch_size.clone())).unwrap();
         registry.register(Box::new(wal_ops_processed_total.clone())).unwrap();
         registry.register(Box::new(wal_read_cursor_bytes.clone())).unwrap();
+        registry.register(Box::new(wal_ops_written_total.clone())).unwrap();
+        registry.register(Box::new(wal_last_applied_timestamp_seconds.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
 
         Self {
@@ -881,6 +895,8 @@ impl Metrics {
             sync_batch_size,
             wal_ops_processed_total,
             wal_read_cursor_bytes,
+            wal_ops_written_total,
+            wal_last_applied_timestamp_seconds,
             boot_phase_seconds,
         }
     }
