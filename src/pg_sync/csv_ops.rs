@@ -115,6 +115,11 @@ fn image_row_to_ops(row: &CopyImageRow) -> Vec<Op> {
         (None, None) => 0,
     };
     ops.push(Op::Set { field: "existedAt".into(), value: json!(existed_at) });
+    // sortAt = GREATEST(existedAt, publishedAt). Emit existedAt as initial value —
+    // the computed sort recomputation in ops_processor will update to GREATEST
+    // when publishedAt arrives via enrichment. Without this, sortAt is never
+    // written to docstore (only bitmaps get the computed value).
+    ops.push(Op::Set { field: "sortAt".into(), value: json!(existed_at) });
 
     // blockedFor
     if let Some(ref bf) = row.blocked_for {
