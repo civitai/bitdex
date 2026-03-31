@@ -121,3 +121,45 @@ spec:
           annotations:
             summary: "BitDex lazy load p95 exceeds 5 seconds"
             description: "Field loading is taking {{ $value | humanizeDuration }} at p95. First queries after startup will stall."
+
+    - name: bitdex.wal
+      rules:
+        # WAL reader dead — processing zero ops when there's pending data
+        - alert: BitdexWALReaderDead
+          expr: rate(bitdex_wal_ops_processed_total[5m]) == 0 and bitdex_sync_wal_pending_bytes > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "WAL reader is not processing ops despite pending data"
+            description: "WAL reader throughput is zero but {{ $value }} bytes pending. Check WAL reader logs for errors."
+
+        # WAL reader errors sustained
+        - alert: BitdexWALReaderErrors
+          expr: rate(bitdex_pgsync_errors_total[5m]) > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "WAL reader is producing errors"
+            description: "WAL reader error rate: {{ $value }}/s. Check server logs for 'WAL reader error'."
+
+        # Pipeline stale — no ops applied recently
+        - alert: BitdexPipelineStale
+          expr: (time() - bitdex_wal_last_applied_timestamp_seconds) > 300 and bitdex_wal_last_applied_timestamp_seconds > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "No ops applied in 5+ minutes"
+            description: "Last op applied {{ $value | humanizeDuration }} ago. Pipeline may be stalled."
+
+        # WAL lag growing — reader falling behind writer
+        - alert: BitdexWALLagGrowing
+          expr: bitdex_sync_wal_pending_bytes > 10485760
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "WAL lag exceeds 10MB"
+            description: "WAL pending bytes: {{ $value | humanize1024 }}. Reader may be falling behind."

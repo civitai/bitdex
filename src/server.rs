@@ -1212,6 +1212,11 @@ impl BitdexServer {
                                     // WAL read-side metrics
                                     if applied > 0 {
                                         wal_state.metrics.wal_ops_processed_total.inc_by(applied as u64);
+                                        let epoch = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs();
+                                        wal_state.metrics.wal_last_applied_timestamp_seconds.set(epoch as i64);
                                     }
                                     let cursor = reader.cursor();
                                     wal_state.metrics.wal_read_cursor_bytes.set(cursor.offset as i64);
@@ -4637,6 +4642,7 @@ async fn handle_ops(
 
     match result {
         Ok(Ok(bytes)) => {
+            state.metrics.wal_ops_written_total.inc_by(ops_count as u64);
             (StatusCode::OK, Json(serde_json::json!({
                 "accepted": ops_count,
                 "bytes_written": bytes,
