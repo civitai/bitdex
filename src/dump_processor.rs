@@ -1340,6 +1340,18 @@ pub fn process_dump_with_progress(
         })
         .unwrap_or_default();
 
+    // Build set of boolean field names from data schema for type-aware docstore writes.
+    // PG COPY outputs booleans as "t"/"f" strings — we need to coerce them to PackedValue::B.
+    let boolean_fields: HashSet<String> = data_schema
+        .map(|ds| {
+            ds.fields
+                .iter()
+                .filter(|m| m.value_type == crate::config::FieldValueType::Boolean)
+                .map(|m| m.target.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Prepare BulkWriter for docstore — exclude filter_only fields so that
     // field_to_idx().get(target) returns None and docstore writes are skipped.
     let mut all_target_names: Vec<String> = target_fields
@@ -1676,6 +1688,50 @@ pub fn process_dump_with_progress(
                     None
                 };
 
+                // Evaluate config-computed sort values (e.g., sortAt = GREATEST(existedAt, publishedAt)).
+                // Computed early so both the deferred alive path and normal path can include them
+                // in the docstore write. Without this, deferred rows get sortAt:0 in docstore.
+                let config_computed_sort_vals: Vec<(&str, i64)> = if !config_computed_sorts_ref.is_empty() {
+                    let mut row_sv: HashMap<&str, u32> = HashMap::new();
+                    for fm in request_fields {
+                        let t = fm.target();
+                        if sort_bits_ref.contains_key(t) || config_computed_sources_ref.contains(t) {
+                            if let Some(v) = row.get_i64(fm.column()).or_else(|| enriched_get(t).and_then(|s| s.parse::<i64>().ok())) {
+                                row_sv.insert(t, v as u32);
+                            }
+                        }
+                    }
+                    for t in enrichment_targets_ref {
+                        if sort_bits_ref.contains_key(t.as_str()) || config_computed_sources_ref.contains(t.as_str()) {
+                            if let Some(s) = enriched_get(t) { if let Ok(v) = s.parse::<i64>() { row_sv.insert(t, v as u32); } }
+                        }
+                    }
+                    for (t, value) in &enriched.computed {
+                        if sort_bits_ref.contains_key(t.as_str()) || config_computed_sources_ref.contains(t.as_str()) {
+                            if let NateExprValue::Int(n) = value { row_sv.insert(t, *n as u32); }
+                        }
+                    }
+                    for def in computed_defs_ref {
+                        if sort_bits_ref.contains_key(&def.target) || config_computed_sources_ref.contains(&def.target) {
+                            if let Some(NateExprValue::Int(v)) = def.eval_indexed(&indexed_fields_buf, col_idx, None) {
+                                row_sv.insert(&def.target, v as u32);
+                            }
+                        }
+                    }
+                    config_computed_sorts_ref.iter().map(|ccs| {
+                        let vals: Vec<u32> = ccs.source_fields.iter()
+                            .map(|sf| row_sv.get(sf.as_str()).copied().unwrap_or(0))
+                            .collect();
+                        let cv = match ccs.op {
+                            crate::config::ComputedOp::Greatest => *vals.iter().max().unwrap_or(&0),
+                            crate::config::ComputedOp::Least => *vals.iter().min().unwrap_or(&0),
+                        };
+                        (ccs.target.as_str(), cv as i64)
+                    }).collect()
+                } else {
+                    Vec::new()
+                };
+
                 // Check deferred alive: if publishedAt from enrichment is in the future
                 if has_deferred_alive {
                     if let Some(pub_str) = enriched_get("publishedAt") {
@@ -1692,6 +1748,8 @@ pub fn process_dump_with_progress(
                                     request_fields,
                                     &bulk_writer,
                                     &field_idx_cache,
+                                    &boolean_fields,
+                                    &config_computed_sort_vals,
                                     &mut serialize_buf,
                                     &mut tuple_buf,
                                     &mut write_buf,
@@ -1745,7 +1803,7 @@ pub fn process_dump_with_progress(
                         if let Some(v) = row.get_i64(column).or_else(|| {
                             enriched_get(target).and_then(|s| s.parse::<i64>().ok())
                         }) {
-                            let val32 = v as u32;
+                            let val32 = v.max(0) as u32;
                             if let Some(sm) = sort_maps.get_mut(target) {
                                 for bit in 0..(bits as usize) {
                                     if (val32 >> bit) & 1 == 1 {
@@ -1777,7 +1835,7 @@ pub fn process_dump_with_progress(
                         // Sort bitmap
                         if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
                             if let Some(v) = val_str.parse::<i64>().ok() {
-                                let val32 = v as u32;
+                                let val32 = v.max(0) as u32;
                                 if let Some(sm) = sort_maps.get_mut(target.as_str()) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
@@ -1809,7 +1867,7 @@ pub fn process_dump_with_progress(
                                     .insert(slot);
                             }
                             if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
-                                let val32 = *n as u32;
+                                let val32 = (*n).max(0) as u32;
                                 if let Some(sm) = sort_maps.get_mut(target.as_str()) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
@@ -1838,7 +1896,7 @@ pub fn process_dump_with_progress(
                                 }
                             }
                             if let Some(&bits) = sort_bits_ref.get(&def.target) {
-                                let val32 = v as u32;
+                                let val32 = v.max(0) as u32;
                                 if let Some(sm) = sort_maps.get_mut(&def.target) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
@@ -1892,7 +1950,7 @@ pub fn process_dump_with_progress(
                             if let Some(v) = row.get_i64(column).or_else(|| {
                                 enriched_get(target).and_then(|s| s.parse::<i64>().ok())
                             }) {
-                                row_sort_vals.insert(target, v as u32);
+                                row_sort_vals.insert(target, v.max(0) as u32);
                             }
                         }
                     }
@@ -1901,7 +1959,7 @@ pub fn process_dump_with_progress(
                         if sort_bits_ref.contains_key(target.as_str()) || config_computed_sources_ref.contains(target.as_str()) {
                             if let Some(val_str) = enriched_get(target) {
                                 if let Ok(v) = val_str.parse::<i64>() {
-                                    row_sort_vals.insert(target.as_str(), v as u32);
+                                    row_sort_vals.insert(target.as_str(), v.max(0) as u32);
                                 }
                             }
                         }
@@ -1910,7 +1968,7 @@ pub fn process_dump_with_progress(
                     for (target, value) in &enriched.computed {
                         if sort_bits_ref.contains_key(target.as_str()) || config_computed_sources_ref.contains(target.as_str()) {
                             if let NateExprValue::Int(n) = value {
-                                row_sort_vals.insert(target.as_str(), *n as u32);
+                                row_sort_vals.insert(target.as_str(), (*n).max(0) as u32);
                             }
                         }
                     }
@@ -1918,7 +1976,7 @@ pub fn process_dump_with_progress(
                     for def in computed_defs_ref {
                         if sort_bits_ref.contains_key(&def.target) || config_computed_sources_ref.contains(&def.target) {
                             if let Some(NateExprValue::Int(v)) = def.eval_indexed(&indexed_fields_buf, col_idx, None) {
-                                row_sort_vals.insert(&def.target, v as u32);
+                                row_sort_vals.insert(&def.target, v.max(0) as u32);
                             }
                         }
                     }
@@ -1942,7 +2000,7 @@ pub fn process_dump_with_progress(
                     }
                 }
 
-                // Write docstore (direct + enriched + dump computed fields)
+                // Write docstore (direct + enriched + dump computed + config-computed sort fields)
                 write_docstore_row_indexed(
                     &row,
                     &enriched,
@@ -1953,66 +2011,12 @@ pub fn process_dump_with_progress(
                     request_fields,
                     &bulk_writer,
                     &field_idx_cache,
+                    &boolean_fields,
+                    &config_computed_sort_vals,
                     &mut serialize_buf,
                     &mut tuple_buf,
                     &mut write_buf,
                 );
-
-                // Write config-computed sort values to docstore (e.g., sortAt).
-                // Reuses the computed values from the bitmap section above.
-                if !config_computed_sorts_ref.is_empty() {
-                    // Re-derive (fast — just re-evaluates the GREATEST/LEAST over cached source values)
-                    let mut row_sv: HashMap<&str, u32> = HashMap::new();
-                    for fm in request_fields {
-                        let t = fm.target();
-                        if sort_bits_ref.contains_key(t) || config_computed_sources_ref.contains(t) {
-                            if let Some(v) = row.get_i64(fm.column()).or_else(|| enriched_get(t).and_then(|s| s.parse::<i64>().ok())) {
-                                row_sv.insert(t, v as u32);
-                            }
-                        }
-                    }
-                    for t in enrichment_targets_ref {
-                        if sort_bits_ref.contains_key(t.as_str()) || config_computed_sources_ref.contains(t.as_str()) {
-                            if let Some(s) = enriched_get(t) { if let Ok(v) = s.parse::<i64>() { row_sv.insert(t, v as u32); } }
-                        }
-                    }
-                    for (t, value) in &enriched.computed {
-                        if sort_bits_ref.contains_key(t.as_str()) || config_computed_sources_ref.contains(t.as_str()) {
-                            if let NateExprValue::Int(n) = value { row_sv.insert(t, *n as u32); }
-                        }
-                    }
-                    for def in computed_defs_ref {
-                        if sort_bits_ref.contains_key(&def.target) || config_computed_sources_ref.contains(&def.target) {
-                            if let Some(NateExprValue::Int(v)) = def.eval_indexed(&indexed_fields_buf, col_idx, None) {
-                                row_sv.insert(&def.target, v as u32);
-                            }
-                        }
-                    }
-                    serialize_buf.clear();
-                    tuple_buf.clear();
-                    for ccs in config_computed_sorts_ref {
-                        if let Some(&fidx) = field_idx_cache.get(ccs.target.as_str()) {
-                            let vals: Vec<u32> = ccs.source_fields.iter()
-                                .map(|sf| row_sv.get(sf.as_str()).copied().unwrap_or(0))
-                                .collect();
-                            let cv = match ccs.op {
-                                crate::config::ComputedOp::Greatest => *vals.iter().max().unwrap_or(&0),
-                                crate::config::ComputedOp::Least => *vals.iter().min().unwrap_or(&0),
-                            };
-                            let start = serialize_buf.len() as u32;
-                            if rmp_serde::encode::write(&mut serialize_buf, &crate::docstore::PackedValue::I(cv as i64)).is_ok() {
-                                let len = serialize_buf.len() as u32 - start;
-                                tuple_buf.push((fidx, start, len));
-                            }
-                        }
-                    }
-                    if !tuple_buf.is_empty() {
-                        let refs: Vec<(u16, &[u8])> = tuple_buf.iter()
-                            .map(|&(idx, off, len)| (idx, &serialize_buf[off as usize..(off + len) as usize]))
-                            .collect();
-                        bulk_writer.append_tuples_raw(slot, &refs, &mut write_buf);
-                    }
-                }
 
                 count += 1;
                 if count % LOG_INTERVAL == 0 {
@@ -2721,6 +2725,9 @@ fn collect_enrichment_targets(config: &EnrichmentConfig, targets: &mut Vec<Strin
 
 /// Write a single row's data to the docstore via BulkWriter (indexed path).
 /// Uses cached field_idx, indexed fields, and reusable serialize buffer.
+/// `boolean_fields` contains target field names declared as boolean in the data schema,
+/// enabling proper "t"/"f" → PackedValue::B coercion for PG COPY boolean columns.
+/// `extra_i64_fields` contains additional (target, value) pairs to write (e.g., config-computed sorts).
 fn write_docstore_row_indexed(
     row: &ParsedRow,
     enriched: &dump_enrichment::EnrichedFields,
@@ -2731,6 +2738,8 @@ fn write_docstore_row_indexed(
     request_fields: &[DumpFieldMapping],
     bulk_writer: &Arc<BulkWriter>,
     field_idx: &HashMap<String, u16>,
+    boolean_fields: &HashSet<String>,
+    extra_i64_fields: &[(&str, i64)],
     serialize_buf: &mut Vec<u8>,
     tuple_buf: &mut Vec<(u16, u32, u32)>,
     write_buf: &mut Vec<u8>,
@@ -2757,7 +2766,15 @@ fn write_docstore_row_indexed(
             if let Some(v) = row.get_i64(column) {
                 collect_packed!(fidx, &PackedValue::I(v));
             } else if let Some(s) = row.get_str(column) {
-                collect_packed!(fidx, &PackedValue::S(s.to_string()));
+                if boolean_fields.contains(target) {
+                    match s {
+                        "t" | "true" => collect_packed!(fidx, &PackedValue::B(true)),
+                        "f" | "false" => collect_packed!(fidx, &PackedValue::B(false)),
+                        _ => collect_packed!(fidx, &PackedValue::S(s.to_string())),
+                    }
+                } else {
+                    collect_packed!(fidx, &PackedValue::S(s.to_string()));
+                }
             }
         }
     }
@@ -2767,6 +2784,12 @@ fn write_docstore_row_indexed(
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             if let Ok(v) = value.parse::<i64>() {
                 collect_packed!(fidx, &PackedValue::I(v));
+            } else if boolean_fields.contains(target.as_str()) {
+                match value.as_str() {
+                    "t" | "true" => collect_packed!(fidx, &PackedValue::B(true)),
+                    "f" | "false" => collect_packed!(fidx, &PackedValue::B(false)),
+                    _ => collect_packed!(fidx, &PackedValue::S(value.clone())),
+                }
             } else {
                 collect_packed!(fidx, &PackedValue::S(value.clone()));
             }
@@ -2778,7 +2801,13 @@ fn write_docstore_row_indexed(
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             match value {
                 NateExprValue::Int(v) => { collect_packed!(fidx, &PackedValue::I(*v)); }
-                NateExprValue::Bool(b) => { collect_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 })); }
+                NateExprValue::Bool(b) => {
+                    if boolean_fields.contains(target.as_str()) {
+                        collect_packed!(fidx, &PackedValue::B(*b));
+                    } else {
+                        collect_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 }));
+                    }
+                }
                 NateExprValue::Str(ref s) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
                 NateExprValue::Null => {}
             }
@@ -2790,10 +2819,23 @@ fn write_docstore_row_indexed(
         if let Some(&fidx) = field_idx.get(def.target.as_str()) {
             match def.eval_indexed(indexed_fields, col_idx, None) {
                 Some(NateExprValue::Int(v)) => { collect_packed!(fidx, &PackedValue::I(v)); }
-                Some(NateExprValue::Bool(b)) => { collect_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 })); }
+                Some(NateExprValue::Bool(b)) => {
+                    if boolean_fields.contains(def.target.as_str()) {
+                        collect_packed!(fidx, &PackedValue::B(b));
+                    } else {
+                        collect_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 }));
+                    }
+                }
                 Some(NateExprValue::Str(ref s)) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
                 _ => {}
             }
+        }
+    }
+
+    // Extra i64 fields (config-computed sort values like sortAt = GREATEST(existedAt, publishedAt))
+    for &(target, value) in extra_i64_fields {
+        if let Some(&fidx) = field_idx.get(target) {
+            collect_packed!(fidx, &PackedValue::I(value));
         }
     }
 
@@ -3349,5 +3391,28 @@ mod tests {
             }
             other => panic!("Expected Single(Integer), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_negative_sort_values_clamped_to_zero() {
+        // Verify that negative i64 values are clamped to 0 when cast to u32 for sort bitmaps.
+        // Before fix: -1i64 as u32 = 4294967295 (all bits set), sorting to top in DESC.
+        // After fix: -1i64.max(0) as u32 = 0, sorting to bottom correctly.
+        let negative: i64 = -1;
+        let clamped = negative.max(0) as u32;
+        assert_eq!(clamped, 0, "negative values must clamp to 0, not wrap to u32::MAX");
+
+        let large_negative: i64 = -100;
+        assert_eq!(large_negative.max(0) as u32, 0);
+
+        // Positive values pass through
+        let positive: i64 = 42;
+        assert_eq!(positive.max(0) as u32, 42);
+
+        // Zero stays zero
+        assert_eq!(0i64.max(0) as u32, 0);
+
+        // Verify the old buggy behavior: raw cast wraps negatives
+        assert_eq!((-1i64) as u32, u32::MAX, "raw cast wraps -1 to u32::MAX (the bug)");
     }
 }
