@@ -410,11 +410,13 @@ impl ConcurrentEngine {
                 // Fields with no saved bitmaps don't need lazy loading.
                 if counter_val > 0 {
                     for fc in &config.filter_fields {
-                        if fc.field_type == FilterFieldType::MultiValue && !fc.eager_load {
-                            // High-cardinality without eager_load: per-value lazy loading
+                        if !fc.eager_load && (fc.field_type == FilterFieldType::MultiValue || fc.per_value_lazy) {
+                            // Per-value lazy loading: multi_value fields (always) and
+                            // single_value fields with per_value_lazy (e.g. postId with 22M+ values).
+                            // Only loads the specific values needed by each query from disk.
                             lazy_value_fields.insert(fc.name.clone());
                         } else {
-                            // Low-cardinality, boolean, or eager_load multi_value: full-field loading
+                            // Full-field loading: low-cardinality, boolean, or eager_load fields.
                             pending_filter_loads.insert(fc.name.clone());
                         }
                     }
@@ -1167,6 +1169,7 @@ impl ConcurrentEngine {
             let eviction_configs: HashMap<String, f64> = config.filter_fields.iter()
                 .filter_map(|fc| fc.eviction.as_ref().map(|e| (fc.name.clone(), e.idle_seconds)))
                 .collect();
+            let flush_mem_cache = Arc::clone(&bitmap_memory_cache);
 
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
@@ -1190,12 +1193,14 @@ impl ConcurrentEngine {
                     // Phase 1b: Drain lazy load channel — apply loaded fields to staging.
                     // This keeps staging in sync with snapshots published by ensure_loaded().
                     let mut lazy_loaded = false;
+                    let mut stale_fields: Vec<String> = Vec::new();
                     while let Ok(load) = lazy_rx.try_recv() {
                         match load {
                             LazyLoad::FilterField { name, bitmaps } => {
                                 if let Some(field) = staging.filters.get_field_mut(&name) {
                                     field.load_field_complete(bitmaps);
                                 }
+                                stale_fields.push(name);
                             }
                             LazyLoad::FilterValues { field, values } => {
                                 if let Some(f) = staging.filters.get_field_mut(&field) {
@@ -1205,6 +1210,7 @@ impl ConcurrentEngine {
                                     let requested: Vec<u64> = values.keys().copied().collect();
                                     f.load_values(values, &requested);
                                 }
+                                stale_fields.push(field);
                             }
                             LazyLoad::SortField { name, layers } => {
                                 if let Some(sf) = staging.sorts.get_field_mut(&name) {
@@ -1219,6 +1225,7 @@ impl ConcurrentEngine {
                                         }
                                     }
                                 }
+                                stale_fields.push(name);
                             }
                             LazyLoad::Slots { slots } => {
                                 staging.slots = slots;
@@ -1239,6 +1246,20 @@ impl ConcurrentEngine {
                             &mut staging.sorts,
                         );
                         flush_apply_ns.store(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+                        // Collect mutated field names for bitmap memory cache staleness tracking.
+                        for fgk in coalescer.filter_insert_entries().keys() {
+                            stale_fields.push(fgk.field.to_string());
+                        }
+                        for fgk in coalescer.filter_remove_entries().keys() {
+                            stale_fields.push(fgk.field.to_string());
+                        }
+                        for sgk in coalescer.sort_set_entries().keys() {
+                            stale_fields.push(sgk.field.to_string());
+                        }
+                        for sgk in coalescer.sort_clear_entries().keys() {
+                            stale_fields.push(sgk.field.to_string());
+                        }
 
                         // Persist deferred map when new deferred entries are added.
                         if coalescer.has_deferred_alive() {
@@ -1462,6 +1483,18 @@ impl ConcurrentEngine {
                             flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             staging_dirty = false;
 
+                            // Mark fields touched by mutations or lazy loads as stale
+                            // in the bitmap memory cache so the scanner re-measures them.
+                            if !stale_fields.is_empty() {
+                                // Dedup to avoid redundant lock acquisitions.
+                                stale_fields.sort_unstable();
+                                stale_fields.dedup();
+                                for field in &stale_fields {
+                                    flush_mem_cache.mark_stale(field);
+                                }
+                                stale_fields.clear();
+                            }
+
                             // Record flush stats for Prometheus
                             let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
                             flush_pub_count.fetch_add(1, Ordering::Relaxed);
@@ -1643,6 +1676,10 @@ impl ConcurrentEngine {
                                 // Publish the compacted staging
                                 inner.store(Arc::new(staging.clone()));
                                 staging_dirty = false;
+                                // Mark compacted fields as stale in memory cache.
+                                for name in &dirty_fields {
+                                    flush_mem_cache.mark_stale(name);
+                                }
                                 eprintln!("  Idle compaction: published clean staging");
                             }
                         }
@@ -1658,6 +1695,8 @@ impl ConcurrentEngine {
                         flush_unified_cache.lock().clear();
                         inner.store(Arc::new(staging.clone()));
                         staging_dirty = false;
+                        // All fields changed during loading — mark everything stale.
+                        flush_mem_cache.mark_all_stale();
                     }
                     was_loading = is_loading;
 
@@ -1960,6 +1999,15 @@ impl ConcurrentEngine {
                     // Queries during loading are expected to see stale data anyway.
                     if lazy_loaded && bitmap_count == 0 && !is_loading {
                         inner.store(Arc::new(staging.clone()));
+                        // Mark lazy-loaded fields as stale in memory cache.
+                        if !stale_fields.is_empty() {
+                            stale_fields.sort_unstable();
+                            stale_fields.dedup();
+                            for field in &stale_fields {
+                                flush_mem_cache.mark_stale(field);
+                            }
+                            stale_fields.clear();
+                        }
                     }
 
                     // Incremental time bucket refresh: instead of scanning 107M alive slots,
@@ -5893,7 +5941,7 @@ impl ConcurrentEngine {
         }
 
         // Trigger initial population of bitmap memory cache after load completes.
-        self.bitmap_memory_cache.mark_all_dirty();
+        self.bitmap_memory_cache.mark_all_stale();
     }
 
     /// Combined exit-loading + save + unload that avoids the memory spike.
@@ -7672,6 +7720,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
@@ -7679,6 +7728,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
@@ -7686,6 +7736,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -8823,6 +8874,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
@@ -8830,6 +8882,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
@@ -8837,6 +8890,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -9786,6 +9840,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: true, // <-- eager
+                    per_value_lazy: false,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
@@ -9793,6 +9848,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false, // <-- lazy (default)
+                    per_value_lazy: false,
                 },
             ],
             sort_fields: vec![
@@ -10430,6 +10486,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
                 FilterFieldConfig {
                     name: "collectionIds".to_string(),
@@ -10437,6 +10494,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
+                    per_value_lazy: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
