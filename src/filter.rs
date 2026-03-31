@@ -95,11 +95,14 @@ impl FilterField {
     }
 
     /// Bulk-remove multiple slots from the bitmap for the given value.
+    /// If the value isn't in memory (lazy-loaded field), creates an unloaded
+    /// entry with pending removes in the diff layer. The removes will be
+    /// applied when the base is loaded during compaction or lazy-load.
     pub fn remove_bulk(&mut self, value: u64, slots: &[u32]) {
-        if let Some(vb) = self.bitmaps.get_mut(&value) {
-            for &slot in slots {
-                vb.remove(slot);
-            }
+        let vb = self.bitmaps.entry(value)
+            .or_insert_with(VersionedBitmap::new_unloaded);
+        for &slot in slots {
+            vb.remove(slot);
         }
     }
 
