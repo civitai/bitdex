@@ -204,6 +204,9 @@ triggers:
       - hash
       - width
       - height
+      # existedAt = GREATEST(scannedAt, createdAt) — required for sortAt computation.
+      # Without this, new images get sortAt=0 because neither source field is emitted.
+      - { column: existedAt, expression: "GREATEST(extract(epoch from {scannedAt})::bigint, extract(epoch from {createdAt})::bigint)" }
     computed_fields:
       - target: hasMeta
         expression: "({flags} >> 13) & 1 = 1 AND ({flags} >> 2) & 1 = 0"
@@ -213,10 +216,6 @@ triggers:
         expression: "({flags} >> 3) & 1 = 1"
       - target: poi
         expression: "({flags} >> 4) & 1 = 1"
-      # existedAt = GREATEST(scannedAt, createdAt) — required for sortAt computation.
-      # Without this, new images get sortAt=0 because existedAt is never emitted.
-      - target: existedAt
-        expression: "GREATEST(extract(epoch from {scannedAt})::bigint, extract(epoch from {createdAt})::bigint)"
 
   - table: TagsOnImageNew
     slot_field: imageId
