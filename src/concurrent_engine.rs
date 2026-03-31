@@ -1439,52 +1439,11 @@ impl ConcurrentEngine {
                                     .filter(|(_, field)| field.has_dirty())
                                     .map(|(name, _)| name.clone())
                                     .collect();
-                                // For lazy_value_fields with dirty+unloaded entries, auto-load
-                                // bases from disk so merge can compact them. Without this, ops
-                                // mutations create unloaded dirty entries that can never be merged
-                                // or evicted, causing unbounded memory growth.
-                                let lvf = flush_lazy_value_fields.lock();
-                                for name in &dirty_fields {
-                                    if !lvf.contains(name) {
-                                        continue;
-                                    }
-                                    if let Some(ref fs) = flush_filter_store {
-                                        // Collect unloaded dirty value keys
-                                        let unloaded_dirty: Vec<u64> = staging.filters.get_field(name)
-                                            .map(|field| {
-                                                field.bitmap_keys()
-                                                    .filter(|&v| {
-                                                        field.get_versioned(*v)
-                                                            .map(|vb| vb.is_dirty() && !vb.is_loaded())
-                                                            .unwrap_or(false)
-                                                    })
-                                                    .copied()
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default();
-
-                                        if !unloaded_dirty.is_empty() {
-                                            // Load bases from disk for these values
-                                            match fs.load_field_values(name, &unloaded_dirty) {
-                                                Ok(loaded) => {
-                                                    if let Some(field) = staging.filters.get_field_mut(name) {
-                                                        field.load_values(loaded, &unloaded_dirty);
-                                                    }
-                                                    if !unloaded_dirty.is_empty() {
-                                                        eprintln!(
-                                                            "Compaction: auto-loaded {} bases for '{}' (dirty+unloaded)",
-                                                            unloaded_dirty.len(), name
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("WARNING: Failed to auto-load bases for '{}': {e}", name);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                drop(lvf);
+                                // NOTE: Auto-loading bases for dirty+unloaded entries is disabled.
+                                // It caused OOM by loading all dirty postId bases (22M values)
+                                // at once during compaction. Dirty diffs on unloaded fields are
+                                // small and persist safely via ShardStore ops log. They'll be
+                                // merged when the field is eventually loaded by a query.
 
                                 // Only make_mut + merge on fields that actually have dirty diffs
                                 for name in &dirty_fields {
@@ -1674,32 +1633,8 @@ impl ConcurrentEngine {
 
                             if !dirty_fields.is_empty() {
                                 eprintln!("  Idle compaction (tick {}): {} dirty fields: {:?}", tick, dirty_fields.len(), dirty_fields);
-                                let lvf = flush_lazy_value_fields.lock();
-                                for name in &dirty_fields {
-                                    if !lvf.contains(name) { continue; }
-                                    if let Some(ref fs) = flush_filter_store {
-                                        let unloaded_dirty: Vec<u64> = staging.filters.get_field(name)
-                                            .map(|field| {
-                                                field.bitmap_keys()
-                                                    .filter(|&v| field.get_versioned(*v)
-                                                        .map(|vb| vb.is_dirty() && !vb.is_loaded())
-                                                        .unwrap_or(false))
-                                                    .copied().collect()
-                                            }).unwrap_or_default();
-                                        if !unloaded_dirty.is_empty() {
-                                            match fs.load_field_values(name, &unloaded_dirty) {
-                                                Ok(loaded) => {
-                                                    if let Some(field) = staging.filters.get_field_mut(name) {
-                                                        field.load_values(loaded, &unloaded_dirty);
-                                                    }
-                                                    eprintln!("  Idle compaction: auto-loaded {} bases for '{}'", unloaded_dirty.len(), name);
-                                                }
-                                                Err(e) => eprintln!("WARNING: Failed to auto-load bases for '{}': {e}", name),
-                                            }
-                                        }
-                                    }
-                                }
-                                drop(lvf);
+                                // NOTE: Auto-loading bases disabled (same as regular compaction).
+                                // Dirty diffs persist via ShardStore, merge on query load.
                                 for name in &dirty_fields {
                                     if let Some(field) = staging.filters.get_field_mut(name) {
                                         field.merge_dirty();
