@@ -50,6 +50,7 @@ fn list_generations(dir: &Path) -> Vec<u32> {
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .filter_map(|e| parse_generation(&e.file_name().to_string_lossy()))
         .collect();
     gens.sort();
@@ -59,7 +60,7 @@ fn list_generations(dir: &Path) -> Vec<u32> {
 fn gen_path(dir: &Path, gen: u32) -> PathBuf {
     if gen == 0 {
         let legacy = dir.join("ops.wal");
-        if legacy.exists() {
+        if legacy.is_file() {
             return legacy;
         }
     }
