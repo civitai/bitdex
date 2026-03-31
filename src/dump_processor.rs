@@ -2116,6 +2116,11 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
+    // Explicitly flush BulkWriter's buffered V2 writers to disk.
+    // BufWriter::drop would flush, but silently swallows errors — this ensures
+    // data integrity especially for the metrics phase (runs last, vulnerable to OOM).
+    bulk_writer.flush_v2_writers();
+
     let elapsed = t.elapsed();
     eprintln!(
         "  Dump {} parse+merge complete: {} rows in {:.1}s ({:.0}/s)",
@@ -3349,5 +3354,122 @@ mod tests {
             }
             other => panic!("Expected Single(Integer), got {:?}", other),
         }
+    }
+
+    /// Test that write_docstore_row_indexed correctly coerces PG boolean strings
+    /// ("t"/"f") to PackedValue::B for fields declared as boolean in the data schema.
+    #[test]
+    fn test_boolean_coercion_in_docstore_write() {
+        use crate::docstore::DocStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ds = DocStore::new_v2(dir.path(), false);
+
+        let field_names = vec!["poi".to_string(), "type".to_string()];
+        let bulk_writer = Arc::new(ds.prepare_bulk_writer(&field_names).unwrap());
+        let field_idx = bulk_writer.field_to_idx().clone();
+
+        let mut boolean_fields = HashSet::new();
+        boolean_fields.insert("poi".to_string());
+
+        let col_index: HashMap<String, usize> = [
+            ("id".to_string(), 0),
+            ("poi".to_string(), 1),
+            ("type".to_string(), 2),
+        ].into_iter().collect();
+        let line = b"1,f,Checkpoint";
+        let fields = parse_delimited_line(line, b',');
+        let row = ParsedRow { fields, col_index: &col_index };
+
+        let request_fields = vec![
+            DumpFieldMapping::Short("poi".to_string()),
+            DumpFieldMapping::Short("type".to_string()),
+        ];
+
+        let enriched = crate::dump_enrichment::EnrichedFields::default();
+        let computed_defs: Vec<ComputedFieldDef> = vec![];
+        let indexed_fields = row.to_indexed_fields();
+        let col_idx = row.col_index_ref();
+        let extra_i64: Vec<(&str, i64)> = vec![];
+
+        let mut serialize_buf = Vec::new();
+        let mut tuple_buf = Vec::new();
+        let mut write_buf = Vec::new();
+
+        write_docstore_row_indexed(
+            &row, &enriched, &computed_defs, &indexed_fields, col_idx,
+            1, &request_fields, &bulk_writer, &field_idx,
+            &boolean_fields, &extra_i64,
+            &mut serialize_buf, &mut tuple_buf, &mut write_buf,
+        );
+        bulk_writer.flush_v2_writers();
+
+        let doc = ds.get_v2(1).unwrap().unwrap();
+        assert_eq!(
+            doc.fields.get("poi"),
+            Some(&serde_json::Value::Bool(false)),
+            "poi should be boolean false, not string 'f'"
+        );
+        assert_eq!(
+            doc.fields.get("type"),
+            Some(&serde_json::Value::String("Checkpoint".to_string())),
+            "type should remain a string"
+        );
+    }
+
+    /// Test that extra_i64_fields (config-computed sorts) are written to docstore.
+    #[test]
+    fn test_extra_i64_fields_in_docstore_write() {
+        use crate::docstore::DocStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ds = DocStore::new_v2(dir.path(), false);
+
+        let field_names = vec!["userId".to_string(), "sortAt".to_string()];
+        let bulk_writer = Arc::new(ds.prepare_bulk_writer(&field_names).unwrap());
+        let field_idx = bulk_writer.field_to_idx().clone();
+
+        let boolean_fields = HashSet::new();
+        let col_index: HashMap<String, usize> = [
+            ("id".to_string(), 0),
+            ("userId".to_string(), 1),
+        ].into_iter().collect();
+        let line = b"1,42";
+        let fields = parse_delimited_line(line, b',');
+        let row = ParsedRow { fields, col_index: &col_index };
+
+        let request_fields = vec![DumpFieldMapping::Short("userId".to_string())];
+        let enriched = crate::dump_enrichment::EnrichedFields::default();
+        let computed_defs: Vec<ComputedFieldDef> = vec![];
+        let indexed_fields = row.to_indexed_fields();
+        let col_idx = row.col_index_ref();
+
+        let extra_i64: Vec<(&str, i64)> = vec![("sortAt", 1711234567)];
+
+        let mut serialize_buf = Vec::new();
+        let mut tuple_buf = Vec::new();
+        let mut write_buf = Vec::new();
+
+        write_docstore_row_indexed(
+            &row, &enriched, &computed_defs, &indexed_fields, col_idx,
+            1, &request_fields, &bulk_writer, &field_idx,
+            &boolean_fields, &extra_i64,
+            &mut serialize_buf, &mut tuple_buf, &mut write_buf,
+        );
+        bulk_writer.flush_v2_writers();
+
+        let doc = ds.get_v2(1).unwrap().unwrap();
+        assert_eq!(
+            doc.fields.get("userId"),
+            Some(&serde_json::json!(42)),
+            "userId should be written"
+        );
+        assert_eq!(
+            doc.fields.get("sortAt"),
+            Some(&serde_json::json!(1711234567)),
+            "sortAt should be written via extra_i64_fields"
+        );
     }
 }

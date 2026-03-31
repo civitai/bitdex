@@ -507,17 +507,18 @@ async fn run_streaming_pipeline(
     let start = std::time::Instant::now();
 
     // Download ClickHouse metrics CSV in background (separate from PG COPY)
-    let ch_handle = if let Some(ref ch_url) = sync_config.clickhouse_url {
+    let mut ch_handle = if let Some(ref ch_url) = sync_config.clickhouse_url {
         let ch_url = ch_url.clone();
         let stage = stage_dir.to_path_buf();
         let user = sync_config.clickhouse_username.clone();
         let pass = sync_config.clickhouse_password.clone();
         Some(tokio::spawn(async move {
-            let _ = bulk_loader::download_metrics_from_clickhouse(
+            if let Err(e) = bulk_loader::download_metrics_from_clickhouse(
                 &stage, &ch_url, user.as_deref(), pass.as_deref(),
-            ).await.map_err(|e| {
-                eprintln!("WARNING: ClickHouse metrics download failed: {e}");
-            });
+            ).await {
+                eprintln!("ERROR: ClickHouse metrics download failed: {e}");
+                eprintln!("  Metrics sort fields (reactionCount, commentCount, collectedCount) will be zero.");
+            }
         }))
     } else {
         None
@@ -578,6 +579,17 @@ async fn run_streaming_pipeline(
             }));
         }
 
+        // For ClickHouse-sourced phases, wait for the background download to finish first
+        if phase.source.as_deref() == Some("clickhouse") {
+            if let Some(handle) = ch_handle.take() {
+                eprintln!("[{}/{}] Waiting for ClickHouse download to finish...", i + 1, total);
+                match handle.await {
+                    Ok(()) => eprintln!("  ClickHouse download complete."),
+                    Err(e) => eprintln!("  WARNING: ClickHouse download task panicked: {e}"),
+                }
+            }
+        }
+
         // Check CSV exists
         let csv_ext = if phase.format == "tsv" { "tsv" } else { "csv" };
         let csv_path = stage_dir.join(format!("{}.{}", phase.name, csv_ext));
@@ -585,7 +597,7 @@ async fn run_streaming_pipeline(
             if phase.source.as_deref() == Some("clickhouse") {
                 let tsv_path = stage_dir.join(format!("{}.tsv", phase.name));
                 if !tsv_path.exists() {
-                    eprintln!("[{}/{}] WARNING: Skipping '{name}' — CSV not found", i + 1, total);
+                    eprintln!("[{}/{}] ERROR: Skipping '{name}' — ClickHouse CSV not found (download may have failed)", i + 1, total);
                     continue;
                 }
             } else {

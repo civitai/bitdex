@@ -1742,4 +1742,21 @@ mod tests {
         let has_filter_insert = ops.iter().any(|op| matches!(op, MutationOp::FilterInsert { .. }));
         assert!(!has_filter_insert, "deferred should not insert any filter bitmaps");
     }
+
+    #[test]
+    fn test_value_to_sort_u32_clamps_negatives() {
+        // Positive values pass through
+        assert_eq!(value_to_sort_u32(&Value::Integer(42)), Some(42));
+        assert_eq!(value_to_sort_u32(&Value::Integer(0)), Some(0));
+        assert_eq!(value_to_sort_u32(&Value::Integer(u32::MAX as i64)), Some(u32::MAX));
+
+        // Negative values clamp to 0 (not wrap to u32::MAX)
+        assert_eq!(value_to_sort_u32(&Value::Integer(-1)), Some(0));
+        assert_eq!(value_to_sort_u32(&Value::Integer(-100)), Some(0));
+        assert_eq!(value_to_sort_u32(&Value::Integer(i64::MIN)), Some(0));
+
+        // Non-integer types return None
+        assert_eq!(value_to_sort_u32(&Value::Bool(true)), None);
+        assert_eq!(value_to_sort_u32(&Value::String("42".into())), None);
+    }
 }
