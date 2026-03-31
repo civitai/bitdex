@@ -62,15 +62,76 @@ During the 2026-03-31 data fix sprint:
 
 Dead code that looks like production code is actively dangerous — it wastes investigation time and leads to fixes in the wrong place.
 
+### 4. Dead modules in `src/` (lib.rs exports)
+
+**`src/field_handler.rs`** — DEAD. Exported in lib.rs but zero imports anywhere. Trait + implementations for field operation validation. Abandoned feature.
+
+**`src/preset.rs`** — DEAD. Exported in lib.rs but zero imports. Config overlay system (`load_preset`, `apply_preset`). Only internal tests call it.
+
+**`src/shard_store_migrate.rs`** — DEAD. Zero external callers. V2→V3 docstore migration code that was never wired in.
+
+**`src/shard_store_doc.rs`** — DEAD (transitively). Only imported by `field_handler.rs` and `shard_store_migrate.rs`, both dead.
+
+### 5. Dead functions in `src/pg_sync/copy_queries.rs`
+
+Parse functions only called by dead modules (csv_ops.rs, dead ops_processor enrichment functions):
+- `parse_image_row` — only caller is csv_ops.rs (dead)
+- `parse_tag_row` — only caller is csv_ops.rs (dead)
+- `parse_tool_row` — only caller is csv_ops.rs (dead)
+- `parse_technique_row` — only caller is csv_ops.rs (dead)
+- `parse_resource_row` — only caller is csv_ops.rs (dead)
+- `parse_post_row` — callers are csv_ops.rs (dead) + ops_processor load_posts_enrichment (dead private fn)
+- `parse_model_version_row` — callers are csv_ops.rs (dead) + ops_processor (dead private fn)
+- `parse_model_row` — callers are csv_ops.rs (dead) + ops_processor (dead private fn)
+- `parse_metric_row` — zero callers
+- `parse_collection_item_row` — zero callers
+
+The `copy_*` functions (copy_images, copy_posts, etc.) are LIVE — used by bulk_loader for PG COPY.
+
+### 6. Dead functions in `src/loader.rs`
+
+- `json_to_document()` — zero callers (superseded by `json_to_document_with_dicts`)
+- `apply_computed_sort_fields()` — zero callers
+- `convert_field_with_dict()` — zero callers
+
+### 7. Dead functions in `src/pg_sync/bulk_loader.rs`
+
+- `download_from_sync_config()` — zero callers outside module
+
+### 8. Nearly-dead: `src/pg_sync/backfill.rs`
+
+Entry points are dead:
+- `auto_backfill()` — zero callers
+- `needs_backfill()` — zero callers
+- `mark_backfilled()` — zero callers
+
+Only `process_collection_items_csv()` is called (from integration tests).
+
+### 9. Nearly-dead: `src/ingester.rs`
+
+- `Ingester<B>` struct — zero callers. Callers use `CoalescerSink`/`AccumSink` directly.
+- `DocSink` — only used in ingester's own tests, never in production.
+- `BitmapSink` trait and `CoalescerSink`/`AccumSink` are LIVE.
+
 ## Cleanup Plan
 
 | Item | Action | Risk |
 |------|--------|------|
 | `src/pg_sync/csv_ops.rs` | Delete module + mod.rs entry | None — zero callers |
+| `src/field_handler.rs` | Delete module + lib.rs entry | None — zero imports |
+| `src/preset.rs` | Delete module + lib.rs entry | None — zero imports |
+| `src/shard_store_migrate.rs` | Delete module + lib.rs entry | None — zero callers |
+| `src/shard_store_doc.rs` | Delete module + lib.rs entry | None — only dead callers |
 | `process_wal_dump()` | Delete | None — zero callers |
 | `apply_ops_batch_dump()` | Delete | None — only caller is process_wal_dump |
-| `src/pg_sync/copy_queries.rs` | Audit — may have functions only used by csv_ops | Check `parse_image_row`, `parse_tag_row` callers |
-| `image_row_to_ops_pub` | Delete with csv_ops.rs | None |
+| `parse_*_row` functions | Delete all 10 parse functions | None — only dead callers |
+| `ops_processor` enrichment fns | Delete load_posts/mv/model_enrichment | None — private, zero callers |
+| `loader.rs` dead fns | Delete json_to_document, apply_computed_sort_fields, convert_field_with_dict | None |
+| `bulk_loader::download_from_sync_config` | Delete | None — zero callers |
+| `backfill.rs` entry points | Delete auto_backfill, needs_backfill, mark_backfilled | None — zero callers |
+| `ingester.rs` Ingester struct | Delete wrapper; keep BitmapSink + sinks | Low — callers already bypass it |
+
+**Estimated total:** ~2,000-3,000 lines of dead code across 6 modules and ~20 functions.
 
 ## Related: Code That IS Production
 
@@ -80,3 +141,7 @@ For reference, the code paths that ARE live in production:
 - **Steady-state ops:** `ops_processor.rs::apply_ops_batch()` (WAL reader → bitmap mutations)
 - **Metrics poller:** `metrics_poller.rs` (ClickHouse → Op::Set → /ops endpoint)
 - **Ops endpoint:** `server.rs::handle_ops()` (POST /ops → WAL append)
+- **Server handlers:** All 51 route handlers are wired and live
+- **All 6 binary targets:** Live and registered in Cargo.toml
+- **bitmap_fs.rs:** Still heavily used (82 refs in concurrent_engine) despite "legacy" label
+- **unified_cache.rs:** Live (82 refs in concurrent_engine)
