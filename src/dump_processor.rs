@@ -1711,24 +1711,24 @@ pub fn process_dump_with_progress(
                         let t = fm.target();
                         if sort_bits_ref.contains_key(t) || config_computed_sources_ref.contains(t) {
                             if let Some(v) = row.get_i64(fm.column()).or_else(|| enriched_get(t).and_then(|s| s.parse::<i64>().ok())) {
-                                row_sv.insert(t, v as u32);
+                                row_sv.insert(t, v.max(0) as u32);
                             }
                         }
                     }
                     for t in enrichment_targets_ref {
                         if sort_bits_ref.contains_key(t.as_str()) || config_computed_sources_ref.contains(t.as_str()) {
-                            if let Some(s) = enriched_get(t) { if let Ok(v) = s.parse::<i64>() { row_sv.insert(t, v as u32); } }
+                            if let Some(s) = enriched_get(t) { if let Ok(v) = s.parse::<i64>() { row_sv.insert(t, v.max(0) as u32); } }
                         }
                     }
                     for (t, value) in &enriched.computed {
                         if sort_bits_ref.contains_key(t.as_str()) || config_computed_sources_ref.contains(t.as_str()) {
-                            if let NateExprValue::Int(n) = value { row_sv.insert(t, *n as u32); }
+                            if let NateExprValue::Int(n) = value { row_sv.insert(t, (*n).max(0) as u32); }
                         }
                     }
                     for def in computed_defs_ref {
                         if sort_bits_ref.contains_key(&def.target) || config_computed_sources_ref.contains(&def.target) {
                             if let Some(NateExprValue::Int(v)) = def.eval_indexed(&indexed_fields_buf, col_idx, None) {
-                                row_sv.insert(&def.target, v as u32);
+                                row_sv.insert(&def.target, v.max(0) as u32);
                             }
                         }
                     }
@@ -1826,7 +1826,7 @@ pub fn process_dump_with_progress(
                         if let Some(v) = row.get_i64(column).or_else(|| {
                             enriched_get(target).and_then(|s| s.parse::<i64>().ok())
                         }) {
-                            let val32 = v as u32;
+                            let val32 = v.max(0) as u32;
                             if let Some(sm) = sort_maps.get_mut(target) {
                                 for bit in 0..(bits as usize) {
                                     if (val32 >> bit) & 1 == 1 {
@@ -1858,7 +1858,7 @@ pub fn process_dump_with_progress(
                         // Sort bitmap
                         if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
                             if let Some(v) = val_str.parse::<i64>().ok() {
-                                let val32 = v as u32;
+                                let val32 = v.max(0) as u32;
                                 if let Some(sm) = sort_maps.get_mut(target.as_str()) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
@@ -1890,7 +1890,7 @@ pub fn process_dump_with_progress(
                                     .insert(slot);
                             }
                             if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
-                                let val32 = *n as u32;
+                                let val32 = (*n).max(0) as u32;
                                 if let Some(sm) = sort_maps.get_mut(target.as_str()) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
@@ -1919,7 +1919,7 @@ pub fn process_dump_with_progress(
                                 }
                             }
                             if let Some(&bits) = sort_bits_ref.get(&def.target) {
-                                let val32 = v as u32;
+                                let val32 = v.max(0) as u32;
                                 if let Some(sm) = sort_maps.get_mut(&def.target) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
@@ -1973,7 +1973,7 @@ pub fn process_dump_with_progress(
                             if let Some(v) = row.get_i64(column).or_else(|| {
                                 enriched_get(target).and_then(|s| s.parse::<i64>().ok())
                             }) {
-                                row_sort_vals.insert(target, v as u32);
+                                row_sort_vals.insert(target, v.max(0) as u32);
                             }
                         }
                     }
@@ -1982,7 +1982,7 @@ pub fn process_dump_with_progress(
                         if sort_bits_ref.contains_key(target.as_str()) || config_computed_sources_ref.contains(target.as_str()) {
                             if let Some(val_str) = enriched_get(target) {
                                 if let Ok(v) = val_str.parse::<i64>() {
-                                    row_sort_vals.insert(target.as_str(), v as u32);
+                                    row_sort_vals.insert(target.as_str(), v.max(0) as u32);
                                 }
                             }
                         }
@@ -1991,7 +1991,7 @@ pub fn process_dump_with_progress(
                     for (target, value) in &enriched.computed {
                         if sort_bits_ref.contains_key(target.as_str()) || config_computed_sources_ref.contains(target.as_str()) {
                             if let NateExprValue::Int(n) = value {
-                                row_sort_vals.insert(target.as_str(), *n as u32);
+                                row_sort_vals.insert(target.as_str(), (*n).max(0) as u32);
                             }
                         }
                     }
@@ -1999,7 +1999,7 @@ pub fn process_dump_with_progress(
                     for def in computed_defs_ref {
                         if sort_bits_ref.contains_key(&def.target) || config_computed_sources_ref.contains(&def.target) {
                             if let Some(NateExprValue::Int(v)) = def.eval_indexed(&indexed_fields_buf, col_idx, None) {
-                                row_sort_vals.insert(&def.target, v as u32);
+                                row_sort_vals.insert(&def.target, v.max(0) as u32);
                             }
                         }
                     }
