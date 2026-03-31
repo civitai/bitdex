@@ -2776,6 +2776,12 @@ fn write_docstore_row_indexed(
     serialize_buf.clear();
     tuple_buf.clear();
 
+    // Build skip set: fields provided by extra_i64_fields (config-computed sort values
+    // like sortAt = GREATEST) take priority over direct/enriched/computed writes.
+    // Without this, a data_schema mapping (e.g., sortAtUnix → sortAt) that fails to
+    // find its source column could overwrite the correct computed value with 0.
+    let extra_skip: std::collections::HashSet<&str> = extra_i64_fields.iter().map(|&(t, _)| t).collect();
+
     // Collect all fields into serialize_buf, track (field_idx, offset, len) in tuple_buf
     macro_rules! collect_packed {
         ($fidx:expr, $value:expr) => {
@@ -2787,9 +2793,10 @@ fn write_docstore_row_indexed(
         };
     }
 
-    // Direct fields
+    // Direct fields — skip fields that will be written by extra_i64_fields
     for mapping in request_fields {
         let target = mapping.target();
+        if extra_skip.contains(target) { continue; }
         let column = mapping.column();
         if let Some(&fidx) = field_idx.get(target) {
             if let Some(v) = row.get_i64(column) {
@@ -2808,8 +2815,9 @@ fn write_docstore_row_indexed(
         }
     }
 
-    // Enriched fields
+    // Enriched fields — skip fields that will be written by extra_i64_fields
     for (target, value) in &enriched.fields {
+        if extra_skip.contains(target.as_str()) { continue; }
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             if let Ok(v) = value.parse::<i64>() {
                 collect_packed!(fidx, &PackedValue::I(v));
@@ -2825,8 +2833,9 @@ fn write_docstore_row_indexed(
         }
     }
 
-    // Enriched computed fields
+    // Enriched computed fields — skip fields that will be written by extra_i64_fields
     for (target, value) in &enriched.computed {
+        if extra_skip.contains(target.as_str()) { continue; }
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             match value {
                 NateExprValue::Int(v) => { collect_packed!(fidx, &PackedValue::I(*v)); }
@@ -2843,8 +2852,9 @@ fn write_docstore_row_indexed(
         }
     }
 
-    // Computed fields via indexed eval
+    // Computed fields via indexed eval — skip fields that will be written by extra_i64_fields
     for def in computed_defs {
+        if extra_skip.contains(def.target.as_str()) { continue; }
         if let Some(&fidx) = field_idx.get(def.target.as_str()) {
             match def.eval_indexed(indexed_fields, col_idx, None) {
                 Some(NateExprValue::Int(v)) => { collect_packed!(fidx, &PackedValue::I(v)); }
