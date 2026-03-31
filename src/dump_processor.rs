@@ -2862,10 +2862,19 @@ fn write_docstore_row_indexed(
     }
 
     // Extra i64 fields (config-computed sort values like sortAt = GREATEST(existedAt, publishedAt))
+    let pre_extra_count = tuple_buf.len();
     for &(target, value) in extra_i64_fields {
         if let Some(&fidx) = field_idx.get(target) {
             collect_packed!(fidx, &PackedValue::I(value));
         }
+    }
+    // DIAG: trace extra_i64 write for first 3 slots
+    if slot <= 3 && !extra_i64_fields.is_empty() {
+        let post_extra_count = tuple_buf.len();
+        let added = post_extra_count - pre_extra_count;
+        eprintln!("  [WRITE-DIAG] slot={} extra_i64={:?} pre={} post={} added={} field_idx_has_sortAt={}",
+            slot, extra_i64_fields, pre_extra_count, post_extra_count, added,
+            field_idx.contains_key("sortAt"));
     }
 
     // One lock acquisition for all fields
