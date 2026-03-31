@@ -173,41 +173,63 @@ async fn main() {
                 &stage_dir, &bitdex_client, full_sync_config.as_ref(), cursor_override,
             ).await;
 
-            // Run both pollers concurrently
+            // Run pollers concurrently (ops + optional metrics)
             let cursor_name = format!("pg-sync-{}", sync_config.replica_id);
+            let ops_disabled = sync_config.poll_interval_ms == Some(0);
 
-            let ops_fut = ops_poller::run_ops_poller(
-                &pool,
-                &bitdex_client,
-                sync_config.poll_interval(),
-                sync_config.outbox_batch_limit,
-                &cursor_name,
-                Some(sync_config.replica_id.as_str()),
-            );
+            if ops_disabled {
+                eprintln!("Ops poller DISABLED (poll_interval_ms=0)");
+            }
 
-            if let Some(ref ch_url) = sync_config.clickhouse_url {
+            if !ops_disabled {
+                let ops_fut = ops_poller::run_ops_poller(
+                    &pool,
+                    &bitdex_client,
+                    sync_config.poll_interval(),
+                    sync_config.outbox_batch_limit,
+                    &cursor_name,
+                    Some(sync_config.replica_id.as_str()),
+                );
+
+                if let Some(ref ch_url) = sync_config.clickhouse_url {
+                    let ch_config = metrics_poller::ClickHouseConfig {
+                        url: ch_url.clone(),
+                        username: sync_config.clickhouse_username.clone(),
+                        password: sync_config.clickhouse_password.clone(),
+                    };
+                    let metrics_fut = metrics_poller::run_metrics_poller(
+                        &ch_config,
+                        &bitdex_client,
+                        sync_config.metrics_poll_interval_secs,
+                    );
+
+                    eprintln!("Starting ops poller + metrics poller (bitdex={bitdex_url})...");
+                    tokio::select! {
+                        res = ops_fut => eprintln!("Ops poller exited: {res:?}"),
+                        res = metrics_fut => eprintln!("Metrics poller exited: {res:?}"),
+                    }
+                } else {
+                    eprintln!("No clickhouse_url configured — ops poller only (bitdex={bitdex_url})");
+                    if let Err(e) = ops_fut.await {
+                        eprintln!("Ops poller error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Some(ref ch_url) = sync_config.clickhouse_url {
+                // Ops disabled but metrics still runs
                 let ch_config = metrics_poller::ClickHouseConfig {
                     url: ch_url.clone(),
                     username: sync_config.clickhouse_username.clone(),
                     password: sync_config.clickhouse_password.clone(),
                 };
-                let metrics_fut = metrics_poller::run_metrics_poller(
-                    &ch_config,
-                    &bitdex_client,
-                    sync_config.metrics_poll_interval_secs,
-                );
-
-                eprintln!("Starting ops poller + metrics poller (bitdex={bitdex_url})...");
-                tokio::select! {
-                    res = ops_fut => eprintln!("Ops poller exited: {res:?}"),
-                    res = metrics_fut => eprintln!("Metrics poller exited: {res:?}"),
+                eprintln!("Starting metrics poller only (ops disabled)...");
+                if let Err(e) = metrics_poller::run_metrics_poller(
+                    &ch_config, &bitdex_client, sync_config.metrics_poll_interval_secs,
+                ).await {
+                    eprintln!("Metrics poller error: {e}");
                 }
             } else {
-                eprintln!("No clickhouse_url configured — ops poller only (bitdex={bitdex_url})");
-                if let Err(e) = ops_fut.await {
-                    eprintln!("Ops poller error: {e}");
-                    std::process::exit(1);
-                }
+                eprintln!("Both ops and metrics disabled — nothing to poll. Exiting.");
             }
         }
     }
