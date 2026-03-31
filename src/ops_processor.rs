@@ -59,12 +59,27 @@ impl DocWriter {
     }
 
     /// Write a single-value field update to the docstore.
+    /// Clamps negative integers to 0 — sort fields (reactionCount, etc.) are
+    /// unsigned in bitmaps; storing negatives in docstore would diverge from
+    /// the bitmap value and confuse shadow-mode comparisons.
     fn write_set(&mut self, slot: u32, field: &str, value: &JsonValue) {
         let idx = match self.resolve_field(field) {
             Some(idx) => idx,
             None => return,
         };
-        if let Some(packed) = json_to_packed(value) {
+        // Clamp negative integers to 0 before docstore write
+        let clamped;
+        let effective = if let Some(n) = value.as_i64() {
+            if n < 0 {
+                clamped = serde_json::json!(0);
+                &clamped
+            } else {
+                value
+            }
+        } else {
+            value
+        };
+        if let Some(packed) = json_to_packed(effective) {
             if let Ok(bytes) = rmp_serde::to_vec(&packed) {
                 self.pending.push((slot, idx, bytes));
             }
