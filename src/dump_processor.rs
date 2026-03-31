@@ -1545,6 +1545,15 @@ pub fn process_dump_with_progress(
         .collect();
     let config_computed_sorts_ref = &config_computed_sorts;
 
+    // Source fields needed by config-computed sorts (e.g., existedAt, publishedAt for sortAt).
+    // These values must be collected per-row even if the source field isn't in sort_fields,
+    // so that GREATEST/LEAST can evaluate correctly.
+    let config_computed_sources: std::collections::HashSet<String> = config_computed_sorts
+        .iter()
+        .flat_map(|ccs| ccs.source_fields.iter().cloned())
+        .collect();
+    let config_computed_sources_ref = &config_computed_sources;
+
     // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
     // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
     type ThreadResult = (
@@ -1875,11 +1884,11 @@ pub fn process_dump_with_progress(
                     // We need the u32 values that were just set in sort_maps.
                     let mut row_sort_vals: HashMap<&str, u32> = HashMap::new();
 
-                    // Direct fields
+                    // Direct fields (sort fields + computed sort sources)
                     for field_mapping in request_fields {
                         let target = field_mapping.target();
                         let column = field_mapping.column();
-                        if sort_bits_ref.contains_key(target) {
+                        if sort_bits_ref.contains_key(target) || config_computed_sources_ref.contains(target) {
                             if let Some(v) = row.get_i64(column).or_else(|| {
                                 enriched_get(target).and_then(|s| s.parse::<i64>().ok())
                             }) {
@@ -1887,9 +1896,9 @@ pub fn process_dump_with_progress(
                             }
                         }
                     }
-                    // Enrichment-only sort fields
+                    // Enrichment-only sort fields + computed sort sources
                     for target in enrichment_targets_ref {
-                        if sort_bits_ref.contains_key(target.as_str()) {
+                        if sort_bits_ref.contains_key(target.as_str()) || config_computed_sources_ref.contains(target.as_str()) {
                             if let Some(val_str) = enriched_get(target) {
                                 if let Ok(v) = val_str.parse::<i64>() {
                                     row_sort_vals.insert(target.as_str(), v as u32);
@@ -1897,17 +1906,17 @@ pub fn process_dump_with_progress(
                             }
                         }
                     }
-                    // Enrichment computed Int sort fields
+                    // Enrichment computed Int fields + computed sort sources
                     for (target, value) in &enriched.computed {
-                        if sort_bits_ref.contains_key(target.as_str()) {
+                        if sort_bits_ref.contains_key(target.as_str()) || config_computed_sources_ref.contains(target.as_str()) {
                             if let NateExprValue::Int(n) = value {
                                 row_sort_vals.insert(target.as_str(), *n as u32);
                             }
                         }
                     }
-                    // Dump computed sort fields (e.g., existedAt)
+                    // Dump computed fields + computed sort sources
                     for def in computed_defs_ref {
-                        if sort_bits_ref.contains_key(&def.target) {
+                        if sort_bits_ref.contains_key(&def.target) || config_computed_sources_ref.contains(&def.target) {
                             if let Some(NateExprValue::Int(v)) = def.eval_indexed(&indexed_fields_buf, col_idx, None) {
                                 row_sort_vals.insert(&def.target, v as u32);
                             }
@@ -1956,24 +1965,24 @@ pub fn process_dump_with_progress(
                     let mut row_sv: HashMap<&str, u32> = HashMap::new();
                     for fm in request_fields {
                         let t = fm.target();
-                        if sort_bits_ref.contains_key(t) {
+                        if sort_bits_ref.contains_key(t) || config_computed_sources_ref.contains(t) {
                             if let Some(v) = row.get_i64(fm.column()).or_else(|| enriched_get(t).and_then(|s| s.parse::<i64>().ok())) {
                                 row_sv.insert(t, v as u32);
                             }
                         }
                     }
                     for t in enrichment_targets_ref {
-                        if sort_bits_ref.contains_key(t.as_str()) {
+                        if sort_bits_ref.contains_key(t.as_str()) || config_computed_sources_ref.contains(t.as_str()) {
                             if let Some(s) = enriched_get(t) { if let Ok(v) = s.parse::<i64>() { row_sv.insert(t, v as u32); } }
                         }
                     }
                     for (t, value) in &enriched.computed {
-                        if sort_bits_ref.contains_key(t.as_str()) {
+                        if sort_bits_ref.contains_key(t.as_str()) || config_computed_sources_ref.contains(t.as_str()) {
                             if let NateExprValue::Int(n) = value { row_sv.insert(t, *n as u32); }
                         }
                     }
                     for def in computed_defs_ref {
-                        if sort_bits_ref.contains_key(&def.target) {
+                        if sort_bits_ref.contains_key(&def.target) || config_computed_sources_ref.contains(&def.target) {
                             if let Some(NateExprValue::Int(v)) = def.eval_indexed(&indexed_fields_buf, col_idx, None) {
                                 row_sv.insert(&def.target, v as u32);
                             }
