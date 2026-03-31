@@ -45,6 +45,12 @@ pub enum Op {
     #[serde(rename = "delete")]
     Delete,
 
+    /// Signal that this entity should have its alive bit set (creates the slot).
+    /// Emitted by PG triggers on INSERT for `sets_alive: true` tables.
+    /// When present, ops_poller sets `creates_slot: true` on the EntityOps.
+    #[serde(rename = "alive")]
+    Alive,
+
     /// Query-resolved bulk operation. Resolves slots via a BitDex query string,
     /// then applies the nested ops to all matching slots.
     /// Used for fan-out tables (ModelVersion, Post, Model).

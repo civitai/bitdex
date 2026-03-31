@@ -107,6 +107,7 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
                 query_ops.insert(query.clone(), nested_ops.clone());
             }
             Op::Delete => unreachable!("handled above"),
+            Op::Alive => {} // Signal-only, no dedup needed
         }
     }
 

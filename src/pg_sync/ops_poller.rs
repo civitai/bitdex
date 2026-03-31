@@ -115,10 +115,21 @@ async fn poll_and_process(
     // Convert to EntityOps
     let mut batch: Vec<EntityOps> = rows
         .into_iter()
-        .map(|row| EntityOps {
-            entity_id: row.entity_id,
-            ops: row.ops.0,
-            creates_slot: false, // Determined by trigger config at source; override in pg-sync
+        .map(|row| {
+            // Check if trigger emitted an Alive op — signals this is an INSERT
+            // on a sets_alive table. Remove the Alive op from the ops list
+            // (it's a signal, not an actual bitmap mutation).
+            let has_alive = row.ops.0.iter().any(|op| matches!(op, Op::Alive));
+            let ops: Vec<Op> = if has_alive {
+                row.ops.0.into_iter().filter(|op| !matches!(op, Op::Alive)).collect()
+            } else {
+                row.ops.0
+            };
+            EntityOps {
+                entity_id: row.entity_id,
+                ops,
+                creates_slot: has_alive,
+            }
         })
         .collect();
 
