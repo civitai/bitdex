@@ -1384,6 +1384,14 @@ pub fn process_dump_with_progress(
         if !computed_targets.is_empty() {
             eprintln!("  Docstore field_idx has {} fields, computed targets: {:?}", field_idx.len(), computed_targets);
         }
+        // Log config-computed sort fields presence in field_idx
+        for sc in &config.sort_fields {
+            if sc.computed.is_some() {
+                let in_idx = field_idx.contains_key(&sc.name);
+                eprintln!("  [diag] config-computed sort '{}': in field_idx={}, sources={:?}",
+                    sc.name, in_idx, sc.computed.as_ref().map(|c| &c.source_fields));
+            }
+        }
     }
 
     // Mmap the CSV/TSV file
@@ -1731,6 +1739,15 @@ pub fn process_dump_with_progress(
                 } else {
                     Vec::new()
                 };
+
+                // Diagnostic: log config-computed sort values for first 3 rows per thread
+                if count < 3 && !config_computed_sort_vals.is_empty() {
+                    eprintln!("  [diag] slot={} config_computed_sort_vals={:?} enriched_fields={:?}",
+                        slot,
+                        config_computed_sort_vals,
+                        enriched.fields.iter().map(|(t, v)| (t.as_str(), &v[..v.len().min(20)])).collect::<Vec<_>>()
+                    );
+                }
 
                 // Check deferred alive: if publishedAt from enrichment is in the future
                 if has_deferred_alive {
