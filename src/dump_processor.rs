@@ -2873,6 +2873,10 @@ fn write_docstore_row_indexed(
 
     // Extra i64 fields (config-computed sort values like sortAt = GREATEST(existedAt, publishedAt))
     for &(target, value) in extra_i64_fields {
+        // Skip zero values: zero means no source data was available in this phase
+        // (e.g., tags/resources/metrics phases have no existedAt/publishedAt →
+        // GREATEST(0,0)=0). A prior phase wrote the real value; don't overwrite it.
+        if value == 0 { continue; }
         if let Some(&fidx) = field_idx.get(target) {
             collect_packed!(fidx, &PackedValue::I(value));
         }
