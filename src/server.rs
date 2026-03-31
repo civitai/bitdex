@@ -4617,23 +4617,23 @@ async fn handle_ops(
     }
 
     // Ensure WAL writer exists (lazy init)
-    let wal_path = {
+    // Initialize shared WAL writer if needed (uses wal/ directory, not a file path)
+    {
         let mut wal_guard = state.ops_wal.lock();
         if wal_guard.is_none() {
             let wal_dir = state.data_dir.join("wal");
             std::fs::create_dir_all(&wal_dir).ok();
-            let path = wal_dir.join("ops.wal");
-            *wal_guard = Some(crate::ops_wal::WalWriter::new(path));
+            *wal_guard = Some(crate::ops_wal::WalWriter::new(&wal_dir));
         }
-        wal_guard.as_ref().unwrap().path().to_path_buf()
-    };
+    }
 
-    // Write to WAL on blocking thread (fsync is blocking I/O)
-    let result = tokio::task::spawn_blocking(move || {
-        let writer = crate::ops_wal::WalWriter::new(&wal_path);
-        writer.append_batch(&batch.ops)
-    })
-    .await;
+    // Write to WAL using the shared writer (supports generational rotation)
+    let wal_guard = state.ops_wal.lock();
+    let writer = wal_guard.as_ref().unwrap();
+    let result = writer.append_batch(&batch.ops);
+    drop(wal_guard);
+    // Wrap to match the old spawn_blocking Result<Result<..>> pattern
+    let result: Result<Result<u64, std::io::Error>, tokio::task::JoinError> = Ok(result);
 
     match result {
         Ok(Ok(bytes)) => {
