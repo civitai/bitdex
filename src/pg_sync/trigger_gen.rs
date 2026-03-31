@@ -251,6 +251,15 @@ fn generate_direct_body(source: &SyncSource) -> String {
             field_name, new_expr
         )
     }));
+    // Computed fields: emit set ops with computed expression values (e.g., existedAt).
+    let computed = source.computed_fields.as_deref().unwrap_or(&[]);
+    for cf in computed {
+        let new_expr = substitute_columns(&cf.expression, "NEW");
+        insert_ops.push(format!(
+            "      jsonb_build_object('op', 'set', 'field', '{}', 'value', to_jsonb({}))",
+            cf.target, new_expr
+        ));
+    }
     body.push_str(&insert_ops.join(",\n"));
     body.push_str("\n    );\n");
     body.push_str(&format!(
@@ -286,6 +295,22 @@ fn generate_direct_body(source: &SyncSource) -> String {
             old = old_expr,
             new = new_expr,
             field = field_name,
+        ));
+    }
+    // Computed fields on UPDATE: emit remove/set when computed value changes
+    for cf in computed {
+        let old_expr = substitute_columns(&cf.expression, "OLD");
+        let new_expr = substitute_columns(&cf.expression, "NEW");
+        body.push_str(&format!(
+            "    IF ({old}) IS DISTINCT FROM ({new}) THEN\n\
+             \x20     _ops := _ops || jsonb_build_array(\n\
+             \x20       jsonb_build_object('op', 'remove', 'field', '{field}', 'value', to_jsonb({old})),\n\
+             \x20       jsonb_build_object('op', 'set', 'field', '{field}', 'value', to_jsonb({new}))\n\
+             \x20     );\n\
+             \x20   END IF;\n",
+            old = old_expr,
+            new = new_expr,
+            field = cf.target,
         ));
     }
     body.push_str("    IF jsonb_array_length(_ops) > 0 THEN\n");
@@ -409,43 +434,63 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
         body.push_str("  _source_result jsonb;\n");
     }
     body.push_str("BEGIN\n");
-    body.push_str("  IF TG_OP = 'UPDATE' THEN\n");
 
-    // Build the query string with PG variable interpolation.
-    // Template: "postId eq {id}" → _query := 'postId eq ' || NEW."id"::text
-    // This ensures PG evaluates the column reference at runtime.
-    if let Some(ref expr) = source.expression {
-        // Custom expression (e.g., Model's json_agg subquery).
-        // Execute the expression as a subquery, store result in a variable,
-        // then use that variable in the query template.
-        // Use EXECUTE with $1 parameter to pass NEW.column values safely.
-        let (param_sql, param_refs) = build_execute_with_params(expr, "NEW");
-        body.push_str(&format!(
-            "    EXECUTE '{}' INTO _source_result{};\n",
-            param_sql.replace('\'', "''"),
-            if param_refs.is_empty() { String::new() } else { format!(" USING {}", param_refs.join(", ")) }
-        ));
-        // The query template references the subquery result (e.g., {ids}).
-        // Replace {ids} with the _source_result variable.
-        let query_with_result = query_template
-            .replace("{ids}", "' || _source_result::text || '");
-        body.push_str(&format!("    _query := '{}';\n", query_with_result));
-    } else if let Some(ref query_source) = source.query_source {
-        let source_sql = substitute_columns(query_source, "NEW");
-        body.push_str(&format!(
-            "    EXECUTE format('SELECT ({})') INTO _source_result;\n",
-            source_sql.replace('\'', "''")
-        ));
-        body.push_str(&format!(
-            "    _query := {};\n",
-            build_query_concatenation(query_template, "NEW")
-        ));
-    } else {
-        body.push_str(&format!(
-            "    _query := {};\n",
-            build_query_concatenation(query_template, "NEW")
-        ));
-    }
+    // Helper: build the query string for this fan-out source using NEW row values.
+    // Shared between INSERT and UPDATE paths.
+    let build_query_block = |body: &mut String, source: &SyncSource, query_template: &str| {
+        if let Some(ref expr) = source.expression {
+            let (param_sql, param_refs) = build_execute_with_params(expr, "NEW");
+            body.push_str(&format!(
+                "    EXECUTE '{}' INTO _source_result{};\n",
+                param_sql.replace('\'', "''"),
+                if param_refs.is_empty() { String::new() } else { format!(" USING {}", param_refs.join(", ")) }
+            ));
+            let query_with_result = query_template
+                .replace("{ids}", "' || _source_result::text || '");
+            body.push_str(&format!("    _query := '{}';\n", query_with_result));
+        } else if let Some(ref query_source) = source.query_source {
+            let source_sql = substitute_columns(query_source, "NEW");
+            body.push_str(&format!(
+                "    EXECUTE format('SELECT ({})') INTO _source_result;\n",
+                source_sql.replace('\'', "''")
+            ));
+            body.push_str(&format!(
+                "    _query := {};\n",
+                build_query_concatenation(query_template, "NEW")
+            ));
+        } else {
+            body.push_str(&format!(
+                "    _query := {};\n",
+                build_query_concatenation(query_template, "NEW")
+            ));
+        }
+    };
+
+    // INSERT: emit set ops for all tracked fields (new entity, no prior state).
+    // Fan-out on INSERT ensures e.g. Post publishedAt reaches images immediately.
+    body.push_str("  IF TG_OP = 'INSERT' THEN\n");
+    build_query_block(&mut body, source, query_template);
+    body.push_str("    _ops := jsonb_build_array(\n");
+    let insert_ops: Vec<String> = track_fields.iter().map(|f| {
+        let (field_name, _insert_expr, template_expr) = parse_track_field(f);
+        let new_expr = substitute_columns(&template_expr, "NEW");
+        format!(
+            "      jsonb_build_object('op', 'set', 'field', '{}', 'value', to_jsonb({}))",
+            field_name, new_expr
+        )
+    }).collect();
+    body.push_str(&insert_ops.join(",\n"));
+    body.push_str("\n    );\n");
+    body.push_str(&format!(
+        "    INSERT INTO \"BitdexOps\" (entity_id, ops) VALUES (NEW.id, jsonb_build_array(\n\
+         \x20       jsonb_build_object('op', 'queryOpSet', 'query', _query, 'ops', _ops)\n\
+         \x20     ));\n"
+    ));
+    body.push_str("    RETURN NEW;\n");
+
+    // UPDATE: emit remove/set pairs only for changed fields
+    body.push_str("  ELSIF TG_OP = 'UPDATE' THEN\n");
+    build_query_block(&mut body, source, query_template);
 
     // Build ops array from tracked fields that changed
     body.push_str("    _ops := '[]'::jsonb;\n");
