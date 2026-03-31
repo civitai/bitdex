@@ -7,13 +7,13 @@ config:
     - { name: type, field_type: single_value, eager_load: true }
     - { name: baseModel, field_type: single_value, eager_load: true }
     - { name: availability, field_type: single_value, eager_load: true }
-    - { name: postId, field_type: single_value }
-    - { name: postedToId, field_type: single_value }
+    - { name: postId, field_type: single_value, eager_load: true }
+    - { name: postedToId, field_type: single_value, eager_load: true }
     - { name: remixOfId, field_type: single_value }
     - { name: hasMeta, field_type: boolean, eager_load: true }
     - { name: onSite, field_type: boolean, eager_load: true }
-    - { name: poi, field_type: boolean }
-    - { name: minor, field_type: boolean }
+    - { name: poi, field_type: boolean, eager_load: true }
+    - { name: minor, field_type: boolean, eager_load: true }
     - { name: isPublished, field_type: boolean, eager_load: true }
     - { name: isRemix, field_type: boolean }
     - { name: blockedFor, field_type: single_value, eager_load: true }
