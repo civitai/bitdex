@@ -237,17 +237,20 @@ fn generate_direct_body(source: &SyncSource) -> String {
     // INSERT: emit set ops for all tracked fields (no remove since no prior state)
     body.push_str("  IF TG_OP = 'INSERT' THEN\n");
     body.push_str("    _ops := jsonb_build_array(\n");
-    let insert_ops: Vec<String> = track_fields
-        .iter()
-        .map(|f| {
-            let (field_name, insert_expr, template_expr) = parse_track_field(f);
-            let new_expr = substitute_columns(&template_expr, "NEW");
-            format!(
-                "      jsonb_build_object('op', 'set', 'field', '{}', 'value', to_jsonb({}))",
-                field_name, new_expr
-            )
-        })
-        .collect();
+    let mut insert_ops: Vec<String> = Vec::new();
+    // For sets_alive tables, emit an "alive" signal so the ops processor knows
+    // this entity should have its alive bit set (new slot creation).
+    if source.sets_alive {
+        insert_ops.push("      jsonb_build_object('op', 'alive')".to_string());
+    }
+    insert_ops.extend(track_fields.iter().map(|f| {
+        let (field_name, _insert_expr, template_expr) = parse_track_field(f);
+        let new_expr = substitute_columns(&template_expr, "NEW");
+        format!(
+            "      jsonb_build_object('op', 'set', 'field', '{}', 'value', to_jsonb({}))",
+            field_name, new_expr
+        )
+    }));
     body.push_str(&insert_ops.join(",\n"));
     body.push_str("\n    );\n");
     body.push_str(&format!(

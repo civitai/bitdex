@@ -742,12 +742,28 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // In steady-state, ops arriving for non-existent slots are stale or
         // out-of-order — silently skip them. queryOpSet entries are exempt because
         // their entity_id is the source entity (e.g., Post.id), not the target slot.
+        //
+        // Safety net: if the slot is beyond the current high-water mark (slot_counter),
+        // it's a genuinely new entity — auto-promote to creates_slot behavior.
+        // This handles the case where ops_poller doesn't know which table sets alive.
         let has_query_op_set = entry.ops.iter().any(|op| matches!(op, Op::QueryOpSet { .. }));
-        if !entry.creates_slot && !has_query_op_set {
+        let mut creates_slot = entry.creates_slot;
+        if !creates_slot && !has_query_op_set {
             if let Some(eng) = engine {
                 if !eng.is_slot_alive(slot) {
-                    skipped += 1;
-                    continue;
+                    if slot >= eng.slot_counter() {
+                        // Slot is beyond high-water mark — this is a new entity,
+                        // not a stale op for a deleted slot. Auto-promote.
+                        creates_slot = true;
+                        tracing::info!(
+                            "ops processor: auto-promoting slot {slot} to creates_slot \
+                             (entity_id={entity_id}, beyond slot_counter={})",
+                            eng.slot_counter()
+                        );
+                    } else {
+                        skipped += 1;
+                        continue;
+                    }
                 }
             }
         }
@@ -756,7 +772,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // If creates_slot=true and publishedAt is in the future, skip ALL bitmaps
         // (alive + filter + sort). Only write docstore so activate_due() can
         // rebuild bitmaps later.
-        let is_deferred = if entry.creates_slot {
+        let is_deferred = if creates_slot {
             check_deferred_alive(meta, &entry.ops)
         } else {
             false
@@ -841,8 +857,8 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     }
                     has_any_ops = true;
                 }
-                Op::Delete | Op::QueryOpSet { .. } => {
-                    // Already handled above
+                Op::Delete | Op::QueryOpSet { .. } | Op::Alive => {
+                    // Already handled above (Delete/QueryOpSet) or signal-only (Alive)
                 }
             }
         }
@@ -961,7 +977,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
         }
 
         // Set alive if creates_slot is true and not deferred (deferred handled above).
-        if entry.creates_slot {
+        if creates_slot {
             sink.alive_insert(slot);
         }
 
@@ -1154,6 +1170,7 @@ fn apply_query_op_set<S: BitmapSink>(
                     // Nested queryOpSets not supported
                     tracing::warn!("nested queryOpSet ignored");
                 }
+                Op::Alive => {} // Signal-only, handled at EntityOps level
             }
         }
         applied += 1;
