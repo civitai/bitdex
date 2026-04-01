@@ -1767,7 +1767,7 @@ fn pack_value(v: &Value) -> PackedValue {
 }
 
 /// Convert a raw JSON value to PackedValue, with optional dictionary for LowCardinalityString.
-fn json_to_packed_with_dict(
+pub fn json_to_packed_with_dict(
     raw: &serde_json::Value,
     mapping: &FieldMapping,
     ms_to_seconds: bool,
