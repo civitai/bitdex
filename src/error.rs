@@ -27,4 +27,7 @@ pub enum BitdexError {
 
     #[error("docstore error: {0}")]
     DocStore(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }

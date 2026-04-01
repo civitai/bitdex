@@ -17,7 +17,8 @@ use crate::filter::FilterFieldType;
 use crate::cache;
 use crate::concurrency::InFlightTracker;
 use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
-use crate::docstore::{DocStore, StoredDoc};
+use crate::docstore::StoredDoc;
+use crate::shard_store_doc::DocStoreV3;
 use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
 use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, value_to_sort_u32, Document, FieldRegistry, PatchPayload};
@@ -196,7 +197,7 @@ pub struct ConcurrentEngine {
     inner: Arc<ArcSwap<InnerEngine>>,
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
-    docstore: Arc<parking_lot::Mutex<DocStore>>,
+    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
     /// Docstore root path, cached to avoid locking docstore just to read the path.
     docstore_root: Arc<PathBuf>,
     config: Arc<Config>,
@@ -318,18 +319,20 @@ impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
-        let docstore = DocStore::open_temp()?;
+        let docstore = DocStoreV3::open_temp()
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("open temp: {e}")))?;
         Self::build(config, docstore)
     }
 
     /// Create a new concurrent engine with an on-disk docstore.
     pub fn new_with_path(config: Config, path: &Path) -> Result<Self> {
         config.validate()?;
-        let docstore = DocStore::open(path)?;
+        let docstore = DocStoreV3::open(path)
+            .map_err(|e| crate::error::BitdexError::DocStore(format!("open: {e}")))?;
         Self::build(config, docstore)
     }
 
-    fn build(config: Config, mut docstore: DocStore) -> Result<Self> {
+    fn build(config: Config, mut docstore: DocStoreV3) -> Result<Self> {
         let mut filters = crate::filter::FilterIndex::new();
         let mut sorts = crate::sort::SortIndex::new();
 
@@ -876,56 +879,12 @@ impl ConcurrentEngine {
         #[cfg(feature = "server")]
         let metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> = Arc::new(ArcSwap::from_pointee(None));
 
-        // Compaction channel + worker: only created when threshold > 0.
-        // When threshold is 0, no staleness tracking on reads, no worker thread.
-        docstore.set_compact_threshold(config.compact_threshold_pct);
-        let (compact_tx, compact_handle) = if config.compact_threshold_pct > 0 {
-            let (tx, compact_rx): (Sender<(u32, Vec<u8>)>, Receiver<(u32, Vec<u8>)>) =
-                crossbeam_channel::bounded(32);
-            docstore.set_compact_channel(tx.clone());
-            docstore.set_compact_skipped(Arc::clone(&compaction_skipped));
-
-            // Extract root and v2_writers BEFORE wrapping docstore in Mutex.
-            // The compaction worker uses these directly — no full DocStore lock needed.
-            let compact_root = docstore.root().to_path_buf();
-            let compact_v2_writers = docstore.v2_writers_handle();
-
-            // Clone metrics bridge for the compaction worker thread.
-            #[cfg(feature = "server")]
-            let compact_metrics = Arc::clone(&metrics_bridge);
-
-            // Spawn compaction worker thread. Uses the standalone compact_shard_from_buffer
-            // with pre-extracted root/v2_writers — never holds the DocStore mutex during I/O.
-            let handle = thread::spawn(move || {
-                while let Ok((shard_id, data)) = compact_rx.recv() {
-                    let start = std::time::Instant::now();
-                    if let Err(e) = crate::docstore::compact_shard_from_buffer(
-                        shard_id,
-                        &data,
-                        &compact_root,
-                        &compact_v2_writers,
-                    ) {
-                        eprintln!("Compaction worker: shard {shard_id} failed: {e}");
-                    } else {
-                        let elapsed = start.elapsed();
-                        #[cfg(feature = "server")]
-                        {
-                            let guard = compact_metrics.load();
-                            if let Some(ref bridge) = **guard {
-                                bridge.compaction_total.with_label_values(&[&bridge.index_name]).inc();
-                                bridge.compaction_duration.with_label_values(&[&bridge.index_name])
-                                    .observe(elapsed.as_secs_f64());
-                            }
-                        }
-                        #[cfg(not(feature = "server"))]
-                        let _ = elapsed;
-                    }
-                }
-            });
-            (Some(tx), Some(handle))
-        } else {
-            (None, None)
-        };
+        // DocStoreV3 uses ShardStore native compaction — no manual compaction worker needed.
+        // Set threshold for auto-compaction within DocStoreV3.
+        if config.compact_threshold_pct > 0 {
+            docstore.set_compact_threshold(config.compact_threshold_pct as u32);
+        }
+        let (compact_tx, compact_handle): (Option<Sender<(u32, Vec<u8>)>>, Option<JoinHandle<()>>) = (None, None);
 
         let docstore_root = Arc::new(docstore.path().to_path_buf());
         let docstore = Arc::new(parking_lot::Mutex::new(docstore));
@@ -5685,7 +5644,7 @@ impl ConcurrentEngine {
 
     /// Compact the docstore, reclaiming space from old write transactions.
     pub fn compact_docstore(&self) -> Result<bool> {
-        self.docstore.lock().compact()
+        Ok(self.docstore.lock().compact()?)
     }
 
     /// Configure docstore field defaults from a DataSchema.
@@ -5699,8 +5658,8 @@ impl ConcurrentEngine {
         self.docstore.lock().schema_version()
     }
 
-    /// Get a clone of the Arc<Mutex<DocStore>> for external writers (e.g., DocWriter).
-    pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<crate::docstore::DocStore>> {
+    /// Get a clone of the Arc<Mutex<DocStoreV3>> for external writers (e.g., DocWriter).
+    pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<DocStoreV3>> {
         Arc::clone(&self.docstore)
     }
 
@@ -5722,11 +5681,11 @@ impl ConcurrentEngine {
         self.docstore.lock().build_schema_registry()
     }
 
-    /// Prepare a BulkWriter for lock-free parallel docstore writes during bulk loading.
-    /// The BulkWriter holds a snapshot of the field dictionary and can encode/write
-    /// docs without acquiring the DocStore Mutex.
-    pub fn prepare_bulk_writer(&self, field_names: &[String]) -> crate::error::Result<crate::docstore::BulkWriter> {
-        self.docstore.lock().prepare_bulk_load(field_names)
+    /// Prepare a ShardStoreBulkWriter for lock-free parallel docstore writes during bulk loading.
+    /// The writer holds a snapshot of the field dictionary and can encode/write
+    /// docs without acquiring the DocStoreV3 Mutex.
+    pub fn prepare_bulk_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::ShardStoreBulkWriter> {
+        Ok(self.docstore.lock().prepare_bulk_load(field_names)?)
     }
 
     /// Return the set of indexed field names (filter + sort + "id").
@@ -6905,7 +6864,7 @@ impl ConcurrentEngine {
 
         // Open a read-only DocStore for parallel reads
         let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStore::open(&ds_path)
+        let reader = DocStoreV3::open(&ds_path)
             .map_err(|e| crate::error::BitdexError::DocStore(
                 format!("open reader docstore: {e}")))?;
 
@@ -7215,7 +7174,7 @@ impl ConcurrentEngine {
         // Parallel shard-based iteration using rayon fold+reduce.
         // Open a second read-only DocStore (no mutex) for parallel reads.
         let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStore::open(&ds_path)
+        let reader = DocStoreV3::open(&ds_path)
             .map_err(|e| crate::error::BitdexError::DocStore(
                 format!("open reader docstore: {e}")))?;
 
@@ -7456,7 +7415,7 @@ impl ConcurrentEngine {
 
         // Open read-only docstore for parallel reads
         let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStore::open(&ds_path)
+        let reader = DocStoreV3::open(&ds_path)
             .map_err(|e| crate::error::BitdexError::DocStore(
                 format!("open reader docstore: {e}")))?;
 
@@ -7613,7 +7572,7 @@ impl ConcurrentEngine {
     /// Returns Ok(()) if all fields are found, or Err with the missing field names.
     pub fn validate_fields_in_docstore(&self, field_names: &[&str]) -> Result<Vec<String>> {
         let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStore::open(&ds_path)
+        let reader = DocStoreV3::open(&ds_path)
             .map_err(|e| crate::error::BitdexError::DocStore(
                 format!("open reader docstore: {e}")))?;
 
@@ -7696,11 +7655,8 @@ impl ConcurrentEngine {
         if let Some(handle) = self.merge_handle.take() {
             handle.join().ok();
         }
-        // Drop ALL compact_tx senders to signal the compact worker to exit.
-        // The docstore also holds a clone — must clear it too or recv() never
-        // returns Err and the worker hangs forever.
+        // DocStoreV3 uses ShardStore native compaction — no compact worker to shut down.
         drop(self.compact_tx.take());
-        self.docstore.lock().clear_compact_channel();
         if let Some(handle) = self.compact_handle.take() {
             handle.join().ok();
         }
@@ -10064,51 +10020,49 @@ mod tests {
 
     #[test]
     fn test_compaction_worker_e2e() {
-        use crate::docstore::{DocStore, PackedValue};
+        use crate::docstore::PackedValue;
+        use crate::shard_store_doc::{DocStoreV3, SlotHexShard};
 
-        // Use an on-disk docstore so V2 tuples and compaction can run.
+        // Use an on-disk docstore so ShardStore ops and compaction can run.
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
         let mut engine = ConcurrentEngine::new_with_path(test_config(), &docs_dir).unwrap();
 
-        // Write V2 tuples directly to the docstore to create stale data.
-        // Use field_idx=0 — the field won't resolve to a name, but that's fine
-        // for testing compaction (which operates on raw tuples).
+        // Write 10 Set ops to the same (slot=0, field=0) — 9 of 10 are stale after compaction.
         let field_idx: u16 = 0;
         {
-            let ds = engine.docstore.lock();
-
-            // Write 10 versions of the same (slot=0, field=0) tuple — 90% stale
+            let mut ds = engine.docstore.lock();
             for v in 0..10i64 {
                 let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
                 ds.append_tuple(0, field_idx, &packed).unwrap();
             }
-            // Close buffered writers so data is fully on disk
-            ds.v2_writers_handle().clear();
         }
 
-        // Record shard file size before compaction
-        let shard_id = DocStore::shard_id(0);
-        let shard_path = DocStore::shard_path(&docs_dir, shard_id);
-        let size_before = std::fs::metadata(&shard_path).unwrap().len();
+        // Verify the shard has ops before compaction
+        let shard_key = SlotHexShard::slot_to_shard(0);
+        let ops_before = {
+            let ds = engine.docstore.lock();
+            ds.shard_store().ops_count(&shard_key).unwrap().unwrap_or(0)
+        };
+        assert_eq!(ops_before, 10, "should have 10 ops before compaction");
 
-        // Read via get_v2 — this triggers compaction enqueue (>30% stale).
-        // The doc may come back empty (no field name in dict), but the read
-        // still scans all tuples and detects staleness.
+        // Trigger compaction
+        engine.compact_docstore().unwrap();
+
+        // After compaction, ops should be folded into a snapshot (0 ops remaining)
+        let ops_after = {
+            let ds = engine.docstore.lock();
+            ds.shard_store().ops_count(&shard_key).unwrap().unwrap_or(0)
+        };
+        assert_eq!(ops_after, 0, "ops should be 0 after compaction");
+
+        // Verify the data is still correct — the last Set (value=9) wins
         {
             let ds = engine.docstore.lock();
-            let _doc = ds.get_v2(0).unwrap();
+            let snap = ds.shard_store().read(&shard_key).unwrap().unwrap();
+            let fields = snap.docs.get(&0).unwrap();
+            assert_eq!(fields[0], (0, PackedValue::I(9)));
         }
-
-        // Wait for the background compaction worker to process the shard
-        thread::sleep(Duration::from_millis(100));
-
-        // Verify shard file shrank — proving the compaction worker ran
-        let size_after = std::fs::metadata(&shard_path).unwrap().len();
-        assert!(
-            size_after < size_before,
-            "compacted shard ({size_after}) should be smaller than original ({size_before})"
-        );
 
         engine.shutdown();
     }
