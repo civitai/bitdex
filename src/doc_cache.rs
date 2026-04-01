@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
-use crate::docstore::StoredDoc;
+use crate::shard_store_doc::StoredDoc;
 
 /// Configuration for the generational document cache.
 #[derive(Debug, Clone)]

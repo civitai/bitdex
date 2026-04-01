@@ -1,22 +1,117 @@
-//! Document codecs and sharding strategy for ShardStore.
+//! Document storage engine — types, codecs, and ShardStore-backed persistence.
 //!
-//! Implements:
-//! - `DocSnapshotCodec` — serialize/deserialize `DocSnapshot` (slot → field values)
-//! - `DocOpCodec` — typed document operations (Set, Append, Remove, Delete, Create)
-//! - `SlotHexShard` — maps slot IDs to hex-bucketed shard files (same layout as DocStore V2)
+//! This module is the single source of truth for document storage:
+//! - `StoredDoc` — the named-field document type used across the codebase
+//! - `PackedValue` — compact enum for field values (integer, float, bool, string, multi)
+//! - `DocStoreV3` — high-level document store backed by ShardStore
+//! - `ShardStoreBulkWriter` — high-throughput parallel writer for dump processor
+//! - `DocSnapshotCodec` / `DocOpCodec` — ShardStore codecs
+//! - `SlotHexShard` — hex-bucketed shard file layout
+//! - `json_to_packed_with_dict` — JSON → PackedValue conversion with dictionary support
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::docstore::PackedValue;
+use crate::config::{FieldMapping, FieldValueType};
+use crate::mutation::FieldValue;
 use crate::shard_store::{SnapshotCodec, OpCodec, ShardingStrategy};
 
 // ---------------------------------------------------------------------------
-// Shard shift — same as DocStore V2: 512 docs per shard
+// Core types — StoredDoc + PackedValue
 // ---------------------------------------------------------------------------
 
-const SHARD_SHIFT: u32 = 9;
+/// Number of bits to shift slot_id right to get shard index.
+/// 9 → 512 docs per shard.
+pub const SHARD_SHIFT: u32 = 9;
+
+/// Public accessor for SHARD_SHIFT (used by slot_arena finalization).
+pub const SHARD_SHIFT_PUB: u32 = SHARD_SHIFT;
+
+/// A stored document containing all field values.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredDoc {
+    pub fields: HashMap<String, FieldValue>,
+    /// Schema version this document was encoded with.
+    /// 0 = legacy (pre-versioning), 1+ = versioned.
+    #[serde(skip, default)]
+    pub schema_version: u8,
+}
+
+/// Compact value encoding for document fields.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub enum PackedValue {
+    I(i64),
+    F(f64),
+    B(bool),
+    S(String),
+    Mi(Vec<i64>),
+    Mm(Vec<PackedValue>),
+}
+
+/// Convert a raw JSON value to PackedValue, with optional dictionary for LowCardinalityString.
+pub fn json_to_packed_with_dict(
+    raw: &serde_json::Value,
+    mapping: &FieldMapping,
+    ms_to_seconds: bool,
+    dictionary: Option<&crate::dictionary::FieldDictionary>,
+) -> Option<PackedValue> {
+    match mapping.value_type {
+        FieldValueType::Integer => {
+            let n = raw
+                .as_i64()
+                .or_else(|| raw.as_u64().map(|u| u as i64))
+                .or_else(|| raw.as_f64().map(|f| f as i64))?;
+            let n = if ms_to_seconds {
+                ((n / 1000) as u32) as i64
+            } else {
+                n
+            };
+            Some(PackedValue::I(n))
+        }
+        FieldValueType::Boolean => Some(PackedValue::B(raw.as_bool()?)),
+        FieldValueType::String => Some(PackedValue::S(raw.as_str()?.to_string())),
+        FieldValueType::MappedString => {
+            let s = raw.as_str()?;
+            let lookup = if mapping.case_sensitive {
+                std::borrow::Cow::Borrowed(s)
+            } else {
+                std::borrow::Cow::Owned(s.to_lowercase())
+            };
+            let n = mapping
+                .string_map
+                .as_ref()
+                .and_then(|m| m.get(lookup.as_ref()).copied())
+                .unwrap_or(0);
+            Some(PackedValue::I(n))
+        }
+        FieldValueType::LowCardinalityString => {
+            let s = raw.as_str()?;
+            if let Some(dict) = dictionary {
+                let n = dict.get_or_insert(s);
+                Some(PackedValue::I(n))
+            } else {
+                Some(PackedValue::I(0))
+            }
+        }
+        FieldValueType::IntegerArray => {
+            let arr = raw.as_array()?;
+            if arr.is_empty() {
+                return None;
+            }
+            let values: Vec<i64> = arr
+                .iter()
+                .filter_map(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+                .collect();
+            if values.is_empty() { None } else { Some(PackedValue::Mi(values)) }
+        }
+        FieldValueType::ExistsBoolean => Some(PackedValue::B(true)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shard layout
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // DocSnapshot — the materialized state of one shard
@@ -238,7 +333,10 @@ impl SnapshotCodec for DocSnapshotCodec {
         let mut docs = HashMap::with_capacity(num_docs);
         for _ in 0..num_docs {
             if pos + 6 > bytes.len() {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("truncated doc snapshot: expected {} docs, decoded {}", num_docs, docs.len()),
+                ));
             }
             let slot = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
             pos += 4;
@@ -512,6 +610,890 @@ impl ShardingStrategy for SlotHexShard {
 
 /// Type alias for a document ShardStore.
 pub type DocShardStore = crate::shard_store::ShardStore<DocSnapshotCodec, DocOpCodec, SlotHexShard>;
+
+// ---------------------------------------------------------------------------
+// DocStoreV3 — high-level wrapper over DocShardStore
+// ---------------------------------------------------------------------------
+
+use crate::config::DataSchema;
+
+/// High-level document store backed by ShardStore.
+///
+/// Drop-in replacement for DocStore V2 that provides CRC32 integrity,
+/// generation pinning, and native ShardStore compaction. Maintains the
+/// same field dictionary and StoredDoc interface.
+pub struct DocStoreV3 {
+    store: DocShardStore,
+    root: PathBuf,
+    field_to_idx: HashMap<String, u16>,
+    idx_to_field: Vec<String>,
+    /// Per-field default values keyed by field dict index.
+    field_defaults: HashMap<u16, PackedValue>,
+    /// Current schema version.
+    schema_version: u8,
+    /// Historical defaults keyed by schema version.
+    historical_defaults: HashMap<u8, HashMap<u16, PackedValue>>,
+    /// Compaction threshold: number of ops before auto-compaction.
+    compact_threshold: u32,
+}
+
+impl DocStoreV3 {
+    /// Open a DocStoreV3 at the given directory.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(path.join("meta"))?;
+
+        let store = DocShardStore::new(path.to_path_buf(), SlotHexShard)?;
+        let (field_to_idx, idx_to_field) = Self::load_field_dict(path)?;
+        let historical_defaults = Self::load_schema_history(path, &field_to_idx);
+
+        // Rehydrate schema version and defaults from the latest persisted history.
+        // Without this, get() would use version=1 and empty defaults after restart,
+        // causing fields elided under old defaults to not rehydrate correctly.
+        let (schema_version, field_defaults) = if let Some((&max_ver, defaults)) =
+            historical_defaults.iter().max_by_key(|(&v, _)| v)
+        {
+            (max_ver, defaults.clone())
+        } else {
+            (1, HashMap::new())
+        };
+
+        Ok(Self {
+            store,
+            root: path.to_path_buf(),
+            field_to_idx,
+            idx_to_field,
+            field_defaults,
+            schema_version,
+            historical_defaults,
+            compact_threshold: 1000,
+        })
+    }
+
+    /// Open an in-memory DocStoreV3 (for testing).
+    /// Creates a temp directory under std::env::temp_dir() for ShardStore files.
+    pub fn open_temp() -> io::Result<Self> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("bitdex-docstore-v3-{}-{}", std::process::id(), ts));
+        std::fs::create_dir_all(tmp_dir.join("meta"))?;
+        let store = DocShardStore::new(tmp_dir.clone(), SlotHexShard)?;
+        Ok(Self {
+            store,
+            root: tmp_dir,
+            field_to_idx: HashMap::new(),
+            idx_to_field: Vec::new(),
+            field_defaults: HashMap::new(),
+            schema_version: 1,
+            historical_defaults: HashMap::new(),
+            compact_threshold: 1000,
+        })
+    }
+
+    /// Get the root path.
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// Get the root path (alias for path()).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    // ---- Field dictionary ----
+
+    fn dict_path(root: &Path) -> PathBuf {
+        root.join("meta").join("field_dict.bin")
+    }
+
+    fn load_field_dict(root: &Path) -> io::Result<(HashMap<String, u16>, Vec<String>)> {
+        let path = Self::dict_path(root);
+        match std::fs::read(&path) {
+            Ok(data) => {
+                let names: Vec<String> = rmp_serde::from_slice(&data)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("field dict decode: {e}")))?;
+                let map: HashMap<String, u16> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.clone(), i as u16))
+                    .collect();
+                Ok((map, names))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((HashMap::new(), Vec::new())),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn save_field_dict(&self) -> io::Result<()> {
+        let bytes = rmp_serde::to_vec(&self.idx_to_field)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("field dict encode: {e}")))?;
+        let path = Self::dict_path(&self.root);
+        let tmp = path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::OpenOptions::new().write(true).open(&tmp)?
+            .sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    fn ensure_field_idx(&mut self, name: &str) -> io::Result<u16> {
+        if let Some(&idx) = self.field_to_idx.get(name) {
+            return Ok(idx);
+        }
+        if self.idx_to_field.len() >= u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("field dictionary overflow: cannot add '{}' (already {} fields)", name, self.idx_to_field.len()),
+            ));
+        }
+        let idx = self.idx_to_field.len() as u16;
+        self.idx_to_field.push(name.to_string());
+        self.field_to_idx.insert(name.to_string(), idx);
+        Ok(idx)
+    }
+
+    /// Get the field index for a name.
+    pub fn field_index(&self, name: &str) -> Option<u16> {
+        self.field_to_idx.get(name).copied()
+    }
+
+    /// Get or create a field index. Saves the dict if a new field was added.
+    pub fn ensure_field_index(&mut self, name: &str) -> io::Result<u16> {
+        let existed = self.field_to_idx.contains_key(name);
+        let idx = self.ensure_field_idx(name)?;
+        if !existed {
+            self.save_field_dict()?;
+        }
+        Ok(idx)
+    }
+
+    /// Snapshot the current field name → index mapping.
+    pub fn field_dict_snapshot(&self) -> HashMap<String, u16> {
+        self.field_to_idx.clone()
+    }
+
+    /// Get the field name → index mapping.
+    pub fn field_to_idx(&self) -> &HashMap<String, u16> {
+        &self.field_to_idx
+    }
+
+    /// Get the index → field name mapping.
+    pub fn idx_to_field(&self) -> &[String] {
+        &self.idx_to_field
+    }
+
+    // ---- Schema ----
+
+    /// Build the field_defaults map from a DataSchema.
+    pub fn set_field_defaults(&mut self, schema: &DataSchema) {
+        self.schema_version = schema.schema_version;
+        self.field_defaults.clear();
+        for mapping in &schema.fields {
+            if let Some(ref default_val) = mapping.default_value {
+                if let Some(&idx) = self.field_to_idx.get(&mapping.target) {
+                    if let Some(pv) = json_to_packed_default(default_val) {
+                        self.field_defaults.insert(idx, pv);
+                    }
+                }
+            }
+        }
+        self.historical_defaults
+            .insert(self.schema_version, self.field_defaults.clone());
+        self.save_schema_history();
+    }
+
+    /// Get the current schema version.
+    pub fn schema_version(&self) -> u8 {
+        self.schema_version
+    }
+
+    /// Build a schema registry mapping version → (field_name → default_json_value).
+    pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {
+        let mut registry = HashMap::new();
+        let current_defaults = if !self.field_defaults.is_empty() {
+            self.idx_defaults_to_named(&self.field_defaults)
+        } else if let Some(hist) = self.historical_defaults.get(&self.schema_version) {
+            self.idx_defaults_to_named(hist)
+        } else {
+            HashMap::new()
+        };
+        registry.insert(self.schema_version, current_defaults);
+        for (&version, defaults) in &self.historical_defaults {
+            if version != self.schema_version {
+                registry.insert(version, self.idx_defaults_to_named(defaults));
+            }
+        }
+        registry
+    }
+
+    fn idx_defaults_to_named(
+        &self,
+        defaults: &HashMap<u16, PackedValue>,
+    ) -> HashMap<String, serde_json::Value> {
+        defaults
+            .iter()
+            .filter_map(|(&idx, pv)| {
+                self.idx_to_field
+                    .get(idx as usize)
+                    .map(|name| (name.clone(), packed_value_to_json(pv)))
+            })
+            .collect()
+    }
+
+    // ---- Schema history persistence ----
+
+    fn schema_dir(root: &Path) -> PathBuf {
+        root.join("meta").join("schema")
+    }
+
+    fn save_schema_history(&self) {
+        let dir = Self::schema_dir(&self.root);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("DocStoreV3: failed to create schema dir: {e}");
+            return;
+        }
+        let defaults_map: HashMap<String, Option<serde_json::Value>> = self
+            .field_defaults
+            .iter()
+            .filter_map(|(&idx, pv)| {
+                self.idx_to_field
+                    .get(idx as usize)
+                    .map(|name| (name.clone(), Some(packed_value_to_json(pv))))
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "schema_version": self.schema_version,
+            "field_defaults": defaults_map,
+        });
+        let path = dir.join(format!("v{}.json", self.schema_version));
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(json) = serde_json::to_string_pretty(&payload) {
+            if let Err(e) = std::fs::write(&tmp, &json) {
+                eprintln!("DocStoreV3: failed to write schema v{}: {e}", self.schema_version);
+                return;
+            }
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    fn load_schema_history(root: &Path, field_to_idx: &HashMap<String, u16>) -> HashMap<u8, HashMap<u16, PackedValue>> {
+        let dir = Self::schema_dir(root);
+        let mut history = HashMap::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return history,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if !name.starts_with('v') || path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let version: u8 = match name[1..].parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let data = match std::fs::read_to_string(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let json: serde_json::Value = match serde_json::from_str(&data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(defaults_obj) = json.get("field_defaults").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let mut defaults = HashMap::new();
+            for (field_name, val) in defaults_obj {
+                if let Some(&idx) = field_to_idx.get(field_name) {
+                    if let Some(pv) = json_to_packed_default(val) {
+                        defaults.insert(idx, pv);
+                    }
+                }
+            }
+            history.insert(version, defaults);
+        }
+        history
+    }
+
+    // ---- Document read/write ----
+
+    /// Get a stored document by slot ID.
+    pub fn get(&self, id: u32) -> io::Result<Option<StoredDoc>> {
+        let shard_key = SlotHexShard::slot_to_shard(id);
+
+        let snap = match self.store.read(&shard_key)? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        Ok(snap.docs.get(&id).map(|fields| self.fields_to_stored_doc(fields)))
+    }
+
+    /// Read all documents from a single shard, decoded.
+    pub fn get_shard(&self, shard_id: u32) -> io::Result<Vec<(u32, StoredDoc)>> {
+        let snap = match self.store.read(&shard_id)? {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+        Ok(snap.docs.iter().map(|(&slot, fields)| {
+            (slot, self.fields_to_stored_doc(fields))
+        }).collect())
+    }
+
+    /// Read a shard and return raw (slot_id, packed_pairs) without full StoredDoc decode.
+    pub fn get_shard_packed(&self, shard_id: u32) -> io::Result<Vec<(u32, Vec<(u16, PackedValue)>)>> {
+        let snap = match self.store.read(&shard_id)? {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+        Ok(snap.docs.into_iter().collect())
+    }
+
+    /// Store a single document.
+    pub fn put(&mut self, id: u32, doc: &StoredDoc) -> io::Result<()> {
+        self.put_batch(&[(id, doc.clone())])
+    }
+
+    /// Store multiple documents. Converts to ShardStore Create ops.
+    pub fn put_batch(&mut self, docs: &[(u32, StoredDoc)]) -> io::Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+
+        // Ensure field dictionary is up to date
+        let mut dict_changed = false;
+        for (_, doc) in docs {
+            for name in doc.fields.keys() {
+                let old_len = self.idx_to_field.len();
+                self.ensure_field_idx(name)?;
+                if self.idx_to_field.len() > old_len {
+                    dict_changed = true;
+                }
+            }
+        }
+        if dict_changed {
+            self.save_field_dict()?;
+        }
+
+        // Group by shard and emit Create ops
+        let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
+        for (id, doc) in docs {
+            let shard_key = SlotHexShard::slot_to_shard(*id);
+            let fields = self.stored_doc_to_fields(doc);
+            by_shard.entry(shard_key).or_default().push(DocOp::Create {
+                slot: *id,
+                fields,
+            });
+        }
+
+        for (shard_key, ops) in by_shard {
+            self.store.append_ops(&shard_key, &ops)?;
+            self.maybe_auto_compact(shard_key);
+        }
+
+        Ok(())
+    }
+
+    /// Append tuples for a single slot (used by DocWriter in ops_processor).
+    pub fn append_tuples_batch(&mut self, tuples: Vec<(u32, u16, Vec<u8>)>) -> io::Result<()> {
+        // Group tuples by shard
+        let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
+        for (slot, field_idx, value_bytes) in tuples {
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            // Decode PackedValue from msgpack bytes
+            let pv: PackedValue = rmp_serde::from_slice(&value_bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode packed: {e}")))?;
+            by_shard.entry(shard_key).or_default().push(DocOp::Set {
+                slot,
+                field: field_idx,
+                value: pv,
+            });
+        }
+
+        for (shard_key, ops) in by_shard {
+            self.store.append_ops(&shard_key, &ops)?;
+            self.maybe_auto_compact(shard_key);
+        }
+        Ok(())
+    }
+
+    /// Append a single tuple (used by ingester).
+    pub fn append_tuple(&mut self, slot: u32, field_idx: u16, value_bytes: &[u8]) -> io::Result<()> {
+        let shard_key = SlotHexShard::slot_to_shard(slot);
+        let pv: PackedValue = rmp_serde::from_slice(value_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode packed: {e}")))?;
+        self.store.append_op(&shard_key, &DocOp::Set {
+            slot,
+            field: field_idx,
+            value: pv,
+        })?;
+        self.maybe_auto_compact(shard_key);
+        Ok(())
+    }
+
+    /// Check ops count and auto-compact if threshold exceeded.
+    fn maybe_auto_compact(&self, shard_key: u32) {
+        if self.compact_threshold == 0 {
+            return;
+        }
+        if let Ok(Some(count)) = self.store.ops_count(&shard_key) {
+            if count > self.compact_threshold {
+                if let Err(e) = self.store.compact_current(&shard_key) {
+                    eprintln!("DocStoreV3: auto-compaction failed for shard {shard_key}: {e}");
+                }
+            }
+        }
+    }
+
+    /// Compact all shards. Returns true if any compaction was done.
+    pub fn compact(&self) -> io::Result<bool> {
+        let shards = self.store.list_current_shards()?;
+        let mut did_compact = false;
+        for key in shards {
+            if self.store.should_compact(&key, self.compact_threshold)? {
+                self.store.compact_current(&key)?;
+                did_compact = true;
+            }
+        }
+        Ok(did_compact)
+    }
+
+    /// Set compaction threshold (ops count before triggering compaction).
+    pub fn set_compact_threshold(&mut self, threshold: u32) {
+        self.compact_threshold = threshold;
+    }
+
+    /// Prepare a ShardStoreBulkWriter for parallel docstore writes during bulk loading.
+    pub fn prepare_bulk_load(&mut self, field_names: &[String]) -> io::Result<ShardStoreBulkWriter> {
+        let mut changed = false;
+        for name in field_names {
+            let old_len = self.idx_to_field.len();
+            self.ensure_field_idx(name)?;
+            if self.idx_to_field.len() > old_len {
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_field_dict()?;
+        }
+        Ok(ShardStoreBulkWriter {
+            field_to_idx: self.field_to_idx.clone(),
+            root: self.root.clone(),
+            field_defaults: self.field_defaults.clone(),
+            shard_buffers: Arc::new(DashMap::new()),
+        })
+    }
+
+    /// Get a reference to the underlying ShardStore.
+    pub fn shard_store(&self) -> &DocShardStore {
+        &self.store
+    }
+
+    /// Pin the current generation for crash-consistent snapshots.
+    pub fn pin_generation(&self) -> io::Result<u64> {
+        self.store.pin_generation()
+    }
+
+    /// List all shard keys on disk.
+    pub fn list_shards(&self) -> io::Result<Vec<u32>> {
+        self.store.list_current_shards()
+    }
+
+    /// Get the shard ID for a slot.
+    pub fn shard_id(slot_id: u32) -> u32 {
+        SlotHexShard::slot_to_shard(slot_id)
+    }
+
+    /// Get the shard file path for a shard ID (compatibility with code that computes paths).
+    pub fn shard_path(root: &Path, shard_id: u32) -> PathBuf {
+        // Matches SlotHexShard layout in gen_000
+        let dir_byte = ((shard_id >> 8) & 0xFF) as u8;
+        root.join("gen_000")
+            .join("shards")
+            .join(format!("{:02x}", dir_byte))
+            .join(format!("{:06}.shard", shard_id))
+    }
+
+    // ---- Conversion helpers ----
+
+    fn fields_to_stored_doc(&self, fields: &[(u16, PackedValue)]) -> StoredDoc {
+        let mut map = HashMap::with_capacity(fields.len());
+        for (idx, pv) in fields {
+            if let Some(name) = self.idx_to_field.get(*idx as usize) {
+                map.insert(name.clone(), packed_to_field_value(pv));
+            }
+        }
+        // Apply defaults for missing fields
+        for (&idx, default_pv) in &self.field_defaults {
+            if let Some(name) = self.idx_to_field.get(idx as usize) {
+                if !map.contains_key(name) {
+                    map.insert(name.clone(), packed_to_field_value(default_pv));
+                }
+            }
+        }
+        StoredDoc {
+            fields: map,
+            schema_version: self.schema_version,
+        }
+    }
+
+    fn stored_doc_to_fields(&self, doc: &StoredDoc) -> Vec<(u16, PackedValue)> {
+        let mut pairs = Vec::with_capacity(doc.fields.len());
+        for (name, fv) in &doc.fields {
+            if let Some(&idx) = self.field_to_idx.get(name.as_str()) {
+                let pv = field_value_to_packed(fv);
+                // Elide fields matching their schema default
+                if let Some(default_pv) = self.field_defaults.get(&idx) {
+                    if &pv == default_pv {
+                        continue;
+                    }
+                }
+                pairs.push((idx, pv));
+            }
+        }
+        pairs
+    }
+}
+
+/// Convert a PackedValue to a FieldValue.
+fn packed_to_field_value(pv: &PackedValue) -> FieldValue {
+    use crate::query::Value;
+    match pv {
+        PackedValue::I(i) => FieldValue::Single(Value::Integer(*i)),
+        PackedValue::F(f) => FieldValue::Single(Value::Float(*f)),
+        PackedValue::B(b) => FieldValue::Single(Value::Bool(*b)),
+        PackedValue::S(s) => FieldValue::Single(Value::String(s.clone())),
+        PackedValue::Mi(v) => FieldValue::Multi(v.iter().map(|i| Value::Integer(*i)).collect()),
+        PackedValue::Mm(v) => FieldValue::Multi(v.iter().filter_map(|pv| match pv {
+            PackedValue::I(i) => Some(Value::Integer(*i)),
+            PackedValue::F(f) => Some(Value::Float(*f)),
+            PackedValue::B(b) => Some(Value::Bool(*b)),
+            PackedValue::S(s) => Some(Value::String(s.clone())),
+            // Nested multi-values (Mi/Mm inside Mm) cannot be represented in FieldValue.
+            // Skip rather than silently corrupt to Integer(0).
+            other => {
+                eprintln!("packed_to_field_value: skipping nested multi-value {:?}", std::mem::discriminant(other));
+                None
+            }
+        }).collect()),
+    }
+}
+
+/// Convert a FieldValue to a PackedValue.
+fn field_value_to_packed(fv: &FieldValue) -> PackedValue {
+    use crate::query::Value;
+    match fv {
+        FieldValue::Single(v) => match v {
+            Value::Integer(i) => PackedValue::I(*i),
+            Value::Float(f) => PackedValue::F(*f),
+            Value::Bool(b) => PackedValue::B(*b),
+            Value::String(s) => PackedValue::S(s.clone()),
+        },
+        FieldValue::Multi(vs) => {
+            if vs.iter().all(|v| matches!(v, Value::Integer(_))) {
+                PackedValue::Mi(vs.iter().map(|v| match v {
+                    Value::Integer(i) => *i,
+                    _ => unreachable!(),
+                }).collect())
+            } else {
+                PackedValue::Mm(vs.iter().map(|v| match v {
+                    Value::Integer(i) => PackedValue::I(*i),
+                    Value::Float(f) => PackedValue::F(*f),
+                    Value::Bool(b) => PackedValue::B(*b),
+                    Value::String(s) => PackedValue::S(s.clone()),
+                }).collect())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ShardStoreBulkWriter — high-throughput parallel writes for dump processor
+// ---------------------------------------------------------------------------
+
+use dashmap::DashMap;
+use std::sync::Arc;
+
+/// Lock-free bulk writer for DocStoreV3.
+///
+/// Buffers (slot, field_idx, value) tuples in memory, grouped by shard.
+/// On flush, writes complete ShardStore snapshots — one per shard.
+/// Thread-safe: multiple rayon threads can call append_tuple_raw concurrently.
+pub struct ShardStoreBulkWriter {
+    field_to_idx: HashMap<String, u16>,
+    root: PathBuf,
+    field_defaults: HashMap<u16, PackedValue>,
+    /// Buffered tuples grouped by shard. Each shard holds a map of slot → fields.
+    /// DashMap for concurrent access from rayon threads.
+    /// Values are Arc<Mutex<...>> so we can clone them out and drop the DashMap lock
+    /// before acquiring the inner Mutex (avoids holding DashMap shard lock during I/O).
+    shard_buffers: Arc<DashMap<u32, Arc<parking_lot::Mutex<HashMap<u32, Vec<(u16, PackedValue)>>>>>>,
+}
+
+impl ShardStoreBulkWriter {
+    /// Get the field name → index mapping.
+    pub fn field_to_idx(&self) -> &HashMap<String, u16> {
+        &self.field_to_idx
+    }
+
+    /// Append a single raw tuple. Thread-safe via DashMap + per-shard Mutex.
+    pub fn append_tuple_raw(&self, slot: u32, field_idx: u16, value_bytes: &[u8]) {
+        let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("ShardStoreBulkWriter: decode packed value: {e}");
+                return;
+            }
+        };
+        // Elide fields matching their schema default
+        if let Some(default_pv) = self.field_defaults.get(&field_idx) {
+            if &pv == default_pv {
+                return;
+            }
+        }
+        let shard_key = SlotHexShard::slot_to_shard(slot);
+        // Clone Arc out of DashMap to drop the map shard lock before acquiring inner Mutex
+        let mutex = self.shard_buffers.entry(shard_key)
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(HashMap::new())))
+            .clone();
+        let mut shard = mutex.lock();
+        shard.entry(slot).or_default().push((field_idx, pv));
+    }
+
+    /// Append multiple tuples for the same slot in one call.
+    /// The write_buf parameter is accepted for API compatibility but unused.
+    pub fn append_tuples_raw(&self, slot: u32, tuples: &[(u16, &[u8])], _write_buf: &mut Vec<u8>) {
+        if tuples.is_empty() {
+            return;
+        }
+        let shard_key = SlotHexShard::slot_to_shard(slot);
+        let mutex = self.shard_buffers.entry(shard_key)
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(HashMap::new())))
+            .clone();
+        let mut shard = mutex.lock();
+        let fields = shard.entry(slot).or_default();
+        for &(field_idx, value_bytes) in tuples {
+            let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("ShardStoreBulkWriter: decode tuple: {e}");
+                    continue;
+                }
+            };
+            if let Some(default_pv) = self.field_defaults.get(&field_idx) {
+                if &pv == default_pv {
+                    continue;
+                }
+            }
+            fields.push((field_idx, pv));
+        }
+    }
+
+    /// Flush all buffered data as ShardStore snapshots.
+    /// Merges buffered docs into existing shard data (read-merge-write).
+    pub fn flush_to_shardstore(&self) -> io::Result<()> {
+        let store = DocShardStore::new(self.root.clone(), SlotHexShard)?;
+
+        let keys: Vec<u32> = self.shard_buffers.iter().map(|e| *e.key()).collect();
+
+        for shard_key in keys {
+            if let Some(entry) = self.shard_buffers.get(&shard_key) {
+                let mutex = entry.value().clone();
+                drop(entry); // Drop DashMap ref before locking inner Mutex
+                let mut shard = mutex.lock();
+                if shard.is_empty() {
+                    continue;
+                }
+                // Take ownership of buffered data for this flush attempt.
+                let shard_data = std::mem::take(&mut *shard);
+                drop(shard); // Release lock before disk I/O
+
+                // Read existing shard state and merge new docs into it.
+                // Per-slot merge: existing fields are preserved, buffered fields
+                // override by field_idx (last-write-wins), duplicates deduplicated.
+                let flush_result = (|| -> io::Result<()> {
+                    let mut snapshot = store.read(&shard_key)?.unwrap_or_else(DocSnapshot::new);
+                    for (&slot, buffered_fields) in &shard_data {
+                        let doc = snapshot.docs.entry(slot).or_default();
+                        for (field_idx, value) in buffered_fields {
+                            if let Some(existing) = doc.iter_mut().find(|(f, _)| *f == *field_idx) {
+                                existing.1 = value.clone();
+                            } else {
+                                doc.push((*field_idx, value.clone()));
+                            }
+                        }
+                    }
+                    store.write_snapshot(&shard_key, &snapshot)
+                })();
+
+                if let Err(e) = flush_result {
+                    // Restore buffered data on failure so it's not lost
+                    let mut shard = mutex.lock();
+                    for (slot, fields) in shard_data {
+                        shard.entry(slot).or_default().extend(fields);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush all open writers. For ShardStoreBulkWriter this writes ShardStore snapshots.
+    /// Named for API compatibility with the V2 BulkWriter.
+    pub fn flush_v2_writers(&self) {
+        if let Err(e) = self.flush_to_shardstore() {
+            eprintln!("ShardStoreBulkWriter: flush failed: {e}");
+        }
+    }
+
+    /// Write pre-encoded docs to shard files (ShardStore snapshot format).
+    pub fn write_batch_encoded(&self, encoded: Vec<(u32, Vec<u8>)>) {
+        for (slot, bytes) in encoded {
+            let pairs: Vec<(u16, PackedValue)> = match rmp_serde::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            let mutex = self.shard_buffers.entry(shard_key)
+                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(HashMap::new())))
+                .clone();
+            mutex.lock().insert(slot, pairs);
+        }
+    }
+
+    /// Encode a StoredDoc to msgpack bytes using the snapshotted field dictionary.
+    pub fn encode_doc(&self, doc: &StoredDoc) -> Vec<u8> {
+        let mut pairs: Vec<(u16, PackedValue)> = Vec::with_capacity(doc.fields.len());
+        for (name, fv) in &doc.fields {
+            if let Some(&idx) = self.field_to_idx.get(name.as_str()) {
+                let pv = field_value_to_packed(fv);
+                if let Some(default_pv) = self.field_defaults.get(&idx) {
+                    if &pv == default_pv {
+                        continue;
+                    }
+                }
+                pairs.push((idx, pv));
+            }
+        }
+        rmp_serde::to_vec(&pairs).unwrap_or_default()
+    }
+
+    /// Encode a JSON value directly using the DataSchema.
+    pub fn encode_json(&self, json: &serde_json::Value, schema: &DataSchema) -> Vec<u8> {
+        self.encode_json_with_dicts(json, schema, None)
+    }
+
+    /// Encode a JSON document with optional dictionaries.
+    pub fn encode_json_with_dicts(
+        &self,
+        json: &serde_json::Value,
+        schema: &DataSchema,
+        dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+    ) -> Vec<u8> {
+        use crate::config::FieldValueType;
+        let mut pairs: Vec<(u16, PackedValue)> =
+            Vec::with_capacity(schema.fields.len() + 1);
+
+        // ID field
+        if let Some(id_val) = json.get(&schema.id_field) {
+            if let Some(&idx) = self.field_to_idx.get("id") {
+                if let Some(n) = id_val
+                    .as_i64()
+                    .or_else(|| id_val.as_u64().map(|u| u as i64))
+                {
+                    pairs.push((idx, PackedValue::I(n)));
+                }
+            }
+        }
+
+        // Schema fields
+        for mapping in &schema.fields {
+            let Some(&idx) = self.field_to_idx.get(&mapping.target) else {
+                continue;
+            };
+
+            let (raw, apply_ms) = match mapping.resolve_raw(json) {
+                Some(pair) => pair,
+                None => {
+                    if matches!(mapping.value_type, FieldValueType::ExistsBoolean) {
+                        let pv = PackedValue::B(false);
+                        if let Some(default_pv) = self.field_defaults.get(&idx) {
+                            if &pv == default_pv {
+                                continue;
+                            }
+                        }
+                        pairs.push((idx, pv));
+                    }
+                    continue;
+                }
+            };
+
+            let dict = dictionaries.and_then(|d| d.get(&mapping.target));
+            if let Some(pv) = json_to_packed_with_dict(raw, mapping, apply_ms, dict) {
+                if let Some(default_pv) = self.field_defaults.get(&idx) {
+                    if &pv == default_pv {
+                        continue;
+                    }
+                }
+                pairs.push((idx, pv));
+            }
+        }
+
+        rmp_serde::to_vec(&pairs).unwrap_or_default()
+    }
+}
+
+/// Convert a serde_json::Value to a PackedValue for default comparison.
+fn json_to_packed_default(val: &serde_json::Value) -> Option<PackedValue> {
+    match val {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(PackedValue::B(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(PackedValue::I(i))
+            } else if let Some(f) = n.as_f64() {
+                Some(PackedValue::F(f))
+            } else {
+                None
+            }
+        }
+        serde_json::Value::String(s) => Some(PackedValue::S(s.clone())),
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                Some(PackedValue::Mi(Vec::new()))
+            } else if arr.iter().all(|v| v.is_i64() || v.is_u64()) {
+                let ints: Vec<i64> = arr
+                    .iter()
+                    .filter_map(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+                    .collect();
+                Some(PackedValue::Mi(ints))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Convert a PackedValue to a serde_json::Value.
+fn packed_value_to_json(pv: &PackedValue) -> serde_json::Value {
+    match pv {
+        PackedValue::I(i) => serde_json::json!(i),
+        PackedValue::F(f) => serde_json::json!(f),
+        PackedValue::B(b) => serde_json::json!(b),
+        PackedValue::S(s) => serde_json::json!(s),
+        PackedValue::Mi(arr) => serde_json::json!(arr),
+        PackedValue::Mm(arr) => {
+            serde_json::Value::Array(arr.iter().map(packed_value_to_json).collect())
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -17,7 +17,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
-use bitdex_v2::docstore::{DocStore, PackedValue, StoredDoc};
+use bitdex_v2::shard_store_doc::{DocStoreV3, PackedValue, StoredDoc};
 use bitdex_v2::mutation::{value_to_bitmap_key, value_to_sort_u32};
 use bitdex_v2::query::Value;
 
@@ -117,9 +117,8 @@ fn bench_raw_io(docs_path: &Path, num_shards: u32) -> (f64, u64, u64) {
             Ok(data) => {
                 bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
                 // Decompress to measure decompression throughput
-                if let Ok((_entries, decompressed)) = DocStore::read_shard_file_pub(&data) {
-                    bytes_decompressed.fetch_add(decompressed.len() as u64, Ordering::Relaxed);
-                }
+                // ShardStore format — count bytes as decompressed (no separate compression layer)
+                bytes_decompressed.fetch_add(data.len() as u64, Ordering::Relaxed);
                 shards_read.fetch_add(1, Ordering::Relaxed);
             }
             Err(_) => {}
@@ -146,7 +145,7 @@ fn bench_decode(docs_path: &Path, num_shards: u32) -> (f64, u64) {
     eprintln!("\n=== Stage 2: Read + Decode (→ StoredDoc) ===");
     let docs_decoded = AtomicU64::new(0);
 
-    let reader = DocStore::open(docs_path).expect("open docstore");
+    let reader = DocStoreV3::open(docs_path).expect("open docstore");
 
     let t0 = Instant::now();
 
@@ -182,7 +181,7 @@ fn bench_full_rebuild(
     eprintln!("  Filter fields: {:?}", filter_names);
     eprintln!("  Sort fields:   {:?}", sort_names);
 
-    let reader = DocStore::open(docs_path).expect("open docstore");
+    let reader = DocStoreV3::open(docs_path).expect("open docstore");
 
     type FilterMap = HashMap<(usize, u64), RoaringBitmap>;
     struct Accum {
@@ -312,7 +311,7 @@ fn bench_single_field_rebuild(
     eprintln!("\n=== Stage 4: Single Field Rebuild — {} ({}) ===",
         field_name, if is_sort { "sort" } else { "filter" });
 
-    let reader = DocStore::open(docs_path).expect("open docstore");
+    let reader = DocStoreV3::open(docs_path).expect("open docstore");
     let docs_processed = AtomicU64::new(0);
 
     let chunk_size = 500u32;
@@ -455,7 +454,7 @@ fn bench_bitmap_only(
 ) -> (f64, f64, u64) {
     eprintln!("\n=== Stage 5: Split-Phase (pre-read → bitmap-only) ===");
 
-    let reader = DocStore::open(docs_path).expect("open docstore");
+    let reader = DocStoreV3::open(docs_path).expect("open docstore");
 
     // Phase A: Read all shards into memory (decoded StoredDocs)
     let t_read = Instant::now();
@@ -577,7 +576,7 @@ fn bench_selective_decode(
     eprintln!("\n=== Stage 6: Selective Decode (skip full StoredDoc) ===");
     eprintln!("  Target fields: {:?}", target_fields);
 
-    let reader = DocStore::open(docs_path).expect("open docstore");
+    let reader = DocStoreV3::open(docs_path).expect("open docstore");
     let field_to_idx = &reader;
 
     // We'll read raw shard bytes and decode only needed fields
@@ -634,7 +633,7 @@ fn bench_packed_rebuild(
 ) -> (f64, u64) {
     eprintln!("\n=== Stage 7: Packed Rebuild (skip StoredDoc) ===");
 
-    let reader = DocStore::open(docs_path).expect("open docstore");
+    let reader = DocStoreV3::open(docs_path).expect("open docstore");
 
     // Build u16 index → (role, position) lookup table from field dictionary
     // role: 0 = filter, 1 = sort, 2 = both

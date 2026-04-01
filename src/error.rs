@@ -25,6 +25,9 @@ pub enum BitdexError {
     #[error("capacity exceeded: {0}")]
     CapacityExceeded(String),
 
-    #[error("docstore error: {0}")]
-    DocStore(String),
+    #[error("storage error: {0}")]
+    Storage(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }

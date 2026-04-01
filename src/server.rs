@@ -22,7 +22,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{Config, DataSchema, FieldValueType, FilterFieldConfig, SortFieldConfig};
-use crate::docstore::StoredDoc;
+use crate::shard_store_doc::StoredDoc;
 use crate::executor::{CaseSensitiveFields, StringMaps};
 use crate::loader;
 use crate::metrics::Metrics;

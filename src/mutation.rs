@@ -4,7 +4,7 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::config::{ComputedOp, ComputedField, Config};
-use crate::docstore::{DocStore, StoredDoc};
+use crate::shard_store_doc::{DocStoreV3, StoredDoc};
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
 use crate::query::Value;
@@ -700,7 +700,7 @@ pub struct MutationEngine<'a> {
     filters: &'a mut FilterIndex,
     sorts: &'a mut SortIndex,
     config: &'a Config,
-    docstore: &'a mut DocStore,
+    docstore: &'a mut DocStoreV3,
 }
 
 impl<'a> MutationEngine<'a> {
@@ -709,7 +709,7 @@ impl<'a> MutationEngine<'a> {
         filters: &'a mut FilterIndex,
         sorts: &'a mut SortIndex,
         config: &'a Config,
-        docstore: &'a mut DocStore,
+        docstore: &'a mut DocStoreV3,
     ) -> Self {
         Self {
             slots,
@@ -1118,12 +1118,12 @@ mod tests {
         }
     }
 
-    fn setup() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocStore) {
+    fn setup() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocStoreV3) {
         let config = test_config();
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let docstore = DocStore::open_temp().unwrap();
+        let docstore = DocStoreV3::open_temp().unwrap();
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
@@ -1529,12 +1529,12 @@ mod tests {
         }
     }
 
-    fn setup_computed() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocStore) {
+    fn setup_computed() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocStoreV3) {
         let config = computed_config();
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let docstore = DocStore::open_temp().unwrap();
+        let docstore = DocStoreV3::open_temp().unwrap();
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
@@ -1720,7 +1720,7 @@ mod tests {
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(16)));
         old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(1000)));
-        let old_doc = crate::docstore::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH changes publishedAt to far future (year 2050)
         let future_ts = 2524608000i64;

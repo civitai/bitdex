@@ -53,7 +53,7 @@ use std::sync::Mutex;
 use memmap2::MmapMut;
 use roaring::RoaringBitmap;
 
-use crate::docstore::BulkWriter;
+use crate::shard_store_doc::ShardStoreBulkWriter as BulkWriter;
 use crate::config::DataSchema;
 use crate::error::Result;
 
@@ -217,16 +217,16 @@ impl SlotArena {
             .create(true)
             .truncate(true)
             .open(path)
-            .map_err(|e| crate::error::BitdexError::DocStore(
+            .map_err(|e| crate::error::BitdexError::Storage(
                 format!("SlotArena: create file {}: {e}", path.display()),
             ))?;
         file.set_len(file_size).map_err(|e| {
-            crate::error::BitdexError::DocStore(format!("SlotArena: set_len {file_size}: {e}"))
+            crate::error::BitdexError::Storage(format!("SlotArena: set_len {file_size}: {e}"))
         })?;
 
         let mmap = unsafe {
             MmapMut::map_mut(&file).map_err(|e| {
-                crate::error::BitdexError::DocStore(format!("SlotArena: mmap: {e}"))
+                crate::error::BitdexError::Storage(format!("SlotArena: mmap: {e}"))
             })?
         };
 

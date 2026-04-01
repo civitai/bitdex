@@ -22,7 +22,8 @@ use serde_json::Value as JsonValue;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
-use crate::docstore::{DocStore, PackedValue};
+use crate::shard_store_doc::PackedValue;
+use crate::shard_store_doc::DocStoreV3;
 use crate::filter::FilterFieldType;
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
@@ -42,14 +43,14 @@ use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 /// is safe because no concurrent writer can modify the same slot's doc between
 /// the read and write within a single WAL batch cycle.
 pub struct DocWriter {
-    docstore: Arc<parking_lot::Mutex<DocStore>>,
+    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
     field_dict: HashMap<String, u16>,
     pending: Vec<(u32, u16, Vec<u8>)>,
 }
 
 impl DocWriter {
     /// Create a DocWriter from the engine's docstore.
-    pub fn new(docstore: Arc<parking_lot::Mutex<DocStore>>) -> Self {
+    pub fn new(docstore: Arc<parking_lot::Mutex<DocStoreV3>>) -> Self {
         let field_dict = docstore.lock().field_dict_snapshot();
         Self {
             docstore,
@@ -210,7 +211,7 @@ fn qvalue_to_json(v: &QValue) -> JsonValue {
 /// are treated as deletions and their old bitmap bits are cleared.
 pub fn document_to_ops(
     new_doc: &crate::mutation::Document,
-    old_doc: Option<&crate::docstore::StoredDoc>,
+    old_doc: Option<&crate::shard_store_doc::StoredDoc>,
     config: &crate::config::Config,
     is_patch: bool,
 ) -> Vec<Op> {
@@ -1869,11 +1870,12 @@ mod tests {
 
     #[test]
     fn test_doc_writer_write_set() {
-        use crate::docstore::{DocStore, PackedValue};
+        use crate::shard_store_doc::PackedValue;
+        use crate::shard_store_doc::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
-        let mut store = DocStore::open(&docs_dir).unwrap();
+        let mut store = DocStoreV3::open(&docs_dir).unwrap();
         store.ensure_field_index("nsfwLevel").unwrap();
         store.ensure_field_index("userId").unwrap();
 
@@ -1884,10 +1886,7 @@ mod tests {
         dw.write_set(10, "userId", &json!(42));
         dw.flush();
 
-        // Close writers
-        store.lock().v2_writers_handle().clear();
-
-        let doc = store.lock().get_v2(10).unwrap().unwrap();
+        let doc = store.lock().get(10).unwrap().unwrap();
         match &doc.fields["nsfwLevel"] {
             crate::mutation::FieldValue::Single(crate::query::Value::Integer(16)) => {}
             other => panic!("expected nsfwLevel=16, got: {:?}", other),
@@ -1900,22 +1899,22 @@ mod tests {
 
     #[test]
     fn test_doc_writer_write_add_remove() {
-        use crate::docstore::{DocStore, PackedValue};
+        use crate::shard_store_doc::PackedValue;
+        use crate::shard_store_doc::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
-        let mut store = DocStore::open(&docs_dir).unwrap();
+        let mut store = DocStoreV3::open(&docs_dir).unwrap();
         store.ensure_field_index("tagIds").unwrap();
 
         let store = Arc::new(parking_lot::Mutex::new(store));
 
         // First write an initial value
         {
-            let mut dw = DocWriter::new(Arc::clone(&store));
+            let _dw = DocWriter::new(Arc::clone(&store));
             let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100, 200])).unwrap();
             let idx = store.lock().field_index("tagIds").unwrap();
             store.lock().append_tuple(5, idx, &initial).unwrap();
-            store.lock().v2_writers_handle().clear();
         }
 
         // Add a value
@@ -1923,10 +1922,9 @@ mod tests {
             let mut dw = DocWriter::new(Arc::clone(&store));
             dw.write_add(5, "tagIds", &json!(300));
             dw.flush();
-            store.lock().v2_writers_handle().clear();
         }
 
-        let doc = store.lock().get_v2(5).unwrap().unwrap();
+        let doc = store.lock().get(5).unwrap().unwrap();
         match &doc.fields["tagIds"] {
             crate::mutation::FieldValue::Multi(vals) => {
                 let ints: Vec<i64> = vals.iter().filter_map(|v| {
@@ -1944,10 +1942,9 @@ mod tests {
             let mut dw = DocWriter::new(Arc::clone(&store));
             dw.write_remove(5, "tagIds", &json!(200));
             dw.flush();
-            store.lock().v2_writers_handle().clear();
         }
 
-        let doc = store.lock().get_v2(5).unwrap().unwrap();
+        let doc = store.lock().get(5).unwrap().unwrap();
         match &doc.fields["tagIds"] {
             crate::mutation::FieldValue::Multi(vals) => {
                 let ints: Vec<i64> = vals.iter().filter_map(|v| {
@@ -1958,6 +1955,44 @@ mod tests {
                 assert!(ints.contains(&300));
             }
             other => panic!("expected multi-value tagIds, got: {:?}", other),
+        }
+    }
+
+    /// E2E: DocWriter writes scalar fields through DocStoreV3 and reads them back.
+    /// Validates the production ops pipeline docstore write path.
+    #[test]
+    fn test_docstore_v3_doc_writer_e2e_roundtrip() {
+        use crate::shard_store_doc::DocStoreV3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        store.ensure_field_index("sortAt").unwrap();
+        store.ensure_field_index("nsfwLevel").unwrap();
+
+        let store = Arc::new(parking_lot::Mutex::new(store));
+        let mut dw = DocWriter::new(Arc::clone(&store));
+
+        // Write scalar fields via DocWriter (simulates WAL ops processor path)
+        dw.write_set(100, "sortAt", &json!(1711900000));
+        dw.write_set(100, "nsfwLevel", &json!(5));
+        dw.flush();
+
+        // Read back via DocStoreV3 and verify
+        let doc = store.lock().get(100).unwrap();
+        assert!(doc.is_some(), "doc should exist after DocWriter writes");
+        let doc = doc.unwrap();
+        match &doc.fields["sortAt"] {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(v)) => {
+                assert_eq!(*v, 1711900000, "sortAt value should roundtrip");
+            }
+            other => panic!("expected sortAt=1711900000, got: {:?}", other),
+        }
+        match &doc.fields["nsfwLevel"] {
+            crate::mutation::FieldValue::Single(crate::query::Value::Integer(v)) => {
+                assert_eq!(*v, 5, "nsfwLevel value should roundtrip");
+            }
+            other => panic!("expected nsfwLevel=5, got: {:?}", other),
         }
     }
 
@@ -2162,7 +2197,7 @@ mod tests {
 
     #[test]
     fn test_json_to_packed_types() {
-        use crate::docstore::PackedValue;
+        use crate::shard_store_doc::PackedValue;
 
         assert_eq!(json_to_packed(&json!(42)), Some(PackedValue::I(42)));
         assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
@@ -2209,7 +2244,7 @@ mod tests {
         // Old doc: nsfwLevel=8
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::docstore::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // New doc: nsfwLevel=16
         let mut new_fields = std::collections::HashMap::new();
@@ -2234,7 +2269,7 @@ mod tests {
         let mut fields = std::collections::HashMap::new();
         fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
 
-        let old_doc = crate::docstore::StoredDoc { fields: fields.clone(), schema_version: 0 };
+        let old_doc = crate::shard_store_doc::StoredDoc { fields: fields.clone(), schema_version: 0 };
         let new_doc = Document { fields };
 
         let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
@@ -2251,7 +2286,7 @@ mod tests {
         // Old doc has nsfwLevel=8 AND reactionCount sort field
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::docstore::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH only sends userId=42 (nsfwLevel absent from patch)
         let mut new_fields = std::collections::HashMap::new();

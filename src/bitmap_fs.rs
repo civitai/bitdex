@@ -44,13 +44,13 @@ impl BitmapFs {
     pub fn new(root: &Path) -> Result<Self> {
         let root = root.to_path_buf();
         std::fs::create_dir_all(root.join("filter"))
-            .map_err(|e| BitdexError::DocStore(format!("create filter dir: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("create filter dir: {e}")))?;
         std::fs::create_dir_all(root.join("sort"))
-            .map_err(|e| BitdexError::DocStore(format!("create sort dir: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("create sort dir: {e}")))?;
         std::fs::create_dir_all(root.join("system"))
-            .map_err(|e| BitdexError::DocStore(format!("create system dir: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("create system dir: {e}")))?;
         std::fs::create_dir_all(root.join("meta"))
-            .map_err(|e| BitdexError::DocStore(format!("create meta dir: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("create meta dir: {e}")))?;
         Ok(Self { root })
     }
 
@@ -72,20 +72,20 @@ impl BitmapFs {
         let tmp_path = path.with_extension("roar.tmp");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| BitdexError::DocStore(format!("create dir: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("create dir: {e}")))?;
         }
         let mut buf = Vec::with_capacity(bitmap.serialized_size());
         bitmap
             .serialize_into(&mut buf)
-            .map_err(|e| BitdexError::DocStore(format!("bitmap serialize: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("bitmap serialize: {e}")))?;
         std::fs::write(&tmp_path, &buf)
-            .map_err(|e| BitdexError::DocStore(format!("write tmp: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("write tmp: {e}")))?;
         std::fs::OpenOptions::new().write(true).open(&tmp_path)
-            .map_err(|e| BitdexError::DocStore(format!("open tmp for fsync: {e}")))?
+            .map_err(|e| BitdexError::Storage(format!("open tmp for fsync: {e}")))?
             .sync_all()
-            .map_err(|e| BitdexError::DocStore(format!("fsync tmp: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("fsync tmp: {e}")))?;
         std::fs::rename(&tmp_path, path)
-            .map_err(|e| BitdexError::DocStore(format!("rename: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("rename: {e}")))?;
         Ok(())
     }
 
@@ -93,11 +93,11 @@ impl BitmapFs {
         match std::fs::read(path) {
             Ok(bytes) => {
                 let bm = RoaringBitmap::deserialize_from(bytes.as_slice())
-                    .map_err(|e| BitdexError::DocStore(format!("bitmap deserialize: {e}")))?;
+                    .map_err(|e| BitdexError::Storage(format!("bitmap deserialize: {e}")))?;
                 Ok(Some(bm))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(BitdexError::DocStore(format!("read bitmap: {e}"))),
+            Err(e) => Err(BitdexError::Storage(format!("read bitmap: {e}"))),
         }
     }
 
@@ -105,16 +105,16 @@ impl BitmapFs {
         let tmp_path = path.with_extension("bin.tmp");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| BitdexError::DocStore(format!("create dir: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("create dir: {e}")))?;
         }
         std::fs::write(&tmp_path, data)
-            .map_err(|e| BitdexError::DocStore(format!("write tmp: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("write tmp: {e}")))?;
         std::fs::OpenOptions::new().write(true).open(&tmp_path)
-            .map_err(|e| BitdexError::DocStore(format!("open tmp for fsync: {e}")))?
+            .map_err(|e| BitdexError::Storage(format!("open tmp for fsync: {e}")))?
             .sync_all()
-            .map_err(|e| BitdexError::DocStore(format!("fsync tmp: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("fsync tmp: {e}")))?;
         std::fs::rename(&tmp_path, path)
-            .map_err(|e| BitdexError::DocStore(format!("rename: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("rename: {e}")))?;
         Ok(())
     }
 
@@ -149,7 +149,7 @@ impl BitmapFs {
         for &(value, bm) in entries {
             let mut buf = Vec::with_capacity(bm.serialized_size());
             bm.serialize_into(&mut buf)
-                .map_err(|e| BitdexError::DocStore(format!("filter bitmap serialize: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("filter bitmap serialize: {e}")))?;
             serialized.push((value, buf));
         }
 
@@ -178,13 +178,13 @@ impl BitmapFs {
     /// Read entries from a single pack file.
     fn read_pack_file(data: &[u8]) -> Result<Vec<(u64, RoaringBitmap)>> {
         if data.len() < 4 {
-            return Err(BitdexError::DocStore("filter pack header truncated".into()));
+            return Err(BitdexError::Storage("filter pack header truncated".into()));
         }
 
         let num_entries = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let header_size = 4 + num_entries * 16;
         if data.len() < header_size {
-            return Err(BitdexError::DocStore("filter pack index truncated".into()));
+            return Err(BitdexError::Storage("filter pack index truncated".into()));
         }
 
         let data_start = header_size;
@@ -206,11 +206,11 @@ impl BitmapFs {
             let start = data_start + offset;
             let end = start + length;
             if end > data.len() {
-                return Err(BitdexError::DocStore("filter bitmap data truncated".into()));
+                return Err(BitdexError::Storage("filter bitmap data truncated".into()));
             }
 
             let bm = RoaringBitmap::deserialize_from(&data[start..end])
-                .map_err(|e| BitdexError::DocStore(format!("filter bitmap deserialize: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("filter bitmap deserialize: {e}")))?;
             result.push((value, bm));
         }
 
@@ -243,18 +243,18 @@ impl BitmapFs {
             let data = match std::fs::read(&path) {
                 Ok(d) => d,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(BitdexError::DocStore(format!("read pack file: {e}"))),
+                Err(e) => return Err(BitdexError::Storage(format!("read pack file: {e}"))),
             };
 
             if data.len() < 4 {
-                return Err(BitdexError::DocStore("filter pack header truncated".into()));
+                return Err(BitdexError::Storage("filter pack header truncated".into()));
             }
 
             let num_entries =
                 u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
             let header_size = 4 + num_entries * 16;
             if data.len() < header_size {
-                return Err(BitdexError::DocStore("filter pack index truncated".into()));
+                return Err(BitdexError::Storage("filter pack index truncated".into()));
             }
 
             let data_start = header_size;
@@ -293,13 +293,13 @@ impl BitmapFs {
                 let start = data_start + offset;
                 let end = start + length;
                 if end > data.len() {
-                    return Err(BitdexError::DocStore(
+                    return Err(BitdexError::Storage(
                         "filter bitmap data truncated".into(),
                     ));
                 }
 
                 let bm = RoaringBitmap::deserialize_from(&data[start..end]).map_err(|e| {
-                    BitdexError::DocStore(format!("filter bitmap deserialize: {e}"))
+                    BitdexError::Storage(format!("filter bitmap deserialize: {e}"))
                 })?;
                 result.insert(value, bm);
             }
@@ -321,7 +321,7 @@ impl BitmapFs {
 
         // Collect fpack file paths
         let fpack_files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| BitdexError::DocStore(format!("read filter dir: {e}")))?
+            .map_err(|e| BitdexError::Storage(format!("read filter dir: {e}")))?
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
                 if path.extension().map_or(true, |ext| ext != "fpack") {
@@ -339,7 +339,7 @@ impl BitmapFs {
         // Single file: sequential (avoid rayon overhead)
         if fpack_files.len() == 1 {
             let data = std::fs::read(&fpack_files[0])
-                .map_err(|e| BitdexError::DocStore(format!("read pack file: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("read pack file: {e}")))?;
             let entries = Self::read_pack_file(&data)?;
             let mut result = HashMap::with_capacity(entries.len());
             for (value, bm) in entries {
@@ -353,7 +353,7 @@ impl BitmapFs {
             .par_iter()
             .map(|path| {
                 let data = std::fs::read(path)
-                    .map_err(|e| BitdexError::DocStore(format!("read pack file: {e}")))?;
+                    .map_err(|e| BitdexError::Storage(format!("read pack file: {e}")))?;
                 Self::read_pack_file(&data)
             })
             .collect();
@@ -382,7 +382,7 @@ impl BitmapFs {
 
         // Collect fpack paths
         let fpack_files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| BitdexError::DocStore(format!("read filter dir: {e}")))?
+            .map_err(|e| BitdexError::Storage(format!("read filter dir: {e}")))?
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
                 if path.extension().map_or(true, |ext| ext != "fpack") {
@@ -397,7 +397,7 @@ impl BitmapFs {
         fn extract_keys(path: &Path) -> std::result::Result<Vec<u64>, BitdexError> {
             use std::io::Read;
             let mut file = std::fs::File::open(path)
-                .map_err(|e| BitdexError::DocStore(format!("open pack file: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("open pack file: {e}")))?;
 
             // Read just the entry count (4 bytes)
             let mut count_buf = [0u8; 4];
@@ -413,7 +413,7 @@ impl BitmapFs {
             let header_bytes = num_entries * 16;
             let mut header = vec![0u8; header_bytes];
             file.read_exact(&mut header)
-                .map_err(|e| BitdexError::DocStore(format!("read pack header: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("read pack header: {e}")))?;
 
             let mut keys = Vec::with_capacity(num_entries);
             for i in 0..num_entries {
@@ -468,7 +468,7 @@ impl BitmapFs {
         match std::fs::read(&path) {
             Ok(data) => Self::read_pack_file(&data),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(BitdexError::DocStore(format!("read filter bucket: {e}"))),
+            Err(e) => Err(BitdexError::Storage(format!("read filter bucket: {e}"))),
         }
     }
 
@@ -529,7 +529,7 @@ impl BitmapFs {
         for bm in layers {
             let mut buf = Vec::with_capacity(bm.serialized_size());
             bm.serialize_into(&mut buf)
-                .map_err(|e| BitdexError::DocStore(format!("sort layer serialize: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("sort layer serialize: {e}")))?;
             layer_data.push(buf);
         }
 
@@ -568,7 +568,7 @@ impl BitmapFs {
         let data = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(BitdexError::DocStore(format!("read sort file: {e}"))),
+            Err(e) => return Err(BitdexError::Storage(format!("read sort file: {e}"))),
         };
 
         if data.is_empty() {
@@ -578,7 +578,7 @@ impl BitmapFs {
         let stored_layers = data[0] as usize;
         let header_size = 1 + stored_layers * 9;
         if data.len() < header_size {
-            return Err(BitdexError::DocStore("sort file header truncated".into()));
+            return Err(BitdexError::Storage("sort file header truncated".into()));
         }
 
         let data_start = header_size;
@@ -600,10 +600,10 @@ impl BitmapFs {
                 let start = data_start + offset;
                 let end = start + length;
                 if end > data.len() {
-                    return Err(BitdexError::DocStore("sort layer data truncated".into()));
+                    return Err(BitdexError::Storage("sort layer data truncated".into()));
                 }
                 layers[bit_pos] = RoaringBitmap::deserialize_from(&data[start..end])
-                    .map_err(|e| BitdexError::DocStore(format!("sort layer deserialize: {e}")))?;
+                    .map_err(|e| BitdexError::Storage(format!("sort layer deserialize: {e}")))?;
             }
         }
 
@@ -628,9 +628,9 @@ impl BitmapFs {
                 let counter = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                 Ok(Some(counter))
             }
-            Ok(_) => Err(BitdexError::DocStore("slot counter too short".into())),
+            Ok(_) => Err(BitdexError::Storage("slot counter too short".into())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(BitdexError::DocStore(format!("read slot counter: {e}"))),
+            Err(e) => Err(BitdexError::Storage(format!("read slot counter: {e}"))),
         }
     }
 
@@ -662,24 +662,24 @@ impl BitmapFs {
         let data = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(BitdexError::DocStore(format!("read deferred alive: {e}"))),
+            Err(e) => return Err(BitdexError::Storage(format!("read deferred alive: {e}"))),
         };
         if data.len() < 4 {
-            return Err(BitdexError::DocStore("deferred alive file too short".into()));
+            return Err(BitdexError::Storage("deferred alive file too short".into()));
         }
         let entry_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let mut offset = 4;
         let mut map = std::collections::BTreeMap::new();
         for _ in 0..entry_count {
             if offset + 12 > data.len() {
-                return Err(BitdexError::DocStore("deferred alive truncated".into()));
+                return Err(BitdexError::Storage("deferred alive truncated".into()));
             }
             let ts = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
             offset += 8;
             let slot_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + slot_count * 4 > data.len() {
-                return Err(BitdexError::DocStore("deferred alive slots truncated".into()));
+                return Err(BitdexError::Storage("deferred alive slots truncated".into()));
             }
             let mut slots = Vec::with_capacity(slot_count);
             for _ in 0..slot_count {
@@ -706,7 +706,7 @@ impl BitmapFs {
         let path = self.time_bucket_path(bucket_name);
         let mut buf = Vec::with_capacity(bitmap.serialized_size());
         bitmap.serialize_into(&mut buf)
-            .map_err(|e| BitdexError::DocStore(format!("time bucket serialize: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("time bucket serialize: {e}")))?;
         Self::write_bytes_atomic(&path, &buf)
     }
 
@@ -716,11 +716,11 @@ impl BitmapFs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(BitdexError::DocStore(format!("read time_buckets dir: {e}"))),
+            Err(e) => return Err(BitdexError::Storage(format!("read time_buckets dir: {e}"))),
         };
         let mut result = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|e| BitdexError::DocStore(format!("dir entry: {e}")))?;
+            let entry = entry.map_err(|e| BitdexError::Storage(format!("dir entry: {e}")))?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("roar") {
                 if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
@@ -763,9 +763,9 @@ impl BitmapFs {
         let mut count = 0;
         // Scan field directories, count entries across all .fpack files
         for field_entry in std::fs::read_dir(&filter_dir)
-            .map_err(|e| BitdexError::DocStore(e.to_string()))?
+            .map_err(|e| BitdexError::Storage(e.to_string()))?
         {
-            let field_entry = field_entry.map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let field_entry = field_entry.map_err(|e| BitdexError::Storage(e.to_string()))?;
             if !field_entry.path().is_dir() { continue; }
             let field_name = field_entry.path().file_name()
                 .and_then(|s| s.to_str())
@@ -785,7 +785,7 @@ impl BitmapFs {
     pub fn write_cursor(&self, name: &str, value: &str) -> Result<()> {
         let dir = self.root.join("cursors");
         std::fs::create_dir_all(&dir)
-            .map_err(|e| BitdexError::DocStore(format!("create cursors dir: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("create cursors dir: {e}")))?;
         Self::write_bytes_atomic(&dir.join(name), value.as_bytes())
     }
 
@@ -795,7 +795,7 @@ impl BitmapFs {
         match std::fs::read_to_string(&path) {
             Ok(v) => Ok(Some(v)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(BitdexError::DocStore(format!("read cursor {name}: {e}"))),
+            Err(e) => Err(BitdexError::Storage(format!("read cursor {name}: {e}"))),
         }
     }
 
@@ -806,10 +806,10 @@ impl BitmapFs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(result),
-            Err(e) => return Err(BitdexError::DocStore(format!("read cursors dir: {e}"))),
+            Err(e) => return Err(BitdexError::Storage(format!("read cursors dir: {e}"))),
         };
         for entry in entries {
-            let entry = entry.map_err(|e| BitdexError::DocStore(e.to_string()))?;
+            let entry = entry.map_err(|e| BitdexError::Storage(e.to_string()))?;
             let path = entry.path();
             if path.is_file() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -818,7 +818,7 @@ impl BitmapFs {
                         continue;
                     }
                     let value = std::fs::read_to_string(&path)
-                        .map_err(|e| BitdexError::DocStore(format!("read cursor {name}: {e}")))?;
+                        .map_err(|e| BitdexError::Storage(format!("read cursor {name}: {e}")))?;
                     result.insert(name.to_string(), value);
                 }
             }
