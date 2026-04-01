@@ -1499,6 +1499,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         let bitmap_path = runtime_dir.join("bitmaps");
         let docstore_path = runtime_dir.join("docs");
         let mut config = def.config.clone();
+        config.data_schema = def.data_schema.clone();
         config.storage.bitmap_path = Some(bitmap_path.clone());
 
         // Always use new_with_path so bitmaps restore from bitmap_path even if
@@ -1819,6 +1820,7 @@ async fn handle_create_index(
     // Create engine
     let docstore_path = index_dir.join("docs");
     let mut config = req.config;
+    config.data_schema = definition.data_schema.clone();
     config.storage.bitmap_path = Some(index_dir.join("bitmaps"));
 
     let mut engine = match ConcurrentEngine::new_with_path(config, &docstore_path) {
@@ -5139,6 +5141,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         }]);
 
         // Doc has field under SOURCE name (bulk loader path)
@@ -5171,6 +5174,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         }]);
 
         // Doc has field under TARGET name (outbox/PATCH path).
@@ -5203,6 +5207,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: Some(serde_json::json!(0)),
+            nullable: false,
         }]);
 
         let doc = make_stored_doc(vec![
@@ -5232,6 +5237,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: Some(serde_json::json!(0)),
+            nullable: false,
         }]);
 
         // Doc has no reactionCount
@@ -5261,6 +5267,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         }]);
 
         let doc = make_stored_doc(vec![
@@ -5288,6 +5295,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: Some(serde_json::json!(false)),
+            nullable: false,
         }]);
 
         let doc = make_stored_doc(vec![
@@ -5316,6 +5324,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: Some(serde_json::json!([])),
+            nullable: false,
         }]);
 
         let doc = make_stored_doc(vec![
@@ -5347,6 +5356,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             },
             FieldMapping {
                 source: "collectionIds".into(),
@@ -5360,6 +5370,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: Some(serde_json::json!([])),
+                nullable: false,
             },
         ]);
 
@@ -5398,6 +5409,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         }]);
 
         let doc = make_stored_doc(vec![
@@ -5434,6 +5446,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         }]);
 
         let doc = make_stored_doc(vec![
@@ -5466,6 +5479,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         }]);
 
         let doc = make_stored_doc(vec![
@@ -5495,6 +5509,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         }]);
 
         let doc = make_stored_doc(vec![
@@ -5523,6 +5538,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         }]);
 
         let doc = make_stored_doc(vec![
@@ -5548,6 +5564,7 @@ mod tests {
                 fallback: None, string_map: None, doc_only: false, filter_only: false,
                 ms_to_seconds: false, truncate_u32: false, case_sensitive: false,
                 default_value: None,
+                nullable: false,
             },
             FieldMapping {
                 source: "userId".into(),
@@ -5556,6 +5573,7 @@ mod tests {
                 fallback: None, string_map: None, doc_only: false, filter_only: false,
                 ms_to_seconds: false, truncate_u32: false, case_sensitive: false,
                 default_value: None,
+                nullable: false,
             },
         ]);
 
@@ -5586,6 +5604,7 @@ mod tests {
             fallback: None, string_map: None, doc_only: false, filter_only: false,
             ms_to_seconds: false, truncate_u32: false, case_sensitive: false,
             default_value: Some(serde_json::json!(99)), // current default
+            nullable: false,
         }]);
 
         // Doc encoded with schema version 1 (current is also 1, but let's test version 2)
@@ -5620,6 +5639,7 @@ mod tests {
             truncate_u32: true, // legacy alias
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         }]);
 
         // Doc has field under source name (raw ms)
