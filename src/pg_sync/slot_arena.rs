@@ -217,16 +217,16 @@ impl SlotArena {
             .create(true)
             .truncate(true)
             .open(path)
-            .map_err(|e| crate::error::BitdexError::DocStore(
+            .map_err(|e| crate::error::BitdexError::Storage(
                 format!("SlotArena: create file {}: {e}", path.display()),
             ))?;
         file.set_len(file_size).map_err(|e| {
-            crate::error::BitdexError::DocStore(format!("SlotArena: set_len {file_size}: {e}"))
+            crate::error::BitdexError::Storage(format!("SlotArena: set_len {file_size}: {e}"))
         })?;
 
         let mmap = unsafe {
             MmapMut::map_mut(&file).map_err(|e| {
-                crate::error::BitdexError::DocStore(format!("SlotArena: mmap: {e}"))
+                crate::error::BitdexError::Storage(format!("SlotArena: mmap: {e}"))
             })?
         };
 

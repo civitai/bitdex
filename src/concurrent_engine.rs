@@ -319,7 +319,7 @@ impl ConcurrentEngine {
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
         let docstore = DocStoreV3::open_temp()
-            .map_err(|e| crate::error::BitdexError::DocStore(format!("open temp: {e}")))?;
+            .map_err(|e| crate::error::BitdexError::Storage(format!("open temp: {e}")))?;
         Self::build(config, docstore)
     }
 
@@ -327,7 +327,7 @@ impl ConcurrentEngine {
     pub fn new_with_path(config: Config, path: &Path) -> Result<Self> {
         config.validate()?;
         let docstore = DocStoreV3::open(path)
-            .map_err(|e| crate::error::BitdexError::DocStore(format!("open: {e}")))?;
+            .map_err(|e| crate::error::BitdexError::Storage(format!("open: {e}")))?;
         Self::build(config, docstore)
     }
 
@@ -359,15 +359,15 @@ impl ConcurrentEngine {
             (
                 Some(Arc::new(crate::shard_store_bitmap::AliveBitmapStore::new(
                     ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
-                ).map_err(|e| BitdexError::DocStore(format!("alive store init: {e}")))?)),
+                ).map_err(|e| BitdexError::Storage(format!("alive store init: {e}")))?)),
                 Some(Arc::new(crate::shard_store_bitmap::FilterBitmapStore::new(
                     ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
-                ).map_err(|e| BitdexError::DocStore(format!("filter store init: {e}")))?)),
+                ).map_err(|e| BitdexError::Storage(format!("filter store init: {e}")))?)),
                 Some(Arc::new(crate::shard_store_bitmap::SortBitmapStore::new(
                     ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
-                ).map_err(|e| BitdexError::DocStore(format!("sort store init: {e}")))?)),
+                ).map_err(|e| BitdexError::Storage(format!("sort store init: {e}")))?)),
                 Some(Arc::new(crate::shard_store_meta::MetaStore::new(ss_root)
-                    .map_err(|e| BitdexError::DocStore(format!("meta store init: {e}")))?)),
+                    .map_err(|e| BitdexError::Storage(format!("meta store init: {e}")))?)),
             )
         } else {
             (None, None, None, None)
@@ -385,7 +385,7 @@ impl ConcurrentEngine {
         let mut slots = crate::slot::SlotAllocator::new();
         if let Some(ref store) = alive_store {
             let alive = store.load_alive()
-                .map_err(|e| crate::error::BitdexError::DocStore(format!("load alive: {e}")))?;
+                .map_err(|e| crate::error::BitdexError::Storage(format!("load alive: {e}")))?;
             let counter = meta_store.as_ref()
                 .and_then(|ms| ms.load_slot_counter().ok())
                 .flatten();
@@ -2962,7 +2962,7 @@ impl ConcurrentEngine {
         };
 
         wal.append_batch(&[entry]).map_err(|e| {
-            crate::error::BitdexError::DocStore(format!("WAL write failed: {e}"))
+            crate::error::BitdexError::Storage(format!("WAL write failed: {e}"))
         })?;
 
         Ok(())
@@ -2995,7 +2995,7 @@ impl ConcurrentEngine {
         };
 
         wal.append_batch(&[entry]).map_err(|e| {
-            crate::error::BitdexError::DocStore(format!("WAL write failed: {e}"))
+            crate::error::BitdexError::Storage(format!("WAL write failed: {e}"))
         })?;
 
         Ok(())
@@ -3297,7 +3297,7 @@ impl ConcurrentEngine {
         })?;
 
         let new_keys = fs.existence_set(field_name)
-            .map_err(|e| crate::error::BitdexError::DocStore(format!("existence set: {e}")))?;
+            .map_err(|e| crate::error::BitdexError::Storage(format!("existence set: {e}")))?;
         let count = new_keys.len();
         keys_arc.store(Arc::new(new_keys));
 
@@ -3537,7 +3537,7 @@ impl ConcurrentEngine {
                                 }
                                 par_filters.lock().unwrap().push((name.clone(), bitmaps));
                             }
-                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::DocStore(format!("lazy load filter: {e}"))); }
+                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::Storage(format!("lazy load filter: {e}"))); }
                         }
                     });
                 }
@@ -3569,7 +3569,7 @@ impl ConcurrentEngine {
                                 *par_sort.lock().unwrap() = Some((sort_name, layers));
                             }
                             Ok(None) => {}
-                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::DocStore(format!("lazy load sort: {e}"))); }
+                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::Storage(format!("lazy load sort: {e}"))); }
                         }
                     });
                 }
@@ -3600,7 +3600,7 @@ impl ConcurrentEngine {
                                 par_values.lock().unwrap().push((field_name.clone(), loaded, missing.clone()));
                             }
                             Ok(_) => {}
-                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::DocStore(format!("lazy load values: {e}"))); }
+                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::Storage(format!("lazy load values: {e}"))); }
                         }
                     });
                 }
@@ -3619,7 +3619,7 @@ impl ConcurrentEngine {
             for name in &needed_filters {
                 let t0 = std::time::Instant::now();
                 let bitmaps = lazy_filter_store.load_field(name)
-                    .map_err(|e| crate::error::BitdexError::DocStore(format!("lazy load filter: {e}")))?;
+                    .map_err(|e| crate::error::BitdexError::Storage(format!("lazy load filter: {e}")))?;
                 let count = bitmaps.len();
                 eprintln!(
                     "Lazy-loaded filter '{}': {} values in {:.1}ms",
@@ -3637,7 +3637,7 @@ impl ConcurrentEngine {
             if let (Some(sort_name), Some(bits)) = (&needed_sort, sort_bits) {
                 let t0 = std::time::Instant::now();
                 let layers_opt = lazy_sort_store.load_sort_layers(sort_name, bits)
-                    .map_err(|e| crate::error::BitdexError::DocStore(format!("lazy load sort: {e}")))?;
+                    .map_err(|e| crate::error::BitdexError::Storage(format!("lazy load sort: {e}")))?;
                 if let Some(layers) = layers_opt {
                     let layer_count = layers.len();
                     eprintln!(
@@ -3657,7 +3657,7 @@ impl ConcurrentEngine {
             for (field_name, missing) in &value_load_tasks {
                 let t0 = std::time::Instant::now();
                 let loaded = lazy_filter_store.load_field_values(field_name, missing)
-                    .map_err(|e| crate::error::BitdexError::DocStore(format!("lazy load values: {e}")))?;
+                    .map_err(|e| crate::error::BitdexError::Storage(format!("lazy load values: {e}")))?;
                 if !loaded.is_empty() {
                     let count = loaded.len();
                     eprintln!(
@@ -6047,7 +6047,7 @@ impl ConcurrentEngine {
         let cursor_snapshot = self.cursors.lock().clone();
         for (name, value) in &cursor_snapshot {
             meta_s.write_cursor(name, value)
-                .map_err(|e| crate::error::BitdexError::DocStore(format!("write cursor: {e}")))?;
+                .map_err(|e| crate::error::BitdexError::Storage(format!("write cursor: {e}")))?;
         }
 
         // Save LowCardinalityString dictionaries alongside bitmaps.
@@ -6068,15 +6068,15 @@ impl ConcurrentEngine {
         let ss_root = path.join("shardstore");
         let alive_s = crate::shard_store_bitmap::AliveBitmapStore::new(
             ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
-        ).map_err(|e| BitdexError::DocStore(format!("alive store init: {e}")))?;
+        ).map_err(|e| BitdexError::Storage(format!("alive store init: {e}")))?;
         let filter_s = crate::shard_store_bitmap::FilterBitmapStore::new(
             ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
-        ).map_err(|e| BitdexError::DocStore(format!("filter store init: {e}")))?;
+        ).map_err(|e| BitdexError::Storage(format!("filter store init: {e}")))?;
         let sort_s = crate::shard_store_bitmap::SortBitmapStore::new(
             ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
-        ).map_err(|e| BitdexError::DocStore(format!("sort store init: {e}")))?;
+        ).map_err(|e| BitdexError::Storage(format!("sort store init: {e}")))?;
         let meta_s = crate::shard_store_meta::MetaStore::new(ss_root)
-            .map_err(|e| BitdexError::DocStore(format!("meta store init: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("meta store init: {e}")))?;
 
         let skip_sorts = self.pending_sort_loads.lock().clone();
         let skip_filters = self.pending_filter_loads.lock().clone();
@@ -6136,12 +6136,12 @@ impl ConcurrentEngine {
         // Write alive bitmap + slot counter + deferred map first (critical metadata).
         let alive_cow = snap.slots.alive_fused_cow();
         alive_store.write_alive(&alive_cow)
-            .map_err(|e| crate::error::BitdexError::DocStore(format!("write alive: {e}")))?;
+            .map_err(|e| crate::error::BitdexError::Storage(format!("write alive: {e}")))?;
         meta_store.write_slot_counter(snap.slots.slot_counter())
-            .map_err(|e| crate::error::BitdexError::DocStore(format!("write slot_counter: {e}")))?;
+            .map_err(|e| crate::error::BitdexError::Storage(format!("write slot_counter: {e}")))?;
         if snap.slots.deferred_count() > 0 {
             meta_store.write_deferred_alive(snap.slots.deferred_map())
-                .map_err(|e| crate::error::BitdexError::DocStore(format!("write deferred: {e}")))?;
+                .map_err(|e| crate::error::BitdexError::Storage(format!("write deferred: {e}")))?;
         }
 
         // Sort fields — one at a time, zero-copy via fused_cow.
@@ -6155,7 +6155,7 @@ impl ConcurrentEngine {
                 let layer_refs: Vec<&RoaringBitmap> =
                     fused_layers.iter().map(|c| c.as_ref()).collect();
                 sort_store.write_sort_layers(&sc.name, &layer_refs)
-                    .map_err(|e| crate::error::BitdexError::DocStore(format!("write sort {}: {e}", sc.name)))?;
+                    .map_err(|e| crate::error::BitdexError::Storage(format!("write sort {}: {e}", sc.name)))?;
                 eprintln!("  save: sort {} in {:.1}ms",
                     sc.name, t0.elapsed().as_secs_f64() * 1000.0);
             }
@@ -6205,7 +6205,7 @@ impl ConcurrentEngine {
                         .map(|(v, bm)| (*v, bm))
                         .collect();
                     filter_store.write_filter_bucket(name, bucket, &refs)
-                        .map_err(|e| crate::error::BitdexError::DocStore(format!("write filter {name}/{bucket:02x}: {e}")))?;
+                        .map_err(|e| crate::error::BitdexError::Storage(format!("write filter {name}/{bucket:02x}: {e}")))?;
                 }
             } else {
                 // Non-lazy fields: write in-memory state directly (fully loaded)
@@ -6215,7 +6215,7 @@ impl ConcurrentEngine {
                         .map(|(v, c)| (*v, c.as_ref()))
                         .collect();
                     filter_store.write_filter_bucket(name, bucket, &refs)
-                        .map_err(|e| crate::error::BitdexError::DocStore(format!("write filter {name}/{bucket:02x}: {e}")))?;
+                        .map_err(|e| crate::error::BitdexError::Storage(format!("write filter {name}/{bucket:02x}: {e}")))?;
                 }
             }
             eprintln!("  save: filter {} ({} values, {} buckets{}) in {:.1}ms",
@@ -6391,11 +6391,11 @@ impl ConcurrentEngine {
             _ => return Ok(None),
         };
         let gen_alive = alive_s.pin_generation()
-            .map_err(|e| crate::error::BitdexError::DocStore(format!("pin alive gen: {e}")))?;
+            .map_err(|e| crate::error::BitdexError::Storage(format!("pin alive gen: {e}")))?;
         let gen_filter = filter_s.pin_generation()
-            .map_err(|e| crate::error::BitdexError::DocStore(format!("pin filter gen: {e}")))?;
+            .map_err(|e| crate::error::BitdexError::Storage(format!("pin filter gen: {e}")))?;
         let gen_sort = sort_s.pin_generation()
-            .map_err(|e| crate::error::BitdexError::DocStore(format!("pin sort gen: {e}")))?;
+            .map_err(|e| crate::error::BitdexError::Storage(format!("pin sort gen: {e}")))?;
         eprintln!("Pinned shard generations: alive={gen_alive}, filter={gen_filter}, sort={gen_sort}");
         Ok(Some(gen_alive))
     }
@@ -6864,7 +6864,7 @@ impl ConcurrentEngine {
         // Open a read-only DocStore for parallel reads
         let ds_path = self.docstore_root.as_ref().clone();
         let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::DocStore(
+            .map_err(|e| crate::error::BitdexError::Storage(
                 format!("open reader docstore: {e}")))?;
 
         // Build u16 field dictionary → field position lookup tables
@@ -7174,7 +7174,7 @@ impl ConcurrentEngine {
         // Open a second read-only DocStore (no mutex) for parallel reads.
         let ds_path = self.docstore_root.as_ref().clone();
         let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::DocStore(
+            .map_err(|e| crate::error::BitdexError::Storage(
                 format!("open reader docstore: {e}")))?;
 
         let max_slot = alive.max().unwrap_or(0);
@@ -7415,7 +7415,7 @@ impl ConcurrentEngine {
         // Open read-only docstore for parallel reads
         let ds_path = self.docstore_root.as_ref().clone();
         let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::DocStore(
+            .map_err(|e| crate::error::BitdexError::Storage(
                 format!("open reader docstore: {e}")))?;
 
         let max_slot = alive.max().unwrap_or(0);
@@ -7572,7 +7572,7 @@ impl ConcurrentEngine {
     pub fn validate_fields_in_docstore(&self, field_names: &[&str]) -> Result<Vec<String>> {
         let ds_path = self.docstore_root.as_ref().clone();
         let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::DocStore(
+            .map_err(|e| crate::error::BitdexError::Storage(
                 format!("open reader docstore: {e}")))?;
 
         // Find a non-empty shard to sample
@@ -7584,7 +7584,7 @@ impl ConcurrentEngine {
         let sample_shard = sample_slot >> 9;
 
         let docs = reader.get_shard(sample_shard)
-            .map_err(|e| crate::error::BitdexError::DocStore(
+            .map_err(|e| crate::error::BitdexError::Storage(
                 format!("read sample shard {}: {e}", sample_shard)))?;
 
         if docs.is_empty() {

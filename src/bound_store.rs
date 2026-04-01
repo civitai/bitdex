@@ -116,7 +116,7 @@ impl BoundStore {
     /// Creates the directory if it doesn't exist.
     pub fn new(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root)
-            .map_err(|e| BitdexError::DocStore(format!("create bounds dir: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("create bounds dir: {e}")))?;
         Ok(Self { root: root.to_path_buf() })
     }
 
@@ -131,19 +131,19 @@ impl BoundStore {
         let tmp_path = path.with_extension("tmp");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| BitdexError::DocStore(format!("create dir: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("create dir: {e}")))?;
         }
         std::fs::write(&tmp_path, data)
-            .map_err(|e| BitdexError::DocStore(format!("write tmp: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("write tmp: {e}")))?;
         // fsync
         std::fs::OpenOptions::new()
             .write(true)
             .open(&tmp_path)
-            .map_err(|e| BitdexError::DocStore(format!("open tmp for fsync: {e}")))?
+            .map_err(|e| BitdexError::Storage(format!("open tmp for fsync: {e}")))?
             .sync_all()
-            .map_err(|e| BitdexError::DocStore(format!("fsync tmp: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("fsync tmp: {e}")))?;
         std::fs::rename(&tmp_path, path)
-            .map_err(|e| BitdexError::DocStore(format!("rename: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("rename: {e}")))?;
         Ok(())
     }
 
@@ -174,7 +174,7 @@ impl BoundStore {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(BitdexError::DocStore(format!("read meta.bin: {e}"))),
+            Err(e) => Err(BitdexError::Storage(format!("read meta.bin: {e}"))),
         }
     }
 
@@ -206,7 +206,7 @@ impl BoundStore {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(BitdexError::DocStore(format!("read shard {}: {e}", key.filename()))),
+            Err(e) => Err(BitdexError::Storage(format!("read shard {}: {e}", key.filename()))),
         }
     }
 
@@ -216,11 +216,11 @@ impl BoundStore {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(shards),
-            Err(e) => return Err(BitdexError::DocStore(format!("read bounds dir: {e}"))),
+            Err(e) => return Err(BitdexError::Storage(format!("read bounds dir: {e}"))),
         };
 
         for entry in entries {
-            let entry = entry.map_err(|e| BitdexError::DocStore(format!("read dir entry: {e}")))?;
+            let entry = entry.map_err(|e| BitdexError::Storage(format!("read dir entry: {e}")))?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some(key) = parse_shard_filename(&name) {
@@ -235,7 +235,7 @@ impl BoundStore {
         let meta = self.meta_path();
         if meta.exists() {
             std::fs::remove_file(&meta)
-                .map_err(|e| BitdexError::DocStore(format!("delete meta.bin: {e}")))?;
+                .map_err(|e| BitdexError::Storage(format!("delete meta.bin: {e}")))?;
         }
 
         if let Ok(entries) = std::fs::read_dir(&self.root) {
@@ -255,7 +255,7 @@ impl BoundStore {
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(BitdexError::DocStore(format!("delete shard {}: {e}", key.filename()))),
+            Err(e) => Err(BitdexError::Storage(format!("delete shard {}: {e}", key.filename()))),
         }
     }
 }
@@ -287,7 +287,7 @@ fn serialize_meta(meta: &MetaFile) -> Result<Vec<u8>> {
 
         // Key (msgpack-serialized filter clauses)
         let key_bytes = rmp_serde::to_vec(&entry.filter_clauses)
-            .map_err(|e| BitdexError::DocStore(format!("serialize filter clauses: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("serialize filter clauses: {e}")))?;
         buf.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&key_bytes);
 
@@ -303,7 +303,7 @@ fn serialize_meta(meta: &MetaFile) -> Result<Vec<u8>> {
     let mut tombstone_buf = Vec::with_capacity(meta.tombstones.serialized_size());
     meta.tombstones
         .serialize_into(&mut tombstone_buf)
-        .map_err(|e| BitdexError::DocStore(format!("serialize tombstones: {e}")))?;
+        .map_err(|e| BitdexError::Storage(format!("serialize tombstones: {e}")))?;
     buf.extend_from_slice(&(tombstone_buf.len() as u32).to_le_bytes());
     buf.extend_from_slice(&tombstone_buf);
 
@@ -318,7 +318,7 @@ fn deserialize_meta(data: &[u8]) -> Result<MetaFile> {
 
     let version = read_u32(data, &mut pos)?;
     if version != META_VERSION {
-        return Err(BitdexError::DocStore(format!("unsupported meta version: {version}")));
+        return Err(BitdexError::Storage(format!("unsupported meta version: {version}")));
     }
 
     let num_entries = read_u32(data, &mut pos)? as usize;
@@ -330,31 +330,31 @@ fn deserialize_meta(data: &[u8]) -> Result<MetaFile> {
         // Sort field
         let sf_len = read_u16(data, &mut pos)? as usize;
         if pos + sf_len > data.len() {
-            return Err(BitdexError::DocStore("meta entry truncated (sort_field)".into()));
+            return Err(BitdexError::Storage("meta entry truncated (sort_field)".into()));
         }
         let sort_field = std::str::from_utf8(&data[pos..pos + sf_len])
-            .map_err(|e| BitdexError::DocStore(format!("invalid sort_field UTF-8: {e}")))?
+            .map_err(|e| BitdexError::Storage(format!("invalid sort_field UTF-8: {e}")))?
             .to_string();
         pos += sf_len;
 
         // Direction
         if pos >= data.len() {
-            return Err(BitdexError::DocStore("meta entry truncated (direction)".into()));
+            return Err(BitdexError::Storage("meta entry truncated (direction)".into()));
         }
         let direction = match data[pos] {
             0 => SortDirection::Desc,
             1 => SortDirection::Asc,
-            d => return Err(BitdexError::DocStore(format!("invalid direction byte: {d}"))),
+            d => return Err(BitdexError::Storage(format!("invalid direction byte: {d}"))),
         };
         pos += 1;
 
         // Key
         let key_len = read_u32(data, &mut pos)? as usize;
         if pos + key_len > data.len() {
-            return Err(BitdexError::DocStore("meta entry truncated (key)".into()));
+            return Err(BitdexError::Storage("meta entry truncated (key)".into()));
         }
         let filter_clauses: Vec<CanonicalClause> = rmp_serde::from_slice(&data[pos..pos + key_len])
-            .map_err(|e| BitdexError::DocStore(format!("deserialize filter clauses: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("deserialize filter clauses: {e}")))?;
         pos += key_len;
 
         // Metadata
@@ -364,7 +364,7 @@ fn deserialize_meta(data: &[u8]) -> Result<MetaFile> {
         let total_matched = read_u64(data, &mut pos)?;
 
         if pos >= data.len() {
-            return Err(BitdexError::DocStore("meta entry truncated (has_more)".into()));
+            return Err(BitdexError::Storage("meta entry truncated (has_more)".into()));
         }
         let has_more = data[pos] != 0;
         pos += 1;
@@ -385,10 +385,10 @@ fn deserialize_meta(data: &[u8]) -> Result<MetaFile> {
     // Tombstone bitmap
     let tombstone_len = read_u32(data, &mut pos)? as usize;
     if pos + tombstone_len > data.len() {
-        return Err(BitdexError::DocStore("meta truncated (tombstone bitmap)".into()));
+        return Err(BitdexError::Storage("meta truncated (tombstone bitmap)".into()));
     }
     let tombstones = RoaringBitmap::deserialize_from(&data[pos..pos + tombstone_len])
-        .map_err(|e| BitdexError::DocStore(format!("deserialize tombstones: {e}")))?;
+        .map_err(|e| BitdexError::Storage(format!("deserialize tombstones: {e}")))?;
     pos += tombstone_len;
 
     // Next entry ID
@@ -429,13 +429,13 @@ fn serialize_shard(entries: &[ShardEntry]) -> Result<Vec<u8>> {
 
     for entry in entries {
         let key_bytes = rmp_serde::to_vec(&entry.filter_clauses)
-            .map_err(|e| BitdexError::DocStore(format!("serialize shard key: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("serialize shard key: {e}")))?;
         keys.push(key_bytes);
 
         let mut bm_buf = Vec::with_capacity(entry.bitmap.serialized_size());
         entry.bitmap
             .serialize_into(&mut bm_buf)
-            .map_err(|e| BitdexError::DocStore(format!("serialize shard bitmap: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("serialize shard bitmap: {e}")))?;
         bitmaps.push(bm_buf);
 
         // Serialize sorted_keys as raw u64 LE bytes
@@ -504,7 +504,7 @@ fn deserialize_shard(data: &[u8]) -> Result<Vec<ShardEntry>> {
 
     let version = read_u32(data, &mut pos)?;
     if version != 1 && version != SHARD_VERSION {
-        return Err(BitdexError::DocStore(format!("unsupported shard version: {version}")));
+        return Err(BitdexError::Storage(format!("unsupported shard version: {version}")));
     }
 
     let is_v2 = version >= 2;
@@ -513,7 +513,7 @@ fn deserialize_shard(data: &[u8]) -> Result<Vec<ShardEntry>> {
     let num_entries = read_u32(data, &mut pos)? as usize;
     let index_size = num_entries * index_entry_size;
     if pos + index_size > data.len() {
-        return Err(BitdexError::DocStore("shard index truncated".into()));
+        return Err(BitdexError::Storage("shard index truncated".into()));
     }
 
     // Parse index
@@ -563,30 +563,30 @@ fn deserialize_shard(data: &[u8]) -> Result<Vec<ShardEntry>> {
         let ks = key_section_start + ie.key_offset as usize;
         let ke = ks + ie.key_length as usize;
         if ke > data.len() {
-            return Err(BitdexError::DocStore("shard key data truncated".into()));
+            return Err(BitdexError::Storage("shard key data truncated".into()));
         }
         let filter_clauses: Vec<CanonicalClause> = rmp_serde::from_slice(&data[ks..ke])
-            .map_err(|e| BitdexError::DocStore(format!("deserialize shard key: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("deserialize shard key: {e}")))?;
 
         // Deserialize bitmap
         let bs = bitmap_section_start + ie.bitmap_offset as usize;
         let be = bs + ie.bitmap_length as usize;
         if be > data.len() {
-            return Err(BitdexError::DocStore("shard bitmap data truncated".into()));
+            return Err(BitdexError::Storage("shard bitmap data truncated".into()));
         }
         let bitmap = RoaringBitmap::deserialize_from(&data[bs..be])
-            .map_err(|e| BitdexError::DocStore(format!("deserialize shard bitmap: {e}")))?;
+            .map_err(|e| BitdexError::Storage(format!("deserialize shard bitmap: {e}")))?;
 
         // Deserialize sorted_keys (v2 only)
         let sorted_keys = if ie.sorted_keys_length > 0 {
             let sks = sorted_keys_section_start + ie.sorted_keys_offset as usize;
             let ske = sks + ie.sorted_keys_length as usize;
             if ske > data.len() {
-                return Err(BitdexError::DocStore("shard sorted_keys data truncated".into()));
+                return Err(BitdexError::Storage("shard sorted_keys data truncated".into()));
             }
             let sk_data = &data[sks..ske];
             if sk_data.len() % 8 != 0 {
-                return Err(BitdexError::DocStore("sorted_keys length not aligned to u64".into()));
+                return Err(BitdexError::Storage("sorted_keys length not aligned to u64".into()));
             }
             let mut keys = Vec::with_capacity(sk_data.len() / 8);
             let mut sk_pos = 0;
@@ -632,7 +632,7 @@ fn parse_shard_filename(name: &str) -> Option<ShardKey> {
 
 fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16> {
     if *pos + 2 > data.len() {
-        return Err(BitdexError::DocStore("unexpected EOF reading u16".into()));
+        return Err(BitdexError::Storage("unexpected EOF reading u16".into()));
     }
     let val = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
     *pos += 2;
@@ -641,7 +641,7 @@ fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16> {
 
 fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
     if *pos + 4 > data.len() {
-        return Err(BitdexError::DocStore("unexpected EOF reading u32".into()));
+        return Err(BitdexError::Storage("unexpected EOF reading u32".into()));
     }
     let val = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
     *pos += 4;
@@ -650,7 +650,7 @@ fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32> {
 
 fn read_u64(data: &[u8], pos: &mut usize) -> Result<u64> {
     if *pos + 8 > data.len() {
-        return Err(BitdexError::DocStore("unexpected EOF reading u64".into()));
+        return Err(BitdexError::Storage("unexpected EOF reading u64".into()));
     }
     let val = u64::from_le_bytes([
         data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3],
