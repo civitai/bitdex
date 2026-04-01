@@ -533,6 +533,18 @@ where
         Ok(Some(header.ops_count))
     }
 
+    /// Read only the 28-byte header from a shard file path. Returns None if file not found.
+    fn read_header_at(path: &Path) -> io::Result<Option<ShardHeader>> {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut header_buf = [0u8; HEADER_SIZE];
+        file.read_exact(&mut header_buf)?;
+        Ok(Some(ShardHeader::decode(&header_buf)?))
+    }
+
     // -----------------------------------------------------------------------
     // Write path
     // -----------------------------------------------------------------------
@@ -663,17 +675,16 @@ where
     ///
     /// Returns `true` if compaction was performed, `false` if skipped.
     pub fn compact_shard_bounded(&self, key: &Sh::Key, target_gen: u64, max_read_gen: u64) -> io::Result<bool> {
-        // Fast-path: if target_gen shard is already clean and no older gens have data, skip
+        // Fast-path: read only the 28-byte header (not the full file) to check if
+        // the shard in target_gen is already a clean snapshot with no older gen data.
         let target_path = self.shard_path_in_gen(key, target_gen);
-        if let Ok(Some(0)) = self.ops_count_in_gen(key, target_gen) {
-            if let Ok((header, _, _)) = read_shard_file_raw(&target_path) {
-                if header.snapshot_len > 0 && header.ops_count == 0 {
-                    let has_older_data = (0..target_gen).any(|g| {
-                        self.shard_path_in_gen(key, g).exists()
-                    });
-                    if !has_older_data {
-                        return Ok(false);
-                    }
+        if let Some(header) = Self::read_header_at(&target_path)? {
+            if header.snapshot_len > 0 && header.ops_count == 0 {
+                let has_older_data = (0..target_gen).any(|g| {
+                    self.shard_path_in_gen(key, g).exists()
+                });
+                if !has_older_data {
+                    return Ok(false);
                 }
             }
         }

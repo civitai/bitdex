@@ -146,16 +146,16 @@ impl TaskRegistry {
     /// Exclusion rules:
     /// - Mutating tasks (Load, Dump, Rebuild, AddFields, RemoveFields) are exclusive
     ///   with everything — no other task may run concurrently with them.
-    /// - Compact may run concurrently with other Compact tasks but not with mutating tasks.
+    /// - Compact is also exclusive — it modifies on-disk generations and deletes old
+    ///   ones, so concurrent compacts would race on the same shard files.
     pub fn try_start(&self, task_type: TaskType) -> Result<(TaskId, Arc<AtomicU64>), TaskInfo> {
         let mut state = self.state.lock();
 
-        // Check exclusion: new mutating task blocks on anything running; new compact
-        // task blocks on any mutating task running.
-        for active in state.active.values() {
-            if task_type.is_mutating() || active.task_type.is_mutating() {
-                return Err(build_task_info(active));
-            }
+        // All task types are currently exclusive — only one task at a time.
+        // Compact modifies on-disk generations + deletes old ones, so it can't
+        // run concurrently with anything else.
+        if let Some(active) = state.active.values().next() {
+            return Err(build_task_info(active));
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -215,7 +215,8 @@ impl TaskRegistry {
 
     pub fn snapshot(&self) -> TaskSnapshot {
         let state = self.state.lock();
-        let active: Vec<TaskInfo> = state.active.values().map(build_task_info).collect();
+        let mut active: Vec<TaskInfo> = state.active.values().map(build_task_info).collect();
+        active.sort_by_key(|t| t.task_id);
         TaskSnapshot {
             active,
             history: state.history.iter().cloned().collect(),
@@ -3490,6 +3491,17 @@ async fn handle_compact(
     let threshold = req.threshold.unwrap_or(0);
     let workers = req.workers.unwrap_or(4).max(1).min(32);
     let targets = req.targets.unwrap_or_default();
+
+    // Validate target names
+    for t in &targets {
+        if t != "bitmaps" && t != "docs" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid target '{}'. Valid targets: bitmaps, docs", t)})),
+            ).into_response();
+        }
+    }
+
     let compact_bitmaps = targets.is_empty() || targets.iter().any(|t| t == "bitmaps");
     let compact_docs = targets.is_empty() || targets.iter().any(|t| t == "docs");
 
@@ -5834,14 +5846,13 @@ mod tests {
     }
 
     #[test]
-    fn task_registry_two_compacts_run_concurrently() {
+    fn task_registry_two_compacts_are_exclusive() {
         let reg = TaskRegistry::new();
-        let (tid1, _) = reg.try_start(TaskType::Compact).expect("first compact");
-        let (tid2, _) = reg.try_start(TaskType::Compact).expect("second compact should also succeed");
+        let (_tid1, _) = reg.try_start(TaskType::Compact).expect("first compact");
 
-        assert_ne!(tid1, tid2);
-        let snap = reg.snapshot();
-        assert_eq!(snap.active.len(), 2);
+        // Second compact must be rejected — concurrent compacts race on gen deletion
+        let err = reg.try_start(TaskType::Compact).expect_err("second compact should be blocked");
+        assert!(matches!(err.task_type, TaskType::Compact));
     }
 
     #[test]

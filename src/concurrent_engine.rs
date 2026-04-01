@@ -2087,16 +2087,19 @@ impl ConcurrentEngine {
                         }
 
                         // Compact docstore shards that received writes this cycle.
-                        // Uses dirty-shard tracking to avoid scanning all ~209K shards.
+                        // Uses atomic retain(false) to avoid TOCTOU race with writers.
                         {
-                            let dirty: Vec<u32> = merge_dirty_shards.iter().map(|r| *r).collect();
-                            for key in &dirty {
-                                merge_dirty_shards.remove(key);
-                            }
+                            let mut dirty = Vec::new();
+                            merge_dirty_shards.retain(|k| {
+                                dirty.push(*k);
+                                false
+                            });
                             for shard_key in dirty {
                                 if merge_doc_shard_store.needs_compaction(&shard_key).unwrap_or(false) {
                                     if let Err(e) = merge_doc_shard_store.compact_current(&shard_key) {
                                         eprintln!("merge: doc compaction failed for shard {shard_key}: {e}");
+                                        // Re-insert so it gets retried next cycle
+                                        merge_dirty_shards.insert(shard_key);
                                     }
                                 }
                             }
@@ -5988,7 +5991,15 @@ impl ConcurrentEngine {
                 progress.fetch_add(1, Ordering::Relaxed);
 
                 // Filter shards
-                if let Ok(filter_keys) = filter_s.list_all_shards() {
+                let filter_keys = match filter_s.list_all_shards() {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        eprintln!("compact_all: failed to list filter shards: {e}");
+                        any_failed = true;
+                        Vec::new()
+                    }
+                };
+                if !filter_keys.is_empty() {
                     let filter_errors = AtomicU64::new(0);
                     let filter_compacted = AtomicU64::new(0);
                     let filter_skipped = AtomicU64::new(0);
@@ -6020,7 +6031,15 @@ impl ConcurrentEngine {
                 }
 
                 // Sort shards
-                if let Ok(sort_keys) = sort_s.list_all_shards() {
+                let sort_keys = match sort_s.list_all_shards() {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        eprintln!("compact_all: failed to list sort shards: {e}");
+                        any_failed = true;
+                        Vec::new()
+                    }
+                };
+                if !sort_keys.is_empty() {
                     let sort_errors = AtomicU64::new(0);
                     let sort_compacted = AtomicU64::new(0);
                     let sort_skipped = AtomicU64::new(0);
@@ -6053,7 +6072,7 @@ impl ConcurrentEngine {
             }
         }
 
-        if compact_docs {
+        if compact_docs && self.slot_counter() > 0 {
             let doc_store_arc = self.docstore.lock().shard_store_arc();
             let slot_counter = self.slot_counter();
             let max_shard = if slot_counter > 0 {
@@ -6099,15 +6118,15 @@ impl ConcurrentEngine {
 
             if let Some((ref alive_s, ref filter_s, ref sort_s, _)) = self.shard_stores() {
                 for gen in 0..frozen_gen {
-                    alive_s.delete_generation(gen).ok();
-                    filter_s.delete_generation(gen).ok();
-                    sort_s.delete_generation(gen).ok();
+                    if let Err(e) = alive_s.delete_generation(gen) { eprintln!("compact_all: delete alive gen {gen}: {e}"); }
+                    if let Err(e) = filter_s.delete_generation(gen) { eprintln!("compact_all: delete filter gen {gen}: {e}"); }
+                    if let Err(e) = sort_s.delete_generation(gen) { eprintln!("compact_all: delete sort gen {gen}: {e}"); }
                 }
             }
             if compact_docs {
                 let doc_store_arc = self.docstore.lock().shard_store_arc();
                 for gen in 0..frozen_gen {
-                    doc_store_arc.delete_generation(gen).ok();
+                    if let Err(e) = doc_store_arc.delete_generation(gen) { eprintln!("compact_all: delete doc gen {gen}: {e}"); }
                 }
             }
             eprintln!("compact_all: deleted generations 0..{}", frozen_gen - 1);

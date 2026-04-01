@@ -1125,13 +1125,15 @@ impl DocStoreV3 {
         Arc::clone(&self.store)
     }
 
-    /// Drain the set of shard IDs that received writes since last drain.
-    /// Used by merge thread for targeted docstore compaction.
+    /// Atomically drain the set of shard IDs that received writes since last drain.
+    /// Uses retain(false) for atomic collect+remove — avoids TOCTOU race where a
+    /// concurrent writer inserts between our collect and remove.
     pub fn drain_dirty_shards(&self) -> Vec<u32> {
-        let keys: Vec<u32> = self.dirty_shards.iter().map(|r| *r).collect();
-        for key in &keys {
-            self.dirty_shards.remove(key);
-        }
+        let mut keys = Vec::new();
+        self.dirty_shards.retain(|k| {
+            keys.push(*k);
+            false
+        });
         keys
     }
 
