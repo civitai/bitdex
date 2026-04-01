@@ -1656,4 +1656,117 @@ mod tests {
         assert!(store.ops_count(&"nonexistent".to_string()).unwrap().is_none());
         assert!(store.ops_count_in_gen(&"nonexistent".to_string(), 99).unwrap().is_none());
     }
+
+    #[test]
+    fn test_compact_bounded_with_threshold() {
+        let (_dir, store) = temp_store();
+
+        // Write snapshot, add 3 ops
+        let snap = TestSnapshot { values: HashMap::new() };
+        store.write_snapshot(&"doc1".to_string(), &snap).unwrap();
+        for i in 0..3 {
+            store.append_op(&"doc1".to_string(), &TestOp::Set {
+                key: format!("k{i}"), value: format!("v{i}")
+            }).unwrap();
+        }
+
+        // should_compact with threshold 5 → false (3 ops < 5)
+        assert!(!store.should_compact(&"doc1".to_string(), 5).unwrap());
+        // should_compact with threshold 2 → true (3 ops > 2)
+        assert!(store.should_compact(&"doc1".to_string(), 2).unwrap());
+
+        // Compact with threshold check respects bounded read
+        let frozen = store.pin_generation().unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "post_pin".into(), value: "should_not_appear".into()
+        }).unwrap();
+
+        // Compact bounded to frozen gen
+        let did = store.compact_shard_bounded(&"doc1".to_string(), frozen, frozen).unwrap();
+        assert!(did);
+
+        // Verify post-pin op is NOT in the compacted snapshot
+        let bounded = store.read_up_to_generation(&"doc1".to_string(), frozen).unwrap().unwrap();
+        assert!(bounded.values.contains_key("k0"));
+        assert!(!bounded.values.contains_key("post_pin"));
+    }
+
+    #[test]
+    fn test_read_header_at() {
+        let (_dir, store) = temp_store();
+
+        // Non-existent file returns None
+        let path = store.shard_path_in_gen(&"nope".to_string(), 0);
+        assert!(ShardStore::<TestSnapshotCodec, TestOpCodec, FlatShard>::read_header_at(&path).unwrap().is_none());
+
+        // Write a snapshot + 2 ops, verify header
+        let snap = TestSnapshot { values: HashMap::new() };
+        store.write_snapshot(&"doc1".to_string(), &snap).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "a".into(), value: "b".into() }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "c".into(), value: "d".into() }).unwrap();
+
+        let path = store.shard_path_in_gen(&"doc1".to_string(), 0);
+        let header = ShardStore::<TestSnapshotCodec, TestOpCodec, FlatShard>::read_header_at(&path).unwrap().unwrap();
+        assert_eq!(header.ops_count, 2);
+        assert!(header.snapshot_len > 0);
+    }
+
+    #[test]
+    fn test_compact_shard_bounded_with_only_ops_no_snapshot() {
+        let (_dir, store) = temp_store();
+
+        // Write only ops (no snapshot) — shard should still compact
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "a".into(), value: "1".into() }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "b".into(), value: "2".into() }).unwrap();
+
+        let did = store.compact_shard_bounded(&"doc1".to_string(), 0, 0).unwrap();
+        assert!(did);
+
+        // After compaction, should be a clean snapshot with 0 ops
+        let header = store.read_header(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(header.ops_count, 0);
+        assert!(header.snapshot_len > 0);
+
+        // Data should be preserved
+        let result = store.read(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(result.values.get("a").unwrap(), "1");
+        assert_eq!(result.values.get("b").unwrap(), "2");
+    }
+
+    #[test]
+    fn test_compact_nonexistent_shard_returns_false() {
+        let (_dir, store) = temp_store();
+        let did = store.compact_shard_bounded(&"nope".to_string(), 0, 0).unwrap();
+        assert!(!did);
+    }
+
+    #[test]
+    fn test_delete_generation_tolerates_missing() {
+        let (_dir, store) = temp_store();
+        // Deleting a gen that doesn't exist should not error
+        store.delete_generation(99).unwrap();
+    }
+
+    #[test]
+    fn test_compact_generation_flattens_all_shards() {
+        let (_dir, store) = temp_store();
+
+        // Write different shards
+        store.write_snapshot(&"a".to_string(), &TestSnapshot { values: [("k".into(), "va".into())].into() }).unwrap();
+        store.write_snapshot(&"b".to_string(), &TestSnapshot { values: [("k".into(), "vb".into())].into() }).unwrap();
+
+        // Pin and add ops in gen 1
+        store.pin_generation().unwrap();
+        store.append_op(&"a".to_string(), &TestOp::Set { key: "k".into(), value: "va_updated".into() }).unwrap();
+
+        // Compact generation 1 (flatten gen 0+1)
+        store.compact_generation(1).unwrap();
+
+        // Both shards should be readable and clean in gen 1
+        let a = store.read_up_to_generation(&"a".to_string(), 1).unwrap().unwrap();
+        assert_eq!(a.values.get("k").unwrap(), "va_updated");
+
+        let b = store.read_up_to_generation(&"b".to_string(), 1).unwrap().unwrap();
+        assert_eq!(b.values.get("k").unwrap(), "vb");
+    }
 }

@@ -5962,6 +5962,10 @@ impl ConcurrentEngine {
         let t0 = std::time::Instant::now();
         let mut result = CompactResult::default();
 
+        if !compact_bitmaps && !compact_docs {
+            return Ok(result);
+        }
+
         let frozen_gen = match self.pin_shard_generations()? {
             Some(g) => g,
             None => return Err(crate::error::BitdexError::Storage("No shard stores configured".into())),

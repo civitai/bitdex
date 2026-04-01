@@ -50,12 +50,6 @@ pub enum TaskType {
     Compact,
 }
 
-impl TaskType {
-    /// Returns true for tasks that mutate the engine and must run exclusively.
-    fn is_mutating(&self) -> bool {
-        matches!(self, TaskType::Load | TaskType::Rebuild | TaskType::AddFields | TaskType::RemoveFields | TaskType::Dump)
-    }
-}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -3475,6 +3469,23 @@ async fn handle_compact(
         }
     };
 
+    // Validate request before acquiring task slot (avoid leaking active task on validation failure)
+    let threshold = req.threshold.unwrap_or(0);
+    let workers = req.workers.unwrap_or(4).max(1).min(32);
+    let targets = req.targets.unwrap_or_default();
+
+    for t in &targets {
+        if t != "bitmaps" && t != "docs" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid target '{}'. Valid targets: bitmaps, docs", t)})),
+            ).into_response();
+        }
+    }
+
+    let compact_bitmaps = targets.is_empty() || targets.iter().any(|t| t == "bitmaps");
+    let compact_docs = targets.is_empty() || targets.iter().any(|t| t == "docs");
+
     let (task_id, progress) = match tasks.try_start(TaskType::Compact) {
         Ok(v) => v,
         Err(active_info) => {
@@ -3487,23 +3498,6 @@ async fn handle_compact(
             ).into_response();
         }
     };
-
-    let threshold = req.threshold.unwrap_or(0);
-    let workers = req.workers.unwrap_or(4).max(1).min(32);
-    let targets = req.targets.unwrap_or_default();
-
-    // Validate target names
-    for t in &targets {
-        if t != "bitmaps" && t != "docs" {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid target '{}'. Valid targets: bitmaps, docs", t)})),
-            ).into_response();
-        }
-    }
-
-    let compact_bitmaps = targets.is_empty() || targets.iter().any(|t| t == "bitmaps");
-    let compact_docs = targets.is_empty() || targets.iter().any(|t| t == "docs");
 
     let tasks_clone = Arc::clone(&tasks);
     tokio::task::spawn_blocking(move || {

@@ -2633,4 +2633,54 @@ mod proptests {
             }
         }
     }
+
+    #[test]
+    fn test_dirty_shard_tracking() {
+        let ds = DocStoreV3::open_temp().unwrap();
+
+        // Initially no dirty shards
+        assert!(ds.drain_dirty_shards().is_empty());
+
+        // Insert marks shard dirty
+        let shard_key = SlotHexShard::slot_to_shard(100);
+        ds.store.append_op(&shard_key, &DocOp::Create {
+            slot: 100,
+            fields: vec![(0, PackedValue::I(42))],
+        }).unwrap();
+        ds.dirty_shards.insert(shard_key);
+
+        // Drain returns the dirty shard
+        let dirty = ds.drain_dirty_shards();
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty.contains(&shard_key));
+
+        // After drain, set is empty
+        assert!(ds.drain_dirty_shards().is_empty());
+    }
+
+    #[test]
+    fn test_shard_store_arc_accessible() {
+        let ds = DocStoreV3::open_temp().unwrap();
+        let arc = ds.shard_store_arc();
+
+        // Write through the Arc
+        arc.write_snapshot(&0u32, &DocSnapshot::new()).unwrap();
+
+        // Read through the Arc
+        let snap = arc.read(&0u32).unwrap();
+        assert!(snap.is_some());
+    }
+
+    #[test]
+    fn test_dirty_shards_arc_shared() {
+        let ds = DocStoreV3::open_temp().unwrap();
+        let dirty_arc = ds.dirty_shards_arc();
+
+        // Insert via the Arc
+        dirty_arc.insert(42);
+
+        // Visible through drain
+        let drained = ds.drain_dirty_shards();
+        assert_eq!(drained, vec![42]);
+    }
 }
