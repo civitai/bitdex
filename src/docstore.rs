@@ -140,21 +140,3 @@ pub fn pack_value(v: &Value) -> PackedValue {
     }
 }
 
-/// Convert a PackedValue back to a FieldValue.
-pub fn unpack_field_value(pv: PackedValue) -> FieldValue {
-    match pv {
-        PackedValue::I(i) => FieldValue::Single(Value::Integer(i)),
-        PackedValue::F(f) => FieldValue::Single(Value::Float(f)),
-        PackedValue::B(b) => FieldValue::Single(Value::Bool(b)),
-        PackedValue::S(s) => FieldValue::Single(Value::String(s)),
-        PackedValue::Mi(is) => FieldValue::Multi(is.into_iter().map(Value::Integer).collect()),
-        PackedValue::Mm(pvs) => FieldValue::Multi(
-            pvs.into_iter()
-                .map(|pv| match unpack_field_value(pv) {
-                    FieldValue::Single(v) => v,
-                    _ => Value::Integer(0),
-                })
-                .collect(),
-        ),
-    }
-}
