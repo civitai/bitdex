@@ -175,6 +175,14 @@ cargo run --release --features server --bin bitdex-server -- --port 3001 --data-
 - Correctness first, performance second
 - When in doubt, refer to `docs/_in/prepared-prompt.md` for the authoritative specification
 
+### Rust LSP
+
+Load `/rust-lsp` for all Rust code exploration and refactoring. This is the primary tool for understanding the codebase — use it before grepping, before reading files to trace call chains, before manually renaming across files. It gives you the compiler's understanding of the code.
+
+**Explore:** hover for types/docs, find references, go to definition, list symbols, search workspace symbols. **Refactor:** semantic rename across the workspace, apply code actions (extract function, auto-fix). **Diagnose:** get compiler errors without running `cargo check`. **Script:** chain operations in a single call via the `exec` API with `--file` for complex explorations.
+
+Daemon-backed with per-worktree instances. First call ~60s (indexing); subsequent calls 35-180ms. The workflow: **explore with rust-lsp → edit with Edit tool → verify with rust-lsp diagnostics**.
+
 ### Testing Guide
 
 Run `/testing` for the full guide — change→test mapping, E2E development patterns, and test data directory standards. Run `/microbench` for throwaway performance experiments.
