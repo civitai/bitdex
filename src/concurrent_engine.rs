@@ -10749,4 +10749,198 @@ mod tests {
 
         engine.shutdown();
     }
+
+    // -----------------------------------------------------------------------
+    // DocStoreV3 E2E integration tests
+    // -----------------------------------------------------------------------
+
+    /// E2E: put() writes doc through flush thread → docstore, then get reads it back.
+    #[test]
+    fn test_docstore_v3_put_and_read_back() {
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        engine.put(1, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(5))),
+            ("reactionCount", FieldValue::Single(Value::Integer(42))),
+        ])).unwrap();
+
+        // Wait for flush thread to persist the doc
+        wait_for_flush(&engine, 1, 500);
+
+        // Read the doc back from DocStoreV3
+        let doc = engine.docstore.lock().get(1).unwrap();
+        assert!(doc.is_some(), "doc should be readable after put + flush");
+        let doc = doc.unwrap();
+        assert_eq!(
+            doc.fields.get("nsfwLevel"),
+            Some(&FieldValue::Single(Value::Integer(5))),
+            "nsfwLevel should roundtrip through DocStoreV3"
+        );
+        assert_eq!(
+            doc.fields.get("reactionCount"),
+            Some(&FieldValue::Single(Value::Integer(42))),
+            "reactionCount should roundtrip through DocStoreV3"
+        );
+
+        engine.shutdown();
+    }
+
+    /// E2E: upsert reads old doc from DocStoreV3 for diff, clears stale bits.
+    #[test]
+    fn test_docstore_v3_upsert_reads_old_doc() {
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert doc with nsfwLevel=1
+        engine.put(1, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+            ("reactionCount", FieldValue::Single(Value::Integer(10))),
+        ])).unwrap();
+        wait_for_flush(&engine, 1, 500);
+
+        // Verify nsfwLevel=1 matches
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.ids, vec![1], "nsfwLevel=1 should match before upsert");
+
+        // Upsert with nsfwLevel=3 — this requires reading old doc from DocStoreV3
+        engine.put(1, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(3))),
+            ("reactionCount", FieldValue::Single(Value::Integer(10))),
+        ])).unwrap();
+        wait_for_flush(&engine, 1, 500);
+
+        // Old nsfwLevel=1 bitmap bit should be cleared (clean delete via docstore diff)
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.total_matched, 0, "nsfwLevel=1 should be cleared after upsert to 3");
+
+        // New nsfwLevel=3 should match
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(3))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.ids, vec![1], "nsfwLevel=3 should match after upsert");
+
+        // Verify the stored doc has the new values
+        let doc = engine.docstore.lock().get(1).unwrap().unwrap();
+        assert_eq!(
+            doc.fields.get("nsfwLevel"),
+            Some(&FieldValue::Single(Value::Integer(3))),
+        );
+
+        engine.shutdown();
+    }
+
+    /// E2E: delete reads old doc from DocStoreV3 to clear all bitmap bits.
+    #[test]
+    fn test_docstore_v3_delete_reads_old_doc() {
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        engine.put(1, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
+            ("reactionCount", FieldValue::Single(Value::Integer(99))),
+        ])).unwrap();
+        wait_for_flush(&engine, 1, 500);
+
+        // Doc should exist
+        assert!(engine.docstore.lock().get(1).unwrap().is_some());
+
+        // Delete — this reads old doc from DocStoreV3 to clear filter/sort bits
+        engine.delete(1).unwrap();
+        wait_for_flush(&engine, 0, 500);
+
+        // Bitmap should be clean (no alive, no filter match)
+        let result = engine.query(
+            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(2))],
+            None, 10,
+        ).unwrap();
+        assert_eq!(result.total_matched, 0, "nsfwLevel=2 should be cleared after delete");
+
+        engine.shutdown();
+    }
+
+    /// E2E: bulk loading with ShardStoreBulkWriter writes docs readable by DocStoreV3.
+    #[test]
+    fn test_docstore_v3_bulk_writer_roundtrip() {
+        use crate::docstore::PackedValue;
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut engine = ConcurrentEngine::new_with_path(test_config(), &docs_dir).unwrap();
+
+        // Prepare bulk writer
+        let bulk_writer = engine.prepare_bulk_writer(
+            &["nsfwLevel".to_string(), "reactionCount".to_string()]
+        ).unwrap();
+
+        let nsfw_idx = *bulk_writer.field_to_idx().get("nsfwLevel").unwrap();
+        let react_idx = *bulk_writer.field_to_idx().get("reactionCount").unwrap();
+
+        // Write docs via bulk writer (simulating dump processor)
+        for slot in 0..10u32 {
+            let nsfw_bytes = rmp_serde::to_vec(&PackedValue::I(slot as i64 % 3 + 1)).unwrap();
+            let react_bytes = rmp_serde::to_vec(&PackedValue::I(slot as i64 * 100)).unwrap();
+            bulk_writer.append_tuple_raw(slot, nsfw_idx, &nsfw_bytes);
+            bulk_writer.append_tuple_raw(slot, react_idx, &react_bytes);
+        }
+
+        // Flush to ShardStore
+        bulk_writer.flush_v2_writers();
+
+        // Read docs back via DocStoreV3
+        for slot in 0..10u32 {
+            let doc = engine.docstore.lock().get(slot).unwrap();
+            assert!(doc.is_some(), "slot {} should have a doc after bulk write", slot);
+            let doc = doc.unwrap();
+            let nsfw = doc.fields.get("nsfwLevel");
+            assert!(nsfw.is_some(), "slot {} should have nsfwLevel field", slot);
+            match nsfw.unwrap() {
+                FieldValue::Single(Value::Integer(v)) => {
+                    assert_eq!(*v, slot as i64 % 3 + 1, "nsfwLevel mismatch for slot {}", slot);
+                }
+                other => panic!("slot {}: expected Integer, got {:?}", slot, other),
+            }
+        }
+
+        engine.shutdown();
+    }
+
+    /// E2E: DocWriter (ops processor path) writes tuples readable by DocStoreV3.
+    #[cfg(feature = "pg-sync")]
+    #[test]
+    fn test_docstore_v3_doc_writer_roundtrip() {
+        use crate::shard_store_doc::DocStoreV3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        store.ensure_field_index("sortAt").unwrap();
+        store.ensure_field_index("nsfwLevel").unwrap();
+        store.ensure_field_index("tagIds").unwrap();
+
+        let store = Arc::new(parking_lot::Mutex::new(store));
+        let mut dw = crate::ops_processor::DocWriter::new(Arc::clone(&store));
+
+        // Write scalar fields via DocWriter (simulating WAL ops processor)
+        dw.write_set(100, "sortAt", &serde_json::json!(1711900000));
+        dw.write_set(100, "nsfwLevel", &serde_json::json!(5));
+        dw.flush();
+
+        // Read back and verify
+        let doc = store.lock().get(100).unwrap();
+        assert!(doc.is_some(), "doc should exist after DocWriter writes");
+        let doc = doc.unwrap();
+        assert_eq!(
+            doc.fields.get("sortAt"),
+            Some(&FieldValue::Single(Value::Integer(1711900000))),
+        );
+        assert_eq!(
+            doc.fields.get("nsfwLevel"),
+            Some(&FieldValue::Single(Value::Integer(5))),
+        );
+    }
 }
