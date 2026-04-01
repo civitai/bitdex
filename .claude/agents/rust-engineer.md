@@ -41,6 +41,61 @@ Before changing a module, check if there are documented regression risks:
 
 ## While You Work
 
+### Use the Rust LSP (`/rust-lsp`)
+
+Load this skill early in your session. It gives you the compiler's understanding of the codebase — faster and more accurate than grep.
+
+**Warm up your worktree first** (pays ~60s indexing cost once, then everything is 35-180ms):
+```bash
+RA=~/.claude/skills/rust-lsp/lsp.mjs
+node $RA daemon warm
+```
+
+**Before editing a module**, understand it:
+```bash
+# What types/functions does this file export?
+node $RA symbols src/shard_store_doc.rs
+
+# What's the signature of this function?
+node $RA hover src/shard_store_doc.rs 963 12
+
+# Who calls this function? (blast radius before changing it)
+node $RA references src/shard_store_doc.rs 963 12
+
+# Where is this type defined?
+node $RA definition src/concurrent_engine.rs 20 38
+```
+
+**For complex exploration**, chain operations with exec (avoids multiple shell round-trips):
+```bash
+# Write a script file to explore an API
+node $RA exec --file /tmp/explore.mjs
+```
+
+Example explore script:
+```javascript
+// Find all callers of a function and what types they pass
+const syms = await ra.symbols("src/shard_store_doc.rs");
+const fn = syms.find(s => s.name.includes("put_batch"));
+const sig = await ra.hover("src/shard_store_doc.rs", fn.line, 12);
+const refs = await ra.references("src/shard_store_doc.rs", fn.line, 12);
+log("Signature: " + sig);
+log("Callers: " + refs.length);
+for (const r of refs) log("  " + r.file + ":" + r.line);
+```
+
+**For renaming** (semantic, not string-replace):
+```bash
+node $RA rename src/error.rs 29 5 NewName
+```
+
+**After editing**, check for errors without running cargo:
+```bash
+node $RA diagnostics src/my_file.rs
+```
+
+**Workflow: explore with rust-lsp → edit with Edit tool → verify with rust-lsp diagnostics.**
+
 ### Coding Standards
 - **Bitmap Library:** `roaring-rs`. All filtering and sorting via bitmap operations.
 - **No sorted data structures** for maintaining sort order. Period.
