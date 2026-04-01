@@ -1201,15 +1201,20 @@ impl ShardStoreBulkWriter {
             if let Some(entry) = self.shard_buffers.get(&shard_key) {
                 let mutex = entry.value().clone();
                 drop(entry); // Drop DashMap ref before locking inner Mutex
-                let shard = mutex.lock();
+                let mut shard = mutex.lock();
                 if shard.is_empty() {
                     continue;
                 }
+                // Take ownership of buffered data and clear the buffer so repeated
+                // flushes don't rewrite the same data.
+                let shard_data = std::mem::take(&mut *shard);
+                drop(shard); // Release lock before disk I/O
+
                 // Read existing shard state and merge new docs into it.
                 // Per-slot merge: existing fields are preserved, buffered fields
                 // override by field_idx (last-write-wins), duplicates deduplicated.
                 let mut snapshot = store.read(&shard_key)?.unwrap_or_else(DocSnapshot::new);
-                for (&slot, buffered_fields) in shard.iter() {
+                for (&slot, buffered_fields) in &shard_data {
                     let doc = snapshot.docs.entry(slot).or_default();
                     for (field_idx, value) in buffered_fields {
                         if let Some(existing) = doc.iter_mut().find(|(f, _)| *f == *field_idx) {
