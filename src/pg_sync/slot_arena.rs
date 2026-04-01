@@ -53,7 +53,7 @@ use std::sync::Mutex;
 use memmap2::MmapMut;
 use roaring::RoaringBitmap;
 
-use crate::docstore::BulkWriter;
+use crate::shard_store_doc::ShardStoreBulkWriter as BulkWriter;
 use crate::config::DataSchema;
 use crate::error::Result;
 

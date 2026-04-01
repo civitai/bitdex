@@ -22,7 +22,8 @@ use serde_json::Value as JsonValue;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
-use crate::docstore::{DocStore, PackedValue};
+use crate::docstore::PackedValue;
+use crate::shard_store_doc::DocStoreV3;
 use crate::filter::FilterFieldType;
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
@@ -42,14 +43,14 @@ use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 /// is safe because no concurrent writer can modify the same slot's doc between
 /// the read and write within a single WAL batch cycle.
 pub struct DocWriter {
-    docstore: Arc<parking_lot::Mutex<DocStore>>,
+    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
     field_dict: HashMap<String, u16>,
     pending: Vec<(u32, u16, Vec<u8>)>,
 }
 
 impl DocWriter {
     /// Create a DocWriter from the engine's docstore.
-    pub fn new(docstore: Arc<parking_lot::Mutex<DocStore>>) -> Self {
+    pub fn new(docstore: Arc<parking_lot::Mutex<DocStoreV3>>) -> Self {
         let field_dict = docstore.lock().field_dict_snapshot();
         Self {
             docstore,
@@ -1869,11 +1870,12 @@ mod tests {
 
     #[test]
     fn test_doc_writer_write_set() {
-        use crate::docstore::{DocStore, PackedValue};
+        use crate::docstore::PackedValue;
+        use crate::shard_store_doc::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
-        let mut store = DocStore::open(&docs_dir).unwrap();
+        let mut store = DocStoreV3::open(&docs_dir).unwrap();
         store.ensure_field_index("nsfwLevel").unwrap();
         store.ensure_field_index("userId").unwrap();
 
@@ -1884,10 +1886,7 @@ mod tests {
         dw.write_set(10, "userId", &json!(42));
         dw.flush();
 
-        // Close writers
-        store.lock().v2_writers_handle().clear();
-
-        let doc = store.lock().get_v2(10).unwrap().unwrap();
+        let doc = store.lock().get(10).unwrap().unwrap();
         match &doc.fields["nsfwLevel"] {
             crate::mutation::FieldValue::Single(crate::query::Value::Integer(16)) => {}
             other => panic!("expected nsfwLevel=16, got: {:?}", other),
@@ -1900,22 +1899,22 @@ mod tests {
 
     #[test]
     fn test_doc_writer_write_add_remove() {
-        use crate::docstore::{DocStore, PackedValue};
+        use crate::docstore::PackedValue;
+        use crate::shard_store_doc::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
-        let mut store = DocStore::open(&docs_dir).unwrap();
+        let mut store = DocStoreV3::open(&docs_dir).unwrap();
         store.ensure_field_index("tagIds").unwrap();
 
         let store = Arc::new(parking_lot::Mutex::new(store));
 
         // First write an initial value
         {
-            let mut dw = DocWriter::new(Arc::clone(&store));
+            let _dw = DocWriter::new(Arc::clone(&store));
             let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100, 200])).unwrap();
             let idx = store.lock().field_index("tagIds").unwrap();
             store.lock().append_tuple(5, idx, &initial).unwrap();
-            store.lock().v2_writers_handle().clear();
         }
 
         // Add a value
@@ -1923,10 +1922,9 @@ mod tests {
             let mut dw = DocWriter::new(Arc::clone(&store));
             dw.write_add(5, "tagIds", &json!(300));
             dw.flush();
-            store.lock().v2_writers_handle().clear();
         }
 
-        let doc = store.lock().get_v2(5).unwrap().unwrap();
+        let doc = store.lock().get(5).unwrap().unwrap();
         match &doc.fields["tagIds"] {
             crate::mutation::FieldValue::Multi(vals) => {
                 let ints: Vec<i64> = vals.iter().filter_map(|v| {
@@ -1944,10 +1942,9 @@ mod tests {
             let mut dw = DocWriter::new(Arc::clone(&store));
             dw.write_remove(5, "tagIds", &json!(200));
             dw.flush();
-            store.lock().v2_writers_handle().clear();
         }
 
-        let doc = store.lock().get_v2(5).unwrap().unwrap();
+        let doc = store.lock().get(5).unwrap().unwrap();
         match &doc.fields["tagIds"] {
             crate::mutation::FieldValue::Multi(vals) => {
                 let ints: Vec<i64> = vals.iter().filter_map(|v| {

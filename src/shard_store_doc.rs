@@ -855,6 +855,11 @@ impl DocStoreV3 {
         Ok(snap.docs.into_iter().collect())
     }
 
+    /// Store a single document.
+    pub fn put(&mut self, id: u32, doc: &StoredDoc) -> io::Result<()> {
+        self.put_batch(&[(id, doc.clone())])
+    }
+
     /// Store multiple documents. Converts to ShardStore Create ops.
     pub fn put_batch(&mut self, docs: &[(u32, StoredDoc)]) -> io::Result<()> {
         if docs.is_empty() {

@@ -418,7 +418,7 @@ const FINALIZE_CHUNK_SIZE: u32 = 65_536;
 /// Processes alive slots in 65K-block chunks aligned to roaring container
 /// boundaries for efficient `bitmap.range()` iteration.
 fn finalize_from_bitmaps(
-    bulk_writer: &crate::docstore::BulkWriter,
+    bulk_writer: &crate::shard_store_doc::ShardStoreBulkWriter,
     schema: &crate::config::DataSchema,
     alive: &RoaringBitmap,
     image_scalars: &HashMap<u32, ImageScalars>,

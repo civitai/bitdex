@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
-use crate::docstore::{BulkWriter, PackedValue};
+use crate::docstore::PackedValue;
+use crate::shard_store_doc::ShardStoreBulkWriter;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
 use crate::dump_expression::ExprValue as NateExprValue;
@@ -1142,7 +1143,7 @@ impl ShardPreCreator {
                     // Create docstore shard files up to target (no create_dir_all per file)
                     while created_up_to < target_shard {
                         created_up_to += 1;
-                        let path = crate::docstore::DocStore::shard_path(&docstore_root, created_up_to);
+                        let path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, created_up_to);
                         if let Ok(f) = std::fs::OpenOptions::new()
                             .create(true)
                             .append(true)
@@ -1184,7 +1185,7 @@ impl ShardPreCreator {
                         let final_shard = final_max >> 9;
                         while created_up_to < final_shard {
                             created_up_to += 1;
-                            let path = crate::docstore::DocStore::shard_path(&docstore_root, created_up_to);
+                            let path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, created_up_to);
                             if let Ok(f) = std::fs::OpenOptions::new()
                                 .create(true).append(true).open(&path)
                             {
@@ -2408,7 +2409,7 @@ fn process_multi_value_phase(
     delimiter: u8,
     col_index: &Arc<HashMap<String, usize>>,
     filter_expr: &Option<FilterExpression>,
-    bulk_writer: &Arc<BulkWriter>,
+    bulk_writer: &Arc<ShardStoreBulkWriter>,
     progress_counter: &Option<Arc<AtomicU64>>,
     slot_watermark: Option<&Arc<AtomicU64>>,
     shutdown: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -2765,7 +2766,7 @@ fn write_docstore_row_indexed(
     col_idx: &HashMap<String, usize>,
     slot: u32,
     request_fields: &[DumpFieldMapping],
-    bulk_writer: &Arc<BulkWriter>,
+    bulk_writer: &Arc<ShardStoreBulkWriter>,
     field_idx: &HashMap<String, u16>,
     boolean_fields: &HashSet<String>,
     extra_i64_fields: &[(&str, i64)],
@@ -2899,7 +2900,7 @@ fn write_docstore_row(
     csv_row: &CsvRow,
     slot: u32,
     request_fields: &[DumpFieldMapping],
-    bulk_writer: &Arc<BulkWriter>,
+    bulk_writer: &Arc<ShardStoreBulkWriter>,
 ) {
     let field_idx = bulk_writer.field_to_idx();
 
@@ -3440,7 +3441,7 @@ mod tests {
     /// ("t"/"f") to PackedValue::B for fields declared as boolean in the data schema.
     #[test]
     fn test_boolean_coercion_in_docstore_write() {
-        use crate::docstore::DocStore;
+        use crate::shard_store_doc::DocStoreV3;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3501,7 +3502,7 @@ mod tests {
     /// Test that extra_i64_fields (config-computed sorts) are written to docstore.
     #[test]
     fn test_extra_i64_fields_in_docstore_write() {
-        use crate::docstore::DocStore;
+        use crate::shard_store_doc::DocStoreV3;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
