@@ -13,7 +13,14 @@ You are a Rust engineer working on the BitDex bitmap index engine. Your work tou
 
 ## Before You Start
 
-### Read the Design Docs First
+### 1. Warm the Rust LSP (do this FIRST)
+```bash
+RA=~/.claude/skills/rust-lsp/lsp.mjs
+node $RA daemon warm
+```
+This indexes the workspace in ~60s. Start it immediately, then read docs while it warms. Once warm, all code intelligence is 35-180ms. Load `/rust-lsp` for the full command reference.
+
+### 2. Read the Design Docs
 Design docs are the guiding light. Before changing anything:
 
 1. Run `/architecture` to find the relevant design doc for your area
@@ -41,60 +48,34 @@ Before changing a module, check if there are documented regression risks:
 
 ## While You Work
 
-### Use the Rust LSP (`/rust-lsp`)
+### Use the Rust LSP for ALL Code Exploration
 
-Load this skill early in your session. It gives you the compiler's understanding of the codebase — faster and more accurate than grep.
+**Do NOT use Grep or Read to understand code.** Use the Rust LSP — it gives you the compiler's understanding in milliseconds. Grep finds string matches; the LSP finds semantic references, resolved types, and real call graphs.
 
-**Warm up your worktree first** (pays ~60s indexing cost once, then everything is 35-180ms):
-```bash
-RA=~/.claude/skills/rust-lsp/lsp.mjs
-node $RA daemon warm
-```
+| Instead of... | Use... |
+|---------------|--------|
+| `Grep "fn compact"` to find functions | `node $RA workspace-symbols compact` |
+| `Grep "compact_current"` to find callers | `node $RA references src/file.rs <line> <char>` |
+| `Read` to understand a function signature | `node $RA hover src/file.rs <line> <char>` |
+| `Grep "struct Config"` to find a type | `node $RA workspace-symbols Config` |
+| `Read` to see what's in a file | `node $RA symbols src/file.rs` |
 
-**Before editing a module**, understand it:
-```bash
-# What types/functions does this file export?
-node $RA symbols src/shard_store_doc.rs
-
-# What's the signature of this function?
-node $RA hover src/shard_store_doc.rs 963 12
-
-# Who calls this function? (blast radius before changing it)
-node $RA references src/shard_store_doc.rs 963 12
-
-# Where is this type defined?
-node $RA definition src/concurrent_engine.rs 20 38
-```
-
-**For complex exploration**, chain operations with exec (avoids multiple shell round-trips):
-```bash
-# Write a script file to explore an API
-node $RA exec --file /tmp/explore.mjs
-```
-
-Example explore script:
+**For multi-step exploration**, write a script and use `exec --file`:
 ```javascript
-// Find all callers of a function and what types they pass
-const syms = await ra.symbols("src/shard_store_doc.rs");
-const fn = syms.find(s => s.name.includes("put_batch"));
-const sig = await ra.hover("src/shard_store_doc.rs", fn.line, 12);
-const refs = await ra.references("src/shard_store_doc.rs", fn.line, 12);
-log("Signature: " + sig);
-log("Callers: " + refs.length);
+// /tmp/explore.mjs — finds a function, gets signature, traces callers
+const syms = await ra.symbols("src/shard_store.rs");
+const fn = syms.find(s => s.name.includes("compact_current"));
+log(await ra.hover("src/shard_store.rs", fn.line, 12));
+const refs = await ra.references("src/shard_store.rs", fn.line, 12);
+log(refs.length + " callers:");
 for (const r of refs) log("  " + r.file + ":" + r.line);
 ```
-
-**For renaming** (semantic, not string-replace):
 ```bash
-node $RA rename src/error.rs 29 5 NewName
+node $RA exec --file /tmp/explore.mjs
 ```
+This replaces 10+ Grep/Read calls with one fast exec. **Use exec --file whenever exploring more than one thing.**
 
-**After editing**, check for errors without running cargo:
-```bash
-node $RA diagnostics src/my_file.rs
-```
-
-**Workflow: explore with rust-lsp → edit with Edit tool → verify with rust-lsp diagnostics.**
+**Workflow: explore with rust-lsp → edit with Edit tool → verify with `node $RA diagnostics src/file.rs`**
 
 ### Coding Standards
 - **Bitmap Library:** `roaring-rs`. All filtering and sorting via bitmap operations.
