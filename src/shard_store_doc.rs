@@ -632,14 +632,20 @@ impl DocStoreV3 {
         Ok(())
     }
 
-    fn ensure_field_idx(&mut self, name: &str) -> u16 {
+    fn ensure_field_idx(&mut self, name: &str) -> io::Result<u16> {
         if let Some(&idx) = self.field_to_idx.get(name) {
-            return idx;
+            return Ok(idx);
+        }
+        if self.idx_to_field.len() >= u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("field dictionary overflow: cannot add '{}' (already {} fields)", name, self.idx_to_field.len()),
+            ));
         }
         let idx = self.idx_to_field.len() as u16;
         self.idx_to_field.push(name.to_string());
         self.field_to_idx.insert(name.to_string(), idx);
-        idx
+        Ok(idx)
     }
 
     /// Get the field index for a name.
@@ -650,7 +656,7 @@ impl DocStoreV3 {
     /// Get or create a field index. Saves the dict if a new field was added.
     pub fn ensure_field_index(&mut self, name: &str) -> io::Result<u16> {
         let existed = self.field_to_idx.contains_key(name);
-        let idx = self.ensure_field_idx(name);
+        let idx = self.ensure_field_idx(name)?;
         if !existed {
             self.save_field_dict()?;
         }
@@ -857,7 +863,7 @@ impl DocStoreV3 {
         for (_, doc) in docs {
             for name in doc.fields.keys() {
                 let old_len = self.idx_to_field.len();
-                self.ensure_field_idx(name);
+                self.ensure_field_idx(name)?;
                 if self.idx_to_field.len() > old_len {
                     dict_changed = true;
                 }
@@ -880,10 +886,12 @@ impl DocStoreV3 {
 
         for (shard_key, ops) in by_shard {
             self.store.append_ops(&shard_key, &ops)?;
-            // Auto-compact if threshold exceeded
+            // Auto-compact if threshold exceeded (uses > to match ShardStore::should_compact)
             if let Ok(Some(count)) = self.store.ops_count(&shard_key) {
-                if count >= self.compact_threshold {
-                    let _ = self.store.compact_current(&shard_key);
+                if count > self.compact_threshold {
+                    if let Err(e) = self.store.compact_current(&shard_key) {
+                        eprintln!("DocStoreV3: auto-compaction failed for shard {shard_key}: {e}");
+                    }
                 }
             }
         }
@@ -948,7 +956,7 @@ impl DocStoreV3 {
         let mut changed = false;
         for name in field_names {
             let old_len = self.idx_to_field.len();
-            self.ensure_field_idx(name);
+            self.ensure_field_idx(name)?;
             if self.idx_to_field.len() > old_len {
                 changed = true;
             }
@@ -1044,12 +1052,17 @@ fn packed_to_field_value(pv: &PackedValue) -> FieldValue {
         PackedValue::B(b) => FieldValue::Single(Value::Bool(*b)),
         PackedValue::S(s) => FieldValue::Single(Value::String(s.clone())),
         PackedValue::Mi(v) => FieldValue::Multi(v.iter().map(|i| Value::Integer(*i)).collect()),
-        PackedValue::Mm(v) => FieldValue::Multi(v.iter().map(|pv| match pv {
-            PackedValue::I(i) => Value::Integer(*i),
-            PackedValue::F(f) => Value::Float(*f),
-            PackedValue::B(b) => Value::Bool(*b),
-            PackedValue::S(s) => Value::String(s.clone()),
-            _ => Value::Integer(0), // nested multi not supported in FieldValue
+        PackedValue::Mm(v) => FieldValue::Multi(v.iter().filter_map(|pv| match pv {
+            PackedValue::I(i) => Some(Value::Integer(*i)),
+            PackedValue::F(f) => Some(Value::Float(*f)),
+            PackedValue::B(b) => Some(Value::Bool(*b)),
+            PackedValue::S(s) => Some(Value::String(s.clone())),
+            // Nested multi-values (Mi/Mm inside Mm) cannot be represented in FieldValue.
+            // Skip rather than silently corrupt to Integer(0).
+            other => {
+                eprintln!("packed_to_field_value: skipping nested multi-value {:?}", std::mem::discriminant(other));
+                None
+            }
         }).collect()),
     }
 }
@@ -1160,11 +1173,10 @@ impl ShardStoreBulkWriter {
     }
 
     /// Flush all buffered data as ShardStore snapshots.
-    /// Each shard buffer is written as a complete DocSnapshot.
+    /// Merges buffered docs into existing shard data (read-merge-write).
     pub fn flush_to_shardstore(&self) -> io::Result<()> {
         let store = DocShardStore::new(self.root.clone(), SlotHexShard)?;
 
-        // Collect all shard keys
         let keys: Vec<u32> = self.shard_buffers.iter().map(|e| *e.key()).collect();
 
         for shard_key in keys {
@@ -1173,7 +1185,8 @@ impl ShardStoreBulkWriter {
                 if shard.is_empty() {
                     continue;
                 }
-                let mut snapshot = DocSnapshot::new();
+                // Read existing shard state and merge new docs into it
+                let mut snapshot = store.read(&shard_key)?.unwrap_or_else(DocSnapshot::new);
                 for (&slot, fields) in shard.iter() {
                     snapshot.docs.insert(slot, fields.clone());
                 }
