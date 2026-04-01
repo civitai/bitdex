@@ -553,13 +553,24 @@ impl DocStoreV3 {
         let (field_to_idx, idx_to_field) = Self::load_field_dict(path)?;
         let historical_defaults = Self::load_schema_history(path, &field_to_idx);
 
+        // Rehydrate schema version and defaults from the latest persisted history.
+        // Without this, get() would use version=1 and empty defaults after restart,
+        // causing fields elided under old defaults to not rehydrate correctly.
+        let (schema_version, field_defaults) = if let Some((&max_ver, defaults)) =
+            historical_defaults.iter().max_by_key(|(&v, _)| v)
+        {
+            (max_ver, defaults.clone())
+        } else {
+            (1, HashMap::new())
+        };
+
         Ok(Self {
             store,
             root: path.to_path_buf(),
             field_to_idx,
             idx_to_field,
-            field_defaults: HashMap::new(),
-            schema_version: 1,
+            field_defaults,
+            schema_version,
             historical_defaults,
             compact_threshold: 1000,
         })
@@ -1205,26 +1216,36 @@ impl ShardStoreBulkWriter {
                 if shard.is_empty() {
                     continue;
                 }
-                // Take ownership of buffered data and clear the buffer so repeated
-                // flushes don't rewrite the same data.
+                // Take ownership of buffered data for this flush attempt.
                 let shard_data = std::mem::take(&mut *shard);
                 drop(shard); // Release lock before disk I/O
 
                 // Read existing shard state and merge new docs into it.
                 // Per-slot merge: existing fields are preserved, buffered fields
                 // override by field_idx (last-write-wins), duplicates deduplicated.
-                let mut snapshot = store.read(&shard_key)?.unwrap_or_else(DocSnapshot::new);
-                for (&slot, buffered_fields) in &shard_data {
-                    let doc = snapshot.docs.entry(slot).or_default();
-                    for (field_idx, value) in buffered_fields {
-                        if let Some(existing) = doc.iter_mut().find(|(f, _)| *f == *field_idx) {
-                            existing.1 = value.clone();
-                        } else {
-                            doc.push((*field_idx, value.clone()));
+                let flush_result = (|| -> io::Result<()> {
+                    let mut snapshot = store.read(&shard_key)?.unwrap_or_else(DocSnapshot::new);
+                    for (&slot, buffered_fields) in &shard_data {
+                        let doc = snapshot.docs.entry(slot).or_default();
+                        for (field_idx, value) in buffered_fields {
+                            if let Some(existing) = doc.iter_mut().find(|(f, _)| *f == *field_idx) {
+                                existing.1 = value.clone();
+                            } else {
+                                doc.push((*field_idx, value.clone()));
+                            }
                         }
                     }
+                    store.write_snapshot(&shard_key, &snapshot)
+                })();
+
+                if let Err(e) = flush_result {
+                    // Restore buffered data on failure so it's not lost
+                    let mut shard = mutex.lock();
+                    for (slot, fields) in shard_data {
+                        shard.entry(slot).or_default().extend(fields);
+                    }
+                    return Err(e);
                 }
-                store.write_snapshot(&shard_key, &snapshot)?;
             }
         }
         Ok(())
