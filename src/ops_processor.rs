@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::dictionary::FieldDictionary;
 use crate::shard_store_doc::PackedValue;
 use crate::shard_store_doc::DocStoreV3;
-use crate::filter::FilterFieldType;
+use crate::filter::{FilterFieldType, NULL_BITMAP_KEY};
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
 use crate::pg_sync::op_dedup::dedup_ops;
@@ -928,6 +928,8 @@ pub fn apply_ops_batch<S: BitmapSink>(
     (applied, skipped, errors)
 }
 /// Process a `set` op: set the new value's bitmap bit for this slot.
+/// IMPORTANT: null detection happens on raw JsonValue BEFORE json_to_qvalue(),
+/// because json_to_qvalue maps null → Integer(0), losing null information.
 fn process_set_op<S: BitmapSink>(
     sink: &mut S,
     meta: &FieldMeta,
@@ -935,11 +937,19 @@ fn process_set_op<S: BitmapSink>(
     field: &str,
     value: &JsonValue,
 ) {
-    let is_null_nullable = value.is_null() && meta.nullable_fields.contains(field);
+    let is_nullable = meta.nullable_fields.contains(field);
+    let is_null = value.is_null();
     let qval = json_to_qvalue(value);
-    // Check if this is a filter field — skip insert for nullable null values
+
     if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
-        if !is_null_nullable {
+        if is_null && is_nullable {
+            // Null value on nullable field: set the null bitmap key
+            sink.filter_insert(arc_name.clone(), NULL_BITMAP_KEY, slot);
+        } else {
+            if is_nullable {
+                // Non-null value on nullable field: clear the null bitmap key
+                sink.filter_remove(arc_name.clone(), NULL_BITMAP_KEY, slot);
+            }
             if let Some(key) = value_to_bitmap_key(&qval) {
                 sink.filter_insert(arc_name.clone(), key, slot);
             }
@@ -969,15 +979,20 @@ fn process_remove_op<S: BitmapSink>(
     field: &str,
     value: &JsonValue,
 ) {
-    let is_null_nullable = value.is_null() && meta.nullable_fields.contains(field);
+    let is_null = value.is_null();
+    let is_nullable = meta.nullable_fields.contains(field);
     let qval = json_to_qvalue(value);
-    // Check if this is a filter field — skip remove for nullable null values
+
     if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
-        if !is_null_nullable {
+        if is_null && is_nullable {
+            // Removing a null value: clear the null bitmap key
+            sink.filter_remove(arc_name.clone(), NULL_BITMAP_KEY, slot);
+        } else if !is_null {
             if let Some(key) = value_to_bitmap_key(&qval) {
                 sink.filter_remove(arc_name.clone(), key, slot);
             }
         }
+        // null on non-nullable: no-op (can't remove what was never set)
     }
     // Check if this is a sort field
     if let Some((arc_name, num_bits)) = meta.sort_fields.get(field) {

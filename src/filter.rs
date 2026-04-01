@@ -3,6 +3,11 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 use crate::config::FilterFieldConfig;
 use crate::versioned_bitmap::VersionedBitmap;
+
+/// Reserved bitmap key for null values on nullable filter fields.
+/// Null ops insert/remove this key in the existing value bitmap HashMap,
+/// so the entire persistence/coalescing/flush/eviction pipeline works unchanged.
+pub const NULL_BITMAP_KEY: u64 = u64::MAX;
 /// Filter bitmap storage for a single field.
 ///
 /// Each distinct value gets its own VersionedBitmap containing all slot positions
