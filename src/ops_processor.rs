@@ -1016,17 +1016,15 @@ fn process_set_op<S: BitmapSink>(
     field: &str,
     value: &JsonValue,
 ) {
-    // Nullable fields: null value = no-op (don't set any bitmap bit)
-    if value.is_null() && meta.nullable_fields.contains(field) {
-        return;
-    }
-
+    let is_null_nullable = value.is_null() && meta.nullable_fields.contains(field);
     let qval = json_to_qvalue(value);
 
-    // Check if this is a filter field
+    // Check if this is a filter field — skip insert for nullable null values
     if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
-        if let Some(key) = value_to_bitmap_key(&qval) {
-            sink.filter_insert(arc_name.clone(), key, slot);
+        if !is_null_nullable {
+            if let Some(key) = value_to_bitmap_key(&qval) {
+                sink.filter_insert(arc_name.clone(), key, slot);
+            }
         }
     }
 
@@ -1055,17 +1053,15 @@ fn process_remove_op<S: BitmapSink>(
     field: &str,
     value: &JsonValue,
 ) {
-    // Nullable fields: null value = no-op (nothing to clear)
-    if value.is_null() && meta.nullable_fields.contains(field) {
-        return;
-    }
-
+    let is_null_nullable = value.is_null() && meta.nullable_fields.contains(field);
     let qval = json_to_qvalue(value);
 
-    // Check if this is a filter field
+    // Check if this is a filter field — skip remove for nullable null values
     if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
-        if let Some(key) = value_to_bitmap_key(&qval) {
-            sink.filter_remove(arc_name.clone(), key, slot);
+        if !is_null_nullable {
+            if let Some(key) = value_to_bitmap_key(&qval) {
+                sink.filter_remove(arc_name.clone(), key, slot);
+            }
         }
     }
 
@@ -1090,6 +1086,11 @@ fn process_add_op<S: BitmapSink>(
     field: &str,
     value: &JsonValue,
 ) {
+    // Nullable fields: null value = no-op
+    if value.is_null() && meta.nullable_fields.contains(field) {
+        return;
+    }
+
     let qval = json_to_qvalue(value);
 
     if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
@@ -2358,7 +2359,7 @@ mod tests {
                 value: json!(null),
             }],
         }];
-        process_entity_ops(&mut sink, &meta, &mut batch, None, &mut None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
             sink.filter_inserts.iter().all(|(f, _, _)| f != "blockedFor"),
             "null set on nullable field should not insert any bitmap bit"
@@ -2380,7 +2381,7 @@ mod tests {
                 value: json!("TOS violation"),
             }],
         }];
-        process_entity_ops(&mut sink, &meta, &mut batch, None, &mut None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
             sink.filter_inserts.iter().any(|(f, _, _)| f == "blockedFor"),
             "non-null set on nullable field should insert bitmap bit"
@@ -2402,7 +2403,7 @@ mod tests {
                 value: json!(null),
             }],
         }];
-        process_entity_ops(&mut sink, &meta, &mut batch, None, &mut None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
             sink.filter_removes.iter().all(|(f, _, _)| f != "blockedFor"),
             "null remove on nullable field should not remove any bitmap bit"
@@ -2424,10 +2425,68 @@ mod tests {
                 value: json!(null),
             }],
         }];
-        process_entity_ops(&mut sink, &meta, &mut batch, None, &mut None);
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
             sink.filter_inserts.iter().any(|(f, v, _)| f == "nsfwLevel" && *v == 0),
             "null on non-nullable field should map to 0"
+        );
+    }
+
+    #[test]
+    fn test_nullable_transition_old_to_null() {
+        // Simulate blockedFor changing from "copyright" to null:
+        // Remove old value, then Set null — old bitmap removed, no new bitmap created
+        let config = test_config_with_nullable();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![
+                Op::Remove {
+                    field: "blockedFor".into(),
+                    value: json!("copyright"),
+                },
+                Op::Set {
+                    field: "blockedFor".into(),
+                    value: json!(null),
+                },
+            ],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+
+        // Old value should be removed
+        assert!(
+            sink.filter_removes.iter().any(|(f, _, _)| f == "blockedFor"),
+            "old blockedFor value should be removed from bitmap"
+        );
+        // No new bitmap entry should be created
+        assert!(
+            sink.filter_inserts.iter().all(|(f, _, _)| f != "blockedFor"),
+            "null set on nullable field should not create new bitmap entry"
+        );
+    }
+
+    #[test]
+    fn test_nullable_add_null_is_noop() {
+        // Add op with null value on nullable field should be a no-op
+        let config = test_config_with_nullable();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![Op::Add {
+                field: "blockedFor".into(),
+                value: json!(null),
+            }],
+        }];
+        apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert!(
+            sink.filter_inserts.iter().all(|(f, _, _)| f != "blockedFor"),
+            "null add on nullable field should not insert any bitmap bit"
         );
     }
 }
