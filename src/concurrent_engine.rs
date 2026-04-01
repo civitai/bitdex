@@ -3471,6 +3471,11 @@ impl ConcurrentEngine {
                     out.push(field.clone());
                 }
             }
+            FilterClause::IsNull(f) | FilterClause::IsNotNull(f) => {
+                if pending.contains(f) && !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
         }
     }
     /// Recursively collect (field, value) pairs from filter clauses for per-value
@@ -3522,6 +3527,8 @@ impl ConcurrentEngine {
                 }
             }
             FilterClause::BucketBitmap { .. } => {}
+            // IsNull/IsNotNull: no specific value to eager-load; skip.
+            FilterClause::IsNull(_) | FilterClause::IsNotNull(_) => {}
         }
     }
     /// Execute a parsed BitdexQuery.

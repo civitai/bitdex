@@ -206,9 +206,26 @@ fn parse_field_predicate(field: &str, value: &JsonValue) -> Result<Vec<FilterCla
             let mut clauses = Vec::new();
             for (op, op_val) in ops {
                 let clause = match op.as_str() {
+                    "$exists" => {
+                        let exists = op_val.as_bool().ok_or_else(|| {
+                            ParseError::new(format!(
+                                "'$exists' on '{field}' requires a boolean value"
+                            ))
+                        })?;
+                        if exists {
+                            FilterClause::IsNotNull(field.to_string())
+                        } else {
+                            FilterClause::IsNull(field.to_string())
+                        }
+                    }
                     "$eq" => {
-                        let val = json_to_value(op_val)?;
-                        FilterClause::Eq(field.to_string(), val)
+                        // $eq: null → IsNull
+                        if op_val.is_null() {
+                            FilterClause::IsNull(field.to_string())
+                        } else {
+                            let val = json_to_value(op_val)?;
+                            FilterClause::Eq(field.to_string(), val)
+                        }
                     }
                     "$ne" => {
                         let val = json_to_value(op_val)?;
@@ -246,7 +263,7 @@ fn parse_field_predicate(field: &str, value: &JsonValue) -> Result<Vec<FilterCla
                     }
                     other => {
                         return Err(ParseError::new(format!(
-                            "unsupported operator '{other}' on '{field}'; expected $eq, $ne, $gt, $gte, $lt, $lte, $in, $nin"
+                            "unsupported operator '{other}' on '{field}'; expected $eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $exists"
                         )));
                     }
                 };
@@ -255,9 +272,8 @@ fn parse_field_predicate(field: &str, value: &JsonValue) -> Result<Vec<FilterCla
             Ok(clauses)
         }
 
-        JsonValue::Null => Err(ParseError::new(format!(
-            "null is not a valid filter value for '{field}'"
-        ))),
+        // null as a direct value → IsNull (same as { "$exists": false })
+        JsonValue::Null => Ok(vec![FilterClause::IsNull(field.to_string())]),
     }
 }
 
@@ -626,8 +642,28 @@ mod tests {
     // === Error cases ===
 
     #[test]
-    fn test_null_value_rejected() {
-        assert!(parse(r#"{"filter": {"x": null}}"#).is_err());
+    fn test_null_value_rewrites_to_is_null() {
+        // null as a direct field value is shorthand for IsNull
+        let q = parse(r#"{"filter": {"x": null}}"#).unwrap();
+        assert_eq!(q.filters[0], FilterClause::IsNull("x".into()));
+    }
+
+    #[test]
+    fn test_exists_false() {
+        let q = parse(r#"{"filter": {"publishedAt": {"$exists": false}}}"#).unwrap();
+        assert_eq!(q.filters[0], FilterClause::IsNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_exists_true() {
+        let q = parse(r#"{"filter": {"publishedAt": {"$exists": true}}}"#).unwrap();
+        assert_eq!(q.filters[0], FilterClause::IsNotNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_eq_null_rewrites_to_is_null() {
+        let q = parse(r#"{"filter": {"publishedAt": {"$eq": null}}}"#).unwrap();
+        assert_eq!(q.filters[0], FilterClause::IsNull("publishedAt".into()));
     }
 
     #[test]

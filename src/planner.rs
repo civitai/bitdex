@@ -85,6 +85,23 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
         | FilterClause::Lte(_, _) => alive_count / 2,
         // Pre-computed bucket bitmap: use the actual bitmap length as cardinality.
         FilterClause::BucketBitmap { bitmap, .. } => bitmap.len(),
+        // IsNull: use the null bitmap's length if it exists, else assume rare (~10% of alive).
+        FilterClause::IsNull(field) => {
+            if let Some(ff) = filters.get_field(field) {
+                ff.cardinality(crate::filter::NULL_BITMAP_KEY)
+            } else {
+                alive_count / 10
+            }
+        }
+        // IsNotNull: alive minus the null count.
+        FilterClause::IsNotNull(field) => {
+            let null_count = if let Some(ff) = filters.get_field(field) {
+                ff.cardinality(crate::filter::NULL_BITMAP_KEY)
+            } else {
+                alive_count / 10
+            };
+            alive_count.saturating_sub(null_count)
+        }
     }
 }
 /// Resolve a Value to a bitmap key, using string maps/dictionaries for String values.

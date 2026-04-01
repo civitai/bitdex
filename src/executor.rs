@@ -530,6 +530,12 @@ impl<'a> QueryExecutor<'a> {
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &eq_bitmap;
+                // Also subtract null bitmap: null values are not "not equal" — they are unknown.
+                if let Some(filter_field) = self.filters.get_field(field) {
+                    if let Some(null_vb) = filter_field.get_versioned(crate::filter::NULL_BITMAP_KEY) {
+                        result -= null_vb.fused_cow().as_ref();
+                    }
+                }
                 Ok(result)
             }
             FilterClause::In(field, values) => {
@@ -559,6 +565,12 @@ impl<'a> QueryExecutor<'a> {
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &in_bitmap;
+                // Also subtract null bitmap: null values are not "not in" — they are unknown.
+                if let Some(filter_field) = self.filters.get_field(field) {
+                    if let Some(null_vb) = filter_field.get_versioned(crate::filter::NULL_BITMAP_KEY) {
+                        result -= null_vb.fused_cow().as_ref();
+                    }
+                }
                 Ok(result)
             }
             FilterClause::Not(inner) => {
@@ -655,6 +667,32 @@ impl<'a> QueryExecutor<'a> {
             }
             // Pre-computed bucket bitmap from range snapping (C3): use the bitmap directly.
             FilterClause::BucketBitmap { bitmap, .. } => Ok(bitmap.as_ref().clone()),
+            // IsNull: return the null sentinel bitmap for the field, or empty if none.
+            FilterClause::IsNull(field) => {
+                if let Some(filter_field) = self.filters.get_field(field) {
+                    Ok(filter_field
+                        .get_versioned(crate::filter::NULL_BITMAP_KEY)
+                        .map(|vb| vb.fused())
+                        .unwrap_or_default())
+                } else {
+                    Ok(RoaringBitmap::new())
+                }
+            }
+            // IsNotNull: alive minus the null bitmap.
+            FilterClause::IsNotNull(field) => {
+                let null_bitmap = if let Some(filter_field) = self.filters.get_field(field) {
+                    filter_field
+                        .get_versioned(crate::filter::NULL_BITMAP_KEY)
+                        .map(|vb| vb.fused())
+                        .unwrap_or_default()
+                } else {
+                    RoaringBitmap::new()
+                };
+                let alive = self.slots.alive_bitmap();
+                let mut result = alive.clone();
+                result -= &null_bitmap;
+                Ok(result)
+            }
         }
     }
     /// Evaluate a range filter by scanning the filter field's bitmaps.

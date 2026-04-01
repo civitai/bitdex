@@ -43,6 +43,10 @@ pub enum FilterClause {
     Not(Box<FilterClause>),
     And(Vec<FilterClause>),
     Or(Vec<FilterClause>),
+    /// Field value is null (uses NULL_BITMAP_KEY sentinel in filter bitmaps).
+    IsNull(String),
+    /// Field value is not null.
+    IsNotNull(String),
     /// Pre-computed bucket bitmap produced by range-to-bucket snapping.
     /// - `field` — the filter field name (e.g. "sortAt")
     /// - `bucket_name` — the human-readable bucket name (e.g. "7d"), used as the stable cache key
@@ -107,6 +111,8 @@ impl fmt::Display for FilterClause {
             FilterClause::BucketBitmap { field, bucket_name, .. } => {
                 write!(f, "{field} ~bucket({bucket_name})")
             }
+            FilterClause::IsNull(field) => write!(f, "{field} IS NULL"),
+            FilterClause::IsNotNull(field) => write!(f, "{field} IS NOT NULL"),
         }
     }
 }
