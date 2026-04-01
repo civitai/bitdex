@@ -577,7 +577,7 @@ impl DocStoreV3 {
             .as_nanos();
         let tmp_dir = std::env::temp_dir()
             .join(format!("bitdex-docstore-v3-{}-{}", std::process::id(), ts));
-        std::fs::create_dir_all(&tmp_dir)?;
+        std::fs::create_dir_all(tmp_dir.join("meta"))?;
         let store = DocShardStore::new(tmp_dir.clone(), SlotHexShard)?;
         Ok(Self {
             store,
@@ -819,13 +819,6 @@ impl DocStoreV3 {
     /// Get a stored document by slot ID.
     pub fn get(&self, id: u32) -> io::Result<Option<StoredDoc>> {
         let shard_key = SlotHexShard::slot_to_shard(id);
-
-        if self.in_memory {
-            if let Some(snap) = self.memory_shards.get(&shard_key) {
-                return Ok(snap.docs.get(&id).map(|fields| self.fields_to_stored_doc(fields)));
-            }
-            return Ok(None);
-        }
 
         let snap = match self.store.read(&shard_key)? {
             Some(s) => s,

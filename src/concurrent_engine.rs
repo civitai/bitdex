@@ -10046,8 +10046,11 @@ mod tests {
         };
         assert_eq!(ops_before, 10, "should have 10 ops before compaction");
 
-        // Trigger compaction
-        engine.compact_docstore().unwrap();
+        // Trigger compaction directly on the shard (bypasses threshold check)
+        {
+            let ds = engine.docstore.lock();
+            ds.shard_store().compact_current(&shard_key).unwrap();
+        }
 
         // After compaction, ops should be folded into a snapshot (0 ops remaining)
         let ops_after = {
