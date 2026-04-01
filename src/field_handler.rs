@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::docstore::PackedValue;
+use crate::shard_store_doc::PackedValue;
 use crate::shard_store_doc::DocOp;
 
 // ---------------------------------------------------------------------------

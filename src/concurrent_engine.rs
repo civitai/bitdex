@@ -17,8 +17,7 @@ use crate::filter::FilterFieldType;
 use crate::cache;
 use crate::concurrency::InFlightTracker;
 use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
-use crate::docstore::StoredDoc;
-use crate::shard_store_doc::DocStoreV3;
+use crate::shard_store_doc::{DocStoreV3, StoredDoc};
 use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
 use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, value_to_sort_u32, Document, FieldRegistry, PatchPayload};
@@ -6437,7 +6436,7 @@ impl ConcurrentEngine {
             };
 
             // Phase 3: Batch docstore reads for upserts (outside any lock)
-            let old_docs: Vec<Option<crate::docstore::StoredDoc>> = statuses
+            let old_docs: Vec<Option<crate::shard_store_doc::StoredDoc>> = statuses
                 .iter()
                 .map(|&(id, is_upsert, was_allocated)| {
                     if is_upsert || was_allocated {
@@ -6450,7 +6449,7 @@ impl ConcurrentEngine {
 
             // Phase 4: Compute all diffs and collect all ops
             let mut all_ops: Vec<MutationOp> = Vec::new();
-            let mut doc_writes: Vec<(u32, crate::docstore::StoredDoc)> = Vec::new();
+            let mut doc_writes: Vec<(u32, crate::shard_store_doc::StoredDoc)> = Vec::new();
 
             for (i, &(id, ref doc)) in docs.iter().enumerate() {
                 let (_, is_upsert, _) = statuses[i];
@@ -6458,7 +6457,7 @@ impl ConcurrentEngine {
                 all_ops.extend(ops);
                 doc_writes.push((
                     id,
-                    crate::docstore::StoredDoc {
+                    crate::shard_store_doc::StoredDoc {
                         fields: doc.fields.clone(),
                         schema_version: 0,
                     },
@@ -6848,7 +6847,7 @@ impl ConcurrentEngine {
         progress: Arc<AtomicU64>,
         memory_cb: Option<Box<dyn Fn(u64, f64, u64) + Send + Sync>>,
     ) -> Result<(u64, f64)> {
-        use crate::docstore::PackedValue;
+        use crate::shard_store_doc::PackedValue;
 
         let t0 = Instant::now();
 
@@ -10020,7 +10019,7 @@ mod tests {
 
     #[test]
     fn test_compaction_worker_e2e() {
-        use crate::docstore::PackedValue;
+        use crate::shard_store_doc::PackedValue;
         use crate::shard_store_doc::{DocStoreV3, SlotHexShard};
 
         // Use an on-disk docstore so ShardStore ops and compaction can run.
@@ -10866,7 +10865,7 @@ mod tests {
     /// E2E: bulk loading with ShardStoreBulkWriter writes docs readable by DocStoreV3.
     #[test]
     fn test_docstore_v3_bulk_writer_roundtrip() {
-        use crate::docstore::PackedValue;
+        use crate::shard_store_doc::PackedValue;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -10909,38 +10908,5 @@ mod tests {
         engine.shutdown();
     }
 
-    /// E2E: DocWriter (ops processor path) writes tuples readable by DocStoreV3.
-    #[cfg(feature = "pg-sync")]
-    #[test]
-    fn test_docstore_v3_doc_writer_roundtrip() {
-        use crate::shard_store_doc::DocStoreV3;
-
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut store = DocStoreV3::open(&docs_dir).unwrap();
-        store.ensure_field_index("sortAt").unwrap();
-        store.ensure_field_index("nsfwLevel").unwrap();
-        store.ensure_field_index("tagIds").unwrap();
-
-        let store = Arc::new(parking_lot::Mutex::new(store));
-        let mut dw = crate::ops_processor::DocWriter::new(Arc::clone(&store));
-
-        // Write scalar fields via DocWriter (simulating WAL ops processor)
-        dw.write_set(100, "sortAt", &serde_json::json!(1711900000));
-        dw.write_set(100, "nsfwLevel", &serde_json::json!(5));
-        dw.flush();
-
-        // Read back and verify
-        let doc = store.lock().get(100).unwrap();
-        assert!(doc.is_some(), "doc should exist after DocWriter writes");
-        let doc = doc.unwrap();
-        assert_eq!(
-            doc.fields.get("sortAt"),
-            Some(&FieldValue::Single(Value::Integer(1711900000))),
-        );
-        assert_eq!(
-            doc.fields.get("nsfwLevel"),
-            Some(&FieldValue::Single(Value::Integer(5))),
-        );
-    }
+    // DocWriter E2E test lives in ops_processor.rs (needs private method access)
 }

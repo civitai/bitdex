@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn test_doc_sink_append() {
         // DocSink wrapping a real on-disk DocStoreV3 should persist tuples.
-        use crate::docstore::PackedValue;
+        use crate::shard_store_doc::PackedValue;
         use crate::shard_store_doc::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
@@ -407,7 +407,7 @@ mod tests {
     fn test_ingester_full_pipeline() {
         // Ingester with RecordingSink + DocSink should route bitmap ops to the
         // recording sink and doc tuples to the docstore.
-        use crate::docstore::PackedValue;
+        use crate::shard_store_doc::PackedValue;
         use crate::shard_store_doc::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();

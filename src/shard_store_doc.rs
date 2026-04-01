@@ -1,22 +1,117 @@
-//! Document codecs and sharding strategy for ShardStore.
+//! Document storage engine — types, codecs, and ShardStore-backed persistence.
 //!
-//! Implements:
-//! - `DocSnapshotCodec` — serialize/deserialize `DocSnapshot` (slot → field values)
-//! - `DocOpCodec` — typed document operations (Set, Append, Remove, Delete, Create)
-//! - `SlotHexShard` — maps slot IDs to hex-bucketed shard files (same layout as DocStore V2)
+//! This module is the single source of truth for document storage:
+//! - `StoredDoc` — the named-field document type used across the codebase
+//! - `PackedValue` — compact enum for field values (integer, float, bool, string, multi)
+//! - `DocStoreV3` — high-level document store backed by ShardStore
+//! - `ShardStoreBulkWriter` — high-throughput parallel writer for dump processor
+//! - `DocSnapshotCodec` / `DocOpCodec` — ShardStore codecs
+//! - `SlotHexShard` — hex-bucketed shard file layout
+//! - `json_to_packed_with_dict` — JSON → PackedValue conversion with dictionary support
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::docstore::PackedValue;
+use crate::config::{FieldMapping, FieldValueType};
+use crate::mutation::FieldValue;
 use crate::shard_store::{SnapshotCodec, OpCodec, ShardingStrategy};
 
 // ---------------------------------------------------------------------------
-// Shard shift — same as DocStore V2: 512 docs per shard
+// Core types — StoredDoc + PackedValue
 // ---------------------------------------------------------------------------
 
-const SHARD_SHIFT: u32 = 9;
+/// Number of bits to shift slot_id right to get shard index.
+/// 9 → 512 docs per shard.
+pub const SHARD_SHIFT: u32 = 9;
+
+/// Public accessor for SHARD_SHIFT (used by slot_arena finalization).
+pub const SHARD_SHIFT_PUB: u32 = SHARD_SHIFT;
+
+/// A stored document containing all field values.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredDoc {
+    pub fields: HashMap<String, FieldValue>,
+    /// Schema version this document was encoded with.
+    /// 0 = legacy (pre-versioning), 1+ = versioned.
+    #[serde(skip, default)]
+    pub schema_version: u8,
+}
+
+/// Compact value encoding for document fields.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub enum PackedValue {
+    I(i64),
+    F(f64),
+    B(bool),
+    S(String),
+    Mi(Vec<i64>),
+    Mm(Vec<PackedValue>),
+}
+
+/// Convert a raw JSON value to PackedValue, with optional dictionary for LowCardinalityString.
+pub fn json_to_packed_with_dict(
+    raw: &serde_json::Value,
+    mapping: &FieldMapping,
+    ms_to_seconds: bool,
+    dictionary: Option<&crate::dictionary::FieldDictionary>,
+) -> Option<PackedValue> {
+    match mapping.value_type {
+        FieldValueType::Integer => {
+            let n = raw
+                .as_i64()
+                .or_else(|| raw.as_u64().map(|u| u as i64))
+                .or_else(|| raw.as_f64().map(|f| f as i64))?;
+            let n = if ms_to_seconds {
+                ((n / 1000) as u32) as i64
+            } else {
+                n
+            };
+            Some(PackedValue::I(n))
+        }
+        FieldValueType::Boolean => Some(PackedValue::B(raw.as_bool()?)),
+        FieldValueType::String => Some(PackedValue::S(raw.as_str()?.to_string())),
+        FieldValueType::MappedString => {
+            let s = raw.as_str()?;
+            let lookup = if mapping.case_sensitive {
+                std::borrow::Cow::Borrowed(s)
+            } else {
+                std::borrow::Cow::Owned(s.to_lowercase())
+            };
+            let n = mapping
+                .string_map
+                .as_ref()
+                .and_then(|m| m.get(lookup.as_ref()).copied())
+                .unwrap_or(0);
+            Some(PackedValue::I(n))
+        }
+        FieldValueType::LowCardinalityString => {
+            let s = raw.as_str()?;
+            if let Some(dict) = dictionary {
+                let n = dict.get_or_insert(s);
+                Some(PackedValue::I(n))
+            } else {
+                Some(PackedValue::I(0))
+            }
+        }
+        FieldValueType::IntegerArray => {
+            let arr = raw.as_array()?;
+            if arr.is_empty() {
+                return None;
+            }
+            let values: Vec<i64> = arr
+                .iter()
+                .filter_map(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+                .collect();
+            if values.is_empty() { None } else { Some(PackedValue::Mi(values)) }
+        }
+        FieldValueType::ExistsBoolean => Some(PackedValue::B(true)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shard layout
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // DocSnapshot — the materialized state of one shard
@@ -521,8 +616,6 @@ pub type DocShardStore = crate::shard_store::ShardStore<DocSnapshotCodec, DocOpC
 // ---------------------------------------------------------------------------
 
 use crate::config::DataSchema;
-use crate::docstore::StoredDoc;
-use crate::mutation::FieldValue;
 
 /// High-level document store backed by ShardStore.
 ///
@@ -1342,7 +1435,7 @@ impl ShardStoreBulkWriter {
             };
 
             let dict = dictionaries.and_then(|d| d.get(&mapping.target));
-            if let Some(pv) = crate::docstore::json_to_packed_with_dict(raw, mapping, apply_ms, dict) {
+            if let Some(pv) = json_to_packed_with_dict(raw, mapping, apply_ms, dict) {
                 if let Some(default_pv) = self.field_defaults.get(&idx) {
                     if &pv == default_pv {
                         continue;
