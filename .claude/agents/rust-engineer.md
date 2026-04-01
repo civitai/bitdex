@@ -18,7 +18,7 @@ You are a Rust engineer working on the BitDex bitmap index engine. Your work tou
 RA=~/.claude/skills/rust-lsp/lsp.mjs
 node $RA daemon warm
 ```
-This indexes the workspace in ~60s. Start it immediately, then read docs while it warms. Once warm, all code intelligence is 35-180ms. Load `/rust-lsp` for the full command reference.
+This indexes the workspace (~5-30s). Start it immediately, then read docs while it warms. Set Bash timeout to 120000 for this call. Once warm, `workspace-symbols` is instant. Load `/rust-lsp` for the full command reference.
 
 ### 2. Read the Design Docs
 Design docs are the guiding light. Before changing anything:
@@ -48,34 +48,49 @@ Before changing a module, check if there are documented regression risks:
 
 ## While You Work
 
-### Use the Rust LSP for ALL Code Exploration
+### Use the Rust LSP for Finding Code
 
-**Do NOT use Grep or Read to understand code.** Use the Rust LSP — it gives you the compiler's understanding in milliseconds. Grep finds string matches; the LSP finds semantic references, resolved types, and real call graphs.
+**Use `workspace-symbols` instead of Grep for finding functions, types, and modules.** It searches the compiler's symbol index — no regex guessing, no false positives, instant results with file:line locations.
+
+```bash
+RA=~/.claude/skills/rust-lsp/lsp.mjs
+```
 
 | Instead of... | Use... |
 |---------------|--------|
 | `Grep "fn compact"` to find functions | `node $RA workspace-symbols compact` |
-| `Grep "compact_current"` to find callers | `node $RA references src/file.rs <line> <char>` |
-| `Read` to understand a function signature | `node $RA hover src/file.rs <line> <char>` |
 | `Grep "struct Config"` to find a type | `node $RA workspace-symbols Config` |
-| `Read` to see what's in a file | `node $RA symbols src/file.rs` |
+| `Grep "DocStoreV3"` across codebase | `node $RA workspace-symbols DocStoreV3` |
 
-**For multi-step exploration**, write a script and use `exec --file`:
-```javascript
-// /tmp/explore.mjs — finds a function, gets signature, traces callers
-const syms = await ra.symbols("src/shard_store.rs");
-const fn = syms.find(s => s.name.includes("compact_current"));
-log(await ra.hover("src/shard_store.rs", fn.line, 12));
-const refs = await ra.references("src/shard_store.rs", fn.line, 12);
-log(refs.length + " callers:");
-for (const r of refs) log("  " + r.file + ":" + r.line);
-```
+`workspace-symbols` returns the symbol name, kind (Struct/Function/Enum/etc), file path, and line number. **Use this FIRST, then Read the file at that location for details.**
+
+**The workflow:**
+1. `node $RA workspace-symbols <query>` — find where things are (40ms)
+2. `Read` the file at the line number — understand the code
+3. `Edit` — make changes
+4. Repeat step 1 to find related code
+
+**Example — finding and understanding a function:**
 ```bash
-node $RA exec --file /tmp/explore.mjs
-```
-This replaces 10+ Grep/Read calls with one fast exec. **Use exec --file whenever exploring more than one thing.**
+# Find it
+node $RA workspace-symbols compact_current
+# Output: Function compact_current — src/shard_store.rs:714:12
 
-**Workflow: explore with rust-lsp → edit with Edit tool → verify with `node $RA diagnostics src/file.rs`**
+# Read it
+# Use Read tool on src/shard_store.rs at line 714
+```
+
+This replaces multi-file Grep scans with a single instant lookup. **Always try workspace-symbols before grepping.**
+
+**Advanced operations (on main repo — may timeout in worktrees):**
+If you're working on the main repo (not a worktree), you also have hover, references, definition, and symbols. Load `/rust-lsp` for the full reference. These give you the compiler's full understanding — type signatures, all callers, trait implementations.
+
+```bash
+node $RA hover src/file.rs <line> <char>         # Type info + docs
+node $RA references src/file.rs <line> <char>    # Find all callers
+node $RA definition src/file.rs <line> <char>    # Jump to definition
+node $RA symbols src/file.rs                     # List all symbols in a file
+```
 
 ### Coding Standards
 - **Bitmap Library:** `roaring-rs`. All filtering and sorting via bitmap operations.

@@ -177,11 +177,11 @@ cargo run --release --features server --bin bitdex-server -- --port 3001 --data-
 
 ### Rust LSP
 
-Load `/rust-lsp` for all Rust code exploration and refactoring. This is the primary tool for understanding the codebase — use it before grepping, before reading files to trace call chains, before manually renaming across files. It gives you the compiler's understanding of the code.
+Load `/rust-lsp` for semantic code search. **Use `workspace-symbols` instead of grep** to find functions, types, and modules — it searches the compiler's symbol index and returns file:line locations instantly (40ms).
 
-**Explore:** hover for types/docs, find references, go to definition, list symbols, search workspace symbols. **Refactor:** semantic rename across the workspace, apply code actions (extract function, auto-fix). **Diagnose:** get compiler errors without running `cargo check`. **Script:** chain operations in a single call via the `exec` API with `--file` for complex explorations.
+**Primary workflow:** `workspace-symbols` to find things → `Read` at the returned location → `Edit` to make changes. This works everywhere including worktrees.
 
-Daemon-backed with per-worktree instances. First call ~60s (indexing); subsequent calls 35-180ms. The workflow: **explore with rust-lsp → edit with Edit tool → verify with rust-lsp diagnostics**.
+**Advanced operations** (hover, references, definition, rename, exec scripting) are available on the main repo. They may time out in worktrees due to resource contention with VS Code's rust-analyzer. See `/rust-lsp` for the full reference and worktree compatibility table.
 
 ### Testing Guide
 
