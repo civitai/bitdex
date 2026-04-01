@@ -195,12 +195,13 @@ async fn read_cursor_from_pg(pool: &PgPool, cursor_name: &str) -> Result<i64, sq
 }
 
 /// Poll ops from BitdexOps table after a cursor position.
+/// On deserialization failure, logs the raw JSON of the failing row for debugging.
 async fn poll_ops_from_cursor(
     pool: &PgPool,
     cursor: i64,
     limit: i64,
 ) -> Result<Vec<OpsRow>, sqlx::Error> {
-    sqlx::query_as::<_, OpsRow>(
+    let result = sqlx::query_as::<_, OpsRow>(
         r#"SELECT id, entity_id, ops FROM "BitdexOps"
         WHERE id > $1
         ORDER BY id ASC
@@ -209,7 +210,38 @@ async fn poll_ops_from_cursor(
     .bind(cursor)
     .bind(limit)
     .fetch_all(pool)
-    .await
+    .await;
+
+    if let Err(ref e) = result {
+        // Log the raw ops JSON for the failing batch to aid debugging
+        eprintln!("ops_poller: deserialization error: {e}");
+        if let Ok(raw_rows) = sqlx::query_as::<_, (i64, i64, String)>(
+            r#"SELECT id, entity_id, ops::text FROM "BitdexOps"
+            WHERE id > $1
+            ORDER BY id ASC
+            LIMIT $2"#,
+        )
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        {
+            for (id, entity_id, ops_text) in &raw_rows {
+                let preview: String = ops_text.chars().take(200).collect();
+                // Try to parse each row individually to find the exact failing one
+                match serde_json::from_str::<Vec<super::ops::Op>>(ops_text) {
+                    Ok(_) => {} // This row parses fine
+                    Err(parse_err) => {
+                        eprintln!(
+                            "ops_poller: row id={id} entity_id={entity_id} fails: {parse_err}\n  ops={preview}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
 /// Get the current max ops ID (for lag calculation).

@@ -559,6 +559,7 @@ mod tests {
             eviction: None,
             eager_load: false,
             per_value_lazy: false,
+            nullable: false,
         });
         filters.add_field(FilterFieldConfig {
             name: "tagIds".to_string(),
@@ -567,6 +568,7 @@ mod tests {
             eviction: None,
             eager_load: false,
             per_value_lazy: false,
+            nullable: false,
         });
         filters
     }

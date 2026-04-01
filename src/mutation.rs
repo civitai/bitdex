@@ -1088,6 +1088,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
@@ -1096,6 +1097,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
@@ -1104,6 +1106,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -1700,6 +1703,7 @@ mod tests {
             eviction: None,
             eager_load: false,
             per_value_lazy: false,
+            nullable: false,
         }];
         config.sort_fields = vec![SortFieldConfig {
             name: "publishedAt".into(),

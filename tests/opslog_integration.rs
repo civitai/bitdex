@@ -29,6 +29,7 @@ fn opslog_config(bitmap_path: &std::path::Path) -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "tagIds".to_string(),
@@ -37,6 +38,7 @@ fn opslog_config(bitmap_path: &std::path::Path) -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
         ],
         sort_fields: vec![SortFieldConfig {

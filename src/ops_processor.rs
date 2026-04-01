@@ -429,6 +429,8 @@ struct ComputedSortInfo {
 pub struct FieldMeta {
     /// Filter field name → (Arc<str>, FilterFieldType)
     filter_fields: HashMap<String, (Arc<str>, FilterFieldType)>,
+    /// Filter fields that accept null values (null Set/Remove = no-op).
+    nullable_fields: std::collections::HashSet<String>,
     /// Sort field name → (Arc<str>, num_bits)
     sort_fields: HashMap<String, (Arc<str>, usize)>,
     /// Reverse map: source_field → computed sort fields that depend on it.
@@ -448,11 +450,15 @@ impl FieldMeta {
     pub fn from_config(config: &Config) -> Self {
         let registry = FieldRegistry::from_config(config);
         let mut filter_fields = HashMap::new();
+        let mut nullable_fields = std::collections::HashSet::new();
         for fc in &config.filter_fields {
             filter_fields.insert(
                 fc.name.clone(),
                 (registry.get(&fc.name), fc.field_type.clone()),
             );
+            if fc.nullable {
+                nullable_fields.insert(fc.name.clone());
+            }
         }
         let mut sort_fields = HashMap::new();
         for sc in &config.sort_fields {
@@ -489,6 +495,7 @@ impl FieldMeta {
 
         Self {
             filter_fields,
+            nullable_fields,
             sort_fields,
             computed_deps,
             deferred_alive_field,
@@ -1009,6 +1016,11 @@ fn process_set_op<S: BitmapSink>(
     field: &str,
     value: &JsonValue,
 ) {
+    // Nullable fields: null value = no-op (don't set any bitmap bit)
+    if value.is_null() && meta.nullable_fields.contains(field) {
+        return;
+    }
+
     let qval = json_to_qvalue(value);
 
     // Check if this is a filter field
@@ -1043,6 +1055,11 @@ fn process_remove_op<S: BitmapSink>(
     field: &str,
     value: &JsonValue,
 ) {
+    // Nullable fields: null value = no-op (nothing to clear)
+    if value.is_null() && meta.nullable_fields.contains(field) {
+        return;
+    }
+
     let qval = json_to_qvalue(value);
 
     // Check if this is a filter field
@@ -1413,6 +1430,7 @@ mod tests {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "type".into(),
@@ -1421,6 +1439,7 @@ mod tests {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "tagIds".into(),
@@ -1429,6 +1448,7 @@ mod tests {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "hasMeta".into(),
@@ -1437,6 +1457,7 @@ mod tests {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
         ];
         config.sort_fields = vec![SortFieldConfig {
@@ -2306,5 +2327,107 @@ mod tests {
         let ops_put = document_to_ops(&new_doc, Some(&old_doc), &config, false);
         let has_remove_nsfw_put = ops_put.iter().any(|op| matches!(op, Op::Remove { field, .. } if field == "nsfwLevel"));
         assert!(has_remove_nsfw_put, "PUT should remove absent fields (nsfwLevel)");
+    }
+
+    fn test_config_with_nullable() -> Config {
+        let mut config = test_config();
+        config.filter_fields.push(FilterFieldConfig {
+            name: "blockedFor".into(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            nullable: true,
+        });
+        config
+    }
+
+    #[test]
+    fn test_nullable_field_null_set_is_noop() {
+        let config = test_config_with_nullable();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        // Set blockedFor to null — should be a no-op (no bitmap insert)
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![Op::Set {
+                field: "blockedFor".into(),
+                value: json!(null),
+            }],
+        }];
+        process_entity_ops(&mut sink, &meta, &mut batch, None, &mut None);
+        assert!(
+            sink.filter_inserts.iter().all(|(f, _, _)| f != "blockedFor"),
+            "null set on nullable field should not insert any bitmap bit"
+        );
+    }
+
+    #[test]
+    fn test_nullable_field_non_null_set_works() {
+        let config = test_config_with_nullable();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        // Set blockedFor to a real value — should insert bitmap bit
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![Op::Set {
+                field: "blockedFor".into(),
+                value: json!("TOS violation"),
+            }],
+        }];
+        process_entity_ops(&mut sink, &meta, &mut batch, None, &mut None);
+        assert!(
+            sink.filter_inserts.iter().any(|(f, _, _)| f == "blockedFor"),
+            "non-null set on nullable field should insert bitmap bit"
+        );
+    }
+
+    #[test]
+    fn test_nullable_field_null_remove_is_noop() {
+        let config = test_config_with_nullable();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        // Remove blockedFor with null value — should be a no-op
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![Op::Remove {
+                field: "blockedFor".into(),
+                value: json!(null),
+            }],
+        }];
+        process_entity_ops(&mut sink, &meta, &mut batch, None, &mut None);
+        assert!(
+            sink.filter_removes.iter().all(|(f, _, _)| f != "blockedFor"),
+            "null remove on nullable field should not remove any bitmap bit"
+        );
+    }
+
+    #[test]
+    fn test_non_nullable_field_null_maps_to_zero() {
+        // nsfwLevel is NOT nullable — null should map to 0
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![Op::Set {
+                field: "nsfwLevel".into(),
+                value: json!(null),
+            }],
+        }];
+        process_entity_ops(&mut sink, &meta, &mut batch, None, &mut None);
+        assert!(
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "nsfwLevel" && *v == 0),
+            "null on non-nullable field should map to 0"
+        );
     }
 }

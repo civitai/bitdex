@@ -2902,6 +2902,7 @@ mod tests {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             });
             let field = fi.get_field_mut(name).unwrap();
             for (value, slots) in *values {

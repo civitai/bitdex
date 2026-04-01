@@ -34,6 +34,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "tagIds".to_string(),
@@ -42,6 +43,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "userId".to_string(),
@@ -50,6 +52,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "modelVersionIds".to_string(),
@@ -58,6 +61,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "onSite".to_string(),
@@ -66,6 +70,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "hasMeta".to_string(),
@@ -74,6 +79,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "type".to_string(),
@@ -82,6 +88,7 @@ fn civitai_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
         ],
         sort_fields: vec![
@@ -137,6 +144,7 @@ fn minimal_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "tags".to_string(),
@@ -145,6 +153,7 @@ fn minimal_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "active".to_string(),
@@ -153,6 +162,7 @@ fn minimal_config() -> Config {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
         ],
         sort_fields: vec![SortFieldConfig {

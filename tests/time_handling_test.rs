@@ -44,6 +44,7 @@ fn test_deferred_alive_far_future_invisible() {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
@@ -52,6 +53,7 @@ fn test_deferred_alive_far_future_invisible() {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
         ],
         sort_fields: vec![SortFieldConfig {
@@ -121,6 +123,7 @@ fn test_deferred_alive_past_timestamp_visible() {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "nsfwLevel".to_string(),
@@ -129,6 +132,7 @@ fn test_deferred_alive_past_timestamp_visible() {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
         ],
         sort_fields: vec![SortFieldConfig {
@@ -185,6 +189,7 @@ fn test_mixed_deferred_and_immediate() {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
         ],
         sort_fields: vec![SortFieldConfig {
@@ -282,6 +287,7 @@ fn make_bucket_engine() -> (ConcurrentEngine, u64) {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
             FilterFieldConfig {
                 name: "category".to_string(),
@@ -290,6 +296,7 @@ fn make_bucket_engine() -> (ConcurrentEngine, u64) {
                 eviction: None,
                 eager_load: false,
                 per_value_lazy: false,
+                nullable: false,
             },
         ],
         sort_fields: vec![SortFieldConfig {

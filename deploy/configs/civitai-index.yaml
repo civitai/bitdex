@@ -5,7 +5,7 @@ config:
     - { name: nsfwLevel, field_type: single_value, eager_load: true }
     - { name: userId, field_type: single_value, eager_load: true }
     - { name: type, field_type: single_value, eager_load: true }
-    - { name: baseModel, field_type: single_value, eager_load: true }
+    - { name: baseModel, field_type: single_value, eager_load: true, nullable: true }
     - { name: availability, field_type: single_value, eager_load: true }
     - { name: postId, field_type: single_value, per_value_lazy: true }
     - { name: postedToId, field_type: single_value, per_value_lazy: true }
@@ -16,7 +16,7 @@ config:
     - { name: minor, field_type: boolean }
     - { name: isPublished, field_type: boolean, eager_load: true }
     - { name: isRemix, field_type: boolean }
-    - { name: blockedFor, field_type: single_value, eager_load: true }
+    - { name: blockedFor, field_type: single_value, eager_load: true, nullable: true }
     - { name: tagIds, field_type: multi_value }
     - { name: modelVersionIds, field_type: multi_value }
     - { name: modelVersionIdsManual, field_type: multi_value }

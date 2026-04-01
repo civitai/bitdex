@@ -7698,6 +7698,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
@@ -7706,6 +7707,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
@@ -7714,6 +7716,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -8852,6 +8855,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
@@ -8860,6 +8864,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
@@ -8868,6 +8873,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -9818,6 +9824,7 @@ mod tests {
                     eviction: None,
                     eager_load: true, // <-- eager
                     per_value_lazy: false,
+                    nullable: false,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
@@ -9826,6 +9833,7 @@ mod tests {
                     eviction: None,
                     eager_load: false, // <-- lazy (default)
                     per_value_lazy: false,
+                    nullable: false,
                 },
             ],
             sort_fields: vec![
@@ -10465,6 +10473,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
                 FilterFieldConfig {
                     name: "collectionIds".to_string(),
@@ -10473,6 +10482,7 @@ mod tests {
                     eviction: None,
                     eager_load: false,
                     per_value_lazy: false,
+                    nullable: false,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
