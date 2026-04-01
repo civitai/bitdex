@@ -2222,6 +2222,16 @@ impl ConcurrentEngine {
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(sleep_duration);
 
+                    // Snapshot cursors at the START of the persist cycle.
+                    // The WAL reader keeps advancing the in-memory cursor while
+                    // we write — we must persist only the value from when this
+                    // cycle began, so on crash we replay from a consistent point.
+                    // Only written to disk if data was actually persisted this cycle
+                    // AND no write failures occurred.
+                    let cursor_snapshot_for_persist = merge_cursors.lock().clone();
+                    let mut did_persist_data = false;
+                    let mut persist_had_errors = false;
+
                     // ── Per-shard compaction ────────────────────────────────
                     // The flush thread now appends ops incrementally, so the
                     // merge thread's job is compaction (not full snapshots).
@@ -2296,15 +2306,7 @@ impl ConcurrentEngine {
                             }
                         }
 
-                        // Persist named cursors (MetaStore, unchanged)
-                        {
-                            let cursor_snapshot = merge_cursors.lock().clone();
-                            for (name, value) in &cursor_snapshot {
-                                if let Err(e) = ms_.write_cursor(name, value) {
-                                    eprintln!("merge thread: cursor write failed for {name}: {e}");
-                                }
-                            }
-                        }
+                        did_persist_data = true;
                     }
 
                     } // needs_write
@@ -2469,6 +2471,7 @@ impl ConcurrentEngine {
                                 };
                                 if let Err(e) = bs.write_meta(&meta_file) {
                                     eprintln!("merge thread: meta.bin write failed: {e}");
+                                    persist_had_errors = true;
                                 }
                             }
 
@@ -2501,6 +2504,7 @@ impl ConcurrentEngine {
 
                                 if let Err(e) = bs.write_shard(sk, &merged) {
                                     eprintln!("merge thread: shard {} write failed: {e}", sk.filename());
+                                    persist_had_errors = true;
                                 }
 
                                 all_cleaned.extend_from_slice(&per_shard_tombstones[i]);
@@ -2510,6 +2514,24 @@ impl ConcurrentEngine {
                             if !all_cleaned.is_empty() {
                                 let mut uc = merge_unified_cache.lock();
                                 uc.finalize_shard_write(&all_cleaned);
+                            }
+                            did_persist_data = true;
+                        }
+                    }
+
+                    // ── Named cursor persistence ───────────────────────────
+                    //
+                    // Write the cursor snapshot taken at the START of this cycle.
+                    // Only written if data was persisted AND no write failures
+                    // occurred. A partial persist with errors means some state
+                    // didn't make it to disk — advancing the cursor would skip
+                    // the WAL ops needed to reconstruct that state on restart.
+                    if did_persist_data && !persist_had_errors {
+                        if let Some(ref ms_) = merge_meta_store {
+                            for (name, value) in &cursor_snapshot_for_persist {
+                                if let Err(e) = ms_.write_cursor(name, value) {
+                                    eprintln!("merge thread: cursor write failed for {name}: {e}");
+                                }
                             }
                         }
                     }

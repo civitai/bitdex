@@ -1163,12 +1163,28 @@ impl BitdexServer {
         #[cfg(feature = "pg-sync")]
         let _wal_handle: Option<std::thread::JoinHandle<()>> = {
             let wal_dir = self.data_dir.join("wal");
-            let cursor_path = wal_dir.join("cursor");
             let wal_state = Arc::clone(&state);
             std::thread::Builder::new()
                 .name("wal-reader".into())
                 .spawn(move || {
-                    let cursor = crate::ops_wal::load_cursor(&cursor_path);
+                    // Load cursor from engine's named cursor system (MetaStore,
+                    // persisted by the merge thread after bitmap ops and bound
+                    // store writes, so the durable cursor never advances past
+                    // durable state).
+                    let cursor = {
+                        let engine_cursor = wal_state.index.lock()
+                            .as_ref()
+                            .and_then(|idx| idx.engine.get_cursor("wal-reader"));
+                        if let Some(ref val) = engine_cursor {
+                            let c = crate::ops_wal::WalCursor::parse(val);
+                            eprintln!("WAL reader: loaded cursor from MetaStore: {c}");
+                            c
+                        } else {
+                            let c = crate::ops_wal::WalCursor::new(0, 0);
+                            eprintln!("WAL reader: no cursor found, starting from beginning");
+                            c
+                        }
+                    };
                     let mut reader = crate::ops_wal::WalReader::new(&wal_dir, cursor);
                     eprintln!("WAL reader started (cursor={}:{}, dir={})", cursor.generation, cursor.offset, wal_dir.display());
 
@@ -1232,10 +1248,15 @@ impl BitdexServer {
                                             .inc_by(errors as u64);
                                     }
 
-                                    // Persist cursor after successful processing
-                                    if let Err(e) = crate::ops_wal::save_cursor(&cursor_path, cursor) {
-                                        eprintln!("WAL reader: failed to save cursor: {e}");
-                                    }
+                                    // Store cursor in engine's named cursor system.
+                                    // Persisted to disk by the merge thread AFTER bitmap
+                                    // ops and bound store writes, ensuring crash-consistent
+                                    // state: on restart, any unpersisted ops will be replayed
+                                    // idempotently from the WAL.
+                                    engine.set_cursor(
+                                        "wal-reader".to_string(),
+                                        cursor.serialize(),
+                                    );
 
                                     // Update metrics
                                     let m = &wal_state.metrics;
