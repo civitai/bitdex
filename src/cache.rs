@@ -112,6 +112,16 @@ impl CanonicalClause {
                     value_repr: parts.join("|"),
                 })
             }
+            FilterClause::IsNull(field) => Some(CanonicalClause {
+                field: field.clone(),
+                op: "isnull".to_string(),
+                value_repr: String::new(),
+            }),
+            FilterClause::IsNotNull(field) => Some(CanonicalClause {
+                field: field.clone(),
+                op: "isnotnull".to_string(),
+                value_repr: String::new(),
+            }),
         }
     }
 

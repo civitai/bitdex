@@ -234,6 +234,8 @@ enum Token {
     Number(f64),      // numeric literal
     True,
     False,
+    Null,             // NULL keyword
+    Is,               // IS keyword
     Eq,               // =
     NotEq,            // !=
     Gt,               // >
@@ -395,6 +397,8 @@ impl<'a> Tokenizer<'a> {
                     "NOT" | "not" => Ok(Token::Not),
                     "IN" | "in" => Ok(Token::In),
                     "TO" | "to" => Ok(Token::To),
+                    "IS" | "is" => Ok(Token::Is),
+                    "NULL" | "null" => Ok(Token::Null),
                     "true" | "TRUE" => Ok(Token::True),
                     "false" | "FALSE" => Ok(Token::False),
                     _ => Ok(Token::Ident(word.to_string())),
@@ -533,15 +537,44 @@ impl Parser {
                 let field = field.clone();
                 self.advance(); // consume field name
 
-                // Check what follows: operator, IN, NOT IN, or number (TO range)
+                // Check what follows: operator, IN, NOT IN, IS NULL, IS NOT NULL, or number (TO range)
                 match self.peek().clone() {
+                    Token::Is => {
+                        self.advance(); // consume IS
+                        if matches!(self.peek(), Token::Not) {
+                            self.advance(); // consume NOT
+                            if !matches!(self.peek(), Token::Null) {
+                                return Err(ParseError::new(
+                                    "expected 'NULL' after 'IS NOT'",
+                                ));
+                            }
+                            self.advance(); // consume NULL
+                            Ok(FilterClause::IsNotNull(field))
+                        } else if matches!(self.peek(), Token::Null) {
+                            self.advance(); // consume NULL
+                            Ok(FilterClause::IsNull(field))
+                        } else {
+                            Err(ParseError::new(
+                                "expected 'NULL' or 'NOT NULL' after 'IS'",
+                            ))
+                        }
+                    }
                     Token::Eq => {
                         self.advance();
+                        // Rewrite = null → IsNull
+                        if matches!(self.peek(), Token::Null) {
+                            self.advance(); // consume NULL
+                            return Ok(FilterClause::IsNull(field));
+                        }
                         let val = self.parse_value()?;
                         Ok(FilterClause::Eq(field, val))
                     }
                     Token::NotEq => {
                         self.advance();
+                        if matches!(self.peek(), Token::Null) {
+                            self.advance();
+                            return Ok(FilterClause::IsNotNull(field));
+                        }
                         let val = self.parse_value()?;
                         Ok(FilterClause::NotEq(field, val))
                     }
@@ -1017,6 +1050,62 @@ mod tests {
     fn test_empty_filter_string() {
         let q = parse(r#"{"filter": ""}"#).unwrap();
         assert!(q.filters.is_empty());
+    }
+
+    // === IS NULL / IS NOT NULL ===
+
+    #[test]
+    fn test_is_null() {
+        let c = parse_filter("publishedAt IS NULL").unwrap();
+        assert_eq!(c, FilterClause::IsNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_is_not_null() {
+        let c = parse_filter("publishedAt IS NOT NULL").unwrap();
+        assert_eq!(c, FilterClause::IsNotNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_is_null_lowercase() {
+        let c = parse_filter("publishedAt is null").unwrap();
+        assert_eq!(c, FilterClause::IsNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_is_not_null_lowercase() {
+        let c = parse_filter("publishedAt is not null").unwrap();
+        assert_eq!(c, FilterClause::IsNotNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_eq_null_rewrites_to_is_null() {
+        let c = parse_filter("publishedAt = null").unwrap();
+        assert_eq!(c, FilterClause::IsNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_is_null_in_and_expression() {
+        let c = parse_filter("nsfwLevel = 1 AND publishedAt IS NULL").unwrap();
+        assert_eq!(
+            c,
+            FilterClause::And(vec![
+                FilterClause::Eq("nsfwLevel".into(), Value::Integer(1)),
+                FilterClause::IsNull("publishedAt".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_is_not_null_in_or_expression() {
+        let c = parse_filter("publishedAt IS NOT NULL OR deletedAt IS NULL").unwrap();
+        assert_eq!(
+            c,
+            FilterClause::Or(vec![
+                FilterClause::IsNotNull("publishedAt".into()),
+                FilterClause::IsNull("deletedAt".into()),
+            ])
+        );
     }
 
     // === Error cases ===

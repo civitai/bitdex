@@ -3,17 +3,13 @@
 //! Generates random documents, random mutations, and random queries.
 //! After every operation, verifies that a brute-force scan produces the
 //! same result as the query engine.
-
 use std::collections::{HashMap, HashSet};
-
 use proptest::prelude::*;
-
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
 use bitdex_v2::engine::Engine;
 use bitdex_v2::filter::FilterFieldType;
 use bitdex_v2::mutation::FieldValue;
 use bitdex_v2::query::{FilterClause, SortClause, SortDirection, Value};
-
 fn test_config() -> Config {
     Config {
         filter_fields: vec![
@@ -48,12 +44,12 @@ fn test_config() -> Config {
             encoding: "linear".to_string(),
             bits: 32,
             eager_load: false,
+            computed: None,
         }],
         max_page_size: 1000,
         ..Default::default()
     }
 }
-
 fn doc(fields: &[(&str, FieldValue)]) -> bitdex_v2::mutation::Document {
     bitdex_v2::mutation::Document {
         fields: fields
@@ -62,13 +58,11 @@ fn doc(fields: &[(&str, FieldValue)]) -> bitdex_v2::mutation::Document {
             .collect(),
     }
 }
-
 /// Ground truth state that mirrors what the engine should contain.
 #[derive(Clone, Debug)]
 struct Truth {
     docs: HashMap<u32, TruthDoc>,
 }
-
 #[derive(Clone, Debug)]
 struct TruthDoc {
     category: i64,
@@ -76,26 +70,21 @@ struct TruthDoc {
     active: bool,
     score: u32,
 }
-
 impl Truth {
     fn new() -> Self {
         Self {
             docs: HashMap::new(),
         }
     }
-
     fn put(&mut self, id: u32, doc: TruthDoc) {
         self.docs.insert(id, doc);
     }
-
     fn delete(&mut self, id: u32) {
         self.docs.remove(&id);
     }
-
     fn alive_ids(&self) -> HashSet<u32> {
         self.docs.keys().cloned().collect()
     }
-
     fn query_eq_category(&self, cat: i64) -> HashSet<u32> {
         self.docs
             .iter()
@@ -103,7 +92,6 @@ impl Truth {
             .map(|(&id, _)| id)
             .collect()
     }
-
     fn query_eq_tag(&self, tag: i64) -> HashSet<u32> {
         self.docs
             .iter()
@@ -111,7 +99,6 @@ impl Truth {
             .map(|(&id, _)| id)
             .collect()
     }
-
     fn query_active(&self, active: bool) -> HashSet<u32> {
         self.docs
             .iter()
@@ -119,7 +106,6 @@ impl Truth {
             .map(|(&id, _)| id)
             .collect()
     }
-
     fn sorted_desc(&self, ids: &HashSet<u32>, limit: usize) -> Vec<u32> {
         let mut entries: Vec<(u32, u32)> = ids
             .iter()
@@ -129,7 +115,6 @@ impl Truth {
         entries.into_iter().take(limit).map(|(id, _)| id).collect()
     }
 }
-
 /// Strategy for generating a random document.
 fn arb_truth_doc() -> impl Strategy<Value = TruthDoc> {
     (
@@ -145,7 +130,6 @@ fn arb_truth_doc() -> impl Strategy<Value = TruthDoc> {
             score,
         })
 }
-
 /// Strategy for generating a batch of documents with IDs.
 fn arb_doc_batch(count: usize) -> impl Strategy<Value = Vec<(u32, TruthDoc)>> {
     prop::collection::vec(arb_truth_doc(), count).prop_map(|docs| {
@@ -155,7 +139,6 @@ fn arb_doc_batch(count: usize) -> impl Strategy<Value = Vec<(u32, TruthDoc)>> {
             .collect()
     })
 }
-
 fn put_truth_doc(engine: &mut Engine, id: u32, td: &TruthDoc) {
     let tag_values: Vec<Value> = td.tags.iter().map(|&t| Value::Integer(t)).collect();
     engine
@@ -176,7 +159,6 @@ fn put_truth_doc(engine: &mut Engine, id: u32, td: &TruthDoc) {
         )
         .unwrap();
 }
-
 fn engine_query_eq(engine: &Engine, field: &str, val: Value) -> HashSet<u32> {
     engine
         .query(&[FilterClause::Eq(field.to_string(), val)], None, 1000)
@@ -186,28 +168,22 @@ fn engine_query_eq(engine: &Engine, field: &str, val: Value) -> HashSet<u32> {
         .map(|&id| id as u32)
         .collect()
 }
-
 // ===========================================================================
 // Property tests
 // ===========================================================================
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(20))]
-
     /// After inserting N random documents, every EQ filter query matches brute-force.
     #[test]
     fn prop_insert_then_filter_eq(docs in arb_doc_batch(50)) {
         let mut engine = Engine::new(test_config()).unwrap();
         let mut truth = Truth::new();
-
         for (id, td) in &docs {
             put_truth_doc(&mut engine, *id, td);
             truth.put(*id, td.clone());
         }
-
         // Check alive count
         prop_assert_eq!(engine.alive_count(), truth.alive_ids().len() as u64);
-
         // Spot-check category filter for each category 1-10
         for cat in 1..=10i64 {
             let engine_ids = engine_query_eq(&engine, "category", Value::Integer(cat));
@@ -215,7 +191,6 @@ proptest! {
             prop_assert_eq!(engine_ids, truth_ids,
                 "Category EQ mismatch for cat={}", cat);
         }
-
         // Spot-check active filter
         for active in [true, false] {
             let engine_ids = engine_query_eq(&engine, "active", Value::Bool(active));
@@ -224,7 +199,6 @@ proptest! {
                 "Active EQ mismatch for active={}", active);
         }
     }
-
     /// Insert N docs, delete some, verify filters still match brute-force.
     #[test]
     fn prop_insert_delete_filter(
@@ -233,12 +207,10 @@ proptest! {
     ) {
         let mut engine = Engine::new(test_config()).unwrap();
         let mut truth = Truth::new();
-
         for (id, td) in &docs {
             put_truth_doc(&mut engine, *id, td);
             truth.put(*id, td.clone());
         }
-
         // Delete some docs (deduplicate indices)
         let to_delete: HashSet<usize> = delete_indices.into_iter().collect();
         for &idx in &to_delete {
@@ -250,15 +222,12 @@ proptest! {
                 }
             }
         }
-
         // Verify alive count
         prop_assert_eq!(engine.alive_count(), truth.alive_ids().len() as u64);
-
         // Verify all-alive query
         let all = engine.query(&[], None, 1000).unwrap();
         let all_ids: HashSet<u32> = all.ids.iter().map(|&id| id as u32).collect();
         prop_assert_eq!(all_ids, truth.alive_ids());
-
         // Verify category filters
         for cat in 1..=10i64 {
             let engine_ids = engine_query_eq(&engine, "category", Value::Integer(cat));
@@ -267,7 +236,6 @@ proptest! {
                 "After deletion, category EQ mismatch for cat={}", cat);
         }
     }
-
     /// Insert, then upsert some docs, verify state is correct.
     #[test]
     fn prop_insert_upsert_filter(
@@ -276,22 +244,18 @@ proptest! {
     ) {
         let mut engine = Engine::new(test_config()).unwrap();
         let mut truth = Truth::new();
-
         // Initial insert
         for (id, td) in &initial {
             put_truth_doc(&mut engine, *id, td);
             truth.put(*id, td.clone());
         }
-
         // Upsert with new values
         for (id, td) in &updates {
             put_truth_doc(&mut engine, *id, td);
             truth.put(*id, td.clone());
         }
-
         // Verify
         prop_assert_eq!(engine.alive_count(), truth.alive_ids().len() as u64);
-
         for cat in 1..=10i64 {
             let engine_ids = engine_query_eq(&engine, "category", Value::Integer(cat));
             let truth_ids = truth.query_eq_category(cat);
@@ -299,18 +263,15 @@ proptest! {
                 "After upsert, category EQ mismatch for cat={}", cat);
         }
     }
-
     /// Sort results must match naive sort for random data.
     #[test]
     fn prop_sort_matches_naive(docs in arb_doc_batch(50)) {
         let mut engine = Engine::new(test_config()).unwrap();
         let mut truth = Truth::new();
-
         for (id, td) in &docs {
             put_truth_doc(&mut engine, *id, td);
             truth.put(*id, td.clone());
         }
-
         // Query all active=true docs, sorted by score desc, limit 20
         let result = engine
             .query(
@@ -322,26 +283,21 @@ proptest! {
                 20,
             )
             .unwrap();
-
         let engine_order: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
         let truth_ids = truth.query_active(true);
         let truth_order = truth.sorted_desc(&truth_ids, 20);
-
         prop_assert_eq!(engine_order, truth_order,
             "Sort order mismatch for random data");
     }
-
     /// Cursor pagination must cover all results exactly once.
     #[test]
     fn prop_cursor_completeness(docs in arb_doc_batch(30)) {
         let mut engine = Engine::new(test_config()).unwrap();
         let mut truth = Truth::new();
-
         for (id, td) in &docs {
             put_truth_doc(&mut engine, *id, td);
             truth.put(*id, td.clone());
         }
-
         let sort = SortClause {
             field: "score".to_string(),
             direction: SortDirection::Desc,
@@ -349,7 +305,6 @@ proptest! {
         let page_size = 7;
         let mut all_ids: Vec<i64> = Vec::new();
         let mut cursor = None;
-
         loop {
             let query = bitdex_v2::query::BitdexQuery {
                 filters: vec![],
@@ -365,17 +320,14 @@ proptest! {
             }
             all_ids.extend(&result.ids);
             cursor = result.cursor;
-
             if all_ids.len() > 200 {
                 prop_assert!(false, "Pagination loop exceeded expected count");
             }
         }
-
         let unique: HashSet<i64> = all_ids.iter().cloned().collect();
         prop_assert_eq!(all_ids.len(), unique.len(), "Duplicates in pagination");
         prop_assert_eq!(all_ids.len(), truth.alive_ids().len(), "Missing docs in pagination");
     }
-
     /// Mixed mutations: insert, delete, re-insert. State should always be consistent.
     #[test]
     fn prop_mixed_mutations_consistency(
@@ -385,13 +337,11 @@ proptest! {
     ) {
         let mut engine = Engine::new(test_config()).unwrap();
         let mut truth = Truth::new();
-
         // Phase 1: insert all
         for (id, td) in &initial {
             put_truth_doc(&mut engine, *id, td);
             truth.put(*id, td.clone());
         }
-
         // Phase 2: delete based on mask
         for (i, &should_delete) in delete_mask.iter().enumerate() {
             if should_delete && i < initial.len() {
@@ -402,20 +352,16 @@ proptest! {
                 }
             }
         }
-
         // Phase 3: re-insert (upsert) with new values
         for (id, td) in &replacements {
             put_truth_doc(&mut engine, *id, td);
             truth.put(*id, td.clone());
         }
-
         // Verify
         prop_assert_eq!(engine.alive_count(), truth.alive_ids().len() as u64);
-
         let all = engine.query(&[], None, 1000).unwrap();
         let all_ids: HashSet<u32> = all.ids.iter().map(|&id| id as u32).collect();
         prop_assert_eq!(all_ids, truth.alive_ids());
-
         for cat in 1..=10i64 {
             let engine_ids = engine_query_eq(&engine, "category", Value::Integer(cat));
             let truth_ids = truth.query_eq_category(cat);
@@ -423,22 +369,18 @@ proptest! {
         }
     }
 }
-
 // ===========================================================================
 // S1.7: VersionedBitmap property tests
 // ===========================================================================
-
 use std::sync::Arc;
 use bitdex_v2::versioned_bitmap::VersionedBitmap;
 use roaring::RoaringBitmap;
-
 /// Operation on a VersionedBitmap: insert or remove a bit.
 #[derive(Clone, Debug)]
 enum VbOp {
     Insert(u32),
     Remove(u32),
 }
-
 fn arb_vb_ops(max_ops: usize) -> impl Strategy<Value = Vec<VbOp>> {
     prop::collection::vec(
         prop::strategy::Union::new(vec![
@@ -448,7 +390,6 @@ fn arb_vb_ops(max_ops: usize) -> impl Strategy<Value = Vec<VbOp>> {
         0..max_ops,
     )
 }
-
 /// Apply ops to a VersionedBitmap and also to a reference HashSet, return both.
 fn apply_ops(base_bits: &[u32], ops: &[VbOp]) -> (VersionedBitmap, HashSet<u32>) {
     let mut base = RoaringBitmap::new();
@@ -472,10 +413,8 @@ fn apply_ops(base_bits: &[u32], ops: &[VbOp]) -> (VersionedBitmap, HashSet<u32>)
     }
     (vb, truth)
 }
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
-
     /// apply_diff(universe) produces the same bitmap as merge() then base().
     #[test]
     fn prop_vb_apply_diff_matches_merge(
@@ -483,22 +422,18 @@ proptest! {
         ops in arb_vb_ops(100),
     ) {
         let (vb, _truth) = apply_ops(&base_bits, &ops);
-
         // Full universe: 0..1000
         let mut universe = RoaringBitmap::new();
         for i in 0..1000u32 {
             universe.insert(i);
         }
         let via_apply = vb.apply_diff(&universe);
-
         let mut merged = vb.clone();
         merged.merge();
         let via_merge = merged.base().as_ref().clone();
-
         prop_assert_eq!(via_apply, via_merge,
             "apply_diff(universe) != merge+base");
     }
-
     /// fused() produces the same result as merge() then base().
     #[test]
     fn prop_vb_fused_matches_merge(
@@ -506,17 +441,13 @@ proptest! {
         ops in arb_vb_ops(100),
     ) {
         let (vb, _truth) = apply_ops(&base_bits, &ops);
-
         let via_fused = vb.fused();
-
         let mut merged = vb.clone();
         merged.merge();
         let via_merge = merged.base().as_ref().clone();
-
         prop_assert_eq!(via_fused, via_merge,
             "fused() != merge+base");
     }
-
     /// merge() is idempotent: merging twice yields the same result.
     #[test]
     fn prop_vb_merge_idempotent(
@@ -524,17 +455,13 @@ proptest! {
         ops in arb_vb_ops(100),
     ) {
         let (vb, _truth) = apply_ops(&base_bits, &ops);
-
         let mut once = vb.clone();
         once.merge();
         let after_once = once.base().as_ref().clone();
-
         once.merge(); // second merge
         let after_twice = once.base().as_ref().clone();
-
         prop_assert_eq!(after_once, after_twice, "merge is not idempotent");
     }
-
     /// contains(bit) matches apply_diff({bit}) for every bit in range.
     #[test]
     fn prop_vb_contains_matches_apply(
@@ -542,7 +469,6 @@ proptest! {
         ops in arb_vb_ops(50),
     ) {
         let (vb, truth) = apply_ops(&base_bits, &ops);
-
         for bit in 0..200u32 {
             let via_contains = vb.contains(bit);
             let expected = truth.contains(&bit);
@@ -550,7 +476,6 @@ proptest! {
                 "contains({}) = {}, expected {}", bit, via_contains, expected);
         }
     }
-
     /// Last-write-wins: for the same bit, the final operation determines state.
     #[test]
     fn prop_vb_last_write_wins(
@@ -559,13 +484,11 @@ proptest! {
         final_op in any::<bool>(), // true = insert, false = remove
     ) {
         let (mut vb, _truth) = apply_ops(&base_bits, &[]);
-
         // Random sequence of ops on the same bit
         vb.insert(bit);
         vb.remove(bit);
         vb.insert(bit);
         vb.remove(bit);
-
         // Final operation
         if final_op {
             vb.insert(bit);

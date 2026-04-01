@@ -85,6 +85,27 @@ fn parse_filter_node(value: &JsonValue, depth: usize) -> Result<FilterClause, Pa
         .as_object()
         .ok_or_else(|| ParseError::new("filter clause must be a JSON object"))?;
 
+    // Check for IsNull / IsNotNull shorthand: { "IsNull": "fieldName" }
+    if let Some(field_val) = get_case_insensitive(obj, "IsNull") {
+        let field = field_val
+            .as_str()
+            .ok_or_else(|| ParseError::new("'IsNull' requires a field name string"))?;
+        if field.is_empty() {
+            return Err(ParseError::new("field name must not be empty"));
+        }
+        return Ok(FilterClause::IsNull(field.to_string()));
+    }
+
+    if let Some(field_val) = get_case_insensitive(obj, "IsNotNull") {
+        let field = field_val
+            .as_str()
+            .ok_or_else(|| ParseError::new("'IsNotNull' requires a field name string"))?;
+        if field.is_empty() {
+            return Err(ParseError::new("field name must not be empty"));
+        }
+        return Ok(FilterClause::IsNotNull(field.to_string()));
+    }
+
     // Check for compound operators (case-insensitive keys)
     if let Some(and_val) = get_case_insensitive(obj, "AND") {
         let clauses = parse_filter_array(and_val, depth + 1)?;
@@ -123,10 +144,20 @@ fn parse_filter_node(value: &JsonValue, depth: usize) -> Result<FilterClause, Pa
         .ok_or_else(|| ParseError::new(format!("filter on '{field_name}' requires an 'op' string")))?;
 
     match op {
+        "is_null" => {
+            return Ok(FilterClause::IsNull(field_name.to_string()));
+        }
+        "is_not_null" => {
+            return Ok(FilterClause::IsNotNull(field_name.to_string()));
+        }
         "eq" => {
             let raw_val = obj.get("value").ok_or_else(|| {
                 ParseError::new(format!("'{op}' on '{field_name}' requires a 'value'"))
             })?;
+            // Rewrite eq + null → IsNull
+            if raw_val.is_null() {
+                return Ok(FilterClause::IsNull(field_name.to_string()));
+            }
             let val = json_to_value(raw_val)?;
             Ok(FilterClause::Eq(field_name.to_string(), val))
         }
@@ -134,8 +165,12 @@ fn parse_filter_node(value: &JsonValue, depth: usize) -> Result<FilterClause, Pa
             let raw_val = obj.get("value").ok_or_else(|| {
                 ParseError::new(format!("'{op}' on '{field_name}' requires a 'value'"))
             })?;
-            let val = json_to_value(raw_val)?;
-            Ok(FilterClause::NotEq(field_name.to_string(), val))
+            if raw_val.is_null() {
+                Ok(FilterClause::IsNotNull(field_name.to_string()))
+            } else {
+                let val = json_to_value(raw_val)?;
+                Ok(FilterClause::NotEq(field_name.to_string(), val))
+            }
         }
         "in" => {
             let raw_arr = obj
@@ -176,7 +211,7 @@ fn parse_filter_node(value: &JsonValue, depth: usize) -> Result<FilterClause, Pa
             Ok(FilterClause::Lte(field_name.to_string(), val))
         }
         other => Err(ParseError::new(format!(
-            "unsupported operator '{other}'; expected one of: eq, not_eq, in, gt, lt, gte, lte"
+            "unsupported operator '{other}'; expected one of: eq, not_eq, in, gt, lt, gte, lte, is_null, is_not_null"
         ))),
     }
 }
@@ -642,10 +677,34 @@ mod tests {
     }
 
     #[test]
-    fn test_null_value_rejected() {
-        let err =
-            parse(r#"{"filters": {"field": "x", "op": "eq", "value": null}}"#).unwrap_err();
-        assert!(err.message.contains("null"));
+    fn test_eq_null_rewrites_to_is_null() {
+        // eq with null value is a shorthand for IsNull
+        let q = parse(r#"{"filters": {"field": "x", "op": "eq", "value": null}}"#).unwrap();
+        assert_eq!(q.filters[0], FilterClause::IsNull("x".into()));
+    }
+
+    #[test]
+    fn test_is_null_op() {
+        let q = parse(r#"{"filters": {"field": "publishedAt", "op": "is_null"}}"#).unwrap();
+        assert_eq!(q.filters[0], FilterClause::IsNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_is_not_null_op() {
+        let q = parse(r#"{"filters": {"field": "publishedAt", "op": "is_not_null"}}"#).unwrap();
+        assert_eq!(q.filters[0], FilterClause::IsNotNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_is_null_shorthand() {
+        let q = parse(r#"{"filters": {"IsNull": "publishedAt"}}"#).unwrap();
+        assert_eq!(q.filters[0], FilterClause::IsNull("publishedAt".into()));
+    }
+
+    #[test]
+    fn test_is_not_null_shorthand() {
+        let q = parse(r#"{"filters": {"IsNotNull": "publishedAt"}}"#).unwrap();
+        assert_eq!(q.filters[0], FilterClause::IsNotNull("publishedAt".into()));
     }
 
     #[test]

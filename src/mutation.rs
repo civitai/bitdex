@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-
 use roaring::RoaringBitmap;
-
 use crate::config::{ComputedOp, ComputedField, Config};
 use crate::shard_store_doc::{DocStoreV3, StoredDoc};
 use crate::error::{BitdexError, Result};
@@ -11,7 +9,6 @@ use crate::query::Value;
 use crate::slot::SlotAllocator;
 use crate::sort::SortIndex;
 use crate::write_coalescer::MutationOp;
-
 /// A document mutation payload for PUT operations.
 /// Contains field name -> value mappings for both filter and sort fields.
 /// Bitdex does NOT store these values; they are consumed to set bitmap bits.
@@ -19,7 +16,6 @@ use crate::write_coalescer::MutationOp;
 pub struct Document {
     pub fields: HashMap<String, FieldValue>,
 }
-
 /// A field value in a mutation payload.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum FieldValue {
@@ -28,14 +24,12 @@ pub enum FieldValue {
     /// Multiple values for multi_value fields (e.g., tags).
     Multi(Vec<Value>),
 }
-
 /// A partial update payload for PATCH operations.
 /// Contains only the changed fields with old and new values.
 #[derive(Debug, Clone)]
 pub struct PatchPayload {
     pub fields: HashMap<String, PatchField>,
 }
-
 /// A single field change in a PATCH operation.
 /// Both old and new values come from the WAL event -- we never look up stored state.
 #[derive(Debug, Clone)]
@@ -43,14 +37,12 @@ pub struct PatchField {
     pub old: FieldValue,
     pub new: FieldValue,
 }
-
 /// Registry of interned field names. Built once from Config at engine construction.
 /// Cloning an Arc<str> is just an atomic increment -- essentially free.
 #[derive(Debug, Clone)]
 pub struct FieldRegistry {
     fields: HashMap<String, Arc<str>>,
 }
-
 impl FieldRegistry {
     /// Build a FieldRegistry from a Config, interning all filter and sort field names.
     pub fn from_config(config: &Config) -> Self {
@@ -67,7 +59,6 @@ impl FieldRegistry {
         }
         Self { fields }
     }
-
     /// Get the interned Arc<str> for a field name, or create one on the fly.
     pub fn get(&self, name: &str) -> Arc<str> {
         self.fields
@@ -76,7 +67,6 @@ impl FieldRegistry {
             .unwrap_or_else(|| Arc::from(name))
     }
 }
-
 /// Pure diff function: given old doc (if any), new doc, config, field registry, and slot ID,
 /// returns the list of MutationOps needed to update bitmaps.
 ///
@@ -108,7 +98,6 @@ pub fn diff_document(
                     .as_secs();
                 if activate_at > now {
                     let mut ops = Vec::new();
-
                     // If this is an upsert (old doc exists with live bitmaps),
                     // we must clear all old filter/sort bits and the alive bit.
                     // Otherwise the document stays visible with stale data until
@@ -141,7 +130,6 @@ pub fn diff_document(
                         }
                         ops.push(MutationOp::AliveRemove { slots: vec![slot] });
                     }
-
                     ops.push(MutationOp::DeferredAlive {
                         slot,
                         activate_at,
@@ -151,25 +139,19 @@ pub fn diff_document(
             }
         }
     }
-
     let mut ops = Vec::new();
-
     if is_upsert {
         // Upsert: diff old vs new, only emit ops for changed fields
         let empty_fields = HashMap::new();
         let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
-
         for filter_config in &config.filter_fields {
             let field_name = &filter_config.name;
             let old_val = old_fields.get(field_name);
             let new_val = new_doc.fields.get(field_name);
-
             if field_values_equal(old_val, new_val) {
                 continue;
             }
-
             let arc_name = registry.get(field_name);
-
             // Clear old filter bits
             if let Some(old) = old_val {
                 collect_filter_remove_ops(&mut ops, &arc_name, slot, old);
@@ -179,7 +161,6 @@ pub fn diff_document(
                 collect_filter_insert_ops(&mut ops, &arc_name, slot, new);
             }
         }
-
         for sort_config in &config.sort_fields {
             let (old_sort, new_sort) = if let Some(ref computed) = sort_config.computed {
                 // Computed sort field: resolve value from source fields
@@ -189,11 +170,9 @@ pub fn diff_document(
                 let field_name = &sort_config.name;
                 let old_val = old_fields.get(field_name);
                 let new_val = new_doc.fields.get(field_name);
-
                 if field_values_equal(old_val, new_val) {
                     continue;
                 }
-
                 let old_s = old_val.and_then(|v| match v {
                     FieldValue::Single(val) => value_to_sort_u32(val),
                     _ => None,
@@ -204,11 +183,9 @@ pub fn diff_document(
                 });
                 (old_s, new_s)
             };
-
             if old_sort == new_sort {
                 continue;
             }
-
             let arc_name = registry.get(&sort_config.name);
             let num_bits = sort_config.bits as usize;
             emit_sort_diff_ops(&mut ops, &arc_name, num_bits, slot, old_sort, new_sort);
@@ -242,7 +219,6 @@ pub fn diff_document(
                 }
             }
         }
-
         // Set all new bitmaps
         for filter_config in &config.filter_fields {
             if let Some(field_value) = new_doc.fields.get(&filter_config.name) {
@@ -264,7 +240,6 @@ pub fn diff_document(
                     _ => None,
                 })
             };
-
             if let Some(sort_val) = sort_val {
                 let arc_name = registry.get(&sort_config.name);
                 let num_bits = sort_config.bits as usize;
@@ -280,14 +255,11 @@ pub fn diff_document(
             }
         }
     }
-
     // Alive insert (for both fresh insert and upsert -- idempotent).
     // If we reach here, the document is not deferred (checked at top of function).
     ops.push(MutationOp::AliveInsert { slots: vec![slot] });
-
     ops
 }
-
 /// Pure diff for partial update (PATCH): like diff_document upsert path,
 /// but ONLY processes fields present in new_doc. Missing fields are skipped
 /// entirely — they are NOT treated as deletions. This is the key difference
@@ -317,7 +289,6 @@ pub fn diff_document_partial(
                     let mut ops = Vec::new();
                     let empty_fields = HashMap::new();
                     let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
-
                     // Clear old bitmaps if this was a live slot
                     for filter_config in &config.filter_fields {
                         if let Some(old_val) = old_fields.get(&filter_config.name) {
@@ -351,11 +322,9 @@ pub fn diff_document_partial(
             }
         }
     }
-
     let mut ops = Vec::new();
     let empty_fields = HashMap::new();
     let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
-
     for filter_config in &config.filter_fields {
         let field_name = &filter_config.name;
         // PATCH semantics: skip fields not in the new doc
@@ -364,11 +333,9 @@ pub fn diff_document_partial(
             None => continue,
         };
         let old_val = old_fields.get(field_name);
-
         if field_values_equal(old_val, new_val) {
             continue;
         }
-
         let arc_name = registry.get(field_name);
         if let Some(old) = old_val {
             collect_filter_remove_ops(&mut ops, &arc_name, slot, old);
@@ -377,7 +344,6 @@ pub fn diff_document_partial(
             collect_filter_insert_ops(&mut ops, &arc_name, slot, new);
         }
     }
-
     for sort_config in &config.sort_fields {
         let (old_sort, new_sort) = if let Some(ref computed) = sort_config.computed {
             // Computed sort field: check if any source field is in the PATCH
@@ -395,11 +361,9 @@ pub fn diff_document_partial(
                 None => continue,
             };
             let old_val = old_fields.get(field_name);
-
             if field_values_equal(old_val, new_val) {
                 continue;
             }
-
             let old_s = old_val.and_then(|v| match v {
                 FieldValue::Single(val) => value_to_sort_u32(val),
                 _ => None,
@@ -410,19 +374,15 @@ pub fn diff_document_partial(
             });
             (old_s, new_s)
         };
-
         if old_sort == new_sort {
             continue;
         }
-
         let arc_name = registry.get(&sort_config.name);
         let num_bits = sort_config.bits as usize;
         emit_sort_diff_ops(&mut ops, &arc_name, num_bits, slot, old_sort, new_sort);
     }
-
     ops
 }
-
 /// Pure diff for PATCH: given old/new field values, returns MutationOps.
 pub fn diff_patch(
     slot: u32,
@@ -431,17 +391,14 @@ pub fn diff_patch(
     registry: &FieldRegistry,
 ) -> Vec<MutationOp> {
     let mut ops = Vec::new();
-
     for (field_name, change) in &patch.fields {
         let arc_name = registry.get(field_name);
-
         // Check if this is a filter field
         let is_filter = config.filter_fields.iter().any(|f| f.name == *field_name);
         if is_filter {
             collect_filter_remove_ops(&mut ops, &arc_name, slot, &change.old);
             collect_filter_insert_ops(&mut ops, &arc_name, slot, &change.new);
         }
-
         // Check if this is a sort field
         if let Some(sort_config) = config.sort_fields.iter().find(|s| s.name == *field_name) {
             if let (FieldValue::Single(old_val), FieldValue::Single(new_val)) =
@@ -473,10 +430,8 @@ pub fn diff_patch(
             }
         }
     }
-
     ops
 }
-
 /// Collect FilterRemove ops for a field value.
 pub fn collect_filter_remove_ops(
     ops: &mut Vec<MutationOp>,
@@ -507,7 +462,6 @@ pub fn collect_filter_remove_ops(
         }
     }
 }
-
 /// Collect FilterInsert ops for a field value.
 fn collect_filter_insert_ops(
     ops: &mut Vec<MutationOp>,
@@ -538,7 +492,6 @@ fn collect_filter_insert_ops(
         }
     }
 }
-
 /// Compare two optional FieldValues for equality (public for reuse).
 fn field_values_equal(a: Option<&FieldValue>, b: Option<&FieldValue>) -> bool {
     match (a, b) {
@@ -551,7 +504,6 @@ fn field_values_equal(a: Option<&FieldValue>, b: Option<&FieldValue>) -> bool {
         _ => false,
     }
 }
-
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(a), Value::Integer(b)) => a == b,
@@ -561,16 +513,18 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         _ => false,
     }
 }
-
 /// Convert a Value to a u64 bitmap key for filter indexing.
 pub fn value_to_bitmap_key(val: &Value) -> Option<u64> {
     match val {
         Value::Bool(b) => Some(if *b { 1 } else { 0 }),
-        Value::Integer(v) => Some(*v as u64),
+        Value::Integer(v) => {
+            let key = *v as u64;
+            // Guard: -1i64 as u64 == u64::MAX == NULL_BITMAP_KEY. Reject it.
+            if key == crate::filter::NULL_BITMAP_KEY { None } else { Some(key) }
+        }
         Value::Float(_) | Value::String(_) => None,
     }
 }
-
 /// Convert a Value to a u32 for sort layer bit decomposition.
 pub fn value_to_sort_u32(val: &Value) -> Option<u32> {
     match val {
@@ -578,7 +532,6 @@ pub fn value_to_sort_u32(val: &Value) -> Option<u32> {
         _ => None,
     }
 }
-
 /// Extract a u32 sort value from a field in a field map.
 fn field_to_sort_u32(fields: &HashMap<String, FieldValue>, name: &str) -> Option<u32> {
     fields.get(name).and_then(|fv| match fv {
@@ -586,7 +539,6 @@ fn field_to_sort_u32(fields: &HashMap<String, FieldValue>, name: &str) -> Option
         _ => None,
     })
 }
-
 /// Resolve old and new computed sort values from source fields.
 /// For each source field, reads from new_fields if present, else old_fields.
 fn resolve_computed_sort(
@@ -601,11 +553,9 @@ fn resolve_computed_sort(
         // Changed if new_fields has this field and it differs from old
         new_val.is_some() && !field_values_equal(old_val, new_val)
     });
-
     if !any_changed {
         return (None, None); // Caller will see equal values and skip
     }
-
     // Compute old value from old_fields
     let old_values: Vec<u32> = computed.source_fields.iter()
         .filter_map(|f| field_to_sort_u32(old_fields, f))
@@ -615,7 +565,6 @@ fn resolve_computed_sort(
     } else {
         Some(apply_computed_op(&computed.op, &old_values))
     };
-
     // Compute new value: use new_fields if field is present, else fall back to old_fields
     let new_values: Vec<u32> = computed.source_fields.iter()
         .filter_map(|f| {
@@ -628,10 +577,8 @@ fn resolve_computed_sort(
     } else {
         Some(apply_computed_op(&computed.op, &new_values))
     };
-
     (old_computed, new_computed)
 }
-
 /// Apply a computed operation to a set of u32 values.
 pub fn apply_computed_op(op: &ComputedOp, values: &[u32]) -> u32 {
     match op {
@@ -639,7 +586,6 @@ pub fn apply_computed_op(op: &ComputedOp, values: &[u32]) -> u32 {
         ComputedOp::Least => values.iter().copied().min().unwrap_or(0),
     }
 }
-
 /// Emit sort layer set/clear ops for a value change on a single slot.
 fn emit_sort_diff_ops(
     ops: &mut Vec<MutationOp>,
@@ -693,7 +639,6 @@ fn emit_sort_diff_ops(
         (None, None) => {}
     }
 }
-
 /// The core mutation engine. Applies PUT/PATCH/DELETE/DELETE WHERE to bitmaps.
 pub struct MutationEngine<'a> {
     slots: &'a mut SlotAllocator,
@@ -702,7 +647,6 @@ pub struct MutationEngine<'a> {
     config: &'a Config,
     docstore: &'a mut DocStoreV3,
 }
-
 impl<'a> MutationEngine<'a> {
     pub fn new(
         slots: &'a mut SlotAllocator,
@@ -719,7 +663,6 @@ impl<'a> MutationEngine<'a> {
             docstore,
         }
     }
-
     /// PUT(id, document) -- full replace with upsert semantics.
     ///
     /// If slot is alive (upsert): read old doc from docstore, diff each field,
@@ -730,7 +673,6 @@ impl<'a> MutationEngine<'a> {
     /// Always writes the new doc to docstore after bitmap updates.
     pub fn put(&mut self, id: u32, doc: &Document) -> Result<()> {
         let is_upsert = self.slots.is_alive(id);
-
         if is_upsert {
             // Upsert: read old doc from docstore and diff
             let old_doc = self.docstore.get(id)?;
@@ -746,30 +688,24 @@ impl<'a> MutationEngine<'a> {
                     self.clear_old_bitmaps(id, old);
                 }
             }
-
             // Set all bitmaps for the new document
             self.set_all_bitmaps(id, doc);
         }
-
         // Allocate slot (sets alive bit) -- idempotent for upserts
         self.slots.allocate(id)?;
-
         // Write new doc to docstore
         let stored = StoredDoc {
             fields: doc.fields.clone(),
             schema_version: 0,
         };
         self.docstore.put(id, &stored)?;
-
         // Eager merge: sort diffs and alive must be compacted before readers see them
         for (_name, field) in self.sorts.fields_mut() {
             field.merge_dirty();
         }
         self.slots.merge_alive();
-
         Ok(())
     }
-
     /// Diff old vs new doc and update only changed bitmaps. Used for upserts.
     fn diff_and_update(
         &mut self,
@@ -779,18 +715,15 @@ impl<'a> MutationEngine<'a> {
     ) -> Result<()> {
         let empty_fields = HashMap::new();
         let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
-
         // Process filter fields
         for filter_config in &self.config.filter_fields {
             let field_name = &filter_config.name;
             let old_val = old_fields.get(field_name);
             let new_val = new_doc.fields.get(field_name);
-
             // Skip if both are identical
             if Self::field_values_equal(old_val, new_val) {
                 continue;
             }
-
             if let Some(filter_field) = self.filters.get_field_mut(field_name) {
                 // Clear old bitmap bits
                 if let Some(old) = old_val {
@@ -802,17 +735,14 @@ impl<'a> MutationEngine<'a> {
                 }
             }
         }
-
         // Process sort fields
         for sort_config in &self.config.sort_fields {
             let field_name = &sort_config.name;
             let old_val = old_fields.get(field_name);
             let new_val = new_doc.fields.get(field_name);
-
             if Self::field_values_equal(old_val, new_val) {
                 continue;
             }
-
             if let Some(sort_field) = self.sorts.get_field_mut(field_name) {
                 let old_sort = old_val.and_then(|v| {
                     if let FieldValue::Single(val) = v {
@@ -828,7 +758,6 @@ impl<'a> MutationEngine<'a> {
                         None
                     }
                 });
-
                 match (old_sort, new_sort) {
                     (Some(old_s), Some(new_s)) => {
                         sort_field.update(id, old_s, new_s);
@@ -843,10 +772,8 @@ impl<'a> MutationEngine<'a> {
                 }
             }
         }
-
         Ok(())
     }
-
     /// Clear stale bitmaps for a dead slot being re-inserted, using the old stored doc.
     fn clear_old_bitmaps(&mut self, id: u32, old_doc: &StoredDoc) {
         for filter_config in &self.config.filter_fields {
@@ -868,7 +795,6 @@ impl<'a> MutationEngine<'a> {
             }
         }
     }
-
     /// Set all bitmaps for a fresh insert (no diffing).
     fn set_all_bitmaps(&mut self, id: u32, doc: &Document) {
         for filter_config in &self.config.filter_fields {
@@ -890,7 +816,6 @@ impl<'a> MutationEngine<'a> {
             }
         }
     }
-
     /// Compare two optional FieldValues for equality.
     fn field_values_equal(a: Option<&FieldValue>, b: Option<&FieldValue>) -> bool {
         match (a, b) {
@@ -905,7 +830,6 @@ impl<'a> MutationEngine<'a> {
             _ => false,
         }
     }
-
     /// Compare two Values for equality.
     fn values_equal(a: &Value, b: &Value) -> bool {
         match (a, b) {
@@ -916,7 +840,6 @@ impl<'a> MutationEngine<'a> {
             _ => false,
         }
     }
-
     /// Clear filter bitmap bits for a field value.
     fn clear_filter_bits(
         filter_field: &mut crate::filter::FilterField,
@@ -938,7 +861,6 @@ impl<'a> MutationEngine<'a> {
             }
         }
     }
-
     /// Set filter bitmap bits for a field value.
     fn set_filter_bits(
         filter_field: &mut crate::filter::FilterField,
@@ -960,7 +882,6 @@ impl<'a> MutationEngine<'a> {
             }
         }
     }
-
     /// PATCH(id, partial_fields) -- merge only provided fields.
     ///
     /// For each changed filter field: clear old bitmap bit, set new bitmap bit.
@@ -970,7 +891,6 @@ impl<'a> MutationEngine<'a> {
         if !self.slots.is_alive(id) {
             return Err(BitdexError::SlotNotFound(id));
         }
-
         for (field_name, change) in &patch.fields {
             // Update filter bitmaps
             if let Some(filter_field) = self.filters.get_field_mut(field_name) {
@@ -1005,7 +925,6 @@ impl<'a> MutationEngine<'a> {
                     }
                 }
             }
-
             // Update sort layer bitmaps
             if let Some(sort_field) = self.sorts.get_field_mut(field_name) {
                 if let (FieldValue::Single(old_val), FieldValue::Single(new_val)) =
@@ -1019,15 +938,12 @@ impl<'a> MutationEngine<'a> {
                 }
             }
         }
-
         // Eager merge: sort diffs must be compacted before readers see them
         for (_name, field) in self.sorts.fields_mut() {
             field.merge_dirty();
         }
-
         Ok(())
     }
-
     /// DELETE(id) -- clean delete: clear filter/sort bitmaps then alive bit.
     ///
     /// Reads the doc from the docstore to determine which bitmaps need clearing.
@@ -1046,7 +962,6 @@ impl<'a> MutationEngine<'a> {
         self.slots.merge_alive();
         Ok(())
     }
-
     /// DELETE WHERE(predicate) -- resolve predicate, clean-delete all matches.
     ///
     /// Takes a pre-computed bitmap of matching slots (the caller resolves the predicate
@@ -1071,13 +986,11 @@ impl<'a> MutationEngine<'a> {
         Ok(count)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{FilterFieldConfig, SortFieldConfig};
     use crate::filter::FilterFieldType;
-
     fn test_config() -> Config {
         Config {
             filter_fields: vec![
@@ -1131,10 +1044,8 @@ mod tests {
         for sc in &config.sort_fields {
             sorts.add_field(sc.clone());
         }
-
         (slots, filters, sorts, config, docstore)
     }
-
     fn make_doc(fields: Vec<(&str, FieldValue)>) -> Document {
         Document {
             fields: fields
@@ -1143,13 +1054,11 @@ mod tests {
                 .collect(),
         }
     }
-
     #[test]
     fn test_put_insert() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
             MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
-
         let doc = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
             (
@@ -1159,17 +1068,13 @@ mod tests {
             ("onSite", FieldValue::Single(Value::Bool(true))),
             ("reactionCount", FieldValue::Single(Value::Integer(42))),
         ]);
-
         engine.put(100, &doc).unwrap();
-
         assert!(slots.is_alive(100));
         assert_eq!(slots.alive_count(), 1);
-
         // Merge filter diffs before reading (Engine::put does this; MutationEngine does not)
         for (_name, field) in filters.fields_mut() {
             field.merge_dirty();
         }
-
         assert!(filters
             .get_field("nsfwLevel")
             .unwrap()
@@ -1194,7 +1099,6 @@ mod tests {
             .get(1)
             .unwrap()
             .contains(100));
-
         assert_eq!(
             sorts
                 .get_field("reactionCount")
@@ -1203,30 +1107,25 @@ mod tests {
             42
         );
     }
-
     #[test]
     fn test_put_upsert_replaces_old_values() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
             MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
-
         let doc1 = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
             ("reactionCount", FieldValue::Single(Value::Integer(10))),
         ]);
         engine.put(100, &doc1).unwrap();
-
         let doc2 = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
             ("reactionCount", FieldValue::Single(Value::Integer(99))),
         ]);
         engine.put(100, &doc2).unwrap();
-
         // Merge filter diffs before reading
         for (_name, field) in filters.fields_mut() {
             field.merge_dirty();
         }
-
         // Old filter value gone
         assert!(filters.get_field("nsfwLevel").unwrap().get(1).is_none()
             || !filters
@@ -1235,7 +1134,6 @@ mod tests {
                 .get(1)
                 .unwrap()
                 .contains(100));
-
         // New filter value set
         assert!(filters
             .get_field("nsfwLevel")
@@ -1243,7 +1141,6 @@ mod tests {
             .get(2)
             .unwrap()
             .contains(100));
-
         assert_eq!(
             sorts
                 .get_field("reactionCount")
@@ -1252,19 +1149,16 @@ mod tests {
             99
         );
     }
-
     #[test]
     fn test_patch_filter_field() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
             MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
-
         let doc = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
             ("reactionCount", FieldValue::Single(Value::Integer(10))),
         ]);
         engine.put(100, &doc).unwrap();
-
         let patch = PatchPayload {
             fields: vec![(
                 "nsfwLevel".to_string(),
@@ -1277,12 +1171,10 @@ mod tests {
             .collect(),
         };
         engine.patch(100, &patch).unwrap();
-
         // Merge filter diffs before reading
         for (_name, field) in filters.fields_mut() {
             field.merge_dirty();
         }
-
         assert!(filters.get_field("nsfwLevel").unwrap().get(1).is_none()
             || !filters
                 .get_field("nsfwLevel")
@@ -1290,7 +1182,6 @@ mod tests {
                 .get(1)
                 .unwrap()
                 .contains(100));
-
         assert!(filters
             .get_field("nsfwLevel")
             .unwrap()
@@ -1298,18 +1189,15 @@ mod tests {
             .unwrap()
             .contains(100));
     }
-
     #[test]
     fn test_patch_sort_field_uses_xor() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
             MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
-
         let doc = make_doc(vec![
             ("reactionCount", FieldValue::Single(Value::Integer(100))),
         ]);
         engine.put(10, &doc).unwrap();
-
         let patch = PatchPayload {
             fields: vec![(
                 "reactionCount".to_string(),
@@ -1322,7 +1210,6 @@ mod tests {
             .collect(),
         };
         engine.patch(10, &patch).unwrap();
-
         assert_eq!(
             sorts
                 .get_field("reactionCount")
@@ -1331,19 +1218,16 @@ mod tests {
             200
         );
     }
-
     #[test]
     fn test_patch_multi_value_field() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
             MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
-
         let doc = make_doc(vec![(
             "tagIds",
             FieldValue::Multi(vec![Value::Integer(100), Value::Integer(200)]),
         )]);
         engine.put(10, &doc).unwrap();
-
         let patch = PatchPayload {
             fields: vec![(
                 "tagIds".to_string(),
@@ -1356,12 +1240,10 @@ mod tests {
             .collect(),
         };
         engine.patch(10, &patch).unwrap();
-
         // Merge filter diffs before reading
         for (_name, field) in filters.fields_mut() {
             field.merge_dirty();
         }
-
         assert!(filters.get_field("tagIds").unwrap().get(100).is_none()
             || !filters
                 .get_field("tagIds")
@@ -1369,14 +1251,12 @@ mod tests {
                 .get(100)
                 .unwrap()
                 .contains(10));
-
         assert!(filters
             .get_field("tagIds")
             .unwrap()
             .get(200)
             .unwrap()
             .contains(10));
-
         assert!(filters
             .get_field("tagIds")
             .unwrap()
@@ -1384,27 +1264,22 @@ mod tests {
             .unwrap()
             .contains(10));
     }
-
     #[test]
     fn test_delete_cleans_all_bitmaps() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
         let mut engine =
             MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
-
         let doc = make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
             ("reactionCount", FieldValue::Single(Value::Integer(42))),
         ]);
         engine.put(100, &doc).unwrap();
         engine.delete(100).unwrap();
-
         assert!(!slots.is_alive(100));
-
         // Merge filter diffs before reading
         for (_name, field) in filters.fields_mut() {
             field.merge_dirty();
         }
-
         // Filter bitmap is clean — stale bit removed on delete
         assert!(
             filters.get_field("nsfwLevel").unwrap().get(1).is_none()
@@ -1415,7 +1290,6 @@ mod tests {
                     .unwrap()
                     .contains(100)
         );
-
         // Sort bitmap is clean — stale bits removed on delete
         assert_eq!(
             sorts
@@ -1425,7 +1299,6 @@ mod tests {
             0
         );
     }
-
     #[test]
     fn test_delete_nonexistent() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
@@ -1433,7 +1306,6 @@ mod tests {
             MutationEngine::new(&mut slots, &mut filters, &mut sorts, &config, &mut docstore);
         assert!(engine.delete(999).is_err());
     }
-
     #[test]
     fn test_patch_nonexistent() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
@@ -1444,11 +1316,9 @@ mod tests {
         };
         assert!(engine.patch(999, &patch).is_err());
     }
-
     #[test]
     fn test_delete_where() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup();
-
         // Insert docs
         {
             let mut engine =
@@ -1461,12 +1331,10 @@ mod tests {
                 engine.put(i, &doc).unwrap();
             }
         }
-
         // Merge filter diffs before reading
         for (_name, field) in filters.fields_mut() {
             field.merge_dirty();
         }
-
         // Get matching bitmap, then delete
         let matching = filters
             .get_field("nsfwLevel")
@@ -1479,7 +1347,6 @@ mod tests {
         let deleted = engine.delete_where(&matching).unwrap();
         assert_eq!(deleted, 5);
         assert_eq!(slots.alive_count(), 5);
-
         for i in 0..5 {
             assert!(!slots.is_alive(i));
         }
@@ -1487,11 +1354,9 @@ mod tests {
             assert!(slots.is_alive(i));
         }
     }
-
     // -----------------------------------------------------------------------
     // Computed sort field tests
     // -----------------------------------------------------------------------
-
     fn computed_config() -> Config {
         use crate::config::{ComputedField, ComputedOp};
         Config {
@@ -1544,26 +1409,21 @@ mod tests {
         }
         (slots, filters, sorts, config, docstore)
     }
-
     #[test]
     fn test_computed_sort_fresh_insert() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
         let registry = FieldRegistry::from_config(&config);
         let slot = 0u32;
-
         let mut fields = HashMap::new();
         fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
         fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
         let doc = Document { fields };
-
         let ops = diff_document(slot, None, &doc, &config, false, &registry);
-
         // Should have sort ops for existedAt=100, publishedAt=200, and sortAt=200 (GREATEST)
         let sort_at_sets: Vec<_> = ops.iter().filter(|op| matches!(op,
             MutationOp::SortSet { field, .. } if field.as_ref() == "sortAt"
         )).collect();
         assert!(!sort_at_sets.is_empty(), "Should have sortAt set ops");
-
         // Verify the computed value is 200 (max of 100, 200) by checking bit pattern
         let mut reconstructed: u32 = 0;
         for op in &ops {
@@ -1575,28 +1435,23 @@ mod tests {
         }
         assert_eq!(reconstructed, 200, "sortAt should be GREATEST(100, 200) = 200");
     }
-
     #[test]
     fn test_computed_sort_upsert_source_changes() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
         let registry = FieldRegistry::from_config(&config);
         let slot = 0u32;
-
         // Old doc: existedAt=100, publishedAt=200 → sortAt=200
         let mut old_fields = HashMap::new();
         old_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
         old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
         old_fields.insert("sortAt".into(), FieldValue::Single(Value::Integer(200)));
         let old_doc = StoredDoc { fields: old_fields, schema_version: 0 };
-
         // New doc: existedAt=300 (changed), publishedAt=200 → sortAt should become 300
         let mut new_fields = HashMap::new();
         new_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(300)));
         new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
         let new_doc = Document { fields: new_fields };
-
         let ops = diff_document(slot, Some(&old_doc), &new_doc, &config, true, &registry);
-
         // Reconstruct sortAt from ops: should have clears for old value (200) and sets for new (300)
         let mut set_bits: u32 = 0;
         let mut clear_bits: u32 = 0;
@@ -1617,26 +1472,21 @@ mod tests {
         // set_bits | clear_bits should equal the diff (all changed bits accounted for)
         assert_eq!(set_bits | clear_bits, diff, "All changed bits should have ops");
     }
-
     #[test]
     fn test_computed_sort_no_change_when_sources_unchanged() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
         let registry = FieldRegistry::from_config(&config);
         let slot = 0u32;
-
         let mut old_fields = HashMap::new();
         old_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
         old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
         let old_doc = StoredDoc { fields: old_fields, schema_version: 0 };
-
         // Same values in new doc
         let mut new_fields = HashMap::new();
         new_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
         new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
         let new_doc = Document { fields: new_fields };
-
         let ops = diff_document(slot, Some(&old_doc), &new_doc, &config, true, &registry);
-
         // Should have no sortAt ops since sources didn't change
         let sort_at_ops: Vec<_> = ops.iter().filter(|op| match op {
             MutationOp::SortSet { field, .. } | MutationOp::SortClear { field, .. } => field.as_ref() == "sortAt",
@@ -1644,26 +1494,21 @@ mod tests {
         }).collect();
         assert!(sort_at_ops.is_empty(), "No sortAt ops when sources unchanged");
     }
-
     #[test]
     fn test_computed_sort_patch_updates_computed() {
         let (mut slots, mut filters, mut sorts, config, mut docstore) = setup_computed();
         let registry = FieldRegistry::from_config(&config);
         let slot = 0u32;
-
         // Old doc with both source fields
         let mut old_fields = HashMap::new();
         old_fields.insert("existedAt".into(), FieldValue::Single(Value::Integer(100)));
         old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(200)));
         let old_doc = StoredDoc { fields: old_fields, schema_version: 0 };
-
         // PATCH only changes publishedAt to 50
         let mut new_fields = HashMap::new();
         new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(50)));
         let new_doc = Document { fields: new_fields };
-
         let ops = diff_document_partial(slot, Some(&old_doc), &new_doc, &config, &registry);
-
         // sortAt should change from GREATEST(100,200)=200 to GREATEST(100,50)=100
         let has_sort_at_ops = ops.iter().any(|op| match op {
             MutationOp::SortSet { field, .. } | MutationOp::SortClear { field, .. } => field.as_ref() == "sortAt",
@@ -1671,27 +1516,23 @@ mod tests {
         });
         assert!(has_sort_at_ops, "PATCH changing publishedAt should update sortAt");
     }
-
     #[test]
     fn test_apply_computed_op_greatest() {
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Greatest, &[10, 20, 5]), 20);
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Greatest, &[0]), 0);
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Greatest, &[]), 0);
     }
-
     #[test]
     fn test_apply_computed_op_least() {
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[10, 20, 5]), 5);
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[0]), 0);
         assert_eq!(apply_computed_op(&crate::config::ComputedOp::Least, &[]), 0);
     }
-
     #[test]
     fn test_diff_document_partial_deferred_alive() {
         use crate::config::{DeferredAliveConfig, FilterFieldConfig, SortFieldConfig};
         use crate::filter::FilterFieldType;
         use crate::write_coalescer::MutationOp;
-
         let mut config = Config::default();
         config.filter_fields = vec![FilterFieldConfig {
             name: "nsfwLevel".into(),
@@ -1713,9 +1554,7 @@ mod tests {
             source_field: "publishedAt".into(),
             ms_to_seconds: false,
         });
-
         let registry = FieldRegistry::from_config(&config);
-
         // Old doc has nsfwLevel=16 and publishedAt=1000 (alive)
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(16)));
@@ -1727,34 +1566,27 @@ mod tests {
         let mut new_fields = std::collections::HashMap::new();
         new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(future_ts)));
         let new_doc = Document { fields: new_fields };
-
         let ops = diff_document_partial(42, Some(&old_doc), &new_doc, &config, &registry);
-
         // Should contain: filter removes (clear old nsfwLevel), sort clears,
         // alive remove, and deferred alive
         let has_deferred = ops.iter().any(|op| matches!(op, MutationOp::DeferredAlive { .. }));
         let has_alive_remove = ops.iter().any(|op| matches!(op, MutationOp::AliveRemove { .. }));
-
         assert!(has_deferred, "PATCH to future publishedAt should defer alive");
         assert!(has_alive_remove, "PATCH to future should remove alive bit");
-
         // Should NOT have any filter inserts or sort sets (all bitmaps cleared)
         let has_filter_insert = ops.iter().any(|op| matches!(op, MutationOp::FilterInsert { .. }));
         assert!(!has_filter_insert, "deferred should not insert any filter bitmaps");
     }
-
     #[test]
     fn test_value_to_sort_u32_clamps_negatives() {
         // Positive values pass through
         assert_eq!(value_to_sort_u32(&Value::Integer(42)), Some(42));
         assert_eq!(value_to_sort_u32(&Value::Integer(0)), Some(0));
         assert_eq!(value_to_sort_u32(&Value::Integer(u32::MAX as i64)), Some(u32::MAX));
-
         // Negative values clamp to 0 (not wrap to u32::MAX)
         assert_eq!(value_to_sort_u32(&Value::Integer(-1)), Some(0));
         assert_eq!(value_to_sort_u32(&Value::Integer(-100)), Some(0));
         assert_eq!(value_to_sort_u32(&Value::Integer(i64::MIN)), Some(0));
-
         // Non-integer types return None
         assert_eq!(value_to_sort_u32(&Value::Bool(true)), None);
         assert_eq!(value_to_sort_u32(&Value::String("42".into())), None);

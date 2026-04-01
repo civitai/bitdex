@@ -241,6 +241,7 @@ impl FilterClause {
             FilterClause::Not(inner) => inner.field_name(),
             FilterClause::And(_) => Some("AND"),
             FilterClause::Or(_) => Some("OR"),
+            FilterClause::IsNull(f) | FilterClause::IsNotNull(f) => Some(f.as_str()),
         }
     }
 
@@ -259,6 +260,8 @@ impl FilterClause {
             FilterClause::And(..) => "And",
             FilterClause::Or(..) => "Or",
             FilterClause::BucketBitmap { .. } => "BucketBitmap",
+            FilterClause::IsNull(..) => "IsNull",
+            FilterClause::IsNotNull(..) => "IsNotNull",
         }
     }
 
@@ -284,6 +287,7 @@ impl FilterClause {
             FilterClause::And(cs) => format!("{} clauses", cs.len()),
             FilterClause::Or(cs) => format!("{} clauses", cs.len()),
             FilterClause::BucketBitmap { bucket_name, .. } => bucket_name.clone(),
+            FilterClause::IsNull(_) | FilterClause::IsNotNull(_) => String::new(),
         }
     }
 }

@@ -8,9 +8,7 @@
 //! 5. DELETE WHERE — predicate resolution + alive bitmap clearing
 //! 6. PATCH — only changed fields update, unchanged fields retain correct bits
 //! 7. Property-based tests using proptest
-
 use std::collections::{HashMap, HashSet};
-
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
 use bitdex_v2::engine::Engine;
 use bitdex_v2::filter::FilterFieldType;
@@ -18,11 +16,9 @@ use bitdex_v2::mutation::{FieldValue, PatchField, PatchPayload};
 use bitdex_v2::query::{
     BitdexQuery, CursorPosition, FilterClause, SortClause, SortDirection, Value,
 };
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
 /// Civitai-like config: 7 filter fields, 5 sort fields.
 fn civitai_config() -> Config {
     Config {
@@ -91,6 +87,7 @@ fn civitai_config() -> Config {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             },
             SortFieldConfig {
                 name: "sortAt".to_string(),
@@ -98,6 +95,7 @@ fn civitai_config() -> Config {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             },
             SortFieldConfig {
                 name: "commentCount".to_string(),
@@ -105,6 +103,7 @@ fn civitai_config() -> Config {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             },
             SortFieldConfig {
                 name: "collectedCount".to_string(),
@@ -112,6 +111,7 @@ fn civitai_config() -> Config {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             },
             SortFieldConfig {
                 name: "id".to_string(),
@@ -119,13 +119,13 @@ fn civitai_config() -> Config {
                 encoding: "linear".to_string(),
                 bits: 32,
                 eager_load: false,
+                computed: None,
             },
         ],
         max_page_size: 200,
         ..Default::default()
     }
 }
-
 /// Minimal config for focused tests.
 fn minimal_config() -> Config {
     Config {
@@ -161,12 +161,12 @@ fn minimal_config() -> Config {
             encoding: "linear".to_string(),
             bits: 32,
             eager_load: false,
+            computed: None,
         }],
         max_page_size: 100,
         ..Default::default()
     }
 }
-
 /// Build a Document from a slice of (field_name, FieldValue) pairs.
 fn doc(fields: &[(&str, FieldValue)]) -> bitdex_v2::mutation::Document {
     bitdex_v2::mutation::Document {
@@ -176,7 +176,6 @@ fn doc(fields: &[(&str, FieldValue)]) -> bitdex_v2::mutation::Document {
             .collect(),
     }
 }
-
 /// In-memory "ground truth" tracker for brute-force verification.
 /// Stores what the engine SHOULD contain after a sequence of mutations.
 struct GroundTruth {
@@ -185,7 +184,6 @@ struct GroundTruth {
     /// id -> sort field -> sort value
     sort_values: HashMap<u32, HashMap<String, u32>>,
 }
-
 impl GroundTruth {
     fn new() -> Self {
         Self {
@@ -193,11 +191,9 @@ impl GroundTruth {
             sort_values: HashMap::new(),
         }
     }
-
     fn put(&mut self, id: u32, fields: &[(&str, FieldValue)]) {
         let mut field_map: HashMap<String, Vec<i64>> = HashMap::new();
         let mut sort_map: HashMap<String, u32> = HashMap::new();
-
         for (name, fv) in fields {
             match fv {
                 FieldValue::Single(Value::Integer(v)) => {
@@ -221,20 +217,16 @@ impl GroundTruth {
                 _ => {}
             }
         }
-
         self.alive.insert(id, field_map);
         self.sort_values.insert(id, sort_map);
     }
-
     fn delete(&mut self, id: u32) {
         self.alive.remove(&id);
         self.sort_values.remove(&id);
     }
-
     fn alive_ids(&self) -> HashSet<u32> {
         self.alive.keys().cloned().collect()
     }
-
     /// Brute-force filter: return all alive IDs that match field == value.
     fn brute_eq(&self, field: &str, value: i64) -> HashSet<u32> {
         self.alive
@@ -247,13 +239,11 @@ impl GroundTruth {
             .map(|(id, _)| *id)
             .collect()
     }
-
     /// Brute-force filter: return all alive IDs that do NOT match field == value.
     fn brute_not_eq(&self, field: &str, value: i64) -> HashSet<u32> {
         let eq = self.brute_eq(field, value);
         self.alive_ids().difference(&eq).cloned().collect()
     }
-
     /// Brute-force filter: return all alive IDs matching field IN values.
     fn brute_in(&self, field: &str, values: &[i64]) -> HashSet<u32> {
         self.alive
@@ -266,7 +256,6 @@ impl GroundTruth {
             .map(|(id, _)| *id)
             .collect()
     }
-
     /// Brute-force sorted IDs for a given sort field, descending.
     fn brute_sort_desc(&self, sort_field: &str, ids: &HashSet<u32>) -> Vec<u32> {
         let mut entries: Vec<(u32, u32)> = ids
@@ -284,7 +273,6 @@ impl GroundTruth {
         entries.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
         entries.into_iter().map(|(id, _)| id).collect()
     }
-
     /// Brute-force sorted IDs for a given sort field, ascending.
     fn brute_sort_asc(&self, sort_field: &str, ids: &HashSet<u32>) -> Vec<u32> {
         let mut entries: Vec<(u32, u32)> = ids
@@ -303,16 +291,13 @@ impl GroundTruth {
         entries.into_iter().map(|(id, _)| id).collect()
     }
 }
-
 // ===========================================================================
 // 1. Filter correctness vs brute-force scan
 // ===========================================================================
-
 #[test]
 fn filter_eq_matches_brute_force() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     // Insert 100 documents with varying nsfwLevel (1-5)
     for i in 1..=100u32 {
         let nsfw = ((i % 5) + 1) as i64;
@@ -326,7 +311,6 @@ fn filter_eq_matches_brute_force() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     // Verify EQ filter for each nsfwLevel
     for level in 1..=5i64 {
         let result = engine
@@ -339,22 +323,18 @@ fn filter_eq_matches_brute_force() {
                 200,
             )
             .unwrap();
-
         let engine_ids: HashSet<u32> = result.ids.iter().map(|&id| id as u32).collect();
         let truth_ids = truth.brute_eq("nsfwLevel", level);
-
         assert_eq!(
             engine_ids, truth_ids,
             "EQ filter mismatch for nsfwLevel={level}"
         );
     }
 }
-
 #[test]
 fn filter_not_eq_matches_brute_force() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     for i in 1..=50u32 {
         let nsfw = ((i % 3) + 1) as i64;
         let fields: Vec<(&str, FieldValue)> = vec![
@@ -367,7 +347,6 @@ fn filter_not_eq_matches_brute_force() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     for level in 1..=3i64 {
         let result = engine
             .query(
@@ -379,22 +358,18 @@ fn filter_not_eq_matches_brute_force() {
                 200,
             )
             .unwrap();
-
         let engine_ids: HashSet<u32> = result.ids.iter().map(|&id| id as u32).collect();
         let truth_ids = truth.brute_not_eq("nsfwLevel", level);
-
         assert_eq!(
             engine_ids, truth_ids,
             "NOT EQ filter mismatch for nsfwLevel!={level}"
         );
     }
 }
-
 #[test]
 fn filter_in_matches_brute_force() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     for i in 1..=60u32 {
         let nsfw = ((i % 5) + 1) as i64;
         let fields: Vec<(&str, FieldValue)> = vec![
@@ -407,7 +382,6 @@ fn filter_in_matches_brute_force() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     let in_values = vec![1i64, 3, 5];
     let result = engine
         .query(
@@ -419,18 +393,14 @@ fn filter_in_matches_brute_force() {
             200,
         )
         .unwrap();
-
     let engine_ids: HashSet<u32> = result.ids.iter().map(|&id| id as u32).collect();
     let truth_ids = truth.brute_in("nsfwLevel", &in_values);
-
     assert_eq!(engine_ids, truth_ids, "IN filter mismatch");
 }
-
 #[test]
 fn filter_multi_value_eq_matches_brute_force() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     // Each doc has 2-3 tagIds
     for i in 1..=30u32 {
         let tag1 = ((i % 10) + 1) as i64;
@@ -448,7 +418,6 @@ fn filter_multi_value_eq_matches_brute_force() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     // Query for a specific tagId
     for tag in [1i64, 5, 10, 15] {
         let result = engine
@@ -458,22 +427,18 @@ fn filter_multi_value_eq_matches_brute_force() {
                 200,
             )
             .unwrap();
-
         let engine_ids: HashSet<u32> = result.ids.iter().map(|&id| id as u32).collect();
         let truth_ids = truth.brute_eq("tagIds", tag);
-
         assert_eq!(
             engine_ids, truth_ids,
             "Multi-value EQ filter mismatch for tagId={tag}"
         );
     }
 }
-
 #[test]
 fn filter_boolean_matches_brute_force() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     for i in 1..=40u32 {
         let on_site = i % 3 != 0;
         let fields: Vec<(&str, FieldValue)> = vec![
@@ -486,7 +451,6 @@ fn filter_boolean_matches_brute_force() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     // true = 1, false = 0 in bitmap key space
     let result_true = engine
         .query(
@@ -508,12 +472,10 @@ fn filter_boolean_matches_brute_force() {
             200,
         )
         .unwrap();
-
     let engine_true: HashSet<u32> = result_true.ids.iter().map(|&id| id as u32).collect();
     let engine_false: HashSet<u32> = result_false.ids.iter().map(|&id| id as u32).collect();
     let truth_true = truth.brute_eq("onSite", 1);
     let truth_false = truth.brute_eq("onSite", 0);
-
     assert_eq!(engine_true, truth_true, "Boolean TRUE filter mismatch");
     assert_eq!(engine_false, truth_false, "Boolean FALSE filter mismatch");
     // No overlap
@@ -522,12 +484,10 @@ fn filter_boolean_matches_brute_force() {
         "TRUE and FALSE results overlap"
     );
 }
-
 #[test]
 fn filter_compound_and_or_matches_brute_force() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     for i in 1..=50u32 {
         let nsfw = ((i % 5) + 1) as i64;
         let on_site = i % 2 == 0;
@@ -542,7 +502,6 @@ fn filter_compound_and_or_matches_brute_force() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     // Complex: (nsfwLevel == 1 OR nsfwLevel == 2) AND onSite == true
     let result = engine
         .query(
@@ -557,27 +516,21 @@ fn filter_compound_and_or_matches_brute_force() {
             200,
         )
         .unwrap();
-
     let engine_ids: HashSet<u32> = result.ids.iter().map(|&id| id as u32).collect();
-
     // Brute force: docs that have nsfwLevel in {1,2} AND are onSite
     let nsfw_match = truth
         .brute_in("nsfwLevel", &[1, 2]);
     let on_site_match = truth.brute_eq("onSite", 1);
     let expected: HashSet<u32> = nsfw_match.intersection(&on_site_match).cloned().collect();
-
     assert_eq!(engine_ids, expected, "Compound AND/OR filter mismatch");
 }
-
 // ===========================================================================
 // 2. Bitmap consistency after insert/update/delete sequences
 // ===========================================================================
-
 #[test]
 fn bitmap_consistency_after_mixed_mutations() {
     let mut engine = Engine::new(minimal_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     // Phase 1: Insert 20 documents
     for i in 1..=20u32 {
         let status = ((i % 4) + 1) as i64;
@@ -593,17 +546,13 @@ fn bitmap_consistency_after_mixed_mutations() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     verify_consistency(&engine, &truth, "after initial insert");
-
     // Phase 2: Delete some docs
     for &id in &[3u32, 7, 15, 19] {
         engine.delete(id).unwrap();
         truth.delete(id);
     }
-
     verify_consistency(&engine, &truth, "after deletions");
-
     // Phase 3: Upsert (re-PUT) existing docs with changed values
     for &id in &[1u32, 5, 10] {
         let fields: Vec<(&str, FieldValue)> = vec![
@@ -614,9 +563,7 @@ fn bitmap_consistency_after_mixed_mutations() {
         engine.put(id, &doc(&fields)).unwrap();
         truth.put(id, &fields);
     }
-
     verify_consistency(&engine, &truth, "after upserts");
-
     // Phase 4: Insert new docs into previously unused IDs
     for id in 21..=30u32 {
         let fields: Vec<(&str, FieldValue)> = vec![
@@ -627,10 +574,8 @@ fn bitmap_consistency_after_mixed_mutations() {
         engine.put(id, &doc(&fields)).unwrap();
         truth.put(id, &fields);
     }
-
     verify_consistency(&engine, &truth, "after new inserts");
 }
-
 fn verify_consistency(engine: &Engine, truth: &GroundTruth, phase: &str) {
     // Verify alive count
     assert_eq!(
@@ -638,7 +583,6 @@ fn verify_consistency(engine: &Engine, truth: &GroundTruth, phase: &str) {
         truth.alive_ids().len() as u64,
         "alive count mismatch {phase}"
     );
-
     // Verify all alive IDs are queryable
     let all_result = engine.query(&[], None, 1000).unwrap();
     let all_ids: HashSet<u32> = all_result.ids.iter().map(|&id| id as u32).collect();
@@ -648,16 +592,13 @@ fn verify_consistency(engine: &Engine, truth: &GroundTruth, phase: &str) {
         "alive ID set mismatch {phase}"
     );
 }
-
 // ===========================================================================
 // 3. Sort correctness vs naive sort
 // ===========================================================================
-
 #[test]
 fn sort_desc_matches_naive_sort() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     for i in 1..=50u32 {
         // Intentionally non-monotonic sort values
         let reaction_count = ((i * 7 + 13) % 1000) as i64;
@@ -671,7 +612,6 @@ fn sort_desc_matches_naive_sort() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     let sort = SortClause {
         field: "reactionCount".to_string(),
         direction: SortDirection::Desc,
@@ -686,22 +626,18 @@ fn sort_desc_matches_naive_sort() {
             50,
         )
         .unwrap();
-
     let engine_order: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
     let all_ids = truth.brute_eq("nsfwLevel", 1);
     let truth_order = truth.brute_sort_desc("reactionCount", &all_ids);
-
     assert_eq!(
         engine_order, truth_order,
         "Descending sort order mismatch vs naive sort"
     );
 }
-
 #[test]
 fn sort_asc_matches_naive_sort() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     for i in 1..=50u32 {
         let comment_count = ((i * 11 + 3) % 500) as i64;
         let fields: Vec<(&str, FieldValue)> = vec![
@@ -714,7 +650,6 @@ fn sort_asc_matches_naive_sort() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     let sort = SortClause {
         field: "commentCount".to_string(),
         direction: SortDirection::Asc,
@@ -729,22 +664,18 @@ fn sort_asc_matches_naive_sort() {
             50,
         )
         .unwrap();
-
     let engine_order: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
     let all_ids = truth.brute_eq("nsfwLevel", 1);
     let truth_order = truth.brute_sort_asc("commentCount", &all_ids);
-
     assert_eq!(
         engine_order, truth_order,
         "Ascending sort order mismatch vs naive sort"
     );
 }
-
 #[test]
 fn sort_top_n_subset_matches_naive_sort() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     for i in 1..=200u32 {
         let reaction_count = ((i * 37 + 17) % 10_000) as i64;
         let nsfw = ((i % 3) + 1) as i64;
@@ -758,7 +689,6 @@ fn sort_top_n_subset_matches_naive_sort() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     // Only request top 10 of the ~67 docs with nsfwLevel=1
     let sort = SortClause {
         field: "reactionCount".to_string(),
@@ -774,7 +704,6 @@ fn sort_top_n_subset_matches_naive_sort() {
             10,
         )
         .unwrap();
-
     let engine_order: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
     let all_ids = truth.brute_eq("nsfwLevel", 1);
     let truth_order: Vec<u32> = truth
@@ -782,18 +711,15 @@ fn sort_top_n_subset_matches_naive_sort() {
         .into_iter()
         .take(10)
         .collect();
-
     assert_eq!(
         engine_order, truth_order,
         "Top-N sort subset mismatch vs naive sort"
     );
 }
-
 #[test]
 fn sort_after_deletions_matches_naive_sort() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     for i in 1..=30u32 {
         let fields: Vec<(&str, FieldValue)> = vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
@@ -805,13 +731,11 @@ fn sort_after_deletions_matches_naive_sort() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     // Delete every third doc
     for i in (3..=30u32).step_by(3) {
         engine.delete(i).unwrap();
         truth.delete(i);
     }
-
     let sort = SortClause {
         field: "reactionCount".to_string(),
         direction: SortDirection::Desc,
@@ -826,11 +750,9 @@ fn sort_after_deletions_matches_naive_sort() {
             100,
         )
         .unwrap();
-
     let engine_order: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
     let all_ids = truth.brute_eq("nsfwLevel", 1);
     let truth_order = truth.brute_sort_desc("reactionCount", &all_ids);
-
     assert_eq!(
         engine_order, truth_order,
         "Sort after deletions mismatch"
@@ -843,15 +765,12 @@ fn sort_after_deletions_matches_naive_sort() {
         );
     }
 }
-
 // ===========================================================================
 // 4. Cursor pagination — no gaps, no duplicates
 // ===========================================================================
-
 #[test]
 fn cursor_pagination_no_gaps_no_duplicates_desc() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     for i in 1..=50u32 {
         let reaction_count = ((i * 13 + 7) % 1000) as i64;
         engine
@@ -867,16 +786,13 @@ fn cursor_pagination_no_gaps_no_duplicates_desc() {
             )
             .unwrap();
     }
-
     let sort = SortClause {
         field: "reactionCount".to_string(),
         direction: SortDirection::Desc,
     };
-
     let page_size = 7;
     let mut all_ids: Vec<i64> = Vec::new();
     let mut cursor: Option<CursorPosition> = None;
-
     // Paginate through all results
     loop {
         let query = BitdexQuery {
@@ -890,21 +806,17 @@ fn cursor_pagination_no_gaps_no_duplicates_desc() {
             offset: None,
             skip_cache: false,
         };
-
         let result = engine.execute_query(&query).unwrap();
         if result.ids.is_empty() {
             break;
         }
-
         all_ids.extend(&result.ids);
         cursor = result.cursor;
-
         // Safety: don't loop forever
         if all_ids.len() > 100 {
             panic!("Pagination loop exceeded expected count");
         }
     }
-
     // Verify no duplicates
     let unique: HashSet<i64> = all_ids.iter().cloned().collect();
     assert_eq!(
@@ -914,10 +826,8 @@ fn cursor_pagination_no_gaps_no_duplicates_desc() {
         all_ids.len(),
         unique.len()
     );
-
     // Verify completeness (all 50 docs)
     assert_eq!(all_ids.len(), 50, "Cursor pagination missed documents");
-
     // Verify ordering is monotonically non-increasing by sort value
     for window in all_ids.windows(2) {
         let a = window[0] as u32;
@@ -938,11 +848,9 @@ fn cursor_pagination_no_gaps_no_duplicates_desc() {
         );
     }
 }
-
 #[test]
 fn cursor_pagination_no_gaps_no_duplicates_asc() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     for i in 1..=50u32 {
         let score = ((i * 19 + 3) % 500) as i64;
         engine
@@ -958,16 +866,13 @@ fn cursor_pagination_no_gaps_no_duplicates_asc() {
             )
             .unwrap();
     }
-
     let sort = SortClause {
         field: "commentCount".to_string(),
         direction: SortDirection::Asc,
     };
-
     let page_size = 11;
     let mut all_ids: Vec<i64> = Vec::new();
     let mut cursor: Option<CursorPosition> = None;
-
     loop {
         let query = BitdexQuery {
             filters: vec![FilterClause::Eq(
@@ -980,29 +885,23 @@ fn cursor_pagination_no_gaps_no_duplicates_asc() {
             offset: None,
             skip_cache: false,
         };
-
         let result = engine.execute_query(&query).unwrap();
         if result.ids.is_empty() {
             break;
         }
-
         all_ids.extend(&result.ids);
         cursor = result.cursor;
-
         if all_ids.len() > 100 {
             panic!("Pagination loop exceeded expected count");
         }
     }
-
     let unique: HashSet<i64> = all_ids.iter().cloned().collect();
     assert_eq!(all_ids.len(), unique.len(), "Duplicates in ascending pagination");
     assert_eq!(all_ids.len(), 50, "Missing docs in ascending pagination");
 }
-
 #[test]
 fn cursor_page2_starts_where_page1_ended() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     for i in 1..=20u32 {
         engine
             .put(
@@ -1017,12 +916,10 @@ fn cursor_page2_starts_where_page1_ended() {
             )
             .unwrap();
     }
-
     let sort = SortClause {
         field: "reactionCount".to_string(),
         direction: SortDirection::Desc,
     };
-
     let page1 = engine
         .query(
             &[FilterClause::Eq(
@@ -1033,10 +930,8 @@ fn cursor_page2_starts_where_page1_ended() {
             5,
         )
         .unwrap();
-
     assert_eq!(page1.ids.len(), 5);
     let cursor = page1.cursor.as_ref().unwrap();
-
     let page2_query = BitdexQuery {
         filters: vec![FilterClause::Eq(
             "nsfwLevel".to_string(),
@@ -1049,7 +944,6 @@ fn cursor_page2_starts_where_page1_ended() {
         skip_cache: false,
     };
     let page2 = engine.execute_query(&page2_query).unwrap();
-
     // No overlap between pages
     let page1_set: HashSet<i64> = page1.ids.iter().cloned().collect();
     let page2_set: HashSet<i64> = page2.ids.iter().cloned().collect();
@@ -1057,7 +951,6 @@ fn cursor_page2_starts_where_page1_ended() {
         page1_set.is_disjoint(&page2_set),
         "Page 1 and Page 2 overlap"
     );
-
     // Page 2's best is worse than page 1's worst (descending)
     if let (Some(&p1_last), Some(&p2_first)) = (page1.ids.last(), page2.ids.first()) {
         let v1 = engine
@@ -1076,16 +969,13 @@ fn cursor_page2_starts_where_page1_ended() {
         );
     }
 }
-
 // ===========================================================================
 // 5. DELETE WHERE — predicate resolution + alive bitmap clearing
 // ===========================================================================
-
 #[test]
 fn delete_where_removes_correct_subset() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     for i in 1..=40u32 {
         let nsfw = if i <= 20 { 1 } else { 2 };
         let fields: Vec<(&str, FieldValue)> = vec![
@@ -1101,7 +991,6 @@ fn delete_where_removes_correct_subset() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     // Delete WHERE nsfwLevel == 1
     let deleted = engine
         .delete_where(&[FilterClause::Eq(
@@ -1109,20 +998,16 @@ fn delete_where_removes_correct_subset() {
             Value::Integer(1),
         )])
         .unwrap();
-
     assert_eq!(deleted, 20, "Expected 20 deletions");
     assert_eq!(engine.alive_count(), 20);
-
     // Update truth
     for i in 1..=20u32 {
         truth.delete(i);
     }
-
     // Verify remaining docs
     let remaining = engine.query(&[], None, 200).unwrap();
     let remaining_ids: HashSet<u32> = remaining.ids.iter().map(|&id| id as u32).collect();
     assert_eq!(remaining_ids, truth.alive_ids());
-
     // Verify deleted docs no longer appear in queries
     let nsfw1_result = engine
         .query(
@@ -1140,11 +1025,9 @@ fn delete_where_removes_correct_subset() {
         "Deleted nsfwLevel=1 docs still appear in query"
     );
 }
-
 #[test]
 fn delete_where_compound_predicate() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     for i in 1..=30u32 {
         let nsfw = ((i % 3) + 1) as i64;
         let on_site = i % 2 == 0;
@@ -1162,7 +1045,6 @@ fn delete_where_compound_predicate() {
             )
             .unwrap();
     }
-
     // Delete WHERE nsfwLevel == 1 AND onSite == true
     let deleted = engine
         .delete_where(&[
@@ -1170,11 +1052,9 @@ fn delete_where_compound_predicate() {
             FilterClause::Eq("onSite".to_string(), Value::Bool(true)),
         ])
         .unwrap();
-
     assert!(deleted > 0, "Should have deleted at least one doc");
     let total_alive = engine.alive_count();
     assert_eq!(total_alive, 30 - deleted, "Alive count mismatch after delete_where");
-
     // Verify no remaining doc matches both conditions
     let check = engine
         .query(
@@ -1192,15 +1072,12 @@ fn delete_where_compound_predicate() {
         "Docs matching the delete predicate still visible"
     );
 }
-
 // ===========================================================================
 // 6. PATCH — only changed fields update, unchanged retain correct bits
 // ===========================================================================
-
 #[test]
 fn patch_changes_only_specified_fields() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     // Insert doc with all fields
     engine
         .put(
@@ -1217,7 +1094,6 @@ fn patch_changes_only_specified_fields() {
             ]),
         )
         .unwrap();
-
     // PATCH only nsfwLevel (1 -> 28) and reactionCount (50 -> 999)
     engine
         .patch(
@@ -1244,7 +1120,6 @@ fn patch_changes_only_specified_fields() {
             },
         )
         .unwrap();
-
     // Verify changed fields
     let nsfw_old = engine
         .query(
@@ -1260,7 +1135,6 @@ fn patch_changes_only_specified_fields() {
         !nsfw_old.ids.contains(&1),
         "Old nsfwLevel=1 should not match doc 1"
     );
-
     let nsfw_new = engine
         .query(
             &[FilterClause::Eq(
@@ -1275,7 +1149,6 @@ fn patch_changes_only_specified_fields() {
         nsfw_new.ids.contains(&1),
         "New nsfwLevel=28 should match doc 1"
     );
-
     // Verify unchanged fields still work
     let tag_query = engine
         .query(
@@ -1291,7 +1164,6 @@ fn patch_changes_only_specified_fields() {
         tag_query.ids.contains(&1),
         "Unchanged tagIds should still match doc 1"
     );
-
     let on_site_query = engine
         .query(
             &[FilterClause::Eq(
@@ -1306,7 +1178,6 @@ fn patch_changes_only_specified_fields() {
         on_site_query.ids.contains(&1),
         "Unchanged onSite should still match doc 1"
     );
-
     // Verify sort value updated
     let sort_val = engine
         .sorts()
@@ -1314,7 +1185,6 @@ fn patch_changes_only_specified_fields() {
         .unwrap()
         .reconstruct_value(1);
     assert_eq!(sort_val, 999, "reactionCount should be updated to 999");
-
     // Verify unchanged sort value
     let comment_val = engine
         .sorts()
@@ -1326,11 +1196,9 @@ fn patch_changes_only_specified_fields() {
         "commentCount should be unchanged at 10"
     );
 }
-
 #[test]
 fn patch_multi_value_field_correctly_swaps() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     engine
         .put(
             1,
@@ -1347,7 +1215,6 @@ fn patch_multi_value_field_correctly_swaps() {
             ]),
         )
         .unwrap();
-
     // PATCH tagIds: remove 200, add 400
     engine
         .patch(
@@ -1373,7 +1240,6 @@ fn patch_multi_value_field_correctly_swaps() {
             },
         )
         .unwrap();
-
     // Tag 100 still present
     let r100 = engine
         .query(
@@ -1383,7 +1249,6 @@ fn patch_multi_value_field_correctly_swaps() {
         )
         .unwrap();
     assert!(r100.ids.contains(&1));
-
     // Tag 200 removed
     let r200 = engine
         .query(
@@ -1393,7 +1258,6 @@ fn patch_multi_value_field_correctly_swaps() {
         )
         .unwrap();
     assert!(!r200.ids.contains(&1));
-
     // Tag 300 still present
     let r300 = engine
         .query(
@@ -1403,7 +1267,6 @@ fn patch_multi_value_field_correctly_swaps() {
         )
         .unwrap();
     assert!(r300.ids.contains(&1));
-
     // Tag 400 added
     let r400 = engine
         .query(
@@ -1414,11 +1277,9 @@ fn patch_multi_value_field_correctly_swaps() {
         .unwrap();
     assert!(r400.ids.contains(&1));
 }
-
 #[test]
 fn patch_sort_field_xor_correctness() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     // Insert docs with known sort values
     for i in 1..=10u32 {
         engine
@@ -1434,7 +1295,6 @@ fn patch_sort_field_xor_correctness() {
             )
             .unwrap();
     }
-
     // PATCH doc 5: reactionCount 500 -> 1500 (should become the top result)
     engine
         .patch(
@@ -1452,7 +1312,6 @@ fn patch_sort_field_xor_correctness() {
             },
         )
         .unwrap();
-
     let sort = SortClause {
         field: "reactionCount".to_string(),
         direction: SortDirection::Desc,
@@ -1467,7 +1326,6 @@ fn patch_sort_field_xor_correctness() {
             3,
         )
         .unwrap();
-
     // Doc 5 should now be first (1500), then doc 10 (1000), then doc 9 (900)
     assert_eq!(
         result.ids,
@@ -1475,15 +1333,12 @@ fn patch_sort_field_xor_correctness() {
         "After PATCH, sort order should reflect new value"
     );
 }
-
 // ===========================================================================
 // 7. Additional integration scenarios
 // ===========================================================================
-
 #[test]
 fn large_multi_value_field_correctness() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     // Each doc has 20 tags
     for i in 1..=50u32 {
         let tags: Vec<Value> = (0..20u32)
@@ -1499,7 +1354,6 @@ fn large_multi_value_field_correctness() {
             )
             .unwrap();
     }
-
     // A tag that appears frequently
     let result = engine
         .query(
@@ -1508,7 +1362,6 @@ fn large_multi_value_field_correctness() {
             200,
         )
         .unwrap();
-
     // Every doc from i=31..50 has tag 50 (since (31+19)%100=50, (32+18)%100=50, etc.)
     // and i=1..20 also covers tag 50 at various offsets.
     // Just verify the count is reasonable and all returned IDs are alive
@@ -1524,11 +1377,9 @@ fn large_multi_value_field_correctness() {
         );
     }
 }
-
 #[test]
 fn upsert_clears_all_old_state() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     // First PUT with many tags
     engine
         .put(
@@ -1548,7 +1399,6 @@ fn upsert_clears_all_old_state() {
             ]),
         )
         .unwrap();
-
     // Second PUT (upsert) with completely different values
     engine
         .put(
@@ -1564,7 +1414,6 @@ fn upsert_clears_all_old_state() {
             ]),
         )
         .unwrap();
-
     // Old values should be gone
     assert_eq!(
         engine
@@ -1623,7 +1472,6 @@ fn upsert_clears_all_old_state() {
             .contains(&1),
         "Old onSite=true should be gone for doc 1"
     );
-
     // New values should be present
     assert!(
         engine
@@ -1675,7 +1523,6 @@ fn upsert_clears_all_old_state() {
             .ids
             .contains(&1)
     );
-
     // Sort value should be updated
     assert_eq!(
         engine
@@ -1686,11 +1533,9 @@ fn upsert_clears_all_old_state() {
         1
     );
 }
-
 #[test]
 fn delete_makes_stale_bits_invisible() {
     let mut engine = Engine::new(civitai_config()).unwrap();
-
     engine
         .put(
             1,
@@ -1709,10 +1554,8 @@ fn delete_makes_stale_bits_invisible() {
             ]),
         )
         .unwrap();
-
     // Delete doc 1 (the high-value one)
     engine.delete(1).unwrap();
-
     // Stale bits exist in filter and sort bitmaps, but queries should not see doc 1
     let result = engine
         .query(
@@ -1725,7 +1568,6 @@ fn delete_makes_stale_bits_invisible() {
         )
         .unwrap();
     assert_eq!(result.ids, vec![2], "Only doc 2 should be visible");
-
     // Sorted query should also not see doc 1
     let sorted = engine
         .query(
@@ -1742,15 +1584,12 @@ fn delete_makes_stale_bits_invisible() {
         .unwrap();
     assert_eq!(sorted.ids, vec![2], "Sorted query should only return doc 2");
 }
-
 #[test]
 fn json_parser_to_engine_roundtrip() {
     use bitdex_v2::query::QueryParser;
     use bitdex_v2::parser::json::JsonQueryParser;
-
     let mut engine = Engine::new(civitai_config()).unwrap();
     let parser = JsonQueryParser;
-
     for i in 1..=20u32 {
         engine
             .put(
@@ -1768,7 +1607,6 @@ fn json_parser_to_engine_roundtrip() {
             )
             .unwrap();
     }
-
     // Parse a JSON query and execute it (using the parser's expected format)
     let json = r#"{
         "filters": {
@@ -1782,10 +1620,8 @@ fn json_parser_to_engine_roundtrip() {
         },
         "limit": 5
     }"#;
-
     let query = parser.parse(json.as_bytes()).unwrap();
     let result = engine.execute_query(&query).unwrap();
-
     assert_eq!(result.ids.len(), 5);
     assert!(result.total_matched > 0);
     // Verify descending order
@@ -1803,11 +1639,9 @@ fn json_parser_to_engine_roundtrip() {
         assert!(va >= vb, "Sort order violated in JSON parser roundtrip");
     }
 }
-
 #[test]
 fn empty_query_returns_all_alive() {
     let mut engine = Engine::new(minimal_config()).unwrap();
-
     for i in 1..=15u32 {
         engine
             .put(
@@ -1819,17 +1653,14 @@ fn empty_query_returns_all_alive() {
             )
             .unwrap();
     }
-
     engine.delete(5).unwrap();
     engine.delete(10).unwrap();
-
     let result = engine.query(&[], None, 100).unwrap();
     assert_eq!(result.total_matched, 13);
     assert_eq!(result.ids.len(), 13);
     assert!(!result.ids.contains(&5));
     assert!(!result.ids.contains(&10));
 }
-
 #[test]
 fn max_page_size_caps_results() {
     let config = Config {
@@ -1837,7 +1668,6 @@ fn max_page_size_caps_results() {
         ..minimal_config()
     };
     let mut engine = Engine::new(config).unwrap();
-
     for i in 1..=20u32 {
         engine
             .put(
@@ -1849,22 +1679,18 @@ fn max_page_size_caps_results() {
             )
             .unwrap();
     }
-
     // Request 100 but should be capped to 5
     let result = engine.query(&[], None, 100).unwrap();
     assert_eq!(result.ids.len(), 5, "Should be capped to max_page_size=5");
     assert_eq!(result.total_matched, 20, "Total matched should be all 20");
 }
-
 // ===========================================================================
 // 8. Full Civitai-like workflow
 // ===========================================================================
-
 #[test]
 fn civitai_full_workflow() {
     let mut engine = Engine::new(civitai_config()).unwrap();
     let mut truth = GroundTruth::new();
-
     // Simulate Civitai image ingestion
     for i in 1..=100u32 {
         let nsfw = ((i % 5) + 1) as i64;       // 1-5
@@ -1878,7 +1704,6 @@ fn civitai_full_workflow() {
         let sort_at = (1_700_000_000 + i * 3600) as i64;
         let comment_count = ((i * 7) % 200) as i64;
         let collected_count = ((i * 3) % 50) as i64;
-
         let fields: Vec<(&str, FieldValue)> = vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(nsfw))),
             ("userId", FieldValue::Single(Value::Integer(user_id))),
@@ -1907,9 +1732,7 @@ fn civitai_full_workflow() {
         engine.put(i, &doc(&fields)).unwrap();
         truth.put(i, &fields);
     }
-
     assert_eq!(engine.alive_count(), 100);
-
     // Query 1: nsfwLevel <= 2, sorted by reactionCount desc, limit 20
     let result1 = engine
         .query(
@@ -1924,7 +1747,6 @@ fn civitai_full_workflow() {
             20,
         )
         .unwrap();
-
     let truth_ids = truth.brute_in("nsfwLevel", &[1, 2]);
     let truth_sorted: Vec<u32> = truth
         .brute_sort_desc("reactionCount", &truth_ids)
@@ -1933,7 +1755,6 @@ fn civitai_full_workflow() {
         .collect();
     let engine_sorted: Vec<u32> = result1.ids.iter().map(|&id| id as u32).collect();
     assert_eq!(engine_sorted, truth_sorted, "Civitai query 1 mismatch");
-
     // Query 2: specific userId, onSite=true
     let result2 = engine
         .query(
@@ -1945,19 +1766,16 @@ fn civitai_full_workflow() {
             200,
         )
         .unwrap();
-
     let truth_user = truth.brute_eq("userId", 5);
     let truth_on_site = truth.brute_eq("onSite", 1);
     let expected: HashSet<u32> = truth_user.intersection(&truth_on_site).cloned().collect();
     let engine_ids2: HashSet<u32> = result2.ids.iter().map(|&id| id as u32).collect();
     assert_eq!(engine_ids2, expected, "Civitai query 2 mismatch");
-
     // Mutation: delete some docs, patch others
     for i in (5..=100u32).step_by(10) {
         engine.delete(i).unwrap();
         truth.delete(i);
     }
-
     // PATCH remaining docs: bump reactionCount
     for &i in &[1u32, 2, 3] {
         engine
@@ -1983,7 +1801,6 @@ fn civitai_full_workflow() {
             sort_map.insert("reactionCount".to_string(), 50000);
         }
     }
-
     // Re-query after mutations
     let result3 = engine
         .query(
@@ -1998,7 +1815,6 @@ fn civitai_full_workflow() {
             5,
         )
         .unwrap();
-
     // Patched docs (1, 2, 3) with reactionCount=50000 should be at the top if they match nsfwLevel=1
     for &id in &result3.ids {
         assert!(
@@ -2006,7 +1822,6 @@ fn civitai_full_workflow() {
             "Result contains dead slot {id}"
         );
     }
-
     // Verify sort order
     for window in result3.ids.windows(2) {
         let va = engine

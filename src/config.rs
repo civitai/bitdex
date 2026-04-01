@@ -1,11 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
-
 use serde::{Deserialize, Serialize};
-
 use crate::error::{BitdexError, Result};
 pub use crate::filter::FilterFieldType;
-
 /// Top-level Bitdex V2 configuration.
 ///
 /// Loaded from TOML or YAML files. Designed for future hot-reloadability:
@@ -16,90 +13,71 @@ pub struct Config {
     /// Filter field definitions.
     #[serde(default)]
     pub filter_fields: Vec<FilterFieldConfig>,
-
     /// Sort field definitions.
     #[serde(default)]
     pub sort_fields: Vec<SortFieldConfig>,
-
     /// Time bucket configuration for pre-computed time range filters.
     /// Decoupled from filter_fields to avoid creating per-value bitmaps
     /// for high-cardinality timestamp fields.
     #[serde(default)]
     pub time_buckets: Option<TimeBucketFieldConfig>,
-
     /// Maximum results per query (hard cap).
     #[serde(default = "default_max_page_size")]
     pub max_page_size: usize,
-
     /// Trie cache settings.
     #[serde(default)]
     pub cache: CacheConfig,
-
     /// Autovac interval in seconds.
     #[serde(default = "default_autovac_interval")]
     pub autovac_interval_secs: u64,
-
     /// Merge interval for versioned bitmaps, in milliseconds.
     #[serde(default = "default_merge_interval_ms")]
     pub merge_interval_ms: u64,
-
     /// Prometheus metrics port.
     #[serde(default = "default_prometheus_port")]
     pub prometheus_port: u16,
-
     /// Flush interval for the concurrent engine's background flush thread, in microseconds.
     #[serde(default = "default_flush_interval_us")]
     pub flush_interval_us: u64,
-
     /// Bounded channel capacity for the write coalescer.
     #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
-
     /// Bitmap persistence and caching settings.
     #[serde(default)]
     pub storage: StorageConfig,
-
     /// Compaction threshold: percentage of stale tuples that triggers background
     /// compaction. Default 30 (compact when >30% stale). Set to 0 to disable
     /// compaction entirely (no worker thread, no staleness tracking on reads).
     #[serde(default = "default_compact_threshold_pct")]
     pub compact_threshold_pct: u64,
-
     /// Eviction sweep interval: check for idle values every N flush cycles.
     /// Default 1000 (~0.1s at 100μs flush). Lower values make eviction more
     /// responsive (useful for testing).
     #[serde(default = "default_eviction_sweep_interval")]
     pub eviction_sweep_interval: u64,
-
     /// Deferred alive: documents with a future timestamp in the specified field
     /// won't be marked alive until that time arrives. Only one field per document.
     #[serde(default)]
     pub deferred_alive: Option<DeferredAliveConfig>,
-
     /// Memory budget in bytes for RSS-aware cache eviction. When RSS exceeds
     /// `memory_pressure_threshold` of this budget, the flush thread evicts cache
     /// entries until RSS drops below `memory_pressure_target`.
     /// Auto-detected from cgroup v2 / env var if not set.
     #[serde(default)]
     pub memory_budget_bytes: Option<u64>,
-
     /// RSS fraction that triggers memory-pressure eviction (default 0.80).
     #[serde(default = "default_memory_pressure_threshold")]
     pub memory_pressure_threshold: f64,
-
     /// RSS fraction to evict down to (default 0.75).
     #[serde(default = "default_memory_pressure_target")]
     pub memory_pressure_target: f64,
-
     /// Document cache settings (in-memory cache for docstore reads).
     #[serde(default)]
     pub doc_cache: DocCacheConfigEntry,
-
     /// Bitmap memory scanner settings. Replaces the expensive per-scrape
     /// bitmap_memory_report() with incremental background scanning.
     #[serde(default)]
     pub memory_scanner: MemoryScannerConfig,
-
     /// Enabled metric groups. Controls which expensive metric groups are
     /// collected on the Prometheus scrape endpoint.
     /// DEPRECATED: Use `disabled_metrics` (opt-out model) instead.
@@ -108,21 +86,24 @@ pub struct Config {
     /// When `Some(vec)`, only the listed groups are enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_metrics: Option<Vec<String>>,
-
     /// Metric groups to DISABLE (opt-out model). Default: None = all ON.
     /// Takes precedence over `enabled_metrics` when present.
     /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_metrics: Option<Vec<String>>,
-
     /// Headless mode: skip all background threads (flush, merge, eviction).
     /// Used by bulk loaders that write directly to disk and don't need
     /// the engine's write pipeline. The engine still provides config, bitmap
     /// store access, and docstore, but no background work runs.
     #[serde(default)]
     pub headless: bool,
+    /// Field mapping schema: describes how source document fields map to engine
+    /// fields, including nullable semantics. Nullable fields (nullable: true in
+    /// a FieldMapping) treat null/absent values as a no-op rather than mapping
+    /// them to zero in the filter bitmaps.
+    #[serde(default)]
+    pub data_schema: DataSchema,
 }
-
 fn default_max_page_size() -> usize {
     100
 }
@@ -156,7 +137,6 @@ fn default_channel_capacity() -> usize {
 fn default_schema_version() -> u8 {
     1
 }
-
 /// Deferred alive configuration: defer a document's alive bit until a future timestamp.
 ///
 /// The source field is read from the incoming document. If its value is in the future,
@@ -170,7 +150,6 @@ pub struct DeferredAliveConfig {
     #[serde(default)]
     pub ms_to_seconds: bool,
 }
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -196,10 +175,10 @@ impl Default for Config {
             memory_pressure_threshold: default_memory_pressure_threshold(),
             memory_pressure_target: default_memory_pressure_target(),
             headless: false,
+            data_schema: DataSchema::default(),
         }
     }
 }
-
 impl Config {
     /// Load configuration from a file. Format is detected from the file extension.
     ///
@@ -207,12 +186,10 @@ impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| BitdexError::Config(format!("failed to read {}: {e}", path.display())))?;
-
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-
         match ext {
             "toml" => Self::from_toml(&content),
             "yaml" | "yml" => Self::from_yaml(&content),
@@ -222,7 +199,6 @@ impl Config {
             ))),
         }
     }
-
     /// Load configuration from a YAML string.
     #[cfg(feature = "serde_yaml")]
     pub fn from_yaml(yaml_str: &str) -> Result<Self> {
@@ -231,14 +207,12 @@ impl Config {
         config.validate()?;
         Ok(config)
     }
-
     #[cfg(not(feature = "serde_yaml"))]
     pub fn from_yaml(_yaml_str: &str) -> Result<Self> {
         Err(BitdexError::Config(
             "YAML support requires the 'serde_yaml' feature".to_string(),
         ))
     }
-
     /// Load configuration from a JSON string.
     pub fn from_json(json_str: &str) -> Result<Self> {
         let config: Config = serde_json::from_str(json_str)
@@ -246,7 +220,6 @@ impl Config {
         config.validate()?;
         Ok(config)
     }
-
     /// Load configuration from a TOML string.
     pub fn from_toml(toml_str: &str) -> Result<Self> {
         let config: Config =
@@ -254,7 +227,6 @@ impl Config {
         config.validate()?;
         Ok(config)
     }
-
     /// Validate the configuration.
     pub fn validate(&self) -> Result<()> {
         if self.max_page_size == 0 {
@@ -262,14 +234,12 @@ impl Config {
                 "max_page_size must be > 0".to_string(),
             ));
         }
-
         // Validate cache settings
         if self.cache.decay_rate <= 0.0 || self.cache.decay_rate > 1.0 {
             return Err(BitdexError::Config(
                 "cache.decay_rate must be in (0.0, 1.0]".to_string(),
             ));
         }
-
         // Check for duplicate filter field names
         let mut filter_names = std::collections::HashSet::new();
         for f in &self.filter_fields {
@@ -330,7 +300,6 @@ impl Config {
                 }
             }
         }
-
         // Validate top-level time_buckets
         if let Some(ref tb) = self.time_buckets {
             if tb.filter_field.is_empty() {
@@ -370,7 +339,6 @@ impl Config {
                 }
             }
         }
-
         // Validate deferred_alive config
         if let Some(ref da) = self.deferred_alive {
             if da.source_field.is_empty() {
@@ -379,7 +347,6 @@ impl Config {
                 ));
             }
         }
-
         // Check for duplicate sort field names and validate bits
         let mut sort_names = std::collections::HashSet::new();
         for s in &self.sort_fields {
@@ -401,11 +368,9 @@ impl Config {
                 )));
             }
         }
-
         Ok(())
     }
 }
-
 /// Trie cache configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
@@ -460,7 +425,6 @@ pub struct CacheConfig {
     #[serde(default = "default_max_maintenance_ms")]
     pub max_maintenance_ms: u64,
 }
-
 fn default_cache_max_entries() -> usize {
     100_000
 }
@@ -500,7 +464,6 @@ fn default_max_maintenance_work() -> usize {
 fn default_max_maintenance_ms() -> u64 {
     5 // low-latency preset (was 10)
 }
-
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
@@ -520,7 +483,6 @@ impl Default for CacheConfig {
         }
     }
 }
-
 /// Configuration for bitmap persistence.
 ///
 /// All bitmaps are stored as individual files on the filesystem.
@@ -534,7 +496,6 @@ pub struct StorageConfig {
     #[serde(default)]
     pub bitmap_path: Option<std::path::PathBuf>,
 }
-
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -542,19 +503,15 @@ impl Default for StorageConfig {
         }
     }
 }
-
 fn default_doc_cache_max_bytes() -> u64 {
     1_073_741_824 // 1 GB — matches DocCacheConfig::default()
 }
-
 fn default_doc_cache_generation_interval() -> u64 {
     60
 }
-
 fn default_doc_cache_max_generations() -> usize {
     30
 }
-
 /// Document cache configuration (generational eviction with lock-free reads).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocCacheConfigEntry {
@@ -568,7 +525,6 @@ pub struct DocCacheConfigEntry {
     #[serde(default = "default_doc_cache_max_generations")]
     pub max_generations: usize,
 }
-
 impl Default for DocCacheConfigEntry {
     fn default() -> Self {
         Self {
@@ -578,7 +534,6 @@ impl Default for DocCacheConfigEntry {
         }
     }
 }
-
 /// Bitmap memory scanner configuration.
 ///
 /// The scanner runs a background thread that incrementally measures per-field
@@ -596,11 +551,9 @@ pub struct MemoryScannerConfig {
     #[serde(default = "default_scanner_batch_size")]
     pub batch_size: u64,
 }
-
 fn default_scanner_enabled() -> bool { true }
 fn default_scanner_interval_ms() -> u64 { 100 }
 fn default_scanner_batch_size() -> u64 { 3 }
-
 impl Default for MemoryScannerConfig {
     fn default() -> Self {
         Self {
@@ -610,7 +563,6 @@ impl Default for MemoryScannerConfig {
         }
     }
 }
-
 /// Configuration for a single filter field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterFieldConfig {
@@ -635,7 +587,6 @@ pub struct FilterFieldConfig {
     #[serde(default)]
     pub per_value_lazy: bool,
 }
-
 /// Per-value idle eviction configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvictionConfig {
@@ -643,7 +594,6 @@ pub struct EvictionConfig {
     /// The flush thread converts this to flush cycles using observed cycle timing.
     pub idle_seconds: f64,
 }
-
 /// Time-related behaviors for timestamp fields.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FieldBehaviors {
@@ -657,7 +607,6 @@ pub struct FieldBehaviors {
     #[serde(default)]
     pub sort_field: Option<String>,
 }
-
 /// Configuration for a single time range bucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketConfig {
@@ -668,7 +617,6 @@ pub struct BucketConfig {
     /// How often to rebuild this bucket's bitmap, in seconds.
     pub refresh_interval_secs: u64,
 }
-
 /// Top-level time bucket configuration.
 /// Maps a filter clause field name to a sort field for value reconstruction,
 /// with pre-computed range buckets. This is separate from filter_fields
@@ -685,7 +633,6 @@ pub struct TimeBucketFieldConfig {
     /// Pre-computed range buckets.
     pub range_buckets: Vec<BucketConfig>,
 }
-
 /// Configuration for a single sort field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SortFieldConfig {
@@ -709,7 +656,6 @@ pub struct SortFieldConfig {
     #[serde(default)]
     pub computed: Option<ComputedField>,
 }
-
 /// Defines how a sort field value is computed from other document fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComputedField {
@@ -718,7 +664,6 @@ pub struct ComputedField {
     /// Names of sort or document fields to read as u32 inputs.
     pub source_fields: Vec<String>,
 }
-
 /// Operations available for computed sort fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -728,7 +673,6 @@ pub enum ComputedOp {
     /// Result = min(source_fields...)
     Least,
 }
-
 fn default_source_type() -> String {
     "uint32".to_string()
 }
@@ -738,11 +682,9 @@ fn default_encoding() -> String {
 fn default_bits() -> u8 {
     32
 }
-
 // ---------------------------------------------------------------------------
 // Data Schema — describes how to map raw NDJSON fields to engine Documents
 // ---------------------------------------------------------------------------
-
 /// Schema describing how raw NDJSON records map to engine documents.
 /// Used by the generic loader to convert arbitrary JSON into Documents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -759,7 +701,6 @@ pub struct DataSchema {
     #[serde(default)]
     pub fields: Vec<FieldMapping>,
 }
-
 impl Default for DataSchema {
     fn default() -> Self {
         Self {
@@ -769,7 +710,6 @@ impl Default for DataSchema {
         }
     }
 }
-
 /// Maps a single source JSON field to a target engine field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldMapping {
@@ -808,15 +748,18 @@ pub struct FieldMapping {
     /// elided on write. On read, missing fields are reconstructed from this default.
     #[serde(default, rename = "default")]
     pub default_value: Option<serde_json::Value>,
+    /// If true, this field can be null/absent. Nullable filter fields get a
+    /// dedicated null bitmap tracking which slots have null. Queryable via
+    /// IsNull/IsNotNull operators. Docstore omission = null for nullable fields.
+    #[serde(default)]
+    pub nullable: bool,
 }
-
 impl FieldMapping {
     /// Whether this field should convert ms timestamps to seconds.
     /// Accepts either the new `ms_to_seconds` or legacy `truncate_u32` flag.
     pub fn should_convert_ms(&self) -> bool {
         self.ms_to_seconds || self.truncate_u32
     }
-
     /// Resolve the raw JSON value for this field, trying source then fallback.
     /// Returns (value, apply_ms_to_seconds). When the fallback is used, ms_to_seconds
     /// is NOT applied since the fallback is assumed to already be in the target unit.
@@ -845,7 +788,6 @@ impl FieldMapping {
         }
     }
 }
-
 impl DataSchema {
     /// Validate the schema.
     pub fn validate(&self) -> Result<()> {
@@ -864,7 +806,6 @@ impl DataSchema {
         }
         Ok(())
     }
-
     /// Normalize string_map keys to lowercase for case-insensitive MappedString fields.
     /// Call once after deserialization, before use in loader/docstore/server.
     pub fn normalize_string_maps(&mut self) {
@@ -877,7 +818,6 @@ impl DataSchema {
         }
     }
 }
-
 /// How a field value should be interpreted during NDJSON loading.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -900,12 +840,10 @@ pub enum FieldValueType {
     /// Useful for "isPublished", "hasBlockedFor", "isRemix", etc.
     ExistsBoolean,
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
     #[test]
     fn test_default_config() {
         let config = Config::default();
@@ -922,7 +860,6 @@ mod tests {
         assert_eq!(config.prometheus_port, 9090);
         assert!(config.validate().is_ok());
     }
-
     #[test]
     fn test_toml_parsing() {
         let toml_str = r#"
@@ -930,29 +867,23 @@ max_page_size = 50
 autovac_interval_secs = 7200
 merge_interval_ms = 3000
 prometheus_port = 9191
-
 [cache]
 max_entries = 5000
 decay_rate = 0.9
-
 [[filter_fields]]
 name = "nsfwLevel"
 field_type = "single_value"
-
 [[filter_fields]]
 name = "tagIds"
 field_type = "multi_value"
-
 [[filter_fields]]
 name = "onSite"
 field_type = "boolean"
-
 [[sort_fields]]
 name = "reactionCount"
 source_type = "uint32"
 encoding = "linear"
 bits = 32
-
 [[sort_fields]]
 name = "sortAt"
 source_type = "uint32"
@@ -973,7 +904,6 @@ bits = 32
         assert_eq!(config.filter_fields[2].field_type, FilterFieldType::Boolean);
         assert_eq!(config.sort_fields[0].bits, 32);
     }
-
     #[test]
     fn test_from_file_toml() {
         let dir = tempfile::tempdir().unwrap();
@@ -982,7 +912,6 @@ bits = 32
             &path,
             r#"
 max_page_size = 42
-
 [cache]
 max_entries = 999
 "#,
@@ -992,7 +921,6 @@ max_entries = 999
         assert_eq!(config.max_page_size, 42);
         assert_eq!(config.cache.max_entries, 999);
     }
-
     #[test]
     fn test_from_file_unsupported_format() {
         let dir = tempfile::tempdir().unwrap();
@@ -1001,13 +929,11 @@ max_entries = 999
         let err = Config::from_file(&path);
         assert!(err.is_err());
     }
-
     #[test]
     fn test_from_file_not_found() {
         let path = PathBuf::from("/nonexistent/config.toml");
         assert!(Config::from_file(&path).is_err());
     }
-
     #[test]
     fn test_validation_rejects_zero_page_size() {
         let config = Config {
@@ -1016,21 +942,18 @@ max_entries = 999
         };
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_validation_rejects_invalid_decay_rate_zero() {
         let mut config = Config::default();
         config.cache.decay_rate = 0.0;
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_validation_rejects_invalid_decay_rate_over_one() {
         let mut config = Config::default();
         config.cache.decay_rate = 1.5;
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_validation_rejects_duplicate_filter_fields() {
         let config = Config {
@@ -1056,7 +979,6 @@ max_entries = 999
         };
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_validation_rejects_duplicate_sort_fields() {
         let config = Config {
@@ -1082,7 +1004,6 @@ max_entries = 999
         };
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_validation_rejects_empty_field_names() {
         let config = Config {
@@ -1097,7 +1018,6 @@ max_entries = 999
             ..Default::default()
         };
         assert!(config.validate().is_err());
-
         let config = Config {
             sort_fields: vec![SortFieldConfig {
                 name: "".to_string(),
@@ -1111,7 +1031,6 @@ max_entries = 999
         };
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_validation_rejects_invalid_bits() {
         let config = Config {
@@ -1126,7 +1045,6 @@ max_entries = 999
             ..Default::default()
         };
         assert!(config.validate().is_err());
-
         let config = Config {
             sort_fields: vec![SortFieldConfig {
                 name: "test".to_string(),
@@ -1140,7 +1058,6 @@ max_entries = 999
         };
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_civitai_config_toml() {
         let toml_str = r#"
@@ -1148,59 +1065,46 @@ max_page_size = 100
 autovac_interval_secs = 3600
 merge_interval_ms = 5000
 prometheus_port = 9090
-
 [cache]
 max_entries = 10000
 decay_rate = 0.95
-
 [[filter_fields]]
 name = "nsfwLevel"
 field_type = "single_value"
-
 [[filter_fields]]
 name = "tagIds"
 field_type = "multi_value"
-
 [[filter_fields]]
 name = "userId"
 field_type = "single_value"
-
 [[filter_fields]]
 name = "modelVersionIds"
 field_type = "multi_value"
-
 [[filter_fields]]
 name = "onSite"
 field_type = "boolean"
-
 [[filter_fields]]
 name = "hasMeta"
 field_type = "boolean"
-
 [[filter_fields]]
 name = "type"
 field_type = "single_value"
-
 [[sort_fields]]
 name = "reactionCount"
 source_type = "uint32"
 bits = 32
-
 [[sort_fields]]
 name = "sortAt"
 source_type = "uint32"
 bits = 32
-
 [[sort_fields]]
 name = "commentCount"
 source_type = "uint32"
 bits = 32
-
 [[sort_fields]]
 name = "collectedCount"
 source_type = "uint32"
 bits = 32
-
 [[sort_fields]]
 name = "id"
 source_type = "uint32"
@@ -1212,12 +1116,10 @@ bits = 32
         assert_eq!(config.cache.max_entries, 10_000);
         assert_eq!(config.cache.decay_rate, 0.95);
     }
-
     #[test]
     fn test_invalid_toml() {
         assert!(Config::from_toml("{{{{not valid").is_err());
     }
-
     #[test]
     fn test_serde_roundtrip_toml() {
         let config = Config {
@@ -1245,30 +1147,25 @@ bits = 32
         assert_eq!(roundtrip.sort_fields[0].name, "score");
         assert_eq!(roundtrip.filter_fields[0].field_type, FilterFieldType::SingleValue);
     }
-
     #[test]
     fn test_storage_config_defaults() {
         let sc = StorageConfig::default();
         assert!(sc.bitmap_path.is_none());
     }
-
     #[test]
     fn test_config_default_includes_storage() {
         let config = Config::default();
         assert!(config.storage.bitmap_path.is_none());
     }
-
     #[test]
     fn test_toml_with_storage_path() {
         let toml_str = r#"
 [[filter_fields]]
 name = "tagIds"
 field_type = "multi_value"
-
 [[filter_fields]]
 name = "nsfwLevel"
 field_type = "single_value"
-
 [storage]
 bitmap_path = "/tmp/bitmaps"
 "#;
@@ -1278,7 +1175,6 @@ bitmap_path = "/tmp/bitmaps"
             Some(std::path::PathBuf::from("/tmp/bitmaps"))
         );
     }
-
     #[test]
     fn test_toml_without_storage_uses_defaults() {
         let toml_str = r#"
@@ -1287,24 +1183,20 @@ max_page_size = 50
         let config = Config::from_toml(toml_str).unwrap();
         assert!(config.storage.bitmap_path.is_none());
     }
-
     #[test]
     fn test_field_behaviors_toml_parsing() {
         let toml_str = r#"
 [[filter_fields]]
 name = "scheduledAt"
 field_type = "single_value"
-
 [[filter_fields.behaviors.range_buckets]]
 name = "24h"
 duration_secs = 86400
 refresh_interval_secs = 60
-
 [[filter_fields.behaviors.range_buckets]]
 name = "7d"
 duration_secs = 604800
 refresh_interval_secs = 300
-
 [deferred_alive]
 source_field = "scheduledAt"
 "#;
@@ -1322,7 +1214,6 @@ source_field = "scheduledAt"
         assert_eq!(da.source_field, "scheduledAt");
         assert!(!da.ms_to_seconds);
     }
-
     #[test]
     fn test_field_behaviors_defaults_to_none() {
         let toml_str = r#"
@@ -1333,7 +1224,6 @@ field_type = "single_value"
         let config = Config::from_toml(toml_str).unwrap();
         assert!(config.filter_fields[0].behaviors.is_none());
     }
-
     #[test]
     fn test_validation_rejects_empty_deferred_alive_source_field() {
         let config = Config {
@@ -1345,7 +1235,6 @@ field_type = "single_value"
         };
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_deferred_alive_config_parsing() {
         let toml_str = r#"
@@ -1358,14 +1247,12 @@ ms_to_seconds = true
         assert_eq!(da.source_field, "publishedAtUnix");
         assert!(da.ms_to_seconds);
     }
-
     #[test]
     fn test_validation_rejects_duplicate_bucket_names() {
         let config = Config {
             filter_fields: vec![FilterFieldConfig {
                 name: "scheduledAt".into(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: Some(FieldBehaviors {
                     range_buckets: vec![
                         BucketConfig {
@@ -1389,14 +1276,12 @@ ms_to_seconds = true
         };
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_validation_rejects_zero_duration_secs() {
         let config = Config {
             filter_fields: vec![FilterFieldConfig {
                 name: "scheduledAt".into(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: Some(FieldBehaviors {
                     range_buckets: vec![BucketConfig {
                         name: "bad".into(),
@@ -1413,14 +1298,12 @@ ms_to_seconds = true
         };
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_validation_rejects_zero_refresh_interval_secs() {
         let config = Config {
             filter_fields: vec![FilterFieldConfig {
                 name: "scheduledAt".into(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: Some(FieldBehaviors {
                     range_buckets: vec![BucketConfig {
                         name: "bad".into(),
@@ -1437,14 +1320,12 @@ ms_to_seconds = true
         };
         assert!(config.validate().is_err());
     }
-
     #[test]
     fn test_field_behaviors_serde_roundtrip_toml() {
         let config = Config {
             filter_fields: vec![FilterFieldConfig {
                 name: "scheduledAt".into(),
                 field_type: FilterFieldType::SingleValue,
-
                 behaviors: Some(FieldBehaviors {
                     range_buckets: vec![BucketConfig {
                         name: "7d".into(),
@@ -1471,27 +1352,23 @@ ms_to_seconds = true
         let da = roundtrip.deferred_alive.as_ref().unwrap();
         assert_eq!(da.source_field, "scheduledAt");
     }
-
     #[test]
     fn test_data_schema_default_version() {
         let schema = DataSchema::default();
         assert_eq!(schema.schema_version, 1);
     }
-
     #[test]
     fn test_data_schema_version_from_json() {
         let json = r#"{"id_field": "id", "schema_version": 3, "fields": []}"#;
         let schema: DataSchema = serde_json::from_str(json).unwrap();
         assert_eq!(schema.schema_version, 3);
     }
-
     #[test]
     fn test_data_schema_version_defaults_to_1_in_json() {
         let json = r#"{"id_field": "id", "fields": []}"#;
         let schema: DataSchema = serde_json::from_str(json).unwrap();
         assert_eq!(schema.schema_version, 1);
     }
-
     #[test]
     fn test_data_schema_validates_version_zero() {
         let schema = DataSchema {
@@ -1500,13 +1377,11 @@ ms_to_seconds = true
         };
         assert!(schema.validate().is_err());
     }
-
     #[test]
     fn test_data_schema_validates_version_one() {
         let schema = DataSchema::default();
         assert!(schema.validate().is_ok());
     }
-
     #[test]
     fn test_config_patch_roundtrip() {
         // Build a config with known filter/sort fields
@@ -1543,7 +1418,6 @@ ms_to_seconds = true
             },
             ..Config::default()
         };
-
         // Simulate a partial patch: flip eager_load on nsfwLevel, update cache
         for fc in config.filter_fields.iter_mut() {
             if fc.name == "nsfwLevel" {
@@ -1557,11 +1431,9 @@ ms_to_seconds = true
         }
         config.cache.max_entries = 20_000;
         config.cache.bound_target_size = 5_000;
-
         // Serialize to JSON and deserialize back
         let json = serde_json::to_string_pretty(&config).unwrap();
         let restored: Config = serde_json::from_str(&json).unwrap();
-
         // Verify the patched values survived roundtrip
         assert!(restored.filter_fields.iter().find(|f| f.name == "nsfwLevel").unwrap().eager_load);
         assert!(restored.filter_fields.iter().find(|f| f.name == "tagIds").unwrap().eager_load);
