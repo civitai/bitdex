@@ -12,6 +12,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use dashmap::{DashMap, DashSet};
 
 use crate::config::{FieldMapping, FieldValueType};
 use crate::mutation::FieldValue;
@@ -623,7 +626,7 @@ use crate::config::DataSchema;
 /// generation pinning, and native ShardStore compaction. Maintains the
 /// same field dictionary and StoredDoc interface.
 pub struct DocStoreV3 {
-    store: DocShardStore,
+    store: Arc<DocShardStore>,
     root: PathBuf,
     field_to_idx: HashMap<String, u16>,
     idx_to_field: Vec<String>,
@@ -635,6 +638,9 @@ pub struct DocStoreV3 {
     historical_defaults: HashMap<u8, HashMap<u16, PackedValue>>,
     /// Compaction threshold: number of ops before auto-compaction.
     compact_threshold: u32,
+    /// Shard IDs that received writes since last drain.
+    /// Used by merge thread for targeted compaction (avoids scanning all 209K shards).
+    dirty_shards: Arc<DashSet<u32>>,
 }
 
 impl DocStoreV3 {
@@ -646,9 +652,6 @@ impl DocStoreV3 {
         let (field_to_idx, idx_to_field) = Self::load_field_dict(path)?;
         let historical_defaults = Self::load_schema_history(path, &field_to_idx);
 
-        // Rehydrate schema version and defaults from the latest persisted history.
-        // Without this, get() would use version=1 and empty defaults after restart,
-        // causing fields elided under old defaults to not rehydrate correctly.
         let (schema_version, field_defaults) = if let Some((&max_ver, defaults)) =
             historical_defaults.iter().max_by_key(|(&v, _)| v)
         {
@@ -658,7 +661,7 @@ impl DocStoreV3 {
         };
 
         Ok(Self {
-            store,
+            store: Arc::new(store),
             root: path.to_path_buf(),
             field_to_idx,
             idx_to_field,
@@ -666,11 +669,11 @@ impl DocStoreV3 {
             schema_version,
             historical_defaults,
             compact_threshold: 1000,
+            dirty_shards: Arc::new(DashSet::new()),
         })
     }
 
     /// Open an in-memory DocStoreV3 (for testing).
-    /// Creates a temp directory under std::env::temp_dir() for ShardStore files.
     pub fn open_temp() -> io::Result<Self> {
         use std::time::{SystemTime, UNIX_EPOCH};
         let ts = SystemTime::now()
@@ -682,7 +685,7 @@ impl DocStoreV3 {
         std::fs::create_dir_all(tmp_dir.join("meta"))?;
         let store = DocShardStore::new(tmp_dir.clone(), SlotHexShard)?;
         Ok(Self {
-            store,
+            store: Arc::new(store),
             root: tmp_dir,
             field_to_idx: HashMap::new(),
             idx_to_field: Vec::new(),
@@ -690,6 +693,7 @@ impl DocStoreV3 {
             schema_version: 1,
             historical_defaults: HashMap::new(),
             compact_threshold: 1000,
+            dirty_shards: Arc::new(DashSet::new()),
         })
     }
 
@@ -993,7 +997,7 @@ impl DocStoreV3 {
 
         for (shard_key, ops) in by_shard {
             self.store.append_ops(&shard_key, &ops)?;
-            self.maybe_auto_compact(shard_key);
+            self.dirty_shards.insert(shard_key);
         }
 
         Ok(())
@@ -1017,7 +1021,7 @@ impl DocStoreV3 {
 
         for (shard_key, ops) in by_shard {
             self.store.append_ops(&shard_key, &ops)?;
-            self.maybe_auto_compact(shard_key);
+            self.dirty_shards.insert(shard_key);
         }
         Ok(())
     }
@@ -1113,6 +1117,27 @@ impl DocStoreV3 {
     /// Get a reference to the underlying ShardStore.
     pub fn shard_store(&self) -> &DocShardStore {
         &self.store
+    }
+
+    /// Get an Arc clone of the underlying ShardStore for concurrent access.
+    /// Used by compact endpoint and merge thread to bypass the DocStoreV3 Mutex.
+    pub fn shard_store_arc(&self) -> Arc<DocShardStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// Drain the set of shard IDs that received writes since last drain.
+    /// Used by merge thread for targeted docstore compaction.
+    pub fn drain_dirty_shards(&self) -> Vec<u32> {
+        let keys: Vec<u32> = self.dirty_shards.iter().map(|r| *r).collect();
+        for key in &keys {
+            self.dirty_shards.remove(key);
+        }
+        keys
+    }
+
+    /// Get an Arc clone of the dirty shards set (for passing to merge thread).
+    pub fn dirty_shards_arc(&self) -> Arc<DashSet<u32>> {
+        Arc::clone(&self.dirty_shards)
     }
 
     /// Pin the current generation for crash-consistent snapshots.
@@ -1236,9 +1261,6 @@ fn field_value_to_packed(fv: &FieldValue) -> PackedValue {
 // ---------------------------------------------------------------------------
 // ShardStoreBulkWriter — high-throughput parallel writes for dump processor
 // ---------------------------------------------------------------------------
-
-use dashmap::DashMap;
-use std::sync::Arc;
 
 /// Lock-free bulk writer for DocStoreV3.
 ///
