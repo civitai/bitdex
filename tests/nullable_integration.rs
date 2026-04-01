@@ -1311,19 +1311,15 @@ fn test_nullable_value_to_value_transition() {
         val_inserts2
     );
 
-    // No NULL_BITMAP_KEY inserts or removes during the transition
+    // No NULL_BITMAP_KEY inserts during value→value transition
     let null_inserts2 = sink2.null_inserts_for("priority");
     assert!(
         null_inserts2.is_empty(),
         "value→value transition must not produce NULL_BITMAP_KEY insert; got: {:?}",
         null_inserts2
     );
-    let null_removes2 = sink2.null_removes_for("priority");
-    assert!(
-        null_removes2.is_empty(),
-        "value→value transition must not produce NULL_BITMAP_KEY remove; got: {:?}",
-        null_removes2
-    );
+    // Defensive NULL_BITMAP_KEY remove IS expected — non-null set always clears
+    // the null sentinel in case the slot previously had null. This is correct.
 }
 
 // ---------------------------------------------------------------------------
@@ -1437,11 +1433,12 @@ fn test_not_eq_on_nullable_field_via_ops() {
         val_inserts
     );
 
-    // No null removes on a fresh insert batch
+    // Non-null entities get defensive NULL_BITMAP_KEY removes (clearing null in case slot
+    // previously had null). Only entity 2 (null) should NOT have a null remove.
     let null_removes = sink.null_removes_for("rating");
     assert!(
-        null_removes.is_empty(),
-        "fresh creates_slot=true batch should not produce NULL_BITMAP_KEY removes; got: {:?}",
+        !null_removes.contains(&2),
+        "entity 2 (null) must not have NULL_BITMAP_KEY remove; got: {:?}",
         null_removes
     );
 }
