@@ -13,13 +13,11 @@
 //!   --stages <LIST>   Comma-separated stages to run: insert,bulk,persist,restore,update,query,concurrent,mixed,contention,all (default: all)
 //!   --threads <N>     Number of threads for concurrent benchmarks (default: 4)
 //!   --in-memory-docstore  Use in-memory docstore instead of on-disk (default: on-disk)
-
 // Use rpmalloc for better concurrent allocation performance.
 // The default Windows CRT allocator fragments under heavy parallel load,
 // causing parse times to degrade 5x+ as bitmap memory grows to 6+ GB.
 #[global_allocator]
 static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -28,20 +26,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-
 use rand::Rng;
 use rayon::prelude::*;
-
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
 use bitdex_v2::filter::FilterFieldType;
 use bitdex_v2::mutation::{Document, FieldValue};
 use bitdex_v2::query::{BitdexQuery, CursorPosition, FilterClause, SortClause, SortDirection, Value};
-
 // ---------------------------------------------------------------------------
 // NDJSON record definition
 // ---------------------------------------------------------------------------
-
 #[derive(serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -70,11 +64,9 @@ struct NdjsonRecord {
     width: Option<u64>,
     height: Option<u64>,
 }
-
 impl NdjsonRecord {
     fn to_document(&self) -> Document {
         let mut fields = HashMap::new();
-
         if let Some(v) = self.nsfw_level {
             fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(v as i64)));
         }
@@ -147,11 +139,9 @@ impl NdjsonRecord {
         }
         // Use the record id itself as a sort field
         fields.insert("id".into(), FieldValue::Single(Value::Integer(self.id as i64)));
-
         Document { fields }
     }
 }
-
 fn type_to_int(t: &str) -> i64 {
     match t {
         "image" => 1,
@@ -160,34 +150,30 @@ fn type_to_int(t: &str) -> i64 {
         _ => 0,
     }
 }
-
 // ---------------------------------------------------------------------------
 // Byte utilities
 // ---------------------------------------------------------------------------
-
 /// Find the last newline in a byte slice (equivalent to memrchr for '\n').
 fn memrchr_newline(data: &[u8]) -> Option<usize> {
     data.iter().rposition(|&b| b == b'\n')
 }
-
 // ---------------------------------------------------------------------------
 // Config matching the Civitai schema
 // ---------------------------------------------------------------------------
-
 fn civitai_config() -> Config {
     Config {
         filter_fields: vec![
-            FilterFieldConfig { name: "nsfwLevel".into(), field_type: FilterFieldType::SingleValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "userId".into(), field_type: FilterFieldType::SingleValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "type".into(), field_type: FilterFieldType::SingleValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "hasMeta".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "onSite".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "poi".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "minor".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "tagIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "modelVersionIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "toolIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
-            FilterFieldConfig { name: "techniqueIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false, nullable: false },
+            FilterFieldConfig { name: "nsfwLevel".into(), field_type: FilterFieldType::SingleValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "userId".into(), field_type: FilterFieldType::SingleValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "type".into(), field_type: FilterFieldType::SingleValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "hasMeta".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "onSite".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "poi".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "minor".into(), field_type: FilterFieldType::Boolean, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "tagIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "modelVersionIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "toolIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
+            FilterFieldConfig { name: "techniqueIds".into(), field_type: FilterFieldType::MultiValue, behaviors: None, eviction: None, eager_load: false, per_value_lazy: false },
         ],
         sort_fields: vec![
             SortFieldConfig { name: "reactionCount".into(), source_type: "uint32".into(), encoding: "linear".into(), bits: 32, eager_load: false, computed: None },
@@ -200,11 +186,9 @@ fn civitai_config() -> Config {
         ..Default::default()
     }
 }
-
 // ---------------------------------------------------------------------------
 // CLI arg parsing (minimal, no extra dependencies)
 // ---------------------------------------------------------------------------
-
 struct Args {
     data_path: PathBuf,
     limit: Option<usize>,
@@ -216,7 +200,6 @@ struct Args {
     remap_ids: bool,
     in_memory_docstore: bool,
 }
-
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     let mut data_path: Option<PathBuf> = None;
@@ -228,7 +211,6 @@ fn parse_args() -> Args {
     let mut flush_interval_us: u64 = 100;
     let mut remap_ids = false;
     let mut in_memory_docstore = false;
-
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -273,7 +255,6 @@ fn parse_args() -> Args {
         }
         i += 1;
     }
-
     // Auto-detect data path
     let data_path = data_path.unwrap_or_else(|| {
         let candidates = [
@@ -289,18 +270,14 @@ fn parse_args() -> Args {
         eprintln!("Could not find images.ndjson. Use --data <PATH> to specify.");
         std::process::exit(1);
     });
-
     Args { data_path, limit, json_output, stages, threads, channel_capacity, flush_interval_us, remap_ids, in_memory_docstore }
 }
-
 fn should_run(stages: &[String], name: &str) -> bool {
     stages.iter().any(|s| s == "all" || s == name)
 }
-
 // ---------------------------------------------------------------------------
 // Latency stats
 // ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, serde::Serialize)]
 struct LatencyStats {
     count: usize,
@@ -312,7 +289,6 @@ struct LatencyStats {
     p95_ms: f64,
     p99_ms: f64,
 }
-
 fn compute_stats(mut durations: Vec<Duration>) -> LatencyStats {
     assert!(!durations.is_empty());
     durations.sort();
@@ -322,13 +298,11 @@ fn compute_stats(mut durations: Vec<Duration>) -> LatencyStats {
     let min_ms = durations[0].as_secs_f64() * 1000.0;
     let max_ms = durations[count - 1].as_secs_f64() * 1000.0;
     let mean_ms = total_ms / count as f64;
-
     let p = |pct: f64| -> f64 {
         let idx = ((pct / 100.0) * count as f64).ceil() as usize;
         let idx = idx.min(count).saturating_sub(1);
         durations[idx].as_secs_f64() * 1000.0
     };
-
     LatencyStats {
         count,
         total_ms,
@@ -340,11 +314,9 @@ fn compute_stats(mut durations: Vec<Duration>) -> LatencyStats {
         p99_ms: p(99.0),
     }
 }
-
 // ---------------------------------------------------------------------------
 // Memory tracking
 // ---------------------------------------------------------------------------
-
 fn rss_bytes() -> u64 {
     #[cfg(target_os = "windows")]
     {
@@ -377,7 +349,6 @@ fn rss_bytes() -> u64 {
         0
     }
 }
-
 #[cfg(target_os = "windows")]
 #[repr(C)]
 #[allow(non_snake_case)]
@@ -393,23 +364,19 @@ struct PROCESS_MEMORY_COUNTERS {
     pagefile_usage: usize,
     peak_pagefile_usage: usize,
 }
-
 #[cfg(target_os = "windows")]
 extern "system" {
     fn GetCurrentProcess() -> isize;
 }
-
 #[cfg(target_os = "windows")]
 #[link(name = "psapi")]
 extern "system" {
     fn GetProcessMemoryInfo(process: isize, ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS, cb: u32) -> i32;
 }
-
 #[cfg(target_os = "windows")]
 unsafe fn windows_process_handle() -> isize {
     GetCurrentProcess()
 }
-
 fn dir_size(path: &std::path::Path) -> u64 {
     fn recurse(p: &std::path::Path) -> u64 {
         let mut total = 0u64;
@@ -427,7 +394,6 @@ fn dir_size(path: &std::path::Path) -> u64 {
     }
     recurse(path)
 }
-
 fn format_bytes(b: u64) -> String {
     if b >= 1 << 30 {
         format!("{:.2} GB", b as f64 / (1u64 << 30) as f64)
@@ -439,7 +405,6 @@ fn format_bytes(b: u64) -> String {
         format!("{b} B")
     }
 }
-
 fn _format_rate(count: usize, elapsed: Duration) -> String {
     let secs = elapsed.as_secs_f64();
     if secs == 0.0 {
@@ -454,11 +419,9 @@ fn _format_rate(count: usize, elapsed: Duration) -> String {
         format!("{:.0}/s", rate)
     }
 }
-
 // ---------------------------------------------------------------------------
 // Benchmark report structures (for JSON output)
 // ---------------------------------------------------------------------------
-
 #[derive(Debug, serde::Serialize)]
 struct BenchmarkReport {
     dataset: DatasetInfo,
@@ -470,7 +433,6 @@ struct BenchmarkReport {
     contention_benchmark: Option<ContentionBenchmark>,
     memory_snapshots: Vec<MemorySnapshot>,
 }
-
 #[derive(Debug, serde::Serialize)]
 struct DatasetInfo {
     path: String,
@@ -478,7 +440,6 @@ struct DatasetInfo {
     records_loaded: usize,
     parse_time_ms: f64,
 }
-
 #[derive(Debug, serde::Serialize)]
 struct InsertBenchmark {
     batch_label: String,
@@ -490,14 +451,12 @@ struct InsertBenchmark {
     rss_after_bytes: u64,
     rss_delta_bytes: u64,
 }
-
 #[derive(Debug, serde::Serialize)]
 struct UpdateBenchmark {
     record_count: usize,
     elapsed_ms: f64,
     rate_per_sec: f64,
 }
-
 #[derive(Debug, serde::Serialize)]
 struct QueryBenchmark {
     name: String,
@@ -505,7 +464,6 @@ struct QueryBenchmark {
     iterations: usize,
     stats: LatencyStats,
 }
-
 #[derive(Debug, serde::Serialize)]
 struct ConcurrentInsertBenchmark {
     threads: usize,
@@ -517,7 +475,6 @@ struct ConcurrentInsertBenchmark {
     rss_before_bytes: u64,
     rss_after_bytes: u64,
 }
-
 #[derive(Debug, serde::Serialize)]
 struct MixedRwBenchmark {
     writer_threads: usize,
@@ -528,7 +485,6 @@ struct MixedRwBenchmark {
     insert_rate_per_sec: f64,
     query_stats: LatencyStats,
 }
-
 #[derive(Debug, serde::Serialize)]
 struct ContentionBenchmark {
     duration_secs: f64,
@@ -545,7 +501,6 @@ struct ContentionBenchmark {
     rss_before_bytes: u64,
     rss_after_bytes: u64,
 }
-
 #[derive(Debug, serde::Serialize)]
 struct MemorySnapshot {
     stage: String,
@@ -553,12 +508,10 @@ struct MemorySnapshot {
     rss_human: String,
     alive_count: u64,
 }
-
 // ---------------------------------------------------------------------------
 // Streaming helpers — re-read the NDJSON file for each phase instead of
 // holding millions of parsed records in RAM.
 // ---------------------------------------------------------------------------
-
 /// Count total records in the file (raw byte scan -- just counts newlines).
 fn count_records(path: &PathBuf, limit: usize) -> usize {
     use std::io::Read;
@@ -579,7 +532,6 @@ fn count_records(path: &PathBuf, limit: usize) -> usize {
     }
     count
 }
-
 /// Stream records from the NDJSON file, calling `f` for each parsed record.
 /// Stops after `limit` successful records. Returns (records_processed, parse_errors).
 fn stream_records<F>(path: &PathBuf, limit: usize, mut f: F) -> (usize, usize)
@@ -604,7 +556,6 @@ where
     }
     (count, errors)
 }
-
 /// Load records into a Vec for concurrent benchmarks (needs pre-parsed data
 /// so chunks can be distributed to threads).
 fn load_records(path: &PathBuf, limit: usize, remap_ids: bool) -> Vec<(u32, Document)> {
@@ -617,14 +568,12 @@ fn load_records(path: &PathBuf, limit: usize, remap_ids: bool) -> Vec<(u32, Docu
     });
     records
 }
-
 /// Print a detailed bitmap memory breakdown from the ConcurrentEngine.
 fn print_bitmap_memory(engine: &ConcurrentEngine) {
     let (slot_bytes, filter_bytes, sort_bytes, _cache_entries, cache_bytes, filter_details, sort_details) =
         engine.bitmap_memory_report();
     let uc = engine.unified_cache_stats();
     let total = slot_bytes + filter_bytes + sort_bytes + cache_bytes;
-
     println!("--- Bitmap Memory (pure Bitdex, excludes docstore/allocator) ---");
     println!("  Slots (alive+clean):  {:>10}", format_bytes(slot_bytes as u64));
     println!("  Filter bitmaps:       {:>10}", format_bytes(filter_bytes as u64));
@@ -641,7 +590,6 @@ fn print_bitmap_memory(engine: &ConcurrentEngine) {
     println!("  Total bitmap memory:  {:>10}", format_bytes(total as u64));
     println!();
 }
-
 /// Create a ConcurrentEngine with on-disk or in-memory docstore based on the flag.
 fn create_concurrent_engine(config: Config, bench_dir: &Path, label: &str, in_memory: bool) -> ConcurrentEngine {
     if in_memory {
@@ -654,7 +602,6 @@ fn create_concurrent_engine(config: Config, bench_dir: &Path, label: &str, in_me
         ConcurrentEngine::new_with_path(config, &db_path).unwrap()
     }
 }
-
 /// Wait for the ConcurrentEngine flush thread to catch up.
 fn wait_for_flush(engine: &ConcurrentEngine, expected_alive: u64, max_ms: u64) {
     let deadline = Instant::now() + Duration::from_millis(max_ms);
@@ -666,14 +613,11 @@ fn wait_for_flush(engine: &ConcurrentEngine, expected_alive: u64, max_ms: u64) {
         thread::sleep(Duration::from_millis(1));
     }
 }
-
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-
 fn main() {
     let args = parse_args();
-
     println!("==========================================================");
     println!("  Bitdex V2 Benchmark Harness");
     println!("==========================================================");
@@ -687,7 +631,6 @@ fn main() {
     println!("Docstore:   {}", if args.in_memory_docstore { "in-memory" } else { "on-disk" });
     println!("Stages:     {:?}", args.stages);
     println!();
-
     // Set up on-disk docstore directory next to the executable (cleaned up at end)
     let bench_dir = std::env::current_exe()
         .expect("failed to get exe path")
@@ -707,9 +650,7 @@ fn main() {
         println!();
     }
     let persist_path = bench_dir.join("bitmaps");
-
     let limit = args.limit.unwrap_or(usize::MAX);
-
     // -----------------------------------------------------------------------
     // Phase 1: Count records (quick scan, no full parse into memory)
     // Skip if only running bulk/persist/restore/query — the bulk path streams
@@ -734,7 +675,6 @@ fn main() {
         println!();
         (limit, 0.0)
     };
-
     let mut report = BenchmarkReport {
         dataset: DatasetInfo {
             path: args.data_path.display().to_string(),
@@ -755,38 +695,32 @@ fn main() {
             alive_count: 0,
         }],
     };
-
     // -----------------------------------------------------------------------
     // Phase 2: Insert benchmarks at varying batch sizes (ConcurrentEngine
     //          for batched docstore writes even in single-threaded mode)
     // -----------------------------------------------------------------------
     if should_run(&args.stages, "insert") {
         println!("--- Phase 2: Insert Benchmarks (ConcurrentEngine, single caller) ---");
-
         let batch_sizes: Vec<usize> = vec![1_000, 10_000, 100_000, 500_000, 1_000_000, total_records]
             .into_iter()
             .filter(|&s| s <= total_records)
             .collect();
-
         let batch_sizes: Vec<usize> = {
             let mut v = batch_sizes;
             v.dedup();
             v
         };
-
         for &batch_size in &batch_sizes {
             let label = if batch_size == total_records {
                 format!("all ({})", total_records)
             } else {
                 format!("{}", batch_size)
             };
-
             let rss_before = rss_bytes();
             let engine = create_concurrent_engine(civitai_config(), &bench_dir, &format!("insert_{}", batch_size), args.in_memory_docstore);
             engine.enter_loading_mode();
             let mut insert_time = Duration::ZERO;
             let mut id_counter = 0u32;
-
             let wall_start = Instant::now();
             stream_records(&args.data_path, batch_size, |rec| {
                 let id = if args.remap_ids { let v = id_counter; id_counter += 1; v } else { rec.id as u32 };
@@ -801,9 +735,7 @@ fn main() {
             let wall_elapsed = wall_start.elapsed();
             let rss_after = rss_bytes();
             let rss_delta = rss_after.saturating_sub(rss_before);
-
             let insert_rate = batch_size as f64 / insert_time.as_secs_f64();
-
             println!("  [{:>12}] put: {:.2}s  wall: {:.2}s  ({:.0}/s)  RSS: {} (+{})  alive: {}",
                 label,
                 insert_time.as_secs_f64(),
@@ -813,7 +745,6 @@ fn main() {
                 format_bytes(rss_delta),
                 engine.alive_count()
             );
-
             report.insert_benchmarks.push(InsertBenchmark {
                 batch_label: label.clone(),
                 record_count: batch_size,
@@ -824,7 +755,6 @@ fn main() {
                 rss_after_bytes: rss_after,
                 rss_delta_bytes: rss_delta,
             });
-
             report.memory_snapshots.push(MemorySnapshot {
                 stage: format!("insert_{}", label),
                 rss_bytes: rss_after,
@@ -834,19 +764,16 @@ fn main() {
         }
         println!();
     }
-
     // -----------------------------------------------------------------------
     // Phase 2b: Concurrent insert benchmark (ConcurrentEngine, N threads)
     // -----------------------------------------------------------------------
     if args.threads > 1 && should_run(&args.stages, "concurrent") {
         println!("--- Phase 2b: Concurrent Insert Benchmark ({} threads, ConcurrentEngine) ---", args.threads);
         println!("  Loading records into memory for thread distribution...");
-
         let load_start = Instant::now();
         let records = load_records(&args.data_path, total_records, args.remap_ids);
         let load_elapsed = load_start.elapsed();
         println!("  Loaded {} records in {:.2}s (parse + to_document)", records.len(), load_elapsed.as_secs_f64());
-
         let rss_before = rss_bytes();
         // Use tunable config for concurrent benchmarks
         let mut config = civitai_config();
@@ -860,19 +787,15 @@ fn main() {
         println!("  Channel capacity: {}, flush interval: {}us", config.channel_capacity, config.flush_interval_us);
         let engine = Arc::new(create_concurrent_engine(config, &bench_dir, "concurrent_insert", args.in_memory_docstore));
         engine.enter_loading_mode();
-
         // Split records into chunks for each thread
         let chunk_size = (records.len() + args.threads - 1) / args.threads;
         let chunks: Vec<Vec<(u32, Document)>> = records
             .chunks(chunk_size)
             .map(|c| c.to_vec())
             .collect();
-
         let total_inserted = Arc::new(AtomicUsize::new(0));
-
         println!("  Inserting with {} threads ({} records/thread avg, auto-coalesced)...", args.threads, chunk_size);
         let wall_start = Instant::now();
-
         let handles: Vec<_> = chunks
             .into_iter()
             .map(|chunk| {
@@ -890,25 +813,20 @@ fn main() {
                 })
             })
             .collect();
-
         let mut per_thread_counts = Vec::new();
         for h in handles {
             per_thread_counts.push(h.join().unwrap());
         }
-
         let wall_elapsed = wall_start.elapsed();
         let total_count = total_inserted.load(Ordering::Relaxed);
-
         // Exit loading mode and wait for all mutations to flush
         engine.exit_loading_mode();
         println!("  Waiting for flush thread to catch up...");
         wait_for_flush(&engine, total_count as u64, 30_000);
         let alive = engine.alive_count();
-
         let rss_after = rss_bytes();
         let total_rate = total_count as f64 / wall_elapsed.as_secs_f64();
         let per_thread_rate = total_rate / args.threads as f64;
-
         println!("  Concurrent insert complete:");
         println!("    Records:          {}", total_count);
         println!("    Wall time:        {:.2}s", wall_elapsed.as_secs_f64());
@@ -920,7 +838,6 @@ fn main() {
             println!("    Thread {}: {} records", i, count);
         }
         println!();
-
         report.concurrent_insert_benchmark = Some(ConcurrentInsertBenchmark {
             threads: args.threads,
             record_count: total_count,
@@ -931,7 +848,6 @@ fn main() {
             rss_before_bytes: rss_before,
             rss_after_bytes: rss_after,
         });
-
         report.memory_snapshots.push(MemorySnapshot {
             stage: format!("concurrent_insert_{}t", args.threads),
             rss_bytes: rss_after,
@@ -939,33 +855,26 @@ fn main() {
             alive_count: alive,
         });
     }
-
     // -----------------------------------------------------------------------
     // Phase 2c: Bulk insert benchmark (put_bulk — parallel decompose + direct bitmap build)
     // -----------------------------------------------------------------------
     let mut bulk_engine: Option<ConcurrentEngine> = None;
-
     if should_run(&args.stages, "bulk") {
         println!("--- Phase 2c: Bulk Insert Benchmark (put_bulk, {} threads) ---", args.threads);
-
         // Process in chunks to avoid OOM at large scales.
         // Each chunk loads N records, calls put_bulk(), then frees the chunk.
         let chunk_size = 5_000_000.min(total_records);
-
         let rss_before = rss_bytes();
         let engine = create_concurrent_engine(civitai_config(), &bench_dir, "bulk_insert", args.in_memory_docstore);
-
         let wall_start = Instant::now();
         let mut total_inserted: usize = 0;
         let mut chunks_processed: usize = 0;
         let mut id_counter: u32 = 0;
-
         // Use loading mode: accumulate into a private staging InnerEngine
         // without publishing intermediate snapshots. This avoids the
         // Arc::make_mut deep-clone cascade that happens when the published
         // snapshot shares Arc references with the staging copy.
         let mut staging = engine.clone_staging();
-
         // Pipelined bulk loading with parallel parsing:
         //
         // 1. Reader thread reads raw lines in small batches (read_batch_size)
@@ -978,7 +887,6 @@ fn main() {
         let remap_ids = args.remap_ids;
         let num_threads = args.threads;
         let read_batch_size = 500_000; // smaller read batches for better pipelining
-
         // Pipelined bulk loading:
         // 1. Reader thread reads large byte blocks (~300 MB each, ~500K lines)
         //    and sends complete-line buffers as Vec<u8>.
@@ -992,7 +900,6 @@ fn main() {
         let data_path = args.data_path.clone();
         let target_batch_bytes = read_batch_size * 600; // ~600 bytes/line × 500K lines ≈ 300 MB
         let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
-
         let reader_handle = thread::spawn(move || {
             use std::io::Read;
             let file = File::open(&data_path).expect("Failed to open data file");
@@ -1001,7 +908,6 @@ fn main() {
             let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB read buffer
             let mut accum = Vec::<u8>::with_capacity(target_batch_bytes + 4 * 1024 * 1024);
             let mut blocks_sent: usize = 0;
-
             loop {
                 let bytes_read = reader.read(&mut buf).unwrap_or(0);
                 if bytes_read == 0 {
@@ -1016,9 +922,7 @@ fn main() {
                     }
                     break;
                 }
-
                 accum.extend_from_slice(&buf[..bytes_read]);
-
                 // Once we have enough data, find the last newline and split
                 if accum.len() >= target_batch_bytes {
                     match memrchr_newline(&accum) {
@@ -1026,17 +930,14 @@ fn main() {
                             // Everything up to (including) last newline is a complete batch
                             let remainder = accum[last_nl + 1..].to_vec();
                             accum.truncate(last_nl + 1);
-
                             // Prepend any leftover from previous split
                             if !leftover.is_empty() {
                                 let mut combined = std::mem::take(&mut leftover);
                                 combined.append(&mut accum);
                                 accum = combined;
                             }
-
                             let batch = std::mem::replace(&mut accum, Vec::with_capacity(target_batch_bytes + 4 * 1024 * 1024));
                             leftover = remainder;
-
                             if block_tx.send(batch).is_err() { break; }
                             blocks_sent += 1;
                         }
@@ -1048,24 +949,19 @@ fn main() {
             }
             blocks_sent
         });
-
         // Main thread: receive byte blocks, parallel-parse with rayon, accumulate into bitmap chunks
         let mut doc_chunk: Vec<(u32, Document)> = Vec::with_capacity(chunk_size);
         let mut parse_time_accum = Duration::ZERO;
-
         while let Ok(raw_block) = block_rx.recv() {
             let parse_start = Instant::now();
             let base_id = id_counter;
-
             let block_str = std::str::from_utf8(&raw_block).expect("NDJSON block is not valid UTF-8");
-
             // Split into lines and parallel-parse with rayon
             let lines: Vec<&str> = block_str.split('\n')
                 .map(|l| l.trim_end_matches('\r'))
                 .filter(|l| !l.is_empty())
                 .collect();
             let line_count = lines.len() as u32;
-
             let mut parsed: Vec<(u32, Document)> = lines.into_par_iter()
                 .enumerate()
                 .filter_map(|(i, line)| {
@@ -1078,15 +974,12 @@ fn main() {
             let parse_elapsed = parse_start.elapsed();
             parse_time_accum += parse_elapsed;
             id_counter += line_count;
-
             doc_chunk.append(&mut parsed);
-
             // When we have enough docs, run bitmap building
             if doc_chunk.len() >= chunk_size {
                 let bitmap_start = Instant::now();
                 let count = engine.put_bulk_loading(&mut staging, &doc_chunk, num_threads);
                 let bitmap_elapsed = bitmap_start.elapsed();
-
                 total_inserted += count;
                 chunks_processed += 1;
                 let alive = staging.slots.alive_count();
@@ -1099,13 +992,11 @@ fn main() {
                 parse_time_accum = Duration::ZERO;
             }
         }
-
         // Process remaining docs
         if !doc_chunk.is_empty() {
             let bitmap_start = Instant::now();
             let count = engine.put_bulk_loading(&mut staging, &doc_chunk, num_threads);
             let bitmap_elapsed = bitmap_start.elapsed();
-
             total_inserted += count;
             chunks_processed += 1;
             let alive = staging.slots.alive_count();
@@ -1115,21 +1006,16 @@ fn main() {
                 parse_time_accum.as_secs_f64(), bitmap_elapsed.as_secs_f64(),
                 rate, alive);
         }
-
         reader_handle.join().unwrap();
-
         // Publish the fully-built staging as the live snapshot
         let publish_start = Instant::now();
         engine.publish_staging(staging);
         let publish_elapsed = publish_start.elapsed();
         println!("  publish: {:.2}s  alive: {}", publish_elapsed.as_secs_f64(), engine.alive_count());
-
         let wall_elapsed = wall_start.elapsed();
         let rss_after = rss_bytes();
         let rss_delta = rss_after.saturating_sub(rss_before);
-
         let bulk_rate = total_inserted as f64 / wall_elapsed.as_secs_f64();
-
         println!("  [{:>12}] put_bulk total: {:.2}s  ({:.0}/s)  RSS: {} (+{})  alive: {}",
             format!("{}", total_inserted),
             wall_elapsed.as_secs_f64(),
@@ -1138,10 +1024,8 @@ fn main() {
             format_bytes(rss_delta),
             engine.alive_count()
         );
-
         // Bitmap memory breakdown
         print_bitmap_memory(&engine);
-
         report.insert_benchmarks.push(InsertBenchmark {
             batch_label: format!("bulk_{}", total_inserted),
             record_count: total_inserted,
@@ -1152,7 +1036,6 @@ fn main() {
             rss_after_bytes: rss_after,
             rss_delta_bytes: rss_delta,
         });
-
         report.memory_snapshots.push(MemorySnapshot {
             stage: format!("bulk_insert_{}", total_inserted),
             rss_bytes: rss_after,
@@ -1160,11 +1043,9 @@ fn main() {
             alive_count: engine.alive_count(),
         });
         println!();
-
         // Keep the bulk engine for query/update phases if those stages are also requested
         bulk_engine = Some(engine);
     }
-
     // -----------------------------------------------------------------------
     // Phase 3: Build the full engine (streaming from file)
     // If bulk was already run, reuse that engine instead of rebuilding.
@@ -1174,14 +1055,12 @@ fn main() {
         println!("  Alive: {}", be.alive_count());
         println!("  RSS: {}", format_bytes(rss_bytes()));
         println!();
-
         report.memory_snapshots.push(MemorySnapshot {
             stage: "full_engine (from bulk)".into(),
             rss_bytes: rss_bytes(),
             rss_human: format_bytes(rss_bytes()),
             alive_count: be.alive_count(),
         });
-
         print_bitmap_memory(&be);
         be
     } else {
@@ -1203,19 +1082,16 @@ fn main() {
         println!("  Alive: {}", engine.alive_count());
         println!("  RSS: {}", format_bytes(rss));
         println!();
-
         report.memory_snapshots.push(MemorySnapshot {
             stage: "full_engine".into(),
             rss_bytes: rss,
             rss_human: format_bytes(rss),
             alive_count: engine.alive_count(),
         });
-
         // Bitmap memory breakdown (excludes redb, allocator, channels — pure Bitdex)
         print_bitmap_memory(&engine);
         engine
     };
-
     // -----------------------------------------------------------------------
     // Phase: Persist — save engine bitmap snapshot to disk
     // -----------------------------------------------------------------------
@@ -1225,29 +1101,24 @@ fn main() {
         let persist_start = Instant::now();
         engine.save_snapshot_to(&persist_path).unwrap();
         let persist_elapsed = persist_start.elapsed();
-
         let file_size = dir_size(&persist_path);
         println!("  Saved {} alive in {:.2}s (bitmaps dir: {})",
             alive_before, persist_elapsed.as_secs_f64(), format_bytes(file_size));
         println!("  RSS: {}", format_bytes(rss_bytes()));
         println!();
     }
-
     // -----------------------------------------------------------------------
     // Phase: Restore — drop engine, rebuild from bitmap snapshot
     // -----------------------------------------------------------------------
     if should_run(&args.stages, "restore") {
         println!("--- Phase: Restore (load from bitmap snapshot) ---");
-
         if !persist_path.exists() {
             eprintln!("  ERROR: no bitmaps dir found at {}. Run with 'persist' stage first.", persist_path.display());
         } else {
             let rss_before = rss_bytes();
-
             // Create a new engine with bitmap_path pointing to the snapshot
             let mut restore_config = civitai_config();
             restore_config.storage.bitmap_path = Some(persist_path.clone());
-
             let restore_start = Instant::now();
             let restored = if args.in_memory_docstore {
                 ConcurrentEngine::new(restore_config).unwrap()
@@ -1256,33 +1127,27 @@ fn main() {
                 ConcurrentEngine::new_with_path(restore_config, &db_path).unwrap()
             };
             let restore_elapsed = restore_start.elapsed();
-
             // Replace the old engine (implicitly drops it)
             engine = restored;
-
             let rss_restored = rss_bytes();
             println!("  Restored {} alive in {:.2}s (was {} RSS before)",
                 engine.alive_count(), restore_elapsed.as_secs_f64(), format_bytes(rss_before));
             println!("  RSS: {}", format_bytes(rss_restored));
             println!();
-
             report.memory_snapshots.push(MemorySnapshot {
                 stage: "restored_engine".into(),
                 rss_bytes: rss_restored,
                 rss_human: format_bytes(rss_restored),
                 alive_count: engine.alive_count(),
             });
-
             print_bitmap_memory(&engine);
         }
     }
-
     // -----------------------------------------------------------------------
     // Phase 4: Update/re-insert benchmark (re-reads file from top)
     // -----------------------------------------------------------------------
     if should_run(&args.stages, "update") {
         println!("--- Phase 4: Update (Increment reactionCount) Benchmark ---");
-
         let update_count = total_records.min(100_000);
         let mut update_time = Duration::ZERO;
         let mut update_counter = 0u32;
@@ -1301,32 +1166,27 @@ fn main() {
         wait_for_flush(&engine, total_records as u64, 30_000);
         let wall_elapsed = wall_start.elapsed();
         let update_rate = update_count as f64 / update_time.as_secs_f64();
-
         println!("  Updated {} records in {:.2}s (wall: {:.2}s) ({:.0}/s)",
             update_count, update_time.as_secs_f64(), wall_elapsed.as_secs_f64(), update_rate);
         println!("  Alive after upsert: {} (should be unchanged)", engine.alive_count());
         println!();
-
         report.update_benchmark = Some(UpdateBenchmark {
             record_count: update_count,
             elapsed_ms: update_time.as_secs_f64() * 1000.0,
             rate_per_sec: update_rate,
         });
     }
-
     // -----------------------------------------------------------------------
     // Phase 5: Query benchmarks
     // -----------------------------------------------------------------------
     if should_run(&args.stages, "query") {
         println!("--- Phase 5: Query Benchmarks ---");
         println!();
-
         // Quick streaming pass to collect frequency stats for realistic queries.
         let mut user_freq: HashMap<i64, usize> = HashMap::new();
         let mut tag_freq: HashMap<i64, usize> = HashMap::new();
         let mut sample_tag_ids: Vec<i64> = Vec::new();
         let sample_limit = 100_000.min(total_records);
-
         stream_records(&args.data_path, sample_limit, |rec| {
             if let Some(uid) = rec.user_id {
                 *user_freq.entry(uid as i64).or_default() += 1;
@@ -1340,12 +1200,10 @@ fn main() {
                 }
             }
         });
-
         let frequent_user_id = user_freq.iter()
             .max_by_key(|(_, &count)| count)
             .map(|(&uid, _)| uid)
             .unwrap_or(1);
-
         let popular_tag = tag_freq.iter()
             .max_by_key(|(_, &count)| count)
             .map(|(&tid, _)| tid)
@@ -1354,9 +1212,7 @@ fn main() {
             .find(|(_, &count)| count > 100 && count < 5000)
             .map(|(&tid, _)| tid)
             .unwrap_or(5133);
-
         let iterations = 200;
-
         struct QuerySpec {
             name: &'static str,
             description: &'static str,
@@ -1364,7 +1220,6 @@ fn main() {
             sort: Option<SortClause>,
             limit: usize,
         }
-
         let queries = vec![
             // --- Filter-only queries ---
             QuerySpec {
@@ -1549,7 +1404,6 @@ fn main() {
                 limit: 50,
             },
         ];
-
         // Warm-up: run each query 10 times to populate unified cache
         let warmup_passes = 10;
         println!("  Warming up ({} passes x {} queries)...", warmup_passes, queries.len());
@@ -1559,12 +1413,10 @@ fn main() {
             }
         }
         println!();
-
         // Run benchmarks
         println!("  {:<40} {:>8} {:>8} {:>8} {:>8} {:>8}",
             "Query", "p50", "p95", "p99", "mean", "count");
         println!("  {}", "-".repeat(82));
-
         for q in &queries {
             let mut durations = Vec::with_capacity(iterations);
             for _ in 0..iterations {
@@ -1575,9 +1427,7 @@ fn main() {
                 let _ = result.unwrap();
                 durations.push(elapsed);
             }
-
             let stats = compute_stats(durations);
-
             println!("  {:<40} {:>7.3} {:>7.3} {:>7.3} {:>7.3}ms {:>5}",
                 q.name,
                 stats.p50_ms,
@@ -1586,7 +1436,6 @@ fn main() {
                 stats.mean_ms,
                 stats.count,
             );
-
             report.query_benchmarks.push(QueryBenchmark {
                 name: q.name.to_string(),
                 description: q.description.to_string(),
@@ -1595,10 +1444,8 @@ fn main() {
             });
         }
         println!();
-
         // Show bitmap memory after queries (unified cache populated)
         print_bitmap_memory(&engine);
-
         // -------------------------------------------------------------------
         // Phase 5b: Unified Cache Effectiveness (cold vs warm)
         //
@@ -1608,16 +1455,13 @@ fn main() {
         // -------------------------------------------------------------------
         println!("--- Phase 5b: Unified Cache Effectiveness (cold vs warm) ---");
         println!();
-
         engine.clear_unified_cache();
-
         struct BoundTestSpec {
             name: &'static str,
             filters: Vec<FilterClause>,
             sort: SortClause,
             limit: usize,
         }
-
         let bound_tests = vec![
             BoundTestSpec {
                 name: "all_sort_reactions",
@@ -1659,17 +1503,14 @@ fn main() {
                 limit: 50,
             },
         ];
-
         println!("  {:<36} {:>8} {:>8} {:>8} {:>8}",
             "Query", "cold", "warm p50", "warm p95", "speedup");
         println!("  {}", "-".repeat(72));
-
         for bt in &bound_tests {
             // Cold: no cached results
             let cold_start = Instant::now();
             let _ = engine.query(&bt.filters, Some(&bt.sort), bt.limit).unwrap();
             let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
-
             // Warm: bound was just formed, subsequent queries benefit
             let warm_iters = 100;
             let mut warm_durations = Vec::with_capacity(warm_iters);
@@ -1680,12 +1521,10 @@ fn main() {
             }
             let warm_stats = compute_stats(warm_durations);
             let speedup = cold_ms / warm_stats.p50_ms;
-
             println!("  {:<36} {:>7.3} {:>7.3} {:>7.3}ms {:>7.1}x",
                 bt.name, cold_ms, warm_stats.p50_ms, warm_stats.p95_ms, speedup);
         }
         println!();
-
         // Report unified cache stats after effectiveness test
         {
             let uc = engine.unified_cache_stats();
@@ -1693,7 +1532,6 @@ fn main() {
                 uc.entries, uc.hits, uc.misses);
         }
         println!();
-
         // -------------------------------------------------------------------
         // Phase 5c: Deep Pagination Benchmark
         //
@@ -1702,7 +1540,6 @@ fn main() {
         // -------------------------------------------------------------------
         println!("--- Phase 5c: Deep Pagination (cursor through 10 pages) ---");
         println!();
-
         let pagination_filters = vec![
             FilterClause::Eq("nsfwLevel".into(), Value::Integer(1)),
             FilterClause::Eq("onSite".into(), Value::Bool(true)),
@@ -1712,18 +1549,15 @@ fn main() {
             direction: SortDirection::Desc,
         };
         let page_size = 50;
-
         println!("  Filters: nsfwLevel=1 AND onSite=true");
         println!("  Sort: reactionCount DESC, page_size={}", page_size);
         println!();
         println!("  {:>6} {:>8} {:>10} {:>14}",
             "Page", "latency", "results", "cursor_value");
         println!("  {}", "-".repeat(44));
-
         let snap = engine.snapshot_public();
         let sort_field = snap.sorts.get_field("reactionCount").unwrap();
         let mut cursor: Option<CursorPosition> = None;
-
         for page in 1..=10 {
             let query = BitdexQuery {
                 filters: pagination_filters.clone(),
@@ -1733,13 +1567,10 @@ fn main() {
                 offset: None,
                 skip_cache: false,
             };
-
             let start = Instant::now();
             let result = engine.execute_query(&query).unwrap();
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-
             let result_count = result.ids.len();
-
             if let Some(&last_id) = result.ids.last() {
                 let last_slot = last_id as u32;
                 let sv = sort_field.reconstruct_value(last_slot);
@@ -1754,13 +1585,11 @@ fn main() {
                     page, elapsed_ms, result_count, "-");
                 break; // No more results
             }
-
             if result_count < page_size {
                 break; // Partial page = end of results
             }
         }
         drop(snap);
-
         // Report unified cache stats after pagination
         {
             let uc = engine.unified_cache_stats();
@@ -1770,25 +1599,20 @@ fn main() {
         }
         println!();
     }
-
     // -----------------------------------------------------------------------
     // Phase 6: Mixed read/write benchmark (ConcurrentEngine)
     // Some threads insert while others query concurrently
     // -----------------------------------------------------------------------
     if args.threads > 1 && should_run(&args.stages, "mixed") {
         println!("--- Phase 6: Mixed Read/Write Benchmark ({} threads, ConcurrentEngine) ---", args.threads);
-
         // Use half threads for writing, half for reading (min 1 each)
         let writer_threads = (args.threads / 2).max(1);
         let reader_threads = (args.threads - writer_threads).max(1);
-
         // Load a subset of records for writing (use 50K or total if less)
         let mixed_record_count = total_records.min(50_000);
         println!("  Loading {} records for mixed benchmark...", mixed_record_count);
         let records = load_records(&args.data_path, mixed_record_count, args.remap_ids);
-
         let engine = Arc::new(create_concurrent_engine(civitai_config(), &bench_dir, "mixed_rw", args.in_memory_docstore));
-
         // Pre-populate with half the records so readers have data to query
         let prepop_count = records.len() / 2;
         for (id, doc) in &records[..prepop_count] {
@@ -1796,7 +1620,6 @@ fn main() {
         }
         wait_for_flush(&engine, prepop_count as u64, 10_000);
         println!("  Pre-populated {} records, alive: {}", prepop_count, engine.alive_count());
-
         // The remaining records will be inserted by writers during the mixed phase
         let write_records: Vec<(u32, Document)> = records[prepop_count..].to_vec();
         let write_chunk_size = (write_records.len() + writer_threads - 1) / writer_threads;
@@ -1804,17 +1627,13 @@ fn main() {
             .chunks(write_chunk_size)
             .map(|c| c.to_vec())
             .collect();
-
         let total_queries = Arc::new(AtomicUsize::new(0));
         let total_writes = Arc::new(AtomicUsize::new(0));
         let all_query_durations: Arc<parking_lot::Mutex<Vec<Duration>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
-
         let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
         println!("  Running mixed workload: {} writer threads, {} reader threads...", writer_threads, reader_threads);
         let wall_start = Instant::now();
-
         // Spawn writer threads
         let mut handles = Vec::new();
         for chunk in write_chunks {
@@ -1829,7 +1648,6 @@ fn main() {
                 }
             }));
         }
-
         // Spawn reader threads
         for _ in 0..reader_threads {
             let engine = Arc::clone(&engine);
@@ -1865,45 +1683,36 @@ fn main() {
                 durations.lock().extend(local_durations);
             }));
         }
-
         // Wait for writer threads to finish (they're bounded by the chunk size)
         // Reader threads run until stop_flag is set
         // Wait for the first N handles (writers)
         for h in handles.drain(..writer_threads.min(handles.len())) {
             h.join().unwrap();
         }
-
         // Signal readers to stop
         stop_flag.store(true, Ordering::Relaxed);
         for h in handles {
             h.join().unwrap();
         }
-
         let wall_elapsed = wall_start.elapsed();
         let writes = total_writes.load(Ordering::Relaxed);
         let queries = total_queries.load(Ordering::Relaxed);
-
         // Wait for flush
         wait_for_flush(&engine, (prepop_count + writes) as u64, 10_000);
-
         let insert_rate = writes as f64 / wall_elapsed.as_secs_f64();
-
         let query_durations = Arc::try_unwrap(all_query_durations)
             .unwrap_or_else(|arc| arc.lock().clone().into())
             .into_inner();
-
         println!("  Mixed workload complete:");
         println!("    Wall time:     {:.2}s", wall_elapsed.as_secs_f64());
         println!("    Records inserted: {} ({:.0} docs/s)", writes, insert_rate);
         println!("    Queries executed: {}", queries);
         println!("    Alive after:   {}", engine.alive_count());
-
         if !query_durations.is_empty() {
             let stats = compute_stats(query_durations);
             println!("    Query latency under concurrent writes:");
             println!("      p50: {:.3}ms  p95: {:.3}ms  p99: {:.3}ms  mean: {:.3}ms",
                 stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.mean_ms);
-
             report.mixed_rw_benchmark = Some(MixedRwBenchmark {
                 writer_threads,
                 reader_threads,
@@ -1916,7 +1725,6 @@ fn main() {
         }
         println!();
     }
-
     // -----------------------------------------------------------------------
     // Phase 7: Realistic contention benchmark
     //
@@ -1926,18 +1734,15 @@ fn main() {
     // -----------------------------------------------------------------------
     if should_run(&args.stages, "contention") {
         println!("--- Phase 7: Realistic Contention Benchmark ---");
-
         let duration_secs = 15;
         let insert_target_per_sec = 15.0_f64;  // slow trickle of new docs
         let update_target_per_sec = 150.0_f64; // moderate reaction count churn
         let reader_thread_count = 4.max(args.threads.saturating_sub(2));
-
         println!("  Duration:       {}s", duration_secs);
         println!("  Insert target:  {:.0}/s (new docs)", insert_target_per_sec);
         println!("  Update target:  {:.0}/s (reactionCount++)", update_target_per_sec);
         println!("  Reader threads: {}", reader_thread_count);
         println!();
-
         // Build a ConcurrentEngine loaded with the full dataset
         println!("  Building ConcurrentEngine with full dataset...");
         let mut conc_config = civitai_config();
@@ -1948,7 +1753,6 @@ fn main() {
         }
         conc_config.flush_interval_us = args.flush_interval_us;
         let conc_engine = Arc::new(create_concurrent_engine(conc_config, &bench_dir, "contention", args.in_memory_docstore));
-
         let load_start = Instant::now();
         stream_records(&args.data_path, limit, |rec| {
             let id = rec.id as u32;
@@ -1958,13 +1762,11 @@ fn main() {
         // Wait for full flush before measuring
         wait_for_flush(&conc_engine, total_records as u64, 60_000);
         println!("  Loaded in {:.2}s, alive: {}", load_start.elapsed().as_secs_f64(), conc_engine.alive_count());
-
         // Collect sample values for randomized queries
         let mut sample_nsfw_levels: Vec<i64> = Vec::new();
         let mut sample_user_ids: Vec<i64> = Vec::new();
         let mut sample_tags: Vec<i64> = Vec::new();
         let mut max_id: u32 = 0;
-
         stream_records(&args.data_path, 100_000.min(total_records), |rec| {
             if rec.id as u32 > max_id { max_id = rec.id as u32; }
             if let Some(v) = rec.nsfw_level {
@@ -1985,31 +1787,24 @@ fn main() {
                 }
             }
         });
-
         if sample_nsfw_levels.is_empty() { sample_nsfw_levels.push(1); }
         if sample_user_ids.is_empty() { sample_user_ids.push(1); }
         if sample_tags.is_empty() { sample_tags.push(304); }
-
         let sample_nsfw_levels = Arc::new(sample_nsfw_levels);
         let sample_user_ids = Arc::new(sample_user_ids);
         let sample_tags = Arc::new(sample_tags);
-
         let sort_fields: Arc<Vec<&str>> = Arc::new(vec![
             "reactionCount", "sortAt", "commentCount", "collectedCount", "id",
         ]);
-
         let alive_before = conc_engine.alive_count();
         let rss_before = rss_bytes();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
         let insert_count = Arc::new(AtomicUsize::new(0));
         let update_count = Arc::new(AtomicUsize::new(0));
         let query_count = Arc::new(AtomicUsize::new(0));
         let query_durations: Arc<parking_lot::Mutex<Vec<Duration>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
-
         let mut handles = Vec::new();
-
         // --- Insert thread: slow trickle of new documents ---
         {
             let engine = Arc::clone(&conc_engine);
@@ -2017,7 +1812,6 @@ fn main() {
             let counter = Arc::clone(&insert_count);
             let sleep_per_insert = Duration::from_secs_f64(1.0 / insert_target_per_sec);
             let start_id = max_id + 1_000_000; // well beyond existing IDs
-
             handles.push(thread::spawn(move || {
                 let mut rng = rand::thread_rng();
                 let mut id = start_id;
@@ -2043,7 +1837,6 @@ fn main() {
                 }
             }));
         }
-
         // --- Update thread: moderate rate reactionCount increments ---
         {
             let engine = Arc::clone(&conc_engine);
@@ -2055,7 +1848,6 @@ fn main() {
             stream_records(&args.data_path, 50_000.min(total_records), |rec| {
                 update_ids.push(rec.id as u32);
             });
-
             handles.push(thread::spawn(move || {
                 let mut rng = rand::thread_rng();
                 while !stop.load(Ordering::Relaxed) {
@@ -2074,7 +1866,6 @@ fn main() {
                 }
             }));
         }
-
         // --- Reader threads: max rate, randomized queries ---
         for _ in 0..reader_thread_count {
             let engine = Arc::clone(&conc_engine);
@@ -2085,16 +1876,13 @@ fn main() {
             let users = Arc::clone(&sample_user_ids);
             let tags = Arc::clone(&sample_tags);
             let sorts = Arc::clone(&sort_fields);
-
             handles.push(thread::spawn(move || {
                 let mut rng = rand::thread_rng();
                 let mut local_durations = Vec::with_capacity(100_000);
-
                 while !stop.load(Ordering::Relaxed) {
                     // Build a randomized query
                     let num_clauses = rng.gen_range(1..=3);
                     let mut filters: Vec<FilterClause> = Vec::new();
-
                     for _ in 0..num_clauses {
                         let clause_type = rng.gen_range(0..9);
                         let clause = match clause_type {
@@ -2172,7 +1960,6 @@ fn main() {
                         };
                         filters.push(clause);
                     }
-
                     // Random sort
                     let sort_field = sorts[rng.gen_range(0..sorts.len())];
                     let direction = if rng.gen_bool(0.5) {
@@ -2184,23 +1971,18 @@ fn main() {
                         field: sort_field.to_string(),
                         direction,
                     };
-
                     let limit = *[20, 50, 100].get(rng.gen_range(0..3)).unwrap();
-
                     let start = Instant::now();
                     let _ = engine.query(&filters, Some(&sort), limit);
                     local_durations.push(start.elapsed());
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
-
                 durations.lock().extend(local_durations);
             }));
         }
-
         // Let it run for the configured duration
         println!("  Running for {}s...", duration_secs);
         let bench_start = Instant::now();
-
         // Print progress every 3 seconds
         for tick in 1..=(duration_secs / 3) {
             thread::sleep(Duration::from_secs(3));
@@ -2213,33 +1995,27 @@ fn main() {
             );
             let _ = tick;
         }
-
         // Sleep remaining time if any
         let remaining = Duration::from_secs(duration_secs as u64).saturating_sub(bench_start.elapsed());
         if !remaining.is_zero() {
             thread::sleep(remaining);
         }
-
         // Signal stop
         stop.store(true, Ordering::Relaxed);
         for h in handles {
             h.join().unwrap();
         }
-
         let wall_elapsed = bench_start.elapsed();
         let total_inserts = insert_count.load(Ordering::Relaxed);
         let total_updates = update_count.load(Ordering::Relaxed);
         let total_queries = query_count.load(Ordering::Relaxed);
-
         // Wait for flush to settle
         thread::sleep(Duration::from_millis(200));
         let alive_after = conc_engine.alive_count();
         let rss_after = rss_bytes();
-
         let all_durations = Arc::try_unwrap(query_durations)
             .unwrap_or_else(|arc| arc.lock().clone().into())
             .into_inner();
-
         println!();
         println!("  Realistic contention results:");
         println!("    Wall time:       {:.2}s", wall_elapsed.as_secs_f64());
@@ -2254,13 +2030,11 @@ fn main() {
         println!("    RSS:             {} -> {} (delta: {})",
             format_bytes(rss_before), format_bytes(rss_after),
             format_bytes(rss_after.saturating_sub(rss_before)));
-
         if !all_durations.is_empty() {
             let stats = compute_stats(all_durations);
             println!("    Query latency under contention:");
             println!("      p50: {:.3}ms  p95: {:.3}ms  p99: {:.3}ms  max: {:.3}ms  mean: {:.3}ms",
                 stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.max_ms, stats.mean_ms);
-
             report.contention_benchmark = Some(ContentionBenchmark {
                 duration_secs: wall_elapsed.as_secs_f64(),
                 reader_threads: reader_thread_count,
@@ -2277,17 +2051,14 @@ fn main() {
                 rss_after_bytes: rss_after,
             });
         }
-
         report.memory_snapshots.push(MemorySnapshot {
             stage: "contention".into(),
             rss_bytes: rss_after,
             rss_human: format_bytes(rss_after),
             alive_count: alive_after,
         });
-
         println!();
     }
-
     // -----------------------------------------------------------------------
     // Final memory snapshot
     // -----------------------------------------------------------------------
@@ -2298,13 +2069,11 @@ fn main() {
         rss_human: format_bytes(final_rss),
         alive_count: engine.alive_count(),
     });
-
     println!("--- Final State ---");
     println!("  Alive documents: {}", engine.alive_count());
     println!("  Slot counter:    {}", engine.slot_counter());
     println!("  RSS:             {}", format_bytes(final_rss));
     println!();
-
     // -----------------------------------------------------------------------
     // JSON output
     // -----------------------------------------------------------------------
@@ -2314,13 +2083,11 @@ fn main() {
         std::fs::write(&out_path, &json).expect("Failed to write JSON report");
         println!("JSON report written to: {}", out_path.display());
     }
-
     // Clean up on-disk data (drop engine first to release file handles)
     drop(engine);
     if needs_bench_dir && bench_dir.exists() {
         std::fs::remove_dir_all(&bench_dir).ok();
     }
-
     println!("==========================================================");
     println!("  Benchmark complete.");
     println!("==========================================================");

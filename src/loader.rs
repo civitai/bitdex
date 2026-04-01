@@ -982,6 +982,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 42, "count": 100});
@@ -1013,6 +1014,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "secondary": 99});
@@ -1044,6 +1046,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "type": "image"});
@@ -1075,6 +1078,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false, // default
                 default_value: None,
+                nullable: false,
             }],
         };
         schema.normalize_string_maps();
@@ -1117,6 +1121,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: true,
                 default_value: None,
+                nullable: false,
             }],
         };
         schema.normalize_string_maps();
@@ -1155,6 +1160,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "hasMeta": true});
@@ -1182,6 +1188,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "tagIds": [10, 20, 30]});
@@ -1213,6 +1220,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         // Millisecond timestamp → divide by 1000, then cast to u32
@@ -1245,6 +1253,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
 
@@ -1306,6 +1315,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
 
@@ -1357,6 +1367,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "url": "http://example.com"});
@@ -1386,6 +1397,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1});
@@ -1410,6 +1422,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "val": null});
@@ -1434,6 +1447,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         let json: serde_json::Value = serde_json::json!({"id": 1, "tags": []});
@@ -1468,6 +1482,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
 
@@ -1523,6 +1538,7 @@ mod tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
 
@@ -1565,6 +1581,7 @@ mod tests {
             truncate_u32: false,
             case_sensitive: false,
             default_value: None,
+            nullable: false,
         };
 
         let mut field_map: HashMap<u64, RoaringBitmap> = HashMap::new();
@@ -1743,6 +1760,7 @@ mod checkpoint_tests {
                     truncate_u32: false,
                     case_sensitive: false,
                     default_value: None,
+                    nullable: false,
                 },
                 FieldMapping {
                     source: "collectionIds".into(),
@@ -1756,6 +1774,7 @@ mod checkpoint_tests {
                     truncate_u32: false,
                     case_sensitive: false,
                     default_value: None,
+                    nullable: false,
                 },
             ],
         };
@@ -1796,6 +1815,7 @@ mod checkpoint_tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
 
@@ -1834,6 +1854,7 @@ mod checkpoint_tests {
                 truncate_u32: false,
                 case_sensitive: false,
                 default_value: None,
+                nullable: false,
             }],
         };
         assert!(schema.validate().is_err(), "doc_only + filter_only should fail validation");

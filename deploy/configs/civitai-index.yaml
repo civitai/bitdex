@@ -5,7 +5,7 @@ config:
     - { name: nsfwLevel, field_type: single_value, eager_load: true }
     - { name: userId, field_type: single_value, eager_load: true }
     - { name: type, field_type: single_value, eager_load: true }
-    - { name: baseModel, field_type: single_value, eager_load: true, nullable: true }
+    - { name: baseModel, field_type: single_value, eager_load: true }
     - { name: availability, field_type: single_value, eager_load: true }
     - { name: postId, field_type: single_value, per_value_lazy: true }
     - { name: postedToId, field_type: single_value, per_value_lazy: true }
@@ -16,7 +16,7 @@ config:
     - { name: minor, field_type: boolean }
     - { name: isPublished, field_type: boolean, eager_load: true }
     - { name: isRemix, field_type: boolean }
-    - { name: blockedFor, field_type: single_value, eager_load: true, nullable: true }
+    - { name: blockedFor, field_type: single_value, eager_load: true }
     - { name: tagIds, field_type: multi_value }
     - { name: modelVersionIds, field_type: multi_value }
     - { name: modelVersionIdsManual, field_type: multi_value }
@@ -58,14 +58,14 @@ data_schema:
     - { source: nsfwLevel, target: nsfwLevel, value_type: integer, fallback: combinedNsfwLevel }
     - { source: userId, target: userId, value_type: integer }
     - { source: type, target: type, value_type: low_cardinality_string }
-    - { source: baseModel, target: baseModel, value_type: low_cardinality_string }
-    - { source: availability, target: availability, value_type: low_cardinality_string }
-    - { source: postId, target: postId, value_type: integer }
-    - { source: postedToId, target: postedToId, value_type: integer }
-    - { source: remixOfId, target: remixOfId, value_type: integer }
+    - { source: baseModel, target: baseModel, value_type: low_cardinality_string, nullable: true }
+    - { source: availability, target: availability, value_type: low_cardinality_string, nullable: true }
+    - { source: postId, target: postId, value_type: integer, nullable: true }
+    - { source: postedToId, target: postedToId, value_type: integer, nullable: true }
+    - { source: remixOfId, target: remixOfId, value_type: integer, nullable: true }
     - { source: publishedAtUnix, target: isPublished, value_type: exists_boolean }
     - { source: remixOfId, target: isRemix, value_type: exists_boolean }
-    - { source: blockedFor, target: blockedFor, value_type: low_cardinality_string }
+    - { source: blockedFor, target: blockedFor, value_type: low_cardinality_string, nullable: true }
     - { source: hasMeta, target: hasMeta, value_type: boolean, default: false }
     - { source: onSite, target: onSite, value_type: boolean, default: false }
     - { source: poi, target: poi, value_type: boolean, default: false }
