@@ -1205,10 +1205,19 @@ impl ShardStoreBulkWriter {
                 if shard.is_empty() {
                     continue;
                 }
-                // Read existing shard state and merge new docs into it
+                // Read existing shard state and merge new docs into it.
+                // Per-slot merge: existing fields are preserved, buffered fields
+                // override by field_idx (last-write-wins), duplicates deduplicated.
                 let mut snapshot = store.read(&shard_key)?.unwrap_or_else(DocSnapshot::new);
-                for (&slot, fields) in shard.iter() {
-                    snapshot.docs.insert(slot, fields.clone());
+                for (&slot, buffered_fields) in shard.iter() {
+                    let doc = snapshot.docs.entry(slot).or_default();
+                    for (field_idx, value) in buffered_fields {
+                        if let Some(existing) = doc.iter_mut().find(|(f, _)| *f == *field_idx) {
+                            existing.1 = value.clone();
+                        } else {
+                            doc.push((*field_idx, value.clone()));
+                        }
+                    }
                 }
                 store.write_snapshot(&shard_key, &snapshot)?;
             }
