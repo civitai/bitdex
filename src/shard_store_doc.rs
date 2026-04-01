@@ -238,7 +238,10 @@ impl SnapshotCodec for DocSnapshotCodec {
         let mut docs = HashMap::with_capacity(num_docs);
         for _ in 0..num_docs {
             if pos + 6 > bytes.len() {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("truncated doc snapshot: expected {} docs, decoded {}", num_docs, docs.len()),
+                ));
             }
             let slot = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
             pos += 4;
@@ -886,14 +889,7 @@ impl DocStoreV3 {
 
         for (shard_key, ops) in by_shard {
             self.store.append_ops(&shard_key, &ops)?;
-            // Auto-compact if threshold exceeded (uses > to match ShardStore::should_compact)
-            if let Ok(Some(count)) = self.store.ops_count(&shard_key) {
-                if count > self.compact_threshold {
-                    if let Err(e) = self.store.compact_current(&shard_key) {
-                        eprintln!("DocStoreV3: auto-compaction failed for shard {shard_key}: {e}");
-                    }
-                }
-            }
+            self.maybe_auto_compact(shard_key);
         }
 
         Ok(())
@@ -917,6 +913,7 @@ impl DocStoreV3 {
 
         for (shard_key, ops) in by_shard {
             self.store.append_ops(&shard_key, &ops)?;
+            self.maybe_auto_compact(shard_key);
         }
         Ok(())
     }
@@ -930,7 +927,23 @@ impl DocStoreV3 {
             slot,
             field: field_idx,
             value: pv,
-        })
+        })?;
+        self.maybe_auto_compact(shard_key);
+        Ok(())
+    }
+
+    /// Check ops count and auto-compact if threshold exceeded.
+    fn maybe_auto_compact(&self, shard_key: u32) {
+        if self.compact_threshold == 0 {
+            return;
+        }
+        if let Ok(Some(count)) = self.store.ops_count(&shard_key) {
+            if count > self.compact_threshold {
+                if let Err(e) = self.store.compact_current(&shard_key) {
+                    eprintln!("DocStoreV3: auto-compaction failed for shard {shard_key}: {e}");
+                }
+            }
+        }
     }
 
     /// Compact all shards. Returns true if any compaction was done.
@@ -1113,7 +1126,9 @@ pub struct ShardStoreBulkWriter {
     field_defaults: HashMap<u16, PackedValue>,
     /// Buffered tuples grouped by shard. Each shard holds a map of slot → fields.
     /// DashMap for concurrent access from rayon threads.
-    shard_buffers: Arc<DashMap<u32, parking_lot::Mutex<HashMap<u32, Vec<(u16, PackedValue)>>>>>,
+    /// Values are Arc<Mutex<...>> so we can clone them out and drop the DashMap lock
+    /// before acquiring the inner Mutex (avoids holding DashMap shard lock during I/O).
+    shard_buffers: Arc<DashMap<u32, Arc<parking_lot::Mutex<HashMap<u32, Vec<(u16, PackedValue)>>>>>>,
 }
 
 impl ShardStoreBulkWriter {
@@ -1138,9 +1153,11 @@ impl ShardStoreBulkWriter {
             }
         }
         let shard_key = SlotHexShard::slot_to_shard(slot);
-        let entry = self.shard_buffers.entry(shard_key)
-            .or_insert_with(|| parking_lot::Mutex::new(HashMap::new()));
-        let mut shard = entry.lock();
+        // Clone Arc out of DashMap to drop the map shard lock before acquiring inner Mutex
+        let mutex = self.shard_buffers.entry(shard_key)
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(HashMap::new())))
+            .clone();
+        let mut shard = mutex.lock();
         shard.entry(slot).or_default().push((field_idx, pv));
     }
 
@@ -1151,9 +1168,10 @@ impl ShardStoreBulkWriter {
             return;
         }
         let shard_key = SlotHexShard::slot_to_shard(slot);
-        let entry = self.shard_buffers.entry(shard_key)
-            .or_insert_with(|| parking_lot::Mutex::new(HashMap::new()));
-        let mut shard = entry.lock();
+        let mutex = self.shard_buffers.entry(shard_key)
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(HashMap::new())))
+            .clone();
+        let mut shard = mutex.lock();
         let fields = shard.entry(slot).or_default();
         for &(field_idx, value_bytes) in tuples {
             let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
@@ -1181,7 +1199,9 @@ impl ShardStoreBulkWriter {
 
         for shard_key in keys {
             if let Some(entry) = self.shard_buffers.get(&shard_key) {
-                let shard = entry.lock();
+                let mutex = entry.value().clone();
+                drop(entry); // Drop DashMap ref before locking inner Mutex
+                let shard = mutex.lock();
                 if shard.is_empty() {
                     continue;
                 }
@@ -1212,9 +1232,10 @@ impl ShardStoreBulkWriter {
                 Err(_) => continue,
             };
             let shard_key = SlotHexShard::slot_to_shard(slot);
-            let entry = self.shard_buffers.entry(shard_key)
-                .or_insert_with(|| parking_lot::Mutex::new(HashMap::new()));
-            entry.lock().insert(slot, pairs);
+            let mutex = self.shard_buffers.entry(shard_key)
+                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(HashMap::new())))
+                .clone();
+            mutex.lock().insert(slot, pairs);
         }
     }
 
