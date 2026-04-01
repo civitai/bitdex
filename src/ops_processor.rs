@@ -987,12 +987,13 @@ fn process_remove_op<S: BitmapSink>(
         if is_null && is_nullable {
             // Removing a null value: clear the null bitmap key
             sink.filter_remove(arc_name.clone(), NULL_BITMAP_KEY, slot);
-        } else if !is_null {
+        } else {
+            // Non-null remove, or null on non-nullable (null→0 via json_to_qvalue).
+            // Must clear the 0 bit that was set when the null was originally stored.
             if let Some(key) = value_to_bitmap_key(&qval) {
                 sink.filter_remove(arc_name.clone(), key, slot);
             }
         }
-        // null on non-nullable: no-op (can't remove what was never set)
     }
     // Check if this is a sort field
     if let Some((arc_name, num_bits)) = meta.sort_fields.get(field) {

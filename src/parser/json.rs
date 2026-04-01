@@ -165,8 +165,12 @@ fn parse_filter_node(value: &JsonValue, depth: usize) -> Result<FilterClause, Pa
             let raw_val = obj.get("value").ok_or_else(|| {
                 ParseError::new(format!("'{op}' on '{field_name}' requires a 'value'"))
             })?;
-            let val = json_to_value(raw_val)?;
-            Ok(FilterClause::NotEq(field_name.to_string(), val))
+            if raw_val.is_null() {
+                Ok(FilterClause::IsNotNull(field_name.to_string()))
+            } else {
+                let val = json_to_value(raw_val)?;
+                Ok(FilterClause::NotEq(field_name.to_string(), val))
+            }
         }
         "in" => {
             let raw_arr = obj

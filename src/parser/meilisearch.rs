@@ -571,6 +571,10 @@ impl Parser {
                     }
                     Token::NotEq => {
                         self.advance();
+                        if matches!(self.peek(), Token::Null) {
+                            self.advance();
+                            return Ok(FilterClause::IsNotNull(field));
+                        }
                         let val = self.parse_value()?;
                         Ok(FilterClause::NotEq(field, val))
                     }

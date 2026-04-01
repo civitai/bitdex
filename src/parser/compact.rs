@@ -228,8 +228,12 @@ fn parse_field_predicate(field: &str, value: &JsonValue) -> Result<Vec<FilterCla
                         }
                     }
                     "$ne" => {
-                        let val = json_to_value(op_val)?;
-                        FilterClause::NotEq(field.to_string(), val)
+                        if op_val.is_null() {
+                            FilterClause::IsNotNull(field.to_string())
+                        } else {
+                            let val = json_to_value(op_val)?;
+                            FilterClause::NotEq(field.to_string(), val)
+                        }
                     }
                     "$gt" => {
                         let val = json_to_value(op_val)?;
