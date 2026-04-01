@@ -531,9 +531,6 @@ pub struct DocStoreV3 {
     root: PathBuf,
     field_to_idx: HashMap<String, u16>,
     idx_to_field: Vec<String>,
-    in_memory: bool,
-    /// In-memory backing store for testing (when in_memory=true).
-    memory_shards: HashMap<u32, DocSnapshot>,
     /// Per-field default values keyed by field dict index.
     field_defaults: HashMap<u16, PackedValue>,
     /// Current schema version.
@@ -558,8 +555,6 @@ impl DocStoreV3 {
             root: path.to_path_buf(),
             field_to_idx,
             idx_to_field,
-            in_memory: false,
-            memory_shards: HashMap::new(),
             field_defaults: HashMap::new(),
             schema_version: 1,
             historical_defaults,
@@ -584,8 +579,6 @@ impl DocStoreV3 {
             root: tmp_dir,
             field_to_idx: HashMap::new(),
             idx_to_field: Vec::new(),
-            in_memory: true,
-            memory_shards: HashMap::new(),
             field_defaults: HashMap::new(),
             schema_version: 1,
             historical_defaults: HashMap::new(),
@@ -967,7 +960,6 @@ impl DocStoreV3 {
             field_to_idx: self.field_to_idx.clone(),
             root: self.root.clone(),
             field_defaults: self.field_defaults.clone(),
-            schema_version: self.schema_version,
             shard_buffers: Arc::new(DashMap::new()),
         })
     }
@@ -1106,7 +1098,6 @@ pub struct ShardStoreBulkWriter {
     field_to_idx: HashMap<String, u16>,
     root: PathBuf,
     field_defaults: HashMap<u16, PackedValue>,
-    schema_version: u8,
     /// Buffered tuples grouped by shard. Each shard holds a map of slot → fields.
     /// DashMap for concurrent access from rayon threads.
     shard_buffers: Arc<DashMap<u32, parking_lot::Mutex<HashMap<u32, Vec<(u16, PackedValue)>>>>>,

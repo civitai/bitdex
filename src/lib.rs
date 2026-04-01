@@ -37,7 +37,6 @@ pub mod shard_store;
 pub mod shard_store_bitmap;
 pub mod shard_store_doc;
 pub mod shard_store_meta;
-pub mod shard_store_migrate;
 #[cfg(feature = "server")]
 pub mod metrics;
 #[cfg(feature = "server")]
