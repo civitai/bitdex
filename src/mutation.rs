@@ -517,7 +517,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 pub fn value_to_bitmap_key(val: &Value) -> Option<u64> {
     match val {
         Value::Bool(b) => Some(if *b { 1 } else { 0 }),
-        Value::Integer(v) => Some(*v as u64),
+        Value::Integer(v) => {
+            let key = *v as u64;
+            // Guard: -1i64 as u64 == u64::MAX == NULL_BITMAP_KEY. Reject it.
+            if key == crate::filter::NULL_BITMAP_KEY { None } else { Some(key) }
+        }
         Value::Float(_) | Value::String(_) => None,
     }
 }

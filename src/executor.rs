@@ -669,25 +669,21 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::BucketBitmap { bitmap, .. } => Ok(bitmap.as_ref().clone()),
             // IsNull: return the null sentinel bitmap for the field, or empty if none.
             FilterClause::IsNull(field) => {
-                if let Some(filter_field) = self.filters.get_field(field) {
-                    Ok(filter_field
-                        .get_versioned(crate::filter::NULL_BITMAP_KEY)
-                        .map(|vb| vb.fused())
-                        .unwrap_or_default())
-                } else {
-                    Ok(RoaringBitmap::new())
-                }
+                let filter_field = self.filters.get_field(field)
+                    .ok_or_else(|| BitdexError::FieldNotFound(field.to_string()))?;
+                Ok(filter_field
+                    .get_versioned(crate::filter::NULL_BITMAP_KEY)
+                    .map(|vb| vb.fused())
+                    .unwrap_or_default())
             }
             // IsNotNull: alive minus the null bitmap.
             FilterClause::IsNotNull(field) => {
-                let null_bitmap = if let Some(filter_field) = self.filters.get_field(field) {
-                    filter_field
-                        .get_versioned(crate::filter::NULL_BITMAP_KEY)
-                        .map(|vb| vb.fused())
-                        .unwrap_or_default()
-                } else {
-                    RoaringBitmap::new()
-                };
+                let filter_field = self.filters.get_field(field)
+                    .ok_or_else(|| BitdexError::FieldNotFound(field.to_string()))?;
+                let null_bitmap = filter_field
+                    .get_versioned(crate::filter::NULL_BITMAP_KEY)
+                    .map(|vb| vb.fused())
+                    .unwrap_or_default();
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &null_bitmap;
@@ -717,6 +713,8 @@ impl<'a> QueryExecutor<'a> {
             })?;
         let mut result = RoaringBitmap::new();
         for (&key, vb) in filter_field.iter_versioned() {
+            // Skip the null sentinel key — null is not a real value for range comparisons
+            if key == crate::filter::NULL_BITMAP_KEY { continue; }
             if predicate(key, target) {
                 if vb.is_dirty() {
                     result |= vb.fused();

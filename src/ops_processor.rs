@@ -2138,11 +2138,11 @@ mod tests {
         config
     }
     #[test]
-    fn test_nullable_field_null_set_is_noop() {
+    fn test_nullable_field_null_set_inserts_sentinel() {
         let config = test_config_with_nullable();
         let meta = FieldMeta::from_config(&config);
         let mut sink = RecordingSink::new();
-        // Set blockedFor to null — should be a no-op (no bitmap insert)
+        // Set blockedFor to null — should insert NULL_BITMAP_KEY sentinel
         let mut batch = vec![EntityOps {
             entity_id: 42,
             creates_slot: true,
@@ -2153,8 +2153,8 @@ mod tests {
         }];
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
-            sink.filter_inserts.iter().all(|(f, _, _)| f != "blockedFor"),
-            "null set on nullable field should not insert any bitmap bit"
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            "null set on nullable field should insert NULL_BITMAP_KEY sentinel"
         );
     }
     #[test]
@@ -2162,27 +2162,31 @@ mod tests {
         let config = test_config_with_nullable();
         let meta = FieldMeta::from_config(&config);
         let mut sink = RecordingSink::new();
-        // Set blockedFor to a real value — should insert bitmap bit
+        // Set blockedFor to a real value — should insert bitmap bit AND remove null sentinel
         let mut batch = vec![EntityOps {
             entity_id: 42,
             creates_slot: true,
             ops: vec![Op::Set {
                 field: "blockedFor".into(),
-                value: json!("TOS violation"),
+                value: json!(42), // use integer since blockedFor is SingleValue in test config
             }],
         }];
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
-            sink.filter_inserts.iter().any(|(f, _, _)| f == "blockedFor"),
-            "non-null set on nullable field should insert bitmap bit"
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::filter::NULL_BITMAP_KEY),
+            "non-null set on nullable field should insert value bitmap bit"
+        );
+        assert!(
+            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            "non-null set on nullable field should remove NULL_BITMAP_KEY sentinel"
         );
     }
     #[test]
-    fn test_nullable_field_null_remove_is_noop() {
+    fn test_nullable_field_null_remove_clears_sentinel() {
         let config = test_config_with_nullable();
         let meta = FieldMeta::from_config(&config);
         let mut sink = RecordingSink::new();
-        // Remove blockedFor with null value — should be a no-op
+        // Remove blockedFor with null value — should remove NULL_BITMAP_KEY sentinel
         let mut batch = vec![EntityOps {
             entity_id: 42,
             creates_slot: true,
@@ -2193,8 +2197,8 @@ mod tests {
         }];
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
-            sink.filter_removes.iter().all(|(f, _, _)| f != "blockedFor"),
-            "null remove on nullable field should not remove any bitmap bit"
+            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            "null remove on nullable field should remove NULL_BITMAP_KEY sentinel"
         );
     }
     #[test]
@@ -2219,8 +2223,8 @@ mod tests {
     }
     #[test]
     fn test_nullable_transition_old_to_null() {
-        // Simulate blockedFor changing from "copyright" to null:
-        // Remove old value, then Set null — old bitmap removed, no new bitmap created
+        // Simulate blockedFor changing from a value to null:
+        // Remove old value, then Set null — old bitmap removed, null sentinel inserted
         let config = test_config_with_nullable();
         let meta = FieldMeta::from_config(&config);
         let mut sink = RecordingSink::new();
@@ -2230,7 +2234,7 @@ mod tests {
             ops: vec![
                 Op::Remove {
                     field: "blockedFor".into(),
-                    value: json!("copyright"),
+                    value: json!(42), // use integer since blockedFor is SingleValue
                 },
                 Op::Set {
                     field: "blockedFor".into(),
@@ -2241,13 +2245,13 @@ mod tests {
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         // Old value should be removed
         assert!(
-            sink.filter_removes.iter().any(|(f, _, _)| f == "blockedFor"),
+            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::filter::NULL_BITMAP_KEY),
             "old blockedFor value should be removed from bitmap"
         );
-        // No new bitmap entry should be created
+        // Null sentinel should be inserted
         assert!(
-            sink.filter_inserts.iter().all(|(f, _, _)| f != "blockedFor"),
-            "null set on nullable field should not create new bitmap entry"
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            "null set should insert NULL_BITMAP_KEY sentinel"
         );
     }
     #[test]
