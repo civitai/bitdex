@@ -11,7 +11,6 @@ use std::collections::HashMap;
 
 use crate::config::{FieldMapping, FieldValueType};
 use crate::mutation::FieldValue;
-use crate::query::Value;
 
 /// Number of bits to shift slot_id right to get shard index.
 /// 9 → 512 docs per shard.
@@ -109,34 +108,4 @@ pub fn json_to_packed_with_dict(
     }
 }
 
-/// Convert a FieldValue to a PackedValue.
-pub fn pack_field_value(fv: &FieldValue) -> PackedValue {
-    match fv {
-        FieldValue::Single(v) => pack_value(v),
-        FieldValue::Multi(vs) => {
-            if vs.iter().all(|v| matches!(v, Value::Integer(_))) {
-                PackedValue::Mi(
-                    vs.iter()
-                        .map(|v| match v {
-                            Value::Integer(i) => *i,
-                            _ => unreachable!(),
-                        })
-                        .collect(),
-                )
-            } else {
-                PackedValue::Mm(vs.iter().map(pack_value).collect())
-            }
-        }
-    }
-}
-
-/// Convert a single Value to a PackedValue.
-pub fn pack_value(v: &Value) -> PackedValue {
-    match v {
-        Value::Integer(i) => PackedValue::I(*i),
-        Value::Float(f) => PackedValue::F(*f),
-        Value::Bool(b) => PackedValue::B(*b),
-        Value::String(s) => PackedValue::S(s.clone()),
-    }
-}
 
