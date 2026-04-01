@@ -180,6 +180,15 @@ pub struct InnerEngine {
 /// mutations to a private staging copy, then atomically publishes a
 /// new snapshot via ArcSwap::store().
 ///
+/// Result of a compact_all() operation.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct CompactResult {
+    pub shards_scanned: u64,
+    pub shards_compacted: u64,
+    pub shards_skipped: u64,
+    pub elapsed_secs: f64,
+}
+
 /// Readers load the current snapshot via `load_full()` — fully lock-free,
 /// no contention with writers or the flush thread.
 pub struct ConcurrentEngine {
@@ -2025,6 +2034,9 @@ impl ConcurrentEngine {
             let merge_cursors = Arc::clone(&cursors);
             let merge_bound_store = bound_store.clone();
             let merge_unified_cache = Arc::clone(&unified_cache);
+            let merge_doc_shard_store = docstore.lock().shard_store_arc();
+            let merge_dirty_shards = docstore.lock().dirty_shards_arc();
+
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
                 while !shutdown.load(Ordering::Relaxed) {
@@ -2073,6 +2085,23 @@ impl ConcurrentEngine {
                                 }
                             }
                         }
+
+                        // Compact docstore shards that received writes this cycle.
+                        // Uses dirty-shard tracking to avoid scanning all ~209K shards.
+                        {
+                            let dirty: Vec<u32> = merge_dirty_shards.iter().map(|r| *r).collect();
+                            for key in &dirty {
+                                merge_dirty_shards.remove(key);
+                            }
+                            for shard_key in dirty {
+                                if merge_doc_shard_store.needs_compaction(&shard_key).unwrap_or(false) {
+                                    if let Err(e) = merge_doc_shard_store.compact_current(&shard_key) {
+                                        eprintln!("merge: doc compaction failed for shard {shard_key}: {e}");
+                                    }
+                                }
+                            }
+                        }
+
                         // Persist slot counter + deferred alive (critical metadata)
                         {
                             let snap = merge_inner.load();
@@ -5887,11 +5916,11 @@ impl ConcurrentEngine {
             Arc::clone(self.meta_store.as_ref()?),
         ))
     }
-    /// Pin ShardStore generations across alive, filter, and sort stores.
+    /// Pin ShardStore generations across alive, filter, sort, and docstore.
     ///
-    /// Bumps the generation counter on all three stores so that new writes go
+    /// Bumps the generation counter on all stores so that new writes go
     /// to Gen N+1 while Gen N preserves the pre-pin state. Returns the frozen
-    /// generation number. Used by capture start/stop to bracket a time window.
+    /// generation number. Used by capture start/stop and compact endpoint.
     ///
     /// Returns None if no shard stores are configured.
     pub fn pin_shard_generations(&self) -> Result<Option<u64>> {
@@ -5905,9 +5934,195 @@ impl ConcurrentEngine {
             .map_err(|e| crate::error::BitdexError::Storage(format!("pin filter gen: {e}")))?;
         let gen_sort = sort_s.pin_generation()
             .map_err(|e| crate::error::BitdexError::Storage(format!("pin sort gen: {e}")))?;
-        eprintln!("Pinned shard generations: alive={gen_alive}, filter={gen_filter}, sort={gen_sort}");
+        let gen_doc = self.docstore.lock().pin_generation()
+            .map_err(|e| crate::error::BitdexError::Storage(format!("pin doc gen: {e}")))?;
+        eprintln!("Pinned shard generations: alive={gen_alive}, filter={gen_filter}, sort={gen_sort}, doc={gen_doc}");
         Ok(Some(gen_alive))
     }
+
+    /// Force-compact all shards across all stores using parallel workers.
+    ///
+    /// 1. Pin all store generations → frozen gen N, new writes go to N+1
+    /// 2. Compact shards in parallel via rayon (bounded read through gen N only)
+    /// 3. Grace period for in-flight readers to finish LIFO traversal
+    /// 4. Delete old gens 0..N-1 (only if all compactions succeeded)
+    pub fn compact_all(
+        &self,
+        threshold: u32,
+        workers: usize,
+        compact_bitmaps: bool,
+        compact_docs: bool,
+        progress: Arc<AtomicU64>,
+    ) -> Result<CompactResult> {
+        use rayon::prelude::*;
+
+        let t0 = std::time::Instant::now();
+        let mut result = CompactResult::default();
+
+        let frozen_gen = match self.pin_shard_generations()? {
+            Some(g) => g,
+            None => return Err(crate::error::BitdexError::Storage("No shard stores configured".into())),
+        };
+        eprintln!("compact_all: frozen gen={frozen_gen}, threshold={threshold}, workers={workers}");
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .map_err(|e| crate::error::BitdexError::Storage(format!("rayon pool: {e}")))?;
+
+        let mut any_failed = false;
+
+        if compact_bitmaps {
+            if let Some((ref alive_s, ref filter_s, ref sort_s, _)) = self.shard_stores() {
+                // Alive: single shard
+                if alive_s.should_compact(&crate::shard_store_bitmap::AliveShardKey, threshold).unwrap_or(false) {
+                    match alive_s.compact_shard_bounded(&crate::shard_store_bitmap::AliveShardKey, frozen_gen, frozen_gen) {
+                        Ok(true) => result.shards_compacted += 1,
+                        Ok(false) => result.shards_skipped += 1,
+                        Err(e) => { eprintln!("compact alive: {e}"); any_failed = true; }
+                    }
+                } else {
+                    result.shards_skipped += 1;
+                }
+                result.shards_scanned += 1;
+                progress.fetch_add(1, Ordering::Relaxed);
+
+                // Filter shards
+                if let Ok(filter_keys) = filter_s.list_all_shards() {
+                    let filter_errors = AtomicU64::new(0);
+                    let filter_compacted = AtomicU64::new(0);
+                    let filter_skipped = AtomicU64::new(0);
+                    let filter_count = filter_keys.len() as u64;
+
+                    pool.install(|| {
+                        filter_keys.par_iter().for_each(|key| {
+                            let needs = filter_s.should_compact(key, threshold).unwrap_or(false);
+                            if needs {
+                                match filter_s.compact_shard_bounded(key, frozen_gen, frozen_gen) {
+                                    Ok(true) => { filter_compacted.fetch_add(1, Ordering::Relaxed); }
+                                    Ok(false) => { filter_skipped.fetch_add(1, Ordering::Relaxed); }
+                                    Err(e) => {
+                                        eprintln!("compact filter {}: {e}", key.field);
+                                        filter_errors.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            } else {
+                                filter_skipped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            progress.fetch_add(1, Ordering::Relaxed);
+                        });
+                    });
+
+                    result.shards_scanned += filter_count;
+                    result.shards_compacted += filter_compacted.load(Ordering::Relaxed);
+                    result.shards_skipped += filter_skipped.load(Ordering::Relaxed);
+                    if filter_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
+                }
+
+                // Sort shards
+                if let Ok(sort_keys) = sort_s.list_all_shards() {
+                    let sort_errors = AtomicU64::new(0);
+                    let sort_compacted = AtomicU64::new(0);
+                    let sort_skipped = AtomicU64::new(0);
+                    let sort_count = sort_keys.len() as u64;
+
+                    pool.install(|| {
+                        sort_keys.par_iter().for_each(|key| {
+                            let needs = sort_s.should_compact(key, threshold).unwrap_or(false);
+                            if needs {
+                                match sort_s.compact_shard_bounded(key, frozen_gen, frozen_gen) {
+                                    Ok(true) => { sort_compacted.fetch_add(1, Ordering::Relaxed); }
+                                    Ok(false) => { sort_skipped.fetch_add(1, Ordering::Relaxed); }
+                                    Err(e) => {
+                                        eprintln!("compact sort {}/{}: {e}", key.field, key.bit_position);
+                                        sort_errors.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            } else {
+                                sort_skipped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            progress.fetch_add(1, Ordering::Relaxed);
+                        });
+                    });
+
+                    result.shards_scanned += sort_count;
+                    result.shards_compacted += sort_compacted.load(Ordering::Relaxed);
+                    result.shards_skipped += sort_skipped.load(Ordering::Relaxed);
+                    if sort_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
+                }
+            }
+        }
+
+        if compact_docs {
+            let doc_store_arc = self.docstore.lock().shard_store_arc();
+            let slot_counter = self.slot_counter();
+            let max_shard = if slot_counter > 0 {
+                (slot_counter - 1) >> crate::shard_store_doc::SHARD_SHIFT_PUB
+            } else {
+                0
+            };
+            let doc_count = (max_shard + 1) as u64;
+            let doc_errors = AtomicU64::new(0);
+            let doc_compacted = AtomicU64::new(0);
+            let doc_skipped = AtomicU64::new(0);
+
+            eprintln!("compact_all: compacting {doc_count} doc shards (0..={max_shard})");
+
+            pool.install(|| {
+                (0..=max_shard).into_par_iter().for_each(|shard_id| {
+                    let needs = doc_store_arc.should_compact(&shard_id, threshold).unwrap_or(false);
+                    if needs {
+                        match doc_store_arc.compact_shard_bounded(&shard_id, frozen_gen, frozen_gen) {
+                            Ok(true) => { doc_compacted.fetch_add(1, Ordering::Relaxed); }
+                            Ok(false) => { doc_skipped.fetch_add(1, Ordering::Relaxed); }
+                            Err(e) => {
+                                eprintln!("compact doc shard {shard_id}: {e}");
+                                doc_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        doc_skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    progress.fetch_add(1, Ordering::Relaxed);
+                });
+            });
+
+            result.shards_scanned += doc_count;
+            result.shards_compacted += doc_compacted.load(Ordering::Relaxed);
+            result.shards_skipped += doc_skipped.load(Ordering::Relaxed);
+            if doc_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
+        }
+
+        // Grace period + delete old generations
+        if !any_failed && frozen_gen > 0 {
+            std::thread::sleep(Duration::from_secs(5));
+
+            if let Some((ref alive_s, ref filter_s, ref sort_s, _)) = self.shard_stores() {
+                for gen in 0..frozen_gen {
+                    alive_s.delete_generation(gen).ok();
+                    filter_s.delete_generation(gen).ok();
+                    sort_s.delete_generation(gen).ok();
+                }
+            }
+            if compact_docs {
+                let doc_store_arc = self.docstore.lock().shard_store_arc();
+                for gen in 0..frozen_gen {
+                    doc_store_arc.delete_generation(gen).ok();
+                }
+            }
+            eprintln!("compact_all: deleted generations 0..{}", frozen_gen - 1);
+        } else if any_failed {
+            eprintln!("compact_all: skipping old gen deletion due to errors");
+        }
+
+        result.elapsed_secs = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "compact_all: done in {:.1}s — scanned={}, compacted={}, skipped={}",
+            result.elapsed_secs, result.shards_scanned, result.shards_compacted, result.shards_skipped
+        );
+        Ok(result)
+    }
+
     /// Get a reference to the in-flight tracker.
     pub fn in_flight(&self) -> &InFlightTracker {
         &self.in_flight
