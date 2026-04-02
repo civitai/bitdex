@@ -445,6 +445,11 @@ fn generate_fan_out_body(source: &SyncSource) -> String {
                 param_sql.replace('\'', "''"),
                 if param_refs.is_empty() { String::new() } else { format!(" USING {}", param_refs.join(", ")) }
             ));
+            // Note: if expression returns NULL (e.g., json_agg with no rows),
+            // _query will be NULL due to PG null propagation. The ops processor
+            // skips null-query ops gracefully (Option<String> deserialization).
+            // A trigger-side guard could prevent emitting the row entirely, but
+            // it's harmless — the op is ~100 bytes and skipped in <1μs.
             let query_with_result = query_template
                 .replace("{ids}", "' || _source_result::text || '");
             body.push_str(&format!("    _query := '{}';\n", query_with_result));

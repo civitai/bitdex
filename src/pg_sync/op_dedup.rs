@@ -82,7 +82,7 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
     let mut multi_value_net: HashMap<(String, String), i64> = HashMap::new();
 
     // Track queryOpSet by query string (last wins)
-    let mut query_ops: HashMap<String, Vec<Op>> = HashMap::new();
+    let mut query_ops: HashMap<Option<String>, Vec<Op>> = HashMap::new();
 
     for op in all_ops {
         match op {
@@ -236,11 +236,11 @@ mod tests {
     fn test_query_op_set_last_wins() {
         let mut batch = vec![entity(456, vec![
             Op::QueryOpSet {
-                query: "modelVersionIds eq 456".into(),
+                query: Some("modelVersionIds eq 456".into()),
                 ops: vec![Op::Set { field: "baseModel".into(), value: json!("SD 1.5") }],
             },
             Op::QueryOpSet {
-                query: "modelVersionIds eq 456".into(),
+                query: Some("modelVersionIds eq 456".into()),
                 ops: vec![Op::Set { field: "baseModel".into(), value: json!("SDXL") }],
             },
         ])];

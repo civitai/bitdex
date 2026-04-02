@@ -54,10 +54,16 @@ pub enum Op {
     /// Query-resolved bulk operation. Resolves slots via a BitDex query string,
     /// then applies the nested ops to all matching slots.
     /// Used for fan-out tables (ModelVersion, Post, Model).
+    ///
+    /// `query` is `Option<String>` because PG triggers may emit queryOpSet with
+    /// null query when the join condition can't be resolved (e.g., fan-out from
+    /// a Model/Post that lacks the data to build a query). Ops with None query
+    /// are skipped at processing time.
     #[serde(rename = "queryOpSet")]
     QueryOpSet {
-        /// BitDex query string (e.g., "modelVersionIds eq 456")
-        query: String,
+        /// BitDex query string (e.g., "modelVersionIds eq 456"), or None if
+        /// the trigger couldn't resolve the join condition.
+        query: Option<String>,
         /// Ops to apply to all slots matching the query
         ops: Vec<Op>,
     },
@@ -188,7 +194,7 @@ mod tests {
     #[test]
     fn test_query_op_set_roundtrip() {
         let op = Op::QueryOpSet {
-            query: "modelVersionIds eq 456".into(),
+            query: Some("modelVersionIds eq 456".into()),
             ops: vec![
                 Op::Remove {
                     field: "baseModel".into(),
@@ -203,6 +209,20 @@ mod tests {
         let json = serde_json::to_string(&op).unwrap();
         let parsed: Op = serde_json::from_str(&json).unwrap();
         assert_eq!(op, parsed);
+    }
+
+    #[test]
+    fn test_query_op_set_null_query_deserializes() {
+        // PG triggers may emit queryOpSet with null query when join condition
+        // can't be resolved (fan-out from Model/Post without matching data).
+        let json = r#"{"op":"queryOpSet","query":null,"ops":[{"op":"set","field":"poi","value":false}]}"#;
+        let parsed: Op = serde_json::from_str(json).unwrap();
+        if let Op::QueryOpSet { query, ops } = parsed {
+            assert!(query.is_none(), "null query should deserialize to None");
+            assert_eq!(ops.len(), 1);
+        } else {
+            panic!("Expected QueryOpSet");
+        }
     }
 
     #[test]
@@ -288,7 +308,7 @@ mod tests {
     fn test_query_op_set_with_in_query() {
         // Model POI change: fan-out to all model versions
         let op = Op::QueryOpSet {
-            query: "modelVersionIds in [101, 102, 103]".into(),
+            query: Some("modelVersionIds in [101, 102, 103]".into()),
             ops: vec![Op::Set {
                 field: "poi".into(),
                 value: json!(true),
@@ -297,7 +317,7 @@ mod tests {
         let json = serde_json::to_string(&op).unwrap();
         let parsed: Op = serde_json::from_str(&json).unwrap();
         if let Op::QueryOpSet { query, ops } = parsed {
-            assert!(query.contains("in [101"));
+            assert!(query.as_deref().unwrap().contains("in [101"));
             assert_eq!(ops.len(), 1);
         } else {
             panic!("Expected QueryOpSet");
