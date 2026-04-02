@@ -573,7 +573,7 @@ mod tests {
         let w = WalWriter::new(d.path());
         w.append_batch(&[ops(456, vec![
             Op::QueryOpSet {
-                query: "modelVersionIds eq 456".into(),
+                query: Some("modelVersionIds eq 456".into()),
                 ops: vec![
                     Op::Remove { field: "baseModel".into(), value: json!("SD 1.5") },
                     Op::Set { field: "baseModel".into(), value: json!("SDXL") },
@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(res.entries[0].entity_id, 456);
         match &res.entries[0].ops[0] {
             Op::QueryOpSet { query, ops } => {
-                assert_eq!(query, "modelVersionIds eq 456");
+                assert_eq!(query.as_deref(), Some("modelVersionIds eq 456"));
                 assert_eq!(ops.len(), 2);
             }
             _ => panic!("expected QueryOpSet"),

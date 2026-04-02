@@ -743,11 +743,19 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // Handle queryOpSets (steady-state only — needs engine for query resolution)
         for op in &entry.ops {
             if let Op::QueryOpSet { query, ops } = op {
+                let query_str = match query {
+                    Some(q) => q,
+                    None => {
+                        // Null query: trigger couldn't resolve join condition — skip silently
+                        skipped += 1;
+                        continue;
+                    }
+                };
                 if let Some(eng) = engine {
-                    match apply_query_op_set(sink, meta, eng, query, ops) {
+                    match apply_query_op_set(sink, meta, eng, query_str, ops) {
                         Ok(count) => applied += count,
                         Err(e) => {
-                            tracing::warn!("ops processor: queryOpSet '{query}' failed: {e}");
+                            tracing::warn!("ops processor: queryOpSet '{query_str}' failed: {e}");
                             errors += 1;
                         }
                     }
