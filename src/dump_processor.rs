@@ -2450,7 +2450,10 @@ fn process_multi_value_phase(
                     }
                 }
             }
-            // StreamingDocWriter writes directly to disk — no flush needed
+            // Finalize: flush BufWriters and update shard headers
+            if let Err(e) = bw.finalize() {
+                eprintln!("StreamingDocWriter: multi-value finalize error: {e}");
+            }
         })
     });
 
