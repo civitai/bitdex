@@ -1219,6 +1219,9 @@ impl BitdexServer {
                                             Some(&mut doc_writer),
                                         );
 
+                                    // Flush pending docstore writes (DocWriter buffers tuples)
+                                    doc_writer.flush();
+
                                     // Invalidate doc cache for mutated entities so
                                     // GET /documents returns fresh data after ops.
                                     if applied > 0 {

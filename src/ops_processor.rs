@@ -115,7 +115,7 @@ impl DocWriter {
         }
     }
     /// Flush pending tuples to the docstore.
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         if self.pending.is_empty() {
             return;
         }
