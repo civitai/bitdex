@@ -9248,6 +9248,82 @@ mod tests {
         assert!(result.is_ok(), "sync_filter_values should skip non-alive slots");
         engine.shutdown();
     }
+    /// Reproduce the WAL reader stall: ops for alive slots should be applied,
+    /// not silently skipped. This test exercises the exact code path used by
+    /// the server WAL reader thread.
+    #[cfg(feature = "pg-sync")]
+    #[test]
+    fn test_wal_reader_ops_alive_check() {
+        use crate::pg_sync::ops::{EntityOps, Op};
+        use crate::ops_processor::{FieldMeta, apply_ops_batch, DocWriter};
+        use crate::ingester::CoalescerSink;
+        use serde_json::json;
+
+        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
+
+        // Insert doc to make slot 100 alive
+        engine.put(100, &make_doc(vec![
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+        ])).unwrap();
+        wait_for_flush(&engine, 1, 500);
+        assert!(engine.is_slot_alive(100), "slot 100 should be alive");
+
+        // Build ops processor components (same as server WAL reader thread)
+        let meta = FieldMeta::from_config(engine.config());
+        let sender = engine.mutation_sender();
+        let mut sink = CoalescerSink::new(sender);
+        let mut doc_writer = DocWriter::new(engine.docstore_arc());
+
+        // Apply ops for alive slot — should succeed
+        let mut entries = vec![EntityOps {
+            entity_id: 100,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "nsfwLevel".into(), value: json!(16) }],
+        }];
+        let (applied, skipped, errors) = apply_ops_batch(
+            &mut sink, &meta, &mut entries, Some(&engine), Some(&mut doc_writer),
+        );
+        assert_eq!(applied, 1, "op for alive slot must be applied");
+        assert_eq!(skipped, 0, "no ops should be skipped");
+        assert_eq!(errors, 0, "no errors expected");
+
+        // Apply ops for non-alive slot below slot_counter — should be skipped
+        let sc = engine.slot_counter();
+        eprintln!("slot_counter = {sc}");
+        let dead_slot: i64 = if sc > 50 { 50 } else { (sc + 100) as i64 };
+        let mut entries2 = vec![EntityOps {
+            entity_id: dead_slot,
+            creates_slot: false,
+            ops: vec![Op::Set { field: "nsfwLevel".into(), value: json!(8) }],
+        }];
+        let (applied2, skipped2, errors2) = apply_ops_batch(
+            &mut sink, &meta, &mut entries2, Some(&engine), Some(&mut doc_writer),
+        );
+        if (dead_slot as u32) < sc {
+            assert_eq!(skipped2, 1, "non-alive slot below slot_counter should be skipped");
+            assert_eq!(applied2, 0);
+        } else {
+            // Auto-promoted because beyond slot_counter
+            assert_eq!(applied2, 1, "slot beyond slot_counter should be auto-promoted");
+        }
+        assert_eq!(errors2, 0);
+
+        // Apply ops with creates_slot=true for new entity — should succeed
+        let new_slot = (sc + 1000) as i64;
+        let mut entries3 = vec![EntityOps {
+            entity_id: new_slot,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "nsfwLevel".into(), value: json!(4) }],
+        }];
+        let (applied3, skipped3, errors3) = apply_ops_batch(
+            &mut sink, &meta, &mut entries3, Some(&engine), Some(&mut doc_writer),
+        );
+        assert_eq!(applied3, 1, "creates_slot=true should always succeed");
+        assert_eq!(skipped3, 0);
+        assert_eq!(errors3, 0);
+
+        engine.shutdown();
+    }
     #[test]
     fn test_patch_document_creates_new_slot() {
         // PATCH on a non-existent slot should fall through to PUT,

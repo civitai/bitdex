@@ -1188,6 +1188,7 @@ impl BitdexServer {
                     let mut reader = crate::ops_wal::WalReader::new(&wal_dir, cursor);
                     eprintln!("WAL reader started (cursor={}:{}, dir={})", cursor.generation, cursor.offset, wal_dir.display());
 
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     while !wal_state.shutting_down.load(Ordering::Relaxed) {
                         // Read a batch from the WAL
                         match reader.read_batch(10_000) {
@@ -1200,6 +1201,8 @@ impl BitdexServer {
 
                                 if let Some(engine) = engine {
                                     let cycle_start = std::time::Instant::now();
+                                    let batch_len = batch.entries.len();
+                                    let batch_crc = batch.crc_failures;
 
                                     // Build FieldMeta, CoalescerSink, and DocWriter for the ops processor
                                     let meta = crate::ops_processor::FieldMeta::from_config(engine.config());
@@ -1237,9 +1240,15 @@ impl BitdexServer {
                                     let cursor = reader.cursor();
                                     wal_state.metrics.wal_read_cursor_bytes.set(cursor.offset as i64);
 
+                                    // Always log when ops are read — silence was hiding the skip path
                                     if applied > 0 || errors > 0 {
                                         eprintln!(
                                             "WAL reader: applied={applied} skipped={skipped} errors={errors} cursor={cursor}"
+                                        );
+                                    } else if skipped > 0 {
+                                        eprintln!(
+                                            "WAL reader: ALL SKIPPED batch={batch_len} skipped={skipped} crc_failures={batch_crc} cursor={cursor} slot_counter={}",
+                                            engine.slot_counter()
                                         );
                                     }
                                     if errors > 0 {
@@ -1264,13 +1273,30 @@ impl BitdexServer {
                                         .with_label_values(&["wal-reader"])
                                         .observe(cycle_start.elapsed().as_secs_f64());
                                 } else {
-                                    // No index loaded yet — sleep and retry
+                                    // No index loaded yet — reset cursor so these ops
+                                    // will be re-read on the next iteration (prevents data loss).
+                                    let pre_cursor = crate::ops_wal::WalCursor::new(
+                                        reader.cursor().generation,
+                                        reader.cursor().offset.saturating_sub(batch.bytes_read),
+                                    );
+                                    eprintln!(
+                                        "WAL reader: WARNING engine=None, {} ops not processed — rewinding cursor from {} to {pre_cursor}",
+                                        batch.entries.len(), reader.cursor()
+                                    );
+                                    reader.set_cursor(pre_cursor);
                                     std::thread::sleep(std::time::Duration::from_secs(1));
                                 }
                             }
-                            Ok(_) => {
-                                // No new records — still update cursor metric so it's not stuck at 0
-                                wal_state.metrics.wal_read_cursor_bytes.set(reader.cursor().offset as i64);
+                            Ok(batch) => {
+                                // Empty entries — could be CRC failures or end of WAL
+                                let cursor = reader.cursor();
+                                if batch.crc_failures > 0 || batch.bytes_read > 0 {
+                                    eprintln!(
+                                        "WAL reader: empty batch but bytes_read={} crc_failures={} cursor={cursor}",
+                                        batch.bytes_read, batch.crc_failures,
+                                    );
+                                }
+                                wal_state.metrics.wal_read_cursor_bytes.set(cursor.offset as i64);
                                 std::thread::sleep(std::time::Duration::from_millis(50));
                             }
                             Err(e) => {
@@ -1282,7 +1308,24 @@ impl BitdexServer {
                             }
                         }
                     }
-                    eprintln!("WAL reader exiting (shutdown)");
+                    })); // end catch_unwind
+                    match result {
+                        Ok(()) => eprintln!("WAL reader exiting (shutdown)"),
+                        Err(panic_info) => {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            eprintln!("WAL reader PANICKED: {msg}");
+                            // Ensure the metric reflects the error
+                            wal_state.metrics.pgsync_errors_total
+                                .with_label_values(&["wal-reader-panic"])
+                                .inc();
+                        }
+                    }
                 })
                 .ok()
         };

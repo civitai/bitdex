@@ -50,7 +50,7 @@ fn test_ops_wal_roundtrip_with_dedup() {
     writer.append_batch(&batch).unwrap();
 
     // Read back
-    let mut reader = WalReader::new(&wal_path, 0);
+    let mut reader = WalReader::new(&wal_path, bitdex_v2::ops_wal::WalCursor::new(1, 0));
     let result = reader.read_batch(100).unwrap();
     assert_eq!(result.entries.len(), 3);
 
@@ -99,7 +99,7 @@ fn test_delete_absorbs_prior_ops_through_wal() {
     }]).unwrap();
 
     // Read all
-    let mut reader = WalReader::new(&wal_path, 0);
+    let mut reader = WalReader::new(&wal_path, bitdex_v2::ops_wal::WalCursor::new(1, 0));
     let result = reader.read_batch(100).unwrap();
     assert_eq!(result.entries.len(), 2);
 
@@ -130,7 +130,7 @@ fn test_add_remove_cancellation_through_wal() {
         },
     ]).unwrap();
 
-    let mut reader = WalReader::new(&wal_path, 0);
+    let mut reader = WalReader::new(&wal_path, bitdex_v2::ops_wal::WalCursor::new(1, 0));
     let result = reader.read_batch(100).unwrap();
     let mut entries = result.entries;
     dedup_ops(&mut entries);
@@ -149,7 +149,7 @@ fn test_query_op_set_through_wal() {
         entity_id: 456,
         creates_slot: false,
         ops: vec![Op::QueryOpSet {
-            query: "modelVersionIds eq 456".into(),
+            query: Some("modelVersionIds eq 456".into()),
             ops: vec![
                 Op::Remove { field: "baseModel".into(), value: json!("SD 1.5") },
                 Op::Set { field: "baseModel".into(), value: json!("SDXL") },
@@ -157,7 +157,7 @@ fn test_query_op_set_through_wal() {
         }],
     }]).unwrap();
 
-    let mut reader = WalReader::new(&wal_path, 0);
+    let mut reader = WalReader::new(&wal_path, bitdex_v2::ops_wal::WalCursor::new(1, 0));
     let result = reader.read_batch(100).unwrap();
     assert_eq!(result.entries.len(), 1);
 
@@ -165,7 +165,7 @@ fn test_query_op_set_through_wal() {
     assert_eq!(entry.entity_id, 456);
     match &entry.ops[0] {
         Op::QueryOpSet { query, ops } => {
-            assert_eq!(query, "modelVersionIds eq 456");
+            assert_eq!(query.as_deref(), Some("modelVersionIds eq 456"));
             assert_eq!(ops.len(), 2);
         }
         _ => panic!("Expected QueryOpSet"),
@@ -188,7 +188,7 @@ fn test_wal_cursor_resume_across_appends() {
     }]).unwrap();
 
     // Read batch 1
-    let mut reader = WalReader::new(&wal_path, 0);
+    let mut reader = WalReader::new(&wal_path, bitdex_v2::ops_wal::WalCursor::new(1, 0));
     let r1 = reader.read_batch(100).unwrap();
     assert_eq!(r1.entries.len(), 1);
     let cursor = reader.cursor();
@@ -362,7 +362,7 @@ fn test_ops_batch_json_format() {
                 entity_id: 456,
                 creates_slot: false,
                 ops: vec![Op::QueryOpSet {
-                    query: "modelVersionIds eq 456".into(),
+                    query: Some("modelVersionIds eq 456".into()),
                     ops: vec![
                         Op::Remove { field: "baseModel".into(), value: json!("SD 1.5") },
                         Op::Set { field: "baseModel".into(), value: json!("SDXL") },
@@ -388,3 +388,88 @@ fn test_ops_batch_json_format() {
     assert_eq!(meta.source, "pg-sync-default");
     assert_eq!(meta.lag_rows, Some(80_000_000));
 }
+
+// ── WAL Reader Stall Reproduction ──
+// Simulates the production scenario: cursor mid-gen-1, ops in gen-1 and gen-2,
+// verifies the reader correctly reads through gen transition.
+
+#[test]
+fn test_wal_reader_mid_gen_transition() {
+    let dir = TempDir::new().unwrap();
+    let wal_dir = dir.path();
+
+    // Use small rotation to force gen transition
+    let writer = WalWriter::with_rotation_size(wal_dir, 200);
+
+    // Write batch 1 to gen 1 — big enough to trigger rotation
+    let batch1 = vec![
+        EntityOps {
+            entity_id: 100,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "nsfwLevel".into(), value: json!(1) },
+                Op::Set { field: "type".into(), value: json!("image") },
+            ],
+        },
+        EntityOps {
+            entity_id: 200,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "nsfwLevel".into(), value: json!(8) },
+                Op::Set { field: "type".into(), value: json!("video_with_audio_and_extra_padding_for_size") },
+            ],
+        },
+    ];
+    writer.append_batch(&batch1).unwrap();
+    let gen_after_batch1 = writer.current_generation();
+
+    // Write batch 2 — should go to gen 2 after rotation
+    let batch2 = vec![
+        EntityOps {
+            entity_id: 300,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "nsfwLevel".into(), value: json!(16) }],
+        },
+        EntityOps {
+            entity_id: 400,
+            creates_slot: false,
+            ops: vec![Op::Add { field: "tagIds".into(), value: json!(42) }],
+        },
+    ];
+    writer.append_batch(&batch2).unwrap();
+    let gen_after_batch2 = writer.current_generation();
+    assert!(
+        gen_after_batch2 > gen_after_batch1,
+        "expected gen rotation: gen1={gen_after_batch1}, gen2={gen_after_batch2}"
+    );
+
+    // Read first entry only, save cursor
+    let mut reader = WalReader::new(wal_dir, bitdex_v2::ops_wal::WalCursor::new(gen_after_batch1, 0));
+    let r1 = reader.read_batch(1).unwrap();
+    assert_eq!(r1.entries.len(), 1, "should read exactly 1 entry");
+    assert_eq!(r1.entries[0].entity_id, 100);
+    let mid_cursor = reader.cursor();
+
+    // Now simulate restart: new reader from mid-cursor
+    let mut reader2 = WalReader::new(wal_dir, mid_cursor);
+
+    // Read remaining — should get entity 200 from gen 1, then 300+400 from gen 2
+    let r2 = reader2.read_batch(100).unwrap();
+    assert!(
+        r2.entries.len() >= 2,
+        "expected at least 2 more entries after mid-cursor, got {}",
+        r2.entries.len()
+    );
+
+    // Verify we got entries from both gens
+    let ids: Vec<i64> = r2.entries.iter().map(|e| e.entity_id).collect();
+    assert!(ids.contains(&200), "missing entity 200 from gen 1 remainder");
+    // May or may not have 300/400 in same batch depending on rotation
+    // Read one more batch to get any remaining
+    let r3 = reader2.read_batch(100).unwrap();
+    let all_ids: Vec<i64> = r2.entries.iter().chain(r3.entries.iter()).map(|e| e.entity_id).collect();
+    assert!(all_ids.contains(&300), "missing entity 300 from gen 2: got {:?}", all_ids);
+}
+
+// NOTE: apply_ops_batch alive-check test lives in src/concurrent_engine.rs
+// (test_wal_reader_ops_alive_skip) since it needs internal engine types.

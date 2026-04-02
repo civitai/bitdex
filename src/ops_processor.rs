@@ -670,6 +670,9 @@ pub fn apply_ops_batch<S: BitmapSink>(
     for entry in batch.iter() {
         let entity_id = entry.entity_id;
         if entity_id < 0 || entity_id > u32::MAX as i64 {
+            if skipped < 3 {
+                eprintln!("ops processor: SKIP entity_id={entity_id} out of u32 range");
+            }
             skipped += 1;
             continue;
         }
@@ -708,6 +711,21 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             eng.slot_counter()
                         );
                     } else {
+                        // Diagnostic: log first few skips to help debug WAL reader stall
+                        if skipped < 3 {
+                            eprintln!(
+                                "ops processor: SKIP slot={slot} entity_id={entity_id} !alive slot_counter={} creates_slot={} ops={:?}",
+                                eng.slot_counter(), entry.creates_slot,
+                                entry.ops.iter().map(|o| match o {
+                                    Op::Set { field, .. } => format!("set:{field}"),
+                                    Op::Remove { field, .. } => format!("rm:{field}"),
+                                    Op::Add { field, .. } => format!("add:{field}"),
+                                    Op::Delete => "delete".into(),
+                                    Op::Alive => "alive".into(),
+                                    Op::QueryOpSet { .. } => "queryOpSet".into(),
+                                }).collect::<Vec<_>>()
+                            );
+                        }
                         skipped += 1;
                         continue;
                     }
