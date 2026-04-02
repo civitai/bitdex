@@ -1155,9 +1155,21 @@ impl ShardPreCreator {
                         {
                             let meta = f.metadata().ok();
                             if meta.map(|m| m.len()).unwrap_or(0) == 0 {
+                                // Write a full valid ShardStore header (28 bytes).
+                                // Previous code only wrote the 4-byte magic, leaving
+                                // stubs that append_ops_to_shard can't read (needs 28).
+                                let header = crate::shard_store::ShardHeader {
+                                    version: crate::shard_store::SHARD_VERSION,
+                                    ops_section_offset: crate::shard_store::HEADER_SIZE as u64,
+                                    snapshot_len: 0,
+                                    ops_count: 0,
+                                    flags: 0,
+                                };
+                                let mut buf = Vec::with_capacity(crate::shard_store::HEADER_SIZE);
+                                header.encode(&mut buf);
                                 let mut bw = std::io::BufWriter::new(f);
                                 use std::io::Write as _;
-                                let _ = bw.write_all(&0x42445832u32.to_le_bytes());
+                                let _ = bw.write_all(&buf);
                                 let _ = bw.flush();
                             }
                         }
@@ -1195,9 +1207,18 @@ impl ShardPreCreator {
                             {
                                 let meta = f.metadata().ok();
                                 if meta.map(|m| m.len()).unwrap_or(0) == 0 {
+                                    let header = crate::shard_store::ShardHeader {
+                                        version: crate::shard_store::SHARD_VERSION,
+                                        ops_section_offset: crate::shard_store::HEADER_SIZE as u64,
+                                        snapshot_len: 0,
+                                        ops_count: 0,
+                                        flags: 0,
+                                    };
+                                    let mut buf = Vec::with_capacity(crate::shard_store::HEADER_SIZE);
+                                    header.encode(&mut buf);
                                     let mut bw = std::io::BufWriter::new(f);
                                     use std::io::Write as _;
-                                    let _ = bw.write_all(&0x42445832u32.to_le_bytes());
+                                    let _ = bw.write_all(&buf);
                                     let _ = bw.flush();
                                 }
                             }

@@ -334,6 +334,14 @@ pub(crate) fn write_shard_file_atomic(
     Ok(())
 }
 
+/// Check if a shard file has at least a full header (28 bytes).
+/// Returns false for undersized stubs (e.g., 4-byte PreCreator placeholders).
+fn is_valid_shard_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|m| m.len() >= HEADER_SIZE as u64)
+        .unwrap_or(false)
+}
+
 /// Append ops bytes to an existing shard file and update the header's ops_count.
 fn append_ops_to_shard(path: &Path, new_ops_bytes: &[u8], additional_count: u32) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -451,7 +459,7 @@ where
 
         for gen in (0..=current_gen).rev() {
             let shard_path = self.shard_path_in_gen(key, gen);
-            if !shard_path.exists() {
+            if !shard_path.exists() || !is_valid_shard_file(&shard_path) {
                 continue;
             }
             found_any = true;
@@ -534,11 +542,11 @@ where
         let mut ops_buf = Vec::new();
         write_op_entry::<O>(op, &mut ops_buf);
 
-        if shard_path.exists() {
+        if shard_path.exists() && is_valid_shard_file(&shard_path) {
             // Append to existing shard
             append_ops_to_shard(&shard_path, &ops_buf, 1)?;
         } else {
-            // Create new shard with empty snapshot
+            // Create new shard (or replace undersized stub from PreCreator)
             let header = ShardHeader {
                 version: SHARD_VERSION,
                 ops_section_offset: HEADER_SIZE as u64,
@@ -568,9 +576,10 @@ where
 
         let count = ops.len() as u32;
 
-        if shard_path.exists() {
+        if shard_path.exists() && is_valid_shard_file(&shard_path) {
             append_ops_to_shard(&shard_path, &ops_buf, count)?;
         } else {
+            // Create new shard (or replace undersized stub from PreCreator)
             let header = ShardHeader {
                 version: SHARD_VERSION,
                 ops_section_offset: HEADER_SIZE as u64,
@@ -1481,5 +1490,50 @@ mod tests {
         // Now reads find save generation
         let result = store.read(&"doc1".to_string()).unwrap().unwrap();
         assert_eq!(result.values.get("v").unwrap(), "saved");
+    }
+
+    #[test]
+    fn test_append_ops_replaces_undersized_stub() {
+        // Simulate PreCreator stub: file exists but only has 4 bytes (magic only).
+        // append_ops should detect the undersized file and create a fresh shard.
+        let dir = tempfile::tempdir().unwrap();
+        let store = TestStore::new(dir.path().to_path_buf(), FlatShard).unwrap();
+
+        // Manually create a 4-byte stub at the shard path
+        let key = "stub_shard".to_string();
+        let shard_path = store.shard_path_in_gen(&key, 0);
+        if let Some(parent) = shard_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        // Write only 4 bytes (magic) — mimicking old PreCreator behavior
+        fs::write(&shard_path, &SHARD_MAGIC).unwrap();
+        assert_eq!(fs::metadata(&shard_path).unwrap().len(), 4);
+
+        // append_ops should succeed by replacing the stub
+        store.append_op(&key, &TestOp::Set {
+            key: "name".into(), value: "test".into()
+        }).unwrap();
+
+        // Read should return the appended data
+        let result = store.read(&key).unwrap().unwrap();
+        assert_eq!(result.values.get("name").unwrap(), "test");
+    }
+
+    #[test]
+    fn test_read_skips_undersized_stub() {
+        // read() should skip undersized stubs without erroring
+        let dir = tempfile::tempdir().unwrap();
+        let store = TestStore::new(dir.path().to_path_buf(), FlatShard).unwrap();
+
+        let key = "stub_shard".to_string();
+        let shard_path = store.shard_path_in_gen(&key, 0);
+        if let Some(parent) = shard_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&shard_path, &SHARD_MAGIC).unwrap();
+
+        // read should return None (stub is skipped), not error
+        let result = store.read(&key).unwrap();
+        assert!(result.is_none());
     }
 }
