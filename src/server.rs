@@ -39,7 +39,7 @@ use crate::query::{BitdexQuery, Value};
 
 type TaskId = u64;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
     Load,
@@ -47,7 +47,9 @@ pub enum TaskType {
     AddFields,
     RemoveFields,
     Dump,
+    Compact,
 }
+
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -79,7 +81,7 @@ pub struct TaskInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskSnapshot {
-    pub active: Option<TaskInfo>,
+    pub active: Vec<TaskInfo>,
     pub history: Vec<TaskInfo>,
 }
 
@@ -88,20 +90,21 @@ struct ActiveTask {
     task_type: TaskType,
     status: TaskStatus,
     started_at: Instant,
+    progress: Arc<AtomicU64>,
 }
 
 struct RegistryState {
-    active: Option<ActiveTask>,
+    active: HashMap<TaskId, ActiveTask>,
     history: VecDeque<TaskInfo>,
 }
 
 pub struct TaskRegistry {
     next_id: AtomicU64,
-    active_progress: Arc<AtomicU64>,
     state: Mutex<RegistryState>,
 }
 
-fn build_task_info(active: &ActiveTask, progress: u64) -> TaskInfo {
+fn build_task_info(active: &ActiveTask) -> TaskInfo {
+    let progress = active.progress.load(Ordering::Acquire);
     TaskInfo {
         task_id: active.id,
         task_type: active.task_type.clone(),
@@ -124,75 +127,72 @@ impl TaskRegistry {
     pub fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
-            active_progress: Arc::new(AtomicU64::new(0)),
             state: Mutex::new(RegistryState {
-                active: None,
+                active: HashMap::new(),
                 history: VecDeque::new(),
             }),
         }
     }
 
     /// Try to start a new task. Returns (task_id, progress_counter) on success,
-    /// or the active TaskInfo on conflict.
+    /// or the TaskInfo of the conflicting active task on failure.
+    ///
+    /// Exclusion rules:
+    /// - Mutating tasks (Load, Dump, Rebuild, AddFields, RemoveFields) are exclusive
+    ///   with everything — no other task may run concurrently with them.
+    /// - Compact is also exclusive — it modifies on-disk generations and deletes old
+    ///   ones, so concurrent compacts would race on the same shard files.
     pub fn try_start(&self, task_type: TaskType) -> Result<(TaskId, Arc<AtomicU64>), TaskInfo> {
         let mut state = self.state.lock();
-        if let Some(ref active) = state.active {
-            let progress = self.active_progress.load(Ordering::Acquire);
-            return Err(build_task_info(active, progress));
+
+        // All task types are currently exclusive — only one task at a time.
+        // Compact modifies on-disk generations + deletes old ones, so it can't
+        // run concurrently with anything else.
+        if let Some(active) = state.active.values().next() {
+            return Err(build_task_info(active));
         }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.active_progress.store(0, Ordering::Release);
-        state.active = Some(ActiveTask {
+        let progress = Arc::new(AtomicU64::new(0));
+        state.active.insert(id, ActiveTask {
             id,
             task_type,
             status: TaskStatus::Running,
             started_at: Instant::now(),
+            progress: Arc::clone(&progress),
         });
-        Ok((id, Arc::clone(&self.active_progress)))
+        Ok((id, progress))
     }
 
     pub fn set_saving(&self, task_id: TaskId) {
         let mut state = self.state.lock();
-        if let Some(ref mut active) = state.active {
-            if active.id == task_id {
-                active.status = TaskStatus::Saving;
-            }
+        if let Some(active) = state.active.get_mut(&task_id) {
+            active.status = TaskStatus::Saving;
         }
     }
 
     pub fn set_complete(&self, task_id: TaskId, result: Option<serde_json::Value>) {
         let mut state = self.state.lock();
-        if let Some(active) = state.active.take() {
-            if active.id == task_id {
-                let progress = self.active_progress.load(Ordering::Acquire);
-                let mut info = build_task_info(&active, progress);
-                info.status = TaskStatus::Complete;
-                info.result = result;
-                state.history.push_front(info);
-                if state.history.len() > 20 {
-                    state.history.pop_back();
-                }
-            } else {
-                // Put it back — wrong task_id
-                state.active = Some(active);
+        if let Some(active) = state.active.remove(&task_id) {
+            let mut info = build_task_info(&active);
+            info.status = TaskStatus::Complete;
+            info.result = result;
+            state.history.push_front(info);
+            if state.history.len() > 20 {
+                state.history.pop_back();
             }
         }
     }
 
     pub fn set_error(&self, task_id: TaskId, message: String) {
         let mut state = self.state.lock();
-        if let Some(active) = state.active.take() {
-            if active.id == task_id {
-                let progress = self.active_progress.load(Ordering::Acquire);
-                let mut info = build_task_info(&active, progress);
-                info.status = TaskStatus::Error;
-                info.error = Some(message);
-                state.history.push_front(info);
-                if state.history.len() > 20 {
-                    state.history.pop_back();
-                }
-            } else {
-                state.active = Some(active);
+        if let Some(active) = state.active.remove(&task_id) {
+            let mut info = build_task_info(&active);
+            info.status = TaskStatus::Error;
+            info.error = Some(message);
+            state.history.push_front(info);
+            if state.history.len() > 20 {
+                state.history.pop_back();
             }
         }
     }
@@ -200,11 +200,8 @@ impl TaskRegistry {
     pub fn get(&self, task_id: TaskId) -> Option<TaskInfo> {
         let state = self.state.lock();
         // Check active first
-        if let Some(ref active) = state.active {
-            if active.id == task_id {
-                let progress = self.active_progress.load(Ordering::Acquire);
-                return Some(build_task_info(active, progress));
-            }
+        if let Some(active) = state.active.get(&task_id) {
+            return Some(build_task_info(active));
         }
         // Check history
         state.history.iter().find(|t| t.task_id == task_id).cloned()
@@ -212,10 +209,8 @@ impl TaskRegistry {
 
     pub fn snapshot(&self) -> TaskSnapshot {
         let state = self.state.lock();
-        let active = state.active.as_ref().map(|a| {
-            let progress = self.active_progress.load(Ordering::Acquire);
-            build_task_info(a, progress)
-        });
+        let mut active: Vec<TaskInfo> = state.active.values().map(build_task_info).collect();
+        active.sort_by_key(|t| t.task_id);
         TaskSnapshot {
             active,
             history: state.history.iter().cloned().collect(),
@@ -1352,6 +1347,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/rebuild", post(handle_rebuild))
             .route("/api/indexes/{name}/fields", post(handle_add_fields).delete(handle_remove_fields))
             .route("/api/indexes/{name}/fields/{field}/reload", post(handle_reload_field))
+            .route("/api/indexes/{name}/compact", post(handle_compact))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
             // Capture endpoints (Phase 2)
@@ -2267,7 +2263,7 @@ async fn handle_delete_index(
     // Check if a task is active
     if let Some(idx) = guard.as_ref() {
         let snap = idx.tasks.snapshot();
-        if snap.active.is_some() {
+        if !snap.active.is_empty() {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({"error": "Cannot delete index while a task is running"})),
@@ -3430,6 +3426,90 @@ async fn handle_rebuild(
             }
             Err(e) => {
                 guard.tasks.set_error(task_id, format!("Rebuild failed: {}", e));
+                guard.defuse();
+            }
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"task_id": task_id})),
+    ).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Compact
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CompactRequest {
+    targets: Option<Vec<String>>,
+    threshold: Option<u32>,
+    workers: Option<usize>,
+}
+
+async fn handle_compact(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<CompactRequest>,
+) -> impl IntoResponse {
+    let (engine, tasks) = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => (
+                Arc::clone(&idx.engine),
+                Arc::clone(&idx.tasks),
+            ),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    // Validate request before acquiring task slot (avoid leaking active task on validation failure)
+    let threshold = req.threshold.unwrap_or(0);
+    let workers = req.workers.unwrap_or(4).max(1).min(32);
+    let targets = req.targets.unwrap_or_default();
+
+    for t in &targets {
+        if t != "bitmaps" && t != "docs" {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid target '{}'. Valid targets: bitmaps, docs", t)})),
+            ).into_response();
+        }
+    }
+
+    let compact_bitmaps = targets.is_empty() || targets.iter().any(|t| t == "bitmaps");
+    let compact_docs = targets.is_empty() || targets.iter().any(|t| t == "docs");
+
+    let (task_id, progress) = match tasks.try_start(TaskType::Compact) {
+        Ok(v) => v,
+        Err(active_info) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "A conflicting task is already running",
+                    "active_task": serde_json::to_value(&active_info).unwrap(),
+                })),
+            ).into_response();
+        }
+    };
+
+    let tasks_clone = Arc::clone(&tasks);
+    tokio::task::spawn_blocking(move || {
+        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
+
+        match engine.compact_all(threshold, workers, compact_bitmaps, compact_docs, progress) {
+            Ok(result) => {
+                guard.tasks.set_complete(task_id, Some(serde_json::to_value(&result).unwrap()));
+                guard.defuse();
+            }
+            Err(e) => {
+                guard.tasks.set_error(task_id, format!("Compact failed: {}", e));
                 guard.defuse();
             }
         }
@@ -5700,5 +5780,135 @@ mod tests {
 
         // truncate_u32 should behave like ms_to_seconds
         assert_eq!(result["oldTimestamp"], serde_json::json!(1487255090));
+    }
+
+    // -----------------------------------------------------------------------
+    // TaskRegistry tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_registry_start_and_complete() {
+        let reg = TaskRegistry::new();
+        let (tid, progress) = reg.try_start(TaskType::Load).expect("should start");
+        progress.store(42, Ordering::Release);
+
+        let info = reg.get(tid).expect("should find active task");
+        assert_eq!(info.task_id, tid);
+        assert_eq!(info.progress.records_processed, 42);
+        assert!(matches!(info.status, TaskStatus::Running));
+
+        reg.set_complete(tid, Some(serde_json::json!({"ok": true})));
+
+        // No longer active
+        let snap = reg.snapshot();
+        assert!(snap.active.is_empty());
+
+        // Moved to history
+        let hist = reg.get(tid).expect("should find in history");
+        assert!(matches!(hist.status, TaskStatus::Complete));
+        assert_eq!(hist.result, Some(serde_json::json!({"ok": true})));
+    }
+
+    #[test]
+    fn task_registry_exclusive_tasks_block_each_other() {
+        let reg = TaskRegistry::new();
+        let (_tid, _progress) = reg.try_start(TaskType::Load).expect("first start should succeed");
+
+        // A second mutating task must fail
+        let err = reg.try_start(TaskType::Dump).expect_err("should conflict");
+        assert!(matches!(err.task_type, TaskType::Load));
+    }
+
+    #[test]
+    fn task_registry_compact_blocks_on_mutating() {
+        let reg = TaskRegistry::new();
+        let (_tid, _progress) = reg.try_start(TaskType::Rebuild).expect("rebuild should start");
+
+        // Compact cannot start while a mutating task is running
+        let err = reg.try_start(TaskType::Compact).expect_err("compact should be blocked");
+        assert!(matches!(err.task_type, TaskType::Rebuild));
+    }
+
+    #[test]
+    fn task_registry_mutating_blocks_on_compact() {
+        let reg = TaskRegistry::new();
+        let (_tid, _progress) = reg.try_start(TaskType::Compact).expect("compact should start");
+
+        // A mutating task cannot start while compact is running
+        let err = reg.try_start(TaskType::Load).expect_err("load should be blocked by compact");
+        assert!(matches!(err.task_type, TaskType::Compact));
+    }
+
+    #[test]
+    fn task_registry_two_compacts_are_exclusive() {
+        let reg = TaskRegistry::new();
+        let (_tid1, _) = reg.try_start(TaskType::Compact).expect("first compact");
+
+        // Second compact must be rejected — concurrent compacts race on gen deletion
+        let err = reg.try_start(TaskType::Compact).expect_err("second compact should be blocked");
+        assert!(matches!(err.task_type, TaskType::Compact));
+    }
+
+    #[test]
+    fn task_registry_set_error_moves_to_history() {
+        let reg = TaskRegistry::new();
+        let (tid, _) = reg.try_start(TaskType::AddFields).expect("start");
+        reg.set_error(tid, "something went wrong".to_string());
+
+        let snap = reg.snapshot();
+        assert!(snap.active.is_empty());
+
+        let hist = reg.get(tid).expect("in history");
+        assert!(matches!(hist.status, TaskStatus::Error));
+        assert_eq!(hist.error.as_deref(), Some("something went wrong"));
+    }
+
+    #[test]
+    fn task_registry_set_saving_changes_status() {
+        let reg = TaskRegistry::new();
+        let (tid, _) = reg.try_start(TaskType::Load).expect("start");
+        reg.set_saving(tid);
+
+        let info = reg.get(tid).expect("still active");
+        assert!(matches!(info.status, TaskStatus::Saving));
+    }
+
+    #[test]
+    fn task_registry_history_capped_at_20() {
+        let reg = TaskRegistry::new();
+        for _ in 0..25 {
+            let (tid, _) = reg.try_start(TaskType::Compact).expect("start");
+            reg.set_complete(tid, None);
+        }
+        let snap = reg.snapshot();
+        assert_eq!(snap.history.len(), 20);
+    }
+
+    #[test]
+    fn task_registry_snapshot_active_is_vec() {
+        let reg = TaskRegistry::new();
+        let snap = reg.snapshot();
+        assert!(snap.active.is_empty());
+
+        let (_tid, _) = reg.try_start(TaskType::Compact).expect("start");
+        let snap = reg.snapshot();
+        assert_eq!(snap.active.len(), 1);
+    }
+
+    #[test]
+    fn task_guard_calls_set_error_on_drop() {
+        let reg = Arc::new(TaskRegistry::new());
+        let (tid, _) = reg.try_start(TaskType::Load).expect("start");
+
+        {
+            let _guard = TaskGuard { tasks: Arc::clone(&reg), task_id: Some(tid) };
+            // Drop without defusing — simulates a panic
+        }
+
+        // Task should be in error state in history
+        let snap = reg.snapshot();
+        assert!(snap.active.is_empty());
+        let hist = reg.get(tid).expect("in history");
+        assert!(matches!(hist.status, TaskStatus::Error));
     }
 }

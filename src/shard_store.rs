@@ -450,44 +450,50 @@ where
     ///
     /// Returns `None` if no shard exists for this key in any generation.
     pub fn read(&self, key: &Sh::Key) -> io::Result<Option<S::Snapshot>> {
-        let current_gen = self.current_generation();
+        self.read_up_to_generation(key, self.current_generation())
+    }
 
-        // Collect ops from newest → oldest until we find a snapshot.
-        // Each entry: (gen, ops) — ops in file order (append-order within gen).
+    /// Read a shard's state bounded to generations 0..=max_gen.
+    ///
+    /// Like `read()` but stops at `max_gen` instead of `current_generation()`.
+    /// Essential for compaction after a gen pin: compactor reads through gen N
+    /// while new writes flow to gen N+1.
+    ///
+    /// Tolerates NotFound errors (concurrent gen deletion) by skipping missing files.
+    pub fn read_up_to_generation(&self, key: &Sh::Key, max_gen: u64) -> io::Result<Option<S::Snapshot>> {
         let mut pending_ops: Vec<Vec<O::Op>> = Vec::new();
         let mut found_any = false;
 
-        for gen in (0..=current_gen).rev() {
+        for gen in (0..=max_gen).rev() {
             let shard_path = self.shard_path_in_gen(key, gen);
-            if !shard_path.exists() || !is_valid_shard_file(&shard_path) {
+
+            // Skip invalid shard stubs (e.g. PreCreator empty files)
+            if shard_path.exists() && !is_valid_shard_file(&shard_path) {
                 continue;
             }
+
+            let (header, snapshot_bytes, ops_bytes) = match read_shard_file_raw(&shard_path) {
+                Ok(result) => result,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
             found_any = true;
 
-            let (header, snapshot_bytes, ops_bytes) = read_shard_file_raw(&shard_path)?;
-
-            // Collect this gen's ops (will be applied later in chronological order)
             if header.ops_count > 0 {
                 pending_ops.push(read_op_entries::<O>(&ops_bytes));
             }
 
-            // If this gen has a snapshot, we've found our base — stop walking
             if header.snapshot_len > 0 {
                 let mut snapshot = S::decode(&snapshot_bytes)?;
-
-                // Apply ops chronologically: oldest gen first (reverse of collection order).
-                // Within each gen, ops are already in append order (oldest first).
                 for ops in pending_ops.iter().rev() {
                     for op in ops {
                         O::apply(&mut snapshot, op);
                     }
                 }
-
                 return Ok(Some(snapshot));
             }
         }
 
-        // No snapshot found in any gen — apply all ops to empty if we found any shards
         if found_any && !pending_ops.is_empty() {
             let mut snapshot = S::empty();
             for ops in pending_ops.iter().rev() {
@@ -499,7 +505,6 @@ where
         }
 
         if found_any {
-            // Shards exist but all are empty (no snapshot, no ops)
             return Ok(Some(S::empty()));
         }
 
@@ -508,17 +513,36 @@ where
 
     /// Read the raw ops count for a key in the current generation.
     /// Used by janitor to decide if compaction is needed.
+    ///
+    /// Tolerates NotFound (concurrent gen deletion or missing shard).
     pub fn ops_count(&self, key: &Sh::Key) -> io::Result<Option<u32>> {
-        let shard_path = self.shard_path_in_gen(key, self.current_generation());
-        if !shard_path.exists() {
-            return Ok(None);
-        }
+        self.ops_count_in_gen(key, self.current_generation())
+    }
 
-        let mut file = File::open(&shard_path)?;
+    /// Read the raw ops count for a key in a specific generation.
+    pub fn ops_count_in_gen(&self, key: &Sh::Key, gen: u64) -> io::Result<Option<u32>> {
+        let shard_path = self.shard_path_in_gen(key, gen);
+        let mut file = match File::open(&shard_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let mut header_buf = [0u8; HEADER_SIZE];
         file.read_exact(&mut header_buf)?;
         let header = ShardHeader::decode(&header_buf)?;
         Ok(Some(header.ops_count))
+    }
+
+    /// Read only the 28-byte header from a shard file path. Returns None if file not found.
+    fn read_header_at(path: &Path) -> io::Result<Option<ShardHeader>> {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut header_buf = [0u8; HEADER_SIZE];
+        file.read_exact(&mut header_buf)?;
+        Ok(Some(ShardHeader::decode(&header_buf)?))
     }
 
     // -----------------------------------------------------------------------
@@ -633,19 +657,42 @@ where
         Ok(old_gen)
     }
 
-    /// Compact a shard: read snapshot + ops across generations, produce a
+    /// Compact a shard: read snapshot + ops across all generations, produce a
     /// fresh shard with a materialized snapshot and zero ops.
-    ///
-    /// Writes the compacted shard to `target_gen`.
     pub fn compact_shard(&self, key: &Sh::Key, target_gen: u64) -> io::Result<()> {
-        // Read the full reconstructed state
-        let snapshot = match self.read(key)? {
-            Some(s) => s,
-            None => return Ok(()), // Nothing to compact
-        };
+        self.compact_shard_bounded(key, target_gen, self.current_generation())?;
+        Ok(())
+    }
 
-        // Write as a fresh snapshot in the target generation
-        let shard_path = self.shard_path_in_gen(key, target_gen);
+    /// Compact a shard with bounded read: only reads generations 0..=max_read_gen.
+    ///
+    /// Essential for compaction after a gen pin: compactor reads through gen N
+    /// (the frozen gen) while new writes flow to gen N+1. Without bounding,
+    /// `read()` would fold in post-pin writes, corrupting the compacted snapshot.
+    ///
+    /// **Skip-clean fast-path:** If the shard in `target_gen` already has a
+    /// snapshot with zero ops and no older gen data, skip it entirely.
+    ///
+    /// Returns `true` if compaction was performed, `false` if skipped.
+    pub fn compact_shard_bounded(&self, key: &Sh::Key, target_gen: u64, max_read_gen: u64) -> io::Result<bool> {
+        // Fast-path: read only the 28-byte header (not the full file) to check if
+        // the shard in target_gen is already a clean snapshot with no older gen data.
+        let target_path = self.shard_path_in_gen(key, target_gen);
+        if let Some(header) = Self::read_header_at(&target_path)? {
+            if header.snapshot_len > 0 && header.ops_count == 0 {
+                let has_older_data = (0..target_gen).any(|g| {
+                    self.shard_path_in_gen(key, g).exists()
+                });
+                if !has_older_data {
+                    return Ok(false);
+                }
+            }
+        }
+
+        let snapshot = match self.read_up_to_generation(key, max_read_gen)? {
+            Some(s) => s,
+            None => return Ok(false),
+        };
 
         let mut snapshot_bytes = Vec::new();
         S::encode(&snapshot, &mut snapshot_bytes);
@@ -659,14 +706,13 @@ where
             flags: 0,
         };
 
-        write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])?;
-        Ok(())
+        write_shard_file_atomic(&target_path, &header, &snapshot_bytes, &[])?;
+        Ok(true)
     }
 
     /// Compact all shards in a generation: merge all older generations into
     /// `target_gen` with zero ops.
     pub fn compact_generation(&self, target_gen: u64) -> io::Result<()> {
-        // Collect all shard keys across all generations up to target_gen
         let mut all_keys = std::collections::HashSet::new();
         for gen in 0..=target_gen {
             let gen_dir = self.gen_dir(gen);
@@ -677,9 +723,8 @@ where
             }
         }
 
-        // Compact each shard
         for key in &all_keys {
-            self.compact_shard(key, target_gen)?;
+            self.compact_shard_bounded(key, target_gen, target_gen)?;
         }
 
         Ok(())
@@ -1535,5 +1580,193 @@ mod tests {
         // read should return None (stub is skipped), not error
         let result = store.read(&key).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_up_to_generation_bounded() {
+        let (_dir, store) = temp_store();
+        let mut snap = TestSnapshot { values: HashMap::new() };
+        snap.values.insert("v".into(), "gen0".into());
+        store.write_snapshot(&"doc1".to_string(), &snap).unwrap();
+
+        store.pin_generation().unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "v".into(), value: "gen1".into() }).unwrap();
+
+        // Unbounded sees gen1
+        let result = store.read(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(result.values.get("v").unwrap(), "gen1");
+
+        // Bounded to gen 0 does NOT see gen1
+        let bounded = store.read_up_to_generation(&"doc1".to_string(), 0).unwrap().unwrap();
+        assert_eq!(bounded.values.get("v").unwrap(), "gen0");
+    }
+
+    #[test]
+    fn test_read_tolerates_not_found() {
+        let (_dir, store) = temp_store();
+        let mut snap = TestSnapshot { values: HashMap::new() };
+        snap.values.insert("v".into(), "hello".into());
+        store.write_snapshot(&"doc1".to_string(), &snap).unwrap();
+
+        store.delete_generation(0).unwrap();
+        let result = store.read(&"doc1".to_string()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_compact_shard_bounded_skips_clean() {
+        let (_dir, store) = temp_store();
+        let mut snap = TestSnapshot { values: HashMap::new() };
+        snap.values.insert("v".into(), "clean".into());
+        store.write_snapshot(&"doc1".to_string(), &snap).unwrap();
+
+        let did_compact = store.compact_shard_bounded(&"doc1".to_string(), 0, 0).unwrap();
+        assert!(!did_compact, "should skip clean shard");
+    }
+
+    #[test]
+    fn test_compact_shard_bounded_flattens_cross_gen() {
+        let (_dir, store) = temp_store();
+        let mut snap = TestSnapshot { values: HashMap::new() };
+        snap.values.insert("v".into(), "base".into());
+        store.write_snapshot(&"doc1".to_string(), &snap).unwrap();
+
+        store.pin_generation().unwrap(); // frozen=0, writes→1
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "v".into(), value: "updated".into() }).unwrap();
+
+        store.pin_generation().unwrap(); // frozen=1, writes→2
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "extra".into(), value: "new".into() }).unwrap();
+
+        // Compact bounded to gen 1 — should NOT include gen 2 ops
+        let did_compact = store.compact_shard_bounded(&"doc1".to_string(), 1, 1).unwrap();
+        assert!(did_compact);
+
+        let result = store.read_up_to_generation(&"doc1".to_string(), 1).unwrap().unwrap();
+        assert_eq!(result.values.get("v").unwrap(), "updated");
+        assert!(!result.values.contains_key("extra"));
+
+        // Full read sees everything
+        let full = store.read(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(full.values.get("extra").unwrap(), "new");
+    }
+
+    #[test]
+    fn test_ops_count_tolerates_not_found() {
+        let (_dir, store) = temp_store();
+        assert!(store.ops_count(&"nonexistent".to_string()).unwrap().is_none());
+        assert!(store.ops_count_in_gen(&"nonexistent".to_string(), 99).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_compact_bounded_with_threshold() {
+        let (_dir, store) = temp_store();
+
+        // Write snapshot, add 3 ops
+        let snap = TestSnapshot { values: HashMap::new() };
+        store.write_snapshot(&"doc1".to_string(), &snap).unwrap();
+        for i in 0..3 {
+            store.append_op(&"doc1".to_string(), &TestOp::Set {
+                key: format!("k{i}"), value: format!("v{i}")
+            }).unwrap();
+        }
+
+        // should_compact with threshold 5 → false (3 ops < 5)
+        assert!(!store.should_compact(&"doc1".to_string(), 5).unwrap());
+        // should_compact with threshold 2 → true (3 ops > 2)
+        assert!(store.should_compact(&"doc1".to_string(), 2).unwrap());
+
+        // Compact with threshold check respects bounded read
+        let frozen = store.pin_generation().unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set {
+            key: "post_pin".into(), value: "should_not_appear".into()
+        }).unwrap();
+
+        // Compact bounded to frozen gen
+        let did = store.compact_shard_bounded(&"doc1".to_string(), frozen, frozen).unwrap();
+        assert!(did);
+
+        // Verify post-pin op is NOT in the compacted snapshot
+        let bounded = store.read_up_to_generation(&"doc1".to_string(), frozen).unwrap().unwrap();
+        assert!(bounded.values.contains_key("k0"));
+        assert!(!bounded.values.contains_key("post_pin"));
+    }
+
+    #[test]
+    fn test_read_header_at() {
+        let (_dir, store) = temp_store();
+
+        // Non-existent file returns None
+        let path = store.shard_path_in_gen(&"nope".to_string(), 0);
+        assert!(ShardStore::<TestSnapshotCodec, TestOpCodec, FlatShard>::read_header_at(&path).unwrap().is_none());
+
+        // Write a snapshot + 2 ops, verify header
+        let snap = TestSnapshot { values: HashMap::new() };
+        store.write_snapshot(&"doc1".to_string(), &snap).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "a".into(), value: "b".into() }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "c".into(), value: "d".into() }).unwrap();
+
+        let path = store.shard_path_in_gen(&"doc1".to_string(), 0);
+        let header = ShardStore::<TestSnapshotCodec, TestOpCodec, FlatShard>::read_header_at(&path).unwrap().unwrap();
+        assert_eq!(header.ops_count, 2);
+        assert!(header.snapshot_len > 0);
+    }
+
+    #[test]
+    fn test_compact_shard_bounded_with_only_ops_no_snapshot() {
+        let (_dir, store) = temp_store();
+
+        // Write only ops (no snapshot) — shard should still compact
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "a".into(), value: "1".into() }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "b".into(), value: "2".into() }).unwrap();
+
+        let did = store.compact_shard_bounded(&"doc1".to_string(), 0, 0).unwrap();
+        assert!(did);
+
+        // After compaction, should be a clean snapshot with 0 ops
+        let header = store.read_header(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(header.ops_count, 0);
+        assert!(header.snapshot_len > 0);
+
+        // Data should be preserved
+        let result = store.read(&"doc1".to_string()).unwrap().unwrap();
+        assert_eq!(result.values.get("a").unwrap(), "1");
+        assert_eq!(result.values.get("b").unwrap(), "2");
+    }
+
+    #[test]
+    fn test_compact_nonexistent_shard_returns_false() {
+        let (_dir, store) = temp_store();
+        let did = store.compact_shard_bounded(&"nope".to_string(), 0, 0).unwrap();
+        assert!(!did);
+    }
+
+    #[test]
+    fn test_delete_generation_tolerates_missing() {
+        let (_dir, store) = temp_store();
+        // Deleting a gen that doesn't exist should not error
+        store.delete_generation(99).unwrap();
+    }
+
+    #[test]
+    fn test_compact_generation_flattens_all_shards() {
+        let (_dir, store) = temp_store();
+
+        // Write different shards
+        store.write_snapshot(&"a".to_string(), &TestSnapshot { values: [("k".into(), "va".into())].into() }).unwrap();
+        store.write_snapshot(&"b".to_string(), &TestSnapshot { values: [("k".into(), "vb".into())].into() }).unwrap();
+
+        // Pin and add ops in gen 1
+        store.pin_generation().unwrap();
+        store.append_op(&"a".to_string(), &TestOp::Set { key: "k".into(), value: "va_updated".into() }).unwrap();
+
+        // Compact generation 1 (flatten gen 0+1)
+        store.compact_generation(1).unwrap();
+
+        // Both shards should be readable and clean in gen 1
+        let a = store.read_up_to_generation(&"a".to_string(), 1).unwrap().unwrap();
+        assert_eq!(a.values.get("k").unwrap(), "va_updated");
+
+        let b = store.read_up_to_generation(&"b".to_string(), 1).unwrap().unwrap();
+        assert_eq!(b.values.get("k").unwrap(), "vb");
     }
 }
