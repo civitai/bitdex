@@ -1089,6 +1089,27 @@ impl DocStoreV3 {
         })
     }
 
+    /// Prepare a StreamingDocWriter for write-through docstore writes during bulk loading.
+    /// Unlike prepare_bulk_load which buffers in memory, this writer streams ops to disk.
+    pub fn prepare_streaming_writer(&mut self, field_names: &[String]) -> io::Result<StreamingDocWriter> {
+        let mut changed = false;
+        for name in field_names {
+            let old_len = self.idx_to_field.len();
+            self.ensure_field_idx(name)?;
+            if self.idx_to_field.len() > old_len {
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_field_dict()?;
+        }
+        Ok(StreamingDocWriter::new(
+            self.root.clone(),
+            self.field_to_idx.clone(),
+            self.field_defaults.clone(),
+        ))
+    }
+
     /// Get a reference to the underlying ShardStore.
     pub fn shard_store(&self) -> &DocShardStore {
         &self.store
@@ -1317,7 +1338,12 @@ impl ShardStoreBulkWriter {
                 // Per-slot merge: existing fields are preserved, buffered fields
                 // override by field_idx (last-write-wins), duplicates deduplicated.
                 let flush_result = (|| -> io::Result<()> {
-                    let mut snapshot = store.read(&shard_key)?.unwrap_or_else(DocSnapshot::new);
+                    // Read existing shard; if file is corrupted/pre-created stub, start fresh.
+                    let mut snapshot = match store.read(&shard_key) {
+                        Ok(Some(s)) => s,
+                        Ok(None) => DocSnapshot::new(),
+                        Err(_) => DocSnapshot::new(),
+                    };
                     for (&slot, buffered_fields) in &shard_data {
                         let doc = snapshot.docs.entry(slot).or_default();
                         for (field_idx, value) in buffered_fields {
@@ -1491,6 +1517,300 @@ fn packed_value_to_json(pv: &PackedValue) -> serde_json::Value {
         PackedValue::Mi(arr) => serde_json::json!(arr),
         PackedValue::Mm(arr) => {
             serde_json::Value::Array(arr.iter().map(packed_value_to_json).collect())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StreamingDocWriter — write-through docstore writer for dump processing
+// ---------------------------------------------------------------------------
+
+/// Per-shard state for streaming writes.
+struct ShardFileWriter {
+    writer: std::io::BufWriter<std::fs::File>,
+    ops_count: u32,
+}
+
+/// Write-through docstore writer that streams ops directly to ShardStore shard files.
+///
+/// Unlike ShardStoreBulkWriter which buffers all docs in memory, this writer
+/// opens one BufWriter<File> per shard and writes ops immediately. Memory
+/// footprint is just BufWriter buffers (~8KB × num_open_shards ≈ 1.6MB for 213K shards).
+///
+/// Thread-safe: multiple rayon threads can call write_doc concurrently via DashMap
+/// + per-shard Mutex.
+///
+/// Shard file format: standard ShardStore with empty snapshot + ops log.
+/// After dump completes, compaction merges ops into snapshots for fast reads.
+pub struct StreamingDocWriter {
+    field_to_idx: HashMap<String, u16>,
+    field_defaults: HashMap<u16, PackedValue>,
+    root: PathBuf,
+    shards: DashMap<u32, Arc<parking_lot::Mutex<ShardFileWriter>>>,
+}
+
+impl StreamingDocWriter {
+    /// Create a new streaming writer. `root` is the docstore directory (e.g. indexes/civitai/docs).
+    pub fn new(
+        root: PathBuf,
+        field_to_idx: HashMap<String, u16>,
+        field_defaults: HashMap<u16, PackedValue>,
+    ) -> Self {
+        Self {
+            field_to_idx,
+            field_defaults,
+            root,
+            shards: DashMap::new(),
+        }
+    }
+
+    /// Get the field name → index mapping.
+    pub fn field_to_idx(&self) -> &HashMap<String, u16> {
+        &self.field_to_idx
+    }
+
+    /// Write a doc's fields as a DocOp::Create op to the shard file.
+    /// Thread-safe via DashMap + per-shard Mutex. The BufWriter handles
+    /// OS-level write batching — no in-memory doc accumulation.
+    pub fn write_doc(&self, slot: u32, fields: &[(u16, PackedValue)]) {
+        // Skip if all fields are defaults
+        let non_default: Vec<(u16, PackedValue)> = fields.iter()
+            .filter(|(idx, val)| {
+                self.field_defaults.get(idx).map_or(true, |d| d != val)
+            })
+            .cloned()
+            .collect();
+
+        if non_default.is_empty() {
+            return;
+        }
+
+        let shard_key = SlotHexShard::slot_to_shard(slot);
+        let mutex = self.shards.entry(shard_key)
+            .or_insert_with(|| {
+                Arc::new(parking_lot::Mutex::new(self.open_shard(shard_key)))
+            })
+            .clone();
+
+        // Encode the op: DocOp::Create { slot, fields }
+        let op = DocOp::Create { slot, fields: non_default };
+        let mut payload = Vec::new();
+        DocOpCodec::encode_op(&op, &mut payload);
+
+        // Write op entry: [u32 len][payload][u32 crc32]
+        let len = payload.len() as u32;
+        let crc = crate::shard_store::crc32_of(&payload);
+
+        let mut shard = mutex.lock();
+        use std::io::Write;
+        let _ = shard.writer.write_all(&len.to_le_bytes());
+        let _ = shard.writer.write_all(&payload);
+        let _ = shard.writer.write_all(&crc.to_le_bytes());
+        shard.ops_count += 1;
+    }
+
+    /// Write a single field value as a DocOp::Set op.
+    /// Used for multi-value phases (tags, resources) that append to existing docs.
+    pub fn write_field(&self, slot: u32, field_idx: u16, value: &PackedValue) {
+        if self.field_defaults.get(&field_idx).map_or(false, |d| d == value) {
+            return;
+        }
+
+        let shard_key = SlotHexShard::slot_to_shard(slot);
+        let mutex = self.shards.entry(shard_key)
+            .or_insert_with(|| {
+                Arc::new(parking_lot::Mutex::new(self.open_shard(shard_key)))
+            })
+            .clone();
+
+        let op = DocOp::Set { slot, field: field_idx, value: value.clone() };
+        let mut payload = Vec::new();
+        DocOpCodec::encode_op(&op, &mut payload);
+
+        let len = payload.len() as u32;
+        let crc = crate::shard_store::crc32_of(&payload);
+
+        let mut shard = mutex.lock();
+        use std::io::Write;
+        let _ = shard.writer.write_all(&len.to_le_bytes());
+        let _ = shard.writer.write_all(&payload);
+        let _ = shard.writer.write_all(&crc.to_le_bytes());
+        shard.ops_count += 1;
+    }
+
+    /// Write raw msgpack-encoded tuples as a DocOp::Create.
+    /// API-compatible with ShardStoreBulkWriter::append_tuples_raw.
+    pub fn append_tuples_raw(&self, slot: u32, tuples: &[(u16, &[u8])], _write_buf: &mut Vec<u8>) {
+        if tuples.is_empty() {
+            return;
+        }
+
+        let mut fields = Vec::with_capacity(tuples.len());
+        for &(field_idx, value_bytes) in tuples {
+            let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if self.field_defaults.get(&field_idx).map_or(false, |d| d == &pv) {
+                continue;
+            }
+            fields.push((field_idx, pv));
+        }
+
+        if fields.is_empty() {
+            return;
+        }
+
+        let shard_key = SlotHexShard::slot_to_shard(slot);
+        let mutex = self.shards.entry(shard_key)
+            .or_insert_with(|| {
+                Arc::new(parking_lot::Mutex::new(self.open_shard(shard_key)))
+            })
+            .clone();
+
+        let op = DocOp::Create { slot, fields };
+        let mut payload = Vec::new();
+        DocOpCodec::encode_op(&op, &mut payload);
+
+        let len = payload.len() as u32;
+        let crc = crate::shard_store::crc32_of(&payload);
+
+        let mut shard = mutex.lock();
+        use std::io::Write;
+        let _ = shard.writer.write_all(&len.to_le_bytes());
+        let _ = shard.writer.write_all(&payload);
+        let _ = shard.writer.write_all(&crc.to_le_bytes());
+        shard.ops_count += 1;
+    }
+
+    /// Write a single raw msgpack tuple. API-compatible with ShardStoreBulkWriter.
+    pub fn append_tuple_raw(&self, slot: u32, field_idx: u16, value_bytes: &[u8]) {
+        let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if self.field_defaults.get(&field_idx).map_or(false, |d| d == &pv) {
+            return;
+        }
+        self.write_field(slot, field_idx, &pv);
+    }
+
+    /// Finalize all shard files: flush BufWriters, update ops_count in headers, sync.
+    /// Called once at the end of the dump phase.
+    pub fn finalize(&self) -> io::Result<()> {
+        use std::io::{Seek, Write};
+
+        let keys: Vec<u32> = self.shards.iter().map(|e| *e.key()).collect();
+        let mut errors = 0u32;
+
+        for shard_key in keys {
+            if let Some(entry) = self.shards.get(&shard_key) {
+                let mutex = entry.value().clone();
+                drop(entry);
+                let mut shard = mutex.lock();
+
+                // Flush buffered writes
+                if let Err(e) = shard.writer.flush() {
+                    eprintln!("StreamingDocWriter: flush shard {shard_key}: {e}");
+                    errors += 1;
+                    continue;
+                }
+
+                // Update ops_count in header
+                let ops_count = shard.ops_count;
+                let file = shard.writer.get_mut();
+                if let Err(e) = file.seek(std::io::SeekFrom::Start(
+                    crate::shard_store::HEADER_OPS_COUNT_OFFSET,
+                )) {
+                    eprintln!("StreamingDocWriter: seek shard {shard_key}: {e}");
+                    errors += 1;
+                    continue;
+                }
+                if let Err(e) = file.write_all(&ops_count.to_le_bytes()) {
+                    eprintln!("StreamingDocWriter: write ops_count shard {shard_key}: {e}");
+                    errors += 1;
+                    continue;
+                }
+                if let Err(e) = file.sync_all() {
+                    eprintln!("StreamingDocWriter: sync shard {shard_key}: {e}");
+                    errors += 1;
+                }
+            }
+        }
+
+        if errors > 0 {
+            eprintln!("StreamingDocWriter: finalize completed with {errors} errors");
+        }
+        Ok(())
+    }
+
+    /// No-op for API compatibility with ShardStoreBulkWriter.
+    pub fn flush_v2_writers(&self) {
+        // Streaming writer writes directly to disk — nothing to flush.
+    }
+
+    /// Open or create a shard file with a proper ShardStore header.
+    fn open_shard(&self, shard_key: u32) -> ShardFileWriter {
+        let path = DocStoreV3::shard_path(&self.root, shard_key);
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Check if a valid shard file already exists (e.g., from a previous phase)
+        let (file, existing_ops) = if path.exists() {
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.len() >= crate::shard_store::HEADER_SIZE as u64 => {
+                    // Try to open and validate existing file
+                    match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+                        Ok(mut f) => {
+                            use std::io::Read;
+                            let mut header_buf = [0u8; crate::shard_store::HEADER_SIZE];
+                            if f.read_exact(&mut header_buf).is_ok() {
+                                if let Ok(header) = crate::shard_store::ShardHeader::decode(&header_buf) {
+                                    // Valid shard — seek to end, append new ops
+                                    use std::io::Seek;
+                                    let _ = f.seek(std::io::SeekFrom::End(0));
+                                    return ShardFileWriter {
+                                        writer: std::io::BufWriter::with_capacity(256, f),
+                                        ops_count: header.ops_count,
+                                    };
+                                }
+                            }
+                            // Invalid header — will overwrite below
+                            drop(f);
+                            (None::<std::fs::File>, 0u32)
+                        }
+                        Err(_) => (None, 0),
+                    }
+                }
+                _ => (None, 0), // File too small or can't stat — overwrite
+            }
+        } else {
+            (None, 0)
+        };
+
+        // Create new shard file with empty snapshot
+        let header = crate::shard_store::ShardHeader {
+            version: crate::shard_store::SHARD_VERSION,
+            ops_section_offset: crate::shard_store::HEADER_SIZE as u64,
+            snapshot_len: 0,
+            ops_count: 0, // Updated in finalize()
+            flags: 0,
+        };
+        let mut header_bytes = Vec::with_capacity(crate::shard_store::HEADER_SIZE);
+        header.encode(&mut header_bytes);
+
+        let f = std::fs::File::create(&path).expect("failed to create shard file");
+        // Small buffer: 213K shards × 256 bytes = 54MB total, vs 1.7GB with default 8KB
+        let mut writer = std::io::BufWriter::with_capacity(256, f);
+        use std::io::Write;
+        writer.write_all(&header_bytes).expect("failed to write shard header");
+
+        ShardFileWriter {
+            writer,
+            ops_count: 0,
         }
     }
 }

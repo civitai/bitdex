@@ -5254,6 +5254,10 @@ impl ConcurrentEngine {
     pub fn prepare_bulk_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::ShardStoreBulkWriter> {
         Ok(self.docstore.lock().prepare_bulk_load(field_names)?)
     }
+    /// Prepare a StreamingDocWriter for write-through docstore writes during dump processing.
+    pub fn prepare_streaming_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::StreamingDocWriter> {
+        Ok(self.docstore.lock().prepare_streaming_writer(field_names)?)
+    }
     /// Return the set of indexed field names (filter + sort + "id").
     /// Used by the loader to strip doc-only fields from the bitmap accumulator.
     pub fn indexed_field_names(&self) -> std::collections::HashSet<String> {
