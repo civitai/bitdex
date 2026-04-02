@@ -77,10 +77,18 @@ pub struct Metrics {
     pub eviction_total: IntGaugeVec,
     pub eviction_resident_values: IntGaugeVec,
 
-    // -- Shard compaction --
+    // -- Shard compaction (merge thread) --
     pub compaction_total: IntCounterVec,
     pub compaction_duration_seconds: HistogramVec,
     pub compaction_skipped_total: IntGaugeVec,
+
+    // -- Compact endpoint --
+    pub compact_running: IntGauge,
+    pub compact_shards_scanned: IntGauge,
+    pub compact_shards_compacted: IntGauge,
+    pub compact_shards_skipped: IntGauge,
+    pub compact_runs_total: IntCounter,
+    pub compact_duration_seconds: Histogram,
 
     // -- Query concurrency --
     pub queries_in_flight: IntGauge,
@@ -471,6 +479,28 @@ impl Metrics {
         )
         .unwrap();
 
+        // Compact endpoint metrics
+        let compact_running = IntGauge::new(
+            "bitdex_compact_running", "Whether a compact endpoint task is currently running (0 or 1)",
+        ).unwrap();
+        let compact_shards_scanned = IntGauge::new(
+            "bitdex_compact_shards_scanned", "Shards scanned in current/last compact run",
+        ).unwrap();
+        let compact_shards_compacted = IntGauge::new(
+            "bitdex_compact_shards_compacted", "Shards actually compacted in current/last compact run",
+        ).unwrap();
+        let compact_shards_skipped = IntGauge::new(
+            "bitdex_compact_shards_skipped", "Shards skipped (already clean) in current/last compact run",
+        ).unwrap();
+        let compact_runs_total = IntCounter::new(
+            "bitdex_compact_runs_total", "Total compact endpoint invocations",
+        ).unwrap();
+        let compact_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "bitdex_compact_duration_seconds", "Compact endpoint total duration",
+            ).buckets(vec![1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0]),
+        ).unwrap();
+
         // Query concurrency metrics
         let queries_in_flight = IntGauge::new(
             "bitdex_queries_in_flight", "Queries currently executing",
@@ -762,6 +792,12 @@ impl Metrics {
         registry.register(Box::new(compaction_total.clone())).unwrap();
         registry.register(Box::new(compaction_duration_seconds.clone())).unwrap();
         registry.register(Box::new(compaction_skipped_total.clone())).unwrap();
+        registry.register(Box::new(compact_running.clone())).unwrap();
+        registry.register(Box::new(compact_shards_scanned.clone())).unwrap();
+        registry.register(Box::new(compact_shards_compacted.clone())).unwrap();
+        registry.register(Box::new(compact_shards_skipped.clone())).unwrap();
+        registry.register(Box::new(compact_runs_total.clone())).unwrap();
+        registry.register(Box::new(compact_duration_seconds.clone())).unwrap();
         registry.register(Box::new(queries_in_flight.clone())).unwrap();
         registry.register(Box::new(queries_in_flight_peak.clone())).unwrap();
         registry.register(Box::new(queries_rejected_total.clone())).unwrap();
@@ -855,6 +891,12 @@ impl Metrics {
             compaction_total,
             compaction_duration_seconds,
             compaction_skipped_total,
+            compact_running,
+            compact_shards_scanned,
+            compact_shards_compacted,
+            compact_shards_skipped,
+            compact_runs_total,
+            compact_duration_seconds,
             queries_in_flight,
             queries_in_flight_peak,
             queries_rejected_total,
