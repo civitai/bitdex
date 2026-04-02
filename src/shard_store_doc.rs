@@ -1824,6 +1824,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_streaming_writer_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut ds = DocStoreV3::open(&docs_dir).unwrap();
+
+        let field_names = vec!["userId".to_string(), "nsfwLevel".to_string()];
+        let writer = ds.prepare_streaming_writer(&field_names).unwrap();
+        let fidx = writer.field_to_idx().clone();
+
+        // Write a doc via streaming writer
+        writer.write_doc(1000, &[
+            (fidx["userId"], PackedValue::I(42)),
+            (fidx["nsfwLevel"], PackedValue::I(3)),
+        ]);
+        writer.finalize().unwrap();
+
+        // Read it back via DocStoreV3
+        let doc = ds.get(1000).unwrap();
+        assert!(doc.is_some(), "streaming writer doc should be readable");
+        let doc = doc.unwrap();
+        assert_eq!(doc.fields.len(), 2, "doc should have 2 fields, got {:?}", doc.fields);
+    }
+
+    #[test]
     fn test_packed_value_roundtrip_i64() {
         let pv = PackedValue::I(42);
         let mut buf = Vec::new();
