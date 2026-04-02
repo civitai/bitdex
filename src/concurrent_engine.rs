@@ -5981,15 +5981,12 @@ impl ConcurrentEngine {
 
         if compact_bitmaps {
             if let Some((ref alive_s, ref filter_s, ref sort_s, _)) = self.shard_stores() {
-                // Alive: single shard
-                if alive_s.should_compact_in_gen(&crate::shard_store_bitmap::AliveShardKey, threshold, frozen_gen).unwrap_or(false) {
-                    match alive_s.compact_shard_bounded(&crate::shard_store_bitmap::AliveShardKey, frozen_gen, frozen_gen) {
-                        Ok(true) => result.shards_compacted += 1,
-                        Ok(false) => result.shards_skipped += 1,
-                        Err(e) => { eprintln!("compact alive: {e}"); any_failed = true; }
-                    }
-                } else {
-                    result.shards_skipped += 1;
+                // Alive: single shard — always compact (no threshold gating)
+                // All shards must be written to target_gen before old gens are deleted.
+                match alive_s.compact_shard_bounded(&crate::shard_store_bitmap::AliveShardKey, frozen_gen, frozen_gen) {
+                    Ok(true) => result.shards_compacted += 1,
+                    Ok(false) => result.shards_skipped += 1,
+                    Err(e) => { eprintln!("compact alive: {e}"); any_failed = true; }
                 }
                 result.shards_scanned += 1;
                 progress.fetch_add(1, Ordering::Relaxed);
@@ -6011,18 +6008,13 @@ impl ConcurrentEngine {
 
                     pool.install(|| {
                         filter_keys.par_iter().for_each(|key| {
-                            let needs = filter_s.should_compact_in_gen(key, threshold, frozen_gen).unwrap_or(false);
-                            if needs {
-                                match filter_s.compact_shard_bounded(key, frozen_gen, frozen_gen) {
-                                    Ok(true) => { filter_compacted.fetch_add(1, Ordering::Relaxed); }
-                                    Ok(false) => { filter_skipped.fetch_add(1, Ordering::Relaxed); }
-                                    Err(e) => {
-                                        eprintln!("compact filter {}: {e}", key.field);
-                                        filter_errors.fetch_add(1, Ordering::Relaxed);
-                                    }
+                            match filter_s.compact_shard_bounded(key, frozen_gen, frozen_gen) {
+                                Ok(true) => { filter_compacted.fetch_add(1, Ordering::Relaxed); }
+                                Ok(false) => { filter_skipped.fetch_add(1, Ordering::Relaxed); }
+                                Err(e) => {
+                                    eprintln!("compact filter {}: {e}", key.field);
+                                    filter_errors.fetch_add(1, Ordering::Relaxed);
                                 }
-                            } else {
-                                filter_skipped.fetch_add(1, Ordering::Relaxed);
                             }
                             progress.fetch_add(1, Ordering::Relaxed);
                         });
@@ -6051,18 +6043,13 @@ impl ConcurrentEngine {
 
                     pool.install(|| {
                         sort_keys.par_iter().for_each(|key| {
-                            let needs = sort_s.should_compact_in_gen(key, threshold, frozen_gen).unwrap_or(false);
-                            if needs {
-                                match sort_s.compact_shard_bounded(key, frozen_gen, frozen_gen) {
-                                    Ok(true) => { sort_compacted.fetch_add(1, Ordering::Relaxed); }
-                                    Ok(false) => { sort_skipped.fetch_add(1, Ordering::Relaxed); }
-                                    Err(e) => {
-                                        eprintln!("compact sort {}/{}: {e}", key.field, key.bit_position);
-                                        sort_errors.fetch_add(1, Ordering::Relaxed);
-                                    }
+                            match sort_s.compact_shard_bounded(key, frozen_gen, frozen_gen) {
+                                Ok(true) => { sort_compacted.fetch_add(1, Ordering::Relaxed); }
+                                Ok(false) => { sort_skipped.fetch_add(1, Ordering::Relaxed); }
+                                Err(e) => {
+                                    eprintln!("compact sort {}/{}: {e}", key.field, key.bit_position);
+                                    sort_errors.fetch_add(1, Ordering::Relaxed);
                                 }
-                            } else {
-                                sort_skipped.fetch_add(1, Ordering::Relaxed);
                             }
                             progress.fetch_add(1, Ordering::Relaxed);
                         });
@@ -6093,18 +6080,13 @@ impl ConcurrentEngine {
 
             pool.install(|| {
                 (0..=max_shard).into_par_iter().for_each(|shard_id| {
-                    let needs = doc_store_arc.should_compact_in_gen(&shard_id, threshold, frozen_gen).unwrap_or(false);
-                    if needs {
-                        match doc_store_arc.compact_shard_bounded(&shard_id, frozen_gen, frozen_gen) {
-                            Ok(true) => { doc_compacted.fetch_add(1, Ordering::Relaxed); }
-                            Ok(false) => { doc_skipped.fetch_add(1, Ordering::Relaxed); }
-                            Err(e) => {
-                                eprintln!("compact doc shard {shard_id}: {e}");
-                                doc_errors.fetch_add(1, Ordering::Relaxed);
-                            }
+                    match doc_store_arc.compact_shard_bounded(&shard_id, frozen_gen, frozen_gen) {
+                        Ok(true) => { doc_compacted.fetch_add(1, Ordering::Relaxed); }
+                        Ok(false) => { doc_skipped.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => {
+                            eprintln!("compact doc shard {shard_id}: {e}");
+                            doc_errors.fetch_add(1, Ordering::Relaxed);
                         }
-                    } else {
-                        doc_skipped.fetch_add(1, Ordering::Relaxed);
                     }
                     progress.fetch_add(1, Ordering::Relaxed);
                 });
