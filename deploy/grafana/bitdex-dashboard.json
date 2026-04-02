@@ -1921,6 +1921,208 @@
           "refId": "B"
         }
       ]
+    },
+    {
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 120 },
+      "id": 120,
+      "title": "Compaction",
+      "type": "row",
+      "panels": [
+        {
+          "title": "Status",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 0, "y": 121 },
+          "id": 121,
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                { "options": { "0": { "text": "IDLE", "color": "green", "index": 0 }, "1": { "text": "RUNNING", "color": "orange", "index": 1 } }, "type": "value" }
+              ],
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center",
+            "textMode": "value"
+          },
+          "targets": [
+            { "expr": "bitdex_compact_running", "legendFormat": "", "refId": "A" }
+          ]
+        },
+        {
+          "title": "Total Runs",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 4, "y": 121 },
+          "id": 122,
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "fixedColor": "blue", "mode": "fixed" },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          },
+          "targets": [
+            { "expr": "bitdex_compact_runs_total", "legendFormat": "", "refId": "A" }
+          ]
+        },
+        {
+          "title": "Last Duration",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 8, "y": 121 },
+          "id": 123,
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "color": { "fixedColor": "purple", "mode": "fixed" },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60 }, { "color": "red", "value": 300 }] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          },
+          "targets": [
+            { "expr": "bitdex_compact_duration_seconds_sum / bitdex_compact_duration_seconds_count", "legendFormat": "avg", "refId": "A" }
+          ]
+        },
+        {
+          "title": "Shards Scanned",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 12, "y": 121 },
+          "id": 124,
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "fixedColor": "blue", "mode": "fixed" },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          },
+          "targets": [
+            { "expr": "bitdex_compact_shards_scanned", "legendFormat": "", "refId": "A" }
+          ]
+        },
+        {
+          "title": "Shards Compacted",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 16, "y": 121 },
+          "id": 125,
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "fixedColor": "green", "mode": "fixed" },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          },
+          "targets": [
+            { "expr": "bitdex_compact_shards_compacted", "legendFormat": "", "refId": "A" }
+          ]
+        },
+        {
+          "title": "Shards Skipped",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 4, "x": 20, "y": 121 },
+          "id": 126,
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "fixedColor": "yellow", "mode": "fixed" },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "yellow", "value": null }] }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "colorMode": "value",
+            "graphMode": "none",
+            "justifyMode": "auto",
+            "textMode": "auto"
+          },
+          "targets": [
+            { "expr": "bitdex_compact_shards_skipped", "legendFormat": "", "refId": "A" }
+          ]
+        },
+        {
+          "title": "Shard Progress Over Time",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 125 },
+          "id": 127,
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20, "stacking": { "mode": "none" }, "pointSize": 5, "showPoints": "auto" }
+            },
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "scanned" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
+              { "matcher": { "id": "byName", "options": "compacted" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+              { "matcher": { "id": "byName", "options": "skipped" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] }
+            ]
+          },
+          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            { "expr": "bitdex_compact_shards_scanned", "legendFormat": "scanned", "refId": "A" },
+            { "expr": "bitdex_compact_shards_compacted", "legendFormat": "compacted", "refId": "B" },
+            { "expr": "bitdex_compact_shards_skipped", "legendFormat": "skipped", "refId": "C" }
+          ]
+        },
+        {
+          "title": "Compaction Duration Distribution",
+          "type": "histogram",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 125 },
+          "id": 128,
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "color": { "mode": "palette-classic" }
+            },
+            "overrides": []
+          },
+          "options": { "bucketSize": 5, "combine": false, "fillOpacity": 80, "gradientMode": "scheme", "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+          "targets": [
+            { "expr": "bitdex_compact_duration_seconds_bucket", "legendFormat": "{{le}}", "refId": "A", "format": "heatmap" }
+          ]
+        }
+      ]
     }
   ],
   "refresh": "30s",
