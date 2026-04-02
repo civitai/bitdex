@@ -1133,12 +1133,15 @@ impl ShardPreCreator {
 
                     // Pre-create all 256 hex subdirectories once (eliminates per-file create_dir_all)
                     if !docstore_dirs_done && current_max_slot > 0 {
-                        let shards_dir = docstore_root.join("shards");
+                        // Derive shards dir from DocStoreV3::shard_path to match ShardStore layout.
+                        // shard_path returns root/gen_NNN/shards/xx/NNNNNN.shard — go up 2 levels for shards dir.
+                        let sample_path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, 0);
+                        let shards_dir = sample_path.parent().unwrap().parent().unwrap();
                         for hex in 0..=255u8 {
                             let _ = std::fs::create_dir_all(shards_dir.join(format!("{:02x}", hex)));
                         }
                         docstore_dirs_done = true;
-                        eprintln!("  ShardPreCreator: docstore hex dirs created");
+                        eprintln!("  ShardPreCreator: docstore hex dirs created at {}", shards_dir.display());
                     }
 
                     // Create docstore shard files up to target (no create_dir_all per file)
@@ -2450,7 +2453,10 @@ fn process_multi_value_phase(
                     }
                 }
             }
-            // StreamingDocWriter writes directly to disk — no flush needed
+            // Finalize: flush BufWriters and update shard headers
+            if let Err(e) = bw.finalize() {
+                eprintln!("StreamingDocWriter: multi-value finalize error: {e}");
+            }
         })
     });
 
