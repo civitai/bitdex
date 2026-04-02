@@ -754,6 +754,17 @@ where
         }
     }
 
+    /// Check if a shard in a specific generation needs compaction.
+    ///
+    /// Essential for compact_all() after gen pinning: current_generation() is N+1
+    /// (empty), but the ops we want to check are in frozen gen N.
+    pub fn should_compact_in_gen(&self, key: &Sh::Key, threshold: u32, gen: u64) -> io::Result<bool> {
+        match self.ops_count_in_gen(key, gen)? {
+            Some(count) => Ok(count > threshold),
+            None => Ok(false),
+        }
+    }
+
     /// Check if a shard needs compaction using the default threshold (500 ops).
     /// Based on microbench results: knee at 500 ops, <2x overhead below that.
     pub fn needs_compaction(&self, key: &Sh::Key) -> io::Result<bool> {
