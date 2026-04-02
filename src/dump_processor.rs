@@ -27,12 +27,13 @@ use serde::{Deserialize, Serialize};
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
 use crate::shard_store_doc::PackedValue;
-use crate::shard_store_doc::ShardStoreBulkWriter;
+use crate::shard_store_doc::StreamingDocWriter;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
 use crate::dump_expression::ExprValue as NateExprValue;
 
 const LOG_INTERVAL: u64 = 1_000_000;
+
 
 /// Emit a structured JSON stage marker to stderr for phase monitoring.
 /// Zero overhead — only called at stage transitions, not per row.
@@ -1375,8 +1376,8 @@ pub fn process_dump_with_progress(
     }
     let bulk_writer = Arc::new(
         engine
-            .prepare_bulk_writer(&all_target_names)
-            .map_err(|e| format!("prepare_bulk_writer: {e}"))?,
+            .prepare_streaming_writer(&all_target_names)
+            .map_err(|e| format!("prepare_streaming_writer: {e}"))?,
     );
 
     // Log docstore field dictionary for debugging computed field persistence
@@ -1500,7 +1501,6 @@ pub fn process_dump_with_progress(
     let total = AtomicU64::new(0);
     let total_ref = &total;
     let ext_progress = &progress_counter; // task system progress counter
-
     // Shared references for parallel access
     let filter_expr_ref = &filter_expr;
     let computed_defs_ref = &computed_defs;
@@ -2049,6 +2049,7 @@ pub fn process_dump_with_progress(
                     eprintln!("  dump {}: {}M rows...", request.name, t / 1_000_000);
                     // Check shutdown flag — abort early on Ctrl+C
                     if let Some(ref sf) = shutdown { if sf() { break; } }
+
                 }
             }
             let remainder = count % LOG_INTERVAL;
@@ -2144,10 +2145,10 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
-    // Explicitly flush BulkWriter's buffered V2 writers to disk.
-    // BufWriter::drop would flush, but silently swallows errors — this ensures
-    // data integrity especially for the metrics phase (runs last, vulnerable to OOM).
-    bulk_writer.flush_v2_writers();
+    // Finalize streaming writer: flush BufWriters, update ops_count headers, sync.
+    if let Err(e) = bulk_writer.finalize() {
+        eprintln!("  dump {}: StreamingDocWriter finalize error: {e}", request.name);
+    }
 
     let elapsed = t.elapsed();
     eprintln!(
@@ -2409,7 +2410,7 @@ fn process_multi_value_phase(
     delimiter: u8,
     col_index: &Arc<HashMap<String, usize>>,
     filter_expr: &Option<FilterExpression>,
-    bulk_writer: &Arc<ShardStoreBulkWriter>,
+    bulk_writer: &Arc<StreamingDocWriter>,
     progress_counter: &Option<Arc<AtomicU64>>,
     slot_watermark: Option<&Arc<AtomicU64>>,
     shutdown: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -2449,6 +2450,7 @@ fn process_multi_value_phase(
                     }
                 }
             }
+            // StreamingDocWriter writes directly to disk — no flush needed
         })
     });
 
@@ -2766,7 +2768,7 @@ fn write_docstore_row_indexed(
     col_idx: &HashMap<String, usize>,
     slot: u32,
     request_fields: &[DumpFieldMapping],
-    bulk_writer: &Arc<ShardStoreBulkWriter>,
+    bulk_writer: &Arc<StreamingDocWriter>,
     field_idx: &HashMap<String, u16>,
     boolean_fields: &HashSet<String>,
     extra_i64_fields: &[(&str, i64)],
@@ -2900,7 +2902,7 @@ fn write_docstore_row(
     csv_row: &CsvRow,
     slot: u32,
     request_fields: &[DumpFieldMapping],
-    bulk_writer: &Arc<ShardStoreBulkWriter>,
+    bulk_writer: &Arc<StreamingDocWriter>,
 ) {
     let field_idx = bulk_writer.field_to_idx();
 
@@ -3450,7 +3452,7 @@ mod tests {
         let mut ds = DocStoreV3::open(&docs_dir).unwrap();
 
         let field_names = vec!["poi".to_string(), "type".to_string()];
-        let bulk_writer = Arc::new(ds.prepare_bulk_load(&field_names).unwrap());
+        let bulk_writer = Arc::new(ds.prepare_streaming_writer(&field_names).unwrap());
         let field_idx = bulk_writer.field_to_idx().clone();
 
         let mut boolean_fields = HashSet::new();
@@ -3486,7 +3488,7 @@ mod tests {
             &boolean_fields, &extra_i64,
             &mut serialize_buf, &mut tuple_buf, &mut write_buf,
         );
-        bulk_writer.flush_v2_writers();
+        bulk_writer.finalize().unwrap();
 
         // Read back via DocStoreV3 — fields are FieldValue, not JSON
         let doc = ds.get(1).unwrap().unwrap();
@@ -3514,7 +3516,7 @@ mod tests {
         let mut ds = DocStoreV3::open(&docs_dir).unwrap();
 
         let field_names = vec!["userId".to_string(), "sortAt".to_string()];
-        let bulk_writer = Arc::new(ds.prepare_bulk_load(&field_names).unwrap());
+        let bulk_writer = Arc::new(ds.prepare_streaming_writer(&field_names).unwrap());
         let field_idx = bulk_writer.field_to_idx().clone();
 
         let boolean_fields = HashSet::new();
@@ -3544,7 +3546,7 @@ mod tests {
             &boolean_fields, &extra_i64,
             &mut serialize_buf, &mut tuple_buf, &mut write_buf,
         );
-        bulk_writer.flush_v2_writers();
+        bulk_writer.finalize().unwrap();
 
         // Read back via DocStoreV3
         let doc = ds.get(1).unwrap().unwrap();

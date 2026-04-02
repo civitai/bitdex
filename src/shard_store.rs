@@ -107,7 +107,7 @@ const OP_ENTRY_OVERHEAD: usize = 8;
 
 /// Byte offset of the ops_count field within the header.
 /// magic(4) + version(4) + ops_section_offset(8) + snapshot_len(4) = 20.
-const HEADER_OPS_COUNT_OFFSET: u64 = 20;
+pub(crate) const HEADER_OPS_COUNT_OFFSET: u64 = 20;
 
 /// Default janitor compaction threshold: compact when ops_count exceeds this.
 /// Based on Ollie's final microbench results: 2x read overhead at 1,000 ops
@@ -240,7 +240,7 @@ pub fn read_op_entries_pub<O: OpCodec>(data: &[u8]) -> Vec<O::Op> {
 }
 
 /// Simple CRC32 (IEEE / CRC-32C via software). We use a basic lookup table.
-fn crc32_of(data: &[u8]) -> u32 {
+pub(crate) fn crc32_of(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
         let idx = ((crc ^ byte as u32) & 0xFF) as usize;
