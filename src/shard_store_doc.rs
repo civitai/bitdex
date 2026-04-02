@@ -1696,7 +1696,10 @@ impl StreamingDocWriter {
     }
 
     /// Finalize all shard files: flush BufWriters, update ops_count in headers, sync.
-    /// Called once at the end of the dump phase.
+    ///
+    /// Safe to call multiple times (e.g., after each dump phase). After updating
+    /// the header, seeks back to end-of-file so the BufWriter can continue
+    /// appending ops in subsequent phases.
     pub fn finalize(&self) -> io::Result<()> {
         use std::io::{Seek, Write};
 
@@ -1731,6 +1734,15 @@ impl StreamingDocWriter {
                     errors += 1;
                     continue;
                 }
+
+                // Seek back to end of file so subsequent writes (e.g., multi-value
+                // phases) append correctly instead of overwriting ops data.
+                if let Err(e) = file.seek(std::io::SeekFrom::End(0)) {
+                    eprintln!("StreamingDocWriter: seek-to-end shard {shard_key}: {e}");
+                    errors += 1;
+                    continue;
+                }
+
                 if let Err(e) = file.sync_all() {
                     eprintln!("StreamingDocWriter: sync shard {shard_key}: {e}");
                     errors += 1;
@@ -1845,6 +1857,319 @@ mod tests {
         assert!(doc.is_some(), "streaming writer doc should be readable");
         let doc = doc.unwrap();
         assert_eq!(doc.fields.len(), 2, "doc should have 2 fields, got {:?}", doc.fields);
+    }
+
+    #[test]
+    fn test_streaming_writer_roundtrip_after_reopen() {
+        // Simulates a server restart: write via streaming writer, drop DocStoreV3,
+        // re-open, and verify docs are readable.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+
+        // Phase 1: Write
+        {
+            let mut ds = DocStoreV3::open(&docs_dir).unwrap();
+            let field_names = vec!["userId".to_string(), "nsfwLevel".to_string(), "sortAt".to_string()];
+            let writer = ds.prepare_streaming_writer(&field_names).unwrap();
+            let fidx = writer.field_to_idx().clone();
+
+            writer.write_doc(1000, &[
+                (fidx["userId"], PackedValue::I(42)),
+                (fidx["nsfwLevel"], PackedValue::I(3)),
+                (fidx["sortAt"], PackedValue::I(1700000000)),
+            ]);
+            writer.write_doc(2000, &[
+                (fidx["userId"], PackedValue::I(99)),
+                (fidx["nsfwLevel"], PackedValue::I(1)),
+                (fidx["sortAt"], PackedValue::I(1700000001)),
+            ]);
+            writer.finalize().unwrap();
+        }
+        // DocStoreV3 dropped here
+
+        // Phase 2: Re-open (simulates server restart) and read
+        let ds2 = DocStoreV3::open(&docs_dir).unwrap();
+
+        let doc1 = ds2.get(1000).unwrap();
+        assert!(doc1.is_some(), "doc 1000 should exist after reopen");
+        let doc1 = doc1.unwrap();
+        eprintln!("doc1 fields: {:?}", doc1.fields);
+        assert_eq!(doc1.fields.len(), 3, "doc1 should have 3 fields, got {:?}", doc1.fields);
+        assert_eq!(
+            doc1.fields.get("userId"),
+            Some(&FieldValue::Single(crate::query::Value::Integer(42))),
+        );
+
+        let doc2 = ds2.get(2000).unwrap();
+        assert!(doc2.is_some(), "doc 2000 should exist after reopen");
+        let doc2 = doc2.unwrap();
+        assert_eq!(doc2.fields.len(), 3);
+        assert_eq!(
+            doc2.fields.get("userId"),
+            Some(&FieldValue::Single(crate::query::Value::Integer(99))),
+        );
+    }
+
+    #[test]
+    fn test_streaming_writer_append_tuples_raw_reopen() {
+        // Simulates PRODUCTION path: append_tuples_raw (msgpack-encoded) with defaults,
+        // then reopen and verify. This is exactly what the dump processor does.
+        use crate::config::DataSchema;
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+
+        // Phase 1: Write via append_tuples_raw (production dump path)
+        {
+            let mut ds = DocStoreV3::open(&docs_dir).unwrap();
+
+            // Set field defaults like production (reactionCount=0, hasMeta=false)
+            let schema: DataSchema = serde_json::from_value(serde_json::json!({
+                "id_field": "id",
+                "schema_version": 1,
+                "fields": [
+                    { "source": "userId", "target": "userId", "value_type": "integer" },
+                    { "source": "nsfwLevel", "target": "nsfwLevel", "value_type": "integer" },
+                    { "source": "reactionCount", "target": "reactionCount", "value_type": "integer", "default": 0 },
+                    { "source": "hasMeta", "target": "hasMeta", "value_type": "boolean", "default": false },
+                    { "source": "sortAt", "target": "sortAt", "value_type": "integer" },
+                ]
+            })).unwrap();
+
+            let field_names: Vec<String> = schema.fields.iter().map(|f| f.target.clone()).collect();
+            let writer = ds.prepare_streaming_writer(&field_names).unwrap();
+
+            // Set defaults AFTER preparing writer (matches production: set_docstore_defaults
+            // is called after engine creation, and prepare_streaming_writer inherits defaults)
+            ds.set_field_defaults(&schema);
+
+            // Re-create writer with updated defaults
+            let writer = ds.prepare_streaming_writer(&field_names).unwrap();
+            let fidx = writer.field_to_idx().clone();
+
+            // Write via append_tuples_raw (msgpack encoded, like dump processor)
+            let mut write_buf = Vec::new();
+            let tuples: Vec<(u16, Vec<u8>)> = vec![
+                (fidx["userId"], rmp_serde::to_vec(&PackedValue::I(42)).unwrap()),
+                (fidx["nsfwLevel"], rmp_serde::to_vec(&PackedValue::I(3)).unwrap()),
+                (fidx["reactionCount"], rmp_serde::to_vec(&PackedValue::I(100)).unwrap()),
+                (fidx["hasMeta"], rmp_serde::to_vec(&PackedValue::B(true)).unwrap()),
+                (fidx["sortAt"], rmp_serde::to_vec(&PackedValue::I(1700000000)).unwrap()),
+            ];
+            let refs: Vec<(u16, &[u8])> = tuples.iter().map(|(idx, v)| (*idx, v.as_slice())).collect();
+            writer.append_tuples_raw(1000000, &refs, &mut write_buf);
+
+            // Also test with a doc where some fields match defaults (should be elided)
+            let tuples2: Vec<(u16, Vec<u8>)> = vec![
+                (fidx["userId"], rmp_serde::to_vec(&PackedValue::I(99)).unwrap()),
+                (fidx["nsfwLevel"], rmp_serde::to_vec(&PackedValue::I(1)).unwrap()),
+                (fidx["reactionCount"], rmp_serde::to_vec(&PackedValue::I(0)).unwrap()), // matches default
+                (fidx["hasMeta"], rmp_serde::to_vec(&PackedValue::B(false)).unwrap()), // matches default
+                (fidx["sortAt"], rmp_serde::to_vec(&PackedValue::I(1700000001)).unwrap()),
+            ];
+            let refs2: Vec<(u16, &[u8])> = tuples2.iter().map(|(idx, v)| (*idx, v.as_slice())).collect();
+            writer.append_tuples_raw(2000000, &refs2, &mut write_buf);
+
+            writer.finalize().unwrap();
+        }
+        // Everything dropped — simulates server restart
+
+        // Phase 2: Reopen with schema defaults (simulates restore_index → set_docstore_defaults)
+        {
+            let mut ds2 = DocStoreV3::open(&docs_dir).unwrap();
+
+            // Re-apply defaults like the server does on boot
+            let schema: DataSchema = serde_json::from_value(serde_json::json!({
+                "id_field": "id",
+                "schema_version": 1,
+                "fields": [
+                    { "source": "userId", "target": "userId", "value_type": "integer" },
+                    { "source": "nsfwLevel", "target": "nsfwLevel", "value_type": "integer" },
+                    { "source": "reactionCount", "target": "reactionCount", "value_type": "integer", "default": 0 },
+                    { "source": "hasMeta", "target": "hasMeta", "value_type": "boolean", "default": false },
+                    { "source": "sortAt", "target": "sortAt", "value_type": "integer" },
+                ]
+            })).unwrap();
+            ds2.set_field_defaults(&schema);
+
+            // Read doc 1000000 (all non-default values)
+            let doc1 = ds2.get(1000000).unwrap();
+            assert!(doc1.is_some(), "doc 1000000 should exist after reopen");
+            let doc1 = doc1.unwrap();
+            eprintln!("doc1 fields: {:?}", doc1.fields);
+            assert_eq!(
+                doc1.fields.get("userId"),
+                Some(&FieldValue::Single(crate::query::Value::Integer(42))),
+                "userId should be 42, got {:?}", doc1.fields.get("userId")
+            );
+            assert_eq!(
+                doc1.fields.get("nsfwLevel"),
+                Some(&FieldValue::Single(crate::query::Value::Integer(3))),
+            );
+            assert_eq!(
+                doc1.fields.get("reactionCount"),
+                Some(&FieldValue::Single(crate::query::Value::Integer(100))),
+            );
+            assert_eq!(
+                doc1.fields.get("hasMeta"),
+                Some(&FieldValue::Single(crate::query::Value::Bool(true))),
+            );
+
+            // Read doc 2000000 (reactionCount=0 and hasMeta=false were elided as defaults)
+            let doc2 = ds2.get(2000000).unwrap();
+            assert!(doc2.is_some(), "doc 2000000 should exist after reopen");
+            let doc2 = doc2.unwrap();
+            eprintln!("doc2 fields: {:?}", doc2.fields);
+            // reactionCount was elided (matched default 0), should be reconstructed
+            assert_eq!(
+                doc2.fields.get("reactionCount"),
+                Some(&FieldValue::Single(crate::query::Value::Integer(0))),
+                "reactionCount should be 0 (default), got {:?}", doc2.fields.get("reactionCount")
+            );
+            // hasMeta was elided (matched default false), should be reconstructed
+            assert_eq!(
+                doc2.fields.get("hasMeta"),
+                Some(&FieldValue::Single(crate::query::Value::Bool(false))),
+            );
+            // userId should NOT be default
+            assert_eq!(
+                doc2.fields.get("userId"),
+                Some(&FieldValue::Single(crate::query::Value::Integer(99))),
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_writer_finalize_between_phases() {
+        // Reproduces production bug: finalize() after images phase leaves file
+        // position at offset 24 (inside header). Multi-value phase writes
+        // through the same BufWriter, corrupting ops data at the wrong offset.
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut ds = DocStoreV3::open(&docs_dir).unwrap();
+
+        let field_names = vec![
+            "userId".to_string(),
+            "nsfwLevel".to_string(),
+            "tagIds".to_string(),
+        ];
+        let writer = ds.prepare_streaming_writer(&field_names).unwrap();
+        let fidx = writer.field_to_idx().clone();
+
+        // Phase 1: Images — write docs
+        writer.write_doc(42, &[
+            (fidx["userId"], PackedValue::I(123)),
+            (fidx["nsfwLevel"], PackedValue::I(5)),
+        ]);
+        writer.write_doc(100, &[
+            (fidx["userId"], PackedValue::I(456)),
+            (fidx["nsfwLevel"], PackedValue::I(2)),
+        ]);
+        // Finalize after images phase (this is what production does)
+        writer.finalize().unwrap();
+
+        // Phase 2: Tags — write multi-value fields to the SAME shards
+        writer.write_field(42, fidx["tagIds"], &PackedValue::Mi(vec![1, 2, 3]));
+        writer.write_field(100, fidx["tagIds"], &PackedValue::Mi(vec![4, 5]));
+        // Finalize after tags phase
+        writer.finalize().unwrap();
+
+        // Verify: read back docs — both images AND tags fields should be present
+        let doc1 = ds.get(42).unwrap();
+        assert!(doc1.is_some(), "doc 42 should exist after multi-phase write");
+        let doc1 = doc1.unwrap();
+        eprintln!("doc1 fields: {:?}", doc1.fields);
+        assert_eq!(
+            doc1.fields.get("userId"),
+            Some(&FieldValue::Single(crate::query::Value::Integer(123))),
+            "userId should be 123, got {:?}", doc1.fields.get("userId")
+        );
+        assert!(doc1.fields.contains_key("tagIds"), "tagIds should be present");
+
+        let doc2 = ds.get(100).unwrap();
+        assert!(doc2.is_some(), "doc 100 should exist");
+        let doc2 = doc2.unwrap();
+        eprintln!("doc2 fields: {:?}", doc2.fields);
+        assert_eq!(
+            doc2.fields.get("userId"),
+            Some(&FieldValue::Single(crate::query::Value::Integer(456))),
+        );
+
+        // Also verify after reopen (simulates server restart)
+        drop(ds);
+        let ds2 = DocStoreV3::open(&docs_dir).unwrap();
+        let doc1_reopened = ds2.get(42).unwrap();
+        assert!(doc1_reopened.is_some(), "doc 42 should exist after reopen");
+        let doc1_reopened = doc1_reopened.unwrap();
+        assert_eq!(
+            doc1_reopened.fields.get("userId"),
+            Some(&FieldValue::Single(crate::query::Value::Integer(123))),
+            "userId should survive reopen, got {:?}", doc1_reopened.fields.get("userId")
+        );
+    }
+
+    #[test]
+    fn test_streaming_writer_shard_file_format_diagnostic() {
+        // Diagnostic test: write via StreamingDocWriter, then raw-read the shard file
+        // to verify the binary format matches what ShardStore expects.
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut ds = DocStoreV3::open(&docs_dir).unwrap();
+
+        let field_names = vec!["userId".to_string(), "nsfwLevel".to_string()];
+        let writer = ds.prepare_streaming_writer(&field_names).unwrap();
+        let fidx = writer.field_to_idx().clone();
+
+        writer.write_doc(42, &[
+            (fidx["userId"], PackedValue::I(123)),
+            (fidx["nsfwLevel"], PackedValue::I(5)),
+        ]);
+        writer.finalize().unwrap();
+
+        // Find the shard file
+        let shard_key = SlotHexShard::slot_to_shard(42);
+        let shard_path = DocStoreV3::shard_path(&docs_dir, shard_key);
+        eprintln!("Shard path: {}", shard_path.display());
+        assert!(shard_path.exists(), "shard file should exist at {:?}", shard_path);
+
+        // Read raw bytes
+        let data = std::fs::read(&shard_path).unwrap();
+        eprintln!("Shard file size: {} bytes", data.len());
+        assert!(data.len() >= crate::shard_store::HEADER_SIZE, "file too small");
+
+        // Parse header
+        let header = crate::shard_store::ShardHeader::decode(&data[..crate::shard_store::HEADER_SIZE]).unwrap();
+        eprintln!("Header: version={}, ops_section_offset={}, snapshot_len={}, ops_count={}, flags={}",
+            header.version, header.ops_section_offset, header.snapshot_len, header.ops_count, header.flags);
+
+        assert_eq!(header.ops_count, 1, "should have 1 op (Create)");
+        assert_eq!(header.snapshot_len, 0, "snapshot should be empty (ops-only)");
+        assert_eq!(header.ops_section_offset, crate::shard_store::HEADER_SIZE as u64);
+
+        // Read via ShardStore
+        let store = DocShardStore::new(docs_dir.clone(), SlotHexShard).unwrap();
+        let snap = store.read(&shard_key).unwrap();
+        assert!(snap.is_some(), "ShardStore should find the shard");
+        let snap = snap.unwrap();
+        eprintln!("DocSnapshot has {} docs", snap.docs.len());
+        eprintln!("DocSnapshot docs: {:?}", snap.docs);
+        assert!(snap.docs.contains_key(&42), "snapshot should contain slot 42");
+        let fields = &snap.docs[&42];
+        assert_eq!(fields.len(), 2, "doc should have 2 fields");
+
+        // Read via DocStoreV3 (the higher-level API)
+        let ds2 = DocStoreV3::open(&docs_dir).unwrap();
+        let doc = ds2.get(42).unwrap();
+        assert!(doc.is_some(), "DocStoreV3::get should find doc");
+        let doc = doc.unwrap();
+        eprintln!("DocStoreV3::get(42) fields: {:?}", doc.fields);
+        assert_eq!(doc.fields.len(), 2);
+        assert_eq!(
+            doc.fields.get("userId"),
+            Some(&FieldValue::Single(crate::query::Value::Integer(123))),
+        );
     }
 
     #[test]
