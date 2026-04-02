@@ -3500,15 +3500,35 @@ async fn handle_compact(
     };
 
     let tasks_clone = Arc::clone(&tasks);
+    let m_running = state.metrics.compact_running.clone();
+    let m_scanned = state.metrics.compact_shards_scanned.clone();
+    let m_compacted = state.metrics.compact_shards_compacted.clone();
+    let m_skipped = state.metrics.compact_shards_skipped.clone();
+    let m_runs = state.metrics.compact_runs_total.clone();
+    let m_duration = state.metrics.compact_duration_seconds.clone();
+
     tokio::task::spawn_blocking(move || {
         let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
 
+        m_running.set(1);
+        m_runs.inc();
+        m_scanned.set(0);
+        m_compacted.set(0);
+        m_skipped.set(0);
+
         match engine.compact_all(threshold, workers, compact_bitmaps, compact_docs, progress) {
             Ok(result) => {
+                m_scanned.set(result.shards_scanned as i64);
+                m_compacted.set(result.shards_compacted as i64);
+                m_skipped.set(result.shards_skipped as i64);
+                m_duration.observe(result.elapsed_secs);
+                m_running.set(0);
+
                 guard.tasks.set_complete(task_id, Some(serde_json::to_value(&result).unwrap()));
                 guard.defuse();
             }
             Err(e) => {
+                m_running.set(0);
                 guard.tasks.set_error(task_id, format!("Compact failed: {}", e));
                 guard.defuse();
             }
