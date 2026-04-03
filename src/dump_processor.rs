@@ -1256,15 +1256,19 @@ pub fn process_dump(
     slot_watermark: Option<Arc<AtomicU64>>,
     shutdown: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<PhaseResult, String> {
+    let t_total = Instant::now();
     let mut result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema, slot_watermark.as_ref(), shutdown.as_ref())?;
+    eprintln!("  Dump {} process_dump_with_progress returned in {:.1}s", request.name, t_total.elapsed().as_secs_f64());
     let (alive_s, filter_s, sort_s, meta_s) = engine
         .shard_stores()
         .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?;
     let bitmap_path = engine.config().storage.bitmap_path.as_ref()
         .ok_or_else(|| "no bitmap_path configured".to_string())?.clone();
     let dictionaries = engine.dictionaries_arc();
+    let t_save = Instant::now();
     save_phase_to_disk(&mut result, &alive_s, &filter_s, &sort_s, &meta_s, &bitmap_path, &dictionaries, &request.name, request.sets_alive)?;
-    eprintln!("  Dump {} save complete", request.name);
+    eprintln!("  Dump {} save_phase_to_disk in {:.1}s", request.name, t_save.elapsed().as_secs_f64());
+    eprintln!("  Dump {} total process_dump in {:.1}s", request.name, t_total.elapsed().as_secs_f64());
     Ok(result)
 }
 
@@ -1426,7 +1430,12 @@ pub fn process_dump_with_progress(
         }
     }
 
-    // Mmap the CSV/TSV file
+    // Mmap the CSV/TSV file.
+    // IMPORTANT: The mmap is scoped tightly around the parse phase (see the
+    // `mmap_scope` block below). After parsing completes and the PhaseResult
+    // is built, the mmap is dropped immediately. This prevents zombie processes
+    // from holding 80+ GB of virtual memory after a forced kill — the mmap is
+    // the largest allocation and must not outlive the parse.
     let csv_path = std::path::Path::new(&request.csv_path);
     let file = std::fs::File::open(csv_path)
         .map_err(|e| format!("open {}: {e}", csv_path.display()))?;
@@ -1506,7 +1515,7 @@ pub fn process_dump_with_progress(
         };
 
     if is_tags_optimization {
-        return process_multi_value_phase(
+        let result = process_multi_value_phase(
             request,
             body,
             delimiter,
@@ -1517,6 +1526,11 @@ pub fn process_dump_with_progress(
             slot_watermark,
             shutdown,
         );
+        // Drop the mmap immediately after parsing — prevents zombie processes.
+        drop(mmap);
+        drop(file);
+        eprintln!("  Dump {}: mmap released", request.name);
+        return result;
     }
 
     emit_stage(&request.name, "parallel_parse", "start", &t, 0);
@@ -2088,6 +2102,28 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "parallel_parse", "done", &t, total.load(Ordering::Relaxed));
 
+    // Drop the mmap immediately after parsing — prevents zombie processes from
+    // holding 80+ GB of virtual memory if the process is force-killed during
+    // the merge/save phase. NLL ensures the borrow of `body`/`data` has ended.
+    drop(mmap);
+    drop(file);
+    eprintln!("  Dump {}: mmap released", request.name);
+
+    // Drop enrichment tables on a background thread — they can be 5+ GB and
+    // take 30-60s to free due to millions of individual heap allocations.
+    // Spawning the drop avoids blocking the save phase.
+    {
+        let name = request.name.clone();
+        std::thread::spawn(move || {
+            let t_drop = Instant::now();
+            drop(enrichment_mgr);
+            let secs = t_drop.elapsed().as_secs_f64();
+            if secs > 1.0 {
+                eprintln!("  Dump {}: enrichment drop took {:.1}s (background)", name, secs);
+            }
+        });
+    }
+
     emit_stage(&request.name, "merge", "start", &t, total.load(Ordering::Relaxed));
     // Merge all thread results — parallel tree reduction
     type MergeAccum = (
@@ -2452,9 +2488,15 @@ fn process_multi_value_phase(
     let total = AtomicU64::new(0);
     let total_ref = &total;
 
-    // Spawn docstore writer thread — rayon threads push (slot, value) to channel,
-    // writer drains and writes per shard. Zero contention on parse threads.
-    let (doc_tx, doc_rx) = if field_idx.is_some() {
+    // For the vec path (tagIds): docstore writes are deferred to a post-pass after
+    // bitmap merge. We invert the merged bitmaps shard-by-shard and write one Merge
+    // op per slot with the complete multi-value array. This reduces 4.5B individual
+    // writes to ~109M (one per slot) and fixes the correctness bug where Set overwrote
+    // previous values instead of accumulating.
+    //
+    // For the HashMap path (tools/techniques): use the old channel-based writer since
+    // these are small datasets where per-row Set ops are fine.
+    let (doc_tx, doc_rx) = if !use_vec && field_idx.is_some() {
         let (tx, rx) = crossbeam_channel::bounded::<Vec<(u32, i64)>>(64);
         (Some(tx), Some(rx))
     } else {
@@ -2474,7 +2516,6 @@ fn process_multi_value_phase(
                     }
                 }
             }
-            // Finalize: flush BufWriters and update shard headers
             if let Err(e) = bw.finalize() {
                 eprintln!("StreamingDocWriter: multi-value finalize error: {e}");
             }
@@ -2499,7 +2540,6 @@ fn process_multi_value_phase(
                 let chunk = &body[range_start..range_end];
                 let mut bitmaps: Vec<RoaringBitmap> =
                     (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect();
-                let mut doc_batch: Vec<(u32, i64)> = Vec::with_capacity(10_000);
                 let mut local_max_slot: u32 = 0;
                 let mut count = 0u64;
                 let mut line_start = 0;
@@ -2545,26 +2585,11 @@ fn process_multi_value_phase(
                     if value < MAX_TAG_ID {
                         bitmaps[value].insert(slot);
                     }
-                    // Batch for writer thread
-                    if doc_tx.is_some() {
-                        doc_batch.push((slot, value as i64));
-                        if doc_batch.len() >= 10_000 {
-                            if let Some(ref tx) = doc_tx {
-                                let _ = tx.send(std::mem::take(&mut doc_batch));
-                                doc_batch = Vec::with_capacity(10_000);
-                            }
-                        }
-                    }
                     count += 1;
                     if count % LOG_INTERVAL == 0 {
                         total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
                         if let Some(ref p) = progress_counter { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
                         if let Some(ref sf) = shutdown { if sf() { break; } }
-                    }
-                }
-                if !doc_batch.is_empty() {
-                    if let Some(ref tx) = doc_tx {
-                        let _ = tx.send(doc_batch);
                     }
                 }
                 let remainder = count % LOG_INTERVAL;
@@ -2578,10 +2603,8 @@ fn process_multi_value_phase(
             })
             .collect();
 
-        // Docstore writes sent to writer thread above
-
         // Merge Vec<RoaringBitmap> — parallel tree reduction
-        let mut merged_vec = thread_results
+        let merged_vec = thread_results
             .into_par_iter()
             .reduce(
                 || (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect::<Vec<_>>(),
@@ -2595,32 +2618,133 @@ fn process_multi_value_phase(
                 },
             );
 
-        // Convert to HashMap (non-empty only)
+        let total_rows = total.load(Ordering::Relaxed);
+        // Collect non-empty tag IDs for iteration
+        let non_empty_tags: Vec<usize> = merged_vec.iter()
+            .enumerate()
+            .filter(|(_, bm)| !bm.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        let distinct_count = non_empty_tags.len();
+        eprintln!(
+            "  Dump {} ({target}): {} rows, {} distinct values",
+            request.name, total_rows, distinct_count,
+        );
+
+        emit_stage(&request.name, "parallel_parse", "done", &t_mv, total_rows);
+
+        // ── Post-pass: invert bitmaps → per-slot tag arrays, write Merge ops ──
+        //
+        // Process in shard ranges (1M slots each) using rayon parallelism.
+        // For each shard: count tags per slot, build flat array, write Merge ops.
+        // Uses min/max per-tag to skip bitmaps that don't overlap the shard.
+        //
+        // Benchmarked at ~5 min for 4.5B tag entries at 109M slots (synthetic).
+        // DashMap alternative was tested and is 3-5x slower due to lock contention.
+        if let Some(fidx) = field_idx {
+            let t_doc = Instant::now();
+            const SHARD_SIZE: u32 = 1_000_000;
+            let max_slot = non_empty_tags.iter()
+                .filter_map(|&tag| merged_vec[tag].max())
+                .max()
+                .unwrap_or(0);
+            let num_shards = (max_slot / SHARD_SIZE) + 1;
+
+            // Pre-compute min/max slot per tag for fast range skipping
+            let tag_ranges: Vec<(usize, u32, u32)> = non_empty_tags.iter()
+                .filter_map(|&tag| {
+                    let bm = &merged_vec[tag];
+                    Some((tag, bm.min()?, bm.max()?))
+                })
+                .collect();
+
+            let total_docs_written = AtomicU64::new(0);
+            let bw_ref = &*bulk_writer;
+            let merged_ref = &merged_vec;
+            let tag_ranges_ref = &tag_ranges;
+
+            (0..num_shards).into_par_iter().for_each(|shard_idx| {
+                let shard_start = shard_idx * SHARD_SIZE;
+                let shard_end = shard_start + SHARD_SIZE;
+
+                // Filter to tags that overlap this shard
+                let relevant_tags: Vec<usize> = tag_ranges_ref.iter()
+                    .filter(|&&(_, min, max)| max >= shard_start && min < shard_end)
+                    .map(|&(tag, _, _)| tag)
+                    .collect();
+                if relevant_tags.is_empty() { return; }
+
+                // Pass 1: count tags per slot
+                let mut counts = vec![0u32; SHARD_SIZE as usize];
+                for &tag_id in &relevant_tags {
+                    for slot in merged_ref[tag_id].iter() {
+                        if slot < shard_start { continue; }
+                        if slot >= shard_end { break; }
+                        counts[(slot - shard_start) as usize] += 1;
+                    }
+                }
+
+                // Pass 2: prefix sum
+                let mut offsets = vec![0u32; SHARD_SIZE as usize];
+                let mut current_offset = 0u32;
+                for i in 0..SHARD_SIZE as usize {
+                    offsets[i] = current_offset;
+                    current_offset += counts[i];
+                }
+                let total_tags = current_offset as usize;
+                if total_tags == 0 { return; }
+
+                // Pass 3: fill flat tag array
+                let mut flat_tags = vec![0i64; total_tags];
+                let mut cursors = offsets.clone();
+                for &tag_id in &relevant_tags {
+                    for slot in merged_ref[tag_id].iter() {
+                        if slot < shard_start { continue; }
+                        if slot >= shard_end { break; }
+                        let idx = (slot - shard_start) as usize;
+                        let pos = cursors[idx] as usize;
+                        flat_tags[pos] = tag_id as i64;
+                        cursors[idx] += 1;
+                    }
+                }
+
+                // Pass 4: write one Merge per slot
+                let mut shard_docs = 0u64;
+                for i in 0..SHARD_SIZE as usize {
+                    if counts[i] > 0 {
+                        let start = offsets[i] as usize;
+                        let end = start + counts[i] as usize;
+                        let tags = &flat_tags[start..end];
+                        let slot = shard_start + i as u32;
+                        bw_ref.write_merge_doc(slot, &[
+                            (fidx, PackedValue::Mi(tags.to_vec())),
+                        ]);
+                        shard_docs += 1;
+                    }
+                }
+                total_docs_written.fetch_add(shard_docs, Ordering::Relaxed);
+            });
+
+            if let Err(e) = bulk_writer.finalize() {
+                eprintln!("  dump {}: StreamingDocWriter finalize error: {e}", request.name);
+            }
+            let docs = total_docs_written.load(Ordering::Relaxed);
+            eprintln!(
+                "  Dump {} docstore post-pass: {} docs in {:.1}s ({} shards, {:.0} docs/sec)",
+                request.name, docs, t_doc.elapsed().as_secs_f64(), num_shards,
+                docs as f64 / t_doc.elapsed().as_secs_f64().max(0.001)
+            );
+        }
+
+        // Convert to HashMap for return
         let mut filter_map: HashMap<u64, RoaringBitmap> = HashMap::new();
-        for (i, bm) in merged_vec.drain(..).enumerate() {
+        for (i, bm) in merged_vec.into_iter().enumerate() {
             if !bm.is_empty() {
                 filter_map.insert(i as u64, bm);
             }
         }
-
-        let total_rows = total.load(Ordering::Relaxed);
-        eprintln!(
-            "  Dump {} ({target}): {} rows, {} distinct values",
-            request.name,
-            total_rows,
-            filter_map.len(),
-        );
-
         let mut filter_maps = HashMap::new();
         filter_maps.insert(target, filter_map);
-
-        // Wait for docstore writer thread to finish
-        drop(doc_tx);
-        if let Some(handle) = doc_writer_handle {
-            handle.join().ok();
-        }
-
-        emit_stage(&request.name, "parallel_parse", "done", &t_mv, total_rows);
 
         Ok(PhaseResult {
             row_count: total_rows,
@@ -2917,7 +3041,7 @@ fn write_docstore_row_indexed(
         let refs: Vec<(u16, &[u8])> = tuple_buf.iter()
             .map(|&(idx, off, len)| (idx, &serialize_buf[off as usize..(off + len) as usize]))
             .collect();
-        bulk_writer.append_tuples_raw(slot, &refs, write_buf);
+        bulk_writer.append_tuples_merge(slot, &refs, write_buf);
     }
 }
 

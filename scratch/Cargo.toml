@@ -24,3 +24,7 @@ parking_lot = "0.12"
 rand = "0.8"
 rayon = "1"
 memmap2 = "0.9"
+datasilo = { path = "../crates/datasilo" }
+tempfile = "3"
+rmp-serde = "1"
+rmpv = "1"

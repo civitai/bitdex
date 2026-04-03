@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "scratch"]
+members = [".", "scratch", "crates/datasilo"]
 default-members = ["."]
 
 [package]

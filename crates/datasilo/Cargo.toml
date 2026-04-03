@@ -1,0 +1,14 @@
+[package]
+name = "datasilo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Generic mmap'd key-value store with append-only ops log"
+
+[dependencies]
+memmap2 = "0.9"
+crc32fast = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"

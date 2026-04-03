@@ -239,14 +239,10 @@ pub fn read_op_entries_pub<O: OpCodec>(data: &[u8]) -> Vec<O::Op> {
     read_op_entries::<O>(data)
 }
 
-/// Simple CRC32 (IEEE / CRC-32C via software). We use a basic lookup table.
+/// CRC32 using hardware acceleration when available (SSE4.2/ARM NEON),
+/// falling back to optimized software tables. 10-50x faster than naive.
 pub(crate) fn crc32_of(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        let idx = ((crc ^ byte as u32) & 0xFF) as usize;
-        crc = CRC32_TABLE[idx] ^ (crc >> 8);
-    }
-    crc ^ 0xFFFF_FFFF
+    crc32fast::hash(data)
 }
 
 /// CRC-32 lookup table (IEEE polynomial 0xEDB88320).

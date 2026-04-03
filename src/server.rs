@@ -1348,6 +1348,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/fields", post(handle_add_fields).delete(handle_remove_fields))
             .route("/api/indexes/{name}/fields/{field}/reload", post(handle_reload_field))
             .route("/api/indexes/{name}/compact", post(handle_compact))
+            .route("/api/indexes/{name}/time-buckets/rebuild", post(handle_rebuild_time_buckets))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
             // Capture endpoints (Phase 2)
@@ -1387,6 +1388,8 @@ impl BitdexServer {
             .route("/api/indexes/{name}/dumps/{dump_name}/loaded", post(handle_dump_loaded))
             .route("/api/indexes/{name}/dumps/{dump_name}", delete(handle_delete_dump))
             .route("/api/indexes/{name}/dumps/clear", post(handle_clear_dumps))
+            .route("/api/indexes/{name}/dictionaries", get(handle_dictionaries))
+            .route("/api/indexes/{name}/ui-config", get(handle_ui_config))
             .route("/metrics", get(handle_metrics))
             .route("/", get(handle_ui))
             .with_state(Arc::clone(&state));
@@ -1950,6 +1953,95 @@ async fn handle_get_index(
             Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
         ).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: UI — Dictionaries & UI Config
+// ---------------------------------------------------------------------------
+
+/// GET /api/indexes/{name}/dictionaries — reverse maps (int → display string)
+/// for all fields that have dictionaries (LowCardinalityString) or string_maps
+/// (MappedString). The UI uses these to populate dropdowns and render labels.
+async fn handle_dictionaries(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let guard = state.index.lock();
+    match guard.as_ref() {
+        Some(idx) if idx.definition.name == name => {
+            let mut result: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+            // LowCardinalityString dictionaries from the engine
+            for (field_name, dict) in idx.engine.dictionaries().iter() {
+                let snap = dict.snapshot();
+                let reverse = snap.to_reverse_map();
+                let map: serde_json::Map<String, serde_json::Value> = reverse.iter()
+                    .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.clone())))
+                    .collect();
+                result.insert(field_name.clone(), serde_json::Value::Object(map));
+            }
+
+            // MappedString fields from data_schema (reverse the string_map)
+            for mapping in &idx.definition.data_schema.fields {
+                if let Some(ref string_map) = mapping.string_map {
+                    if !result.contains_key(&mapping.target) {
+                        let reverse: serde_json::Map<String, serde_json::Value> = string_map.iter()
+                            .map(|(label, &id)| (id.to_string(), serde_json::Value::String(label.clone())))
+                            .collect();
+                        result.insert(mapping.target.clone(), serde_json::Value::Object(reverse));
+                    }
+                }
+            }
+
+            Json(serde_json::Value::Object(result)).into_response()
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+        ).into_response(),
+    }
+}
+
+/// GET /api/indexes/{name}/ui-config — serve the UI config YAML as JSON.
+/// Loaded from data_dir/indexes/{name}/ui-config.yaml (or index_dir if set).
+/// Returns {} if no UI config file exists (UI falls back to auto-generated controls).
+async fn handle_ui_config(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let config_source_dir = state.index_dir.clone()
+        .unwrap_or_else(|| state.data_dir.join("indexes"));
+    let candidates = [
+        config_source_dir.join(&name).join("ui-config.yaml"),
+        config_source_dir.join(&name).join("ui-config.yml"),
+        state.data_dir.join("indexes").join(&name).join("ui-config.yaml"),
+        state.data_dir.join("indexes").join(&name).join("ui-config.yml"),
+    ];
+
+    for path in &candidates {
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(yaml_str) => {
+                    match serde_yaml::from_str::<serde_json::Value>(&yaml_str) {
+                        Ok(val) => return Json(val).into_response(),
+                        Err(e) => {
+                            eprintln!("Failed to parse ui-config at {}: {e}", path.display());
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"error": format!("Invalid ui-config YAML: {e}")})),
+                            ).into_response();
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to read ui-config at {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
+    // No config file — return empty object (UI auto-generates)
+    Json(serde_json::json!({})).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -3446,6 +3538,42 @@ struct CompactRequest {
     targets: Option<Vec<String>>,
     threshold: Option<u32>,
     workers: Option<usize>,
+}
+
+async fn handle_rebuild_time_buckets(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+    match engine.rebuild_time_buckets() {
+        Ok((bucket_count, slots_scanned)) => {
+            // Include per-bucket counts in the response
+            let bucket_details = engine.time_bucket_stats();
+            Json(serde_json::json!({
+                "status": "ok",
+                "buckets_rebuilt": bucket_count,
+                "slots_scanned": slots_scanned,
+                "buckets": bucket_details,
+            })).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    }
 }
 
 async fn handle_compact(
