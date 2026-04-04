@@ -1,7 +1,6 @@
 //! PostgreSQL COPY TO STDOUT queries and CSV chunk parser for bulk loading.
 //!
-//! Each table is streamed independently with no JOINs. Enrichment data
-//! (Post, ModelVersion, Model) is loaded into HashMaps and merged in memory.
+//! Each table is streamed independently with no JOINs.
 //!
 //! This is significantly faster than JOIN-based loading because:
 //! - No per-row deserialization through sqlx's type system
@@ -140,35 +139,6 @@ pub async fn copy_models(
 }
 
 // ---------------------------------------------------------------------------
-// Row types
-// ---------------------------------------------------------------------------
-
-/// Post row for enrichment — keyed by Post.id, joined to Image via postId.
-#[derive(Debug)]
-pub struct CopyPostRow {
-    pub id: i64,
-    pub published_at_secs: Option<i64>,
-    pub availability: String,
-    pub model_version_id: Option<i64>,
-}
-
-/// ModelVersion row for enrichment — keyed by MV.id.
-#[derive(Debug)]
-pub struct CopyModelVersionRow {
-    pub id: i64,
-    pub base_model: Option<String>,
-    pub model_id: i64,
-}
-
-/// Model row for enrichment — keyed by Model.id.
-#[derive(Debug)]
-pub struct CopyModelRow {
-    pub id: i64,
-    pub poi: bool,
-    pub model_type: String,
-}
-
-// ---------------------------------------------------------------------------
 // CSV chunk parser
 // ---------------------------------------------------------------------------
 
@@ -290,128 +260,6 @@ fn split_csv_fields(line: &[u8]) -> Vec<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// Fast integer parsing
-// ---------------------------------------------------------------------------
-
-/// Parse bytes as i64 without going through str. Returns None on empty/invalid.
-#[inline]
-fn parse_i64_fast(bytes: &[u8]) -> Option<i64> {
-    if bytes.is_empty() {
-        return None;
-    }
-
-    let (negative, start) = if bytes[0] == b'-' {
-        (true, 1)
-    } else {
-        (false, 0)
-    };
-
-    if start >= bytes.len() {
-        return None;
-    }
-
-    let mut val: i64 = 0;
-    for &b in &bytes[start..] {
-        if b < b'0' || b > b'9' {
-            return None;
-        }
-        val = val.wrapping_mul(10).wrapping_add((b - b'0') as i64);
-    }
-
-    if negative {
-        Some(-val)
-    } else {
-        Some(val)
-    }
-}
-
-/// Check if a field represents a PG CSV NULL (empty unquoted field).
-#[inline]
-fn is_null(field: &[u8]) -> bool {
-    field.is_empty()
-}
-
-/// Parse an optional i64 — returns None for empty (NULL) fields.
-#[inline]
-fn parse_opt_i64(field: &[u8]) -> Option<i64> {
-    if is_null(field) {
-        None
-    } else {
-        parse_i64_fast(field)
-    }
-}
-
-/// Parse an optional string — returns None for empty (NULL) fields.
-#[inline]
-fn parse_opt_string(field: &[u8]) -> Option<String> {
-    if is_null(field) {
-        None
-    } else {
-        Some(String::from_utf8_lossy(field).into_owned())
-    }
-}
-
-/// Parse a PG boolean (`t`/`f`).
-#[inline]
-fn parse_bool(field: &[u8]) -> bool {
-    !field.is_empty() && field[0] == b't'
-}
-
-// ---------------------------------------------------------------------------
-// Row parse functions
-// ---------------------------------------------------------------------------
-
-/// Parse a CSV line into a [`CopyPostRow`] (4 fields).
-///
-/// Expected: id, publishedAtSecs, availability, modelVersionId
-pub fn parse_post_row(line: &[u8]) -> Option<CopyPostRow> {
-    let fields = split_csv_fields(line);
-    if fields.len() < 4 {
-        return None;
-    }
-    Some(CopyPostRow {
-        id: parse_i64_fast(&fields[0])?,
-        published_at_secs: parse_opt_i64(&fields[1]),
-        availability: if is_null(&fields[2]) {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&fields[2]).into_owned()
-        },
-        model_version_id: parse_opt_i64(&fields[3]),
-    })
-}
-
-/// Parse a CSV line into a [`CopyModelVersionRow`] (3 fields).
-///
-/// Expected: id, baseModel, modelId
-pub fn parse_model_version_row(line: &[u8]) -> Option<CopyModelVersionRow> {
-    let fields = split_csv_fields(line);
-    if fields.len() < 3 {
-        return None;
-    }
-    Some(CopyModelVersionRow {
-        id: parse_i64_fast(&fields[0])?,
-        base_model: parse_opt_string(&fields[1]),
-        model_id: parse_i64_fast(&fields[2])?,
-    })
-}
-
-/// Parse a CSV line into a [`CopyModelRow`] (3 fields).
-///
-/// Expected: id, poi, type
-pub fn parse_model_row(line: &[u8]) -> Option<CopyModelRow> {
-    let fields = split_csv_fields(line);
-    if fields.len() < 3 {
-        return None;
-    }
-    Some(CopyModelRow {
-        id: parse_i64_fast(&fields[0])?,
-        poi: parse_bool(&fields[1]),
-        model_type: String::from_utf8_lossy(&fields[2]).into_owned(),
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -490,54 +338,6 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let fields = split_csv_fields(&lines[0]);
         assert_eq!(fields[1], b"line1\nline2");
-    }
-
-    #[test]
-    fn test_parse_i64_fast() {
-        assert_eq!(parse_i64_fast(b"12345"), Some(12345));
-        assert_eq!(parse_i64_fast(b"-99"), Some(-99));
-        assert_eq!(parse_i64_fast(b"0"), Some(0));
-        assert_eq!(parse_i64_fast(b""), None);
-        assert_eq!(parse_i64_fast(b"abc"), None);
-        assert_eq!(parse_i64_fast(b"-"), None);
-    }
-
-    #[test]
-    fn test_parse_post_row() {
-        let line = b"777,1700500000,Public,42";
-        let row = parse_post_row(line).expect("should parse");
-        assert_eq!(row.id, 777);
-        assert_eq!(row.published_at_secs, Some(1700500000));
-        assert_eq!(row.availability, "Public");
-        assert_eq!(row.model_version_id, Some(42));
-    }
-
-    #[test]
-    fn test_parse_post_row_nulls() {
-        let line = b"777,,,";
-        let row = parse_post_row(line).expect("should parse");
-        assert_eq!(row.id, 777);
-        assert!(row.published_at_secs.is_none());
-        assert_eq!(row.availability, "");
-        assert!(row.model_version_id.is_none());
-    }
-
-    #[test]
-    fn test_parse_model_version_row() {
-        let line = b"678,SD 1.5,42";
-        let row = parse_model_version_row(line).expect("should parse");
-        assert_eq!(row.id, 678);
-        assert_eq!(row.base_model.as_deref(), Some("SD 1.5"));
-        assert_eq!(row.model_id, 42);
-    }
-
-    #[test]
-    fn test_parse_model_row() {
-        let line = b"42,f,Checkpoint";
-        let row = parse_model_row(line).expect("should parse");
-        assert_eq!(row.id, 42);
-        assert!(!row.poi);
-        assert_eq!(row.model_type, "Checkpoint");
     }
 
     #[test]

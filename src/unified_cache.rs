@@ -271,6 +271,38 @@ impl UnifiedEntry {
             uses_bucket: false, // Set by caller after restore
         }
     }
+    /// Reconstruct a UnifiedEntry from a CacheSilo-persisted CacheEntryData.
+    /// Uses the persisted bitmap, sorted_keys, and metadata directly.
+    pub fn from_cache_entry_data(
+        data: crate::cache_silo::CacheEntryData,
+        initial_capacity: usize,
+        max_capacity: usize,
+    ) -> Self {
+        let card = data.bitmap.len() as usize;
+        let capacity = if card > initial_capacity { max_capacity } else { initial_capacity };
+        let sorted_keys = data.sorted_keys.map(Arc::new).filter(|k| !k.is_empty());
+        let min_tracked_value = data.min_tracked_value;
+        Self {
+            bitmap: Arc::new(data.bitmap),
+            min_tracked_value,
+            capacity,
+            max_capacity,
+            has_more: data.has_more,
+            total_matched: data.total_matched,
+            needs_rebuild: false,
+            rebuilding: AtomicBool::new(false),
+            prefetching: AtomicBool::new(false),
+            last_used: Instant::now(),
+            meta_id: 0, // reassigned by insert_restored_entry
+            persist_dirty: false,
+            sorted_keys,
+            radix: None,
+            direction: data.direction,
+            bucket_cutoff: 0,
+            uses_bucket: false,
+        }
+    }
+
     pub fn bitmap(&self) -> &Arc<RoaringBitmap> {
         &self.bitmap
     }
@@ -1289,6 +1321,7 @@ impl UnifiedCache {
             }
             let key_hash = crate::cache_silo::hash_unified_key(key);
             let data = crate::cache_silo::CacheEntryData {
+                key: key.clone(),
                 bitmap: entry.bitmap.as_ref().clone(),
                 min_tracked_value: entry.min_tracked_value,
                 capacity: entry.capacity,

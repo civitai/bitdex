@@ -344,25 +344,6 @@ fn json_to_packed(v: &JsonValue) -> Option<PackedValue> {
         JsonValue::Object(_) => None,
     }
 }
-// ---------------------------------------------------------------------------
-// Enrichment types for dump processing
-// ---------------------------------------------------------------------------
-/// Post enrichment data, keyed by post_id.
-struct PostEnrichment {
-    published_at_secs: Option<i64>,
-    availability: String,
-    // postedToId is derived from Post.modelVersionId — not directly available
-    // We use post_id itself as postedToId (Post table's ID is the posted-to entity)
-}
-/// ModelVersion enrichment data, keyed by model_version_id.
-struct MvEnrichment {
-    base_model: Option<String>,
-    model_id: i64,
-}
-/// Model enrichment data, keyed by model_id.
-struct ModelEnrichment {
-    poi: bool,
-}
 /// Convert a serde_json::Value to a query::Value for bitmap key conversion.
 fn json_to_qvalue(v: &JsonValue) -> QValue {
     match v {
@@ -494,113 +475,6 @@ impl FieldMeta {
     fn has_computed_deps(&self, field: &str) -> bool {
         self.computed_deps.contains_key(field)
     }
-}
-// ---------------------------------------------------------------------------
-// Enrichment loading — small tables loaded into memory as HashMaps
-// ---------------------------------------------------------------------------
-/// Load posts.csv into a HashMap<post_id, PostEnrichment>.
-/// Posts: id, publishedAtSecs, availability, modelVersionId (4 columns CSV)
-fn load_posts_enrichment(csv_dir: &Path) -> HashMap<i64, PostEnrichment> {
-    use crate::pg_sync::copy_queries::parse_post_row;
-    use std::io::BufRead;
-    let path = csv_dir.join("posts.csv");
-    if !path.exists() {
-        eprintln!("  posts.csv not found, skipping post enrichment");
-        return HashMap::new();
-    }
-    let start = std::time::Instant::now();
-    let file = std::fs::File::open(&path).expect("open posts.csv");
-    let reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
-    let mut map = HashMap::new();
-    let mut count = 0u64;
-    for line in reader.split(b'\n') {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() { continue; }
-        if let Some(row) = parse_post_row(&line) {
-            map.insert(row.id, PostEnrichment {
-                published_at_secs: row.published_at_secs,
-                availability: row.availability,
-            });
-            count += 1;
-        }
-    }
-    eprintln!("  posts enrichment: {} rows in {:.1}s", count, start.elapsed().as_secs_f64());
-    map
-}
-/// Load model_versions.csv into a HashMap<mv_id, MvEnrichment>.
-/// ModelVersions: id, baseModel, modelId (3 columns CSV)
-fn load_mv_enrichment(csv_dir: &Path) -> HashMap<i64, MvEnrichment> {
-    use crate::pg_sync::copy_queries::parse_model_version_row;
-    use std::io::BufRead;
-    let path = csv_dir.join("model_versions.csv");
-    if !path.exists() {
-        eprintln!("  model_versions.csv not found, skipping MV enrichment");
-        return HashMap::new();
-    }
-    let start = std::time::Instant::now();
-    let file = std::fs::File::open(&path).expect("open model_versions.csv");
-    let reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
-    let mut map = HashMap::new();
-    let mut count = 0u64;
-    for line in reader.split(b'\n') {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() { continue; }
-        if let Some(row) = parse_model_version_row(&line) {
-            map.insert(row.id, MvEnrichment {
-                base_model: row.base_model,
-                model_id: row.model_id,
-            });
-            count += 1;
-        }
-    }
-    eprintln!("  model_versions enrichment: {} rows in {:.1}s", count, start.elapsed().as_secs_f64());
-    map
-}
-/// Load models.csv into a HashMap<model_id, ModelEnrichment>.
-/// Models: id, poi, type (3 columns CSV)
-fn load_model_enrichment(csv_dir: &Path) -> HashMap<i64, ModelEnrichment> {
-    use crate::pg_sync::copy_queries::parse_model_row;
-    use std::io::BufRead;
-    let path = csv_dir.join("models.csv");
-    if !path.exists() {
-        eprintln!("  models.csv not found, skipping model enrichment");
-        return HashMap::new();
-    }
-    let start = std::time::Instant::now();
-    let file = std::fs::File::open(&path).expect("open models.csv");
-    let reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
-    let mut map = HashMap::new();
-    let mut count = 0u64;
-    for line in reader.split(b'\n') {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() { continue; }
-        if let Some(row) = parse_model_row(&line) {
-            map.insert(row.id, ModelEnrichment {
-                poi: row.poi,
-            });
-            count += 1;
-        }
-    }
-    eprintln!("  models enrichment: {} rows in {:.1}s", count, start.elapsed().as_secs_f64());
-    map
-}
-/// Resolve a string value through the field dictionary, returning the u64 bitmap key.
-#[inline]
-fn resolve_string_dict(
-    dicts: &HashMap<String, FieldDictionary>,
-    field: &str,
-    value: &str,
-) -> Option<u64> {
-    dicts.get(field).map(|dict| dict.get_or_insert(value) as u64)
 }
 /// Set sort layers for a u32 value on a slot in a BitmapAccum.
 #[inline]

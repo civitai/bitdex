@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 use roaring::RoaringBitmap;
 
+use crate::cache::CanonicalClause;
 use crate::query::SortDirection;
 use crate::unified_cache::UnifiedKey;
 
@@ -44,6 +45,9 @@ use crate::unified_cache::UnifiedKey;
 /// These are either transient or rebuilt on demand.
 #[derive(Debug, Clone)]
 pub struct CacheEntryData {
+    /// The cache key (filter clauses + sort field + direction).
+    /// Stored alongside the entry so restore can reconstruct the UnifiedKey.
+    pub key: UnifiedKey,
     /// Bounded top-K bitmap within the filter result.
     pub bitmap: RoaringBitmap,
     /// Sort floor (Desc) or ceiling (Asc) of the current bound.
@@ -63,7 +67,21 @@ pub struct CacheEntryData {
     pub sorted_keys: Option<Vec<u64>>,
 }
 
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
+
+fn encode_string(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn decode_string(cur: &mut Cursor<&[u8]>) -> io::Result<String> {
+    let mut len_buf = [0u8; 4];
+    cur.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut str_buf = vec![0u8; len];
+    cur.read_exact(&mut str_buf)?;
+    String::from_utf8(str_buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
 
 impl CacheEntryData {
     /// Encode to bytes using the documented binary format.
@@ -104,6 +122,16 @@ impl CacheEntryData {
                     buf.extend_from_slice(&k.to_le_bytes());
                 }
             }
+        }
+
+        // UnifiedKey: sort_field + direction + filter_clauses
+        encode_string(&mut buf, &self.key.sort_field);
+        // direction already encoded in header (byte 1)
+        buf.extend_from_slice(&(self.key.filter_clauses.len() as u32).to_le_bytes());
+        for cc in &self.key.filter_clauses {
+            encode_string(&mut buf, &cc.field);
+            encode_string(&mut buf, &cc.op);
+            encode_string(&mut buf, &cc.value_repr);
         }
 
         buf
@@ -165,7 +193,25 @@ impl CacheEntryData {
             Some(keys)
         };
 
+        // UnifiedKey
+        let sort_field = decode_string(&mut cur)?;
+        // direction already decoded from header
+        let clause_count = read_u32_le(&mut cur)? as usize;
+        let mut filter_clauses = Vec::with_capacity(clause_count);
+        for _ in 0..clause_count {
+            let field = decode_string(&mut cur)?;
+            let op = decode_string(&mut cur)?;
+            let value_repr = decode_string(&mut cur)?;
+            filter_clauses.push(CanonicalClause { field, op, value_repr });
+        }
+        let key = UnifiedKey {
+            filter_clauses,
+            sort_field,
+            direction,
+        };
+
         Ok(Self {
+            key,
             bitmap,
             min_tracked_value,
             capacity,
@@ -362,6 +408,15 @@ mod tests {
         };
 
         CacheEntryData {
+            key: UnifiedKey {
+                filter_clauses: vec![CanonicalClause {
+                    field: "nsfwLevel".to_string(),
+                    op: "eq".to_string(),
+                    value_repr: "1".to_string(),
+                }],
+                sort_field: "sortAt".to_string(),
+                direction,
+            },
             bitmap: bm,
             min_tracked_value: 10,
             capacity: 4000,

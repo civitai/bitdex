@@ -313,7 +313,7 @@ impl ConcurrentEngine {
             max_maintenance_ms: config.cache.max_maintenance_ms,
             prefetch_threshold: config.cache.prefetch_threshold,
         };
-        let uc = UnifiedCache::new(uc_config);
+        let mut uc = UnifiedCache::new(uc_config);
         // CacheSilo: open and restore persisted cache entries into UnifiedCache.
         let cache_silo_arc: Option<Arc<parking_lot::RwLock<crate::cache_silo::CacheSilo>>> =
             config.storage.bitmap_path.as_ref().and_then(|bp| {
@@ -332,12 +332,18 @@ impl ConcurrentEngine {
             match cs.load_all() {
                 Ok(entries) => {
                     let count = entries.len();
+                    uc.begin_restore();
                     for (_key_hash, entry_data) in entries {
-                        // Entries restored from disk start with needs_rebuild=false and
-                        // persist_dirty=false. They will be served until live maintenance
-                        // marks them stale (needs_rebuild) or eviction clears them.
-                        let _ = entry_data; // UnifiedCache.restore_entry wired below
+                        // Reconstruct UnifiedEntry from CacheEntryData and insert
+                        let key = entry_data.key.clone();
+                        let entry = crate::unified_cache::UnifiedEntry::from_cache_entry_data(
+                            entry_data,
+                            uc.config().initial_capacity,
+                            uc.config().max_capacity,
+                        );
+                        uc.insert_restored_entry(key, entry);
                     }
+                    uc.finish_restore();
                     eprintln!("CacheSilo: restored {count} cache entries from disk");
                 }
                 Err(e) => {
