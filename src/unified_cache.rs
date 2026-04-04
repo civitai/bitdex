@@ -1274,6 +1274,35 @@ impl UnifiedCache {
         }
         count
     }
+    // ── CacheSilo Support ────────────────────────────────────────────────────
+    /// Drain all cache entries with `persist_dirty = true`, returning them as
+    /// (key_hash, CacheEntryData) pairs ready for CacheSilo persistence.
+    ///
+    /// Called by the flush thread under a brief Mutex lock. The flush thread
+    /// writes the returned data to CacheSilo outside the lock, keeping the
+    /// Mutex hold time short.
+    pub fn drain_dirty_for_silo(&mut self) -> Vec<(u32, crate::cache_silo::CacheEntryData)> {
+        let mut out = Vec::new();
+        for (key, entry) in self.entries.iter_mut() {
+            if !entry.persist_dirty {
+                continue;
+            }
+            let key_hash = crate::cache_silo::hash_unified_key(key);
+            let data = crate::cache_silo::CacheEntryData {
+                bitmap: entry.bitmap.as_ref().clone(),
+                min_tracked_value: entry.min_tracked_value,
+                capacity: entry.capacity,
+                max_capacity: entry.max_capacity,
+                has_more: entry.has_more,
+                total_matched: entry.total_matched,
+                direction: entry.direction,
+                sorted_keys: entry.sorted_keys.as_ref().map(|arc| arc.as_ref().clone()),
+            };
+            entry.persist_dirty = false;
+            out.push((key_hash, data));
+        }
+        out
+    }
     // ── Live Maintenance (Phase 3) ──────────────────────────────────────────
     /// Maintain cache entries when filter fields change.
     ///

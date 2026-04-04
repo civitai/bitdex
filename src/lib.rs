@@ -1,5 +1,6 @@
 pub mod bitmap_silo;
 pub mod bucket_diff_log;
+pub mod cache_silo;
 pub mod dump_enrichment;
 pub mod dump_expression;
 #[cfg(feature = "pg-sync")]

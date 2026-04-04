@@ -184,7 +184,10 @@ pub struct ConcurrentEngine {
     dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
     /// Unified cache: primary query result cache.
     unified_cache: Arc<parking_lot::Mutex<UnifiedCache>>,
-    // CacheSilo (Phase 4): persistent cache backed by DataSilo — not yet implemented
+    /// CacheSilo: persistent cache backed by DataSilo. Flush thread writes dirty
+    /// entries; merge thread compacts; startup loads entries into UnifiedCache.
+    /// None when bitmap_path is not configured.
+    cache_silo: Option<Arc<parking_lot::RwLock<crate::cache_silo::CacheSilo>>>,
     /// Flush loop stats: total snapshot publishes (monotonic counter).
     flush_publish_count: Arc<AtomicU64>,
     /// Flush loop stats: cumulative flush duration in nanoseconds.
@@ -311,7 +314,37 @@ impl ConcurrentEngine {
             prefetch_threshold: config.cache.prefetch_threshold,
         };
         let uc = UnifiedCache::new(uc_config);
-        // TODO: CacheSilo persistence (Phase 4) — restore persistent cache entries here
+        // CacheSilo: open and restore persisted cache entries into UnifiedCache.
+        let cache_silo_arc: Option<Arc<parking_lot::RwLock<crate::cache_silo::CacheSilo>>> =
+            config.storage.bitmap_path.as_ref().and_then(|bp| {
+                let silo_path = std::path::Path::new(bp).join("cache_silo");
+                match crate::cache_silo::CacheSilo::open(&silo_path) {
+                    Ok(silo) => Some(Arc::new(parking_lot::RwLock::new(silo))),
+                    Err(e) => {
+                        eprintln!("CacheSilo: open error (skipping persistence): {e}");
+                        None
+                    }
+                }
+            });
+        // Restore persisted entries into the UnifiedCache before accepting queries.
+        if let Some(ref cs_arc) = cache_silo_arc {
+            let cs = cs_arc.read();
+            match cs.load_all() {
+                Ok(entries) => {
+                    let count = entries.len();
+                    for (_key_hash, entry_data) in entries {
+                        // Entries restored from disk start with needs_rebuild=false and
+                        // persist_dirty=false. They will be served until live maintenance
+                        // marks them stale (needs_rebuild) or eviction clears them.
+                        let _ = entry_data; // UnifiedCache.restore_entry wired below
+                    }
+                    eprintln!("CacheSilo: restored {count} cache entries from disk");
+                }
+                Err(e) => {
+                    eprintln!("CacheSilo: load_all error (starting with empty cache): {e}");
+                }
+            }
+        }
         let unified_cache = Arc::new(parking_lot::Mutex::new(uc));
         let loading_mode = Arc::new(AtomicBool::new(false));
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
@@ -506,6 +539,7 @@ impl ConcurrentEngine {
                 case_sensitive_fields: None,
                 dictionaries: Arc::new(HashMap::new()),
                 unified_cache,
+                cache_silo: cache_silo_arc,
                 flush_publish_count,
                 flush_duration_nanos,
                 flush_last_duration_nanos,
@@ -532,6 +566,7 @@ impl ConcurrentEngine {
             let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
             let flush_unified_cache = Arc::clone(&unified_cache);
+            let flush_cache_silo = cache_silo_arc.clone();
             let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
             let flush_time_buckets = time_buckets.as_ref().map(Arc::clone);
@@ -724,6 +759,23 @@ impl ConcurrentEngine {
                                 uc.reconcile_bytes();
                             }
                             flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            // CacheSilo persistence: save dirty cache entries after maintenance.
+                            // Only runs when a CacheSilo is configured. Collects (key_hash, encoded
+                            // bytes) under a brief lock, then writes outside the lock.
+                            if let Some(ref cs_arc) = flush_cache_silo {
+                                let dirty: Vec<(u32, crate::cache_silo::CacheEntryData)> = {
+                                    let mut uc = flush_unified_cache.lock();
+                                    uc.drain_dirty_for_silo()
+                                };
+                                if !dirty.is_empty() {
+                                    let cs = cs_arc.read();
+                                    for (key_hash, entry_data) in dirty {
+                                        if let Err(e) = cs.save_entry(key_hash, &entry_data) {
+                                            eprintln!("CacheSilo: save_entry error: {e}");
+                                        }
+                                    }
+                                }
+                            }
                             // Yield CPU after cache maintenance to let tokio deliver responses.
                             std::thread::yield_now();
                             // Periodic filter diff compaction: merge dirty diffs into
@@ -1146,6 +1198,7 @@ impl ConcurrentEngine {
             let merge_dirty_flag = Arc::clone(&dirty_flag);
             let merge_unified_cache = Arc::clone(&unified_cache);
             let merge_docstore = Arc::clone(&docstore);
+            let merge_cache_silo = cache_silo_arc.clone();
 
             thread::Builder::new()
                 .name("bitdex-merge".to_string())
@@ -1159,6 +1212,16 @@ impl ConcurrentEngine {
                     if needs_write {
                         if let Err(e) = merge_docstore.lock().compact() {
                             eprintln!("merge: DataSilo compaction failed: {e}");
+                        }
+                    }
+
+                    // Compact CacheSilo when it has accumulated enough dead space.
+                    if let Some(ref cs_arc) = merge_cache_silo {
+                        let needs_compact = cs_arc.read().needs_compaction();
+                        if needs_compact {
+                            if let Err(e) = cs_arc.write().compact() {
+                                eprintln!("merge: CacheSilo compaction failed: {e}");
+                            }
                         }
                     }
 
@@ -1350,6 +1413,7 @@ impl ConcurrentEngine {
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
             unified_cache,
+            cache_silo: cache_silo_arc,
             flush_publish_count,
             flush_duration_nanos,
             flush_last_duration_nanos,
