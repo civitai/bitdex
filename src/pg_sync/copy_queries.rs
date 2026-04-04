@@ -143,66 +143,6 @@ pub async fn copy_models(
 // Row types
 // ---------------------------------------------------------------------------
 
-/// Image row from COPY CSV (Image table only, no JOINs).
-/// Post-enriched fields start as defaults and are set after Post stream merges.
-#[derive(Debug)]
-pub struct CopyImageRow {
-    pub id: i64,
-    pub url: Option<String>,
-    pub nsfw_level: i32,
-    pub hash: Option<String>,
-    pub flags: i16,
-    pub image_type: String,
-    pub user_id: i64,
-    pub blocked_for: Option<String>,
-    pub scanned_at_secs: Option<i64>,
-    pub created_at_secs: Option<i64>,
-    pub post_id: Option<i64>,
-    pub width: Option<i32>,
-    pub height: Option<i32>,
-    // Post-enriched fields (set after Post stream merges)
-    pub published_at_secs: Option<i64>,
-    pub availability: String,
-    pub posted_to_id: Option<i64>,
-}
-
-impl CopyImageRow {
-    /// hasMeta = hasPrompt(bit13) AND NOT hideMeta(bit2)
-    #[inline]
-    pub fn has_meta(&self) -> bool {
-        (self.flags & (1 << 13)) != 0 && (self.flags & (1 << 2)) == 0
-    }
-
-    /// onSite = madeOnSite(bit14)
-    #[inline]
-    pub fn on_site(&self) -> bool {
-        (self.flags & (1 << 14)) != 0
-    }
-
-    /// minor = bit3
-    #[inline]
-    pub fn minor(&self) -> bool {
-        (self.flags & (1 << 3)) != 0
-    }
-
-    /// poi = bit4 (image-level; OR'd with resource_poi later)
-    #[inline]
-    pub fn poi(&self) -> bool {
-        (self.flags & (1 << 4)) != 0
-    }
-
-    /// sortAt = max(published_at, scanned_at, created_at) in epoch seconds
-    #[inline]
-    pub fn sort_at_secs(&self) -> u64 {
-        let vals = [
-            self.published_at_secs.unwrap_or(0),
-            self.scanned_at_secs.unwrap_or(0),
-            self.created_at_secs.unwrap_or(0),
-        ];
-        vals.into_iter().max().unwrap_or(0) as u64
-    }
-}
-
 /// Post row for enrichment — keyed by Post.id, joined to Image via postId.
 #[derive(Debug)]
 pub struct CopyPostRow {
@@ -210,14 +150,6 @@ pub struct CopyPostRow {
     pub published_at_secs: Option<i64>,
     pub availability: String,
     pub model_version_id: Option<i64>,
-}
-
-/// Resource row from COPY CSV (no JOINs) — one row per (imageId, modelVersionId).
-#[derive(Debug)]
-pub struct CopyResourceRow {
-    pub image_id: i64,
-    pub model_version_id: i64,
-    pub detected: bool,
 }
 
 /// ModelVersion row for enrichment — keyed by MV.id.
@@ -234,16 +166,6 @@ pub struct CopyModelRow {
     pub id: i64,
     pub poi: bool,
     pub model_type: String,
-}
-
-/// Metrics row from ClickHouse dump (TAB-separated).
-/// Columns: imageId, reactionCount, commentCount, collectedCount
-#[derive(Debug)]
-pub struct CopyMetricRow {
-    pub image_id: i64,
-    pub reaction_count: i64,
-    pub comment_count: i64,
-    pub collected_count: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,18 +325,6 @@ fn parse_i64_fast(bytes: &[u8]) -> Option<i64> {
     }
 }
 
-/// Parse bytes as i16. Returns None on empty/invalid.
-#[inline]
-fn parse_i16_fast(bytes: &[u8]) -> Option<i16> {
-    parse_i64_fast(bytes).map(|v| v as i16)
-}
-
-/// Parse bytes as i32. Returns None on empty/invalid.
-#[inline]
-fn parse_i32_fast(bytes: &[u8]) -> Option<i32> {
-    parse_i64_fast(bytes).map(|v| v as i32)
-}
-
 /// Check if a field represents a PG CSV NULL (empty unquoted field).
 #[inline]
 fn is_null(field: &[u8]) -> bool {
@@ -428,14 +338,6 @@ fn parse_opt_i64(field: &[u8]) -> Option<i64> {
         None
     } else {
         parse_i64_fast(field)
-    }
-}
-
-fn parse_opt_i32(field: &[u8]) -> Option<i32> {
-    if is_null(field) {
-        None
-    } else {
-        parse_i32_fast(field)
     }
 }
 
@@ -459,37 +361,6 @@ fn parse_bool(field: &[u8]) -> bool {
 // Row parse functions
 // ---------------------------------------------------------------------------
 
-/// Parse a CSV line into a [`CopyImageRow`] (Image table only, 13 fields).
-///
-/// Expected: id, url, nsfwLevel, hash, flags, type, userId, blockedFor,
-///           scannedAtSecs, createdAtSecs, postId, width, height
-pub fn parse_image_row(line: &[u8]) -> Option<CopyImageRow> {
-    let fields = split_csv_fields(line);
-    if fields.len() < 11 {
-        return None;
-    }
-
-    Some(CopyImageRow {
-        id: parse_i64_fast(&fields[0])?,
-        url: parse_opt_string(&fields[1]),
-        nsfw_level: parse_i32_fast(&fields[2]).unwrap_or(0),
-        hash: parse_opt_string(&fields[3]),
-        flags: parse_i16_fast(&fields[4]).unwrap_or(0),
-        image_type: String::from_utf8_lossy(&fields[5]).into_owned(),
-        user_id: parse_i64_fast(&fields[6])?,
-        blocked_for: parse_opt_string(&fields[7]),
-        scanned_at_secs: parse_opt_i64(&fields[8]),
-        created_at_secs: parse_opt_i64(&fields[9]),
-        post_id: parse_opt_i64(&fields[10]),
-        width: if fields.len() > 11 { parse_opt_i32(&fields[11]) } else { None },
-        height: if fields.len() > 12 { parse_opt_i32(&fields[12]) } else { None },
-        // Post-enriched fields — defaults, set after Post stream
-        published_at_secs: None,
-        availability: String::new(),
-        posted_to_id: None,
-    })
-}
-
 /// Parse a CSV line into a [`CopyPostRow`] (4 fields).
 ///
 /// Expected: id, publishedAtSecs, availability, modelVersionId
@@ -510,49 +381,6 @@ pub fn parse_post_row(line: &[u8]) -> Option<CopyPostRow> {
     })
 }
 
-/// Parse a CSV line into a (tag_id, image_id) pair.
-pub fn parse_tag_row(line: &[u8]) -> Option<(i64, i64)> {
-    let fields = split_csv_fields(line);
-    if fields.len() < 2 {
-        return None;
-    }
-    Some((parse_i64_fast(&fields[0])?, parse_i64_fast(&fields[1])?))
-}
-
-/// Parse a CSV line into a (tool_id, image_id) pair.
-pub fn parse_tool_row(line: &[u8]) -> Option<(i64, i64)> {
-    let fields = split_csv_fields(line);
-    if fields.len() < 2 {
-        return None;
-    }
-    Some((parse_i64_fast(&fields[0])?, parse_i64_fast(&fields[1])?))
-}
-
-/// Parse a CSV line into a (technique_id, image_id) pair.
-pub fn parse_technique_row(line: &[u8]) -> Option<(i64, i64)> {
-    let fields = split_csv_fields(line);
-    if fields.len() < 2 {
-        return None;
-    }
-    Some((parse_i64_fast(&fields[0])?, parse_i64_fast(&fields[1])?))
-}
-
-/// Parse a CSV line into a [`CopyResourceRow`] (3 fields, no JOINs).
-///
-/// Expected: imageId, modelVersionId, detected
-pub fn parse_resource_row(line: &[u8]) -> Option<CopyResourceRow> {
-    let fields = split_csv_fields(line);
-    if fields.len() < 3 {
-        return None;
-    }
-
-    Some(CopyResourceRow {
-        image_id: parse_i64_fast(&fields[0])?,
-        model_version_id: parse_i64_fast(&fields[1])?,
-        detected: parse_bool(&fields[2]),
-    })
-}
-
 /// Parse a CSV line into a [`CopyModelVersionRow`] (3 fields).
 ///
 /// Expected: id, baseModel, modelId
@@ -566,32 +394,6 @@ pub fn parse_model_version_row(line: &[u8]) -> Option<CopyModelVersionRow> {
         base_model: parse_opt_string(&fields[1]),
         model_id: parse_i64_fast(&fields[2])?,
     })
-}
-
-/// Parse a TAB-separated metrics row (ClickHouse dump format).
-///
-/// Expected: imageId\treactionCount\tcommentCount\tcollectedCount
-pub fn parse_metric_row(line: &[u8]) -> Option<CopyMetricRow> {
-    let mut iter = line.split(|&b| b == b'\t');
-    let image_id = parse_i64_fast(iter.next()?)?;
-    let reaction_count = iter.next().and_then(parse_i64_fast).unwrap_or(0);
-    let comment_count = iter.next().and_then(parse_i64_fast).unwrap_or(0);
-    let collected_count = iter.next().and_then(parse_i64_fast).unwrap_or(0);
-    Some(CopyMetricRow {
-        image_id,
-        reaction_count,
-        comment_count,
-        collected_count,
-    })
-}
-
-/// Parse a CSV line into a (collectionId, imageId) pair.
-pub fn parse_collection_item_row(line: &[u8]) -> Option<(i64, i64)> {
-    let fields = split_csv_fields(line);
-    if fields.len() < 2 {
-        return None;
-    }
-    Some((parse_i64_fast(&fields[0])?, parse_i64_fast(&fields[1])?))
 }
 
 /// Parse a CSV line into a [`CopyModelRow`] (3 fields).
@@ -701,38 +503,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_image_row() {
-        // 11 fields: id, url, nsfwLevel, hash, flags, type, userId, blockedFor,
-        //            scannedAtSecs, createdAtSecs, postId
-        let line = b"12345,https://example.com/img.jpg,8,abc123,8196,image,9999,,1700000000,1699000000,777";
-        let row = parse_image_row(line).expect("should parse");
-        assert_eq!(row.id, 12345);
-        assert_eq!(row.url.as_deref(), Some("https://example.com/img.jpg"));
-        assert_eq!(row.nsfw_level, 8);
-        assert_eq!(row.hash.as_deref(), Some("abc123"));
-        assert_eq!(row.flags, 8196);
-        assert_eq!(row.image_type, "image");
-        assert_eq!(row.user_id, 9999);
-        assert!(row.blocked_for.is_none());
-        assert_eq!(row.scanned_at_secs, Some(1700000000));
-        assert_eq!(row.created_at_secs, Some(1699000000));
-        assert_eq!(row.post_id, Some(777));
-        // Post fields are defaults
-        assert!(row.published_at_secs.is_none());
-        assert_eq!(row.availability, "");
-        assert!(row.posted_to_id.is_none());
-    }
-
-    #[test]
-    fn test_parse_image_row_nulls() {
-        let line = b"12345,,,,,image,9999,,,,";
-        let row = parse_image_row(line).expect("should parse");
-        assert_eq!(row.id, 12345);
-        assert!(row.url.is_none());
-        assert!(row.post_id.is_none());
-    }
-
-    #[test]
     fn test_parse_post_row() {
         let line = b"777,1700500000,Public,42";
         let row = parse_post_row(line).expect("should parse");
@@ -753,85 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn test_flags_has_meta() {
-        let row = CopyImageRow {
-            id: 1, url: None, nsfw_level: 0, hash: None,
-            flags: (1 << 13),
-            image_type: String::new(), user_id: 1, blocked_for: None,
-            scanned_at_secs: None, created_at_secs: None, post_id: None,
-            width: None, height: None,
-            published_at_secs: None, availability: String::new(), posted_to_id: None,
-        };
-        assert!(row.has_meta());
-        let row2 = CopyImageRow { flags: (1 << 13) | (1 << 2), ..row };
-        assert!(!row2.has_meta());
-        let row3 = CopyImageRow { flags: 0, ..row2 };
-        assert!(!row3.has_meta());
-    }
-
-    #[test]
-    fn test_flags_on_site() {
-        let row = CopyImageRow {
-            id: 1, url: None, nsfw_level: 0, hash: None,
-            flags: (1 << 14),
-            image_type: String::new(), user_id: 1, blocked_for: None,
-            scanned_at_secs: None, created_at_secs: None, post_id: None,
-            width: None, height: None,
-            published_at_secs: None, availability: String::new(), posted_to_id: None,
-        };
-        assert!(row.on_site());
-        let row2 = CopyImageRow { flags: 0, ..row };
-        assert!(!row2.on_site());
-    }
-
-    #[test]
-    fn test_sort_at_secs() {
-        let row = CopyImageRow {
-            id: 1, url: None, nsfw_level: 0, hash: None, flags: 0,
-            image_type: String::new(), user_id: 1, blocked_for: None,
-            scanned_at_secs: Some(100),
-            created_at_secs: Some(200),
-            published_at_secs: Some(150),
-            width: None, height: None,
-            availability: String::new(), posted_to_id: None, post_id: None,
-        };
-        assert_eq!(row.sort_at_secs(), 200);
-    }
-
-    #[test]
-    fn test_parse_tag_row() {
-        assert_eq!(parse_tag_row(b"42,12345"), Some((42, 12345)));
-        assert_eq!(parse_tag_row(b""), None);
-        assert_eq!(parse_tag_row(b"42"), None);
-    }
-
-    #[test]
-    fn test_parse_tool_row() {
-        assert_eq!(parse_tool_row(b"7,99999"), Some((7, 99999)));
-    }
-
-    #[test]
-    fn test_parse_technique_row() {
-        assert_eq!(parse_technique_row(b"3,88888"), Some((3, 88888)));
-    }
-
-    #[test]
-    fn test_parse_resource_row() {
-        let line = b"12345,678,t";
-        let row = parse_resource_row(line).expect("should parse");
-        assert_eq!(row.image_id, 12345);
-        assert_eq!(row.model_version_id, 678);
-        assert!(row.detected);
-    }
-
-    #[test]
-    fn test_parse_resource_row_false() {
-        let line = b"12345,678,f";
-        let row = parse_resource_row(line).expect("should parse");
-        assert!(!row.detected);
-    }
-
-    #[test]
     fn test_parse_model_version_row() {
         let line = b"678,SD 1.5,42";
         let row = parse_model_version_row(line).expect("should parse");
@@ -847,32 +538,6 @@ mod tests {
         assert_eq!(row.id, 42);
         assert!(!row.poi);
         assert_eq!(row.model_type, "Checkpoint");
-    }
-
-    #[test]
-    fn test_parse_metric_row() {
-        let line = b"16224430\t2\t0\t0";
-        let row = parse_metric_row(line).expect("should parse");
-        assert_eq!(row.image_id, 16224430);
-        assert_eq!(row.reaction_count, 2);
-        assert_eq!(row.comment_count, 0);
-        assert_eq!(row.collected_count, 0);
-    }
-
-    #[test]
-    fn test_parse_metric_row_high_counts() {
-        let line = b"38906357\t125\t1\t12";
-        let row = parse_metric_row(line).expect("should parse");
-        assert_eq!(row.image_id, 38906357);
-        assert_eq!(row.reaction_count, 125);
-        assert_eq!(row.comment_count, 1);
-        assert_eq!(row.collected_count, 12);
-    }
-
-    #[test]
-    fn test_parse_collection_item_row() {
-        assert_eq!(parse_collection_item_row(b"100,12345"), Some((100, 12345)));
-        assert_eq!(parse_collection_item_row(b""), None);
     }
 
     #[test]

@@ -1,330 +1,36 @@
 BitDex V2 Server
-  port: 3001
-  data-dir: C:/Dev/Repos/open-source/bitdex-v2/data
-Admin endpoints: disabled (set BITDEX_ADMIN_TOKEN to enable)
-Restored 46348 deferred alive slots (5328 timestamps)
-BoundStore: loaded meta.bin (7 entries, 0 tombstones, next_id=7)
-Loaded 6 bucket diffs from disk (coverage: cutoff 0 to 1774591800)
-Boot diff for '24h': gap=300s, scanned 0 bucket slots, found 0 expired in 1µs
-Boot diff: '7d' already current (persisted=1774592100, current=1774072800)
-Boot diff: '30d' already current (persisted=1774592100, current=1772085600)
-Boot diff: '1y' already current (persisted=1774592100, current=1743120000)
-Applied boot diff to '24h' bucket bitmap (cutoff → 1774592100)
-Applied boot diff to '7d' bucket bitmap (cutoff → 1774072800)
-Applied boot diff to '30d' bucket bitmap (cutoff → 1772085600)
-Applied boot diff to '1y' bucket bitmap (cutoff → 1743120000)
-Existence set for 'modelVersionIds': 326719 keys
-Existence set for 'techniqueIds': 8 keys
-Existence set for 'tagIds': 27614 keys
-Existence set for 'toolIds': 219 keys
-Restored index 'civitai' from disk (107570129 records)
-WAL reader started (cursor=0, path=C:/Dev/Repos/open-source/bitdex-v2/data\wal\ops.wal)
-BitDex server listening on http://0.0.0.0:3001
-  RAYON_NUM_THREADS=28, actual=28
-Preload phase 2: 12 bound cache shards in 0.0s
-Lazy-loaded filter 'type': 2 values in 12.7ms
-Lazy-loaded filter 'availability': 3 values in 9.8ms
-  ShardPreCreator started (background file creation)
-Dump failed: Invalid computed expression for 'testComputed': Cannot parse expression: reactionCount + commentCount
-{"dump":"config-test-v2","stage":"validated","detail":"ok","elapsed_ms":0,"rss_bytes":146264064,"rss_gb":0.146,"rows":0}
-{"dump":"config-test-v2","stage":"enrichment","detail":"start","elapsed_ms":0,"rss_bytes":146272256,"rss_gb":0.146,"rows":0}
-{"dump":"config-test-v2","stage":"enrichment","detail":"done","elapsed_ms":0,"rss_bytes":146276352,"rss_gb":0.146,"rows":0}
-  Dump config-test-v2: mmap'd 1391094238 (1.3 GB), format=Tsv
-{"dump":"config-test-v2","stage":"parallel_parse","detail":"start","elapsed_ms":0,"rss_bytes":146296832,"rss_gb":0.146,"rows":0}
-  ShardPreCreator: docstore hex dirs created
-  ShardPreCreator: 50K docstore files created
-  ShardPreCreator: 100K docstore files created
-  ShardPreCreator: 150K docstore files created
-  dump config-test-v2: 1M rows...
-  dump config-test-v2: 2M rows...
-  dump config-test-v2: 3M rows...
-  dump config-test-v2: 4M rows...
-  dump config-test-v2: 5M rows...
-  dump config-test-v2: 6M rows...
-  dump config-test-v2: 7M rows...
-  dump config-test-v2: 8M rows...
-  dump config-test-v2: 9M rows...
-  dump config-test-v2: 10M rows...
-  dump config-test-v2: 11M rows...
-  dump config-test-v2: 12M rows...
-  dump config-test-v2: 13M rows...
-  dump config-test-v2: 14M rows...
-  dump config-test-v2: 15M rows...
-  dump config-test-v2: 16M rows...
-  dump config-test-v2: 17M rows...
-  dump config-test-v2: 18M rows...
-  dump config-test-v2: 19M rows...
-  dump config-test-v2: 20M rows...
-  dump config-test-v2: 21M rows...
-  dump config-test-v2: 22M rows...
-  dump config-test-v2: 23M rows...
-  dump config-test-v2: 24M rows...
-  dump config-test-v2: 25M rows...
-  dump config-test-v2: 26M rows...
-  dump config-test-v2: 27M rows...
-  dump config-test-v2: 28M rows...
-  ShardPreCreator: 200K docstore files created
-  dump config-test-v2: 29M rows...
-  dump config-test-v2: 30M rows...
-  dump config-test-v2: 31M rows...
-  dump config-test-v2: 32M rows...
-  dump config-test-v2: 33M rows...
-  dump config-test-v2: 34M rows...
-  dump config-test-v2: 35M rows...
-  dump config-test-v2: 36M rows...
-  dump config-test-v2: 37M rows...
-  dump config-test-v2: 38M rows...
-  dump config-test-v2: 39M rows...
-  dump config-test-v2: 40M rows...
-  dump config-test-v2: 41M rows...
-  dump config-test-v2: 42M rows...
-  dump config-test-v2: 43M rows...
-  dump config-test-v2: 44M rows...
-  dump config-test-v2: 45M rows...
-  dump config-test-v2: 46M rows...
-  dump config-test-v2: 47M rows...
-  dump config-test-v2: 48M rows...
-  dump config-test-v2: 49M rows...
-  dump config-test-v2: 50M rows...
-  dump config-test-v2: 51M rows...
-  dump config-test-v2: 52M rows...
-  dump config-test-v2: 53M rows...
-  dump config-test-v2: 54M rows...
-  dump config-test-v2: 55M rows...
-  dump config-test-v2: 56M rows...
-  dump config-test-v2: 57M rows...
-  dump config-test-v2: 58M rows...
-  dump config-test-v2: 59M rows...
-  dump config-test-v2: 60M rows...
-  dump config-test-v2: 61M rows...
-  dump config-test-v2: 62M rows...
-  dump config-test-v2: 63M rows...
-  dump config-test-v2: 64M rows...
-  dump config-test-v2: 65M rows...
-  dump config-test-v2: 66M rows...
-  dump config-test-v2: 67M rows...
-  dump config-test-v2: 68M rows...
-  dump config-test-v2: 69M rows...
-  dump config-test-v2: 70M rows...
-  dump config-test-v2: 71M rows...
-  dump config-test-v2: 72M rows...
-  dump config-test-v2: 73M rows...
-  dump config-test-v2: 74M rows...
-  dump config-test-v2: 75M rows...
-  dump config-test-v2: 76M rows...
-  dump config-test-v2: 77M rows...
-  dump config-test-v2: 78M rows...
-  dump config-test-v2: 79M rows...
-  dump config-test-v2: 80M rows...
-  dump config-test-v2: 81M rows...
-  ShardPreCreator: 250K docstore files created
-  dump config-test-v2: 82M rows...
-  dump config-test-v2: 84M rows...
-  dump config-test-v2: 85M rows...
-{"dump":"config-test-v2","stage":"parallel_parse","detail":"done","elapsed_ms":61690,"rss_bytes":4174716928,"rss_gb":4.175,"rows":91055169}
-{"dump":"config-test-v2","stage":"merge","detail":"start","elapsed_ms":61690,"rss_bytes":4174716928,"rss_gb":4.175,"rows":91055169}
-{"dump":"config-test-v2","stage":"merge","detail":"done","elapsed_ms":62771,"rss_bytes":4371873792,"rss_gb":4.372,"rows":91055169}
-  Dump config-test-v2 parse+merge complete: 91055169 rows in 62.8s (1450575/s)
-  ShardPreCreator: 300K docstore files created
-  ShardPreCreator: 350K docstore files created
-  ShardPreCreator: 400K docstore files created
-  ShardPreCreator: 450K docstore files created
-  ShardPreCreator: 500K docstore files created
-{"dump":"config-test-v2","stage":"bitmap_save","detail":"start","elapsed_ms":0,"rss_bytes":430571520,"rss_gb":0.431,"rows":91055169}
-  Saved sort collectedCount: 32 layers
-  Saved sort reactionCount: 32 layers
-  Saved sort commentCount: 32 layers
-  Saved dictionary 'baseModel': 67 entries
-  Saved dictionary 'type': 2 entries
-  Saved dictionary 'availability': 3 entries
-  Saved dictionary 'blockedFor': 89 entries
-  Save breakdown: filter=0.00s sort=0.18s alive_meta=0.00s total=0.18s
-{"dump":"config-test-v2","stage":"save_timing","filter_s":0.000,"sort_s":0.175,"alive_meta_s":0.000,"total_s":0.178}
-{"dump":"config-test-v2","stage":"bitmap_save","detail":"done","elapsed_ms":177,"rss_bytes":435015680,"rss_gb":0.435,"rows":91055169}
-  Dump config-test-v2 save complete
-  ShardPreCreator: 550K docstore files created
-  ShardPreCreator: 600K docstore files created
-  ShardPreCreator: 650K docstore files created
-  ShardPreCreator: 700K docstore files created
-  ShardPreCreator: 750K docstore files created
-  ShardPreCreator: 800K docstore files created
-  ShardPreCreator: 850K docstore files created
-  ShardPreCreator: 900K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774592100→1774592400 in 638.7µs
-  ShardPreCreator: 950K docstore files created
-  ShardPreCreator: 1000K docstore files created
-Warning: deferred slot 122981656 has no stored doc, setting alive only
-Warning: deferred slot 122981629 has no stored doc, setting alive only
-Warning: deferred slot 122981650 has no stored doc, setting alive only
-Warning: deferred slot 122981646 has no stored doc, setting alive only
-Warning: deferred slot 122981640 has no stored doc, setting alive only
-Warning: deferred slot 122981642 has no stored doc, setting alive only
-Warning: deferred slot 122981644 has no stored doc, setting alive only
-Warning: deferred slot 122981639 has no stored doc, setting alive only
-Warning: deferred slot 122981643 has no stored doc, setting alive only
-Warning: deferred slot 122981655 has no stored doc, setting alive only
-Warning: deferred slot 122981648 has no stored doc, setting alive only
-Warning: deferred slot 122981651 has no stored doc, setting alive only
-  ShardPreCreator: 1050K docstore files created
-  ShardPreCreator: 1100K docstore files created
-  ShardPreCreator: 1150K docstore files created
-  ShardPreCreator: 1200K docstore files created
-  ShardPreCreator: 1250K docstore files created
-  ShardPreCreator: 1300K docstore files created
-  ShardPreCreator: 1350K docstore files created
-  ShardPreCreator: 1400K docstore files created
-  ShardPreCreator: 1450K docstore files created
-  ShardPreCreator: 1500K docstore files created
-  ShardPreCreator: 1550K docstore files created
-  ShardPreCreator: 1600K docstore files created
-  ShardPreCreator: 1650K docstore files created
-  ShardPreCreator: 1700K docstore files created
-  ShardPreCreator: 1750K docstore files created
-  ShardPreCreator: 1800K docstore files created
-  ShardPreCreator: 1850K docstore files created
-  ShardPreCreator: 1900K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774592400→1774592700 in 473.6µs
-  ShardPreCreator: 1950K docstore files created
-  ShardPreCreator: 2000K docstore files created
-  ShardPreCreator: 2050K docstore files created
-  ShardPreCreator: 2100K docstore files created
-  ShardPreCreator: 2150K docstore files created
-  ShardPreCreator: 2200K docstore files created
-  ShardPreCreator: 2250K docstore files created
-  ShardPreCreator: 2300K docstore files created
-  ShardPreCreator: 2350K docstore files created
-  ShardPreCreator: 2400K docstore files created
-  ShardPreCreator: 2450K docstore files created
-  ShardPreCreator: 2500K docstore files created
-  ShardPreCreator: 2550K docstore files created
-  ShardPreCreator: 2600K docstore files created
-  ShardPreCreator: 2650K docstore files created
-  ShardPreCreator: 2700K docstore files created
-  ShardPreCreator: 2750K docstore files created
-  ShardPreCreator: 2800K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774592700→1774593000 in 642.3µs
-  ShardPreCreator: 2850K docstore files created
-  ShardPreCreator: 2900K docstore files created
-  ShardPreCreator: 2950K docstore files created
-  ShardPreCreator: 3000K docstore files created
-  ShardPreCreator: 3050K docstore files created
-  ShardPreCreator: 3100K docstore files created
-  ShardPreCreator: 3150K docstore files created
-  ShardPreCreator: 3200K docstore files created
-  ShardPreCreator: 3250K docstore files created
-  ShardPreCreator: 3300K docstore files created
-  ShardPreCreator: 3350K docstore files created
-  ShardPreCreator: 3400K docstore files created
-  ShardPreCreator: 3450K docstore files created
-  ShardPreCreator: 3500K docstore files created
-  ShardPreCreator: 3550K docstore files created
-  ShardPreCreator: 3600K docstore files created
-  ShardPreCreator: 3650K docstore files created
-  ShardPreCreator: 3700K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774593000→1774593300 in 755.3µs
-  ShardPreCreator: 3750K docstore files created
-  ShardPreCreator: 3800K docstore files created
-  ShardPreCreator: 3850K docstore files created
-  ShardPreCreator: 3900K docstore files created
-  ShardPreCreator: 3950K docstore files created
-  ShardPreCreator: 4000K docstore files created
-  ShardPreCreator: 4050K docstore files created
-  ShardPreCreator: 4100K docstore files created
-  ShardPreCreator: 4150K docstore files created
-  ShardPreCreator: 4200K docstore files created
-  ShardPreCreator: 4250K docstore files created
-  ShardPreCreator: 4300K docstore files created
-  ShardPreCreator: 4350K docstore files created
-  ShardPreCreator: 4400K docstore files created
-  ShardPreCreator: 4450K docstore files created
-  ShardPreCreator: 4500K docstore files created
-  ShardPreCreator: 4550K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774593300→1774593600 in 469.5µs
-  ShardPreCreator: 4600K docstore files created
-  ShardPreCreator: 4650K docstore files created
-  ShardPreCreator: 4700K docstore files created
-  ShardPreCreator: 4750K docstore files created
-  ShardPreCreator: 4800K docstore files created
-  ShardPreCreator: 4850K docstore files created
-  ShardPreCreator: 4900K docstore files created
-  ShardPreCreator: 4950K docstore files created
-  ShardPreCreator: 5000K docstore files created
-  ShardPreCreator: 5050K docstore files created
-  ShardPreCreator: 5100K docstore files created
-  ShardPreCreator: 5150K docstore files created
-  ShardPreCreator: 5200K docstore files created
-  ShardPreCreator: 5250K docstore files created
-  ShardPreCreator: 5300K docstore files created
-  ShardPreCreator: 5350K docstore files created
-  ShardPreCreator: 5400K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774593600→1774593900 in 630.7µs
-  ShardPreCreator: 5450K docstore files created
-  ShardPreCreator: 5500K docstore files created
-  ShardPreCreator: 5550K docstore files created
-  ShardPreCreator: 5600K docstore files created
-  ShardPreCreator: 5650K docstore files created
-  ShardPreCreator: 5700K docstore files created
-  ShardPreCreator: 5750K docstore files created
-  ShardPreCreator: 5800K docstore files created
-  ShardPreCreator: 5850K docstore files created
-  ShardPreCreator: 5900K docstore files created
-  ShardPreCreator: 5950K docstore files created
-  ShardPreCreator: 6000K docstore files created
-  ShardPreCreator: 6050K docstore files created
-  ShardPreCreator: 6100K docstore files created
-  ShardPreCreator: 6150K docstore files created
-  ShardPreCreator: 6200K docstore files created
-  ShardPreCreator: 6250K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774593900→1774594200 in 520.4µs
-  ShardPreCreator: 6300K docstore files created
-  ShardPreCreator: 6350K docstore files created
-  ShardPreCreator: 6400K docstore files created
-  ShardPreCreator: 6450K docstore files created
-  ShardPreCreator: 6500K docstore files created
-  ShardPreCreator: 6550K docstore files created
-  ShardPreCreator: 6600K docstore files created
-  ShardPreCreator: 6650K docstore files created
-  ShardPreCreator: 6700K docstore files created
-  ShardPreCreator: 6750K docstore files created
-  ShardPreCreator: 6800K docstore files created
-  ShardPreCreator: 6850K docstore files created
-  ShardPreCreator: 6900K docstore files created
-  ShardPreCreator: 6950K docstore files created
-  ShardPreCreator: 7000K docstore files created
-  ShardPreCreator: 7050K docstore files created
-  ShardPreCreator: 7100K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774594200→1774594500 in 606.5µs
-  ShardPreCreator: 7150K docstore files created
-  ShardPreCreator: 7200K docstore files created
-  ShardPreCreator: 7250K docstore files created
-  ShardPreCreator: 7300K docstore files created
-  ShardPreCreator: 7350K docstore files created
-  ShardPreCreator: 7400K docstore files created
-  ShardPreCreator: 7450K docstore files created
-  ShardPreCreator: 7500K docstore files created
-  ShardPreCreator: 7550K docstore files created
-  ShardPreCreator: 7600K docstore files created
-  ShardPreCreator: 7650K docstore files created
-  ShardPreCreator: 7700K docstore files created
-  ShardPreCreator: 7750K docstore files created
-  ShardPreCreator: 7800K docstore files created
-  ShardPreCreator: 7850K docstore files created
-  ShardPreCreator: 7900K docstore files created
-  ShardPreCreator: 7950K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774594500→1774594800 in 540.5µs
-  ShardPreCreator: 8000K docstore files created
-  ShardPreCreator: 8050K docstore files created
-  ShardPreCreator: 8100K docstore files created
-  ShardPreCreator: 8150K docstore files created
-  ShardPreCreator: 8200K docstore files created
-  ShardPreCreator: 8250K docstore files created
-  ShardPreCreator: 8300K docstore files created
-  ShardPreCreator: 8350K docstore files created
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774594800→1774595100 in 645.5µs
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774595100→1774595400 in 641.2µs
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774595400→1774595700 in 780µs
-Time bucket '7d' incremental refresh: expired=0 cutoff 1774072800→1774076400 in 1.2938ms
-Time bucket '30d' incremental refresh: expired=0 cutoff 1772085600→1772089200 in 1.672ms
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774595700→1774596000 in 677.7µs
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774596000→1774596300 in 729.6µs
-Time bucket '24h' incremental refresh: expired=0 cutoff 1774596300→1774596600 in 552.7µs
+  port: 3003
+  data-dir: C:/Dev/Repos/open-source/bitdex-v2/data/v3test
+Admin endpoints: enabled (token configured)
+  Boot phase: config_load completed in 0ms
+BitmapSilo: no data found, starting fresh
+Loaded 4 bucket diffs from disk (coverage: cutoff 0 to 1743724800)
+Boot diff: gap 31467900s exceeds bucket duration 86400s for '24h' — skipping (full rebuild on first refresh)
+Boot diff: gap 30949200s exceeds bucket duration 604800s for '7d' — skipping (full rebuild on first refresh)
+Boot diff: gap 28962000s exceeds bucket duration 2592000s for '30d' — skipping (full rebuild on first refresh)
+Boot diff: '1y' already current (persisted=1743724800, current=1743724800)
+Applied boot diff to '24h' bucket bitmap (cutoff → 1775192700)
+Applied boot diff to '7d' bucket bitmap (cutoff → 1774674000)
+Applied boot diff to '30d' bucket bitmap (cutoff → 1772686800)
+Applied boot diff to '1y' bucket bitmap (cutoff → 1743724800)
+  Boot phase: engine_create completed in 2ms
+  Boot phase: dictionary_load completed in 0ms
+  Boot phase: metrics_bridge completed in 0ms
+Restored index 'civitai' from disk (0 records)
+Index restore took 0.00s
+WAL reader: no cursor found, starting from beginning
+WAL reader started (cursor=0:0, dir=C:/Dev/Repos/open-source/bitdex-v2/data/v3test\wal)
+BitDex server listening on http://0.0.0.0:3003
+  RAYON_NUM_THREADS=(not set), actual=32
+  Boot phase: eager_fields completed in 0ms
+  Boot phase: bound_cache completed in 0ms
+  chunk 1: 0 total (0/s) apply=0.1ms
+  chunk 2: 0 total (0/s) apply=0.0ms
+  chunk 3: 0 total (0/s) apply=0.0ms
+  chunk 4: 0 total (0/s) apply=0.0ms
+  chunk 5: 0 total (0/s) apply=0.0ms
+  chunk 6: 0 total (0/s) apply=0.0ms
+  chunk 7: 0 total (0/s) apply=0.0ms
+  chunk 8: 0 total (0/s) apply=0.0ms
+Loaded 0 records in 3.4s (0/s), errors skipped: 14652236
+Load complete: 0 records alive

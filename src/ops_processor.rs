@@ -1229,74 +1229,9 @@ fn parse_query_values_array(s: &str) -> std::result::Result<Vec<QValue>, String>
     }
     Ok(values)
 }
-/// Process a batch of entity ops in dump mode using AccumSink.
-///
-/// This is the bulk-loading path that bypasses the coalescer entirely.
-/// Ops are accumulated directly into bitmaps (like the single-pass loader).
-///
-/// Returns (applied, skipped, errors).
-pub(crate) fn apply_ops_batch_dump(
-    accum: &mut crate::loader::BitmapAccum,
-    meta: &FieldMeta,
-    batch: &mut Vec<EntityOps>,
-    doc_writer: Option<&mut DocWriter>,
-) -> (usize, usize, usize) {
-    let mut sink = crate::ingester::AccumSink::new(accum);
-    apply_ops_batch(&mut sink, meta, batch, None, doc_writer)
-}
-/// Process all WAL entries in dump mode: reads WAL, accumulates bitmaps, applies to engine.
-///
-/// This is the high-level dump pipeline entry point. It:
-/// 1. Creates a BitmapAccum from the engine config
-/// 2. Reads all WAL entries, processes via AccumSink
-/// 3. Applies accumulated bitmaps directly to engine staging
-///
-/// Returns (total_applied, total_errors, elapsed_secs).
-pub fn process_wal_dump(
-    engine: &ConcurrentEngine,
-    wal_path: &Path,
-    batch_size: usize,
-) -> (u64, u64, f64) {
-    use crate::loader::BitmapAccum;
-    use crate::ops_wal::WalReader;
-    use std::time::Instant;
-    let config = engine.config();
-    let meta = FieldMeta::from_config(config);
-    let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
-    let sort_configs: Vec<(String, u8)> = config.sort_fields.iter().map(|s| (s.name.clone(), s.bits)).collect();
-    let mut accum = BitmapAccum::new(&filter_names, &sort_configs);
-    let start = Instant::now();
-    let mut reader = WalReader::from_legacy(wal_path, 0);
-    let mut total_applied = 0u64;
-    let mut total_errors = 0u64;
-    // Create DocWriter so computed sort fields (sortAt = GREATEST) are written
-    // to docstore during dump. Without this, only bitmaps get the computed value.
-    let mut doc_writer = DocWriter::new(engine.docstore_arc());
-    loop {
-        let batch = match reader.read_batch(batch_size) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("WAL read error in dump mode: {e}");
-                total_errors += 1;
-                break;
-            }
-        };
-        if batch.entries.is_empty() {
-            break;
-        }
-        let mut entries = batch.entries;
-        let (applied, _skipped, errors) = apply_ops_batch_dump(&mut accum, &meta, &mut entries, Some(&mut doc_writer));
-        total_applied += applied as u64;
-        total_errors += errors as u64;
-    }
-    // Flush any pending docstore writes
-    doc_writer.flush();
-    // Apply accumulated bitmaps to engine staging
-    engine.apply_accum(&accum);
-    (total_applied, total_errors, start.elapsed().as_secs_f64())
-}
-// V1 dump functions removed: apply_accum_to_staging, process_multi_value_csv,
-// process_csv_dump_direct. Use V2 ops pipeline (ops_poller + /ops endpoint) instead.
+// V1/V2 dump functions removed: apply_ops_batch_dump, process_wal_dump,
+// apply_accum_to_staging, process_multi_value_csv, process_csv_dump_direct.
+// Use V2 ops pipeline (ops_poller + /ops endpoint) instead.
 /// Persist cursor position to disk.
 pub fn save_cursor(path: &Path, cursor: u64) -> std::io::Result<()> {
     std::fs::write(path, cursor.to_string())
