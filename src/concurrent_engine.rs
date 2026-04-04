@@ -1141,76 +1141,58 @@ impl ConcurrentEngine {
         };
         let merge_handle = {
             let shutdown = Arc::clone(&shutdown);
-            let _merge_inner = Arc::clone(&inner);
             let merge_interval_ms = config.merge_interval_ms;
             let merge_config = Arc::clone(&config);
             let merge_dirty_flag = Arc::clone(&dirty_flag);
-            let merge_time_buckets = time_buckets.as_ref().map(Arc::clone);
-            let merge_cursors = Arc::clone(&cursors);
             let merge_unified_cache = Arc::clone(&unified_cache);
             let merge_docstore = Arc::clone(&docstore);
 
-            thread::spawn(move || {
+            thread::Builder::new()
+                .name("bitdex-merge".to_string())
+                .spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(sleep_duration);
-                    // Snapshot cursors at the START of the persist cycle.
-                    // The WAL reader keeps advancing the in-memory cursor while
-                    // we write — we must persist only the value from when this
-                    // cycle began, so on crash we replay from a consistent point.
-                    // Only written to disk if data was actually persisted this cycle
-                    // AND no write failures occurred.
-                    // TODO: CacheSilo persistence (Phase 4) goes here
-                    let _needs_write = merge_dirty_flag.swap(false, Ordering::AcqRel);
-                    // Compact DataSilo (apply pending ops)
-                    if _needs_write {
+
+                    // Compact DataSilo when dirty (apply pending doc ops to data file)
+                    let needs_write = merge_dirty_flag.swap(false, Ordering::AcqRel);
+                    if needs_write {
                         if let Err(e) = merge_docstore.lock().compact() {
                             eprintln!("merge: DataSilo compaction failed: {e}");
                         }
                     }
-                    let _ = &merge_time_buckets; // suppress unused warning
-                    let _ = merge_cursors.lock().clone(); // suppress unused warning
-                    // ── RSS-aware memory pressure eviction ──────────────────
-                    //
-                    // Check real RSS against the memory budget. When RSS exceeds
-                    // the pressure threshold, evict cache entries until RSS drops
-                    // below the target. This catches the serialized_size() undercount
-                    // (~170KB real vs ~2KB tracked per cache entry).
-                    {
-                        let rss = get_rss_bytes();
-                        let budget = merge_config.memory_budget_bytes
-                            .unwrap_or_else(|| crate::memory_pressure::detect_memory_budget(None));
-                        let threshold = (budget as f64 * merge_config.memory_pressure_threshold) as u64;
-                        let target = (budget as f64 * merge_config.memory_pressure_target) as u64;
-                        if rss > threshold {
-                            let mut evicted = 0u64;
-                            let mut rounds = 0u32;
-                            loop {
-                                {
-                                    let mut uc = merge_unified_cache.lock();
-                                    if uc.len() == 0 { break; }
-                                    uc.evict_batch();
-                                }
-                                evicted += 1;
-                                rounds += 1;
-                                // Re-check RSS after each batch eviction
-                                let new_rss = get_rss_bytes();
-                                if new_rss <= target || rounds >= 50 {
-                                    eprintln!(
-                                        "memory pressure: evicted {} batches, RSS {:.2} GB → {:.2} GB (budget {:.2} GB, target {:.2} GB)",
-                                        evicted,
-                                        rss as f64 / 1e9,
-                                        new_rss as f64 / 1e9,
-                                        budget as f64 / 1e9,
-                                        target as f64 / 1e9,
-                                    );
-                                    break;
-                                }
+
+                    // RSS-aware memory pressure eviction: check real RSS against budget,
+                    // evict cache entries until RSS drops below target.
+                    let rss = get_rss_bytes();
+                    let budget = merge_config.memory_budget_bytes
+                        .unwrap_or_else(|| crate::memory_pressure::detect_memory_budget(None));
+                    let threshold = (budget as f64 * merge_config.memory_pressure_threshold) as u64;
+                    let target = (budget as f64 * merge_config.memory_pressure_target) as u64;
+                    if rss > threshold {
+                        let mut evicted = 0u64;
+                        let mut rounds = 0u32;
+                        loop {
+                            {
+                                let mut uc = merge_unified_cache.lock();
+                                if uc.len() == 0 { break; }
+                                uc.evict_batch();
+                            }
+                            evicted += 1;
+                            rounds += 1;
+                            let new_rss = get_rss_bytes();
+                            if new_rss <= target || rounds >= 50 {
+                                eprintln!(
+                                    "memory pressure: evicted {} batches, RSS {:.2} GB → {:.2} GB (budget {:.2} GB, target {:.2} GB)",
+                                    evicted, rss as f64 / 1e9, new_rss as f64 / 1e9,
+                                    budget as f64 / 1e9, target as f64 / 1e9,
+                                );
+                                break;
                             }
                         }
                     }
-                } // while !shutdown
-            })
+                }
+            }).expect("failed to spawn merge thread")
         };
         // Prefetch worker: background cache expansion when cursor nears boundary.
         // Disabled when threshold is 0.0 or 1.0.
