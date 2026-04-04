@@ -340,6 +340,10 @@ struct AppState {
     /// Toggleable metric groups — disable expensive metrics without redeploy.
     /// Default: all enabled. PATCH /config to toggle at runtime.
     metrics_bitmap_memory: AtomicBool,
+    /// Read-only mode: serve queries but reject all write operations with 503.
+    /// Used during zero-downtime rolling deploys — the new pod starts read-only
+    /// and promotes to read-write when the old pod releases the writer lock.
+    read_only: AtomicBool,
     /// WAL writer for V2 ops endpoint. Created lazily on first ops POST.
     #[cfg(feature = "pg-sync")]
     ops_wal: Mutex<Option<crate::ops_wal::WalWriter>>,
@@ -411,6 +415,22 @@ async fn require_admin(
             }
         }
     }
+}
+
+/// Middleware: reject all requests with 503 when the server is in read-only mode.
+/// Applied to admin routes so that create/update/delete operations are blocked
+/// during zero-downtime rolling deploys until this pod acquires the writer lock.
+async fn reject_if_read_only(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if state.read_only.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({
+            "error": "read-only mode: this instance is not the active writer"
+        }))).into_response();
+    }
+    next.run(req).await
 }
 
 /// Middleware: record requests/responses to the caplog when capture is active.
@@ -980,11 +1000,14 @@ pub struct BitdexServer {
     admin_token: Option<String>,
     max_query_concurrency: u32,
     trace_buffer_size: usize,
+    /// Start in read-only mode. Write endpoints return 503.
+    /// Used for zero-downtime deploys where this pod hasn't yet acquired the writer lock.
+    read_only: bool,
 }
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, index_dir: None, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0, trace_buffer_size: 1000 }
+        Self { data_dir, index_dir: None, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0, trace_buffer_size: 1000, read_only: false }
     }
 
     /// Set external index config directory (e.g. ConfigMap mount path).
@@ -1035,6 +1058,13 @@ impl BitdexServer {
         self
     }
 
+    /// Start in read-only mode. Write endpoints (ops, dumps, admin) return 503.
+    /// The server can be promoted to read-write at runtime by clearing the flag.
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     /// Start the HTTP server. Blocks until the server shuts down.
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
         // Ensure data directory exists
@@ -1069,6 +1099,7 @@ impl BitdexServer {
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
             capture: crate::capture::CaptureManager::new(&self.data_dir),
             metrics_bitmap_memory: AtomicBool::new(true),
+            read_only: AtomicBool::new(self.read_only),
             #[cfg(feature = "pg-sync")]
             ops_wal: Mutex::new(None),
             #[cfg(feature = "pg-sync")]
@@ -1129,9 +1160,13 @@ impl BitdexServer {
             }
         }
 
-        // Spawn WAL reader thread if pg-sync feature is enabled and index exists
+        // Spawn WAL reader thread if pg-sync feature is enabled and index exists.
+        // Skip in read-only mode — only the writer pod should process WAL ops.
         #[cfg(feature = "pg-sync")]
-        let _wal_handle: Option<std::thread::JoinHandle<()>> = {
+        let _wal_handle: Option<std::thread::JoinHandle<()>> = if self.read_only {
+            eprintln!("Read-only mode: skipping WAL reader thread");
+            None
+        } else {
             let wal_dir = self.data_dir.join("wal");
             let wal_state = Arc::clone(&state);
             std::thread::Builder::new()
@@ -1294,6 +1329,13 @@ impl BitdexServer {
                 .ok()
         };
 
+        // Log server mode
+        if self.read_only {
+            eprintln!("Server mode: READ-ONLY (write endpoints return 503, waiting for writer lock)");
+        } else {
+            eprintln!("Server mode: READ-WRITE");
+        }
+
         let shutdown_state = Arc::clone(&state);
 
         // Admin routes — require Bearer token (or disabled if no token configured)
@@ -1328,6 +1370,7 @@ impl BitdexServer {
             .route("/debug/snapshots", get(handle_snapshots_list))
             .route("/debug/rescan-memory", post(handle_rescan_memory))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
+            .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), reject_if_read_only))
             .with_state(Arc::clone(&state));
 
         // Public routes — no auth required
@@ -3814,8 +3857,9 @@ async fn handle_list_cursors(
 // Handlers: Utility
 // ---------------------------------------------------------------------------
 
-async fn handle_health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+async fn handle_health(State(state): State<SharedState>) -> impl IntoResponse {
+    let mode = if state.read_only.load(Ordering::Relaxed) { "read-only" } else { "read-write" };
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok", "mode": mode})))
 }
 
 /// Memory budget endpoint — shows where every GB of tracked bitmap memory goes.
@@ -4159,6 +4203,10 @@ async fn handle_ops(
     AxumPath(name): AxumPath<String>,
     Json(batch): Json<crate::sync::ops::OpsBatch>,
 ) -> impl IntoResponse {
+    // Reject writes in read-only mode (zero-downtime deploy: this pod hasn't acquired the writer lock)
+    if state.read_only.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "read-only mode: this instance is not the active writer").into_response();
+    }
     // Verify index exists
     {
         let guard = state.index.lock();
@@ -4299,6 +4347,10 @@ async fn handle_register_dump(
     AxumPath(_name): AxumPath<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // Reject writes in read-only mode (zero-downtime deploy: this pod hasn't acquired the writer lock)
+    if state.read_only.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "read-only mode: this instance is not the active writer").into_response();
+    }
     // Detect V2 DumpRequest by presence of csv_path
     if body.get("csv_path").is_some() {
         // V2: parse DumpRequest and process asynchronously
