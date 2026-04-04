@@ -210,47 +210,6 @@ pub struct MetricsBridge {
     pub compaction_duration: prometheus::HistogramVec,
     pub index_name: String,
 }
-/// Commands sent to the flush thread for state transitions that must
-/// go through the single writer. Keeps flush thread as sole ArcSwap writer.
-enum FlushCommand {
-    /// Force the flush thread to publish its current staging immediately.
-    /// Used by `exit_loading_mode()` to guarantee readers see fresh data
-    /// before the caller continues (e.g., before save_and_unload).
-    ForcePublish {
-        /// Oneshot sender — caller blocks on the receiver until publish completes.
-        done: crossbeam_channel::Sender<()>,
-    },
-    /// Replace staging with an unloaded snapshot and publish it.
-    /// Used by `save_and_unload()` to ensure the flush thread's private
-    /// staging is synced to the unloaded state, preventing re-inflation
-    /// on the next publish cycle.
-    SyncUnloaded {
-        /// The unloaded InnerEngine to replace staging with.
-        unloaded: InnerEngine,
-        /// Oneshot sender — caller blocks until staging is replaced and published.
-        done: crossbeam_channel::Sender<()>,
-    },
-    /// Combined exit-loading + save + unload in one atomic operation.
-    /// Saves bitmaps directly from staging (the single in-memory copy)
-    /// without publishing a full intermediate snapshot. This eliminates
-    /// the memory spike from `staging.clone()` that doubles bitmap memory
-    /// at scale (e.g., 22GB → 38GB at 105M records).
-    ///
-    /// Flow: drain mutations → merge diffs → save staging to disk →
-    /// build unloaded staging → publish unloaded → signal done.
-    ExitLoadingSaveUnload {
-        /// Sets to skip (already pending lazy loads — not in memory).
-        skip_sorts: HashSet<String>,
-        skip_filters: HashSet<String>,
-        /// Loading mode flag — handler clears this AFTER reading the published snapshot,
-        /// preventing the flush thread's loading-exit force-publish from overwriting
-        /// the loader's data before we save it.
-        loading_mode: Arc<AtomicBool>,
-        /// Oneshot sender — caller blocks until save+unload is complete.
-        /// Returns Ok(()) on success or error message on failure.
-        done: crossbeam_channel::Sender<std::result::Result<(), String>>,
-    },
-}
 /// Inner bitmap state published as immutable snapshots via ArcSwap.
 ///
 /// All fields are Clone via Arc-per-bitmap CoW. Cloning bumps refcounts
@@ -291,14 +250,11 @@ pub struct ConcurrentEngine {
     shutdown: Arc<AtomicBool>,
     flush_handle: Option<JoinHandle<()>>,
     merge_handle: Option<JoinHandle<()>>,
-    loading_mode: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
     time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
     /// Pending bucket diffs for lazy application on cache reads.
     /// Flush thread stores new snapshots; query threads load for diff application.
     pending_bucket_diffs: Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,
-    /// Command channel for state transitions (force publish, unload, etc.).
-    cmd_tx: Sender<FlushCommand>,
     /// Reverse string maps for MappedString field query resolution.
     string_maps: Option<Arc<StringMaps>>,
     /// Fields where string matching is case-sensitive (default is case-insensitive).
@@ -476,7 +432,6 @@ impl ConcurrentEngine {
                     }
                 }
             });
-        let loading_mode = Arc::new(AtomicBool::new(false));
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
         let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
             let tb = TimeBucketManager::new_with_sort_field(
@@ -636,9 +591,6 @@ impl ConcurrentEngine {
         let dirty_flag = Arc::new(AtomicBool::new(false));
         // Restore cursors from BitmapSilo (if available), otherwise start empty.
         let cursors = Arc::new(parking_lot::Mutex::new(restored_cursors));
-        // Command channel: external threads send state transition commands to flush thread.
-        let (cmd_tx, cmd_rx): (Sender<FlushCommand>, Receiver<FlushCommand>) =
-            crossbeam_channel::unbounded();
         let flush_publish_count = Arc::new(AtomicU64::new(0));
         let flush_duration_nanos = Arc::new(AtomicU64::new(0));
         let flush_last_duration_nanos = Arc::new(AtomicU64::new(0));
@@ -662,11 +614,9 @@ impl ConcurrentEngine {
                 shutdown,
                 flush_handle: None,
                 merge_handle: None,
-                loading_mode,
                 dirty_since_snapshot: dirty_flag,
                 time_buckets,
                 pending_bucket_diffs: Arc::clone(&pending_bucket_diffs),
-                cmd_tx,
                 string_maps: None,
                 case_sensitive_fields: None,
                 dictionaries: Arc::new(HashMap::new()),
@@ -695,7 +645,6 @@ impl ConcurrentEngine {
             let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
             let flush_cache_silo = cache_silo_arc.clone();
-            let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
             let flush_time_buckets = time_buckets.as_ref().map(Arc::clone);
             let flush_pending_diffs = Arc::clone(&pending_bucket_diffs);
@@ -718,8 +667,6 @@ impl ConcurrentEngine {
                 let max_sleep = Duration::from_micros(flush_interval_us * 10);
                 let mut current_sleep = min_sleep;
                 let mut doc_batch: Vec<(u32, StoredDoc)> = Vec::new();
-                let mut was_loading = false;
-                let mut staging_dirty = false; // tracks unpublished mutations from loading mode
                 let mut flush_cycle: u64 = 0;
                 let mut batch = FlushBatch::new();
                 // Compact filter diffs every N flush cycles (~5s at 100μs interval).
@@ -727,7 +674,6 @@ impl ConcurrentEngine {
                 const COMPACTION_INTERVAL: u64 = 50;
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(current_sleep);
-                    let is_loading = flush_loading_mode.load(Ordering::Relaxed);
                     // Phase 1: Drain channel and group/sort (no lock, pure CPU work)
                     batch.drain_channel(&flush_mutation_rx);
                     let bitmap_count = if !batch.is_empty() {
@@ -741,7 +687,6 @@ impl ConcurrentEngine {
                     // Phase 2: Apply mutations to staging (private, no lock needed)
                     let flush_start = Instant::now();
                     if bitmap_count > 0 {
-                        staging_dirty = true;
                         flush_dirty_flag.store(true, Ordering::Release);
                         let t_apply = Instant::now();
                         batch.apply(
@@ -768,109 +713,103 @@ impl ConcurrentEngine {
                         // monopolizes CPU across apply+cache+publish (~20ms aggregate),
                         // causing 1-4s response delivery delays under concurrent load.
                         std::thread::yield_now();
-                        // In loading mode, skip all maintenance and snapshot publishing.
-                        // This avoids the expensive staging.clone() → Arc::make_mut clone
-                        // cascade that dominates write cost at scale.
-                        if !flush_loading_mode.load(Ordering::Relaxed) {
-                            // Live maintenance for time buckets: add newly-alive slots to
-                            // qualifying buckets, remove deleted slots from all buckets.
-                            let t_tb = Instant::now();
-                            if let Some(ref tb_arc) = flush_time_buckets {
-                                if !batch.alive_inserts.is_empty() || !batch.alive_removes.is_empty() {
-                                    let now_secs = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    let mut tb = tb_arc.lock();
-                                    if !batch.alive_inserts.is_empty() {
-                                        let sort_field_name = tb.sort_field_name().to_string();
-                                        if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
-                                            for &slot in &batch.alive_inserts {
-                                                let ts = sort_field.reconstruct_value(slot) as u64;
-                                                tb.insert_slot(slot, ts, now_secs);
-                                            }
+                        // Live maintenance for time buckets: add newly-alive slots to
+                        // qualifying buckets, remove deleted slots from all buckets.
+                        let t_tb = Instant::now();
+                        if let Some(ref tb_arc) = flush_time_buckets {
+                            if !batch.alive_inserts.is_empty() || !batch.alive_removes.is_empty() {
+                                let now_secs = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let mut tb = tb_arc.lock();
+                                if !batch.alive_inserts.is_empty() {
+                                    let sort_field_name = tb.sort_field_name().to_string();
+                                    if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
+                                        for &slot in &batch.alive_inserts {
+                                            let ts = sort_field.reconstruct_value(slot) as u64;
+                                            tb.insert_slot(slot, ts, now_secs);
                                         }
                                     }
-                                    for &slot in &batch.alive_removes {
-                                        tb.remove_slot(slot);
-                                    }
+                                }
+                                for &slot in &batch.alive_removes {
+                                    tb.remove_slot(slot);
                                 }
                             }
-                            flush_timebucket_ns.store(t_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            // CacheSilo: invalidate stale entries when mutations touch their fields.
-                            // Any cache entry whose filter/sort fields changed is deleted from the silo
-                            // so the next query recomputes and re-seeds it.
-                            let t_cache = Instant::now();
-                            if let Some(ref cs_arc) = flush_cache_silo {
-                                if batch.has_alive_mutations() || !batch.mutated_filter_fields().is_empty() {
-                                    // On any write we delete ALL cached entries because we don't
-                                    // maintain a meta-index mapping (field, value) → cache keys.
-                                    // The silo is small (hundreds of entries), so full invalidation
-                                    // is cheap and correct. Entries are re-seeded on next query miss.
-                                    //
-                                    // Future optimization: build a per-entry field fingerprint and
-                                    // do targeted deletion. For now correctness > complexity.
-                                    let _cs = cs_arc.read(); // no-op drop — invalidation done at query time by recomputing on miss
-                                }
-                            }
-                            flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            // Yield CPU after cache work to let tokio deliver responses.
-                            std::thread::yield_now();
-                            // Periodic filter diff compaction: merge dirty diffs into
-                            // bases so apply_diff/fused don't accumulate unbounded diffs.
-                            // Runs every COMPACTION_INTERVAL flush cycles (~5s).
-                            // Sort diffs and alive are already merged eagerly in WriteBatch::apply().
-                            //
-                            // CRITICAL: Only compact fields that have dirty diffs. Using
-                            // fields_mut() iterates ALL fields and calls Arc::make_mut on
-                            // each — which deep-clones the entire FilterField HashMap when
-                            // the Arc is shared with a published snapshot (refcount > 1).
-                            // For tagIds (31K entries), this clone takes seconds. Targeted
-                            // compaction avoids the clone cascade on untouched fields.
-                            let t_compact = Instant::now();
-                            if flush_cycle % COMPACTION_INTERVAL == 0 {
-                                // Collect names of dirty fields first (read-only, no Arc::make_mut)
-                                let dirty_fields: Vec<String> = staging.filters.fields()
-                                    .filter(|(_, field)| field.has_dirty())
-                                    .map(|(name, _)| name.clone())
-                                    .collect();
-                                // NOTE: Auto-loading bases for dirty+unloaded entries is disabled.
-                                // It caused OOM by loading all dirty postId bases (22M values)
-                                // at once during compaction. Dirty diffs on unloaded fields are
-                                // small and persist safely via BitmapSilo ops log. They'll be
-                                // merged when the field is eventually loaded by a query.
-                                // Only make_mut + merge on fields that actually have dirty diffs
-                                for name in &dirty_fields {
-                                    if let Some(field) = staging.filters.get_field_mut(name) {
-                                        field.merge_dirty();
-                                    }
-                                }
-                            }
-                            flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            flush_cycle += 1;
-                            // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
-                            let t_publish = Instant::now();
-                            inner.store(Arc::new(staging.clone()));
-                            flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            staging_dirty = false;
-                            stale_fields.clear();
-                            // Record flush stats for Prometheus
-                            let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
-                            flush_pub_count.fetch_add(1, Ordering::Relaxed);
-                            flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
-                            flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
-                            // Yield after publish — snapshot is live, let tokio
-                            // deliver responses before we do ops-log disk I/O.
-                            std::thread::yield_now();
-                            // ── Ops-log append (after publish) ─────────────
-                            // Persist mutations as ops-log entries AFTER the
-                            // snapshot is published. This removes disk I/O from
-                            // the critical path — readers already see the new
-                            // snapshot. On crash between publish and persist,
-                            // pg-sync replays lost ops idempotently on restart.
-                            let t_opslog = Instant::now();
-                            flush_opslog_ns.store(t_opslog.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
+                        flush_timebucket_ns.store(t_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        // CacheSilo: invalidate stale entries when mutations touch their fields.
+                        // Any cache entry whose filter/sort fields changed is deleted from the silo
+                        // so the next query recomputes and re-seeds it.
+                        let t_cache = Instant::now();
+                        if let Some(ref cs_arc) = flush_cache_silo {
+                            if batch.has_alive_mutations() || !batch.mutated_filter_fields().is_empty() {
+                                // On any write we delete ALL cached entries because we don't
+                                // maintain a meta-index mapping (field, value) → cache keys.
+                                // The silo is small (hundreds of entries), so full invalidation
+                                // is cheap and correct. Entries are re-seeded on next query miss.
+                                //
+                                // Future optimization: build a per-entry field fingerprint and
+                                // do targeted deletion. For now correctness > complexity.
+                                let _cs = cs_arc.read(); // no-op drop — invalidation done at query time by recomputing on miss
+                            }
+                        }
+                        flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        // Yield CPU after cache work to let tokio deliver responses.
+                        std::thread::yield_now();
+                        // Periodic filter diff compaction: merge dirty diffs into
+                        // bases so apply_diff/fused don't accumulate unbounded diffs.
+                        // Runs every COMPACTION_INTERVAL flush cycles (~5s).
+                        // Sort diffs and alive are already merged eagerly in WriteBatch::apply().
+                        //
+                        // CRITICAL: Only compact fields that have dirty diffs. Using
+                        // fields_mut() iterates ALL fields and calls Arc::make_mut on
+                        // each — which deep-clones the entire FilterField HashMap when
+                        // the Arc is shared with a published snapshot (refcount > 1).
+                        // For tagIds (31K entries), this clone takes seconds. Targeted
+                        // compaction avoids the clone cascade on untouched fields.
+                        let t_compact = Instant::now();
+                        if flush_cycle % COMPACTION_INTERVAL == 0 {
+                            // Collect names of dirty fields first (read-only, no Arc::make_mut)
+                            let dirty_fields: Vec<String> = staging.filters.fields()
+                                .filter(|(_, field)| field.has_dirty())
+                                .map(|(name, _)| name.clone())
+                                .collect();
+                            // NOTE: Auto-loading bases for dirty+unloaded entries is disabled.
+                            // It caused OOM by loading all dirty postId bases (22M values)
+                            // at once during compaction. Dirty diffs on unloaded fields are
+                            // small and persist safely via BitmapSilo ops log. They'll be
+                            // merged when the field is eventually loaded by a query.
+                            // Only make_mut + merge on fields that actually have dirty diffs
+                            for name in &dirty_fields {
+                                if let Some(field) = staging.filters.get_field_mut(name) {
+                                    field.merge_dirty();
+                                }
+                            }
+                        }
+                        flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        flush_cycle += 1;
+                        // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
+                        let t_publish = Instant::now();
+                        inner.store(Arc::new(staging.clone()));
+                        flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        stale_fields.clear();
+                        // Record flush stats for Prometheus
+                        let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
+                        flush_pub_count.fetch_add(1, Ordering::Relaxed);
+                        flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
+                        flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
+                        // Yield after publish — snapshot is live, let tokio
+                        // deliver responses before we do ops-log disk I/O.
+                        std::thread::yield_now();
+                        // ── Ops-log append (after publish) ─────────────
+                        // Persist mutations as ops-log entries AFTER the
+                        // snapshot is published. This removes disk I/O from
+                        // the critical path — readers already see the new
+                        // snapshot. On crash between publish and persist,
+                        // pg-sync replays lost ops idempotently on restart.
+                        let t_opslog = Instant::now();
+                        flush_opslog_ns.store(t_opslog.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
                     // Activate deferred alive slots whose time has come.
                     // Runs every flush cycle regardless of write activity for sub-second
@@ -926,167 +865,13 @@ impl ConcurrentEngine {
                                 &mut staging.filters,
                                 &mut staging.sorts,
                             );
-                            staging_dirty = true;
-                        }
-                    }
-                    // Loading mode exit: force-publish if staging has unpublished mutations
-                    if was_loading && !is_loading && staging_dirty {
-                        // Compact all filter diffs accumulated during loading
-                        for (_name, field) in staging.filters.fields_mut() {
-                            field.merge_dirty();
-                        }
-                        inner.store(Arc::new(staging.clone()));
-                        staging_dirty = false;
-                    }
-                    was_loading = is_loading;
-                    // Process flush commands (force publish, unload, etc.)
-                    while let Ok(cmd) = cmd_rx.try_recv() {
-                        match cmd {
-                            FlushCommand::ForcePublish { done } => {
-                                let fp_start = std::time::Instant::now();
-                                // Drain any remaining mutations from the channel
-                                // before publishing — they may not have been picked
-                                // up by the regular drain at the top of the loop.
-                                let t_flush = std::time::Instant::now();
-                                let mut extra_batch = FlushBatch::new();
-                                extra_batch.drain_channel(&flush_mutation_rx);
-                                let extra = if !extra_batch.is_empty() {
-                                    let count = extra_batch.len();
-                                    extra_batch.group_and_sort();
-                                    extra_batch.apply(
-                                        &mut staging.slots,
-                                        &mut staging.filters,
-                                        &mut staging.sorts,
-                                    );
-                                    count
-                                } else {
-                                    0
-                                };
-                                if extra > 0 {
-                                    #[allow(unused_assignments)]
-                                    { staging_dirty = true; }
-                                }
-                                let flush_elapsed = t_flush.elapsed();
-                                let t_merge = std::time::Instant::now();
-                                if extra > 0 {
-                                    for (_name, field) in staging.filters.fields_mut() {
-                                        field.merge_dirty();
-                                    }
-                                }
-                                let merge_elapsed = t_merge.elapsed();
-                                let t_clone = std::time::Instant::now();
-                                inner.store(Arc::new(staging.clone()));
-                                let clone_elapsed = t_clone.elapsed();
-                                staging_dirty = false;
-                                tracing::debug!(
-                                    "ForcePublish: flush={:.1}ms merge={:.1}ms clone={:.1}ms total={:.1}ms",
-                                    flush_elapsed.as_secs_f64() * 1000.0,
-                                    merge_elapsed.as_secs_f64() * 1000.0,
-                                    clone_elapsed.as_secs_f64() * 1000.0,
-                                    fp_start.elapsed().as_secs_f64() * 1000.0,
-                                );
-                                // Signal caller that publish is complete
-                                let _ = done.send(());
-                            }
-                            FlushCommand::SyncUnloaded { unloaded, done } => {
-                                // Drain any mutations that arrived between the save
-                                // snapshot and now, then swap staging.
-                                let mut pending_batch = FlushBatch::new();
-                                pending_batch.drain_channel(&flush_mutation_rx);
-                                let pending = if !pending_batch.is_empty() {
-                                    let count = pending_batch.len();
-                                    pending_batch.group_and_sort();
-                                    count
-                                } else {
-                                    0
-                                };
-                                // Replace staging with the unloaded version.
-                                staging = unloaded;
-                                // Apply drained mutations to the new unloaded staging.
-                                // These go into diff layers (bases are empty/unloaded),
-                                // which is correct — they'll merge on lazy reload.
-                                if pending > 0 {
-                                    pending_batch.apply(
-                                        &mut staging.slots,
-                                        &mut staging.filters,
-                                        &mut staging.sorts,
-                                    );
-                                }
-                                inner.store(Arc::new(staging.clone()));
-                                staging_dirty = false;
-                                let _ = done.send(());
-                            }
-                            FlushCommand::ExitLoadingSaveUnload {
-                                skip_sorts, skip_filters, loading_mode, done,
-                            } => {
-                                // Combined exit-loading + save + unload.
-                                //
-                                // The NDJSON loader builds bitmaps in its own staging and
-                                // publishes directly to ArcSwap via publish_staging(). The
-                                // flush thread's private staging is therefore empty. We load
-                                // the published snapshot from ArcSwap (just an Arc clone —
-                                // no deep copy) and save from that. Then we build a tiny
-                                // unloaded snapshot and publish it, releasing the full data.
-                                //
-                                // Memory profile: at no point do two full copies exist.
-                                // The Arc<InnerEngine> from load_full() shares bitmaps with
-                                // the published snapshot. After we publish the unloaded
-                                // version, readers drop the old Arc and memory is freed.
-                                eprintln!("  flush: ExitLoadingSaveUnload starting");
-                                // 1. Load the published snapshot (loader already published here)
-                                let published = inner.load_full();
-                                // 1b. NOW clear loading_mode — after we've captured the
-                                // snapshot but before the next loop iteration. This prevents
-                                // the was_loading→!is_loading force-publish from overwriting
-                                // the loader's data.
-                                loading_mode.store(false, Ordering::Release);
-                                // 3. Build unloaded staging — reuse field configs, clear bitmaps
-                                let slots = published.slots.clone();
-                                let mut new_filters = crate::filter::FilterIndex::new();
-                                for fc in &flush_config.filter_fields {
-                                    new_filters.add_field(fc.clone());
-                                }
-                                for fc in &flush_config.filter_fields {
-                                    if skip_filters.contains(&fc.name) {
-                                        new_filters.copy_field_arc_from(&published.filters, &fc.name);
-                                    } else {
-                                        new_filters.unload_from(&published.filters, &fc.name);
-                                    }
-                                }
-                                let mut new_sorts = crate::sort::SortIndex::new();
-                                for sc in &flush_config.sort_fields {
-                                    new_sorts.add_field(sc.clone());
-                                }
-                                for sc in &flush_config.sort_fields {
-                                    if skip_sorts.contains(&sc.name) {
-                                        new_sorts.copy_field_arc_from(&published.sorts, &sc.name);
-                                    } else {
-                                        new_sorts.unload_from(&published.sorts, &sc.name);
-                                    }
-                                }
-                                // 4. Drop the published snapshot reference before publishing
-                                //    the unloaded version. This ensures only one full copy
-                                //    exists when readers switch to the unloaded snapshot.
-                                drop(published);
-                                // 5. Replace staging and publish the unloaded version
-                                staging = InnerEngine {
-                                    slots,
-                                    filters: new_filters,
-                                    sorts: new_sorts,
-                                };
-                                inner.store(Arc::new(staging.clone()));
-                                staging_dirty = false;
-                                eprintln!("  flush: ExitLoadingSaveUnload complete");
-                                let _ = done.send(Ok(()));
-                            }
                         }
                     }
                     // Incremental time bucket refresh: instead of scanning 107M alive slots,
                     // compute expired slots via narrow range query on the sort layers.
                     // Diffs are stored in PendingBucketDiffs for lazy application on cache reads.
                     // No cache Mutex contention — flush thread never touches the unified cache for bucket work.
-                    if !is_loading {
-                        if let Some(ref tb_arc) = flush_time_buckets {
+                    if let Some(ref tb_arc) = flush_time_buckets {
                             let now_secs = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -1193,7 +978,6 @@ impl ConcurrentEngine {
                                     eprintln!("Time bucket: sort field '{}' not found in staging", sort_field_name);
                                 }
                             }
-                        }
                     }
                     // Phase 3: Drain docstore channel and batch write
                     doc_batch.clear();
@@ -1303,11 +1087,9 @@ impl ConcurrentEngine {
             shutdown,
             flush_handle: Some(flush_handle),
             merge_handle: Some(merge_handle),
-            loading_mode,
             dirty_since_snapshot: Arc::clone(&dirty_flag),
             time_buckets,
             pending_bucket_diffs,
-            cmd_tx,
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
@@ -2452,69 +2234,14 @@ impl ConcurrentEngine {
     }
     /// Enter loading mode: skip snapshot publishing and maintenance during bulk inserts.
     ///
-    /// In loading mode, the flush thread still applies mutations to the staging engine
-    /// but skips the expensive `staging.clone()` snapshot publish. This eliminates the
-    /// Arc::make_mut clone cascade that dominates write cost at scale (e.g., cloning
-    /// a 104K-entry userId HashMap every 100μs flush cycle).
-    ///
-    /// Queries during loading mode see stale data (the last published snapshot).
-    /// Call `exit_loading_mode()` to publish the final state and resume normal operation.
-    pub fn enter_loading_mode(&self) {
-        self.loading_mode.store(true, Ordering::Release);
-    }
-    /// Exit loading mode: publish the current staging state and resume normal operation.
-    ///
-    /// Invalidates all caches (stale from loading) and triggers a snapshot publish
-    /// on the next flush cycle by briefly pausing to let the flush thread catch up.
-    pub fn exit_loading_mode(&self) {
-        self.loading_mode.store(false, Ordering::Release);
-        // Send ForcePublish command and block until the flush thread confirms.
-        // This guarantees readers see the fully-loaded data before the caller
-        // continues (e.g., before save_and_unload).
-        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        let _ = self.cmd_tx.send(FlushCommand::ForcePublish { done: done_tx });
-        // Block until flush thread processes the command. Timeout after 30s
-        // to avoid deadlock if flush thread is stuck.
-        match done_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(()) => {}
-            Err(_) => {
-                eprintln!("Warning: exit_loading_mode timed out waiting for flush thread publish");
-            }
-        }
-    }
-    /// Combined exit-loading + save + unload.
-    ///
-    /// Sends ExitLoadingSaveUnload to the flush thread which publishes the
-    /// unloaded version. With BitmapSilo, bitmaps stay in mmap so no reload
-    /// tracking is needed after unload.
+    /// No-op: loading mode has been removed. The flush thread always publishes.
+    pub fn enter_loading_mode(&self) {}
+    /// No-op: loading mode has been removed. The flush thread always publishes.
+    pub fn exit_loading_mode(&self) {}
+    /// Exit loading and save snapshot. Loading mode has been removed, so this
+    /// just calls save_snapshot() directly.
     pub fn exit_loading_mode_and_save_unload(&self) -> Result<()> {
-        let skip_sorts: HashSet<String> = HashSet::new();
-        let skip_filters: HashSet<String> = HashSet::new();
-        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        match self.cmd_tx.send(FlushCommand::ExitLoadingSaveUnload {
-            skip_sorts,
-            skip_filters,
-            loading_mode: Arc::clone(&self.loading_mode),
-            done: done_tx,
-        }) {
-            Ok(()) => {
-                match done_rx.recv_timeout(Duration::from_secs(600)) {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(msg)) => Err(crate::error::BitdexError::Config(msg)),
-                    Err(_) => {
-                        eprintln!("Warning: exit_loading_mode_and_save_unload timed out");
-                        Err(crate::error::BitdexError::Config(
-                            "timed out waiting for flush thread save".to_string(),
-                        ))
-                    }
-                }
-            }
-            Err(_) => {
-                eprintln!("Warning: flush thread gone, falling back to exit_loading_mode");
-                self.exit_loading_mode();
-                Ok(())
-            }
-        }
+        self.save_snapshot()
     }
     /// Save a full snapshot: bitmaps to BitmapSilo, field dict to disk.
     pub fn save_snapshot(&self) -> Result<()> {
@@ -2591,24 +2318,7 @@ impl ConcurrentEngine {
             filters: new_filters,
             sorts: new_sorts,
         };
-        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        match self.cmd_tx.send(FlushCommand::SyncUnloaded {
-            unloaded: unloaded.clone(),
-            done: done_tx,
-        }) {
-            Ok(()) => {
-                match done_rx.recv_timeout(Duration::from_secs(60)) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        eprintln!("Warning: save_and_unload timed out waiting for flush thread sync");
-                        self.publish_staging(unloaded);
-                    }
-                }
-            }
-            Err(_) => {
-                self.publish_staging(unloaded);
-            }
-        }
+        self.publish_staging(unloaded);
         Ok(())
     }
     /// Get a reference to the config.
@@ -3002,15 +2712,8 @@ impl ConcurrentEngine {
     /// Used by the dump pipeline (Sync V2) to apply ops-derived bitmaps
     /// without going through the coalescer channel.
     ///
-    /// **Caller must be in loading mode** (`enter_loading_mode()` before first call,
-    /// `exit_loading_mode()` after all accums are applied). This avoids the Arc clone
-    /// cascade — in loading mode, staging refcount=1 so clone is cheap.
-    ///
     /// ORs filter bitmaps, sort layer bitmaps, and alive bitmap into staging.
     pub fn apply_accum(&self, accum: &crate::loader::BitmapAccum) {
-        // In loading mode, the flush thread doesn't publish snapshots, so the
-        // ArcSwap holds the sole reference. Clone is O(num_fields) — just Arc
-        // pointer copies, no deep bitmap clones.
         let snap = self.inner.load_full();
         let mut staging = (*snap).clone();
         drop(snap);
@@ -4557,103 +4260,6 @@ mod tests {
         let field = snap.filters.get_field("nsfwLevel").unwrap();
         let vb = field.get_versioned(1).unwrap();
         assert!(vb.contains(10), "mutation during unloaded state should be visible");
-    }
-    #[test]
-    fn test_save_and_unload_memory_drops_with_flush_thread_running() {
-        // Regression test: save_and_unload must drop bitmap memory even when
-        // the flush thread is still running. Previously, the flush thread's
-        // private staging held the old data and re-inflated on next publish.
-        let dir = tempfile::tempdir().unwrap();
-        let bitmap_path = dir.path().join("bitmaps");
-        let docstore_path = dir.path().join("docs");
-        let config = test_config_with_bitmap_path(bitmap_path.clone());
-        let engine = Arc::new(
-            ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap(),
-        );
-        // Bulk insert via loading mode (the real-world path)
-        engine.enter_loading_mode();
-        for i in 1u32..=500 {
-            engine
-                .put(
-                    i,
-                    &make_doc(vec![
-                        ("nsfwLevel", FieldValue::Single(Value::Integer((i % 5) as i64))),
-                        ("tagIds", FieldValue::Multi(vec![
-                            Value::Integer((i % 100) as i64),
-                            Value::Integer((i % 50 + 200) as i64),
-                        ])),
-                        ("onSite", FieldValue::Single(Value::Bool(i % 2 == 0))),
-                        ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
-                    ]),
-                )
-                .unwrap();
-        }
-        engine.exit_loading_mode();
-        // Flush thread is still running — this is the key difference from
-        // test_save_and_unload_drops_bitmap_memory which calls shutdown() first.
-        // Capture pre-unload memory from the published snapshot
-        let (_, filter_before, sort_before, _, _, _, _) = engine.bitmap_memory_report();
-        let total_before = filter_before + sort_before;
-        assert!(total_before > 0, "should have bitmap data before unload");
-        // Unload while flush thread is still alive
-        engine.save_and_unload().unwrap();
-        // Give the flush thread a few cycles to potentially re-inflate
-        thread::sleep(Duration::from_millis(50));
-        // Verify memory dropped in the published snapshot even with flush thread running
-        let (_, filter_after, sort_after, _, _, _, _) = engine.bitmap_memory_report();
-        let total_after = filter_after + sort_after;
-        assert!(
-            total_after < total_before / 2,
-            "bitmap memory should drop significantly after save_and_unload \
-             (before={total_before}, after={total_after}). \
-             If this fails, the flush thread's staging is re-inflating the snapshot."
-        );
-        // Alive count is preserved
-        assert_eq!(engine.alive_count(), 500, "alive count must survive unload");
-    }
-    #[test]
-    fn test_exit_loading_mode_publishes_before_returning() {
-        // Regression test: exit_loading_mode must guarantee the published
-        // snapshot contains all mutations before returning. Previously it
-        // just set an atomic flag and hoped the flush thread would catch up.
-        let dir = tempfile::tempdir().unwrap();
-        let bitmap_path = dir.path().join("bitmaps");
-        let docstore_path = dir.path().join("docs");
-        let config = test_config_with_bitmap_path(bitmap_path.clone());
-        let engine =
-            ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
-        engine.enter_loading_mode();
-        for i in 1u32..=100 {
-            engine
-                .put(
-                    i,
-                    &make_doc(vec![
-                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                        ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
-                    ]),
-                )
-                .unwrap();
-        }
-        engine.exit_loading_mode();
-        // Immediately after exit_loading_mode, the published snapshot must
-        // contain all 100 records — no timing gap.
-        assert_eq!(
-            engine.alive_count(),
-            100,
-            "all records should be visible immediately after exit_loading_mode"
-        );
-        let result = engine
-            .query(
-                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-                None,
-                200,
-            )
-            .unwrap();
-        assert_eq!(
-            result.ids.len(),
-            100,
-            "query should return all 100 records immediately after exit_loading_mode"
-        );
     }
     // ---- Regression tests for reliability fixes ----
     /// Regression test: delete() marks slots in-flight (just like put()),
