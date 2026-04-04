@@ -191,19 +191,6 @@ impl SortField {
         self.order_results_frozen(&top_n_bitmap, descending, frozen_layers)
     }
 
-    /// MSB-to-LSB bifurcation traversal.
-    ///
-    /// Walks bit layers from MSB to LSB, narrowing candidates at each layer.
-    /// Returns a bitmap containing exactly min(limit, candidates.len()) top slots.
-    fn bifurcate(
-        &self,
-        candidates: &RoaringBitmap,
-        limit: usize,
-        descending: bool,
-    ) -> RoaringBitmap {
-        self.bifurcate_frozen(candidates, limit, descending, None)
-    }
-
     /// Frozen-aware bifurcation. Uses frozen layers for unloaded bit layers.
     fn bifurcate_frozen<'a>(
         &self,
@@ -268,11 +255,6 @@ impl SortField {
         result
     }
 
-    /// Order the top-N result bitmap into a sorted Vec.
-    fn order_results(&self, result_bitmap: &RoaringBitmap, descending: bool) -> Vec<u32> {
-        self.order_results_frozen(result_bitmap, descending, None)
-    }
-
     /// Frozen-aware ordering: reconstructs sort values using frozen layers when needed.
     fn order_results_frozen<'a>(
         &self,
@@ -292,17 +274,6 @@ impl SortField {
         }
 
         entries.into_iter().map(|(slot, _)| slot).collect()
-    }
-
-    /// Apply cursor-based filtering to candidates using bitmap operations.
-    fn apply_cursor_filter(
-        &self,
-        candidates: &RoaringBitmap,
-        descending: bool,
-        cursor_sort_value: u64,
-        cursor_slot_id: u32,
-    ) -> RoaringBitmap {
-        self.apply_cursor_filter_frozen(candidates, descending, cursor_sort_value, cursor_slot_id, None)
     }
 
     /// Frozen-aware cursor filtering.

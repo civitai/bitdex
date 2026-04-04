@@ -10,7 +10,7 @@
 //! The log is mmap'd so reads are zero-copy through the page cache.
 //! No in-memory HashMap — the mmap IS the read cache.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

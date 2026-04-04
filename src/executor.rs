@@ -760,7 +760,7 @@ impl<'a> QueryExecutor<'a> {
         let mut result = RoaringBitmap::new();
         // Iterate in-memory values (may be loaded or unloaded placeholders)
         if let Some(filter_field) = self.filters.get_field(field) {
-            for (&key, vb) in filter_field.iter_versioned() {
+            for (&key, _vb) in filter_field.iter_versioned() {
                 if key == crate::filter::NULL_BITMAP_KEY { continue; }
                 if predicate(key, target) {
                     if let Some(bm) = self.get_effective_bitmap(field, key) {

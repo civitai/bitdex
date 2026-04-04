@@ -365,13 +365,74 @@ function resources() {
 }
 
 function wipe() {
-  err('Wiping bitmap/docstore data on both PVCs (keeping CSVs)...');
+  err('Wiping bitmap/docstore/WAL data on both PVCs (keeping CSVs in load_stage)...');
+  err('  IMPORTANT: Pod must be scaled to 0 first, or server recreates dirs on boot.');
   for (const i of [0, 1]) {
-    const cmd = `rm -rf ${INDEX_PATH}/bitmaps ${INDEX_PATH}/docs ${INDEX_PATH}/bounds ${INDEX_PATH}/slot_arena.bin ${INDEX_PATH}/snapshot.meta && echo wiped-${i}`;
-    const { logs } = runEphemeralPod(`bitdex-wipe-${i}`, { command: cmd, pvcIndex: i, timeout: 60 });
+    // rm -rf everything EXCEPT load_stage CSVs.
+    // Must use rm -rf (not find -delete) because the server recreates empty dirs
+    // on boot, and find -delete would leave shard files inside recreated dirs.
+    // WAL cleanup is CRITICAL: stale WAL cursor in MetaStore = broken WAL reader.
+    const cmd = [
+      `rm -rf ${INDEX_PATH}/bitmaps`,    // ShardStore: alive, filter, sort + MetaStore cursors
+      `rm -rf ${INDEX_PATH}/docs`,        // DocStore V3 shard files
+      `rm -rf /data/wal`,                 // WAL files (ops_000001.wal etc.)
+      `mkdir -p /data/wal`,               // Recreate empty WAL dir for next boot
+      `rm -rf ${INDEX_PATH}/bounds`,      // Bound cache shards
+      `rm -f ${INDEX_PATH}/dumps.json`,   // Dump state — forces fresh dump on restart
+      `rm -f ${INDEX_PATH}/slot_arena.bin`,
+      `rm -f ${INDEX_PATH}/snapshot.meta`,
+      `echo wiped-${i}`,
+    ].join(' && ');
+    const { logs } = runEphemeralPod(`bitdex-wipe-${i}`, { command: cmd, pvcIndex: i, timeout: 120 });
     err(`  PVC ${i}: ${logs}`);
   }
   json({ wiped: true });
+}
+
+function fullReset() {
+  err('=== FULL RESET: nuke + PG cleanup (keeps CSVs) ===');
+
+  // Step 1: Scale to 0
+  err('Step 1: Scaling to 0...');
+  run(`kubectl scale sts ${STS} -n ${NS} --replicas=0 --context ${K8S_CONTEXT} 2>/dev/null`);
+  err('  Waiting for pods to terminate...');
+  run(`kubectl wait --for=delete pod/bitdex-0 -n ${NS} --timeout=120s --context ${K8S_CONTEXT} 2>/dev/null`, { throws: false });
+
+  // Step 2: Wipe PVC data (keeps CSVs)
+  err('Step 2: Wiping PVC data (keeping load_stage CSVs)...');
+  wipe();
+
+  // Step 3: PG cleanup — drop triggers, truncate ops, delete cursors
+  err('Step 3: PG cleanup...');
+  const pgCmds = [
+    // Drop V2 triggers (they'll be recreated by bitdex-sync on startup)
+    `DO $$ DECLARE r RECORD; BEGIN FOR r IN SELECT tgname, relname FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid WHERE tgname LIKE 'bitdex_%' LOOP EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', r.tgname, r.relname); END LOOP; END $$`,
+    // Truncate ops table
+    `TRUNCATE TABLE "BitdexOps"`,
+    // Delete all cursors
+    `DELETE FROM bitdex_cursors`,
+  ];
+  for (const cmd of pgCmds) {
+    const result = run(
+      `MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} --context ${K8S_CONTEXT} -- psql -U postgres -d civitai -c "${cmd.replace(/"/g, '\\"')}" 2>/dev/null`,
+      { throws: false }
+    );
+    err(`  PG: ${result || 'ok'}`);
+  }
+
+  // Step 4: Scale back to 1
+  err('Step 4: Scaling to 1...');
+  run(`kubectl scale sts ${STS} -n ${NS} --replicas=1 --context ${K8S_CONTEXT} 2>/dev/null`);
+  err('  Waiting for pod to be ready...');
+  run(`kubectl wait --for=condition=ready pod/bitdex-0 -n ${NS} --timeout=300s --context ${K8S_CONTEXT} 2>/dev/null`, { throws: false });
+
+  err('=== FULL RESET COMPLETE ===');
+  err('  PVC: wiped (bitmaps, docs, WAL, bounds, dumps.json) — rm -rf, not find -delete');
+  err('  PG: triggers dropped, ops truncated, cursors deleted');
+  err('  WAL: deleted + empty /data/wal/ recreated');
+  err('  CSVs: preserved in load_stage');
+  err('  Next: pod will boot fresh, sidecar will re-create triggers and start dump from CSVs');
+  json({ reset: true, steps: ['scale_down', 'wipe_pvc', 'pg_cleanup', 'scale_up'] });
 }
 
 function configRead() {
@@ -751,6 +812,7 @@ switch (command) {
   // Operations
   case 'resources': resources(); break;
   case 'wipe': wipe(); break;
+  case 'full-reset': fullReset(); break;
   case 'config-read': configRead(); break;
   case 'config-patch': configPatch(); break;
   case 'memory': memory(); break;
@@ -825,7 +887,7 @@ switch (command) {
         'Tunnels': ['tunnel pg [start|stop|status]', 'tunnel bitdex [start|stop|status]'],
         'Snapshots': ['snapshot-status <session_id>', 'snapshot-download <session_id> [--output <path>]'],
         'Metrics': ['metrics-now', 'metrics-trend [window]', 'metrics-query <promql>'],
-        'Data': ['wipe', 'cleanup <captures|load_stage|legacy|bounds>'],
+        'Data': ['wipe', 'full-reset', 'cleanup <captures|load_stage|legacy|bounds>'],
       },
     });
     process.exit(1);

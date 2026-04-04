@@ -813,7 +813,7 @@ impl UnifiedCache {
         // Collect (last_used, key) for all evictable entries
         let mut candidates: Vec<(Instant, UnifiedKey)> = if self.persistence_enabled {
             // Prefer non-dirty entries first
-            let mut non_dirty: Vec<_> = self.entries.iter()
+            let non_dirty: Vec<_> = self.entries.iter()
                 .filter(|(_, e)| !e.persist_dirty)
                 .map(|(k, e)| (e.last_used, k.clone()))
                 .collect();

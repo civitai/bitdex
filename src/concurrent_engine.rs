@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -67,11 +67,6 @@ enum FlushCommand {
         /// Sets to skip (already pending lazy loads — not in memory).
         skip_sorts: HashSet<String>,
         skip_filters: HashSet<String>,
-        skip_lazy: HashSet<String>,
-        /// Cursors to persist alongside bitmaps.
-        cursors: HashMap<String, String>,
-        /// Dictionaries to persist alongside bitmaps.
-        dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
         /// Loading mode flag — handler clears this AFTER reading the published snapshot,
         /// preventing the flush thread's loading-exit force-publish from overwriting
         /// the loader's data before we save it.
@@ -167,8 +162,6 @@ pub struct ConcurrentEngine {
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
     docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
-    /// Root path for the docstore (used by build_all_from_docstore, rebuild_fields_from_docstore, etc.)
-    docstore_root: Arc<PathBuf>,
     config: Arc<Config>,
     field_registry: FieldRegistry,
     in_flight: InFlightTracker,
@@ -474,7 +467,6 @@ impl ConcurrentEngine {
         #[cfg(feature = "server")]
         let metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> = Arc::new(ArcSwap::from_pointee(None));
 
-        let docstore_root = Arc::new(docstore.path().to_path_buf());
         let docstore = Arc::new(parking_lot::Mutex::new(docstore));
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
@@ -501,7 +493,6 @@ impl ConcurrentEngine {
                 sender,
                 doc_tx,
                 docstore,
-                docstore_root: Arc::clone(&docstore_root),
                 config,
                 field_registry,
                 in_flight: InFlightTracker::new(),
@@ -926,8 +917,7 @@ impl ConcurrentEngine {
                                 let _ = done.send(());
                             }
                             FlushCommand::ExitLoadingSaveUnload {
-                                skip_sorts, skip_filters, skip_lazy,
-                                cursors, dictionaries, loading_mode, done,
+                                skip_sorts, skip_filters, loading_mode, done,
                             } => {
                                 // Combined exit-loading + save + unload.
                                 //
@@ -1365,7 +1355,6 @@ impl ConcurrentEngine {
             sender,
             doc_tx,
             docstore,
-            docstore_root,
             config,
             field_registry,
             in_flight: InFlightTracker::new(),
@@ -3512,16 +3501,10 @@ impl ConcurrentEngine {
     pub fn exit_loading_mode_and_save_unload(&self) -> Result<()> {
         let skip_sorts: HashSet<String> = HashSet::new();
         let skip_filters: HashSet<String> = HashSet::new();
-        let skip_lazy: HashSet<String> = HashSet::new();
-        let cursors = self.cursors.lock().clone();
-        let dictionaries = Arc::clone(&self.dictionaries);
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         match self.cmd_tx.send(FlushCommand::ExitLoadingSaveUnload {
             skip_sorts,
             skip_filters,
-            skip_lazy,
-            cursors,
-            dictionaries,
             loading_mode: Arc::clone(&self.loading_mode),
             done: done_tx,
         }) {
