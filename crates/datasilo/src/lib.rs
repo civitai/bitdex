@@ -74,6 +74,11 @@ pub struct SiloConfig {
     /// that are multiples of this value. Default: 1 (no alignment).
     /// Set to 32 for frozen bitmap silos (FrozenRoaringBitmap requires 32-byte alignment).
     pub alignment: u32,
+    /// Dead space ratio that triggers automatic compaction.
+    /// When `dead_bytes / total_bytes > compact_threshold`, the data file
+    /// is rewritten to reclaim space. Default: 0.20 (20%).
+    /// Set to 0.0 to disable automatic compaction.
+    pub compact_threshold: f32,
 }
 
 impl Default for SiloConfig {
@@ -82,6 +87,7 @@ impl Default for SiloConfig {
             buffer_ratio: 1.3,
             min_entry_size: 256,
             alignment: 1,
+            compact_threshold: 0.20,
         }
     }
 }
@@ -157,6 +163,9 @@ pub struct DataSilo {
     data_mmap: Option<memmap2::Mmap>,
     data_len: u64,
     ops_log: parking_lot::Mutex<OpsLog>,
+    /// Bytes wasted by deleted entries and relocated updates.
+    /// Tracked during hot compaction. Reset to 0 after a full rewrite.
+    dead_bytes: AtomicU64,
 }
 
 unsafe impl Send for DataSilo {}
@@ -176,6 +185,7 @@ impl DataSilo {
             data_mmap: None,
             data_len: 0,
             ops_log: parking_lot::Mutex::new(ops_log),
+            dead_bytes: AtomicU64::new(0),
         };
 
         silo.load_index()?;
@@ -296,6 +306,20 @@ impl DataSilo {
     pub fn ops_size(&self) -> u64 { self.ops_log.lock().data_size() }
     pub fn path(&self) -> &Path { &self.path }
     pub fn config(&self) -> &SiloConfig { &self.config }
+
+    /// Dead bytes in the data file (from deletes and relocating updates).
+    pub fn dead_bytes(&self) -> u64 { self.dead_bytes.load(Ordering::Relaxed) }
+
+    /// Dead space ratio: dead_bytes / total_bytes. Returns 0.0 if no data.
+    pub fn dead_ratio(&self) -> f64 {
+        if self.data_len == 0 { return 0.0; }
+        self.dead_bytes.load(Ordering::Relaxed) as f64 / self.data_len as f64
+    }
+
+    /// Whether automatic compaction should trigger based on dead space threshold.
+    pub fn needs_compaction(&self) -> bool {
+        self.config.compact_threshold > 0.0 && self.dead_ratio() > self.config.compact_threshold as f64
+    }
 
     /// Check if there are uncompacted ops.
     pub fn has_ops(&self) -> bool {
@@ -418,6 +442,7 @@ impl DataSilo {
         self.index_len = index_count as u32;
         self.load_data()?;
         self.data_len = offset;
+        self.dead_bytes.store(0, Ordering::Relaxed); // full rewrite = no dead space
 
         // Clear ops log
         self.ops_log.lock().truncate()?;
@@ -475,6 +500,11 @@ impl DataSilo {
                 None => {
                     // Tombstone: clear the index entry so get() returns None
                     if key < self.index_len {
+                        if let Some(old_entry) = self.index_entry(key) {
+                            if old_entry.allocated > 0 {
+                                self.dead_bytes.fetch_add(old_entry.allocated as u64, Ordering::Relaxed);
+                            }
+                        }
                         let zero_entry = IndexEntry { offset: 0, length: 0, allocated: 0 };
                         if let Some(ref mut index_mmap) = self.index_mmap {
                             let pos = key as usize * INDEX_ENTRY_SIZE;
@@ -515,9 +545,13 @@ impl DataSilo {
                     }
                     in_place += 1;
                 } else {
+                    // Old slot becomes dead space
+                    self.dead_bytes.fetch_add(entry.allocated as u64, Ordering::Relaxed);
                     overflows.push((key, value.clone()));
                 }
             } else {
+                // Doesn't fit — old slot becomes dead space, value relocates to end
+                self.dead_bytes.fetch_add(entry.allocated as u64, Ordering::Relaxed);
                 overflows.push((key, value.clone()));
             }
         }

@@ -52,6 +52,7 @@ impl BitmapSilo {
                 buffer_ratio: 1.2,    // bitmaps don't change size much
                 min_entry_size: 64,   // small bitmaps are common
                 alignment: 32,        // FrozenRoaringBitmap requires 32-byte aligned data
+                compact_threshold: 0.0, // bitmaps are rewritten in full on save, no auto-compact
             },
         )?;
 
