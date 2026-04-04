@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use arc_swap::{ArcSwap, Guard};
+use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender};
 use roaring::RoaringBitmap;
 use crate::cache;
@@ -210,11 +210,9 @@ pub struct MetricsBridge {
     pub compaction_duration: prometheus::HistogramVec,
     pub index_name: String,
 }
-/// Inner bitmap state published as immutable snapshots via ArcSwap.
-///
-/// All fields are Clone via Arc-per-bitmap CoW. Cloning bumps refcounts
-/// on the Arc-wrapped bitmaps — zero data copy. Actual bitmap data is
-/// only cloned on mutation via `Arc::make_mut()`.
+/// Staging buffer used by bulk-load paths (put_bulk_loading, apply_bitmap_maps).
+/// Callers build bitmaps into this struct offline and then call publish_staging()
+/// to atomically swap its contents into the live engine under write locks.
 #[derive(Clone)]
 pub struct InnerEngine {
     pub slots: crate::slot::SlotAllocator,
@@ -237,10 +235,21 @@ pub struct CompactResult {
     pub elapsed_secs: f64,
 }
 
-/// Readers load the current snapshot via `load_full()` — fully lock-free,
-/// no contention with writers or the flush thread.
+/// Thread-safe engine with RwLock-protected bitmap state.
+///
+/// Readers call `filters.read()` / `sorts.read()` / `slots.read()` —
+/// multiple readers share access lock-free while flush thread holds
+/// write locks only for the duration of batch application.
+///
+/// Bulk-load callers use `clone_staging()` + `put_bulk_loading()` to build
+/// bitmaps offline and `publish_staging()` to swap them in.
 pub struct ConcurrentEngine {
-    inner: Arc<ArcSwap<InnerEngine>>,
+    /// Slot allocator: alive bitmap + slot counter + deferred alive set.
+    slots: Arc<parking_lot::RwLock<crate::slot::SlotAllocator>>,
+    /// Filter index: one VersionedBitmap per field × value.
+    filters: Arc<parking_lot::RwLock<crate::filter::FilterIndex>>,
+    /// Sort index: per-field bit-layer bitmaps.
+    sorts: Arc<parking_lot::RwLock<crate::sort::SortIndex>>,
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
     docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
@@ -250,7 +259,8 @@ pub struct ConcurrentEngine {
     shutdown: Arc<AtomicBool>,
     flush_handle: Option<JoinHandle<()>>,
     merge_handle: Option<JoinHandle<()>>,
-    dirty_since_snapshot: Arc<AtomicBool>,
+    /// Dirty flag: flush/write paths set true so the merge thread persists on next cycle.
+    dirty_flag: Arc<AtomicBool>,
     time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
     /// Pending bucket diffs for lazy application on cache reads.
     /// Flush thread stores new snapshots; query threads load for diff application.
@@ -265,8 +275,8 @@ pub struct ConcurrentEngine {
     /// Flush thread writes new entries; merge thread compacts.
     /// None when bitmap_path is not configured.
     cache_silo: Option<Arc<parking_lot::RwLock<crate::cache_silo::CacheSilo>>>,
-    /// Flush loop stats: total snapshot publishes (monotonic counter).
-    flush_publish_count: Arc<AtomicU64>,
+    /// Flush loop stats: total flush cycles that applied mutations (monotonic counter).
+    flush_apply_count: Arc<AtomicU64>,
     /// Flush loop stats: cumulative flush duration in nanoseconds.
     flush_duration_nanos: Arc<AtomicU64>,
     /// Flush loop stats: most recent flush duration in nanoseconds.
@@ -275,9 +285,7 @@ pub struct ConcurrentEngine {
     flush_apply_nanos: Arc<AtomicU64>,
     /// Flush phase timing: last cache maintenance duration in nanoseconds.
     flush_cache_nanos: Arc<AtomicU64>,
-    /// Flush phase timing: last staging.clone() + ArcSwap publish duration in nanoseconds.
-    flush_publish_nanos: Arc<AtomicU64>,
-    /// Flush phase timing: last ops-log append duration in nanoseconds (after publish).
+    /// Flush phase timing: last ops-log append duration in nanoseconds (after apply).
     flush_opslog_nanos: Arc<AtomicU64>,
     /// Flush phase timing: last time bucket maintenance duration in nanoseconds.
     flush_timebucket_nanos: Arc<AtomicU64>,
@@ -564,14 +572,10 @@ impl ConcurrentEngine {
             }
             Arc::new(ArcSwap::new(Arc::new(pending)))
         };
-        let inner_engine = InnerEngine {
-            slots,
-            filters,
-            sorts,
-        };
-        // Flush thread owns a staging clone; readers see published snapshots
-        let mut staging = inner_engine.clone();
-        let inner = Arc::new(ArcSwap::new(Arc::new(inner_engine)));
+        // Wrap live state in RwLocks — flush thread writes, query threads read.
+        let slots_arc = Arc::new(parking_lot::RwLock::new(slots));
+        let filters_arc = Arc::new(parking_lot::RwLock::new(filters));
+        let sorts_arc = Arc::new(parking_lot::RwLock::new(sorts));
         let (mutation_tx, mutation_rx): (crossbeam_channel::Sender<MutationOp>, crossbeam_channel::Receiver<MutationOp>) =
             crossbeam_channel::bounded(config.channel_capacity);
         let sender = MutationSender { tx: mutation_tx };
@@ -591,12 +595,11 @@ impl ConcurrentEngine {
         let dirty_flag = Arc::new(AtomicBool::new(false));
         // Restore cursors from BitmapSilo (if available), otherwise start empty.
         let cursors = Arc::new(parking_lot::Mutex::new(restored_cursors));
-        let flush_publish_count = Arc::new(AtomicU64::new(0));
+        let flush_apply_count = Arc::new(AtomicU64::new(0));
         let flush_duration_nanos = Arc::new(AtomicU64::new(0));
         let flush_last_duration_nanos = Arc::new(AtomicU64::new(0));
         let flush_apply_nanos = Arc::new(AtomicU64::new(0));
         let flush_cache_nanos = Arc::new(AtomicU64::new(0));
-        let flush_publish_nanos = Arc::new(AtomicU64::new(0));
         let flush_timebucket_nanos = Arc::new(AtomicU64::new(0));
         let flush_compact_nanos = Arc::new(AtomicU64::new(0));
         let flush_opslog_nanos = Arc::new(AtomicU64::new(0));
@@ -604,7 +607,9 @@ impl ConcurrentEngine {
         if config.headless {
             eprintln!("Engine starting in headless mode (no background threads)");
             return Ok(Self {
-                inner,
+                slots: Arc::clone(&slots_arc),
+                filters: Arc::clone(&filters_arc),
+                sorts: Arc::clone(&sorts_arc),
                 sender,
                 doc_tx,
                 docstore,
@@ -614,19 +619,18 @@ impl ConcurrentEngine {
                 shutdown,
                 flush_handle: None,
                 merge_handle: None,
-                dirty_since_snapshot: dirty_flag,
+                dirty_flag,
                 time_buckets,
                 pending_bucket_diffs: Arc::clone(&pending_bucket_diffs),
                 string_maps: None,
                 case_sensitive_fields: None,
                 dictionaries: Arc::new(HashMap::new()),
                 cache_silo: cache_silo_arc,
-                flush_publish_count,
+                flush_apply_count,
                 flush_duration_nanos,
                 flush_last_duration_nanos,
                 flush_apply_nanos,
                 flush_cache_nanos,
-                flush_publish_nanos,
                 flush_timebucket_nanos,
                 flush_compact_nanos,
                 flush_opslog_nanos,
@@ -640,7 +644,9 @@ impl ConcurrentEngine {
             });
         }
         let flush_handle = {
-            let inner = Arc::clone(&inner);
+            let flush_slots = Arc::clone(&slots_arc);
+            let flush_filters = Arc::clone(&filters_arc);
+            let flush_sorts = Arc::clone(&sorts_arc);
             let shutdown = Arc::clone(&shutdown);
             let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
@@ -650,12 +656,11 @@ impl ConcurrentEngine {
             let flush_pending_diffs = Arc::clone(&pending_bucket_diffs);
             let flush_diff_log_path = config.storage.bitmap_path.as_ref()
                 .map(|bp| std::path::Path::new(bp).join("bucket_diffs.log"));
-            let flush_pub_count = Arc::clone(&flush_publish_count);
+            let flush_apply_cnt = Arc::clone(&flush_apply_count);
             let flush_dur_nanos = Arc::clone(&flush_duration_nanos);
             let flush_last_dur_nanos = Arc::clone(&flush_last_duration_nanos);
             let flush_apply_ns = Arc::clone(&flush_apply_nanos);
             let flush_cache_ns = Arc::clone(&flush_cache_nanos);
-            let flush_publish_ns = Arc::clone(&flush_publish_nanos);
             let flush_timebucket_ns = Arc::clone(&flush_timebucket_nanos);
             let flush_compact_ns = Arc::clone(&flush_compact_nanos);
             let flush_opslog_ns = Arc::clone(&flush_opslog_nanos);
@@ -684,16 +689,17 @@ impl ConcurrentEngine {
                         0
                     };
                     let mut stale_fields: Vec<String> = Vec::new();
-                    // Phase 2: Apply mutations to staging (private, no lock needed)
+                    // Phase 2: Apply mutations under write locks (brief hold)
                     let flush_start = Instant::now();
                     if bitmap_count > 0 {
                         flush_dirty_flag.store(true, Ordering::Release);
                         let t_apply = Instant::now();
-                        batch.apply(
-                            &mut staging.slots,
-                            &mut staging.filters,
-                            &mut staging.sorts,
-                        );
+                        {
+                            let mut slots_w = flush_slots.write();
+                            let mut filters_w = flush_filters.write();
+                            let mut sorts_w = flush_sorts.write();
+                            batch.apply(&mut *slots_w, &mut *filters_w, &mut *sorts_w);
+                        }
                         flush_apply_ns.store(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         // Collect mutated field names for bitmap memory cache staleness tracking.
                         for fgk in batch.filter_inserts.keys() {
@@ -725,7 +731,8 @@ impl ConcurrentEngine {
                                 let mut tb = tb_arc.lock();
                                 if !batch.alive_inserts.is_empty() {
                                     let sort_field_name = tb.sort_field_name().to_string();
-                                    if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
+                                    let sorts_r = flush_sorts.read();
+                                    if let Some(sort_field) = sorts_r.get_field(&sort_field_name) {
                                         for &slot in &batch.alive_inserts {
                                             let ts = sort_field.reconstruct_value(slot) as u64;
                                             tb.insert_slot(slot, ts, now_secs);
@@ -770,44 +777,37 @@ impl ConcurrentEngine {
                         // compaction avoids the clone cascade on untouched fields.
                         let t_compact = Instant::now();
                         if flush_cycle % COMPACTION_INTERVAL == 0 {
-                            // Collect names of dirty fields first (read-only, no Arc::make_mut)
-                            let dirty_fields: Vec<String> = staging.filters.fields()
-                                .filter(|(_, field)| field.has_dirty())
-                                .map(|(name, _)| name.clone())
-                                .collect();
+                            // Collect names of dirty fields first under read lock (no write needed)
+                            let dirty_fields: Vec<String> = {
+                                let filters_r = flush_filters.read();
+                                filters_r.fields()
+                                    .filter(|(_, field)| field.has_dirty())
+                                    .map(|(name, _)| name.clone())
+                                    .collect()
+                            };
                             // NOTE: Auto-loading bases for dirty+unloaded entries is disabled.
                             // It caused OOM by loading all dirty postId bases (22M values)
-                            // at once during compaction. Dirty diffs on unloaded fields are
-                            // small and persist safely via BitmapSilo ops log. They'll be
-                            // merged when the field is eventually loaded by a query.
-                            // Only make_mut + merge on fields that actually have dirty diffs
-                            for name in &dirty_fields {
-                                if let Some(field) = staging.filters.get_field_mut(name) {
-                                    field.merge_dirty();
+                            // at once during compaction. Only merge fields that have dirty diffs.
+                            if !dirty_fields.is_empty() {
+                                let mut filters_w = flush_filters.write();
+                                for name in &dirty_fields {
+                                    if let Some(field) = filters_w.get_field_mut(name) {
+                                        field.merge_dirty();
+                                    }
                                 }
                             }
                         }
                         flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         flush_cycle += 1;
-                        // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
-                        let t_publish = Instant::now();
-                        inner.store(Arc::new(staging.clone()));
-                        flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         stale_fields.clear();
                         // Record flush stats for Prometheus
                         let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
-                        flush_pub_count.fetch_add(1, Ordering::Relaxed);
+                        flush_apply_cnt.fetch_add(1, Ordering::Relaxed);
                         flush_dur_nanos.fetch_add(flush_elapsed, Ordering::Relaxed);
                         flush_last_dur_nanos.store(flush_elapsed, Ordering::Relaxed);
-                        // Yield after publish — snapshot is live, let tokio
-                        // deliver responses before we do ops-log disk I/O.
+                        // Yield after apply — let tokio deliver responses before disk I/O.
                         std::thread::yield_now();
-                        // ── Ops-log append (after publish) ─────────────
-                        // Persist mutations as ops-log entries AFTER the
-                        // snapshot is published. This removes disk I/O from
-                        // the critical path — readers already see the new
-                        // snapshot. On crash between publish and persist,
-                        // pg-sync replays lost ops idempotently on restart.
+                        // ── Ops-log append ──────────────────────────────────────────────
                         let t_opslog = Instant::now();
                         flush_opslog_ns.store(t_opslog.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
@@ -817,12 +817,13 @@ impl ConcurrentEngine {
                     // replay the full mutation pipeline (filter/sort/alive ops) as if the
                     // document was just PUT for the first time. This ensures the document
                     // only becomes visible in bitmaps at activation time.
-                    if staging.slots.deferred_count() > 0 {
+                    let deferred_count = flush_slots.read().deferred_count();
+                    if deferred_count > 0 {
                         let now_unix = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        let activated = staging.slots.activate_due(now_unix);
+                        let activated = flush_slots.write().activate_due(now_unix);
                         if !activated.is_empty() {
                             // Collect all mutation ops for activated slots and apply in bulk.
                             let mut activation_batch = FlushBatch::new();
@@ -860,11 +861,10 @@ impl ConcurrentEngine {
                                 }
                             } // docstore lock released
                             activation_batch.group_and_sort();
-                            activation_batch.apply(
-                                &mut staging.slots,
-                                &mut staging.filters,
-                                &mut staging.sorts,
-                            );
+                            let mut slots_w = flush_slots.write();
+                            let mut filters_w = flush_filters.write();
+                            let mut sorts_w = flush_sorts.write();
+                            activation_batch.apply(&mut *slots_w, &mut *filters_w, &mut *sorts_w);
                         }
                     }
                     // Incremental time bucket refresh: instead of scanning 107M alive slots,
@@ -899,7 +899,8 @@ impl ConcurrentEngine {
                                 let tb_lock = tb_arc.lock();
                                 let sort_field_name = tb_lock.sort_field_name().to_string();
                                 drop(tb_lock);
-                                if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
+                                let sorts_r = flush_sorts.read();
+                                if let Some(sort_field) = sorts_r.get_field(&sort_field_name) {
                                     let start = std::time::Instant::now();
                                     for (bucket_name, duration_secs, refresh_interval, old_cutoff) in &refresh_info {
                                         let new_cutoff = crate::bucket_diff_log::snap_cutoff(
@@ -1007,16 +1008,14 @@ impl ConcurrentEngine {
                 } else { 0 };
                 if count > 0 {
                     flush_dirty_flag.store(true, Ordering::Release);
-                    shutdown_batch.apply(
-                        &mut staging.slots,
-                        &mut staging.filters,
-                        &mut staging.sorts,
-                    );
-                    // Compact all remaining filter diffs before final publish
-                    for (_name, field) in staging.filters.fields_mut() {
+                    let mut slots_w = flush_slots.write();
+                    let mut filters_w = flush_filters.write();
+                    let mut sorts_w = flush_sorts.write();
+                    shutdown_batch.apply(&mut *slots_w, &mut *filters_w, &mut *sorts_w);
+                    // Compact all remaining filter diffs before shutdown
+                    for (_name, field) in filters_w.fields_mut() {
                         field.merge_dirty();
                     }
-                    inner.store(Arc::new(staging.clone()));
                 }
                 // Final docstore drain
                 doc_batch.clear();
@@ -1077,7 +1076,9 @@ impl ConcurrentEngine {
         };
         // DataSilo mmap reads require no separate eviction thread
         Ok(Self {
-            inner,
+            slots: slots_arc,
+            filters: filters_arc,
+            sorts: sorts_arc,
             sender,
             doc_tx,
             docstore,
@@ -1087,19 +1088,18 @@ impl ConcurrentEngine {
             shutdown,
             flush_handle: Some(flush_handle),
             merge_handle: Some(merge_handle),
-            dirty_since_snapshot: Arc::clone(&dirty_flag),
+            dirty_flag,
             time_buckets,
             pending_bucket_diffs,
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
             cache_silo: cache_silo_arc,
-            flush_publish_count,
+            flush_apply_count,
             flush_duration_nanos,
             flush_last_duration_nanos,
             flush_apply_nanos,
             flush_cache_nanos,
-            flush_publish_nanos,
             flush_timebucket_nanos,
             flush_compact_nanos,
             flush_opslog_nanos,
@@ -1242,11 +1242,6 @@ impl ConcurrentEngine {
         Ok(())
     }
 
-    /// this avoids atomic refcount increment/decrement and moves deallocation
-    /// of old snapshots off the reader path onto the flush thread's `store()`.
-    fn snapshot(&self) -> Guard<Arc<InnerEngine>> {
-        self.inner.load()
-    }
     /// PUT(id, document) -- full replace with upsert semantics.
     ///
     /// 1. Mark in-flight
@@ -1320,15 +1315,11 @@ impl ConcurrentEngine {
     /// Inner PUT logic shared by put() and patch_document() (for new slots).
     /// Caller must handle in_flight marking.
     fn put_inner(&self, id: u32, doc: &Document) -> Result<()> {
-        // Check alive status via lock-free snapshot
+        // Check alive status under read lock
         let (is_upsert, was_allocated) = {
-            let snap = self.snapshot();
-            let alive = snap.slots.is_alive(id);
-            let alloc = if !alive {
-                snap.slots.was_ever_allocated(id)
-            } else {
-                false
-            };
+            let slots_r = self.slots.read();
+            let alive = slots_r.is_alive(id);
+            let alloc = if !alive { slots_r.was_ever_allocated(id) } else { false };
             (alive, alloc)
         };
         // Read old doc from docstore if needed
@@ -1359,12 +1350,9 @@ impl ConcurrentEngine {
     pub fn patch(&self, id: u32, patch: &PatchPayload) -> Result<()> {
         self.in_flight.mark_in_flight(id);
         let result = (|| -> Result<()> {
-            // Verify the slot is alive via lock-free snapshot
-            {
-                let snap = self.snapshot();
-                if !snap.slots.is_alive(id) {
-                    return Err(crate::error::BitdexError::SlotNotFound(id));
-                }
+            // Verify the slot is alive under read lock
+            if !self.slots.read().is_alive(id) {
+                return Err(crate::error::BitdexError::SlotNotFound(id));
             }
             let ops = diff_patch(id, patch, &self.config, &self.field_registry);
             self.send_mutation_ops(ops)?;
@@ -1384,10 +1372,7 @@ impl ConcurrentEngine {
         }
         self.in_flight.mark_in_flight(id);
         let result = (|| -> Result<()> {
-            let is_alive = {
-                let snap = self.snapshot();
-                snap.slots.is_alive(id)
-            };
+            let is_alive = self.slots.read().is_alive(id);
             if !is_alive {
                 // Slot doesn't exist yet — fall through to full PUT semantics.
                 // This handles new records (e.g., images created after the bulk load).
@@ -1488,16 +1473,13 @@ impl ConcurrentEngine {
             // now falls through to PUT), and that will handle the full insert.
             // Setting filter bitmaps before the slot is alive would be pointless
             // since queries require alive status.
-            {
-                let snap = self.snapshot();
-                if !snap.slots.is_alive(slot) {
-                    return Ok(());
-                }
+            if !self.slots.read().is_alive(slot) {
+                return Ok(());
             }
             // Find old values by scanning loaded bitmaps for this field
             let old_values: Vec<u64> = {
-                let snap = self.snapshot();
-                match snap.filters.get_field(field_name) {
+                let filters_r = self.filters.read();
+                match filters_r.get_field(field_name) {
                     Some(field) => field
                         .bitmap_keys()
                         .filter(|&&v| {
@@ -1543,7 +1525,9 @@ impl ConcurrentEngine {
         sort: Option<&SortClause>,
         limit: usize,
     ) -> Result<QueryResult> {
-        let snap = self.snapshot(); // lock-free
+        let slots_r = self.slots.read();
+        let filters_r = self.filters.read();
+        let sorts_r = self.sorts.read();
         let silo_guard = self.bitmap_silo.as_ref().map(|s| s.read());
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
         let now_unix = std::time::SystemTime::now()
@@ -1552,9 +1536,9 @@ impl ConcurrentEngine {
             .as_secs();
         let executor = {
             let mut base = QueryExecutor::new(
-                &snap.slots,
-                &snap.filters,
-                &snap.sorts,
+                &*slots_r,
+                &*filters_r,
+                &*sorts_r,
                 self.config.max_page_size,
             );
             if let Some(ref guard) = silo_guard {
@@ -1594,7 +1578,9 @@ impl ConcurrentEngine {
         query: &BitdexQuery,
         collector: Option<&mut QueryTraceCollector>,
     ) -> Result<QueryResult> {
-        let snap = self.snapshot(); // lock-free
+        let slots_r = self.slots.read();
+        let filters_r = self.filters.read();
+        let sorts_r = self.sorts.read();
         let silo_guard = self.bitmap_silo.as_ref().map(|s| s.read());
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
         let now_unix = std::time::SystemTime::now()
@@ -1603,9 +1589,9 @@ impl ConcurrentEngine {
             .as_secs();
         let executor = {
             let mut base = QueryExecutor::new(
-                &snap.slots,
-                &snap.filters,
-                &snap.sorts,
+                &*slots_r,
+                &*filters_r,
+                &*sorts_r,
                 self.config.max_page_size,
             );
             if let Some(ref guard) = silo_guard {
@@ -1721,7 +1707,7 @@ impl ConcurrentEngine {
                                 result.ids = result.ids.split_off(offset);
                                 if let Some(&last_id) = result.ids.last() {
                                     let slot = last_id as u32;
-                                    if let Some(sf) = snap.sorts.get_field(&sort_clause.field) {
+                                    if let Some(sf) = sorts_r.get_field(&sort_clause.field) {
                                         result.cursor = Some(crate::query::CursorPosition {
                                             sort_value: sf.reconstruct_value(slot) as u64,
                                             slot_id: slot,
@@ -1772,7 +1758,7 @@ impl ConcurrentEngine {
                     None,
                     use_simple_sort,
                 )?;
-                let sort_field = snap.sorts.get_field(&sort_clause.field);
+                let sort_field = sorts_r.get_field(&sort_clause.field);
                 let sorted_slots: Vec<u32> = seed_result.ids.iter().map(|&id| id as u32).collect();
                 let has_more = full_total_matched > sorted_slots.len() as u64;
                 let value_fn = |slot: u32| -> u32 {
@@ -1825,7 +1811,7 @@ impl ConcurrentEngine {
                         result.ids = result.ids.split_off(offset);
                         if let Some(&last_id) = result.ids.last() {
                             let slot = last_id as u32;
-                            if let Some(sf) = snap.sorts.get_field(&sort_clause.field) {
+                            if let Some(sf) = sorts_r.get_field(&sort_clause.field) {
                                 result.cursor = Some(crate::query::CursorPosition {
                                     sort_value: sf.reconstruct_value(slot) as u64,
                                     slot_id: slot,
@@ -1854,7 +1840,7 @@ impl ConcurrentEngine {
                 if let Some(sort_clause) = query.sort.as_ref() {
                     if let Some(&last_id) = result.ids.last() {
                         let slot = last_id as u32;
-                        if let Some(sf) = snap.sorts.get_field(&sort_clause.field) {
+                        if let Some(sf) = sorts_r.get_field(&sort_clause.field) {
                             result.cursor = Some(crate::query::CursorPosition {
                                 sort_value: sf.reconstruct_value(slot) as u64,
                                 slot_id: slot,
@@ -1974,36 +1960,37 @@ impl ConcurrentEngine {
         }
         Ok(())
     }
-    /// Load the current snapshot (lock-free). Public API for advanced use.
-    pub fn snapshot_public(&self) -> Arc<InnerEngine> {
-        self.inner.load_full()
+    /// Clone the current live state into an InnerEngine. Public API for tests and tools.
+    pub fn snapshot_public(&self) -> InnerEngine {
+        self.clone_staging()
     }
-    /// Get the number of alive documents (lock-free snapshot).
+    /// Get the number of alive documents.
     pub fn alive_count(&self) -> u64 {
-        self.snapshot().slots.alive_count()
+        self.slots.read().alive_count()
     }
-    /// Flush loop stats: (publish_count, cumulative_duration_nanos, last_duration_nanos).
+    /// Flush loop stats: (apply_count, cumulative_duration_nanos, last_duration_nanos).
     pub fn flush_stats(&self) -> (u64, u64, u64) {
         (
-            self.flush_publish_count.load(Ordering::Relaxed),
+            self.flush_apply_count.load(Ordering::Relaxed),
             self.flush_duration_nanos.load(Ordering::Relaxed),
             self.flush_last_duration_nanos.load(Ordering::Relaxed),
         )
     }
-    /// Per-phase flush timing in nanoseconds: (apply, cache, publish, timebucket, compact, opslog).
+    /// Per-phase flush timing in nanoseconds: (apply, cache, 0, timebucket, compact, opslog).
+    /// The third slot is 0 (previously measured ArcSwap publish, now removed).
     pub fn flush_phase_stats(&self) -> (u64, u64, u64, u64, u64, u64) {
         (
             self.flush_apply_nanos.load(Ordering::Relaxed),
             self.flush_cache_nanos.load(Ordering::Relaxed),
-            self.flush_publish_nanos.load(Ordering::Relaxed),
+            0, // publish_nanos removed (no ArcSwap)
             self.flush_timebucket_nanos.load(Ordering::Relaxed),
             self.flush_compact_nanos.load(Ordering::Relaxed),
             self.flush_opslog_nanos.load(Ordering::Relaxed),
         )
     }
-    /// Get the high-water mark slot counter (lock-free snapshot).
+    /// Get the high-water mark slot counter.
     pub fn slot_counter(&self) -> u32 {
-        self.snapshot().slots.slot_counter()
+        self.slots.read().slot_counter()
     }
     // ---- Named cursors ----
     /// Set a named cursor value. The value is persisted to disk at the next
@@ -2011,7 +1998,7 @@ impl ConcurrentEngine {
     pub fn set_cursor(&self, name: String, value: String) {
         self.cursors.lock().insert(name, value);
         // Mark dirty so the merge thread will write at next cycle.
-        self.dirty_since_snapshot.store(true, Ordering::Release);
+        self.dirty_flag.store(true, Ordering::Release);
     }
     /// Get a named cursor value (in-memory, not from disk).
     pub fn get_cursor(&self, name: &str) -> Option<String> {
@@ -2055,8 +2042,7 @@ impl ConcurrentEngine {
     }
     /// Check if a slot is alive (for non-alive slot filtering in ops processing).
     pub fn is_slot_alive(&self, slot: u32) -> bool {
-        let snap = self.snapshot();
-        snap.slots.is_alive(slot)
+        self.slots.read().is_alive(slot)
     }
     /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> std::collections::HashMap<u8, std::collections::HashMap<String, serde_json::Value>> {
@@ -2097,29 +2083,25 @@ impl ConcurrentEngine {
     #[allow(clippy::type_complexity)]
     /// Lightweight memory totals — skips per-field detail for fast stats endpoint.
     pub fn bitmap_memory_totals(&self) -> (usize, usize, usize) {
-        let snap = self.snapshot();
-        let slot_bytes = snap.slots.bitmap_bytes();
-        let filter_bytes = snap.filters.bitmap_bytes();
-        let sort_bytes = snap.sorts.bitmap_bytes();
+        let slot_bytes = self.slots.read().bitmap_bytes();
+        let filter_bytes = self.filters.read().bitmap_bytes();
+        let sort_bytes = self.sorts.read().bitmap_bytes();
         (slot_bytes, filter_bytes, sort_bytes)
     }
     pub fn bitmap_memory_report(
         &self,
     ) -> (usize, usize, usize, usize, usize, Vec<(String, usize, usize)>, Vec<(String, usize)>) {
-        let snap = self.snapshot();
-        let slot_bytes = snap.slots.bitmap_bytes();
-        let filter_bytes = snap.filters.bitmap_bytes();
-        let sort_bytes = snap.sorts.bitmap_bytes();
+        let slot_bytes = self.slots.read().bitmap_bytes();
+        let filter_bytes = self.filters.read().bitmap_bytes();
+        let sort_bytes = self.sorts.read().bitmap_bytes();
         let cache_entries = 0usize;
         let cache_bytes = 0usize;
-        let filter_details: Vec<(String, usize, usize)> = snap
-            .filters
+        let filter_details: Vec<(String, usize, usize)> = self.filters.read()
             .per_field_bytes()
             .into_iter()
             .map(|(name, count, bytes)| (name.to_string(), count, bytes))
             .collect();
-        let sort_details: Vec<(String, usize)> = snap
-            .sorts
+        let sort_details: Vec<(String, usize)> = self.sorts.read()
             .per_field_bytes()
             .into_iter()
             .map(|(name, bytes)| (name.to_string(), bytes))
@@ -2149,28 +2131,32 @@ impl ConcurrentEngine {
         let tb_arc = self.time_buckets.as_ref().ok_or_else(|| {
             crate::error::BitdexError::Config("no time_buckets configured".into())
         })?;
-        let snap = self.snapshot();
         let sort_field_name = {
             let tb = tb_arc.lock();
             tb.sort_field_name().to_string()
         };
-        let sort_field = snap.sorts.get_field(&sort_field_name).ok_or_else(|| {
-            crate::error::BitdexError::Config(format!(
-                "time bucket sort field '{}' not loaded", sort_field_name
-            ))
-        })?;
-        let alive = snap.slots.alive_bitmap();
+        // Collect (slot, timestamp) for all alive slots under read locks
+        let slot_values: Vec<(u32, u64)> = {
+            let sorts_r = self.sorts.read();
+            let slots_r = self.slots.read();
+            let sort_field = sorts_r.get_field(&sort_field_name).ok_or_else(|| {
+                crate::error::BitdexError::Config(format!(
+                    "time bucket sort field '{}' not loaded", sort_field_name
+                ))
+            })?;
+            let alive = slots_r.alive_bitmap();
+            let mut vals = Vec::with_capacity(alive.len() as usize);
+            for slot in alive.iter() {
+                let ts = sort_field.reconstruct_value(slot) as u64;
+                vals.push((slot, ts));
+            }
+            vals
+        };
+        let slot_count = slot_values.len() as u64;
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // Collect (slot, timestamp) for all alive slots
-        let slot_count = alive.len();
-        let mut slot_values: Vec<(u32, u64)> = Vec::with_capacity(slot_count as usize);
-        for slot in alive.iter() {
-            let ts = sort_field.reconstruct_value(slot) as u64;
-            slot_values.push((slot, ts));
-        }
         // Rebuild each bucket
         let mut tb = tb_arc.lock();
         let bucket_names: Vec<String> = tb.bucket_names();
@@ -2179,7 +2165,7 @@ impl ConcurrentEngine {
         }
         let bucket_count = bucket_names.len();
         // Mark dirty so merge thread persists
-        self.dirty_since_snapshot.store(true, std::sync::atomic::Ordering::Release);
+        self.dirty_flag.store(true, std::sync::atomic::Ordering::Release);
         // CacheSilo entries will be recomputed on the next query miss after rebuild.
         eprintln!(
             "rebuild_time_buckets: rebuilt {} buckets from {} alive slots in sort field '{}'",
@@ -2251,11 +2237,13 @@ impl ConcurrentEngine {
 
         // Save bitmaps to BitmapSilo
         if let Some(ref bitmap_path) = self.config.storage.bitmap_path {
-            let snap = self.snapshot();
             let cursors = self.cursors.lock().clone();
+            let filters_r = self.filters.read();
+            let sorts_r = self.sorts.read();
+            let slots_r = self.slots.read();
             let mut silo = crate::bitmap_silo::BitmapSilo::open(bitmap_path)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
-            let count = silo.save_all(&snap.filters, &snap.sorts, &snap.slots, &cursors)
+            let count = silo.save_all(&*filters_r, &*sorts_r, &*slots_r, &cursors)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all: {e}")))?;
             eprintln!("save_snapshot: saved {} bitmaps to BitmapSilo", count);
         }
@@ -2264,11 +2252,13 @@ impl ConcurrentEngine {
     }
     /// Save a full snapshot to a custom path.
     pub fn save_snapshot_to(&self, path: &Path) -> Result<()> {
-        let snap = self.snapshot();
         let cursors = self.cursors.lock().clone();
+        let filters_r = self.filters.read();
+        let sorts_r = self.sorts.read();
+        let slots_r = self.slots.read();
         let mut silo = crate::bitmap_silo::BitmapSilo::open(path)
             .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
-        silo.save_all(&snap.filters, &snap.sorts, &snap.slots, &cursors)
+        silo.save_all(&*filters_r, &*sorts_r, &*slots_r, &cursors)
             .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all: {e}")))?;
         Ok(())
     }
@@ -2295,30 +2285,34 @@ impl ConcurrentEngine {
     /// Save the current snapshot to disk (via BitmapSilo) and publish a fresh unloaded state.
     /// With BitmapSilo, all bitmaps are in the silo mmap — no lazy reload tracking needed.
     pub fn save_and_unload(&self) -> Result<()> {
-        // Build an unloaded snapshot: keep slots (always needed), empty filter/sort fields.
-        let snap = self.inner.load_full();
-        let slots = snap.slots.clone();
-        let mut new_filters = crate::filter::FilterIndex::new();
-        for fc in &self.config.filter_fields {
-            new_filters.add_field(fc.clone());
-        }
-        for fc in &self.config.filter_fields {
-            new_filters.unload_from(&snap.filters, &fc.name);
-        }
-        let mut new_sorts = crate::sort::SortIndex::new();
-        for sc in &self.config.sort_fields {
-            new_sorts.add_field(sc.clone());
-        }
-        for sc in &self.config.sort_fields {
-            new_sorts.unload_from(&snap.sorts, &sc.name);
-        }
-        drop(snap);
-        let unloaded = InnerEngine {
-            slots,
-            filters: new_filters,
-            sorts: new_sorts,
+        // Build an unloaded staging buffer: keep slots (always needed), empty filter/sort fields.
+        let (new_slots, new_filters, new_sorts) = {
+            let slots_r = self.slots.read();
+            let filters_r = self.filters.read();
+            let sorts_r = self.sorts.read();
+            let new_slots = slots_r.clone();
+            let mut new_filters = crate::filter::FilterIndex::new();
+            for fc in &self.config.filter_fields {
+                new_filters.add_field(fc.clone());
+            }
+            for fc in &self.config.filter_fields {
+                new_filters.unload_from(&*filters_r, &fc.name);
+            }
+            let mut new_sorts = crate::sort::SortIndex::new();
+            for sc in &self.config.sort_fields {
+                new_sorts.add_field(sc.clone());
+            }
+            for sc in &self.config.sort_fields {
+                new_sorts.unload_from(&*sorts_r, &sc.name);
+            }
+            (new_slots, new_filters, new_sorts)
         };
-        self.publish_staging(unloaded);
+        // Swap in unloaded state under write locks
+        *self.slots.write() = new_slots;
+        *self.filters.write() = new_filters;
+        *self.sorts.write() = new_sorts;
+        self.dirty_flag.store(true, Ordering::Release);
+        self.invalidate_all_caches();
         Ok(())
     }
     /// Get a reference to the config.
@@ -2379,17 +2373,13 @@ impl ConcurrentEngine {
             self.in_flight.mark_in_flight(id);
         }
         let result = (|| -> Result<()> {
-            // Phase 2: Single snapshot load for all alive/allocation checks
+            // Phase 2: Single read lock for all alive/allocation checks
             let statuses: Vec<(u32, bool, bool)> = {
-                let snap = self.snapshot();
+                let slots_r = self.slots.read();
                 docs.iter()
                     .map(|&(id, _)| {
-                        let alive = snap.slots.is_alive(id);
-                        let alloc = if !alive {
-                            snap.slots.was_ever_allocated(id)
-                        } else {
-                            false
-                        };
+                        let alive = slots_r.is_alive(id);
+                        let alloc = if !alive { slots_r.was_ever_allocated(id) } else { false };
                         (id, alive, alloc)
                     })
                     .collect()
@@ -2466,13 +2456,10 @@ impl ConcurrentEngine {
             let handle = thread::spawn(|| {});
             return Ok((0, handle));
         }
-        // Clone snapshot and apply
-        let snap = self.inner.load_full();
-        let mut staging = (*snap).clone();
+        // Clone live state, apply bulk bitmaps, then publish
+        let mut staging = self.clone_staging();
         let count = Self::put_bulk_into(&self.config, &mut staging, &docs, num_threads);
-        // Publish
-        self.inner.store(Arc::new(staging));
-        self.invalidate_all_caches();
+        self.publish_staging(staging);
         // Background docstore persistence
         let docstore_handle = self.spawn_docstore_writer(docs);
         Ok((count, docstore_handle))
@@ -2485,16 +2472,27 @@ impl ConcurrentEngine {
     pub fn put_bulk_loading(&self, staging: &mut InnerEngine, docs: &[(u32, Document)], num_threads: usize) -> usize {
         Self::put_bulk_into(&self.config, staging, docs, num_threads)
     }
-    /// Publish a staging InnerEngine as the current snapshot and invalidate all caches.
+    /// Publish a staging InnerEngine as the current live state and invalidate all caches.
+    ///
+    /// Called after bulk-load paths that build bitmaps offline. Takes write locks
+    /// on all three fields briefly to swap in the new state.
     pub fn publish_staging(&self, staging: InnerEngine) {
-        self.inner.store(Arc::new(staging));
-        self.dirty_since_snapshot.store(true, Ordering::Release);
+        *self.slots.write() = staging.slots;
+        *self.filters.write() = staging.filters;
+        *self.sorts.write() = staging.sorts;
+        self.dirty_flag.store(true, Ordering::Release);
         self.invalidate_all_caches();
     }
-    /// Take a clone of the current snapshot for mutation.
+    /// Clone the current live state into a staging InnerEngine for offline mutation.
     pub fn clone_staging(&self) -> InnerEngine {
-        let snap = self.inner.load_full();
-        (*snap).clone()
+        let slots_r = self.slots.read();
+        let filters_r = self.filters.read();
+        let sorts_r = self.sorts.read();
+        InnerEngine {
+            slots: slots_r.clone(),
+            filters: filters_r.clone(),
+            sorts: sorts_r.clone(),
+        }
     }
     fn invalidate_all_caches(&self) {
         // CacheSilo entries become stale after bulk loads; they'll be recomputed on miss.
@@ -2714,29 +2712,31 @@ impl ConcurrentEngine {
     ///
     /// ORs filter bitmaps, sort layer bitmaps, and alive bitmap into staging.
     pub fn apply_accum(&self, accum: &crate::loader::BitmapAccum) {
-        let snap = self.inner.load_full();
-        let mut staging = (*snap).clone();
-        drop(snap);
-        // Apply filter bitmaps
-        for (field_name, value_map) in &accum.filter_maps {
-            if let Some(field) = staging.filters.get_field_mut(field_name) {
-                for (&value, bitmap) in value_map {
-                    field.or_bitmap(value, bitmap);
+        // Apply filter bitmaps under write lock
+        {
+            let mut filters_w = self.filters.write();
+            for (field_name, value_map) in &accum.filter_maps {
+                if let Some(field) = filters_w.get_field_mut(field_name) {
+                    for (&value, bitmap) in value_map {
+                        field.or_bitmap(value, bitmap);
+                    }
                 }
             }
         }
-        // Apply sort layer bitmaps
-        for (field_name, layer_map) in &accum.sort_maps {
-            if let Some(field) = staging.sorts.get_field_mut(field_name) {
-                for (&bit_layer, bitmap) in layer_map {
-                    field.or_layer(bit_layer, bitmap);
+        // Apply sort layer bitmaps under write lock
+        {
+            let mut sorts_w = self.sorts.write();
+            for (field_name, layer_map) in &accum.sort_maps {
+                if let Some(field) = sorts_w.get_field_mut(field_name) {
+                    for (&bit_layer, bitmap) in layer_map {
+                        field.or_layer(bit_layer, bitmap);
+                    }
                 }
             }
         }
-        // Apply alive bitmap (also updates slot counter)
-        staging.slots.alive_or_bitmap(&accum.alive);
-        // Store back — in loading mode, no snapshot publish overhead
-        self.inner.store(Arc::new(staging));
+        // Apply alive bitmap under write lock
+        self.slots.write().alive_or_bitmap(&accum.alive);
+        self.dirty_flag.store(true, Ordering::Release);
     }
     /// Remove filter and/or sort fields from the engine.
     ///
@@ -4194,18 +4194,12 @@ mod tests {
         engine.shutdown();
         assert_eq!(engine.alive_count(), 2);
         // Capture pre-unload bitmap memory
-        let bytes_before = {
-            let snap = engine.inner.load_full();
-            snap.filters.bitmap_bytes() + snap.sorts.bitmap_bytes()
-        };
+        let bytes_before = engine.filters.read().bitmap_bytes() + engine.sorts.read().bitmap_bytes();
         assert!(bytes_before > 0, "should have bitmap data before unload");
-        // Unload — drops clean bitmaps from the published snapshot
+        // Unload — drops clean bitmaps from the live fields
         engine.save_and_unload().unwrap();
         // Verify bitmap memory dropped
-        let bytes_after = {
-            let snap = engine.inner.load_full();
-            snap.filters.bitmap_bytes() + snap.sorts.bitmap_bytes()
-        };
+        let bytes_after = engine.filters.read().bitmap_bytes() + engine.sorts.read().bitmap_bytes();
         assert!(
             bytes_after < bytes_before,
             "bitmap bytes should drop after save_and_unload: {} -> {}",
@@ -4256,8 +4250,8 @@ mod tests {
             engine.publish_staging(staging);
         }
         // The mutation (slot 10 in nsfwLevel=1) should be visible in the diff
-        let snap = engine.inner.load_full();
-        let field = snap.filters.get_field("nsfwLevel").unwrap();
+        let filters_r = engine.filters.read();
+        let field = filters_r.get_field("nsfwLevel").unwrap();
         let vb = field.get_versioned(1).unwrap();
         assert!(vb.contains(10), "mutation during unloaded state should be visible");
     }
