@@ -1640,7 +1640,7 @@ pub fn process_dump_with_progress(
                     }
                 }
 
-                // Build indexed fields (Vec<Option<&str>> — cheap compared to HashMap)
+                // Build indexed fields (Vec<Option<&str>> — per-row allocation)
                 let indexed_fields_buf = row.to_indexed_fields();
                 let col_idx = row.col_index_ref();
 
@@ -2204,9 +2204,13 @@ pub fn process_dump_with_progress(
                 eprintln!("  Dump {}: multi-value post-pass wrote {} doc ops ({:.1}s)",
                     request.name, mv_count, t_doc.elapsed().as_secs_f64());
             }
-        } else if parallel_ops_writer.is_some() {
+        } else if let Some(ref pw) = parallel_ops_writer {
             // Doc ops were already written directly to the mmap'd ops log during parse.
-            // Just flush the mmap.
+            // Check for overflow (correctness: dropped ops = missing docs)
+            let dropped = pw.overflow_count.load(std::sync::atomic::Ordering::Relaxed);
+            if dropped > 0 {
+                eprintln!("  WARNING: Dump {}: {} doc ops dropped due to parallel writer overflow!", request.name, dropped);
+            }
             ds_lock.silo().flush_ops()
                 .map_err(|e| format!("flush_ops: {e}"))?;
             eprintln!("  Dump {}: doc ops written inline via parallel mmap ({:.1}s)",

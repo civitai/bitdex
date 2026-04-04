@@ -105,6 +105,8 @@ pub struct ParallelOpsWriter {
     cursor: *const AtomicU64,  // points into OpsLog.cursor (stable while mmap is allocated)
     mmap_ptr: *mut u8,         // points into OpsLog.mmap (stable while mmap is allocated)
     mmap_len: usize,
+    /// Count of ops dropped due to mmap overflow. Checked after parallel writes complete.
+    pub overflow_count: AtomicU64,
 }
 
 // Safety: ParallelOpsWriter is Send+Sync because:
@@ -150,7 +152,8 @@ impl ParallelOpsWriter {
         }
 
         if *local_cursor + frame_len > self.mmap_len {
-            return false; // out of space
+            self.overflow_count.fetch_add(1, Ordering::Relaxed);
+            return false; // out of space — caller must handle
         }
 
         unsafe {
@@ -254,6 +257,7 @@ impl DataSilo {
             cursor,
             mmap_ptr: mmap_ptr as *mut u8,
             mmap_len,
+            overflow_count: AtomicU64::new(0),
         })
     }
 
