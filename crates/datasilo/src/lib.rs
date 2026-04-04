@@ -15,7 +15,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 mod ops_log;
 pub mod hash_index;
@@ -162,7 +162,12 @@ pub struct DataSilo {
     index_len: u32,
     data_mmap: Option<memmap2::Mmap>,
     data_len: u64,
-    ops_log: parking_lot::Mutex<OpsLog>,
+    /// Two ops log slots for A-B swap during compaction.
+    /// While one is being compacted (frozen), new writes go to the other.
+    ops_a: parking_lot::Mutex<OpsLog>,
+    ops_b: parking_lot::Mutex<OpsLog>,
+    /// Which slot is currently active for writes: false = A, true = B.
+    active_is_b: AtomicBool,
     /// Bytes wasted by deleted entries and relocated updates.
     /// Tracked during hot compaction. Reset to 0 after a full rewrite.
     dead_bytes: AtomicU64,
@@ -173,9 +178,21 @@ unsafe impl Sync for DataSilo {}
 
 impl DataSilo {
     /// Open or create a DataSilo at the given directory.
+    ///
+    /// Handles legacy migration: if only `ops.log` exists (old single-log format),
+    /// it is renamed to `ops_a.log` before opening.
     pub fn open(path: &Path, config: SiloConfig) -> io::Result<Self> {
         std::fs::create_dir_all(path)?;
-        let ops_log = OpsLog::open(&path.join("ops.log"))?;
+
+        // Legacy migration: rename ops.log → ops_a.log if present and ops_a.log absent.
+        let legacy = path.join("ops.log");
+        let ops_a_path = path.join("ops_a.log");
+        if legacy.exists() && !ops_a_path.exists() {
+            std::fs::rename(&legacy, &ops_a_path)?;
+        }
+
+        let ops_a = OpsLog::open(&ops_a_path)?;
+        let ops_b = OpsLog::open(&path.join("ops_b.log"))?;
 
         let mut silo = Self {
             path: path.to_path_buf(),
@@ -184,7 +201,9 @@ impl DataSilo {
             index_len: 0,
             data_mmap: None,
             data_len: 0,
-            ops_log: parking_lot::Mutex::new(ops_log),
+            ops_a: parking_lot::Mutex::new(ops_a),
+            ops_b: parking_lot::Mutex::new(ops_b),
+            active_is_b: AtomicBool::new(false),
             dead_bytes: AtomicU64::new(0),
         };
 
@@ -193,22 +212,25 @@ impl DataSilo {
         Ok(silo)
     }
 
-    // ── Write path: everything goes through the ops log ─────────────────
+    // ── Write path: everything goes through the active ops log ──────────
 
-    /// Get the ops log for direct parallel writes.
-    /// Callers use `ops_log.cursor().fetch_add()` to reserve space,
-    /// then write CRC32-framed ops directly to the mmap.
+    /// Get the active ops log for direct parallel writes.
+    /// Always returns the currently active slot (A or B).
     pub fn ops_log(&self) -> &parking_lot::Mutex<OpsLog> {
-        &self.ops_log
+        if self.active_is_b.load(Ordering::Acquire) {
+            &self.ops_b
+        } else {
+            &self.ops_a
+        }
     }
 
-    /// Prepare for parallel ops writes. Pre-allocates the ops log mmap.
+    /// Prepare for parallel ops writes. Pre-allocates the active ops log mmap.
     /// Returns a `ParallelOpsWriter` that rayon threads can use for lock-free writes.
     ///
     /// IMPORTANT: Do not call `ensure_ops_capacity` or `compact` while the
     /// `ParallelOpsWriter` is in use — the mmap must not be reallocated.
     pub fn prepare_parallel_ops(&self, estimated_bytes: u64) -> io::Result<ParallelOpsWriter> {
-        let mut log = self.ops_log.lock();
+        let mut log = self.ops_log().lock();
         let needed = log.data_size() + estimated_bytes;
         log.ensure_capacity(needed)?;
 
@@ -224,19 +246,19 @@ impl DataSilo {
         })
     }
 
-    /// Flush the ops log mmap to disk. Call after parallel writes complete.
+    /// Flush the active ops log mmap to disk. Call after parallel writes complete.
     pub fn flush_ops(&self) -> io::Result<()> {
-        self.ops_log.lock().flush()
+        self.ops_log().lock().flush()
     }
 
     /// Append a single op (sequential, single-thread steady-state path).
     pub fn append_op(&self, key: u32, value: &[u8]) -> io::Result<()> {
-        self.ops_log.lock().append(&SiloOp::Put { key, value: value.to_vec() })
+        self.ops_log().lock().append(&SiloOp::Put { key, value: value.to_vec() })
     }
 
     /// Append a batch of ops sequentially. Useful for small batches in steady state.
     pub fn append_ops_batch(&self, ops: &[(u32, Vec<u8>)]) -> io::Result<()> {
-        let mut log = self.ops_log.lock();
+        let mut log = self.ops_log().lock();
         for (key, value) in ops {
             log.append(&SiloOp::Put { key: *key, value: value.clone() })?;
         }
@@ -244,18 +266,18 @@ impl DataSilo {
         Ok(())
     }
 
-    /// Ensure the ops log has capacity for `bytes` of additional data.
+    /// Ensure the active ops log has capacity for `bytes` of additional data.
     /// Call before parallel writes to pre-allocate the mmap.
     pub fn ensure_ops_capacity(&self, bytes: u64) -> io::Result<()> {
-        let mut log = self.ops_log.lock();
+        let mut log = self.ops_log().lock();
         let needed = log.data_size() + bytes;
         log.ensure_capacity(needed)
     }
 
-    /// Delete an entry by key. Appends a Delete tombstone to the ops log.
+    /// Delete an entry by key. Appends a Delete tombstone to the active ops log.
     /// The entry is removed from the data file on the next compaction.
     pub fn delete(&self, key: u32) -> io::Result<()> {
-        self.ops_log.lock().append(&SiloOp::Delete { key })
+        self.ops_log().lock().append(&SiloOp::Delete { key })
     }
 
     // ── Read path ───────────────────────────────────────────────────────
@@ -272,28 +294,44 @@ impl DataSilo {
     }
 
     /// Read an entry with ops overlay (returns owned data).
-    /// Scans the ops log for the latest value of this key.
+    /// Scans BOTH ops logs (A and B) for the latest value of this key.
+    /// Last-write-wins across both logs (frozen log has older ops, active has newer).
     /// Handles both Put (update) and Delete (tombstone) ops.
     pub fn get_with_ops(&self, key: u32) -> Option<Vec<u8>> {
-        // Scan ops log for latest op affecting this key
-        let log = self.ops_log.lock();
+        // Scan both ops logs. We must read them while holding both locks to get a
+        // consistent snapshot. Lock order is always A then B to prevent deadlock.
+        let log_a = self.ops_a.lock();
+        let log_b = self.ops_b.lock();
+
         let mut latest: Option<Option<Vec<u8>>> = None; // Some(Some(v)) = put, Some(None) = deleted
-        let _ = log.for_each_ops(|op| {
-            match op {
-                SiloOp::Put { key: k, value } if k == key => {
-                    latest = Some(Some(value));
+
+        // Scan A first (may be frozen/older), then B (may be active/newer).
+        // Because we scan in order A→B and last-write-wins, the result from B
+        // correctly overwrites A for any key that appears in both.
+        let scan = |log: &OpsLog| {
+            let mut found: Option<Option<Vec<u8>>> = None;
+            let _ = log.for_each_ops(|op| {
+                match op {
+                    SiloOp::Put { key: k, value } if k == key => {
+                        found = Some(Some(value));
+                    }
+                    SiloOp::Delete { key: k } if k == key => {
+                        found = Some(None);
+                    }
+                    _ => {}
                 }
-                SiloOp::Delete { key: k } if k == key => {
-                    latest = Some(None); // tombstone
-                }
-                _ => {}
-            }
-        });
+            });
+            found
+        };
+
+        if let Some(v) = scan(&log_a) { latest = Some(v); }
+        if let Some(v) = scan(&log_b) { latest = Some(v); }
+
         match latest {
-            Some(Some(v)) => Some(v),   // latest op was a put
-            Some(None) => None,          // latest op was a delete
+            Some(Some(v)) => Some(v),
+            Some(None) => None,
             None => {
-                // No ops for this key — fall back to data file
+                // No ops for this key in either log — fall back to data file
                 self.get(key).map(|s| s.to_vec())
             }
         }
@@ -303,7 +341,10 @@ impl DataSilo {
 
     pub fn index_capacity(&self) -> u32 { self.index_len }
     pub fn data_bytes(&self) -> u64 { self.data_len }
-    pub fn ops_size(&self) -> u64 { self.ops_log.lock().data_size() }
+    /// Total bytes written across both ops logs.
+    pub fn ops_size(&self) -> u64 {
+        self.ops_a.lock().data_size() + self.ops_b.lock().data_size()
+    }
     pub fn path(&self) -> &Path { &self.path }
     pub fn config(&self) -> &SiloConfig { &self.config }
 
@@ -321,40 +362,67 @@ impl DataSilo {
         self.config.compact_threshold > 0.0 && self.dead_ratio() > self.config.compact_threshold as f64
     }
 
-    /// Check if there are uncompacted ops.
+    /// Check if there are uncompacted ops in either log.
     pub fn has_ops(&self) -> bool {
-        self.ops_log.lock().data_size() > 0
+        !self.ops_a.lock().is_empty() || !self.ops_b.lock().is_empty()
     }
 
     // ── Compaction ──────────────────────────────────────────────────────
 
     /// Compact: merge ops into the data file.
     ///
-    /// Two modes:
-    /// - **Cold** (no existing data file): scan ops → build index → rename ops.log → data.bin
+    /// Uses the A-B swap protocol to ensure no ops are lost:
+    /// 1. Atomically switch the active write slot (A→B or B→A).
+    ///    New writes now go to the fresh slot.
+    /// 2. Compact the frozen slot (which received no new writes during compaction).
+    /// 3. After data+index are fully synced to disk, truncate the frozen slot.
+    ///
+    /// Two compaction modes:
+    /// - **Cold** (no existing data file): scan ops → build index + data file
     /// - **Hot** (existing data file): apply ops in-place where they fit, overflow to end
     pub fn compact(&mut self) -> io::Result<u64> {
-        let ops_size = self.ops_log.lock().data_size();
-        if ops_size == 0 { return Ok(0); }
+        // Check if the active slot has any ops to compact.
+        let active_has_ops = !self.ops_log().lock().is_empty();
+        if !active_has_ops { return Ok(0); }
 
+        // Step 1: Freeze the active slot by atomically switching to the other slot.
+        // After this store, new writes go to the previously-idle slot.
+        // We use SeqCst to ensure all in-flight writes to the old active slot
+        // are visible before we read from it below.
+        //
+        // frozen_is_b: true = B is the frozen slot, false = A is the frozen slot.
+        let frozen_is_b = self.active_is_b.fetch_xor(true, Ordering::SeqCst);
+        // fetch_xor returns the OLD value. Old active=B means B is now frozen.
+
+        // Step 2: Compact from the frozen slot.
         let has_data = self.data_mmap.is_some() && self.index_len > 0;
-        if has_data {
-            self.compact_hot()
+        let count = if has_data {
+            self.compact_hot_from(frozen_is_b)?
         } else {
-            self.compact_cold()
+            self.compact_cold_from(frozen_is_b)?
+        };
+
+        // Step 3: Truncate the frozen slot (data+index already flushed inside compact_*_from).
+        if frozen_is_b {
+            self.ops_b.lock().truncate()?;
+        } else {
+            self.ops_a.lock().truncate()?;
         }
+
+        Ok(count)
     }
 
     /// Cold compaction: no existing data file.
-    /// Scan ops log for last value per key, write data file + index.
+    /// Scan frozen ops log for last value per key, write data file + index.
     /// Deleted keys (tombstones) are excluded from the output.
-    fn compact_cold(&mut self) -> io::Result<u64> {
-        // Collect last value per key from ops log (last-write-wins).
+    /// `frozen_is_b`: true = ops_b is frozen, false = ops_a is frozen.
+    fn compact_cold_from(&mut self, frozen_is_b: bool) -> io::Result<u64> {
+        // Collect last value per key from frozen ops log (last-write-wins).
         // Deletes remove the entry entirely (tombstone).
         let mut entries: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
         let mut max_key: u32 = 0;
         {
-            let log = self.ops_log.lock();
+            let log = if frozen_is_b { self.ops_b.lock() } else { self.ops_a.lock() };
             log.for_each_ops(|op| {
                 match op {
                     SiloOp::Put { key, value } => {
@@ -466,8 +534,7 @@ impl DataSilo {
         self.data_len = offset;
         self.dead_bytes.store(0, Ordering::Relaxed); // full rewrite = no dead space
 
-        // Clear ops log
-        self.ops_log.lock().truncate()?;
+        // NOTE: caller (compact()) truncates the frozen log after this returns.
 
         eprintln!("DataSilo: cold compacted {} entries, {:.1}MB data, {:.1}MB index",
             count, offset as f64 / 1e6,
@@ -476,14 +543,15 @@ impl DataSilo {
     }
 
     /// Hot compaction: existing data file with pre-allocated buffer slots.
-    /// For each op, write in-place if it fits in the allocated slot, otherwise overflow.
+    /// For each op in the frozen log, write in-place if it fits, otherwise overflow.
     /// Delete tombstones zero out the index entry (length=0, allocated=0).
-    fn compact_hot(&mut self) -> io::Result<u64> {
-        // Collect last value per key from ops log (deletes stored as None)
+    /// `frozen_is_b`: true = ops_b is frozen, false = ops_a is frozen.
+    fn compact_hot_from(&mut self, frozen_is_b: bool) -> io::Result<u64> {
+        // Collect last value per key from frozen ops log (deletes stored as None)
         let mut ops: std::collections::HashMap<u32, Option<Vec<u8>>> = std::collections::HashMap::new();
         let mut max_key: u32 = 0;
         {
-            let log = self.ops_log.lock();
+            let log = if frozen_is_b { self.ops_b.lock() } else { self.ops_a.lock() };
             log.for_each_ops(|op| {
                 match op {
                     SiloOp::Put { key, value } => {
@@ -501,7 +569,6 @@ impl DataSilo {
 
         let count = ops.len() as u64;
         let mut in_place = 0u64;
-        let mut deleted = 0u64;
         let mut overflows: Vec<(u32, Vec<u8>)> = Vec::new();
 
         // Drop read-only data mmap so we can open as writable
@@ -536,7 +603,6 @@ impl DataSilo {
                             }
                         }
                     }
-                    deleted += 1;
                     continue;
                 }
             };
@@ -641,8 +707,7 @@ impl DataSilo {
         // Reload read-only data mmap
         self.load_data()?;
 
-        // Clear ops log
-        self.ops_log.lock().truncate()?;
+        // NOTE: caller (compact()) truncates the frozen log after this returns.
 
         eprintln!("DataSilo: hot compacted {} ops ({} in-place, {} overflow)",
             count, in_place, overflows.len());
@@ -786,7 +851,7 @@ mod tests {
             let silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
             silo.append_op(1, b"hello").unwrap();
             silo.append_op(2, b"world").unwrap();
-            silo.ops_log.lock().flush().unwrap();
+            silo.flush_ops().unwrap();
         }
         {
             let silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
@@ -908,5 +973,96 @@ mod tests {
 
         // Last write wins — reinsert after delete
         assert_eq!(silo.get(1).unwrap(), b"reinserted");
+    }
+
+    /// Verify that ops written after compact() starts are not lost.
+    ///
+    /// Simulates the race condition that the A-B swap is designed to prevent:
+    /// 1. Write initial ops (pre-compaction).
+    /// 2. Call compact() — which atomically switches the active slot, then
+    ///    compacts the frozen slot.
+    /// 3. Write more ops to the silo between compaction calls (they go to the
+    ///    now-active idle slot).
+    /// 4. Compact again — those later ops must survive.
+    #[test]
+    fn test_ab_swap_no_ops_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
+
+        // Phase 1: write some initial docs and compact (cold path).
+        silo.append_op(1, b"doc_1_v1").unwrap();
+        silo.append_op(2, b"doc_2_v1").unwrap();
+        silo.compact().unwrap();
+
+        assert_eq!(silo.get(1).unwrap(), b"doc_1_v1");
+        assert_eq!(silo.get(2).unwrap(), b"doc_2_v1");
+
+        // Phase 2: write ops that will be in the active slot during the NEXT compaction.
+        // These must not be lost even though compact() will swap the slot.
+        silo.append_op(1, b"doc_1_v2").unwrap(); // update existing
+        silo.append_op(3, b"doc_3_v1").unwrap(); // new key
+
+        // Compact (hot path). The swap happens inside compact():
+        // active slot (A) is frozen, new writes would go to B.
+        // The ops above were written to A before the swap, so they are in the frozen log
+        // and must be compacted in.
+        silo.compact().unwrap();
+
+        assert_eq!(silo.get(1).unwrap(), b"doc_1_v2", "update from active slot must survive");
+        assert_eq!(silo.get(2).unwrap(), b"doc_2_v1", "original doc must still be present");
+        assert_eq!(silo.get(3).unwrap(), b"doc_3_v1", "new doc from active slot must survive");
+
+        // Phase 3: write ops AFTER compact() returns (these go to the now-active B slot).
+        silo.append_op(4, b"doc_4_post_compact").unwrap();
+        silo.append_op(1, b"doc_1_v3").unwrap();
+
+        // These ops must be readable via get_with_ops before the next compact.
+        assert_eq!(
+            silo.get_with_ops(4).unwrap(),
+            b"doc_4_post_compact",
+            "post-compact op must be readable before next compact"
+        );
+        assert_eq!(
+            silo.get_with_ops(1).unwrap(),
+            b"doc_1_v3",
+            "post-compact update must shadow data file"
+        );
+
+        // Compact again to verify the post-compact ops also survive.
+        silo.compact().unwrap();
+
+        assert_eq!(silo.get(1).unwrap(), b"doc_1_v3");
+        assert_eq!(silo.get(4).unwrap(), b"doc_4_post_compact");
+
+        // No ops should remain after full compaction of a quiet silo.
+        assert!(!silo.has_ops(), "both slots should be empty after compacting all ops");
+    }
+
+    /// Verify that legacy ops.log is migrated to ops_a.log on open.
+    #[test]
+    fn test_legacy_ops_log_migration() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Simulate old-format silo: create ops.log directly.
+        {
+            let mut log = OpsLog::open(&dir.path().join("ops.log")).unwrap();
+            log.append(&SiloOp::Put { key: 77, value: b"legacy_value".to_vec() }).unwrap();
+            log.flush().unwrap();
+        }
+
+        // Opening should silently migrate ops.log → ops_a.log.
+        let silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
+
+        // ops.log should no longer exist.
+        assert!(!dir.path().join("ops.log").exists(), "legacy ops.log should have been renamed");
+        // ops_a.log should exist.
+        assert!(dir.path().join("ops_a.log").exists(), "ops_a.log should exist after migration");
+
+        // The migrated data should be readable.
+        assert_eq!(
+            silo.get_with_ops(77).unwrap(),
+            b"legacy_value",
+            "migrated ops must be readable"
+        );
     }
 }

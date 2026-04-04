@@ -334,6 +334,11 @@ impl OpsLog {
         self.cursor.load(Ordering::Relaxed)
     }
 
+    /// Returns true if no ops have been written to this log.
+    pub fn is_empty(&self) -> bool {
+        self.cursor.load(Ordering::Relaxed) == 0
+    }
+
     /// Truncate the ops log (after compaction). Drops the mmap, truncates file.
     pub fn truncate(&mut self) -> io::Result<()> {
         self.mmap = None;
