@@ -1457,6 +1457,44 @@ impl ConcurrentEngine {
     /// Load the current snapshot (lock-free, zero refcount ops).
     ///
     /// Returns a Guard that derefs to Arc<InnerEngine>. Unlike `load_full()`,
+    /// Send mutation ops to BOTH the coalescer channel AND the BitmapSilo ops log.
+    /// During Phase 2→4 transition, both paths receive the ops. Phase 4 removes
+    /// the coalescer, leaving only the silo ops log.
+    fn send_mutation_ops(&self, ops: Vec<MutationOp>) -> Result<()> {
+        // Write to BitmapSilo ops log (the V3 path)
+        if let Some(ref silo_arc) = self.bitmap_silo {
+            let silo = silo_arc.read();
+            for op in &ops {
+                match op {
+                    MutationOp::FilterInsert { field, value, slots } => {
+                        for &slot in slots { let _ = silo.filter_set(field, *value, slot); }
+                    }
+                    MutationOp::FilterRemove { field, value, slots } => {
+                        for &slot in slots { let _ = silo.filter_clear(field, *value, slot); }
+                    }
+                    MutationOp::SortSet { field, bit_layer, slots } => {
+                        for &slot in slots { let _ = silo.sort_set(field, *bit_layer, slot); }
+                    }
+                    MutationOp::SortClear { field, bit_layer, slots } => {
+                        for &slot in slots { let _ = silo.sort_clear(field, *bit_layer, slot); }
+                    }
+                    MutationOp::AliveInsert { slots } => {
+                        for &slot in slots { let _ = silo.alive_set(slot); }
+                    }
+                    MutationOp::AliveRemove { slots } => {
+                        for &slot in slots { let _ = silo.alive_clear(slot); }
+                    }
+                    MutationOp::DeferredAlive { .. } => {} // handled separately
+                }
+            }
+        }
+        // Also send to coalescer (the V2 path — removed in Phase 4)
+        self.sender.send_batch(ops).map_err(|_| {
+            crate::error::BitdexError::CapacityExceeded("coalescer channel disconnected".to_string())
+        })?;
+        Ok(())
+    }
+
     /// this avoids atomic refcount increment/decrement and moves deallocation
     /// of old snapshots off the reader path onto the flush thread's `store()`.
     fn snapshot(&self) -> Guard<Arc<InnerEngine>> {
@@ -1555,11 +1593,7 @@ impl ConcurrentEngine {
         // Compute diff purely -> Vec<MutationOp>
         let ops = diff_document(id, old_doc.as_ref(), doc, &self.config, is_upsert, &self.field_registry);
         // Send ops to coalescer channel
-        self.sender.send_batch(ops).map_err(|_| {
-            crate::error::BitdexError::CapacityExceeded(
-                "coalescer channel disconnected".to_string(),
-            )
-        })?;
+        self.send_mutation_ops(ops)?;
         // Enqueue doc write — flush thread will batch these
         let stored = StoredDoc {
             fields: doc.fields.clone(),
@@ -1586,11 +1620,7 @@ impl ConcurrentEngine {
                 }
             }
             let ops = diff_patch(id, patch, &self.config, &self.field_registry);
-            self.sender.send_batch(ops).map_err(|_| {
-                crate::error::BitdexError::CapacityExceeded(
-                    "coalescer channel disconnected".to_string(),
-                )
-            })?;
+            self.send_mutation_ops(ops)?;
             Ok(())
         })();
         self.in_flight.clear_in_flight(id);
@@ -1624,11 +1654,7 @@ impl ConcurrentEngine {
             );
             // Send bitmap mutations
             if !ops.is_empty() {
-                self.sender.send_batch(ops).map_err(|_| {
-                    crate::error::BitdexError::CapacityExceeded(
-                        "coalescer channel disconnected".to_string(),
-                    )
-                })?;
+                self.send_mutation_ops(ops)?;
             }
             // Merge provided fields into stored doc (preserve existing fields)
             let mut merged_fields = old_doc
@@ -1692,11 +1718,7 @@ impl ConcurrentEngine {
             }
             // Clear the alive bit last
             ops.push(MutationOp::AliveRemove { slots: vec![id] });
-            self.sender.send_batch(ops).map_err(|_| {
-                crate::error::BitdexError::CapacityExceeded(
-                    "coalescer channel disconnected".to_string(),
-                )
-            })?;
+            self.send_mutation_ops(ops)?;
             Ok(())
         })();
         self.in_flight.clear_in_flight(id);
@@ -1760,11 +1782,7 @@ impl ConcurrentEngine {
                 });
             }
             if !ops.is_empty() {
-                self.sender.send_batch(ops).map_err(|_| {
-                    crate::error::BitdexError::CapacityExceeded(
-                        "coalescer channel disconnected".to_string(),
-                    )
-                })?;
+                self.send_mutation_ops(ops)?;
             }
             Ok(())
         })();
@@ -3664,12 +3682,8 @@ impl ConcurrentEngine {
                     },
                 ));
             }
-            // Phase 5: Send all ops in one burst
-            self.sender.send_batch(all_ops).map_err(|_| {
-                crate::error::BitdexError::CapacityExceeded(
-                    "coalescer channel disconnected".to_string(),
-                )
-            })?;
+            // Phase 5: Send all ops to both silo and coalescer
+            self.send_mutation_ops(all_ops)?;
             // Phase 6: Enqueue all doc writes
             for item in doc_writes {
                 self.doc_tx.send(item).map_err(|_| {
