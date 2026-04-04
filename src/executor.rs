@@ -152,80 +152,48 @@ impl<'a> QueryExecutor<'a> {
     }
     /// Get the effective bitmap for a filter field+value, using frozen fallback.
     ///
-    /// 1. If the VersionedBitmap exists and is loaded → use its fused() result
-    /// 2. If the VersionedBitmap exists but is unloaded → frozen base from silo + diff
-    /// 3. If no VersionedBitmap exists → try frozen from silo
-    /// 4. None → value doesn't exist anywhere
+    /// Get the effective bitmap for a filter field+value.
+    ///
+    /// Combines data from BitmapSilo (frozen base + silo ops) with in-memory
+    /// VersionedBitmap diffs (mutations not yet written to silo). During the
+    /// Phase 2→4 transition, both sources may have data. Once mutations go
+    /// directly to the silo ops log (Phase 2 complete), the VersionedBitmap
+    /// fallback becomes unnecessary.
     fn get_effective_bitmap(&self, field_name: &str, value: u64) -> Option<RoaringBitmap> {
-        if let Some(field) = self.filters.get_field(field_name) {
-            if let Some(vb) = field.get_versioned(value) {
-                if vb.is_loaded() {
-                    // In-memory base is valid
-                    return Some(vb.fused());
-                }
-                // Base is unloaded — try frozen from silo, apply diff
-                if let Some(silo) = self.bitmap_silo {
-                    if let Some(frozen) = silo.get_frozen_filter(field_name, value) {
-                        if vb.is_dirty() {
-                            // frozen_base | sets - clears
-                            let mut result = frozen.to_owned();
-                            result |= &vb.diff().sets;
-                            result -= &vb.diff().clears;
-                            return Some(result);
-                        } else {
-                            // No diffs, just the frozen base — materialize for compatibility
-                            return Some(frozen.to_owned());
-                        }
-                    }
-                }
-                // No frozen backup — return what we have (empty base + diff)
-                return Some(vb.fused());
+        // Start with BitmapSilo ops-on-read (frozen base + pending silo ops)
+        let silo_bitmap = self.bitmap_silo
+            .and_then(|silo| silo.get_filter_with_ops(field_name, value));
+
+        // Check in-memory VersionedBitmap for mutations not yet in silo
+        let mem_bitmap = self.filters.get_field(field_name)
+            .and_then(|field| field.get_versioned(value))
+            .filter(|vb| vb.is_dirty()) // only if there are pending diffs
+            .map(|vb| vb.fused());
+
+        match (silo_bitmap, mem_bitmap) {
+            (Some(silo), Some(mem)) => {
+                // Union: silo has the base + silo ops, mem has in-memory diffs
+                Some(&silo | &mem)
+            }
+            (Some(silo), None) => Some(silo),
+            (None, Some(mem)) => Some(mem),
+            (None, None) => {
+                // Neither has data — try VersionedBitmap base (for tests without silo)
+                self.filters.get_field(field_name)
+                    .and_then(|field| field.get_versioned(value))
+                    .map(|vb| vb.fused())
             }
         }
-        // Value not in FilterIndex — try silo directly
-        if let Some(silo) = self.bitmap_silo {
-            if let Some(frozen) = silo.get_frozen_filter(field_name, value) {
-                return Some(frozen.to_owned());
-            }
-        }
-        None
     }
 
     /// AND a frozen or in-memory filter bitmap into an accumulator.
     /// Like get_effective_bitmap but intersects with candidates directly,
     /// avoiding full materialization when possible.
+    /// AND a filter bitmap into an accumulator.
+    /// Uses get_effective_bitmap then intersects with acc.
     fn and_effective_bitmap(&self, acc: &RoaringBitmap, field_name: &str, value: u64) -> Option<RoaringBitmap> {
-        if let Some(field) = self.filters.get_field(field_name) {
-            if let Some(vb) = field.get_versioned(value) {
-                if vb.is_loaded() {
-                    // In-memory: use existing diff-aware AND
-                    return Some(if vb.is_dirty() {
-                        vb.apply_diff(acc)
-                    } else {
-                        acc & vb.base()
-                    });
-                }
-                // Unloaded — try frozen AND
-                if let Some(silo) = self.bitmap_silo {
-                    if let Some(frozen) = silo.get_frozen_filter(field_name, value) {
-                        let mut result = acc & &frozen;
-                        if vb.is_dirty() {
-                            result |= acc & &vb.diff().sets;
-                            result -= &vb.diff().clears;
-                        }
-                        return Some(result);
-                    }
-                }
-                return Some(vb.apply_diff(acc));
-            }
-        }
-        // Not in FilterIndex — try silo
-        if let Some(silo) = self.bitmap_silo {
-            if let Some(frozen) = silo.get_frozen_filter(field_name, value) {
-                return Some(acc & &frozen);
-            }
-        }
-        None
+        self.get_effective_bitmap(field_name, value)
+            .map(|bm| acc & &bm)
     }
 
     /// Build a bitmap for a single id = N filter (intersected with alive).
