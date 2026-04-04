@@ -6,7 +6,7 @@ use crate::error::{BitdexError, Result};
 use crate::engine::filter::FilterIndex;
 use crate::query::planner;
 use crate::query::{FilterClause, SortClause, SortDirection, Value};
-use crate::query_metrics::{ClauseTrace, QueryTraceCollector};
+use crate::query::metrics::{ClauseTrace, QueryTraceCollector};
 use crate::engine::slot::SlotAllocator;
 use crate::engine::sort::SortIndex;
 use crate::types::QueryResult;
@@ -63,6 +63,31 @@ impl<'a> QueryExecutor<'a> {
             case_sensitive_fields: None,
             dictionaries: None,
             bitmap_silo: None,
+        }
+    }
+    /// Full constructor — avoids chaining 5 conditional `.with_*()` calls.
+    pub fn new_full(
+        slots: &'a SlotAllocator,
+        filters: &'a FilterIndex,
+        sorts: &'a SortIndex,
+        max_page_size: usize,
+        bitmap_silo: Option<&'a BitmapSilo>,
+        string_maps: Option<&'a StringMaps>,
+        case_sensitive_fields: Option<&'a CaseSensitiveFields>,
+        dictionaries: Option<&'a HashMap<String, FieldDictionary>>,
+        time_buckets: Option<(&'a crate::time_buckets::TimeBucketManager, u64)>,
+    ) -> Self {
+        Self {
+            slots,
+            filters,
+            sorts,
+            max_page_size,
+            time_buckets: time_buckets.map(|(tb, _)| tb),
+            now_unix: time_buckets.map(|(_, n)| n).unwrap_or(0),
+            string_maps,
+            case_sensitive_fields,
+            dictionaries,
+            bitmap_silo,
         }
     }
     /// Attach string maps for MappedString field reverse lookup.
@@ -883,92 +908,6 @@ impl<'a> QueryExecutor<'a> {
             ids,
             total_matched,
             cursor,
-        })
-    }
-    /// Paginate using a RadixSortIndex (bucket-based fast path for expanded entries).
-    ///
-    /// Instead of traversing 32 bit layers on the full bitmap, this:
-    /// 1. Uses cumulative rank arrays to skip directly to the target bucket (O(1) for offset)
-    /// 2. Calls top_n on a small bucket bitmap (~250 items at 64K uniform) instead of 64K
-    /// 3. Collects results across buckets until limit is reached
-    pub fn execute_from_radix(
-        &self,
-        radix: &crate::radix_sort::RadixSortIndex,
-        sort_clause: &SortClause,
-        limit: usize,
-        cursor: Option<&crate::query::CursorPosition>,
-        total_matched: u64,
-    ) -> Result<QueryResult> {
-        let sort_field = self
-            .sorts
-            .get_field(&sort_clause.field)
-            .ok_or_else(|| BitdexError::FieldNotFound(sort_clause.field.clone()))?;
-        let descending = sort_clause.direction == SortDirection::Desc;
-        let limit = limit.min(self.max_page_size);
-        let cursor_prefix = cursor.map(|c| (c.sort_value >> 24) as u8);
-        let cursor_param = cursor.map(|c| (c.sort_value, c.slot_id));
-        let mut result_ids: Vec<i64> = Vec::with_capacity(limit);
-        let mut remaining = limit;
-        let mut last_slot: Option<u32> = None;
-        for (prefix, bucket_bm) in radix.iter_buckets(sort_clause.direction) {
-            if remaining == 0 {
-                break;
-            }
-            // Skip buckets that are entirely before the cursor
-            if let Some(cp) = cursor_prefix {
-                match sort_clause.direction {
-                    SortDirection::Desc => {
-                        if prefix > cp {
-                            // This bucket has higher prefix than cursor — all slots are before cursor
-                            continue;
-                        }
-                    }
-                    SortDirection::Asc => {
-                        if prefix < cp {
-                            continue;
-                        }
-                    }
-                }
-            }
-            // For the cursor bucket, pass the cursor. For subsequent buckets, no cursor needed.
-            let bucket_cursor = if cursor_prefix == Some(prefix) {
-                cursor_param
-            } else {
-                None
-            };
-            let frozen_layers = self.build_frozen_sort_layers(&sort_clause.field, sort_field.num_bits());
-            let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
-                Some(frozen_layers.as_slice())
-            } else {
-                None
-            };
-            let sorted_slots = sort_field.top_n_frozen(bucket_bm, remaining, descending, bucket_cursor, frozen_ref);
-            for &slot in &sorted_slots {
-                result_ids.push(slot as i64);
-                last_slot = Some(slot);
-                remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
-            }
-        }
-        let frozen_layers = self.build_frozen_sort_layers(&sort_clause.field, sort_field.num_bits());
-        let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
-            Some(frozen_layers.as_slice())
-        } else {
-            None
-        };
-        let next_cursor = last_slot.map(|slot| {
-            let sort_value = sort_field.reconstruct_value_frozen(slot, frozen_ref) as u64;
-            crate::query::CursorPosition {
-                sort_value,
-                slot_id: slot,
-            }
-        });
-        Ok(QueryResult {
-            ids: result_ids,
-            cursor: next_cursor,
-            total_matched,
         })
     }
     /// Simple in-memory sort for small result sets.

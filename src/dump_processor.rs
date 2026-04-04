@@ -1196,18 +1196,9 @@ pub fn process_dump(
     }
     eprintln!("  Dump {} apply_bitmaps in {:.1}s", request.name, t_apply.elapsed().as_secs_f64());
 
-    // Save bitmaps to BitmapSilo for persistence across restarts.
-    if engine.config().storage.bitmap_path.is_some() {
-        let t_save = Instant::now();
-        engine.save_snapshot()
-            .map_err(|e| format!("save_snapshot: {e}"))?;
-        eprintln!("  Dump {} save_snapshot in {:.1}s", request.name, t_save.elapsed().as_secs_f64());
-    }
-
-    // Compact doc silo after each phase.
-    let t_compact = Instant::now();
-    compact_after_dumps(engine)?;
-    eprintln!("  Dump {} compact in {:.1}s", request.name, t_compact.elapsed().as_secs_f64());
+    // NOTE: save_snapshot and doc compact are deferred to after all phases complete.
+    // Doing them per-phase was adding 35s+ of overhead per phase (10s save + 24s compact).
+    // The caller (server dump handler) calls save_snapshot + compact once at the end.
 
     // Persist LCS dictionaries after each phase.
     if let Some(ref bitmap_path) = engine.config().storage.bitmap_path {

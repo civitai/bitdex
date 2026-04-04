@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
-use crate::concurrent_engine::ConcurrentEngine;
+use crate::engine::ConcurrentEngine;
 use crate::config::{DataSchema, FieldMapping, FieldValueType};
 use crate::dictionary::FieldDictionary;
 use crate::mutation::{Document, FieldValue};

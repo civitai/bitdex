@@ -178,6 +178,103 @@ impl BitmapSilo {
         Ok(count)
     }
 
+    /// Save all bitmaps using parallel writes for maximum throughput.
+    /// Serializes bitmaps in parallel via rayon, writes directly to data.bin + index.bin
+    /// using DataSilo::write_batch_parallel() — bypasses the ops log entirely.
+    pub fn save_all_parallel(
+        &mut self,
+        filters: &FilterIndex,
+        sorts: &SortIndex,
+        slots: &SlotAllocator,
+        cursors: &HashMap<String, String>,
+    ) -> io::Result<u64> {
+        use rayon::prelude::*;
+
+        // Step 1: Alive + metadata (small, sequential)
+        let alive = slots.alive_bitmap();
+        let alive_size = alive.frozen_serialized_size();
+        let mut alive_buf = vec![0u8; alive_size];
+        alive.serialize_frozen_into(&mut alive_buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("frozen serialize alive: {e:?}")))?;
+
+        let meta = serde_json::json!({
+            "slot_counter": slots.slot_counter(),
+            "cursors": cursors,
+        });
+        let meta_bytes = serde_json::to_vec(&meta)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Step 2: Collect all bitmap (key, RoaringBitmap) pairs with key assignment
+        // Use name_to_key + next_key refs to avoid borrowing &mut self in closures
+        let name_to_key = &self.name_to_key;
+        let key_to_name = &self.key_to_name;
+        let next_key = &self.next_key;
+        let ensure = |name: &str| -> u32 {
+            if let Some(&key) = name_to_key.read().get(name) { return key; }
+            let mut map = name_to_key.write();
+            if let Some(&key) = map.get(name) { return key; }
+            let key = next_key.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            map.insert(name.to_string(), key);
+            key_to_name.write().insert(key, name.to_string());
+            key
+        };
+
+        let filter_items: Vec<(u32, RoaringBitmap)> = filters.fields()
+            .flat_map(|(field_name, field)| {
+                field.bitmaps_fused().map(move |(value, bitmap)| {
+                    let name = format!("filter:{}:{}", field_name, value);
+                    let key = ensure(&name);
+                    (key, bitmap)
+                })
+            })
+            .collect();
+
+        let sort_items: Vec<(u32, RoaringBitmap)> = sorts.fields()
+            .flat_map(|(field_name, field)| {
+                field.layers_fused().into_iter().enumerate()
+                    .filter(|(_, bm)| !bm.is_empty())
+                    .map(move |(bit_idx, bitmap)| {
+                        let name = format!("sort:{}:{}", field_name, bit_idx);
+                        let key = ensure(&name);
+                        (key, bitmap)
+                    })
+            })
+            .collect();
+
+        // Step 3: Parallel serialize all bitmaps to frozen bytes
+        let filter_bufs: Vec<(u32, Vec<u8>)> = filter_items.par_iter()
+            .map(|(key, bitmap)| {
+                let size = bitmap.frozen_serialized_size();
+                let mut buf = vec![0u8; size];
+                bitmap.serialize_frozen_into(&mut buf).ok();
+                (*key, buf)
+            })
+            .collect();
+
+        let sort_bufs: Vec<(u32, Vec<u8>)> = sort_items.par_iter()
+            .map(|(key, bitmap)| {
+                let size = bitmap.frozen_serialized_size();
+                let mut buf = vec![0u8; size];
+                bitmap.serialize_frozen_into(&mut buf).ok();
+                (*key, buf)
+            })
+            .collect();
+
+        // Step 4: Combine all entries and write directly to data.bin + index.bin
+        let mut all_entries: Vec<(u32, Vec<u8>)> = Vec::with_capacity(
+            2 + filter_bufs.len() + sort_bufs.len()
+        );
+        all_entries.push((KEY_ALIVE, alive_buf));
+        all_entries.push((KEY_META, meta_bytes));
+        all_entries.extend(filter_bufs);
+        all_entries.extend(sort_bufs);
+
+        let count = self.silo.write_batch_parallel(&all_entries)?;
+        self.save_manifest()?;
+
+        Ok(count)
+    }
+
     // ── Load ────────────────────────────────────────────────────────────
 
     /// Load metadata from the silo.
@@ -362,6 +459,24 @@ impl BitmapSilo {
         self.silo.append_op(KEY_ALIVE, &buf)
     }
 
+    // ── Parallel bulk writer (for dump pipeline) ──────────────────────
+
+    /// Prepare a lock-free parallel writer for bulk bitmap mutations.
+    /// Used by the dump pipeline — rayon threads write ops without mutex contention.
+    /// Call `flush_parallel_writer()` after all writes are done.
+    pub fn prepare_parallel_writer(&self, estimated_ops: u64) -> io::Result<ParallelBitmapWriter> {
+        // Each op is ~25 bytes framed (4 header + 4 key + 5 value + CRC + padding)
+        let estimated_bytes = estimated_ops * 25;
+        let writer = self.silo.prepare_parallel_ops(estimated_bytes)?;
+        Ok(ParallelBitmapWriter { writer, silo: self })
+    }
+
+    /// Flush ops and save manifest after parallel writes complete.
+    pub fn flush_parallel_writer(&self) -> io::Result<()> {
+        self.silo.flush_ops()?;
+        self.save_manifest()
+    }
+
     // ── Ops-on-read (frozen base + pending mutations) ─────────────────
 
     /// Read a filter bitmap with pending ops applied.
@@ -529,6 +644,88 @@ impl BitmapSilo {
             }
         }
         count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ParallelBitmapWriter — lock-free bulk bitmap writes for the dump pipeline
+// ---------------------------------------------------------------------------
+
+/// Lock-free parallel writer for bulk bitmap mutations.
+/// Created by `BitmapSilo::prepare_parallel_writer()`.
+/// Each rayon thread gets its own cursor/end pair for zero-contention writes.
+pub struct ParallelBitmapWriter<'a> {
+    writer: datasilo::ParallelOpsWriter,
+    silo: &'a BitmapSilo,
+}
+
+// Safety: writer is Send+Sync (atomic cursor + disjoint mmap regions).
+// silo ref is shared read-only (ensure_key uses internal RwLock).
+unsafe impl Send for ParallelBitmapWriter<'_> {}
+unsafe impl Sync for ParallelBitmapWriter<'_> {}
+
+impl<'a> ParallelBitmapWriter<'a> {
+    /// Set a single bit in a filter bitmap. Lock-free, safe from rayon threads.
+    /// `cursor` and `end` are thread-local state — initialize both to 0.
+    #[inline]
+    pub fn filter_set(&self, field: &str, value: u64, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
+        let name = format!("filter:{}:{}", field, value);
+        let key = self.silo.ensure_key(&name);
+        let mut buf = [0u8; 5];
+        buf[0] = OP_SET_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.writer.write_put(key, &buf, cursor, end)
+    }
+
+    /// Clear a single bit in a filter bitmap. Lock-free.
+    #[inline]
+    pub fn filter_clear(&self, field: &str, value: u64, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
+        let name = format!("filter:{}:{}", field, value);
+        let key = self.silo.ensure_key(&name);
+        let mut buf = [0u8; 5];
+        buf[0] = OP_CLEAR_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.writer.write_put(key, &buf, cursor, end)
+    }
+
+    /// Set a single bit in a sort layer bitmap. Lock-free.
+    #[inline]
+    pub fn sort_set(&self, field: &str, bit_idx: usize, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
+        let name = format!("sort:{}:{}", field, bit_idx);
+        let key = self.silo.ensure_key(&name);
+        let mut buf = [0u8; 5];
+        buf[0] = OP_SET_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.writer.write_put(key, &buf, cursor, end)
+    }
+
+    /// Clear a single bit in a sort layer bitmap. Lock-free.
+    #[inline]
+    pub fn sort_clear(&self, field: &str, bit_idx: usize, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
+        let name = format!("sort:{}:{}", field, bit_idx);
+        let key = self.silo.ensure_key(&name);
+        let mut buf = [0u8; 5];
+        buf[0] = OP_CLEAR_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.writer.write_put(key, &buf, cursor, end)
+    }
+
+    /// Set a bit in the alive bitmap. Lock-free.
+    #[inline]
+    pub fn alive_set(&self, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
+        let mut buf = [0u8; 5];
+        buf[0] = OP_SET_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.writer.write_put(KEY_ALIVE, &buf, cursor, end)
+    }
+
+    /// Clear a bit in the alive bitmap. Lock-free.
+    #[inline]
+    pub fn alive_clear(&self, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
+        let mut buf = [0u8; 5];
+        buf[0] = OP_CLEAR_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.writer.write_put(KEY_ALIVE, &buf, cursor, end)
     }
 }
 

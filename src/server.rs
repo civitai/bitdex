@@ -328,7 +328,7 @@ struct AppState {
     /// Minimum query latency (microseconds) to record a trace. 0 = record all.
     trace_min_us: AtomicU64,
     admin_token: Option<String>,
-    trace_buffer: crate::query_metrics::TraceBuffer,
+    trace_buffer: crate::query::metrics::TraceBuffer,
     /// Number of queries currently executing (incremented on entry, decremented on exit).
     queries_in_flight: AtomicI64,
     /// Peak concurrent queries since startup (updated atomically via fetch_max).
@@ -915,15 +915,8 @@ struct ConfigPatch {
     /// entries give only ~5.5s of history — increase for cache analysis.
     #[serde(default)]
     trace_buffer_size: Option<usize>,
-    /// Toggle expensive metric groups at runtime. Array of group names to enable.
-    /// Groups: "bitmap_memory"
-    /// DEPRECATED: Use disabled_metrics instead.
-    /// If provided, ONLY listed groups are enabled (others disabled).
-    #[serde(default)]
-    enabled_metrics: Option<Vec<String>>,
-
     /// Metric groups to DISABLE (opt-out). Default: all ON.
-    /// Takes precedence over enabled_metrics.
+    /// Groups: "bitmap_memory"
     #[serde(default)]
     disabled_metrics: Option<Vec<String>>,
 }
@@ -1070,7 +1063,7 @@ impl BitdexServer {
             enable_traces: AtomicBool::new(self.enable_traces),
             trace_min_us: AtomicU64::new(0),
             admin_token,
-            trace_buffer: crate::query_metrics::TraceBuffer::new(self.trace_buffer_size),
+            trace_buffer: crate::query::metrics::TraceBuffer::new(self.trace_buffer_size),
             queries_in_flight: AtomicI64::new(0),
             queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
@@ -1121,15 +1114,9 @@ impl BitdexServer {
         if let Some(ref idx) = *state.index.lock() {
             let config = &idx.definition.config;
             if let Some(ref disabled) = config.disabled_metrics {
-                // Opt-out model: everything ON except what's listed
                 let bm = !disabled.iter().any(|g| g == "bitmap_memory");
                 state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
                 eprintln!("Restored disabled_metrics from config: {:?} (bitmap_memory={bm})", disabled);
-            } else if let Some(ref groups) = config.enabled_metrics {
-                // Legacy opt-in model (deprecated)
-                let bm = groups.iter().any(|g| g == "bitmap_memory");
-                state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                eprintln!("Restored enabled_metrics (legacy) from config: {:?} (bitmap_memory={bm})", groups);
             }
             // If neither is set: all metrics default to ON (AtomicBool defaults true)
         }
@@ -2148,19 +2135,12 @@ async fn handle_patch_config(
                     eprintln!("Config patch: trace_buffer_size set to {v}");
                 }
 
-                // Toggle metric groups — disabled_metrics takes precedence
+                // Toggle metric groups
                 if let Some(ref disabled) = patch.disabled_metrics {
                     let bm = !disabled.iter().any(|g| g == "bitmap_memory");
                     state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
                     idx.definition.config.disabled_metrics = Some(disabled.clone());
-                    idx.definition.config.enabled_metrics = None; // clear legacy
                     eprintln!("Config patch: disabled_metrics = {:?} (bitmap_memory={bm})", disabled);
-                } else if let Some(ref groups) = patch.enabled_metrics {
-                    // Legacy opt-in (deprecated)
-                    let bm = groups.iter().any(|g| g == "bitmap_memory");
-                    state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                    idx.definition.config.enabled_metrics = Some(groups.clone());
-                    eprintln!("Config patch: enabled_metrics (legacy) = {:?} (bitmap_memory={bm})", groups);
                 }
 
                 // Persist updated config
@@ -4447,6 +4427,25 @@ async fn handle_register_dump(
                     // Other phases just save to disk — fields get loaded lazily on first query.
                     if phase_sets_alive {
                         crate::dump_processor::reload_after_dumps(&engine_for_reload, true);
+                    }
+
+                    // Save bitmaps + compact doc silo after each phase completes.
+                    // (Moved out of process_dump to measure separately.)
+                    if engine_for_reload.config().storage.bitmap_path.is_some() {
+                        let t_save = std::time::Instant::now();
+                        if let Err(e) = engine_for_reload.save_snapshot() {
+                            eprintln!("WARNING: save_snapshot after dump '{}': {e}", dump_name_inner);
+                        } else {
+                            eprintln!("  Dump {} save_snapshot in {:.1}s", dump_name_inner, t_save.elapsed().as_secs_f64());
+                        }
+                    }
+                    {
+                        let t_compact = std::time::Instant::now();
+                        if let Err(e) = crate::dump_processor::compact_after_dumps(&engine_for_reload) {
+                            eprintln!("WARNING: compact after dump '{}': {e}", dump_name_inner);
+                        } else {
+                            eprintln!("  Dump {} compact in {:.1}s", dump_name_inner, t_compact.elapsed().as_secs_f64());
+                        }
                     }
 
                     tasks.set_complete(

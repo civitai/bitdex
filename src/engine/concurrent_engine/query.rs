@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use parking_lot::MutexGuard;
 use super::ConcurrentEngine;
-use crate::cache;
+use crate::silos::cache;
 use crate::silos::cache_silo::UnifiedKey;
 use crate::error::Result;
 use crate::engine::executor::QueryExecutor;
 use crate::query::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause};
-use crate::query_metrics::{QueryTrace, QueryTraceCollector, SortTrace};
+use crate::query::metrics::{QueryTrace, QueryTraceCollector, SortTrace};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
 
@@ -34,31 +34,18 @@ impl ConcurrentEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let executor = {
-            let mut base = QueryExecutor::new(
-                &*slots_r,
-                &*filters_r,
-                &*sorts_r,
-                self.config.max_page_size,
-            );
-            if let Some(ref guard) = silo_guard {
-                base = base.with_bitmap_silo(guard);
-            }
-            if let Some(ref maps) = self.string_maps {
-                base = base.with_string_maps(maps);
-            }
-            if let Some(ref cs) = self.case_sensitive_fields {
-                base = base.with_case_sensitive_fields(cs);
-            }
-            if !self.dictionaries.is_empty() {
-                base = base.with_dictionaries(&self.dictionaries);
-            }
-            if let Some(ref tb) = tb_guard {
-                base.with_time_buckets(tb, now_unix)
-            } else {
-                base
-            }
-        };
+        let dicts = if self.dictionaries.is_empty() { None } else { Some(&*self.dictionaries) };
+        let executor = QueryExecutor::new_full(
+            &*slots_r,
+            &*filters_r,
+            &*sorts_r,
+            self.config.max_page_size,
+            silo_guard.as_deref(),
+            self.string_maps.as_ref().map(|m| &**m),
+            self.case_sensitive_fields.as_ref().map(|c| &**c),
+            dicts,
+            tb_guard.as_deref().map(|tb| (tb, now_unix)),
+        );
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, filters, tb_guard.as_deref(), now_unix)?;
         let result =
@@ -86,31 +73,18 @@ impl ConcurrentEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let executor = {
-            let mut base = QueryExecutor::new(
-                &*slots_r,
-                &*filters_r,
-                &*sorts_r,
-                self.config.max_page_size,
-            );
-            if let Some(ref guard) = silo_guard {
-                base = base.with_bitmap_silo(guard);
-            }
-            if let Some(ref maps) = self.string_maps {
-                base = base.with_string_maps(maps);
-            }
-            if let Some(ref cs) = self.case_sensitive_fields {
-                base = base.with_case_sensitive_fields(cs);
-            }
-            if !self.dictionaries.is_empty() {
-                base = base.with_dictionaries(&self.dictionaries);
-            }
-            if let Some(ref tb) = tb_guard {
-                base.with_time_buckets(tb, now_unix)
-            } else {
-                base
-            }
-        };
+        let dicts = if self.dictionaries.is_empty() { None } else { Some(&*self.dictionaries) };
+        let executor = QueryExecutor::new_full(
+            &*slots_r,
+            &*filters_r,
+            &*sorts_r,
+            self.config.max_page_size,
+            silo_guard.as_deref(),
+            self.string_maps.as_ref().map(|m| &**m),
+            self.case_sensitive_fields.as_ref().map(|c| &**c),
+            dicts,
+            tb_guard.as_deref().map(|tb| (tb, now_unix)),
+        );
         // ── Snap range filters to bucket bitmaps BEFORE cache key ──
         // This ensures cache keys use stable bucket names ("7d") instead of
         // moving timestamps, so all queries within the same bucket window share

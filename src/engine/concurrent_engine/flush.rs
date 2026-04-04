@@ -151,59 +151,10 @@ pub fn run_flush_thread(args: FlushArgs) {
                 }
             }
             flush_timebucket_ns.store(t_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            // CacheSilo: invalidate stale entries when mutations touch their fields.
-            // Any cache entry whose filter/sort fields changed is deleted from the silo
-            // so the next query recomputes and re-seeds it.
-            let t_cache = Instant::now();
-            if let Some(ref cs_arc) = flush_cache_silo {
-                if batch.has_alive_mutations() || !batch.mutated_filter_fields().is_empty() {
-                    // On any write we delete ALL cached entries because we don't
-                    // maintain a meta-index mapping (field, value) → cache keys.
-                    // The silo is small (hundreds of entries), so full invalidation
-                    // is cheap and correct. Entries are re-seeded on next query miss.
-                    //
-                    // Future optimization: build a per-entry field fingerprint and
-                    // do targeted deletion. For now correctness > complexity.
-                    let _cs = cs_arc.read(); // no-op drop — invalidation done at query time by recomputing on miss
-                }
-            }
-            flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            flush_cache_ns.store(0, Ordering::Relaxed);
             // Yield CPU after cache work to let tokio deliver responses.
             std::thread::yield_now();
-            // Periodic filter diff compaction: merge dirty diffs into
-            // bases so apply_diff/fused don't accumulate unbounded diffs.
-            // Runs every COMPACTION_INTERVAL flush cycles (~5s).
-            // Sort diffs and alive are already merged eagerly in WriteBatch::apply().
-            //
-            // CRITICAL: Only compact fields that have dirty diffs. Using
-            // fields_mut() iterates ALL fields and calls Arc::make_mut on
-            // each — which deep-clones the entire FilterField HashMap when
-            // the Arc is shared with a published snapshot (refcount > 1).
-            // For tagIds (31K entries), this clone takes seconds. Targeted
-            // compaction avoids the clone cascade on untouched fields.
-            let t_compact = Instant::now();
-            if flush_cycle % COMPACTION_INTERVAL == 0 {
-                // Collect names of dirty fields first under read lock (no write needed)
-                let dirty_fields: Vec<String> = {
-                    let filters_r = flush_filters.read();
-                    filters_r.fields()
-                        .filter(|(_, field)| field.has_dirty())
-                        .map(|(name, _)| name.clone())
-                        .collect()
-                };
-                // NOTE: Auto-loading bases for dirty+unloaded entries is disabled.
-                // It caused OOM by loading all dirty postId bases (22M values)
-                // at once during compaction. Only merge fields that have dirty diffs.
-                if !dirty_fields.is_empty() {
-                    let mut filters_w = flush_filters.write();
-                    for name in &dirty_fields {
-                        if let Some(field) = filters_w.get_field_mut(name) {
-                            field.merge_dirty();
-                        }
-                    }
-                }
-            }
-            flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            flush_compact_ns.store(0, Ordering::Relaxed);
             flush_cycle += 1;
             stale_fields.clear();
             // Record flush stats for Prometheus

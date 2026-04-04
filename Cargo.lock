@@ -576,6 +576,7 @@ dependencies = [
  "crc32fast",
  "memmap2",
  "parking_lot",
+ "rayon",
  "tempfile",
  "thiserror 2.0.18",
 ]

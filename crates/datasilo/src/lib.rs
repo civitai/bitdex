@@ -13,9 +13,11 @@
 //! Encoding is caller's responsibility — DataSilo stores raw `&[u8]`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use rayon::prelude::*;
 
 mod ops_log;
 pub mod hash_index;
@@ -280,6 +282,124 @@ impl DataSilo {
         self.ops_log().lock().append(&SiloOp::Delete { key })
     }
 
+    // ── Bulk write (bypass ops log, write directly to data+index) ─────
+
+    /// Write a batch of entries directly to data.bin + index.bin using rayon
+    /// parallel mmap writes. Bypasses the ops log entirely — used for bulk saves
+    /// (dump snapshots) where we want maximum throughput.
+    ///
+    /// Semantics: overwrites the entire data file + index. Existing data is dropped.
+    /// The caller is responsible for ensuring no concurrent reads during this call.
+    pub fn write_batch_parallel(&mut self, entries: &[(u32, Vec<u8>)]) -> io::Result<u64> {
+        if entries.is_empty() { return Ok(0); }
+
+        let count = entries.len() as u64;
+        let align = self.config.alignment.max(1) as u64;
+        let buffer_ratio = self.config.buffer_ratio;
+        let min_entry_size = self.config.min_entry_size;
+
+        // Find max key for index sizing
+        let max_key = entries.iter().map(|(k, _)| *k).max().unwrap_or(0);
+
+        // Drop old mmaps before writing
+        self.index_mmap = None;
+        self.data_mmap = None;
+
+        // Phase 1: Compute entry layouts (sequential — offset computation is inherently serial)
+        struct EntryLayout { idx: usize, key: u32, offset: u64, length: u32, allocated: u32 }
+        let mut layouts: Vec<EntryLayout> = Vec::with_capacity(entries.len());
+
+        // Sort by key for index locality
+        let mut sorted_indices: Vec<usize> = (0..entries.len()).collect();
+        sorted_indices.sort_unstable_by_key(|&i| entries[i].0);
+
+        let mut offset: u64 = 0;
+        for &idx in &sorted_indices {
+            let (key, ref value) = entries[idx];
+            if align > 1 {
+                offset = (offset + align - 1) & !(align - 1);
+            }
+            let len = value.len() as u32;
+            let mut allocated = ((len as f32 * buffer_ratio).ceil() as u32)
+                .max(min_entry_size);
+            if align > 1 {
+                allocated = ((allocated as u64 + align - 1) & !(align - 1)) as u32;
+            }
+            layouts.push(EntryLayout { idx, key, offset, length: len, allocated });
+            offset += allocated as u64;
+        }
+        let total_data_size = offset;
+
+        // Phase 2: Pre-allocate data file + index as mmap
+        let data_path = self.path.join("data.bin");
+        let data_file = OpenOptions::new()
+            .create(true).read(true).write(true).truncate(true).open(&data_path)?;
+        data_file.set_len(total_data_size)?;
+        let mut data_mmap = unsafe { memmap2::MmapMut::map_mut(&data_file)? };
+
+        let index_count = max_key as usize + 1;
+        let index_path = self.path.join("index.bin");
+        let index_file = OpenOptions::new()
+            .create(true).read(true).write(true).open(&index_path)?;
+        index_file.set_len((index_count * INDEX_ENTRY_SIZE) as u64)?;
+        let mut index_mmap = unsafe { memmap2::MmapMut::map_mut(&index_file)? };
+
+        // Phase 3: Parallel mmap writes via rayon
+        let data_base = data_mmap.as_mut_ptr() as usize;
+        let index_base = index_mmap.as_mut_ptr() as usize;
+        let data_mmap_len = data_mmap.len();
+        let index_mmap_len = index_mmap.len();
+
+        layouts.par_iter().for_each(|layout| {
+            let value = &entries[layout.idx].1;
+            let start = layout.offset as usize;
+            if start + value.len() <= data_mmap_len {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        value.as_ptr(),
+                        (data_base + start) as *mut u8,
+                        value.len(),
+                    );
+                }
+            }
+            let entry = IndexEntry {
+                offset: layout.offset,
+                length: layout.length,
+                allocated: layout.allocated,
+            };
+            let pos = layout.key as usize * INDEX_ENTRY_SIZE;
+            if pos + INDEX_ENTRY_SIZE <= index_mmap_len {
+                let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(entry) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        (index_base + pos) as *mut u8,
+                        INDEX_ENTRY_SIZE,
+                    );
+                }
+            }
+        });
+
+        data_mmap.flush()?;
+        drop(data_mmap);
+        index_mmap.flush()?;
+
+        self.index_mmap = Some(index_mmap);
+        self.index_len = index_count as u32;
+        self.load_data()?;
+        self.data_len = offset;
+        self.dead_bytes.store(0, Ordering::Relaxed);
+
+        // Truncate both ops logs since we just wrote everything fresh
+        self.ops_a.lock().truncate()?;
+        self.ops_b.lock().truncate()?;
+
+        eprintln!("DataSilo: write_batch_parallel {} entries, {:.1}MB data, {:.1}MB index",
+            count, offset as f64 / 1e6,
+            (index_count * INDEX_ENTRY_SIZE) as f64 / 1e6);
+        Ok(count)
+    }
+
     // ── Read path ───────────────────────────────────────────────────────
 
     /// Read an entry by key from the data file (no ops overlay).
@@ -503,23 +623,23 @@ impl DataSilo {
         index_file.set_len((index_count * INDEX_ENTRY_SIZE) as u64)?;
         let mut index_mmap = unsafe { memmap2::MmapMut::map_mut(&index_file)? };
 
-        // Phase 3: Write entries to mmap (parallel memcpy)
+        // Phase 3: Write entries to mmap (parallel memcpy via rayon)
         // Each entry writes to a pre-computed offset — no overlap, safe for parallel.
-        let data_ptr = data_mmap.as_mut_ptr();
-        let index_ptr = index_mmap.as_mut_ptr();
+        // Store pointers as usize to satisfy Send+Sync for rayon closures.
+        // Safety: each layout targets a unique, non-overlapping region in the mmap.
+        let data_base = data_mmap.as_mut_ptr() as usize;
+        let index_base = index_mmap.as_mut_ptr() as usize;
         let data_mmap_len = data_mmap.len();
         let index_mmap_len = index_mmap.len();
 
-        // Safety: each layout has a unique, non-overlapping (offset..offset+allocated) region.
-        // Parallel writes to disjoint regions of mmap are safe.
-        layouts.iter().for_each(|layout| {
+        layouts.par_iter().for_each(|layout| {
             let value = &entries[&layout.key];
             let start = layout.offset as usize;
             if start + value.len() <= data_mmap_len {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         value.as_ptr(),
-                        data_ptr.add(start),
+                        (data_base + start) as *mut u8,
                         value.len(),
                     );
                 }
@@ -536,7 +656,7 @@ impl DataSilo {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         bytes.as_ptr(),
-                        index_ptr.add(pos),
+                        (index_base + pos) as *mut u8,
                         INDEX_ENTRY_SIZE,
                     );
                 }

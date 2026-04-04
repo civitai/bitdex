@@ -540,4 +540,5 @@ mod tests {
     }
 }
 
+pub mod metrics;
 pub mod planner;

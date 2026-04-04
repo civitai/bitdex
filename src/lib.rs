@@ -5,15 +5,11 @@ pub mod dump_expression;
 pub mod ops_processor;
 #[cfg(feature = "pg-sync")]
 pub mod ops_wal;
-pub mod cache;
 pub mod capture;
-pub mod concurrency;
-pub mod concurrent_engine;
 pub mod config;
 pub mod dictionary;
 
 pub mod engine;
-pub mod engine_facade;
 pub mod silos;
 pub mod query;
 
@@ -21,11 +17,8 @@ pub mod error;
 pub mod ingester;
 pub mod janitor;
 pub mod loader;
-pub mod meta_index;
 pub mod mutation;
 pub mod parser;
-pub mod query_metrics;
-pub mod radix_sort;
 #[cfg(feature = "server")]
 pub mod metrics;
 #[cfg(feature = "server")]

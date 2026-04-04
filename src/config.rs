@@ -63,16 +63,7 @@ pub struct Config {
     /// bitmap_memory_report() with incremental background scanning.
     #[serde(default)]
     pub memory_scanner: MemoryScannerConfig,
-    /// Enabled metric groups. Controls which expensive metric groups are
-    /// collected on the Prometheus scrape endpoint.
-    /// DEPRECATED: Use `disabled_metrics` (opt-out model) instead.
-    /// Groups: "bitmap_memory"
-    /// When `None` (default), all groups are enabled (backward compatible).
-    /// When `Some(vec)`, only the listed groups are enabled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled_metrics: Option<Vec<String>>,
     /// Metric groups to DISABLE (opt-out model). Default: None = all ON.
-    /// Takes precedence over `enabled_metrics` when present.
     /// Groups: "bitmap_memory"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_metrics: Option<Vec<String>>,
@@ -146,7 +137,6 @@ impl Default for Config {
             eviction_sweep_interval: default_eviction_sweep_interval(),
             compact_threshold_pct: default_compact_threshold_pct(),
             memory_scanner: MemoryScannerConfig::default(),
-            enabled_metrics: None,
             disabled_metrics: None,
             deferred_alive: None,
             headless: false,

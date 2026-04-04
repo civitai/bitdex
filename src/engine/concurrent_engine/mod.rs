@@ -994,7 +994,7 @@ impl ConcurrentEngine {
         self.docstore.lock().save_field_dict()
             .map_err(|e| crate::error::BitdexError::Storage(format!("save_field_dict: {e}")))?;
 
-        // Save bitmaps to BitmapSilo
+        // Save bitmaps to BitmapSilo (parallel: rayon serialize + lock-free ops log writes)
         if let Some(ref bitmap_path) = self.config.storage.bitmap_path {
             let cursors = self.cursors.lock().clone();
             let filters_r = self.filters.read();
@@ -1002,9 +1002,9 @@ impl ConcurrentEngine {
             let slots_r = self.slots.read();
             let mut silo = crate::silos::bitmap_silo::BitmapSilo::open(bitmap_path)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
-            let count = silo.save_all(&*filters_r, &*sorts_r, &*slots_r, &cursors)
-                .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all: {e}")))?;
-            eprintln!("save_snapshot: saved {} bitmaps to BitmapSilo", count);
+            let count = silo.save_all_parallel(&*filters_r, &*sorts_r, &*slots_r, &cursors)
+                .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all_parallel: {e}")))?;
+            eprintln!("save_snapshot: saved {} bitmaps to BitmapSilo (parallel)", count);
         }
 
         Ok(())
@@ -1017,8 +1017,8 @@ impl ConcurrentEngine {
         let slots_r = self.slots.read();
         let mut silo = crate::silos::bitmap_silo::BitmapSilo::open(path)
             .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
-        silo.save_all(&*filters_r, &*sorts_r, &*slots_r, &cursors)
-            .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all: {e}")))?;
+        silo.save_all_parallel(&*filters_r, &*sorts_r, &*slots_r, &cursors)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all_parallel: {e}")))?;
         Ok(())
     }
     /// Internal: zero-copy snapshot serialization via BitmapSilo.

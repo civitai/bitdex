@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use roaring::RoaringBitmap;
 
-use crate::cache::CanonicalClause;
+use super::cache::CanonicalClause;
 use crate::query::SortDirection;
 
 // ---------------------------------------------------------------------------
@@ -413,7 +413,7 @@ fn read_u64_le(cur: &mut Cursor<&[u8]>) -> io::Result<u64> {
 mod tests {
     use super::*;
     use roaring::RoaringBitmap;
-    use crate::cache::CanonicalClause;
+    use crate::silos::cache::CanonicalClause;
     use crate::query::SortDirection;
     use tempfile::TempDir;
 

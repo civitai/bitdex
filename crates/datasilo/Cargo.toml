@@ -9,6 +9,7 @@ description = "Generic mmap'd key-value store with append-only ops log"
 memmap2 = "0.9"
 crc32fast = "1"
 parking_lot = "0.12"
+rayon = "1"
 thiserror = "2"
 
 [dev-dependencies]
