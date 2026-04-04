@@ -32,7 +32,18 @@ use roaring::RoaringBitmap;
 
 use crate::cache::CanonicalClause;
 use crate::query::SortDirection;
-use crate::unified_cache::UnifiedKey;
+
+// ---------------------------------------------------------------------------
+// UnifiedKey — moved here from unified_cache.rs (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Cache lookup key: canonical filter clauses + sort field + direction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct UnifiedKey {
+    pub filter_clauses: Vec<CanonicalClause>,
+    pub sort_field: String,
+    pub direction: SortDirection,
+}
 
 // ---------------------------------------------------------------------------
 // CacheEntryData — the serializable subset of UnifiedEntry
@@ -404,7 +415,6 @@ mod tests {
     use roaring::RoaringBitmap;
     use crate::cache::CanonicalClause;
     use crate::query::SortDirection;
-    use crate::unified_cache::UnifiedKey;
     use tempfile::TempDir;
 
     fn make_entry(direction: SortDirection, with_keys: bool) -> CacheEntryData {

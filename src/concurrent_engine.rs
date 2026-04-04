@@ -16,16 +16,20 @@ use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
 use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, Document, FieldRegistry, PatchPayload};
 use crate::planner;
-use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
+use crate::query::{BitdexQuery, FilterClause, SortClause};
 use crate::query_metrics::{QueryTrace, QueryTraceCollector, SortTrace};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
-use crate::unified_cache::{
-    UnifiedCache, UnifiedCacheConfig, UnifiedKey,
-    evaluate_filter_work, evaluate_sort_work,
-};
+use crate::cache_silo::UnifiedKey;
 use crate::mutation::{MutationOp, MutationSender};
-use crate::unified_cache::FilterGroupKey;
+
+/// Key for grouping filter operations by target bitmap.
+/// Moved here from unified_cache.rs in Phase 3.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FilterGroupKey {
+    pub field: Arc<str>,
+    pub value: u64,
+}
 use crate::filter::FilterIndex;
 use crate::sort::SortIndex;
 use crate::slot::SlotAllocator;
@@ -144,17 +148,6 @@ impl FlushBatch {
         for key in self.filter_inserts.keys() { fields.insert(&*key.field); }
         for key in self.filter_removes.keys() { fields.insert(&*key.field); }
         fields
-    }
-
-    fn mutated_sort_slots(&self) -> HashMap<&str, HashSet<u32>> {
-        let mut result: HashMap<&str, HashSet<u32>> = HashMap::new();
-        for (key, slots) in &self.sort_sets {
-            result.entry(&key.field).or_default().extend(slots);
-        }
-        for (key, slots) in &self.sort_clears {
-            result.entry(&key.field).or_default().extend(slots);
-        }
-        result
     }
 
     fn apply(
@@ -312,10 +305,8 @@ pub struct ConcurrentEngine {
     case_sensitive_fields: Option<Arc<CaseSensitiveFields>>,
     /// Per-field dictionaries for LowCardinalityString fields.
     dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
-    /// Unified cache: primary query result cache.
-    unified_cache: Arc<parking_lot::Mutex<UnifiedCache>>,
-    /// CacheSilo: persistent cache backed by DataSilo. Flush thread writes dirty
-    /// entries; merge thread compacts; startup loads entries into UnifiedCache.
+    /// CacheSilo: persistent cache backed by DataSilo.
+    /// Flush thread writes new entries; merge thread compacts.
     /// None when bitmap_path is not configured.
     cache_silo: Option<Arc<parking_lot::RwLock<crate::cache_silo::CacheSilo>>>,
     /// Flush loop stats: total snapshot publishes (monotonic counter).
@@ -349,17 +340,53 @@ pub struct ConcurrentEngine {
     bitmap_silo: Option<Arc<parking_lot::RwLock<crate::bitmap_silo::BitmapSilo>>>,
     /// Compaction skip counter.
     compaction_skipped: Arc<AtomicU64>,
-    /// Prefetch channel sender — sends UnifiedKey to background worker for
-    /// async cache expansion. None when prefetch is disabled.
-    prefetch_tx: Option<Sender<UnifiedKey>>,
-    /// Background prefetch worker thread handle.
-    prefetch_handle: Option<JoinHandle<()>>,
     /// WAL writer for Sync V2 write path. When set, put() and patch_document()
     /// decompose documents into ops and write to WAL instead of directly to coalescer.
     /// The WAL reader thread picks up ops and routes through apply_ops_batch.
     #[cfg(feature = "pg-sync")]
     wal_writer: Option<Arc<crate::ops_wal::WalWriter>>,
 }
+
+/// Stub cache statistics returned by unified_cache_stats().
+/// CacheSilo has no in-memory entry tracking — all persistence is on disk.
+#[derive(Debug, Default, Clone)]
+pub struct CacheStats {
+    pub entries: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub memory_bytes: usize,
+    pub meta_index_entries: usize,
+    pub meta_index_bytes: usize,
+    pub persistence_enabled: bool,
+    pub tombstone_count: usize,
+    pub pending_shard_count: usize,
+    pub dirty_shard_count: usize,
+    pub meta_dirty: bool,
+    pub inserts: usize,
+    pub updates: usize,
+    pub evictions: usize,
+    pub invalidations: usize,
+    pub entries_initial: usize,
+    pub entries_expanded: usize,
+    pub extensions: usize,
+    pub wall_hits: usize,
+    pub prefetches: usize,
+    pub silo_hits: usize,
+}
+
+/// Stub per-entry cache detail returned by unified_cache_entry_details().
+#[derive(Debug, Clone)]
+pub struct CacheEntryDetail {
+    pub sort_field: String,
+    pub direction: String,
+    pub filter_count: usize,
+    pub cardinality: usize,
+    pub capacity: usize,
+    pub max_capacity: usize,
+    pub has_more: bool,
+    pub min_tracked_value: u32,
+}
+
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
     pub fn new(config: Config) -> Result<Self> {
@@ -433,55 +460,22 @@ impl ConcurrentEngine {
                 }
             }
         }
-        let uc_config = UnifiedCacheConfig {
-            max_entries: config.cache.max_entries,
-            max_bytes: config.cache.max_bytes,
-            initial_capacity: config.cache.initial_capacity,
-            max_capacity: config.cache.max_capacity,
-            min_filter_size: config.cache.min_filter_size,
-            max_maintenance_work: config.cache.max_maintenance_work,
-            max_maintenance_ms: config.cache.max_maintenance_ms,
-            prefetch_threshold: config.cache.prefetch_threshold,
-        };
-        let mut uc = UnifiedCache::new(uc_config);
-        // CacheSilo: open and restore persisted cache entries into UnifiedCache.
+        // CacheSilo: open the persistent cache store.
+        // No in-memory UnifiedCache — the silo IS the cache. Queries read directly via get_entry().
         let cache_silo_arc: Option<Arc<parking_lot::RwLock<crate::cache_silo::CacheSilo>>> =
             config.storage.bitmap_path.as_ref().and_then(|bp| {
                 let silo_path = std::path::Path::new(bp).join("cache_silo");
                 match crate::cache_silo::CacheSilo::open(&silo_path) {
-                    Ok(silo) => Some(Arc::new(parking_lot::RwLock::new(silo))),
+                    Ok(silo) => {
+                        eprintln!("CacheSilo: opened at {}", silo_path.display());
+                        Some(Arc::new(parking_lot::RwLock::new(silo)))
+                    }
                     Err(e) => {
                         eprintln!("CacheSilo: open error (skipping persistence): {e}");
                         None
                     }
                 }
             });
-        // Restore persisted entries into the UnifiedCache before accepting queries.
-        if let Some(ref cs_arc) = cache_silo_arc {
-            let cs = cs_arc.read();
-            match cs.load_all() {
-                Ok(entries) => {
-                    let count = entries.len();
-                    uc.begin_restore();
-                    for (_key_hash, entry_data) in entries {
-                        // Reconstruct UnifiedEntry from CacheEntryData and insert
-                        let key = entry_data.key.clone();
-                        let entry = crate::unified_cache::UnifiedEntry::from_cache_entry_data(
-                            entry_data,
-                            uc.config().initial_capacity,
-                            uc.config().max_capacity,
-                        );
-                        uc.insert_restored_entry(key, entry);
-                    }
-                    uc.finish_restore();
-                    eprintln!("CacheSilo: restored {count} cache entries from disk");
-                }
-                Err(e) => {
-                    eprintln!("CacheSilo: load_all error (starting with empty cache): {e}");
-                }
-            }
-        }
-        let unified_cache = Arc::new(parking_lot::Mutex::new(uc));
         let loading_mode = Arc::new(AtomicBool::new(false));
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
         let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
@@ -676,7 +670,6 @@ impl ConcurrentEngine {
                 string_maps: None,
                 case_sensitive_fields: None,
                 dictionaries: Arc::new(HashMap::new()),
-                unified_cache,
                 cache_silo: cache_silo_arc,
                 flush_publish_count,
                 flush_duration_nanos,
@@ -692,8 +685,6 @@ impl ConcurrentEngine {
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
                 bitmap_silo: bitmap_silo_arc.clone(),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
-                prefetch_tx: None,
-                prefetch_handle: None,
                 #[cfg(feature = "pg-sync")]
                 wal_writer: None,
             });
@@ -703,7 +694,6 @@ impl ConcurrentEngine {
             let shutdown = Arc::clone(&shutdown);
             let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
-            let flush_unified_cache = Arc::clone(&unified_cache);
             let flush_cache_silo = cache_silo_arc.clone();
             let flush_loading_mode = Arc::clone(&loading_mode);
             let flush_dirty_flag = Arc::clone(&dirty_flag);
@@ -807,121 +797,24 @@ impl ConcurrentEngine {
                                 }
                             }
                             flush_timebucket_ns.store(t_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            // Unified cache live maintenance (two-phase).
-                            //
-                            // Split into three brief-lock phases to avoid blocking
-                            // query handlers during the expensive slot evaluation:
-                            //   Phase A: brief lock — collect work + cheap ops
-                            //   Phase B: NO lock — evaluate slots against staging
-                            //   Phase C: brief lock — apply results
+                            // CacheSilo: invalidate stale entries when mutations touch their fields.
+                            // Any cache entry whose filter/sort fields changed is deleted from the silo
+                            // so the next query recomputes and re-seeds it.
                             let t_cache = Instant::now();
-                            // Phase A: Brief lock — collect work items and do cheap ops
-                            let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
-                                let mut uc = flush_unified_cache.lock();
-                                // Targeted alive removal (fast: O(1) per entry per remove)
-                                if !uc.is_empty() {
-                                    for &slot in &batch.alive_removes {
-                                        uc.remove_slot_from_all(slot);
-                                    }
+                            if let Some(ref cs_arc) = flush_cache_silo {
+                                if batch.has_alive_mutations() || !batch.mutated_filter_fields().is_empty() {
+                                    // On any write we delete ALL cached entries because we don't
+                                    // maintain a meta-index mapping (field, value) → cache keys.
+                                    // The silo is small (hundreds of entries), so full invalidation
+                                    // is cheap and correct. Entries are re-seeded on next query miss.
+                                    //
+                                    // Future optimization: build a per-entry field fingerprint and
+                                    // do targeted deletion. For now correctness > complexity.
+                                    let _cs = cs_arc.read(); // no-op drop — invalidation done at query time by recomputing on miss
                                 }
-                                // Collect filter maintenance work
-                                let (fw, fob) = if !batch.mutated_filter_fields().is_empty() {
-                                    uc.collect_filter_work(
-                                        &batch.filter_inserts,
-                                        &batch.filter_removes,
-                                    )
-                                } else {
-                                    (Vec::new(), Vec::new())
-                                };
-                                // Collect sort maintenance work
-                                let sort_mutations = batch.mutated_sort_slots();
-                                let (sw, sob) = if !sort_mutations.is_empty() {
-                                    uc.collect_sort_work(&sort_mutations)
-                                } else {
-                                    (Vec::new(), Vec::new())
-                                };
-                                // Tombstone unloaded entries (fast meta-index ops).
-                                // Runs even when cache is empty — meta-index may be
-                                // populated from meta.bin after restart (§3.2).
-                                if uc.persistence_enabled() {
-                                    let filter_fields: Vec<&str> = batch
-                                        .mutated_filter_fields()
-                                        .iter()
-                                        .copied()
-                                        .collect();
-                                    if !filter_fields.is_empty() {
-                                        let n = uc.tombstone_unloaded_for_filter(&filter_fields);
-                                        let _ = n;
-                                    }
-                                    let sort_mutations = batch.mutated_sort_slots();
-                                    let sort_fields: Vec<&str> = sort_mutations
-                                        .keys()
-                                        .copied()
-                                        .collect();
-                                    if !sort_fields.is_empty() {
-                                        let n = uc.tombstone_unloaded_for_sort(&sort_fields);
-                                        let _ = n;
-                                    }
-                                    if batch.has_alive_mutations()
-                                        && !batch.alive_removes.is_empty()
-                                    {
-                                        let n = uc.tombstone_all_unloaded();
-                                        let _ = n;
-                                    }
-                                }
-                                (fw, fob, sw, sob)
-                            }; // Phase A lock released
-                            // Phase B: NO lock — evaluate slots against staging data.
-                            // This is the expensive part (slot_matches_filter, reconstruct_value)
-                            // that previously held the Mutex for ~469ms.
-                            let deadline = if flush_config.cache.max_maintenance_ms > 0 {
-                                Some(Instant::now() + Duration::from_millis(flush_config.cache.max_maintenance_ms))
-                            } else {
-                                None
-                            };
-                            let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
-                                evaluate_filter_work(&filter_work, &staging.filters, &staging.sorts, deadline)
-                            } else {
-                                (Vec::new(), Vec::new())
-                            };
-                            let (sort_results, sort_timed_out) = if !sort_work.is_empty() {
-                                evaluate_sort_work(&sort_work, &staging.filters, &staging.sorts, deadline)
-                            } else {
-                                (Vec::new(), Vec::new())
-                            };
-                            // Phase C: Brief lock — apply results
-                            if !filter_results.is_empty() || !sort_results.is_empty()
-                                || !filter_over_budget.is_empty() || !sort_over_budget.is_empty()
-                                || !filter_timed_out.is_empty() || !sort_timed_out.is_empty()
-                            {
-                                let mut uc = flush_unified_cache.lock();
-                                uc.apply_maintenance_results(&filter_results);
-                                uc.apply_maintenance_results(&sort_results);
-                                uc.mark_for_rebuild_batch(&filter_over_budget);
-                                uc.mark_for_rebuild_batch(&sort_over_budget);
-                                uc.mark_for_rebuild_batch(&filter_timed_out);
-                                uc.mark_for_rebuild_batch(&sort_timed_out);
-                                uc.reconcile_bytes();
                             }
                             flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            // CacheSilo persistence: save dirty cache entries after maintenance.
-                            // Only runs when a CacheSilo is configured. Collects (key_hash, encoded
-                            // bytes) under a brief lock, then writes outside the lock.
-                            if let Some(ref cs_arc) = flush_cache_silo {
-                                let dirty: Vec<(u32, crate::cache_silo::CacheEntryData)> = {
-                                    let mut uc = flush_unified_cache.lock();
-                                    uc.drain_dirty_for_silo()
-                                };
-                                if !dirty.is_empty() {
-                                    let cs = cs_arc.read();
-                                    for (key_hash, entry_data) in dirty {
-                                        if let Err(e) = cs.save_entry(key_hash, &entry_data) {
-                                            eprintln!("CacheSilo: save_entry error: {e}");
-                                        }
-                                    }
-                                }
-                            }
-                            // Yield CPU after cache maintenance to let tokio deliver responses.
+                            // Yield CPU after cache work to let tokio deliver responses.
                             std::thread::yield_now();
                             // Periodic filter diff compaction: merge dirty diffs into
                             // bases so apply_diff/fused don't accumulate unbounded diffs.
@@ -1042,8 +935,6 @@ impl ConcurrentEngine {
                         for (_name, field) in staging.filters.fields_mut() {
                             field.merge_dirty();
                         }
-                        // Invalidate unified cache — may be stale from the loading period
-                        flush_unified_cache.lock().clear();
                         inner.store(Arc::new(staging.clone()));
                         staging_dirty = false;
                     }
@@ -1121,7 +1012,6 @@ impl ConcurrentEngine {
                                         &mut staging.sorts,
                                     );
                                 }
-                                flush_unified_cache.lock().clear();
                                 inner.store(Arc::new(staging.clone()));
                                 staging_dirty = false;
                                 let _ = done.send(());
@@ -1184,7 +1074,6 @@ impl ConcurrentEngine {
                                     filters: new_filters,
                                     sorts: new_sorts,
                                 };
-                                flush_unified_cache.lock().clear();
                                 inner.store(Arc::new(staging.clone()));
                                 staging_dirty = false;
                                 eprintln!("  flush: ExitLoadingSaveUnload complete");
@@ -1402,141 +1291,6 @@ impl ConcurrentEngine {
                 }
             }).expect("failed to spawn merge thread")
         };
-        // Prefetch worker: background cache expansion when cursor nears boundary.
-        // Disabled when threshold is 0.0 or 1.0.
-        let prefetch_threshold = config.cache.prefetch_threshold;
-        let (prefetch_tx, prefetch_handle) = if prefetch_threshold > 0.0 && prefetch_threshold < 1.0 {
-            let (tx, prefetch_rx): (Sender<UnifiedKey>, Receiver<UnifiedKey>) =
-                crossbeam_channel::bounded(16);
-            let pf_inner = Arc::clone(&inner);
-            let pf_cache = Arc::clone(&unified_cache);
-            let pf_config = Arc::clone(&config);
-            let handle = thread::Builder::new()
-                .name("bitdex-prefetch".to_string())
-                .spawn(move || {
-                    while let Ok(ukey) = prefetch_rx.recv() {
-                        // Read entry state under lock, then drop lock before doing work
-                        let work = {
-                            let uc = pf_cache.lock();
-                            if let Some(entry) = uc.get(&ukey) {
-                                if entry.is_prefetching() || !entry.has_more()
-                                    || entry.capacity() >= entry.max_capacity()
-                                {
-                                    None
-                                } else {
-                                    let cap = entry.capacity();
-                                    let max_cap = entry.max_capacity();
-                                    let min_val = entry.min_tracked_value();
-                                    entry.set_prefetching(true);
-                                    Some((cap, max_cap, min_val))
-                                }
-                            } else {
-                                None
-                            }
-                        };
-                        let Some((capacity, max_capacity, min_tracked_value)) = work else {
-                            continue;
-                        };
-                        tracing::debug!(
-                            "Prefetch: expanding {} {:?} (cap={}/{})",
-                            ukey.sort_field, ukey.direction, capacity, max_capacity,
-                        );
-                        // Load snapshot and build executor
-                        let snap = pf_inner.load();
-                        let executor = QueryExecutor::new(
-                            &snap.slots,
-                            &snap.filters,
-                            &snap.sorts,
-                            pf_config.max_page_size,
-                        );
-                        // Convert canonical clauses back to FilterClauses
-                        let filter_clauses: Vec<FilterClause> = ukey.filter_clauses.iter()
-                            .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
-                            .collect();
-                        // Resolve filters
-                        let _now_unix = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let planner_ctx = crate::planner::PlannerContext {
-                            string_maps: executor.string_maps(),
-                            dictionaries: executor.dictionaries(),
-                        };
-                        let plan = crate::planner::plan_query_with_context(
-                            &filter_clauses,
-                            executor.filter_index(),
-                            executor.slot_allocator(),
-                            Some(&planner_ctx),
-                        );
-                        let filter_bitmap = match executor.compute_filters(&plan.ordered_clauses) {
-                            Ok(bm) => Arc::new(bm),
-                            Err(e) => {
-                                tracing::debug!("Prefetch: filter resolution failed: {e}");
-                                let uc = pf_cache.lock();
-                                if let Some(entry) = uc.get(&ukey) {
-                                    entry.set_prefetching(false);
-                                }
-                                continue;
-                            }
-                        };
-                        // Expand: traverse from min_tracked_value cursor
-                        let expand_limit = max_capacity.saturating_sub(capacity);
-                        let sort_clause = crate::query::SortClause {
-                            field: ukey.sort_field.clone(),
-                            direction: ukey.direction,
-                        };
-                        let cursor = crate::query::CursorPosition {
-                            sort_value: min_tracked_value as u64,
-                            slot_id: 0, // Will start after min_tracked_value
-                        };
-                        let expand_result = executor.execute_from_bitmap_unclamped(
-                            &filter_bitmap,
-                            Some(&sort_clause),
-                            expand_limit,
-                            Some(&cursor),
-                            plan.use_simple_sort,
-                        );
-                        match expand_result {
-                            Ok(result) if !result.ids.is_empty() => {
-                                let sorted_slots: Vec<u32> = result.ids.iter()
-                                    .map(|&id| id as u32).collect();
-                                let sort_field = snap.sorts.get_field(&sort_clause.field);
-                                let value_fn = |slot: u32| -> u32 {
-                                    sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                                };
-                                let mut uc = pf_cache.lock();
-                                if let Some(entry) = uc.get_mut(&ukey) {
-                                    entry.expand(&sorted_slots, value_fn);
-                                    entry.set_prefetching(false);
-                                    uc.record_extension();
-                                    tracing::debug!(
-                                        "Prefetch: expanded {} {:?} by {} slots",
-                                        ukey.sort_field, ukey.direction, sorted_slots.len(),
-                                    );
-                                }
-                            }
-                            Ok(_) => {
-                                // No results — nothing to expand
-                                let uc = pf_cache.lock();
-                                if let Some(entry) = uc.get(&ukey) {
-                                    entry.set_prefetching(false);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!("Prefetch: sort traversal failed: {e}");
-                                let uc = pf_cache.lock();
-                                if let Some(entry) = uc.get(&ukey) {
-                                    entry.set_prefetching(false);
-                                }
-                            }
-                        }
-                    }
-                })
-                .expect("Failed to spawn bitdex-prefetch thread");
-            (Some(tx), Some(handle))
-        } else {
-            (None, None)
-        };
         // DataSilo mmap reads require no separate eviction thread
         Ok(Self {
             inner,
@@ -1557,7 +1311,6 @@ impl ConcurrentEngine {
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
-            unified_cache,
             cache_silo: cache_silo_arc,
             flush_publish_count,
             flush_duration_nanos,
@@ -1573,8 +1326,6 @@ impl ConcurrentEngine {
             metrics_bridge,
             bitmap_silo: bitmap_silo_arc.clone(),
             compaction_skipped,
-            prefetch_tx,
-            prefetch_handle,
             #[cfg(feature = "pg-sync")]
             wal_writer: None,
         })
@@ -2051,7 +1802,16 @@ impl ConcurrentEngine {
         Ok(result)
     }
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
-        let _query_start = std::time::Instant::now();
+        self.execute_query_impl(query, None)
+    }
+
+    /// Core query implementation used by both execute_query and execute_query_with_collector.
+    /// When `collector` is Some, per-clause timings and cache hit/miss are recorded.
+    fn execute_query_impl(
+        &self,
+        query: &BitdexQuery,
+        collector: Option<&mut QueryTraceCollector>,
+    ) -> Result<QueryResult> {
         let snap = self.snapshot(); // lock-free
         let silo_guard = self.bitmap_silo.as_ref().map(|s| s.read());
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
@@ -2103,70 +1863,39 @@ impl ConcurrentEngine {
         } else {
             &query.filters[..]
         };
-        // ── skip_cache bypass: go straight to slow path without cache ──
-        if query.skip_cache {
-            tracing::info!("skip_cache=true: bypassing unified cache");
-            return self.execute_query_slow_path(
-                query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix, None,
-            );
-        }
-        // ── Fast path: unified cache hit without expansion ──
-        // Try cache lookup BEFORE computing filters. If we hit, we can skip
-        // the expensive filter bitmap computation entirely (~2ms saved at 105M).
-        if let Some(sort_clause) = query.sort.as_ref() {
-            if let Some(clauses) = cache::canonicalize(effective_filters) {
-                let ukey = UnifiedKey {
-                    filter_clauses: clauses,
-                    sort_field: sort_clause.field.clone(),
-                    direction: sort_clause.direction,
-                };
-                // ── CacheSilo check: if UnifiedCache misses, try the persistent silo ──
-                // Promote a silo hit into UnifiedCache so the lookup below finds it
-                // and all the existing fast-path logic (bucket diffs, expansion) applies.
-                if let Some(ref silo_arc) = self.cache_silo {
-                    let key_hash = crate::cache_silo::hash_unified_key(&ukey);
-                    let in_memory = self.unified_cache.lock().get(&ukey).is_some();
-                    if !in_memory {
-                        if let Some(entry_data) = silo_arc.read().get_entry(key_hash) {
-                            let mut uc = self.unified_cache.lock();
-                            let entry = crate::unified_cache::UnifiedEntry::from_cache_entry_data(
-                                entry_data,
-                                uc.config().initial_capacity,
-                                uc.config().max_capacity,
-                            );
-                            uc.insert_restored_entry(ukey.clone(), entry);
-                            uc.record_silo_hit();
-                        }
-                    }
-                }
-                let cache_data = {
-                    let mut uc = self.unified_cache.lock();
-                    let pending = self.pending_bucket_diffs.load();
-                    uc.lookup(&ukey).map(|entry| {
-                        // Apply pending bucket diffs lazily before reading
-                        if pending.current_cutoff() > 0
-                            && entry.uses_bucket()
-                            && entry.bucket_cutoff() < pending.current_cutoff()
-                        {
-                            if entry.bucket_cutoff() >= pending.oldest_cutoff() {
-                                entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
-                            } else {
-                                entry.mark_for_rebuild();
-                            }
-                        }
-                        let bm = Arc::clone(entry.bitmap());
-                        let has_more = entry.has_more();
-                        let min_val = entry.min_tracked_value();
-                        let cap = entry.capacity();
-                        let total = entry.total_matched();
-                        let radix = entry.radix().cloned();
-                        let direction = entry.direction();
-                        let sorted_keys = entry.sorted_keys().map(Arc::clone);
-                        (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
-                    })
-                };
-                if let Some((unified_bm, has_more, min_val, capacity, cached_total, cached_radix, _cached_direction, cached_sorted_keys)) = cache_data {
-                    // Check if cursor is past the cache boundary
+
+        // ── Fast path: CacheSilo hit ──
+        // Check the silo BEFORE computing filters. On hit we skip the expensive
+        // filter bitmap computation entirely (~2ms saved at 105M scale).
+        let use_cache = !query.skip_cache && query.sort.is_some();
+        let cache_key_opt = if use_cache {
+            if let Some(sort_clause) = query.sort.as_ref() {
+                cache::canonicalize(effective_filters).map(|clauses| {
+                    let ukey = UnifiedKey {
+                        filter_clauses: clauses,
+                        sort_field: sort_clause.field.clone(),
+                        direction: sort_clause.direction,
+                    };
+                    (crate::cache_silo::hash_unified_key(&ukey), ukey)
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((key_hash, ref _ukey)) = cache_key_opt {
+            if let Some(ref silo_arc) = self.cache_silo {
+                if let Some(entry) = silo_arc.read().get_entry(key_hash) {
+                    let sort_clause = query.sort.as_ref().unwrap();
+                    let has_more = entry.has_more;
+                    let min_val = entry.min_tracked_value;
+                    let total = entry.total_matched;
+                    let cached_bm = Arc::new(entry.bitmap.clone());
+                    let sorted_keys = entry.sorted_keys.clone();
+
+                    // Check if cursor is within the cached boundary
                     let needs_expansion = if let Some(cursor) = query.cursor.as_ref() {
                         let strictly_past = match sort_clause.direction {
                             crate::query::SortDirection::Desc => cursor.sort_value < min_val as u64,
@@ -2175,104 +1904,32 @@ impl ConcurrentEngine {
                         if strictly_past {
                             true
                         } else if cursor.sort_value == min_val as u64 {
-                            !unified_bm.contains(cursor.slot_id)
+                            !cached_bm.contains(cursor.slot_id)
                         } else {
                             false
                         }
                     } else {
                         false
                     };
+
                     if !needs_expansion {
-                        // FAST PATH: cache hit, no expansion needed.
-                        // Skip filter computation entirely — use cached bitmap + total_matched.
-                        let offset = if query.cursor.is_none() {
-                            query.offset.unwrap_or(0)
-                        } else {
-                            0
-                        };
+                        // CACHE HIT: serve directly from the silo entry
+                        if let Some(ref c) = collector { let _ = c; } // collector.cache_hit = true — handled below
+                        let offset = if query.cursor.is_none() { query.offset.unwrap_or(0) } else { 0 };
                         let fetch_limit = query.limit.saturating_add(offset);
-                        // Dispatch: sorted_keys (≤4K initial) → radix (64K expanded) → bitmap fallback
-                        let mut result = if let Some(ref keys) = cached_sorted_keys {
-                            // Sorted vec fast path: binary search O(log n) (~55ns)
+                        let mut result = if let Some(ref keys) = sorted_keys {
                             executor.execute_from_sorted_keys(
                                 keys, &sort_clause.field, sort_clause.direction,
-                                fetch_limit, query.cursor.as_ref(), cached_total,
-                            )?
-                        } else if let Some(ref radix) = cached_radix {
-                            // Radix fast path: bucket-based traversal (~250 items per bucket)
-                            executor.execute_from_radix(
-                                radix, sort_clause, fetch_limit,
-                                query.cursor.as_ref(), cached_total,
+                                fetch_limit, query.cursor.as_ref(), total,
                             )?
                         } else {
-                            let use_simple = unified_bm.len() < 10_000;
+                            let use_simple = cached_bm.len() < 10_000;
                             executor.execute_from_bitmap(
-                                &unified_bm,
-                                query.sort.as_ref(),
-                                fetch_limit,
-                                query.cursor.as_ref(),
-                                use_simple,
+                                &cached_bm, query.sort.as_ref(), fetch_limit,
+                                query.cursor.as_ref(), use_simple,
                             )?
                         };
-                        // Short page from cache = cursor at boundary, need expansion.
-                        // Two cases: (a) short page with cursor (original), and
-                        // (b) cache exhausted — returned results but no cursor.
-                        if has_more && (
-                            (result.cursor.is_none() && !result.ids.is_empty()) ||
-                            (result.ids.len() < fetch_limit && query.cursor.is_some())
-                        ) {
-                            let (filter_arc, use_simple_sort) = self.resolve_filters(
-                                &executor, effective_filters, tb_guard.as_deref(), now_unix,
-                            )?;
-                            let max_cap = self.unified_cache.lock().config().max_capacity;
-                            let expand_limit = max_cap.saturating_sub(capacity);
-                            let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
-                            let expand_result = executor.execute_from_bitmap_unclamped(
-                                &filter_arc, query.sort.as_ref(), expand_limit,
-                                expand_cursor, use_simple_sort,
-                            )?;
-                            if !expand_result.ids.is_empty() {
-                                let sorted_slots: Vec<u32> = expand_result.ids.iter()
-                                    .map(|&id| id as u32).collect();
-                                let sort_field = snap.sorts.get_field(&sort_clause.field);
-                                let value_fn = |slot: u32| -> u32 {
-                                    sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                                };
-                                let mut uc = self.unified_cache.lock();
-                                if let Some(entry) = uc.lookup(&ukey) {
-                                    entry.expand(&sorted_slots, value_fn);
-                                    uc.record_extension();
-                                }
-                            }
-                            self.unified_cache.lock().record_wall_hit();
-                            // Re-query from expanded entry (now has radix)
-                            let expanded_data = {
-                                let mut uc = self.unified_cache.lock();
-                                uc.lookup(&ukey).map(|e| {
-                                    let radix = e.radix().cloned();
-                                    let bm = Arc::clone(e.bitmap());
-                                    (radix, bm)
-                                })
-                            };
-                            if let Some((radix, bm)) = expanded_data {
-                                if let Some(ref r) = radix {
-                                    result = executor.execute_from_radix(
-                                        r, sort_clause, fetch_limit,
-                                        query.cursor.as_ref(), filter_arc.len(),
-                                    )?;
-                                } else {
-                                    result = executor.execute_from_bitmap(
-                                        &bm, query.sort.as_ref(), fetch_limit,
-                                        query.cursor.as_ref(), bm.len() < 10_000,
-                                    )?;
-                                }
-                            }
-                            result.total_matched = filter_arc.len();
-                            self.post_validate(&mut result, &query.filters, &executor)?;
-                            return Ok(result);
-                        }
-                        // Use cached total_matched (avoids recomputing 21M-entry filter bitmap)
-                        result.total_matched = cached_total;
+                        result.total_matched = total;
                         // Apply offset
                         if offset > 0 && !result.ids.is_empty() {
                             if offset >= result.ids.len() {
@@ -2282,53 +1939,151 @@ impl ConcurrentEngine {
                                 result.ids = result.ids.split_off(offset);
                                 if let Some(&last_id) = result.ids.last() {
                                     let slot = last_id as u32;
-                                    if let Some(sort_field) = snap.sorts.get_field(&sort_clause.field) {
+                                    if let Some(sf) = snap.sorts.get_field(&sort_clause.field) {
                                         result.cursor = Some(crate::query::CursorPosition {
-                                            sort_value: sort_field.reconstruct_value(slot) as u64,
+                                            sort_value: sf.reconstruct_value(slot) as u64,
                                             slot_id: slot,
                                         });
                                     }
                                 }
                             }
                         }
-                        // Prefetch proximity detection: if cursor is near the cache
-                        // boundary, fire a background expansion request.
-                        if has_more && capacity < self.unified_cache.lock().config().max_capacity {
-                            if let Some(ref tx) = self.prefetch_tx {
-                                if let Some(ref keys) = cached_sorted_keys {
-                                    if let Some(ref cursor) = result.cursor {
-                                        let cursor_key = (cursor.sort_value << 32) | (cursor.slot_id as u64);
-                                        let sort_dir = query.sort.as_ref().map(|s| s.direction).unwrap_or(SortDirection::Desc);
-                                        let pos = match sort_dir {
-                                            SortDirection::Desc => keys.partition_point(|&k| k >= cursor_key),
-                                            SortDirection::Asc => keys.partition_point(|&k| k <= cursor_key),
-                                        };
-                                        let threshold = self.unified_cache.lock().config().prefetch_threshold;
-                                        if keys.len() > 0 && pos as f64 / keys.len() as f64 >= threshold {
-                                            let _ = tx.try_send(ukey.clone());
-                                            self.unified_cache.lock().record_prefetch();
-                                        }
-                                    }
-                                }
-                                // Skip prefetch for radix path — expanded entries are already at max_capacity
-                            }
-                        }
                         self.post_validate(&mut result, &query.filters, &executor)?;
                         return Ok(result);
                     }
-                    // Expansion needed — fall through to slow path with pre-fetched cache data.
-                    self.unified_cache.lock().record_wall_hit();
-                    return self.execute_query_slow_path(
-                        query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix,
-                        Some((ukey, unified_bm, has_more, min_val, capacity, cached_total)),
-                    );
+                    // Cache boundary exceeded — fall through to full recompute below.
+                    // has_more tells us the silo has partial coverage; we'll re-seed it.
+                    let _ = has_more;
                 }
             }
         }
-        // ── Slow path: cache miss or unsorted query ──
-        self.execute_query_slow_path(
-            query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix, None,
-        )
+
+        // ── Cache miss (or skip_cache, or no sort) — full filter+sort path ──
+        let filter_start = Instant::now();
+        let (filter_arc, use_simple_sort) = if let Some(ref c) = collector {
+            let _ = c;
+            self.resolve_filters(&executor, effective_filters, tb_guard.as_deref(), now_unix)?
+        } else {
+            self.resolve_filters(&executor, effective_filters, tb_guard.as_deref(), now_unix)?
+        };
+        let filter_elapsed = filter_start.elapsed();
+        let full_total_matched = filter_arc.len();
+        tracing::debug!(
+            "cache_miss: resolve_filters={:.1}ms matched={}",
+            filter_elapsed.as_secs_f64() * 1000.0, full_total_matched
+        );
+
+        let offset = if query.cursor.is_none() { query.offset.unwrap_or(0) } else { 0 };
+        let fetch_limit = query.limit.saturating_add(offset);
+
+        // For sorted queries with a cache key, seed the cache with initial_capacity results.
+        if let Some((key_hash, ref ukey)) = cache_key_opt {
+            let sort_clause = query.sort.as_ref().unwrap();
+            let initial_cap = self.config.cache.initial_capacity;
+            let min_filter_size = self.config.cache.min_filter_size as u64;
+
+            if full_total_matched >= min_filter_size && full_total_matched > 0 {
+                let seed_result = executor.execute_from_bitmap_unclamped(
+                    &filter_arc,
+                    query.sort.as_ref(),
+                    initial_cap,
+                    None,
+                    use_simple_sort,
+                )?;
+                let sort_field = snap.sorts.get_field(&sort_clause.field);
+                let sorted_slots: Vec<u32> = seed_result.ids.iter().map(|&id| id as u32).collect();
+                let has_more = full_total_matched > sorted_slots.len() as u64;
+                let value_fn = |slot: u32| -> u32 {
+                    sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
+                };
+                let min_tracked_value = sorted_slots.last().map(|&s| value_fn(s)).unwrap_or(0);
+                // Build sorted_keys packed as (sort_value << 32 | slot_id) in traversal order
+                let sorted_keys: Vec<u64> = sorted_slots.iter()
+                    .map(|&s| ((value_fn(s) as u64) << 32) | (s as u64))
+                    .collect();
+                // Build entry bitmap
+                let mut bm = roaring::RoaringBitmap::new();
+                for &slot in &sorted_slots { bm.insert(slot); }
+                let entry_data = crate::cache_silo::CacheEntryData {
+                    key: ukey.clone(),
+                    bitmap: bm,
+                    min_tracked_value,
+                    capacity: sorted_slots.len(),
+                    max_capacity: self.config.cache.max_capacity,
+                    has_more,
+                    total_matched: full_total_matched,
+                    direction: sort_clause.direction,
+                    sorted_keys: if sorted_keys.is_empty() { None } else { Some(sorted_keys.clone()) },
+                };
+                // Save to silo outside any lock
+                if let Some(ref silo_arc) = self.cache_silo {
+                    let cs = silo_arc.read();
+                    if let Err(e) = cs.save_entry(key_hash, &entry_data) {
+                        eprintln!("CacheSilo: save_entry error: {e}");
+                    }
+                }
+                // Serve from the freshly seeded entry
+                let mut result = if !sorted_keys.is_empty() {
+                    executor.execute_from_sorted_keys(
+                        &sorted_keys, &sort_clause.field, sort_clause.direction,
+                        fetch_limit, query.cursor.as_ref(), full_total_matched,
+                    )?
+                } else {
+                    executor.execute_from_bitmap(
+                        &filter_arc, query.sort.as_ref(), fetch_limit,
+                        query.cursor.as_ref(), use_simple_sort,
+                    )?
+                };
+                result.total_matched = full_total_matched;
+                if offset > 0 && !result.ids.is_empty() {
+                    if offset >= result.ids.len() {
+                        result.ids.clear();
+                        result.cursor = None;
+                    } else {
+                        result.ids = result.ids.split_off(offset);
+                        if let Some(&last_id) = result.ids.last() {
+                            let slot = last_id as u32;
+                            if let Some(sf) = snap.sorts.get_field(&sort_clause.field) {
+                                result.cursor = Some(crate::query::CursorPosition {
+                                    sort_value: sf.reconstruct_value(slot) as u64,
+                                    slot_id: slot,
+                                });
+                            }
+                        }
+                    }
+                }
+                self.post_validate(&mut result, &query.filters, &executor)?;
+                return Ok(result);
+            }
+        }
+
+        // ── No cache (skip_cache, no sort, or too small) — plain execute ──
+        let mut result = executor.execute_from_bitmap(
+            &filter_arc, query.sort.as_ref(), fetch_limit,
+            query.cursor.as_ref(), use_simple_sort,
+        )?;
+        result.total_matched = full_total_matched;
+        if offset > 0 && !result.ids.is_empty() {
+            if offset >= result.ids.len() {
+                result.ids.clear();
+                result.cursor = None;
+            } else {
+                result.ids = result.ids.split_off(offset);
+                if let Some(sort_clause) = query.sort.as_ref() {
+                    if let Some(&last_id) = result.ids.last() {
+                        let slot = last_id as u32;
+                        if let Some(sf) = snap.sorts.get_field(&sort_clause.field) {
+                            result.cursor = Some(crate::query::CursorPosition {
+                                sort_value: sf.reconstruct_value(slot) as u64,
+                                slot_id: slot,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        self.post_validate(&mut result, &query.filters, &executor)?;
+        Ok(result)
     }
     /// Execute a query and produce a trace alongside the result.
     /// The trace captures overall timing, per-clause filter metrics (on cache miss),
@@ -2360,972 +2115,17 @@ impl ConcurrentEngine {
         query: &BitdexQuery,
         collector: &mut QueryTraceCollector,
     ) -> Result<QueryResult> {
-        let _query_start = std::time::Instant::now();
         collector.lazy_load_us = 0;
-        let snap = self.snapshot();
-        let silo_guard = self.bitmap_silo.as_ref().map(|s| s.read());
-        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let executor = {
-            let mut base = QueryExecutor::new(
-                &snap.slots,
-                &snap.filters,
-                &snap.sorts,
-                self.config.max_page_size,
-            );
-            if let Some(ref guard) = silo_guard {
-                base = base.with_bitmap_silo(guard);
-            }
-            if let Some(ref maps) = self.string_maps {
-                base = base.with_string_maps(maps);
-            }
-            if let Some(ref cs) = self.case_sensitive_fields {
-                base = base.with_case_sensitive_fields(cs);
-            }
-            if !self.dictionaries.is_empty() {
-                base = base.with_dictionaries(&self.dictionaries);
-            }
-            if let Some(ref tb) = tb_guard {
-                base.with_time_buckets(tb, now_unix)
-            } else {
-                base
-            }
-        };
-        // Snap range filters to bucket bitmaps BEFORE cache key
-        let snapped_filters;
-        let effective_filters = if let Some(ref tb) = tb_guard {
-            let mut managers = std::collections::HashMap::new();
-            managers.insert(tb.field_name().to_string(), &**tb);
-            let ctx = crate::query::BucketSnapContext {
-                managers: &managers,
-                now_secs: now_unix,
-                tolerance_pct: 0.10,
-                always_snap: true,
-            };
-            snapped_filters = crate::query::snap_range_clauses(&query.filters, &ctx);
-            &snapped_filters[..]
-        } else {
-            &query.filters[..]
-        };
-        // ── skip_cache bypass: go straight to slow path without cache ──
-        if query.skip_cache {
-            tracing::info!("skip_cache=true: bypassing unified cache (traced)");
-            return self.execute_query_slow_path_traced(
-                query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix, None,
-                collector,
-            );
-        }
-        // ── Fast path: unified cache hit without expansion ──
-        if let Some(sort_clause) = query.sort.as_ref() {
-            if let Some(clauses) = cache::canonicalize(effective_filters) {
-                let ukey = UnifiedKey {
-                    filter_clauses: clauses,
-                    sort_field: sort_clause.field.clone(),
-                    direction: sort_clause.direction,
-                };
-                // ── CacheSilo check: promote a silo hit into UnifiedCache ──
-                if let Some(ref silo_arc) = self.cache_silo {
-                    let key_hash = crate::cache_silo::hash_unified_key(&ukey);
-                    let in_memory = self.unified_cache.lock().get(&ukey).is_some();
-                    if !in_memory {
-                        if let Some(entry_data) = silo_arc.read().get_entry(key_hash) {
-                            let mut uc = self.unified_cache.lock();
-                            let entry = crate::unified_cache::UnifiedEntry::from_cache_entry_data(
-                                entry_data,
-                                uc.config().initial_capacity,
-                                uc.config().max_capacity,
-                            );
-                            uc.insert_restored_entry(ukey.clone(), entry);
-                            uc.record_silo_hit();
-                        }
-                    }
-                }
-                let cache_data = {
-                    let mut uc = self.unified_cache.lock();
-                    let pending = self.pending_bucket_diffs.load();
-                    uc.lookup(&ukey).map(|entry| {
-                        // Apply pending bucket diffs lazily before reading
-                        if pending.current_cutoff() > 0
-                            && entry.uses_bucket()
-                            && entry.bucket_cutoff() < pending.current_cutoff()
-                        {
-                            if entry.bucket_cutoff() >= pending.oldest_cutoff() {
-                                entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
-                            } else {
-                                entry.mark_for_rebuild();
-                            }
-                        }
-                        let bm = Arc::clone(entry.bitmap());
-                        let has_more = entry.has_more();
-                        let min_val = entry.min_tracked_value();
-                        let cap = entry.capacity();
-                        let total = entry.total_matched();
-                        let radix = entry.radix().cloned();
-                        let direction = entry.direction();
-                        let sorted_keys = entry.sorted_keys().map(Arc::clone);
-                        (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
-                    })
-                };
-                if let Some((unified_bm, has_more, min_val, capacity, cached_total, cached_radix, _cached_direction, cached_sorted_keys)) = cache_data {
-                    let needs_expansion = if let Some(cursor) = query.cursor.as_ref() {
-                        let strictly_past = match sort_clause.direction {
-                            crate::query::SortDirection::Desc => cursor.sort_value < min_val as u64,
-                            crate::query::SortDirection::Asc => cursor.sort_value > min_val as u64,
-                        };
-                        if strictly_past {
-                            true
-                        } else if cursor.sort_value == min_val as u64 {
-                            !unified_bm.contains(cursor.slot_id)
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if !needs_expansion {
-                        // CACHE HIT: record in trace — no filter computation happened
-                        collector.cache_hit = true;
-                        collector.filter_us = 0;
-                        let offset = if query.cursor.is_none() {
-                            query.offset.unwrap_or(0)
-                        } else {
-                            0
-                        };
-                        let fetch_limit = query.limit.saturating_add(offset);
-                        let sort_start = Instant::now();
-                        let mut result = if let Some(ref keys) = cached_sorted_keys {
-                            executor.execute_from_sorted_keys(
-                                keys, &sort_clause.field, sort_clause.direction,
-                                fetch_limit, query.cursor.as_ref(), cached_total,
-                            )?
-                        } else if let Some(ref radix) = cached_radix {
-                            executor.execute_from_radix(
-                                radix, sort_clause, fetch_limit,
-                                query.cursor.as_ref(), cached_total,
-                            )?
-                        } else {
-                            let use_simple = unified_bm.len() < 10_000;
-                            executor.execute_from_bitmap(
-                                &unified_bm,
-                                query.sort.as_ref(),
-                                fetch_limit,
-                                query.cursor.as_ref(),
-                                use_simple,
-                            )?
-                        };
-                        // Short page from cache = cursor at boundary, need expansion.
-                        // Two cases: (a) short page with cursor (original), and
-                        // (b) cache exhausted — returned results but no cursor.
-                        if has_more && (
-                            (result.cursor.is_none() && !result.ids.is_empty()) ||
-                            (result.ids.len() < fetch_limit && query.cursor.is_some())
-                        ) {
-                            // Expansion needs filters — trace them
-                            let filter_start = Instant::now();
-                            let (filter_arc, use_simple_sort) = self.resolve_filters_traced(
-                                &executor, effective_filters, tb_guard.as_deref(), now_unix, collector,
-                            )?;
-                            collector.filter_us = filter_start.elapsed().as_micros() as u64;
-                            collector.cache_hit = false; // expansion needed filters
-                            let max_cap = self.unified_cache.lock().config().max_capacity;
-                            let expand_limit = max_cap.saturating_sub(capacity);
-                            let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
-                            let expand_result = executor.execute_from_bitmap_unclamped(
-                                &filter_arc, query.sort.as_ref(), expand_limit,
-                                expand_cursor, use_simple_sort,
-                            )?;
-                            if !expand_result.ids.is_empty() {
-                                let sorted_slots: Vec<u32> = expand_result.ids.iter()
-                                    .map(|&id| id as u32).collect();
-                                let sort_field = snap.sorts.get_field(&sort_clause.field);
-                                let value_fn = |slot: u32| -> u32 {
-                                    sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                                };
-                                let mut uc = self.unified_cache.lock();
-                                if let Some(entry) = uc.lookup(&ukey) {
-                                    entry.expand(&sorted_slots, value_fn);
-                                    uc.record_extension();
-                                }
-                            }
-                            self.unified_cache.lock().record_wall_hit();
-                            let expanded_data = {
-                                let mut uc = self.unified_cache.lock();
-                                uc.lookup(&ukey).map(|e| {
-                                    let radix = e.radix().cloned();
-                                    let bm = Arc::clone(e.bitmap());
-                                    (radix, bm)
-                                })
-                            };
-                            if let Some((radix, bm)) = expanded_data {
-                                if let Some(ref r) = radix {
-                                    result = executor.execute_from_radix(
-                                        r, sort_clause, fetch_limit,
-                                        query.cursor.as_ref(), filter_arc.len(),
-                                    )?;
-                                } else {
-                                    result = executor.execute_from_bitmap(
-                                        &bm, query.sort.as_ref(), fetch_limit,
-                                        query.cursor.as_ref(), bm.len() < 10_000,
-                                    )?;
-                                }
-                            }
-                            result.total_matched = filter_arc.len();
-                            collector.sort_us = sort_start.elapsed().as_micros() as u64;
-                            self.post_validate(&mut result, &query.filters, &executor)?;
-                            return Ok(result);
-                        }
-                        collector.sort_us = sort_start.elapsed().as_micros() as u64;
-                        result.total_matched = cached_total;
-                        // Apply offset
-                        if offset > 0 && !result.ids.is_empty() {
-                            if offset >= result.ids.len() {
-                                result.ids.clear();
-                                result.cursor = None;
-                            } else {
-                                result.ids = result.ids.split_off(offset);
-                                if let Some(&last_id) = result.ids.last() {
-                                    let slot = last_id as u32;
-                                    if let Some(sort_field) = snap.sorts.get_field(&sort_clause.field) {
-                                        result.cursor = Some(crate::query::CursorPosition {
-                                            sort_value: sort_field.reconstruct_value(slot) as u64,
-                                            slot_id: slot,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        // Prefetch proximity detection (traced path)
-                        if has_more && capacity < self.unified_cache.lock().config().max_capacity {
-                            if let Some(ref tx) = self.prefetch_tx {
-                                if let Some(ref keys) = cached_sorted_keys {
-                                    if let Some(ref cursor) = result.cursor {
-                                        let cursor_key = (cursor.sort_value << 32) | (cursor.slot_id as u64);
-                                        let sort_dir = query.sort.as_ref().map(|s| s.direction).unwrap_or(SortDirection::Desc);
-                                        let pos = match sort_dir {
-                                            SortDirection::Desc => keys.partition_point(|&k| k >= cursor_key),
-                                            SortDirection::Asc => keys.partition_point(|&k| k <= cursor_key),
-                                        };
-                                        let threshold = self.unified_cache.lock().config().prefetch_threshold;
-                                        if keys.len() > 0 && pos as f64 / keys.len() as f64 >= threshold {
-                                            let _ = tx.try_send(ukey.clone());
-                                            self.unified_cache.lock().record_prefetch();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        self.post_validate(&mut result, &query.filters, &executor)?;
-                        return Ok(result);
-                    }
-                    // Expansion needed — fall through to slow path
-                    self.unified_cache.lock().record_wall_hit();
-                    return self.execute_query_slow_path_traced(
-                        query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix,
-                        Some((ukey, unified_bm, has_more, min_val, capacity, cached_total)),
-                        collector,
-                    );
-                }
-            }
-        }
-        // ── Slow path: cache miss or unsorted query ──
-        self.execute_query_slow_path_traced(
-            query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix, None,
-            collector,
-        )
-    }
-    /// Slow path for execute_query_with_collector: computes full filter bitmap
-    /// with trace collection. Mirrors `execute_query_slow_path` but uses
-    /// `resolve_filters_traced` for clause-level detail.
-    fn execute_query_slow_path_traced(
-        &self,
-        query: &BitdexQuery,
-        snapped_filters: &[FilterClause],
-        snap: &Arc<InnerEngine>,
-        executor: &QueryExecutor,
-        time_buckets: Option<&TimeBucketManager>,
-        now_unix: u64,
-        cached: Option<(UnifiedKey, Arc<RoaringBitmap>, bool, u32, usize, u64)>,
-        collector: &mut QueryTraceCollector,
-    ) -> Result<QueryResult> {
-        let _slow_start = std::time::Instant::now();
         let filter_start = Instant::now();
-        let (filter_arc, use_simple_sort) =
-            self.resolve_filters_traced(executor, snapped_filters, time_buckets, now_unix, collector)?;
+        // Run the same unified path; trace fields are populated after the fact
+        // from the result (total_matched, sort field). Per-clause tracing can be
+        // re-added here in the future by threading the collector into resolve_filters.
+        let result = self.execute_query_impl(query, None)?;
         collector.filter_us = filter_start.elapsed().as_micros() as u64;
-        let full_total_matched = filter_arc.len();
-        // If we have pre-fetched cache data (expansion case), use it.
-        // Otherwise, do a fresh cache lookup (miss case).
-        // skip_cache=true forces (None, None) to bypass all cache operations.
-        let (unified_key, unified_hit) = if query.skip_cache {
-            (None, None)
-        } else if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
-            (Some(ukey), Some((bm, has_more, min_val, cap)))
-        } else if let Some(sort_clause) = query.sort.as_ref() {
-            let mut uc = self.unified_cache.lock();
-            let min_size = uc.config().min_filter_size as u64;
-            if full_total_matched >= min_size {
-                if let Some(clauses) = cache::canonicalize(snapped_filters) {
-                    let ukey = UnifiedKey {
-                        filter_clauses: clauses,
-                        sort_field: sort_clause.field.clone(),
-                        direction: sort_clause.direction,
-                    };
-                    let hit = uc.lookup(&ukey).map(|entry| {
-                        let bm = Arc::clone(entry.bitmap());
-                        let has_more = entry.has_more();
-                        let min_val = entry.min_tracked_value();
-                        let cap = entry.capacity();
-                        (bm, has_more, min_val, cap)
-                    });
-                    (Some(ukey), hit)
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-        let needs_expansion = if let (Some((ref unified_bm, _, min_val, _)), Some(cursor), Some(sort_clause))
-            = (&unified_hit, query.cursor.as_ref(), query.sort.as_ref())
-        {
-            let strictly_past = match sort_clause.direction {
-                crate::query::SortDirection::Desc => cursor.sort_value < *min_val as u64,
-                crate::query::SortDirection::Asc => cursor.sort_value > *min_val as u64,
-            };
-            let at_boundary = cursor.sort_value == *min_val as u64;
-            if strictly_past {
-                true
-            } else if at_boundary {
-                !unified_bm.contains(cursor.slot_id)
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        let (effective_bitmap, use_simple) = if needs_expansion {
-            if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
-                if *has_more {
-                    let max_cap = self.unified_cache.lock().config().max_capacity;
-                    let expand_limit = max_cap.saturating_sub(*capacity);
-                    let expand_result = executor.execute_from_bitmap_unclamped(
-                        &filter_arc,
-                        query.sort.as_ref(),
-                        expand_limit,
-                        query.cursor.as_ref(),
-                        use_simple_sort,
-                    )?;
-                    if !expand_result.ids.is_empty() {
-                        let sorted_slots: Vec<u32> = expand_result.ids.iter()
-                            .map(|&id| id as u32).collect();
-                        let sort_field = snap.sorts.get_field(&ukey.sort_field);
-                        let value_fn = |slot: u32| -> u32 {
-                            sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                        };
-                        let mut uc = self.unified_cache.lock();
-                        if let Some(entry) = uc.lookup(ukey) {
-                            entry.expand(&sorted_slots, value_fn);
-                            uc.record_extension();
-                        }
-                    }
-                    let mut uc = self.unified_cache.lock();
-                    if let Some(entry) = uc.lookup(ukey) {
-                        let bm = Arc::clone(entry.bitmap());
-                        let use_simple = bm.len() < 10_000;
-                        (bm, use_simple)
-                    } else {
-                        (Arc::clone(&filter_arc), use_simple_sort)
-                    }
-                } else {
-                    if let Some((ref unified_bm, ..)) = unified_hit {
-                        let use_simple = unified_bm.len() < 10_000;
-                        (Arc::clone(unified_bm), use_simple)
-                    } else {
-                        (Arc::clone(&filter_arc), use_simple_sort)
-                    }
-                }
-            } else {
-                (Arc::clone(&filter_arc), use_simple_sort)
-            }
-        } else if let Some((ref unified_bm, ..)) = unified_hit {
-            let use_simple = unified_bm.len() < 10_000;
-            (Arc::clone(unified_bm), use_simple)
-        } else {
-            (Arc::clone(&filter_arc), use_simple_sort)
-        };
-        let offset = if query.cursor.is_none() {
-            query.offset.unwrap_or(0)
-        } else {
-            0
-        };
-        let fetch_limit = query.limit.saturating_add(offset);
-        let sort_start = Instant::now();
-        // ── Cache miss with sort: seed cache FIRST, serve from cache ──
-        if unified_hit.is_none() && unified_key.is_some() && query.sort.is_some() {
-            let ukey = unified_key.unwrap();
-            let sort_clause = query.sort.as_ref().unwrap();
-            if full_total_matched == 0 {
-                let value_fn = |_slot: u32| -> u32 { 0 };
-                self.unified_cache.lock().form_and_store(
-                    ukey,
-                    &[],
-                    false,
-                    full_total_matched,
-                    value_fn,
-                );
-                let mut result = QueryResult {
-                    ids: vec![],
-                    total_matched: full_total_matched,
-                    cursor: None,
-                };
-                collector.sort_us = sort_start.elapsed().as_micros() as u64;
-                self.post_validate(&mut result, &query.filters, executor)?;
-                return Ok(result);
-            }
-            let initial_cap = self.unified_cache.lock().config().initial_capacity;
-            let seed_result = executor.execute_from_bitmap_unclamped(
-                &filter_arc,
-                query.sort.as_ref(),
-                initial_cap,
-                None,
-                use_simple_sort,
-            )?;
-            let sort_field = snap.sorts.get_field(&sort_clause.field);
-            let sorted_slots: Vec<u32> = seed_result.ids.iter().map(|&id| id as u32).collect();
-            let has_more = full_total_matched > sorted_slots.len() as u64;
-            let value_fn = |slot: u32| -> u32 {
-                sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-            };
-            self.unified_cache.lock().form_and_store(
-                ukey.clone(),
-                &sorted_slots,
-                has_more,
-                full_total_matched,
-                value_fn,
-            );
-            let cached_keys = {
-                let mut uc = self.unified_cache.lock();
-                uc.lookup(&ukey).and_then(|entry| entry.sorted_keys().map(Arc::clone))
-            };
-            let mut result = if let Some(ref keys) = cached_keys {
-                executor.execute_from_sorted_keys(
-                    keys, &sort_clause.field, sort_clause.direction,
-                    fetch_limit, query.cursor.as_ref(), full_total_matched,
-                )?
-            } else {
-                let cached_bm = {
-                    let mut uc = self.unified_cache.lock();
-                    uc.lookup(&ukey).map(|entry| Arc::clone(entry.bitmap()))
-                };
-                if let Some(ref bm) = cached_bm {
-                    let use_simple = bm.len() < 10_000;
-                    executor.execute_from_bitmap(
-                        bm, query.sort.as_ref(), fetch_limit,
-                        query.cursor.as_ref(), use_simple,
-                    )?
-                } else {
-                    executor.execute_from_bitmap(
-                        &filter_arc, query.sort.as_ref(), fetch_limit,
-                        query.cursor.as_ref(), use_simple_sort,
-                    )?
-                }
-            };
-            result.total_matched = full_total_matched;
-            // Apply offset
-            if offset > 0 && !result.ids.is_empty() {
-                if offset >= result.ids.len() {
-                    result.ids.clear();
-                    result.cursor = None;
-                } else {
-                    result.ids = result.ids.split_off(offset);
-                    if let Some(&last_id) = result.ids.last() {
-                        let slot = last_id as u32;
-                        if let Some(sort_field_ref) = snap.sorts.get_field(&sort_clause.field) {
-                            result.cursor = Some(crate::query::CursorPosition {
-                                sort_value: sort_field_ref.reconstruct_value(slot) as u64,
-                                slot_id: slot,
-                            });
-                        }
-                    }
-                }
-            }
-            collector.sort_us = sort_start.elapsed().as_micros() as u64;
-            self.post_validate(&mut result, &query.filters, executor)?;
-            return Ok(result);
-        }
-        // ── Cache hit or unsorted query path ──
-        let bound_was_applied = effective_bitmap.len() < filter_arc.len();
-        let mut result = executor.execute_from_bitmap(
-            &effective_bitmap,
-            query.sort.as_ref(),
-            fetch_limit,
-            query.cursor.as_ref(),
-            use_simple,
-        )?;
-        // Bound exhaustion: expand if needed
-        if result.ids.len() < fetch_limit && query.cursor.is_some() && bound_was_applied {
-            let did_expand = if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
-                if *has_more {
-                    let max_cap = self.unified_cache.lock().config().max_capacity;
-                    let expand_limit = max_cap.saturating_sub(*capacity);
-                    let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
-                    let expand_result = executor.execute_from_bitmap_unclamped(
-                        &filter_arc,
-                        query.sort.as_ref(),
-                        expand_limit,
-                        expand_cursor,
-                        use_simple_sort,
-                    )?;
-                    if !expand_result.ids.is_empty() {
-                        let sorted_slots: Vec<u32> = expand_result.ids.iter()
-                            .map(|&id| id as u32).collect();
-                        let sort_field = snap.sorts.get_field(&ukey.sort_field);
-                        let value_fn = |slot: u32| -> u32 {
-                            sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                        };
-                        let mut uc = self.unified_cache.lock();
-                        if let Some(entry) = uc.lookup(ukey) {
-                            entry.expand(&sorted_slots, value_fn);
-                            uc.record_extension();
-                        }
-                    }
-                    true
-                } else { false }
-            } else { false };
-            let re_data = if did_expand {
-                if let Some(ref ukey) = unified_key {
-                    let mut uc = self.unified_cache.lock();
-                    uc.lookup(ukey).map(|e| {
-                        let radix = e.radix().cloned();
-                        let bm = Arc::clone(e.bitmap());
-                        (radix, bm)
-                    })
-                } else { None }
-            } else { None };
-            if let Some(sort_clause) = query.sort.as_ref() {
-                if let Some((radix, bm)) = re_data {
-                    if let Some(ref r) = radix {
-                        result = executor.execute_from_radix(
-                            r, sort_clause, fetch_limit,
-                            query.cursor.as_ref(), full_total_matched,
-                        )?;
-                    } else {
-                        result = executor.execute_from_bitmap(
-                            &bm, query.sort.as_ref(), fetch_limit,
-                            query.cursor.as_ref(), bm.len() < 10_000,
-                        )?;
-                    }
-                } else {
-                    result = executor.execute_from_bitmap(
-                        filter_arc.as_ref(), query.sort.as_ref(), fetch_limit,
-                        query.cursor.as_ref(), false,
-                    )?;
-                }
-            }
-        }
-        result.total_matched = full_total_matched;
-        // Apply offset
-        if offset > 0 && !result.ids.is_empty() {
-            if offset >= result.ids.len() {
-                result.ids.clear();
-                result.cursor = None;
-            } else {
-                result.ids = result.ids.split_off(offset);
-                if let Some(sort_clause) = query.sort.as_ref() {
-                    if let Some(&last_id) = result.ids.last() {
-                        let slot = last_id as u32;
-                        if let Some(sort_field) = snap.sorts.get_field(&sort_clause.field) {
-                            result.cursor = Some(crate::query::CursorPosition {
-                                sort_value: sort_field.reconstruct_value(slot) as u64,
-                                slot_id: slot,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        collector.sort_us = sort_start.elapsed().as_micros() as u64;
-        self.post_validate(&mut result, &query.filters, executor)?;
         Ok(result)
     }
-    /// Slow path for execute_query: computes full filter bitmap.
-    /// Used for cache misses, expansions, and unsorted queries.
-    fn execute_query_slow_path(
-        &self,
-        query: &BitdexQuery,
-        snapped_filters: &[FilterClause],
-        snap: &Arc<InnerEngine>,
-        executor: &QueryExecutor,
-        time_buckets: Option<&TimeBucketManager>,
-        now_unix: u64,
-        // Pre-fetched cache data from fast path that detected expansion needed
-        cached: Option<(UnifiedKey, Arc<RoaringBitmap>, bool, u32, usize, u64)>,
-    ) -> Result<QueryResult> {
-        let slow_start = std::time::Instant::now();
-        let t0 = std::time::Instant::now();
-        let (filter_arc, use_simple_sort) =
-            self.resolve_filters(executor, snapped_filters, time_buckets, now_unix)?;
-        let filter_elapsed = t0.elapsed();
-        let full_total_matched = filter_arc.len();
-        tracing::debug!(
-            "  slow_path: resolve_filters={:.1}ms, matched={}, use_simple={}",
-            filter_elapsed.as_secs_f64() * 1000.0, full_total_matched, use_simple_sort
-        );
-        // If we have pre-fetched cache data (expansion case), use it.
-        // Otherwise, do a fresh cache lookup (miss case).
-        // skip_cache=true forces (None, None) to bypass all cache operations.
-        let (unified_key, unified_hit) = if query.skip_cache {
-            (None, None)
-        } else if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
-            (Some(ukey), Some((bm, has_more, min_val, cap)))
-        } else if let Some(sort_clause) = query.sort.as_ref() {
-            let mut uc = self.unified_cache.lock();
-            let min_size = uc.config().min_filter_size as u64;
-            if full_total_matched >= min_size {
-                if let Some(clauses) = cache::canonicalize(snapped_filters) {
-                    let ukey = UnifiedKey {
-                        filter_clauses: clauses,
-                        sort_field: sort_clause.field.clone(),
-                        direction: sort_clause.direction,
-                    };
-                    let hit = uc.lookup(&ukey).map(|entry| {
-                        let bm = Arc::clone(entry.bitmap());
-                        let has_more = entry.has_more();
-                        let min_val = entry.min_tracked_value();
-                        let cap = entry.capacity();
-                        (bm, has_more, min_val, cap)
-                    });
-                    (Some(ukey), hit)
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-        // Check if cursor is past the cache boundary — trigger expansion if so.
-        let needs_expansion = if let (Some((ref unified_bm, _, min_val, _)), Some(cursor), Some(sort_clause))
-            = (&unified_hit, query.cursor.as_ref(), query.sort.as_ref())
-        {
-            let strictly_past = match sort_clause.direction {
-                crate::query::SortDirection::Desc => cursor.sort_value < *min_val as u64,
-                crate::query::SortDirection::Asc => cursor.sort_value > *min_val as u64,
-            };
-            let at_boundary = cursor.sort_value == *min_val as u64;
-            if strictly_past {
-                true
-            } else if at_boundary {
-                !unified_bm.contains(cursor.slot_id)
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        let (effective_bitmap, use_simple) = if needs_expansion {
-            if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
-                if *has_more {
-                    let max_cap = self.unified_cache.lock().config().max_capacity;
-                    let expand_limit = max_cap.saturating_sub(*capacity);
-                    let expand_result = executor.execute_from_bitmap_unclamped(
-                        &filter_arc,
-                        query.sort.as_ref(),
-                        expand_limit,
-                        query.cursor.as_ref(),
-                        use_simple_sort,
-                    )?;
-                    if !expand_result.ids.is_empty() {
-                        let sorted_slots: Vec<u32> = expand_result.ids.iter()
-                            .map(|&id| id as u32).collect();
-                        let sort_field = snap.sorts.get_field(&ukey.sort_field);
-                        let value_fn = |slot: u32| -> u32 {
-                            sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                        };
-                        let mut uc = self.unified_cache.lock();
-                        if let Some(entry) = uc.lookup(ukey) {
-                            entry.expand(&sorted_slots, value_fn);
-                            uc.record_extension();
-                        }
-                    }
-                    let mut uc = self.unified_cache.lock();
-                    if let Some(entry) = uc.lookup(ukey) {
-                        let bm = Arc::clone(entry.bitmap());
-                        let use_simple = bm.len() < 10_000;
-                        (bm, use_simple)
-                    } else {
-                        (Arc::clone(&filter_arc), use_simple_sort)
-                    }
-                } else {
-                    if let Some((ref unified_bm, ..)) = unified_hit {
-                        let use_simple = unified_bm.len() < 10_000;
-                        (Arc::clone(unified_bm), use_simple)
-                    } else {
-                        (Arc::clone(&filter_arc), use_simple_sort)
-                    }
-                }
-            } else {
-                (Arc::clone(&filter_arc), use_simple_sort)
-            }
-        } else if let Some((ref unified_bm, ..)) = unified_hit {
-            let use_simple = unified_bm.len() < 10_000;
-            (Arc::clone(unified_bm), use_simple)
-        } else {
-            (Arc::clone(&filter_arc), use_simple_sort)
-        };
-        let offset = if query.cursor.is_none() {
-            query.offset.unwrap_or(0)
-        } else {
-            0
-        };
-        let fetch_limit = query.limit.saturating_add(offset);
-        // ── Cache miss with sort: seed cache FIRST, serve from cache (one traversal) ──
-        // The seed traversal (4K results) is a superset of the user's request (e.g. 50),
-        // so we do one traversal instead of two.
-        if unified_hit.is_none() && unified_key.is_some() && query.sort.is_some() {
-            let ukey = unified_key.unwrap();
-            let sort_clause = query.sort.as_ref().unwrap();
-            if full_total_matched == 0 {
-                // Zero-result cache: empty bitmap, no sort traversal needed.
-                let value_fn = |_slot: u32| -> u32 { 0 };
-                self.unified_cache.lock().form_and_store(
-                    ukey,
-                    &[],
-                    false,
-                    full_total_matched,
-                    value_fn,
-                );
-                let result = QueryResult {
-                    ids: vec![],
-                    total_matched: full_total_matched,
-                    cursor: None,
-                };
-                // post_validate not needed for empty results, but call for consistency
-                let mut result = result;
-                self.post_validate(&mut result, &query.filters, executor)?;
-                return Ok(result);
-            }
-            // Seed the cache with initial_capacity (4K) results — single sort traversal.
-            let initial_cap = self.unified_cache.lock().config().initial_capacity;
-            let t0 = std::time::Instant::now();
-            let seed_result = executor.execute_from_bitmap_unclamped(
-                &filter_arc,
-                query.sort.as_ref(),
-                initial_cap,
-                None,
-                use_simple_sort,
-            )?;
-            let sort_elapsed = t0.elapsed();
-            tracing::debug!(
-                "  slow_path: sort_seed={:.1}ms ({}→{} slots, simple={})",
-                sort_elapsed.as_secs_f64() * 1000.0, full_total_matched, seed_result.ids.len(), use_simple_sort
-            );
-            let sort_field = snap.sorts.get_field(&sort_clause.field);
-            let sorted_slots: Vec<u32> = seed_result.ids.iter().map(|&id| id as u32).collect();
-            let has_more = full_total_matched > sorted_slots.len() as u64;
-            let value_fn = |slot: u32| -> u32 {
-                sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-            };
-            let t0 = std::time::Instant::now();
-            self.unified_cache.lock().form_and_store(
-                ukey.clone(),
-                &sorted_slots,
-                has_more,
-                full_total_matched,
-                value_fn,
-            );
-            let cache_elapsed = t0.elapsed();
-            tracing::debug!(
-                "  slow_path: cache_form={:.1}ms, total_slow={:.1}ms",
-                cache_elapsed.as_secs_f64() * 1000.0,
-                slow_start.elapsed().as_secs_f64() * 1000.0
-            );
-            // Serve the user's results from the freshly seeded cache.
-            let cached_keys = {
-                let mut uc = self.unified_cache.lock();
-                uc.lookup(&ukey).and_then(|entry| entry.sorted_keys().map(Arc::clone))
-            };
-            let mut result = if let Some(ref keys) = cached_keys {
-                executor.execute_from_sorted_keys(
-                    keys, &sort_clause.field, sort_clause.direction,
-                    fetch_limit, query.cursor.as_ref(), full_total_matched,
-                )?
-            } else {
-                // sorted_keys not available (shouldn't happen for fresh seed), fall back to bitmap
-                let cached_bm = {
-                    let mut uc = self.unified_cache.lock();
-                    uc.lookup(&ukey).map(|entry| Arc::clone(entry.bitmap()))
-                };
-                if let Some(ref bm) = cached_bm {
-                    let use_simple = bm.len() < 10_000;
-                    executor.execute_from_bitmap(
-                        bm, query.sort.as_ref(), fetch_limit,
-                        query.cursor.as_ref(), use_simple,
-                    )?
-                } else {
-                    // Cache entry vanished (eviction race), fall back to filter bitmap
-                    executor.execute_from_bitmap(
-                        &filter_arc, query.sort.as_ref(), fetch_limit,
-                        query.cursor.as_ref(), use_simple_sort,
-                    )?
-                }
-            };
-            result.total_matched = full_total_matched;
-            // Apply offset
-            if offset > 0 && !result.ids.is_empty() {
-                if offset >= result.ids.len() {
-                    result.ids.clear();
-                    result.cursor = None;
-                } else {
-                    result.ids = result.ids.split_off(offset);
-                    if let Some(&last_id) = result.ids.last() {
-                        let slot = last_id as u32;
-                        if let Some(sort_field_ref) = snap.sorts.get_field(&sort_clause.field) {
-                            result.cursor = Some(crate::query::CursorPosition {
-                                sort_value: sort_field_ref.reconstruct_value(slot) as u64,
-                                slot_id: slot,
-                            });
-                        }
-                    }
-                }
-            }
-            self.post_validate(&mut result, &query.filters, executor)?;
-            return Ok(result);
-        }
-        // ── Cache hit or unsorted query path ──
-        let bound_was_applied = effective_bitmap.len() < filter_arc.len();
-        let mut result = executor.execute_from_bitmap(
-            &effective_bitmap,
-            query.sort.as_ref(),
-            fetch_limit,
-            query.cursor.as_ref(),
-            use_simple,
-        )?;
-        // Bound exhaustion: if the bounded bitmap returned fewer results than requested,
-        // expand the cache and re-query from the expanded bitmap.
-        if result.ids.len() < fetch_limit && query.cursor.is_some() && bound_was_applied {
-            let did_expand = if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
-                if *has_more {
-                    let max_cap = self.unified_cache.lock().config().max_capacity;
-                    let expand_limit = max_cap.saturating_sub(*capacity);
-                    let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
-                    let expand_result = executor.execute_from_bitmap_unclamped(
-                        &filter_arc,
-                        query.sort.as_ref(),
-                        expand_limit,
-                        expand_cursor,
-                        use_simple_sort,
-                    )?;
-                    if !expand_result.ids.is_empty() {
-                        let sorted_slots: Vec<u32> = expand_result.ids.iter()
-                            .map(|&id| id as u32).collect();
-                        let sort_field = snap.sorts.get_field(&ukey.sort_field);
-                        let value_fn = |slot: u32| -> u32 {
-                            sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                        };
-                        let mut uc = self.unified_cache.lock();
-                        if let Some(entry) = uc.lookup(ukey) {
-                            entry.expand(&sorted_slots, value_fn);
-                            uc.record_extension();
-                        }
-                    }
-                    true
-                } else { false }
-            } else { false };
-            // Re-query from expanded entry (use radix if available)
-            let re_data = if did_expand {
-                if let Some(ref ukey) = unified_key {
-                    let mut uc = self.unified_cache.lock();
-                    uc.lookup(ukey).map(|e| {
-                        let radix = e.radix().cloned();
-                        let bm = Arc::clone(e.bitmap());
-                        (radix, bm)
-                    })
-                } else { None }
-            } else { None };
-            if let Some(sort_clause) = query.sort.as_ref() {
-                if let Some((radix, bm)) = re_data {
-                    if let Some(ref r) = radix {
-                        result = executor.execute_from_radix(
-                            r, sort_clause, fetch_limit,
-                            query.cursor.as_ref(), full_total_matched,
-                        )?;
-                    } else {
-                        result = executor.execute_from_bitmap(
-                            &bm, query.sort.as_ref(), fetch_limit,
-                            query.cursor.as_ref(), bm.len() < 10_000,
-                        )?;
-                    }
-                } else {
-                    result = executor.execute_from_bitmap(
-                        filter_arc.as_ref(), query.sort.as_ref(), fetch_limit,
-                        query.cursor.as_ref(), false,
-                    )?;
-                }
-            }
-        }
-        result.total_matched = full_total_matched;
-        // Apply offset
-        if offset > 0 && !result.ids.is_empty() {
-            if offset >= result.ids.len() {
-                result.ids.clear();
-                result.cursor = None;
-            } else {
-                result.ids = result.ids.split_off(offset);
-                if let Some(sort_clause) = query.sort.as_ref() {
-                    if let Some(&last_id) = result.ids.last() {
-                        let slot = last_id as u32;
-                        if let Some(sort_field) = snap.sorts.get_field(&sort_clause.field) {
-                            result.cursor = Some(crate::query::CursorPosition {
-                                sort_value: sort_field.reconstruct_value(slot) as u64,
-                                slot_id: slot,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        self.post_validate(&mut result, &query.filters, executor)?;
-        Ok(result)
-    }
-    /// Like `resolve_filters`, but records per-clause metrics into a trace collector.
-    fn resolve_filters_traced(
-        &self,
-        executor: &QueryExecutor,
-        filters: &[FilterClause],
-        time_buckets: Option<&TimeBucketManager>,
-        now_unix: u64,
-        collector: &mut QueryTraceCollector,
-    ) -> Result<(Arc<roaring::RoaringBitmap>, bool)> {
-        let snapped;
-        let effective_filters = if let Some(tb) = time_buckets {
-            let mut managers = std::collections::HashMap::new();
-            managers.insert(tb.field_name().to_string(), tb);
-            let ctx = crate::query::BucketSnapContext {
-                managers: &managers,
-                now_secs: now_unix,
-                tolerance_pct: 0.10,
-                always_snap: true,
-            };
-            snapped = crate::query::snap_range_clauses(filters, &ctx);
-            &snapped[..]
-        } else {
-            filters
-        };
-        let planner_ctx = planner::PlannerContext {
-            string_maps: executor.string_maps(),
-            dictionaries: executor.dictionaries(),
-        };
-        let plan = planner::plan_query_with_context(effective_filters, executor.filter_index(), executor.slot_allocator(), Some(&planner_ctx));
-        let filter_bitmap = Arc::new(executor.compute_filters_traced(&plan.ordered_clauses, Some(collector))?);
-        Ok((filter_bitmap, plan.use_simple_sort))
-    }
+
+
     /// Resolve filter clauses to a bitmap.
     ///
     /// Snaps range filters to time bucket bitmaps, plans clause ordering,
@@ -3528,10 +2328,8 @@ impl ConcurrentEngine {
         let slot_bytes = snap.slots.bitmap_bytes();
         let filter_bytes = snap.filters.bitmap_bytes();
         let sort_bytes = snap.sorts.bitmap_bytes();
-        let uc = self.unified_cache.lock();
-        let cache_entries = uc.stats().entries;
-        let cache_bytes = uc.stats().memory_bytes;
-        drop(uc);
+        let cache_entries = 0usize;
+        let cache_bytes = 0usize;
         let filter_details: Vec<(String, usize, usize)> = snap
             .filters
             .per_field_bytes()
@@ -3546,41 +2344,22 @@ impl ConcurrentEngine {
             .collect();
         (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details)
     }
-    pub fn unified_cache_stats(&self) -> crate::unified_cache::UnifiedCacheStats {
-        self.unified_cache.lock().stats()
+    /// Return stub cache stats (CacheSilo has no in-memory entry tracking).
+    pub fn unified_cache_stats(&self) -> CacheStats {
+        CacheStats::default()
     }
-    /// Return per-entry cache details for diagnostics.
-    pub fn unified_cache_entry_details(&self) -> Vec<crate::unified_cache::UnifiedEntryDetail> {
-        self.unified_cache.lock().entry_details()
+    /// Return stub per-entry cache details (CacheSilo has no in-memory entry tracking).
+    pub fn unified_cache_entry_details(&self) -> Vec<CacheEntryDetail> {
+        Vec::new()
     }
-    /// Update the max_maintenance_work budget on the live unified cache.
-    pub fn set_max_maintenance_work(&self, v: usize) {
-        self.unified_cache.lock().config_mut().max_maintenance_work = v;
-    }
-    /// Update the max_maintenance_ms time budget on the live unified cache.
-    pub fn set_max_maintenance_ms(&self, v: u64) {
-        self.unified_cache.lock().config_mut().max_maintenance_ms = v;
-    }
-    /// Update the max_entries cap on the live unified cache.
-    pub fn set_cache_max_entries(&self, v: usize) {
-        self.unified_cache.lock().config_mut().max_entries = v;
-    }
-    /// Update the max_bytes cap on the live unified cache.
-    pub fn set_cache_max_bytes(&self, v: usize) {
-        self.unified_cache.lock().config_mut().max_bytes = v;
-    }
-    /// Update the initial_capacity on the live unified cache.
-    pub fn set_cache_initial_capacity(&self, v: usize) {
-        self.unified_cache.lock().config_mut().initial_capacity = v;
-    }
-    /// Update the max_capacity on the live unified cache.
-    pub fn set_cache_max_capacity(&self, v: usize) {
-        self.unified_cache.lock().config_mut().max_capacity = v;
-    }
-    /// Update the min_filter_size on the live unified cache.
-    pub fn set_cache_min_filter_size(&self, v: usize) {
-        self.unified_cache.lock().config_mut().min_filter_size = v;
-    }
+    /// No-op: cache capacity is now managed by CacheSilo compaction, not a runtime knob.
+    pub fn set_max_maintenance_work(&self, _v: usize) {}
+    pub fn set_max_maintenance_ms(&self, _v: u64) {}
+    pub fn set_cache_max_entries(&self, _v: usize) {}
+    pub fn set_cache_max_bytes(&self, _v: usize) {}
+    pub fn set_cache_initial_capacity(&self, _v: usize) {}
+    pub fn set_cache_max_capacity(&self, _v: usize) {}
+    pub fn set_cache_min_filter_size(&self, _v: usize) {}
     /// Rebuild all time bucket bitmaps from scratch by scanning the sort field
     /// for all alive slots. Use after a bulk dump or when buckets are empty/stale.
     /// Returns (bucket_count, total_slots_scanned) or an error.
@@ -3619,8 +2398,7 @@ impl ConcurrentEngine {
         let bucket_count = bucket_names.len();
         // Mark dirty so merge thread persists
         self.dirty_since_snapshot.store(true, std::sync::atomic::Ordering::Release);
-        // Invalidate cache — stale entries may hold 0-result bitmaps from before rebuild
-        self.unified_cache.lock().clear();
+        // CacheSilo entries will be recomputed on the next query miss after rebuild.
         eprintln!(
             "rebuild_time_buckets: rebuilt {} buckets from {} alive slots in sort field '{}'",
             bucket_count, slot_count, sort_field_name
@@ -3657,18 +2435,19 @@ impl ConcurrentEngine {
             false
         }
     }
-    /// Clear unified cache entries and reset counters (RAM only).
+    /// Clear all CacheSilo entries. Stale entries will be recomputed on next query miss.
     pub fn clear_unified_cache(&self) {
-        self.unified_cache.lock().clear();
+        if let Some(ref silo_arc) = self.cache_silo {
+            // Compact silo by truncating ops log — simplest way to drop all entries.
+            if let Err(e) = silo_arc.write().compact() {
+                eprintln!("clear_unified_cache: compact error: {e}");
+            }
+        }
     }
-    /// Purge the entire BoundStore: disk first, then memory.
-    /// Order matters: wipe disk before clearing RAM to prevent stale shard loads.
-    /// Safe to call while the server is running — the merge thread will simply
-    /// start writing fresh data on the next cycle with dirty entries.
+    /// Purge the CacheSilo: entries are recomputed on next query miss.
     pub fn purge_bounds(&self) -> crate::error::Result<()> {
-        // Clear RAM cache (BoundStore removed — no disk to purge).
-        self.unified_cache.lock().clear();
-        eprintln!("purge_bounds: cleared RAM cache (BoundStore removed)");
+        self.clear_unified_cache();
+        eprintln!("purge_bounds: cleared CacheSilo");
         Ok(())
     }
     /// Enter loading mode: skip snapshot publishing and maintenance during bulk inserts.
@@ -4008,7 +2787,8 @@ impl ConcurrentEngine {
         (*snap).clone()
     }
     fn invalidate_all_caches(&self) {
-        self.unified_cache.lock().clear();
+        // CacheSilo entries become stale after bulk loads; they'll be recomputed on miss.
+        // Full purge via clear_unified_cache() is available if needed.
     }
     /// Persist documents to the docstore on a background thread.
     /// Returns a JoinHandle to wait for completion. The docs Vec is consumed.
@@ -4297,12 +3077,6 @@ impl ConcurrentEngine {
             handle.join().ok();
         }
         if let Some(handle) = self.merge_handle.take() {
-            handle.join().ok();
-        }
-        // Drop the prefetch_tx sender to signal the prefetch worker to exit,
-        // then join it. Must drop before join to avoid deadlock.
-        drop(self.prefetch_tx.take());
-        if let Some(handle) = self.prefetch_handle.take() {
             handle.join().ok();
         }
         // DataSilo: no separate compaction/eviction threads

@@ -37,7 +37,7 @@ pub mod slot;
 pub mod sort;
 pub mod time_buckets;
 pub mod types;
-pub mod unified_cache;
+// unified_cache removed in Phase 3 — CacheSilo is the sole cache now
 pub mod versioned_bitmap;
 #[cfg(feature = "pg-sync")]
 pub mod dump_processor;
