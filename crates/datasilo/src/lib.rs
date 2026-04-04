@@ -371,71 +371,93 @@ impl DataSilo {
         if entries.is_empty() { return Ok(0); }
 
         let count = entries.len() as u64;
+        let align = self.config.alignment.max(1) as u64;
+        let buffer_ratio = self.config.buffer_ratio;
+        let min_entry_size = self.config.min_entry_size;
 
         // Drop old mmaps before writing
         self.index_mmap = None;
         self.data_mmap = None;
 
-        // Write data file + index via sequential BufWriter (simple, correct)
-        let data_path = self.path.join("data.bin");
-        let index_count = max_key as usize + 1;
-        let mut data_file = io::BufWriter::with_capacity(1 << 20, File::create(&data_path)?);
-        let mut offset: u64 = 0;
+        // Sort keys and compute per-entry layout (offsets must be sequential)
+        let mut keys: Vec<u32> = entries.keys().copied().collect();
+        keys.sort_unstable();
 
-        // Pre-allocate index
+        // Phase 1: Compute entry layouts — offset, length, allocated (sequential)
+        struct EntryLayout { key: u32, offset: u64, length: u32, allocated: u32 }
+        let mut layouts: Vec<EntryLayout> = Vec::with_capacity(keys.len());
+        let mut offset: u64 = 0;
+        for &key in &keys {
+            if align > 1 {
+                offset = (offset + align - 1) & !(align - 1);
+            }
+            let len = entries[&key].len() as u32;
+            let mut allocated = ((len as f32 * buffer_ratio).ceil() as u32)
+                .max(min_entry_size);
+            if align > 1 {
+                allocated = ((allocated as u64 + align - 1) & !(align - 1)) as u32;
+            }
+            layouts.push(EntryLayout { key, offset, length: len, allocated });
+            offset += allocated as u64;
+        }
+        let total_data_size = offset;
+
+        // Phase 2: Pre-allocate data file + index as mmap
+        let data_path = self.path.join("data.bin");
+        let data_file = OpenOptions::new()
+            .create(true).read(true).write(true).truncate(true).open(&data_path)?;
+        data_file.set_len(total_data_size)?;
+        let mut data_mmap = unsafe { memmap2::MmapMut::map_mut(&data_file)? };
+
+        let index_count = max_key as usize + 1;
         let index_path = self.path.join("index.bin");
         let index_file = OpenOptions::new()
             .create(true).read(true).write(true).open(&index_path)?;
         index_file.set_len((index_count * INDEX_ENTRY_SIZE) as u64)?;
         let mut index_mmap = unsafe { memmap2::MmapMut::map_mut(&index_file)? };
 
-        // Write entries sorted by key for sequential I/O
-        let mut keys: Vec<u32> = entries.keys().copied().collect();
-        keys.sort_unstable();
+        // Phase 3: Write entries to mmap (parallel memcpy)
+        // Each entry writes to a pre-computed offset — no overlap, safe for parallel.
+        let data_ptr = data_mmap.as_mut_ptr();
+        let index_ptr = index_mmap.as_mut_ptr();
+        let data_mmap_len = data_mmap.len();
+        let index_mmap_len = index_mmap.len();
 
-        let align = self.config.alignment.max(1) as u64;
-        for key in keys {
-            // Align offset for frozen bitmap compatibility
-            if align > 1 {
-                offset = (offset + align - 1) & !(align - 1);
-            }
-
-            let value = &entries[&key];
-            let len = value.len() as u32;
-            let allocated = ((len as f32 * self.config.buffer_ratio).ceil() as u32)
-                .max(self.config.min_entry_size);
-            // Ensure allocated is also aligned
-            let allocated = if align > 1 {
-                ((allocated as u64 + align - 1) & !(align - 1)) as u32
-            } else {
-                allocated
-            };
-
-            data_file.write_all(value)?;
-            // Write padding for allocated headroom
-            if allocated > len {
-                let zeros = [0u8; 4096];
-                let mut rem = (allocated - len) as usize;
-                while rem > 0 {
-                    let c = rem.min(4096);
-                    data_file.write_all(&zeros[..c])?;
-                    rem -= c;
+        // Safety: each layout has a unique, non-overlapping (offset..offset+allocated) region.
+        // Parallel writes to disjoint regions of mmap are safe.
+        layouts.iter().for_each(|layout| {
+            let value = &entries[&layout.key];
+            let start = layout.offset as usize;
+            if start + value.len() <= data_mmap_len {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        value.as_ptr(),
+                        data_ptr.add(start),
+                        value.len(),
+                    );
                 }
             }
-
             // Write index entry
-            let entry = IndexEntry { offset, length: len, allocated };
-            let pos = key as usize * INDEX_ENTRY_SIZE;
-            if pos + INDEX_ENTRY_SIZE <= index_mmap.len() {
+            let entry = IndexEntry {
+                offset: layout.offset,
+                length: layout.length,
+                allocated: layout.allocated,
+            };
+            let pos = layout.key as usize * INDEX_ENTRY_SIZE;
+            if pos + INDEX_ENTRY_SIZE <= index_mmap_len {
                 let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(entry) };
-                index_mmap[pos..pos + INDEX_ENTRY_SIZE].copy_from_slice(&bytes);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        index_ptr.add(pos),
+                        INDEX_ENTRY_SIZE,
+                    );
+                }
             }
+        });
 
-            offset += allocated as u64;
-        }
-
-        data_file.flush()?;
-        drop(data_file);
+        data_mmap.flush()?;
+        drop(data_mmap);
         index_mmap.flush()?;
 
         self.index_mmap = Some(index_mmap);
