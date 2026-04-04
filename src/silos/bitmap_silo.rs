@@ -180,18 +180,6 @@ impl BitmapSilo {
 
     // ── Load ────────────────────────────────────────────────────────────
 
-    /// Load alive bitmap from the silo via FrozenRoaringBitmap::view() → to_owned().
-    pub fn load_alive(&self) -> io::Result<Option<RoaringBitmap>> {
-        match self.silo.get(KEY_ALIVE) {
-            Some(bytes) => {
-                let frozen = roaring::FrozenRoaringBitmap::view(bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("frozen alive: {e:?}")))?;
-                Ok(Some(frozen.to_owned()))
-            }
-            None => Ok(None),
-        }
-    }
-
     /// Load metadata from the silo.
     pub fn load_meta(&self) -> io::Result<Option<serde_json::Value>> {
         match self.silo.get(KEY_META) {
@@ -609,8 +597,8 @@ mod tests {
         let silo = BitmapSilo::open(dir.path()).unwrap();
         assert!(silo.has_data());
 
-        // Load alive
-        let loaded_alive = silo.load_alive().unwrap().unwrap();
+        // Load alive via ops-on-read
+        let loaded_alive = silo.get_alive_with_ops().unwrap();
         assert_eq!(loaded_alive.len(), 200);
 
         // Load meta
