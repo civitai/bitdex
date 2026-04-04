@@ -277,6 +277,22 @@ impl CacheSilo {
         self.silo.delete(key_hash)
     }
 
+    /// Read a single entry by key hash. Checks both ops logs (last-write-wins) and
+    /// falls back to the data file for compacted entries. Returns `None` if the key
+    /// is absent or tombstoned.
+    ///
+    /// Used by the query fast path to check CacheSilo before the in-memory UnifiedCache.
+    pub fn get_entry(&self, key_hash: u32) -> Option<CacheEntryData> {
+        let bytes = self.silo.get_with_ops(key_hash)?;
+        match CacheEntryData::decode(&bytes) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                eprintln!("CacheSilo: decode error for key {key_hash}: {e} (skipping)");
+                None
+            }
+        }
+    }
+
     /// Load all persisted entries. Called on startup before the engine accepts queries.
     ///
     /// Iterates the ops log (LIFO — last write wins) and falls back to the data
@@ -551,6 +567,75 @@ mod tests {
         silo.compact().expect("compact");
         let ops_after = silo.ops_size();
         assert_eq!(ops_after, 0, "ops log should be empty after compaction");
+    }
+
+    // ── get_entry — single-key read path ─────────────────────────────────
+
+    #[test]
+    fn get_entry_returns_saved_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let silo_path = dir.path().join("cache_silo");
+
+        let entry = make_entry(SortDirection::Desc, true);
+        let key = make_key("sortAt", SortDirection::Desc);
+        let key_hash = hash_unified_key(&key);
+
+        let silo = CacheSilo::open(&silo_path).expect("open silo");
+        silo.save_entry(key_hash, &entry).expect("save_entry");
+
+        let got = silo.get_entry(key_hash).expect("get_entry should find saved entry");
+        assert_eq!(got.bitmap, entry.bitmap);
+        assert_eq!(got.min_tracked_value, entry.min_tracked_value);
+        assert_eq!(got.total_matched, entry.total_matched);
+        assert_eq!(got.direction, entry.direction);
+        assert_eq!(got.sorted_keys, entry.sorted_keys);
+    }
+
+    #[test]
+    fn get_entry_returns_none_for_unknown_key() {
+        let dir = TempDir::new().expect("tempdir");
+        let silo_path = dir.path().join("cache_silo");
+
+        let silo = CacheSilo::open(&silo_path).expect("open silo");
+        assert!(silo.get_entry(99999).is_none(), "unknown key should return None");
+    }
+
+    #[test]
+    fn get_entry_returns_none_after_delete() {
+        let dir = TempDir::new().expect("tempdir");
+        let silo_path = dir.path().join("cache_silo");
+
+        let entry = make_entry(SortDirection::Asc, false);
+        let key = make_key("likeCount", SortDirection::Asc);
+        let key_hash = hash_unified_key(&key);
+
+        let silo = CacheSilo::open(&silo_path).expect("open silo");
+        silo.save_entry(key_hash, &entry).expect("save_entry");
+        silo.delete_entry(key_hash).expect("delete_entry");
+
+        assert!(silo.get_entry(key_hash).is_none(), "deleted entry should return None");
+    }
+
+    #[test]
+    fn get_entry_sees_update_after_save() {
+        let dir = TempDir::new().expect("tempdir");
+        let silo_path = dir.path().join("cache_silo");
+
+        let mut entry_v1 = make_entry(SortDirection::Desc, false);
+        entry_v1.total_matched = 111;
+        let mut entry_v2 = make_entry(SortDirection::Desc, false);
+        entry_v2.total_matched = 222;
+
+        let key = make_key("sortAt", SortDirection::Desc);
+        let key_hash = hash_unified_key(&key);
+
+        let silo = CacheSilo::open(&silo_path).expect("open silo");
+        silo.save_entry(key_hash, &entry_v1).expect("save v1");
+        silo.save_entry(key_hash, &entry_v2).expect("save v2 (overwrite)");
+
+        // get_entry uses get_with_ops which returns the last write
+        let got = silo.get_entry(key_hash).expect("get_entry should return v2");
+        assert_eq!(got.total_matched, 222, "should see the latest value");
     }
 
     // ── hash_unified_key is stable ─────────────────────────────────────────

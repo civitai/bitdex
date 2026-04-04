@@ -576,6 +576,8 @@ pub struct UnifiedCacheStats {
     pub extensions: u64,
     pub wall_hits: u64,
     pub prefetches: u64,
+    /// Entries promoted from CacheSilo into UnifiedCache on fast-path cache miss.
+    pub silo_hits: u64,
 }
 /// Per-entry diagnostic detail.
 pub struct UnifiedEntryDetail {
@@ -626,6 +628,8 @@ pub struct UnifiedCache {
     wall_hits: u64,
     /// Cumulative count of prefetch triggers (background expansion requests).
     prefetches: u64,
+    /// Cumulative count of entries promoted from CacheSilo on fast-path cache miss.
+    silo_hits: u64,
     /// True during shard restore — skips per-insert eviction.
     restoring: bool,
     /// Reverse index: ShardKey → set of UnifiedKeys in that shard.
@@ -656,6 +660,7 @@ impl UnifiedCache {
             extensions: 0,
             wall_hits: 0,
             prefetches: 0,
+            silo_hits: 0,
             restoring: false,
             shard_to_keys: HashMap::new(),
         }
@@ -964,6 +969,7 @@ impl UnifiedCache {
             extensions: self.extensions,
             wall_hits: self.wall_hits,
             prefetches: self.prefetches,
+            silo_hits: self.silo_hits,
         }
     }
     /// Return per-entry detail for diagnostics/testing.
@@ -1001,6 +1007,11 @@ impl UnifiedCache {
     /// Record a prefetch trigger (background expansion request sent).
     pub fn record_prefetch(&mut self) {
         self.prefetches += 1;
+    }
+    /// Record a CacheSilo promotion: an entry loaded from the persistent silo into
+    /// UnifiedCache because it was absent from memory on the fast path.
+    pub fn record_silo_hit(&mut self) {
+        self.silo_hits += 1;
     }
     /// Get the cache config.
     pub fn config(&self) -> &UnifiedCacheConfig {

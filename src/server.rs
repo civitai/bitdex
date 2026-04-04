@@ -4338,6 +4338,9 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.cache_prefetch_total
                 .with_label_values(&[name])
                 .set(uc.prefetches as i64);
+            m.cache_silo_hits_total
+                .with_label_values(&[name])
+                .set(uc.silo_hits as i64);
 
             // Per-field bitmap memory gauges removed: BitmapSilo uses mmap, not heap bitmaps.
             // The old bitmap_memory_cache scanner was removed along with lazy loading.

@@ -42,6 +42,7 @@ pub struct Metrics {
     pub cache_extensions_total: IntGaugeVec,
     pub cache_wall_hits_total: IntGaugeVec,
     pub cache_prefetch_total: IntGaugeVec,
+    pub cache_silo_hits_total: IntGaugeVec,
     // -- Bitmap memory --
     pub filter_bitmap_bytes: IntGaugeVec,
     pub filter_bitmap_count: IntGaugeVec,
@@ -291,6 +292,12 @@ impl Metrics {
 
         let cache_prefetch_total = IntGaugeVec::new(
             Opts::new("bitdex_cache_prefetch_total", "Cumulative prefetch triggers for background expansion"),
+            &["index"],
+        )
+        .unwrap();
+
+        let cache_silo_hits_total = IntGaugeVec::new(
+            Opts::new("bitdex_cache_silo_hits_total", "Cumulative CacheSilo promotions into UnifiedCache on fast-path miss"),
             &["index"],
         )
         .unwrap();
@@ -607,6 +614,7 @@ impl Metrics {
         registry.register(Box::new(cache_extensions_total.clone())).unwrap();
         registry.register(Box::new(cache_wall_hits_total.clone())).unwrap();
         registry.register(Box::new(cache_prefetch_total.clone())).unwrap();
+        registry.register(Box::new(cache_silo_hits_total.clone())).unwrap();
         registry
             .register(Box::new(filter_bitmap_bytes.clone()))
             .unwrap();
@@ -699,6 +707,7 @@ impl Metrics {
             cache_extensions_total,
             cache_wall_hits_total,
             cache_prefetch_total,
+            cache_silo_hits_total,
             filter_bitmap_bytes,
             filter_bitmap_count,
             sort_bitmap_bytes,

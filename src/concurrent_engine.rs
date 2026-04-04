@@ -1906,6 +1906,25 @@ impl ConcurrentEngine {
                     sort_field: sort_clause.field.clone(),
                     direction: sort_clause.direction,
                 };
+                // ── CacheSilo check: if UnifiedCache misses, try the persistent silo ──
+                // Promote a silo hit into UnifiedCache so the lookup below finds it
+                // and all the existing fast-path logic (bucket diffs, expansion) applies.
+                if let Some(ref silo_arc) = self.cache_silo {
+                    let key_hash = crate::cache_silo::hash_unified_key(&ukey);
+                    let in_memory = self.unified_cache.lock().get(&ukey).is_some();
+                    if !in_memory {
+                        if let Some(entry_data) = silo_arc.read().get_entry(key_hash) {
+                            let mut uc = self.unified_cache.lock();
+                            let entry = crate::unified_cache::UnifiedEntry::from_cache_entry_data(
+                                entry_data,
+                                uc.config().initial_capacity,
+                                uc.config().max_capacity,
+                            );
+                            uc.insert_restored_entry(ukey.clone(), entry);
+                            uc.record_silo_hit();
+                        }
+                    }
+                }
                 let cache_data = {
                     let mut uc = self.unified_cache.lock();
                     let pending = self.pending_bucket_diffs.load();
@@ -2193,6 +2212,23 @@ impl ConcurrentEngine {
                     sort_field: sort_clause.field.clone(),
                     direction: sort_clause.direction,
                 };
+                // ── CacheSilo check: promote a silo hit into UnifiedCache ──
+                if let Some(ref silo_arc) = self.cache_silo {
+                    let key_hash = crate::cache_silo::hash_unified_key(&ukey);
+                    let in_memory = self.unified_cache.lock().get(&ukey).is_some();
+                    if !in_memory {
+                        if let Some(entry_data) = silo_arc.read().get_entry(key_hash) {
+                            let mut uc = self.unified_cache.lock();
+                            let entry = crate::unified_cache::UnifiedEntry::from_cache_entry_data(
+                                entry_data,
+                                uc.config().initial_capacity,
+                                uc.config().max_capacity,
+                            );
+                            uc.insert_restored_entry(ukey.clone(), entry);
+                            uc.record_silo_hit();
+                        }
+                    }
+                }
                 let cache_data = {
                     let mut uc = self.unified_cache.lock();
                     let pending = self.pending_bucket_diffs.load();
