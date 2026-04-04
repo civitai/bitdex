@@ -3379,44 +3379,15 @@ async fn handle_remove_fields(
         }
     };
 
-    let filter_fields = req.filter_fields;
-    let sort_fields = req.sort_fields;
-    let save = req.save_snapshot;
-
-    let tasks_clone = Arc::clone(&tasks);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
-
-        match engine.remove_fields(&filter_fields, &sort_fields) {
-            Ok(removed) => {
-                if save {
-                    guard.tasks.set_saving(task_id);
-
-                    let snap_start = Instant::now();
-                    if let Err(e) = engine.save_and_unload() {
-                        eprintln!("remove_fields: save_and_unload failed: {e}");
-                    } else {
-                        eprintln!("remove_fields: save_and_unload in {:.1}s", snap_start.elapsed().as_secs_f64());
-                    }
-                }
-
-                guard.tasks.set_complete(task_id, Some(serde_json::json!({
-                    "removed": removed,
-                })));
-                guard.defuse();
-
-                eprintln!("remove_fields: done — removed {:?}", removed);
-            }
-            Err(e) => {
-                guard.tasks.set_error(task_id, format!("Remove fields failed: {}", e));
-                guard.defuse();
-            }
-        }
-    });
-
+    // remove_fields is not yet implemented in the silo architecture.
+    // The config was already updated above; a full reload is required to
+    // make the field removal take effect in bitmaps.
+    let _ = (engine, tasks, task_id);
     (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"task_id": task_id})),
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "remove_fields is not yet implemented — reload the index to apply config changes",
+        })),
     ).into_response()
 }
 

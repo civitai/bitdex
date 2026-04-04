@@ -9,7 +9,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender};
 use roaring::RoaringBitmap;
@@ -529,39 +528,15 @@ impl ConcurrentEngine {
             thread::Builder::new()
                 .name("bitdex-merge".to_string())
                 .spawn(move || {
-                let sleep_duration = Duration::from_millis(merge_interval_ms);
-                while !shutdown.load(Ordering::Relaxed) {
-                    thread::sleep(sleep_duration);
-
-                    // Compact DataSilo when dirty (apply pending doc ops to data file)
-                    let needs_write = merge_dirty_flag.swap(false, Ordering::AcqRel);
-                    if needs_write {
-                        if let Err(e) = merge_docstore.lock().compact() {
-                            eprintln!("merge: DataSilo compaction failed: {e}");
-                        }
-                    }
-
-                    // Compact CacheSilo when it has accumulated enough dead space.
-                    if let Some(ref cs_arc) = merge_cache_silo {
-                        let needs_compact = cs_arc.read().needs_compaction();
-                        if needs_compact {
-                            if let Err(e) = cs_arc.write().compact() {
-                                eprintln!("merge: CacheSilo compaction failed: {e}");
-                            }
-                        }
-                    }
-
-                    // Compact BitmapSilo when it has accumulated enough dead space.
-                    if let Some(ref bs_arc) = merge_bitmap_silo {
-                        let needs_compact = bs_arc.read().needs_compaction();
-                        if needs_compact {
-                            if let Err(e) = bs_arc.write().compact() {
-                                eprintln!("merge: BitmapSilo compaction failed: {e}");
-                            }
-                        }
-                    }
-                }
-            }).expect("failed to spawn merge thread")
+                    crate::janitor::run_janitor(
+                        shutdown,
+                        merge_interval_ms,
+                        merge_dirty_flag,
+                        merge_docstore,
+                        merge_cache_silo,
+                        merge_bitmap_silo,
+                    );
+                }).expect("failed to spawn merge thread")
         };
         // DataSilo mmap reads require no separate eviction thread
         Ok(Self {
@@ -1189,35 +1164,6 @@ impl ConcurrentEngine {
             }
         }
         staging.slots.alive_or_bitmap(&alive);
-    }
-    /// Remove filter and/or sort fields from the engine.
-    ///
-    /// Removes the fields from the in-memory staging snapshot and publishes.
-    /// Does NOT delete bitmap files on disk — orphaned files are overwritten
-    /// on next `save_snapshot` or ignored on boot (field not in config = not loaded).
-    /// The caller (server) is responsible for updating the persisted config.
-    pub fn remove_fields(
-        &self,
-        filter_names: &[String],
-        sort_names: &[String],
-    ) -> Result<Vec<String>> {
-        let mut staging = self.clone_staging();
-        let mut removed = Vec::new();
-        for name in filter_names {
-            if staging.filters.remove_field(name) {
-                removed.push(name.clone());
-            }
-        }
-        for name in sort_names {
-            if staging.sorts.remove_field(name) {
-                removed.push(name.clone());
-            }
-        }
-        if !removed.is_empty() {
-            self.publish_staging(staging);
-            eprintln!("remove_fields: removed {:?}", removed);
-        }
-        Ok(removed)
     }
     /// Signal background threads to stop (non-blocking, works through Arc).
     /// Threads will exit on their next loop iteration. Use this when you can't

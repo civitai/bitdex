@@ -5,6 +5,7 @@ use crate::mutation::{diff_document, Document, FieldRegistry, FieldValue};
 use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection, Value};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 impl ConcurrentEngine {
     /// Test-only helper that replicates PUT semantics without using the removed public API.

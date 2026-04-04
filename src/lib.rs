@@ -19,6 +19,7 @@ pub mod query;
 
 pub mod error;
 pub mod ingester;
+pub mod janitor;
 pub mod loader;
 pub mod meta_index;
 pub mod mutation;
