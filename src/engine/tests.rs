@@ -1,5 +1,5 @@
-use super::*;
-use crate::config::{FilterFieldConfig, SortFieldConfig};
+use super::concurrent_engine::*;
+use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
 use crate::engine::filter::FilterFieldType;
 use crate::mutation::{diff_document, Document, FieldRegistry, FieldValue};
 use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection, Value};

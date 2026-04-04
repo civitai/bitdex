@@ -1,9 +1,3 @@
-mod flush;
-mod flush_batch;
-mod query;
-#[cfg(test)]
-mod tests;
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -74,64 +68,50 @@ pub struct CompactResult {
 /// bitmaps offline and `publish_staging()` to swap them in.
 pub struct ConcurrentEngine {
     /// Slot allocator: alive bitmap + slot counter + deferred alive set.
-    slots: Arc<parking_lot::RwLock<crate::engine::slot::SlotAllocator>>,
+    pub(crate) slots: Arc<parking_lot::RwLock<crate::engine::slot::SlotAllocator>>,
     /// Filter index: one VersionedBitmap per field × value.
-    filters: Arc<parking_lot::RwLock<crate::engine::filter::FilterIndex>>,
+    pub(crate) filters: Arc<parking_lot::RwLock<crate::engine::filter::FilterIndex>>,
     /// Sort index: per-field bit-layer bitmaps.
-    sorts: Arc<parking_lot::RwLock<crate::engine::sort::SortIndex>>,
-    sender: MutationSender,
-    doc_tx: Sender<(u32, StoredDoc)>,
-    docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
-    config: Arc<Config>,
-    field_registry: FieldRegistry,
-    shutdown: Arc<AtomicBool>,
-    flush_handle: Option<JoinHandle<()>>,
-    merge_handle: Option<JoinHandle<()>>,
+    pub(crate) sorts: Arc<parking_lot::RwLock<crate::engine::sort::SortIndex>>,
+    pub(crate) sender: MutationSender,
+    pub(crate) doc_tx: Sender<(u32, StoredDoc)>,
+    pub(crate) docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
+    pub(crate) config: Arc<Config>,
+    pub(crate) field_registry: FieldRegistry,
+    pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) flush_handle: Option<JoinHandle<()>>,
+    pub(crate) merge_handle: Option<JoinHandle<()>>,
     /// Dirty flag: flush/write paths set true so the merge thread persists on next cycle.
-    dirty_flag: Arc<AtomicBool>,
-    time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
+    pub(crate) dirty_flag: Arc<AtomicBool>,
+    pub(crate) time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
     /// Pending bucket diffs for lazy application on cache reads.
-    /// Flush thread stores new snapshots; query threads load for diff application.
-    pending_bucket_diffs: Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,
+    pub(crate) pending_bucket_diffs: Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,
     /// Reverse string maps for MappedString field query resolution.
-    string_maps: Option<Arc<StringMaps>>,
+    pub(crate) string_maps: Option<Arc<StringMaps>>,
     /// Fields where string matching is case-sensitive (default is case-insensitive).
-    case_sensitive_fields: Option<Arc<CaseSensitiveFields>>,
+    pub(crate) case_sensitive_fields: Option<Arc<CaseSensitiveFields>>,
     /// Per-field dictionaries for LowCardinalityString fields.
-    dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
+    pub(crate) dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
     /// CacheSilo: persistent cache backed by DataSilo.
-    /// Flush thread writes new entries; merge thread compacts.
-    /// None when bitmap_path is not configured.
-    cache_silo: Option<Arc<parking_lot::RwLock<crate::silos::cache_silo::CacheSilo>>>,
+    pub(crate) cache_silo: Option<Arc<parking_lot::RwLock<crate::silos::cache_silo::CacheSilo>>>,
     /// Flush loop stats: total flush cycles that applied mutations (monotonic counter).
-    flush_apply_count: Arc<AtomicU64>,
-    /// Flush loop stats: cumulative flush duration in nanoseconds.
-    flush_duration_nanos: Arc<AtomicU64>,
-    /// Flush loop stats: most recent flush duration in nanoseconds.
-    flush_last_duration_nanos: Arc<AtomicU64>,
-    /// Flush phase timing: last apply_prepared duration in nanoseconds.
-    flush_apply_nanos: Arc<AtomicU64>,
-    /// Flush phase timing: last cache maintenance duration in nanoseconds.
-    flush_cache_nanos: Arc<AtomicU64>,
-    /// Flush phase timing: last ops-log append duration in nanoseconds (after apply).
-    flush_opslog_nanos: Arc<AtomicU64>,
-    /// Flush phase timing: last time bucket maintenance duration in nanoseconds.
-    flush_timebucket_nanos: Arc<AtomicU64>,
-    /// Flush phase timing: last diff compaction duration in nanoseconds.
-    flush_compact_nanos: Arc<AtomicU64>,
+    pub(crate) flush_apply_count: Arc<AtomicU64>,
+    pub(crate) flush_duration_nanos: Arc<AtomicU64>,
+    pub(crate) flush_last_duration_nanos: Arc<AtomicU64>,
+    pub(crate) flush_apply_nanos: Arc<AtomicU64>,
+    pub(crate) flush_cache_nanos: Arc<AtomicU64>,
+    pub(crate) flush_opslog_nanos: Arc<AtomicU64>,
+    pub(crate) flush_timebucket_nanos: Arc<AtomicU64>,
+    pub(crate) flush_compact_nanos: Arc<AtomicU64>,
     /// Named cursors: opaque key-value pairs persisted at checkpoint time.
-    /// Callers (e.g. pg-sync sidecars) use these to track replication progress.
-    cursors: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    pub(crate) cursors: Arc<parking_lot::Mutex<HashMap<String, String>>>,
     // BoundStore counters removed (DataSilo Phase 4)
     /// Metrics bridge: prometheus handles set by server layer, read by background threads.
     #[cfg(feature = "server")]
-    metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
-    /// BitmapSilo for frozen bitmap reads. Queries read filter/sort bitmaps
-    /// directly from the silo's mmap via FrozenRoaringBitmap::view().
-    /// RwLock: readers (queries) share access; writer (save_snapshot) gets exclusive.
-    bitmap_silo: Option<Arc<parking_lot::RwLock<crate::silos::bitmap_silo::BitmapSilo>>>,
-    /// Compaction skip counter.
-    compaction_skipped: Arc<AtomicU64>,
+    pub(crate) metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
+    /// BitmapSilo for frozen bitmap reads.
+    pub(crate) bitmap_silo: Option<Arc<parking_lot::RwLock<crate::silos::bitmap_silo::BitmapSilo>>>,
+    pub(crate) compaction_skipped: Arc<AtomicU64>,
 }
 
 /// Stub cache statistics returned by unified_cache_stats().
@@ -490,7 +470,7 @@ impl ConcurrentEngine {
             let flush_field_registry = field_registry.clone();
             let flush_mutation_rx = mutation_rx;
             thread::spawn(move || {
-                flush::run_flush_thread(flush::FlushArgs {
+                super::flush::run_flush_thread(super::flush::FlushArgs {
                     slots: flush_slots,
                     filters: flush_filters,
                     sorts: flush_sorts,
@@ -666,7 +646,7 @@ impl ConcurrentEngine {
     /// Send mutation ops to BOTH the coalescer channel AND the BitmapSilo ops log.
     /// During Phase 2→4 transition, both paths receive the ops. Phase 4 removes
     /// the coalescer, leaving only the silo ops log.
-    fn send_mutation_ops(&self, ops: Vec<MutationOp>) -> Result<()> {
+    pub(crate) fn send_mutation_ops(&self, ops: Vec<MutationOp>) -> Result<()> {
         // Write to BitmapSilo ops log (the V3 path)
         if let Some(ref silo_arc) = self.bitmap_silo {
             let silo = silo_arc.read();

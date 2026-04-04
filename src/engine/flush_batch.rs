@@ -4,7 +4,7 @@ use crate::engine::filter::FilterIndex;
 use crate::mutation::MutationOp;
 use crate::engine::slot::SlotAllocator;
 use crate::engine::sort::SortIndex;
-use super::FilterGroupKey;
+use super::concurrent_engine::FilterGroupKey;
 
 /// Key for grouping sort operations by target bit layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
