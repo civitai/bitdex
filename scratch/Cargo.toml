@@ -38,3 +38,7 @@ path = "src/bin/frozen_merge_bench.rs"
 [[bin]]
 name = "filter_insert_bench"
 path = "src/bin/filter_insert_bench.rs"
+
+[[bin]]
+name = "bitmap_merge_strategies"
+path = "src/bin/bitmap_merge_strategies.rs"
