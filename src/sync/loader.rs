@@ -518,7 +518,7 @@ pub fn load_ndjson(
 
 /// Extract bitmap entries directly from JSON into accumulator maps.
 /// Skips intermediate Document creation for indexed fields.
-#[allow(dead_code)] // Used by pg_sync (feature-gated)
+#[allow(dead_code)] // Used by sync pipeline (feature-gated)
 pub(crate) fn extract_bitmaps(
     json: &serde_json::Value,
     schema: &DataSchema,

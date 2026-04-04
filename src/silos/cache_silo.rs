@@ -1,7 +1,7 @@
-//! CacheSilo — persistent unified cache backed by DataSilo.
+//! CacheSilo — persistent query cache backed by DataSilo.
 //!
-//! Persists UnifiedCache entries across restarts. The key is a u32 hash
-//! derived from the UnifiedKey (filter_clauses + sort_field + direction).
+//! Persists cache entries across restarts. The key is a u32 hash
+//! derived from the cache key (filter_clauses + sort_field + direction).
 //! The value is a binary-encoded CacheEntryData.
 //!
 //! # Binary format (version 1)
@@ -292,7 +292,7 @@ impl CacheSilo {
     /// falls back to the data file for compacted entries. Returns `None` if the key
     /// is absent or tombstoned.
     ///
-    /// Used by the query fast path to check CacheSilo before the in-memory UnifiedCache.
+    /// Used by the query fast path to check the persistent cache.
     pub fn get_entry(&self, key_hash: u32) -> Option<CacheEntryData> {
         let bytes = self.silo.get_with_ops(key_hash)?;
         match CacheEntryData::decode(&bytes) {

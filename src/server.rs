@@ -2915,8 +2915,8 @@ async fn handle_clear_cache(
 }
 
 /// DELETE /api/indexes/{name}/cache/persistent — purge disk + RAM cache.
-/// Wipes all BoundStore files (meta.bin + shards) then clears the in-memory
-/// cache and meta-index. Safe to call while the server is running.
+/// Wipes all CacheSilo data then clears the in-memory cache.
+/// Safe to call while the server is running.
 async fn handle_purge_cache(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,

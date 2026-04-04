@@ -14,7 +14,6 @@ pub(super) struct SortGroupKey {
 }
 
 /// Accumulates MutationOps and applies them in bulk to staging.
-/// Replaces WriteCoalescer/WriteBatch after write_coalescer.rs was deleted.
 pub(super) struct FlushBatch {
     pub ops: Vec<MutationOp>,
     pub filter_inserts: HashMap<FilterGroupKey, Vec<u32>>,

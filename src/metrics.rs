@@ -297,7 +297,7 @@ impl Metrics {
         .unwrap();
 
         let cache_silo_hits_total = IntGaugeVec::new(
-            Opts::new("bitdex_cache_silo_hits_total", "Cumulative CacheSilo promotions into UnifiedCache on fast-path miss"),
+            Opts::new("bitdex_cache_silo_hits_total", "Cumulative CacheSilo hits on fast-path query"),
             &["index"],
         )
         .unwrap();

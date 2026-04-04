@@ -16,7 +16,6 @@ use crate::time_buckets::TimeBucketManager;
 use crate::mutation::{MutationOp, MutationSender};
 
 /// Key for grouping filter operations by target bitmap.
-/// Moved here from unified_cache.rs in Phase 3.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FilterGroupKey {
     pub field: Arc<str>,
@@ -105,7 +104,6 @@ pub struct ConcurrentEngine {
     pub(crate) flush_compact_nanos: Arc<AtomicU64>,
     /// Named cursors: opaque key-value pairs persisted at checkpoint time.
     pub(crate) cursors: Arc<parking_lot::Mutex<HashMap<String, String>>>,
-    // BoundStore counters removed (DataSilo Phase 4)
     /// Metrics bridge: prometheus handles set by server layer, read by background threads.
     #[cfg(feature = "server")]
     pub(crate) metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
@@ -229,8 +227,7 @@ impl ConcurrentEngine {
                 }
             }
         }
-        // CacheSilo: open the persistent cache store.
-        // No in-memory UnifiedCache — the silo IS the cache. Queries read directly via get_entry().
+        // CacheSilo: open the persistent cache store. Queries read directly via get_entry().
         let cache_silo_arc: Option<Arc<parking_lot::RwLock<crate::silos::cache_silo::CacheSilo>>> =
             config.storage.bitmap_path.as_ref().and_then(|bp| {
                 let silo_path = std::path::Path::new(bp).join("cache_silo");
