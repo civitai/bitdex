@@ -10,7 +10,7 @@ use roaring::RoaringBitmap;
 
 use crate::error::Result;
 use crate::loader::BitmapAccum;
-use crate::write_coalescer::{MutationOp, MutationSender};
+use crate::mutation::{MutationOp, MutationSender};
 
 /// Trait for sinking bitmap mutations during document ingestion.
 ///

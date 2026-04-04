@@ -24,7 +24,8 @@ use crate::unified_cache::{
     UnifiedCache, UnifiedCacheConfig, UnifiedKey,
     evaluate_filter_work, evaluate_sort_work,
 };
-use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
+use crate::mutation::{MutationOp, MutationSender};
+use crate::write_coalescer::WriteCoalescer;
 /// Bridge for passing Prometheus metric handles from the server layer into
 /// the engine's background threads (compaction worker).
 /// Only available when compiled with the `server` feature.

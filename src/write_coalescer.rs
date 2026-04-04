@@ -2,46 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use crossbeam_channel::{Receiver, Sender};
 use crate::filter::FilterIndex;
+use crate::mutation::{MutationOp, MutationSender};
 use crate::slot::SlotAllocator;
 use crate::sort::SortIndex;
-/// A bitmap mutation request submitted by any thread.
-/// Field names use Arc<str> to avoid heap allocation per op.
-/// All variants carry `slots: Vec<u32>` for bulk grouping.
-#[derive(Debug, Clone)]
-pub enum MutationOp {
-    /// Set bits in a filter bitmap: field[value] |= slots
-    FilterInsert {
-        field: Arc<str>,
-        value: u64,
-        slots: Vec<u32>,
-    },
-    /// Clear bits in a filter bitmap: field[value] &= !slots
-    FilterRemove {
-        field: Arc<str>,
-        value: u64,
-        slots: Vec<u32>,
-    },
-    /// Set bits in a sort layer: field.bit_layers[bit_layer] |= slots
-    SortSet {
-        field: Arc<str>,
-        bit_layer: usize,
-        slots: Vec<u32>,
-    },
-    /// Clear bits in a sort layer: field.bit_layers[bit_layer] &= !slots
-    SortClear {
-        field: Arc<str>,
-        bit_layer: usize,
-        slots: Vec<u32>,
-    },
-    /// Set alive bits for slots
-    AliveInsert { slots: Vec<u32> },
-    /// Clear alive bits for slots
-    AliveRemove { slots: Vec<u32> },
-    /// Schedule deferred alive activation at a future unix timestamp.
-    /// The slot's filter/sort bitmaps are set immediately, but the alive bit
-    /// is deferred until `activate_at` (seconds since epoch).
-    DeferredAlive { slot: u32, activate_at: u64 },
-}
 /// Key for grouping filter operations by target bitmap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FilterGroupKey {
@@ -324,34 +287,6 @@ impl Default for WriteBatch {
         Self::new()
     }
 }
-/// Cloneable handle for submitting mutations from any thread.
-///
-/// Wraps a `crossbeam_channel::Sender<MutationOp>`. When the bounded channel is full,
-/// `send()` blocks, providing natural backpressure to writers.
-#[derive(Clone)]
-pub struct MutationSender {
-    tx: Sender<MutationOp>,
-}
-impl MutationSender {
-    /// Submit a single mutation. Blocks if the channel is full (backpressure).
-    pub fn send(&self, op: MutationOp) -> Result<(), crossbeam_channel::SendError<MutationOp>> {
-        self.tx.send(op)
-    }
-    /// Approximate number of pending ops in the channel (for metrics).
-    pub fn pending_count(&self) -> usize {
-        self.tx.len()
-    }
-    /// Submit multiple mutations. Blocks per-op if the channel is full.
-    pub fn send_batch(
-        &self,
-        ops: Vec<MutationOp>,
-    ) -> Result<(), crossbeam_channel::SendError<MutationOp>> {
-        for op in ops {
-            self.tx.send(op)?;
-        }
-        Ok(())
-    }
-}
 /// Owns the MPSC channel and provides a `flush()` method for the ConcurrentEngine
 /// to call while holding the write lock on bitmap state.
 pub struct WriteCoalescer {
@@ -374,9 +309,7 @@ impl WriteCoalescer {
     }
     /// Get a cloneable sender handle for submitting mutations.
     pub fn sender(&self) -> MutationSender {
-        MutationSender {
-            tx: self.tx.clone(),
-        }
+        MutationSender { tx: self.tx.clone() }
     }
     /// Approximate number of pending ops in the channel.
     pub fn pending_count(&self) -> usize {
