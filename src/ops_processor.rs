@@ -19,8 +19,8 @@ use serde_json::Value as JsonValue;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
-use crate::shard_store_doc::PackedValue;
-use crate::shard_store_doc::DocStoreV3;
+use crate::doc_format::PackedValue;
+use crate::doc_silo_adapter::DocSiloAdapter;
 use crate::filter::{FilterFieldType, NULL_BITMAP_KEY};
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
@@ -38,29 +38,23 @@ use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 /// is safe because no concurrent writer can modify the same slot's doc between
 /// the read and write within a single WAL batch cycle.
 pub struct DocWriter {
-    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
+    docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
     field_dict: HashMap<String, u16>,
-    pending: Vec<(u32, u16, Vec<u8>)>,
+    /// Pending field updates grouped by slot: slot → [(field_name, FieldValue)]
+    pending: HashMap<u32, Vec<(String, crate::mutation::FieldValue)>>,
 }
 impl DocWriter {
     /// Create a DocWriter from the engine's docstore.
-    pub fn new(docstore: Arc<parking_lot::Mutex<DocStoreV3>>) -> Self {
+    pub fn new(docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>) -> Self {
         let field_dict = docstore.lock().field_dict_snapshot();
         Self {
             docstore,
             field_dict,
-            pending: Vec::new(),
+            pending: HashMap::new(),
         }
     }
     /// Write a single-value field update to the docstore.
-    /// Clamps negative integers to 0 — sort fields (reactionCount, etc.) are
-    /// unsigned in bitmaps; storing negatives in docstore would diverge from
-    /// the bitmap value and confuse shadow-mode comparisons.
     fn write_set(&mut self, slot: u32, field: &str, value: &JsonValue) {
-        let idx = match self.resolve_field(field) {
-            Some(idx) => idx,
-            None => return,
-        };
         // Clamp negative integers to 0 before docstore write
         let clamped;
         let effective = if let Some(n) = value.as_i64() {
@@ -73,62 +67,65 @@ impl DocWriter {
         } else {
             value
         };
-        if let Some(packed) = json_to_packed(effective) {
-            if let Ok(bytes) = rmp_serde::to_vec(&packed) {
-                self.pending.push((slot, idx, bytes));
-            }
+        if let Some(fv) = json_to_field_value(effective) {
+            self.pending.entry(slot).or_default().push((field.to_string(), fv));
         }
     }
     /// Write a multi-value add: read current list, append value, write back.
     fn write_add(&mut self, slot: u32, field: &str, value: &JsonValue) {
-        let idx = match self.resolve_field(field) {
-            Some(idx) => idx,
-            None => return,
-        };
         let add_val = match value.as_i64() {
             Some(v) => v,
             None => return,
         };
-        // Read current doc and get existing multi-value list
         let mut current = self.read_multi_value(slot, field);
         if !current.contains(&add_val) {
             current.push(add_val);
         }
-        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
-            self.pending.push((slot, idx, bytes));
-        }
+        let fv = crate::mutation::FieldValue::Multi(
+            current.into_iter().map(QValue::Integer).collect()
+        );
+        self.pending.entry(slot).or_default().push((field.to_string(), fv));
     }
     /// Write a multi-value remove: read current list, remove value, write back.
     fn write_remove(&mut self, slot: u32, field: &str, value: &JsonValue) {
-        let idx = match self.resolve_field(field) {
-            Some(idx) => idx,
-            None => return,
-        };
         let remove_val = match value.as_i64() {
             Some(v) => v,
             None => return,
         };
         let mut current = self.read_multi_value(slot, field);
         current.retain(|&v| v != remove_val);
-        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
-            self.pending.push((slot, idx, bytes));
-        }
+        let fv = crate::mutation::FieldValue::Multi(
+            current.into_iter().map(QValue::Integer).collect()
+        );
+        self.pending.entry(slot).or_default().push((field.to_string(), fv));
     }
-    /// Flush pending tuples to the docstore.
+    /// Flush pending updates to the docstore.
     pub fn flush(&mut self) {
         if self.pending.is_empty() {
             return;
         }
-        let tuples = std::mem::take(&mut self.pending);
-        if let Err(e) = self.docstore.lock().append_tuples_batch(tuples) {
-            tracing::warn!("DocWriter flush failed: {e}");
+        let pending = std::mem::take(&mut self.pending);
+        let mut ds = self.docstore.lock();
+        for (slot, field_updates) in pending {
+            // Read existing doc and merge
+            let mut doc = ds.get(slot).ok().flatten().unwrap_or_else(|| {
+                crate::doc_format::StoredDoc {
+                    fields: HashMap::new(),
+                    schema_version: 0,
+                }
+            });
+            for (name, value) in field_updates {
+                doc.fields.insert(name, value);
+            }
+            if let Err(e) = ds.put(slot, &doc) {
+                tracing::warn!("DocWriter flush failed for slot {slot}: {e}");
+            }
         }
     }
     fn resolve_field(&mut self, field: &str) -> Option<u16> {
         if let Some(&idx) = self.field_dict.get(field) {
             return Some(idx);
         }
-        // Field not in snapshot — try to ensure it exists
         match self.docstore.lock().ensure_field_index(field) {
             Ok(idx) => {
                 self.field_dict.insert(field.to_string(), idx);
@@ -153,6 +150,34 @@ impl DocWriter {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+/// Convert a JSON value to a FieldValue.
+fn json_to_field_value(v: &JsonValue) -> Option<crate::mutation::FieldValue> {
+    match v {
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(crate::mutation::FieldValue::Single(QValue::Integer(i)))
+            } else if let Some(f) = n.as_f64() {
+                Some(crate::mutation::FieldValue::Single(QValue::Float(f)))
+            } else {
+                None
+            }
+        }
+        JsonValue::Bool(b) => Some(crate::mutation::FieldValue::Single(QValue::Bool(*b))),
+        JsonValue::String(s) => Some(crate::mutation::FieldValue::Single(QValue::String(s.clone()))),
+        JsonValue::Array(arr) => {
+            let vals: Vec<QValue> = arr.iter().filter_map(|v| {
+                match v {
+                    JsonValue::Number(n) => n.as_i64().map(QValue::Integer),
+                    JsonValue::String(s) => Some(QValue::String(s.clone())),
+                    _ => None,
+                }
+            }).collect();
+            if vals.is_empty() { None } else { Some(crate::mutation::FieldValue::Multi(vals)) }
+        }
+        _ => None,
     }
 }
 // ---------------------------------------------------------------------------
@@ -193,7 +218,7 @@ fn qvalue_to_json(v: &QValue) -> JsonValue {
 /// are treated as deletions and their old bitmap bits are cleared.
 pub fn document_to_ops(
     new_doc: &crate::mutation::Document,
-    old_doc: Option<&crate::shard_store_doc::StoredDoc>,
+    old_doc: Option<&crate::doc_format::StoredDoc>,
     config: &crate::config::Config,
     is_patch: bool,
 ) -> Vec<Op> {
@@ -1747,12 +1772,12 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_doc_writer_write_set() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_format::PackedValue;
+        use crate::doc_silo_adapter::DocSiloAdapter;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
-        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        let mut store = DocSiloAdapter::open(&docs_dir).unwrap();
         store.ensure_field_index("nsfwLevel").unwrap();
         store.ensure_field_index("userId").unwrap();
         let store = Arc::new(parking_lot::Mutex::new(store));
@@ -1773,20 +1798,19 @@ mod tests {
     }
     #[test]
     fn test_doc_writer_write_add_remove() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_silo_adapter::DocSiloAdapter;
 
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        let mut store = DocSiloAdapter::open_temp().unwrap();
         store.ensure_field_index("tagIds").unwrap();
         let store = Arc::new(parking_lot::Mutex::new(store));
-        // First write an initial value
+        // First write an initial doc with tagIds
         {
-            let _dw = DocWriter::new(Arc::clone(&store));
-            let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100, 200])).unwrap();
-            let idx = store.lock().field_index("tagIds").unwrap();
-            store.lock().append_tuple(5, idx, &initial).unwrap();
+            let mut fields = std::collections::HashMap::new();
+            fields.insert("tagIds".to_string(), crate::mutation::FieldValue::Multi(
+                vec![crate::query::Value::Integer(100), crate::query::Value::Integer(200)]
+            ));
+            let doc = crate::doc_format::StoredDoc { fields, schema_version: 0 };
+            store.lock().put(5, &doc).unwrap();
         }
         // Add a value
         {
@@ -1828,15 +1852,13 @@ mod tests {
         }
     }
 
-    /// E2E: DocWriter writes scalar fields through DocStoreV3 and reads them back.
+    /// E2E: DocWriter writes scalar fields through DocSiloAdapter and reads them back.
     /// Validates the production ops pipeline docstore write path.
     #[test]
     fn test_docstore_v3_doc_writer_e2e_roundtrip() {
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_silo_adapter::DocSiloAdapter;
 
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        let mut store = DocSiloAdapter::open_temp().unwrap();
         store.ensure_field_index("sortAt").unwrap();
         store.ensure_field_index("nsfwLevel").unwrap();
 
@@ -1848,7 +1870,7 @@ mod tests {
         dw.write_set(100, "nsfwLevel", &json!(5));
         dw.flush();
 
-        // Read back via DocStoreV3 and verify
+        // Read back via DocSiloAdapter and verify
         let doc = store.lock().get(100).unwrap();
         assert!(doc.is_some(), "doc should exist after DocWriter writes");
         let doc = doc.unwrap();
@@ -2042,7 +2064,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_json_to_packed_types() {
-        use crate::shard_store_doc::PackedValue;
+        use crate::doc_format::PackedValue;
 
         assert_eq!(json_to_packed(&json!(42)), Some(PackedValue::I(42)));
         assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
@@ -2081,7 +2103,7 @@ mod tests {
         // Old doc: nsfwLevel=8
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // New doc: nsfwLevel=16
         let mut new_fields = std::collections::HashMap::new();
@@ -2101,7 +2123,7 @@ mod tests {
         let mut fields = std::collections::HashMap::new();
         fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
 
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: fields.clone(), schema_version: 0 };
+        let old_doc = crate::doc_format::StoredDoc { fields: fields.clone(), schema_version: 0 };
         let new_doc = Document { fields };
         let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
         assert!(ops.is_empty(), "unchanged fields should produce no ops");
@@ -2114,7 +2136,7 @@ mod tests {
         // Old doc has nsfwLevel=8 AND reactionCount sort field
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH only sends userId=42 (nsfwLevel absent from patch)
         let mut new_fields = std::collections::HashMap::new();

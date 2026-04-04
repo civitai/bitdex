@@ -6,33 +6,27 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use arc_swap::{ArcSwap, Guard};
 use crossbeam_channel::{Receiver, Sender};
-use dashmap::DashMap;
 use roaring::RoaringBitmap;
-use rayon::prelude::*;
-use crate::bitmap_fs::BitmapFs;
-use crate::filter::FilterFieldType;
 use crate::cache;
 use crate::concurrency::InFlightTracker;
-use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
-use crate::shard_store_doc::{DocStoreV3, StoredDoc};
+use crate::config::Config;
+use crate::doc_format::{StoredDoc};
+use crate::doc_silo_adapter::DocSiloAdapter;
 use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
-use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, value_to_sort_u32, Document, FieldRegistry, PatchPayload};
+use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, Document, FieldRegistry, PatchPayload};
 use crate::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection};
 use crate::query_metrics::{QueryTrace, QueryTraceCollector, SortTrace};
 use crate::time_buckets::TimeBucketManager;
 use crate::types::QueryResult;
 use crate::unified_cache::{
-    UnifiedCache, UnifiedCacheConfig, UnifiedEntry, UnifiedKey,
+    UnifiedCache, UnifiedCacheConfig, UnifiedKey,
     evaluate_filter_work, evaluate_sort_work,
-};
-use crate::shard_store_bitmap::{
-    AliveShardKey, BitmapOp, FilterBucketKey, FilterOp, SortLayerShardKey,
 };
 use crate::write_coalescer::{MutationOp, MutationSender, WriteCoalescer};
 /// Bridge for passing Prometheus metric handles from the server layer into
-/// the engine's background threads (compaction worker, lazy loading).
+/// the engine's background threads (compaction worker).
 /// Only available when compiled with the `server` feature.
 #[cfg(feature = "server")]
 pub struct MetricsBridge {
@@ -139,29 +133,6 @@ pub fn get_rss_bytes() -> u64 {
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     { 0 }
 }
-/// Lazy-load request sent from query threads to the flush thread.
-/// Used during startup restore to load bitmaps on demand per field.
-enum LazyLoad {
-    FilterField {
-        name: String,
-        bitmaps: HashMap<u64, RoaringBitmap>,
-    },
-    /// Per-value lazy load for high-cardinality multi_value fields.
-    /// Only the specific queried values are loaded from disk.
-    FilterValues {
-        field: String,
-        values: HashMap<u64, RoaringBitmap>,
-    },
-    SortField {
-        name: String,
-        layers: Vec<RoaringBitmap>,
-    },
-    /// Reload the alive bitmap + slot counter from disk.
-    /// Used by the dump processor after writing alive to BitmapFs.
-    Slots {
-        slots: crate::slot::SlotAllocator,
-    },
-}
 /// Inner bitmap state published as immutable snapshots via ArcSwap.
 ///
 /// All fields are Clone via Arc-per-bitmap CoW. Cloning bumps refcounts
@@ -195,8 +166,8 @@ pub struct ConcurrentEngine {
     inner: Arc<ArcSwap<InnerEngine>>,
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
-    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
-    /// Docstore root path, cached to avoid locking docstore just to read the path.
+    docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
+    /// Root path for the docstore (used by build_all_from_docstore, rebuild_fields_from_docstore, etc.)
     docstore_root: Arc<PathBuf>,
     config: Arc<Config>,
     field_registry: FieldRegistry,
@@ -204,26 +175,12 @@ pub struct ConcurrentEngine {
     shutdown: Arc<AtomicBool>,
     flush_handle: Option<JoinHandle<()>>,
     merge_handle: Option<JoinHandle<()>>,
-    bitmap_store: Option<Arc<BitmapFs>>,
-    /// ShardStore instances (constructed alongside bitmap_store during migration).
-    alive_store: Option<Arc<crate::shard_store_bitmap::AliveBitmapStore>>,
-    filter_store: Option<Arc<crate::shard_store_bitmap::FilterBitmapStore>>,
-    sort_store: Option<Arc<crate::shard_store_bitmap::SortBitmapStore>>,
-    meta_store: Option<Arc<crate::shard_store_meta::MetaStore>>,
     loading_mode: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
     time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
     /// Pending bucket diffs for lazy application on cache reads.
     /// Flush thread stores new snapshots; query threads load for diff application.
     pending_bucket_diffs: Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,
-    /// Fields not yet loaded from disk (lazy loading on first query).
-    pending_filter_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
-    pending_sort_loads: Arc<parking_lot::Mutex<HashSet<String>>>,
-    /// High-cardinality multi_value fields that use per-value lazy loading.
-    /// These are never "fully loaded" — individual values load on demand.
-    lazy_value_fields: Arc<parking_lot::Mutex<HashSet<String>>>,
-    /// Channel for sending lazy-loaded field data to the flush thread.
-    lazy_tx: Sender<LazyLoad>,
     /// Command channel for state transitions (force publish, unload, etc.).
     cmd_tx: Sender<FlushCommand>,
     /// Reverse string maps for MappedString field query resolution.
@@ -234,8 +191,7 @@ pub struct ConcurrentEngine {
     dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
     /// Unified cache: primary query result cache.
     unified_cache: Arc<parking_lot::Mutex<UnifiedCache>>,
-    /// BoundStore for unified cache persistence (None if no bitmap_path).
-    bound_store: Option<Arc<crate::bound_store::BoundStore>>,
+    // CacheSilo (Phase 4): persistent cache backed by DataSilo — not yet implemented
     /// Flush loop stats: total snapshot publishes (monotonic counter).
     flush_publish_count: Arc<AtomicU64>,
     /// Flush loop stats: cumulative flush duration in nanoseconds.
@@ -257,55 +213,23 @@ pub struct ConcurrentEngine {
     /// Named cursors: opaque key-value pairs persisted at checkpoint time.
     /// Callers (e.g. pg-sync sidecars) use these to track replication progress.
     cursors: Arc<parking_lot::Mutex<HashMap<String, String>>>,
-    /// Positive existence sets for per-value lazy loading fields.
-    /// Maps field_name → set of all value IDs that exist on disk.
-    /// Queries for values NOT in this set skip disk I/O entirely.
-    /// Updated by the flush thread when new distinct values appear.
-    existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>>,
-    /// Per-value last-accessed flush cycle for idle eviction.
-    /// Key: (field_name, value_id). Value: flush cycle when last touched.
-    /// Shared between query threads (stamp) and flush thread (sweep).
-    eviction_stamps: Arc<DashMap<(Arc<str>, u64), AtomicU64>>,
-    /// Global flush cycle counter, incremented by flush thread.
-    flush_cycle: Arc<AtomicU64>,
-    /// Cumulative eviction counts per field (for Prometheus metrics).
-    eviction_total: Arc<DashMap<String, AtomicU64>>,
-    // ── BoundStore operational counters ─────────────────────────────────
-    /// Cumulative shard load events.
-    boundstore_shard_loads: Arc<AtomicU64>,
-    /// Cumulative tombstones created by flush thread.
-    boundstore_tombstones_created: Arc<AtomicU64>,
-    /// Cumulative tombstones cleaned up by merge thread.
-    boundstore_tombstones_cleaned: Arc<AtomicU64>,
-    /// Cumulative bytes written to bounds directory.
-    boundstore_bytes_written: Arc<AtomicU64>,
-    /// Cumulative bytes read from bounds directory.
-    boundstore_bytes_read: Arc<AtomicU64>,
-    /// Cumulative entries restored from shard files.
-    boundstore_entries_restored: Arc<AtomicU64>,
-    /// Cumulative entries skipped (tombstoned + orphan) during shard load.
-    boundstore_entries_skipped: Arc<AtomicU64>,
+    // BoundStore counters removed (DataSilo Phase 4)
     /// Metrics bridge: prometheus handles set by server layer, read by background threads.
     #[cfg(feature = "server")]
     metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
-    /// Amortized bitmap memory scanner cache (replaces expensive per-scrape iteration).
-    bitmap_memory_cache: Arc<crate::bitmap_memory_cache::BitmapMemoryCache>,
-    /// In-memory document cache (DashMap, cache-on-read, write-through, LRU eviction).
-    doc_cache: Option<Arc<crate::doc_cache::DocCache>>,
-    /// Compaction skip counter (incremented by DocStore when channel is full).
+    // doc_cache: REMOVED (DataSilo mmap reads at 23M/s replace it)
+    /// BitmapSilo for frozen bitmap reads. Queries read filter/sort bitmaps
+    /// directly from the silo's mmap via FrozenRoaringBitmap::view().
+    /// RwLock: readers (queries) share access; writer (save_snapshot) gets exclusive.
+    bitmap_silo: Option<Arc<parking_lot::RwLock<crate::bitmap_silo::BitmapSilo>>>,
+    /// Compaction skip counter.
     compaction_skipped: Arc<AtomicU64>,
-    /// Compaction channel sender — held here so we can drop it in shutdown()
-    /// to signal the compact worker to exit.
-    compact_tx: Option<Sender<(u32, Vec<u8>)>>,
-    /// Background compaction worker thread handle.
-    compact_handle: Option<JoinHandle<()>>,
     /// Prefetch channel sender — sends UnifiedKey to background worker for
     /// async cache expansion. None when prefetch is disabled.
     prefetch_tx: Option<Sender<UnifiedKey>>,
     /// Background prefetch worker thread handle.
     prefetch_handle: Option<JoinHandle<()>>,
-    /// Background doc cache eviction thread handle.
-    doc_cache_eviction_handle: Option<JoinHandle<()>>,
+    // doc_cache_eviction_handle: REMOVED
     /// WAL writer for Sync V2 write path. When set, put() and patch_document()
     /// decompose documents into ops and write to WAL instead of directly to coalescer.
     /// The WAL reader thread picks up ops and routes through apply_ops_batch.
@@ -316,19 +240,19 @@ impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
-        let docstore = DocStoreV3::open_temp()
+        let docstore = DocSiloAdapter::open_temp()
             .map_err(|e| crate::error::BitdexError::Storage(format!("open temp: {e}")))?;
         Self::build(config, docstore)
     }
     /// Create a new concurrent engine with an on-disk docstore.
     pub fn new_with_path(config: Config, path: &Path) -> Result<Self> {
         config.validate()?;
-        let docstore = DocStoreV3::open(path)
+        let docstore = DocSiloAdapter::open(path)
             .map_err(|e| crate::error::BitdexError::Storage(format!("open: {e}")))?;
         Self::build(config, docstore)
     }
 
-    fn build(config: Config, mut docstore: DocStoreV3) -> Result<Self> {
+    fn build(config: Config, docstore: DocSiloAdapter) -> Result<Self> {
         let mut filters = crate::filter::FilterIndex::new();
         let mut sorts = crate::sort::SortIndex::new();
         // All fields are in-memory (no tier 2 distinction).
@@ -339,223 +263,50 @@ impl ConcurrentEngine {
             sorts.add_field(sc.clone());
         }
         let field_registry = FieldRegistry::from_config(&config);
-        // Open filesystem bitmap store if configured
-        let bitmap_store = if let Some(ref path) = config.storage.bitmap_path {
-            Some(Arc::new(BitmapFs::new(path)?))
-        } else {
-            None
-        };
-        // Construct ShardStore instances
-        let (alive_store, filter_store, sort_store, meta_store) = if let Some(ref path) = config.storage.bitmap_path {
-            let ss_root = path.join("shardstore");
-            use crate::error::BitdexError;
-            (
-                Some(Arc::new(crate::shard_store_bitmap::AliveBitmapStore::new(
-                    ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
-                ).map_err(|e| BitdexError::Storage(format!("alive store init: {e}")))?)),
-                Some(Arc::new(crate::shard_store_bitmap::FilterBitmapStore::new(
-                    ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
-                ).map_err(|e| BitdexError::Storage(format!("filter store init: {e}")))?)),
-                Some(Arc::new(crate::shard_store_bitmap::SortBitmapStore::new(
-                    ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
-                ).map_err(|e| BitdexError::Storage(format!("sort store init: {e}")))?)),
-                Some(Arc::new(crate::shard_store_meta::MetaStore::new(ss_root)
-                    .map_err(|e| BitdexError::Storage(format!("meta store init: {e}")))?)),
-            )
-        } else {
-            (None, None, None, None)
-        };
-        // Track which fields need lazy loading from disk.
-        // Alive + slot counter are always loaded eagerly (tiny, always needed).
-        // Filter and sort bitmaps are deferred until first query.
-        let mut pending_filter_loads: HashSet<String> = HashSet::new();
-        let mut pending_sort_loads: HashSet<String> = HashSet::new();
-        // Multi-value fields use per-value lazy loading (never fully loaded).
-        let mut lazy_value_fields: HashSet<String> = HashSet::new();
-        // Load alive bitmap and slot counter eagerly (small, always needed)
+
+        // Restore from BitmapSilo: alive+meta loaded to heap; filter/sort stay frozen in mmap
         let mut slots = crate::slot::SlotAllocator::new();
-        if let Some(ref store) = alive_store {
-            let alive = store.load_alive()
-                .map_err(|e| crate::error::BitdexError::Storage(format!("load alive: {e}")))?;
-            let counter = meta_store.as_ref()
-                .and_then(|ms| ms.load_slot_counter().ok())
-                .flatten();
-            if let Some(alive_bm) = alive {
-                let counter_val = counter.unwrap_or(0);
-                slots = crate::slot::SlotAllocator::from_state(
-                    counter_val,
-                    alive_bm,
-                    RoaringBitmap::new(),
-                );
-                // Restore deferred alive map if persisted.
-                if let Some(ref ms) = meta_store {
-                    if let Ok(Some(deferred)) = ms.load_deferred_alive() {
-                        if !deferred.is_empty() {
-                            let total: usize = deferred.values().map(|v| v.len()).sum();
-                            eprintln!("Restored {} deferred alive slots ({} timestamps)", total, deferred.len());
-                            slots.set_deferred(deferred);
-                        }
+        let mut restored_cursors: HashMap<String, String> = HashMap::new();
+        let mut bitmap_silo_instance: Option<crate::bitmap_silo::BitmapSilo> = None;
+        if let Some(ref bitmap_path) = config.storage.bitmap_path {
+            match crate::bitmap_silo::BitmapSilo::open(bitmap_path) {
+                Ok(silo) if silo.has_data() => {
+                    let t_restore = std::time::Instant::now();
+                    // Load alive bitmap + metadata (always owned — used by SlotAllocator)
+                    if let Ok(Some(alive)) = silo.load_alive() {
+                        let meta = silo.load_meta().ok().flatten();
+                        let slot_counter = meta.as_ref()
+                            .and_then(|m| m.get("slot_counter"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32)
+                            .unwrap_or(0);
+                        let alive_count = alive.len();
+                        slots = crate::slot::SlotAllocator::from_state(
+                            slot_counter,
+                            alive,
+                            roaring::RoaringBitmap::new(),
+                        );
+                        restored_cursors = meta.as_ref()
+                            .and_then(|m| m.get("cursors"))
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default();
+                        eprintln!("BitmapSilo: restored alive ({} slots, counter={})", alive_count, slot_counter);
                     }
+                    // Mark filter/sort bitmaps as backed — NOT loaded to heap.
+                    // Queries read frozen bitmaps from silo mmap at query time.
+                    let filter_count = silo.mark_filters_backed(&mut filters);
+                    eprintln!("BitmapSilo: marked {} filter bitmaps as frozen-backed", filter_count);
+                    let sort_count = silo.mark_sorts_backed(&mut sorts);
+                    eprintln!("BitmapSilo: marked {} sort layers as frozen-backed", sort_count);
+                    eprintln!("BitmapSilo: restore complete in {:.1}ms", t_restore.elapsed().as_secs_f64() * 1000.0);
+                    bitmap_silo_instance = Some(silo);
                 }
-                // Only register pending loads if there are actual records to restore.
-                // Fields with no saved bitmaps don't need lazy loading.
-                if counter_val > 0 {
-                    for fc in &config.filter_fields {
-                        if !fc.eager_load && (fc.field_type == FilterFieldType::MultiValue || fc.per_value_lazy) {
-                            // Per-value lazy loading: multi_value fields (always) and
-                            // single_value fields with per_value_lazy (e.g. postId with 22M+ values).
-                            // Only loads the specific values needed by each query from disk.
-                            lazy_value_fields.insert(fc.name.clone());
-                        } else {
-                            // Full-field loading: low-cardinality, boolean, or eager_load fields.
-                            pending_filter_loads.insert(fc.name.clone());
-                        }
-                    }
-                    // Time bucket sort field: load eagerly (needed for bucket rebuild)
-                    let tb_sort_field = config.time_buckets.as_ref()
-                        .map(|tb| tb.sort_field.clone());
-                    for sc in &config.sort_fields {
-                        if tb_sort_field.as_deref() == Some(&sc.name) {
-                            // Eagerly load the sort field used by time buckets
-                            if let Some(ref ss) = sort_store {
-                                if let Ok(Some(layers)) = ss.load_sort_layers(&sc.name, sc.bits as usize) {
-                                    if !layers.is_empty() {
-                                        sorts.add_field(sc.clone());
-                                        if let Some(field) = sorts.get_field_mut(&sc.name) {
-                                            field.load_layers(layers);
-                                        }
-                                        eprintln!("Eagerly loaded sort field '{}' for time buckets", sc.name);
-                                        continue; // Don't add to pending
-                                    }
-                                }
-                            }
-                        }
-                        pending_sort_loads.insert(sc.name.clone());
-                    }
+                Ok(_) => {
+                    eprintln!("BitmapSilo: no data found, starting fresh");
                 }
-            }
-        }
-        // Eager-load fields marked with `eager_load: true` in config.
-        // These are loaded in parallel from ShardStore and applied to the
-        // filters/sorts before constructing the InnerEngine.
-        if filter_store.is_some() || sort_store.is_some() {
-            let eager_filter_names: Vec<String> = config.filter_fields.iter()
-                .filter(|fc| fc.eager_load && fc.field_type != FilterFieldType::MultiValue)
-                .filter(|fc| pending_filter_loads.contains(&fc.name))
-                .map(|fc| fc.name.clone())
-                .collect();
-            let eager_sort_configs: Vec<(String, usize)> = config.sort_fields.iter()
-                .filter(|sc| sc.eager_load)
-                .filter(|sc| pending_sort_loads.contains(&sc.name))
-                .map(|sc| (sc.name.clone(), sc.bits as usize))
-                .collect();
-            if !eager_filter_names.is_empty() || !eager_sort_configs.is_empty() {
-                let t0 = std::time::Instant::now();
-                let total_eager = eager_filter_names.len() + eager_sort_configs.len();
-                if total_eager > 1 {
-                    // Parallel eager loading
-                    use std::sync::Mutex;
-                    let eager_filter_results: Mutex<Vec<(String, HashMap<u64, RoaringBitmap>)>> = Mutex::new(Vec::new());
-                    let eager_sort_results: Mutex<Vec<(String, Vec<RoaringBitmap>)>> = Mutex::new(Vec::new());
-                    std::thread::scope(|s| {
-                        for name in &eager_filter_names {
-                            let fs = filter_store.as_ref().unwrap().clone();
-                            let results = &eager_filter_results;
-                            s.spawn(move || {
-                                let ft0 = std::time::Instant::now();
-                                match fs.load_field(name) {
-                                    Ok(bitmaps) => {
-                                        let count = bitmaps.len();
-                                        eprintln!(
-                                            "Eager-loaded filter '{}': {} values in {:.1}ms",
-                                            name, count, ft0.elapsed().as_secs_f64() * 1000.0
-                                        );
-                                        results.lock().unwrap().push((name.clone(), bitmaps));
-                                    }
-                                    Err(e) => eprintln!("Warning: eager load failed for filter '{}': {}", name, e),
-                                }
-                            });
-                        }
-                        for (name, bits) in &eager_sort_configs {
-                            let ss = sort_store.as_ref().unwrap().clone();
-                            let results = &eager_sort_results;
-                            let name = name.clone();
-                            let bits = *bits;
-                            s.spawn(move || {
-                                let st0 = std::time::Instant::now();
-                                match ss.load_sort_layers(&name, bits) {
-                                    Ok(Some(layers)) if !layers.is_empty() => {
-                                        let layer_count = layers.len();
-                                        eprintln!(
-                                            "Eager-loaded sort '{}': {} layers in {:.1}ms",
-                                            name, layer_count, st0.elapsed().as_secs_f64() * 1000.0
-                                        );
-                                        results.lock().unwrap().push((name, layers));
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => eprintln!("Warning: eager load failed for sort '{}': {}", name, e),
-                                }
-                            });
-                        }
-                    });
-                    for (name, bitmaps) in eager_filter_results.into_inner().unwrap() {
-                        if let Some(field) = filters.get_field_mut(&name) {
-                            field.load_field_complete(bitmaps);
-                        }
-                        pending_filter_loads.remove(&name);
-                    }
-                    for (name, layers) in eager_sort_results.into_inner().unwrap() {
-                        if let Some(field) = sorts.get_field_mut(&name) {
-                            field.load_layers(layers);
-                        }
-                        pending_sort_loads.remove(&name);
-                    }
-                } else {
-                    // Single eager field — load serially (no thread overhead)
-                    if let Some(ref fs) = filter_store {
-                        for name in &eager_filter_names {
-                            let ft0 = std::time::Instant::now();
-                            match fs.load_field(name) {
-                                Ok(bitmaps) => {
-                                    let count = bitmaps.len();
-                                    eprintln!(
-                                        "Eager-loaded filter '{}': {} values in {:.1}ms",
-                                        name, count, ft0.elapsed().as_secs_f64() * 1000.0
-                                    );
-                                    if let Some(field) = filters.get_field_mut(name) {
-                                        field.load_field_complete(bitmaps);
-                                    }
-                                    pending_filter_loads.remove(name);
-                                }
-                                Err(e) => eprintln!("Warning: eager load failed for filter '{}': {}", name, e),
-                            }
-                        }
-                    }
-                    if let Some(ref ss) = sort_store {
-                        for (name, bits) in &eager_sort_configs {
-                            let st0 = std::time::Instant::now();
-                            match ss.load_sort_layers(name, *bits) {
-                                Ok(Some(layers)) if !layers.is_empty() => {
-                                    let layer_count = layers.len();
-                                    eprintln!(
-                                        "Eager-loaded sort '{}': {} layers in {:.1}ms",
-                                        name, layer_count, st0.elapsed().as_secs_f64() * 1000.0
-                                    );
-                                    if let Some(field) = sorts.get_field_mut(name) {
-                                        field.load_layers(layers);
-                                    }
-                                    pending_sort_loads.remove(name);
-                                }
-                                Ok(_) => {}
-                                Err(e) => eprintln!("Warning: eager load failed for sort '{}': {}", name, e),
-                            }
-                        }
-                    }
+                Err(e) => {
+                    eprintln!("BitmapSilo: open error (starting fresh): {e}");
                 }
-                eprintln!(
-                    "Eager loading complete: {} fields in {:.1}ms",
-                    total_eager, t0.elapsed().as_secs_f64() * 1000.0
-                );
             }
         }
         let uc_config = UnifiedCacheConfig {
@@ -568,121 +319,17 @@ impl ConcurrentEngine {
             max_maintenance_ms: config.cache.max_maintenance_ms,
             prefetch_threshold: config.cache.prefetch_threshold,
         };
-        let mut uc = UnifiedCache::new(uc_config);
-        // Initialize BoundStore for unified cache persistence
-        let bound_store = if let Some(ref path) = config.storage.bitmap_path {
-            let bounds_path = path.join("shardstore").join("bounds");
-            match crate::bound_store::BoundStore::new(&bounds_path) {
-                Ok(bs) => {
-                    // Load meta.bin: populate meta-index, record pending shards
-                    match bs.load_meta() {
-                        Ok(Some(meta)) => {
-                            eprintln!(
-                                "BoundStore: loaded meta.bin ({} entries, {} tombstones, next_id={})",
-                                meta.entries.len(),
-                                meta.tombstones.len(),
-                                meta.next_entry_id
-                            );
-                            // Restore meta-index registrations
-                            for entry in &meta.entries {
-                                uc.meta_mut().register_with_id(
-                                    entry.entry_id,
-                                    &entry.filter_clauses,
-                                    Some(&entry.sort_field),
-                                    Some(entry.direction),
-                                );
-                            }
-                            uc.meta_mut().set_next_id(meta.next_entry_id);
-                            uc.meta_mut().set_tombstones(meta.tombstones);
-                            // Store has_more flags for shard restore
-                            let has_more_map: HashMap<crate::meta_index::CacheEntryId, bool> = meta.entries
-                                .iter()
-                                .map(|e| (e.entry_id, e.has_more))
-                                .collect();
-                            uc.set_meta_has_more(has_more_map);
-                            // Store total_matched values for shard restore
-                            let total_matched_map: HashMap<crate::meta_index::CacheEntryId, u64> = meta.entries
-                                .iter()
-                                .map(|e| (e.entry_id, e.total_matched))
-                                .collect();
-                            uc.set_meta_total_matched(total_matched_map);
-                            // Record pending shards from registered entries
-                            let mut shard_keys = HashSet::new();
-                            for entry in &meta.entries {
-                                shard_keys.insert(crate::bound_store::ShardKey::new(
-                                    entry.sort_field.clone(),
-                                    entry.direction,
-                                ));
-                            }
-                            uc.add_pending_shards(shard_keys);
-                            uc.enable_persistence();
-                        }
-                        Ok(None) => {
-                            // No meta.bin — clean orphaned .ucpack files if any
-                            if let Ok(shards) = bs.list_shards() {
-                                if !shards.is_empty() {
-                                    eprintln!(
-                                        "BoundStore: no meta.bin, purging {} orphaned shard files",
-                                        shards.len()
-                                    );
-                                    let _ = bs.purge();
-                                }
-                            }
-                            uc.enable_persistence();
-                        }
-                        Err(e) => {
-                            eprintln!("BoundStore: failed to load meta.bin: {e}");
-                            uc.enable_persistence();
-                        }
-                    }
-                    Some(Arc::new(bs))
-                }
-                Err(e) => {
-                    eprintln!("BoundStore: failed to create: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let uc = UnifiedCache::new(uc_config);
+        // TODO: CacheSilo persistence (Phase 4) — restore persistent cache entries here
         let unified_cache = Arc::new(parking_lot::Mutex::new(uc));
         let loading_mode = Arc::new(AtomicBool::new(false));
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
         let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
-            let mut tb = TimeBucketManager::new_with_sort_field(
+            let tb = TimeBucketManager::new_with_sort_field(
                 tb_config.filter_field.clone(),
                 tb_config.sort_field.clone(),
                 tb_config.range_buckets.clone(),
             );
-            // Restore persisted time bucket bitmaps + cutoffs from disk
-            if let Some(ref ms) = meta_store {
-                match ms.load_time_buckets() {
-                    Ok(persisted) if !persisted.is_empty() => {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let count = persisted.len();
-                        tb.load_persisted(&persisted, now);
-                        // Restore persisted cutoffs (for boot diff computation)
-                        for (name, _) in &persisted {
-                            match ms.load_time_bucket_cutoff(name) {
-                                Ok(cutoff) if cutoff > 0 => {
-                                    if let Some(bucket) = tb.get_bucket_mut(name) {
-                                        bucket.set_last_cutoff(cutoff);
-                                        eprintln!("  Restored cutoff for '{}': {}", name, cutoff);
-                                    }
-                                }
-                                Ok(_) => {} // no persisted cutoff — first boot
-                                Err(e) => eprintln!("Warning: failed to load cutoff for '{}': {e}", name),
-                            }
-                        }
-                        eprintln!("Restored {count} time bucket bitmaps from disk");
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("Warning: failed to load time buckets: {e}"),
-                }
-            }
             Arc::new(parking_lot::Mutex::new(tb))
         });
         // Initialize pending bucket diffs (load from append-only log on disk + compute boot diff)
@@ -827,112 +474,16 @@ impl ConcurrentEngine {
         #[cfg(feature = "server")]
         let metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> = Arc::new(ArcSwap::from_pointee(None));
 
-        // DocStoreV3 uses ShardStore native compaction — no manual compaction worker needed.
-        // Set threshold for auto-compaction within DocStoreV3.
-        if config.compact_threshold_pct > 0 {
-            docstore.set_compact_threshold(config.compact_threshold_pct as u32);
-        }
-        let (compact_tx, compact_handle): (Option<Sender<(u32, Vec<u8>)>>, Option<JoinHandle<()>>) = (None, None);
-
         let docstore_root = Arc::new(docstore.path().to_path_buf());
         let docstore = Arc::new(parking_lot::Mutex::new(docstore));
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
         let dirty_flag = Arc::new(AtomicBool::new(false));
-        // Load named cursors from disk (if any exist).
-        let initial_cursors = if let Some(ref ms) = meta_store {
-            ms.load_all_cursors().unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-        let cursors = Arc::new(parking_lot::Mutex::new(initial_cursors));
-        // Lazy load channel: query threads send loaded field data here for staging sync.
-        let (lazy_tx, lazy_rx): (Sender<LazyLoad>, Receiver<LazyLoad>) =
-            crossbeam_channel::unbounded();
+        // Restore cursors from BitmapSilo (if available), otherwise start empty.
+        let cursors = Arc::new(parking_lot::Mutex::new(restored_cursors));
         // Command channel: external threads send state transition commands to flush thread.
         let (cmd_tx, cmd_rx): (Sender<FlushCommand>, Receiver<FlushCommand>) =
             crossbeam_channel::unbounded();
-        let pending_filter_loads = Arc::new(parking_lot::Mutex::new(pending_filter_loads));
-        let pending_sort_loads = Arc::new(parking_lot::Mutex::new(pending_sort_loads));
-        // Build positive existence sets for per-value lazy loading fields.
-        // Reads bucket snapshots to discover all value IDs — fast even at 31K keys.
-        let mut existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> = HashMap::new();
-        if let Some(ref fs) = filter_store {
-            let fields: Vec<String> = lazy_value_fields.iter().cloned().collect();
-            if fields.len() > 1 {
-                // Parallel existence set loading
-                use rayon::prelude::*;
-                let results: Vec<(String, std::result::Result<HashSet<u64>, _>)> = fields
-                    .par_iter()
-                    .map(|name| (name.clone(), fs.existence_set(name)))
-                    .collect();
-                for (field_name, result) in results {
-                    match result {
-                        Ok(keys) => {
-                            if !keys.is_empty() {
-                                eprintln!("Existence set for '{}': {} keys", field_name, keys.len());
-                            }
-                            existing_keys.insert(field_name, Arc::new(ArcSwap::from_pointee(keys)));
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: failed to build existence set for '{}': {}", field_name, e);
-                            existing_keys.insert(field_name, Arc::new(ArcSwap::from_pointee(HashSet::new())));
-                        }
-                    }
-                }
-            } else {
-                // Single field: sequential
-                for field_name in &fields {
-                    match fs.existence_set(field_name) {
-                        Ok(keys) => {
-                            if !keys.is_empty() {
-                                eprintln!("Existence set for '{}': {} keys", field_name, keys.len());
-                            }
-                            existing_keys.insert(field_name.clone(), Arc::new(ArcSwap::from_pointee(keys)));
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: failed to build existence set for '{}': {}", field_name, e);
-                            existing_keys.insert(field_name.clone(), Arc::new(ArcSwap::from_pointee(HashSet::new())));
-                        }
-                    }
-                }
-            }
-        }
-        // Eviction-enabled fields must always be in lazy_value_fields so that
-        // ensure_fields_loaded() can reload values after eviction, even when the
-        // engine wasn't restored from disk. Skip if eager_load — user wants everything in memory.
-        for fc in &config.filter_fields {
-            if fc.eviction.is_some() && fc.field_type == FilterFieldType::MultiValue && !fc.eager_load {
-                lazy_value_fields.insert(fc.name.clone());
-                // Ensure existence set exists (empty if no bitmap store)
-                existing_keys.entry(fc.name.clone()).or_insert_with(|| {
-                    Arc::new(ArcSwap::from_pointee(HashSet::new()))
-                });
-            }
-        }
-        let lazy_value_fields = Arc::new(parking_lot::Mutex::new(lazy_value_fields));
-        // Document cache: DashMap-based in-memory cache for include_docs queries
-        let doc_cache: Option<Arc<crate::doc_cache::DocCache>> = if config.storage.bitmap_path.is_some() {
-            Some(Arc::new(crate::doc_cache::DocCache::new(
-                crate::doc_cache::DocCacheConfig {
-                    max_bytes: config.doc_cache.max_bytes,
-                    generation_interval_secs: config.doc_cache.generation_interval_secs,
-                    max_generations: config.doc_cache.max_generations,
-                },
-            )))
-        } else {
-            None
-        };
-        // Bitmap memory scanner cache
-        let bitmap_memory_cache = Arc::new(crate::bitmap_memory_cache::BitmapMemoryCache::new(
-            config.memory_scanner.enabled,
-            config.memory_scanner.interval_ms,
-            config.memory_scanner.batch_size,
-        ));
-        // Eviction state
-        let eviction_stamps: Arc<DashMap<(Arc<str>, u64), AtomicU64>> = Arc::new(DashMap::new());
-        let flush_cycle = Arc::new(AtomicU64::new(0));
-        let eviction_total: Arc<DashMap<String, AtomicU64>> = Arc::new(DashMap::new());
         let flush_publish_count = Arc::new(AtomicU64::new(0));
         let flush_duration_nanos = Arc::new(AtomicU64::new(0));
         let flush_last_duration_nanos = Arc::new(AtomicU64::new(0));
@@ -942,17 +493,7 @@ impl ConcurrentEngine {
         let flush_timebucket_nanos = Arc::new(AtomicU64::new(0));
         let flush_compact_nanos = Arc::new(AtomicU64::new(0));
         let flush_opslog_nanos = Arc::new(AtomicU64::new(0));
-        // BoundStore operational counters (defined before flush/merge threads)
-        let boundstore_shard_loads = Arc::new(AtomicU64::new(0));
-        let boundstore_tombstones_created = Arc::new(AtomicU64::new(0));
-        let boundstore_tombstones_cleaned = Arc::new(AtomicU64::new(0));
-        let boundstore_bytes_written = Arc::new(AtomicU64::new(0));
-        let boundstore_bytes_read = Arc::new(AtomicU64::new(0));
-        let boundstore_entries_restored = Arc::new(AtomicU64::new(0));
-        let boundstore_entries_skipped = Arc::new(AtomicU64::new(0));
         // Headless mode: skip all background threads.
-        // The engine provides config, bitmap store, and docstore access but
-        // no flush/merge/eviction threads run.
         if config.headless {
             eprintln!("Engine starting in headless mode (no background threads)");
             return Ok(Self {
@@ -967,25 +508,15 @@ impl ConcurrentEngine {
                 shutdown,
                 flush_handle: None,
                 merge_handle: None,
-                bitmap_store,
-                alive_store: alive_store.clone(),
-                filter_store: filter_store.clone(),
-                sort_store: sort_store.clone(),
-                meta_store: meta_store.clone(),
                 loading_mode,
                 dirty_since_snapshot: dirty_flag,
                 time_buckets,
                 pending_bucket_diffs: Arc::clone(&pending_bucket_diffs),
-                pending_filter_loads,
-                pending_sort_loads,
-                lazy_value_fields,
-                lazy_tx,
                 cmd_tx,
                 string_maps: None,
                 case_sensitive_fields: None,
                 dictionaries: Arc::new(HashMap::new()),
                 unified_cache,
-                bound_store,
                 flush_publish_count,
                 flush_duration_nanos,
                 flush_last_duration_nanos,
@@ -996,27 +527,12 @@ impl ConcurrentEngine {
                 flush_compact_nanos,
                 flush_opslog_nanos,
                 cursors,
-                existing_keys,
-                eviction_stamps,
-                flush_cycle,
-                eviction_total,
-                boundstore_shard_loads,
-                boundstore_tombstones_created,
-                boundstore_tombstones_cleaned,
-                boundstore_bytes_written,
-                boundstore_bytes_read,
-                boundstore_entries_restored,
-                boundstore_entries_skipped,
                 #[cfg(feature = "server")]
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
-                bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
-                doc_cache: doc_cache.clone(),
+                bitmap_silo: bitmap_silo_instance.map(|s| Arc::new(parking_lot::RwLock::new(s))),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
-                compact_handle: None,
-                compact_tx: None,
                 prefetch_tx: None,
                 prefetch_handle: None,
-                doc_cache_eviction_handle: None,
                 #[cfg(feature = "pg-sync")]
                 wal_writer: None,
             });
@@ -1042,27 +558,8 @@ impl ConcurrentEngine {
             let flush_timebucket_ns = Arc::clone(&flush_timebucket_nanos);
             let flush_compact_ns = Arc::clone(&flush_compact_nanos);
             let flush_opslog_ns = Arc::clone(&flush_opslog_nanos);
-            let flush_existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> =
-                existing_keys.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
-            let flush_eviction_stamps = Arc::clone(&eviction_stamps);
-            let flush_eviction_total = Arc::clone(&eviction_total);
-            let flush_cycle_clone = Arc::clone(&flush_cycle);
-            let _flush_bitmap_store = bitmap_store.clone();
-            let flush_doc_cache = doc_cache.clone();
-            let flush_alive_store = alive_store.clone();
-            let flush_filter_store = filter_store.clone();
-            let flush_sort_store = sort_store.clone();
-            let flush_meta_store = meta_store.clone();
             let flush_config = Arc::clone(&config);
             let flush_field_registry = field_registry.clone();
-            let flush_lazy_value_fields = lazy_value_fields.clone();
-            let eviction_sweep_interval = config.eviction_sweep_interval;
-            let flush_tombstones_created = Arc::clone(&boundstore_tombstones_created);
-            // Build eviction config map: field_name → idle_seconds
-            let eviction_configs: HashMap<String, f64> = config.filter_fields.iter()
-                .filter_map(|fc| fc.eviction.as_ref().map(|e| (fc.name.clone(), e.idle_seconds)))
-                .collect();
-            let flush_mem_cache = Arc::clone(&bitmap_memory_cache);
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
                 let max_sleep = Duration::from_micros(flush_interval_us * 10);
@@ -1079,49 +576,7 @@ impl ConcurrentEngine {
                     let is_loading = flush_loading_mode.load(Ordering::Relaxed);
                     // Phase 1: Drain channel and group/sort (no lock, pure CPU work)
                     let bitmap_count = coalescer.prepare();
-                    // Phase 1b: Drain lazy load channel — apply loaded fields to staging.
-                    // This keeps staging in sync with snapshots published by ensure_loaded().
-                    let mut lazy_loaded = false;
                     let mut stale_fields: Vec<String> = Vec::new();
-                    while let Ok(load) = lazy_rx.try_recv() {
-                        match load {
-                            LazyLoad::FilterField { name, bitmaps } => {
-                                if let Some(field) = staging.filters.get_field_mut(&name) {
-                                    field.load_field_complete(bitmaps);
-                                }
-                                stale_fields.push(name);
-                            }
-                            LazyLoad::FilterValues { field, values } => {
-                                if let Some(f) = staging.filters.get_field_mut(&field) {
-                                    // For per-value loads, we use load_from since only
-                                    // specific requested values are sent. The values in
-                                    // the map are all that were requested.
-                                    let requested: Vec<u64> = values.keys().copied().collect();
-                                    f.load_values(values, &requested);
-                                }
-                                stale_fields.push(field);
-                            }
-                            LazyLoad::SortField { name, layers } => {
-                                if let Some(sf) = staging.sorts.get_field_mut(&name) {
-                                    sf.load_layers(layers);
-                                    // If time buckets use this sort field, force a rebuild on the
-                                    // next periodic check (don't rebuild inline — iterating 100M+
-                                    // slots while holding the lock would block queries).
-                                    if let Some(ref tb_arc) = flush_time_buckets {
-                                        let mut tb = tb_arc.lock();
-                                        if tb.sort_field_name() == name {
-                                            tb.force_refresh_due();
-                                        }
-                                    }
-                                }
-                                stale_fields.push(name);
-                            }
-                            LazyLoad::Slots { slots } => {
-                                staging.slots = slots;
-                            }
-                        }
-                        lazy_loaded = true;
-                    }
                     // Phase 2: Apply mutations to staging (private, no lock needed)
                     let flush_start = Instant::now();
                     if bitmap_count > 0 {
@@ -1146,29 +601,6 @@ impl ConcurrentEngine {
                         }
                         for sgk in coalescer.sort_clear_entries().keys() {
                             stale_fields.push(sgk.field.to_string());
-                        }
-                        // Persist deferred map when new deferred entries are added.
-                        if coalescer.has_deferred_alive() {
-                            if let Some(ref ms) = flush_meta_store {
-                                if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
-                                    eprintln!("Warning: failed to persist deferred alive map: {e}");
-                                }
-                            }
-                        }
-                        // Update positive existence sets with any new distinct values.
-                        // This is cheap (HashSet insert + Arc swap) and must be visible
-                        // to query threads immediately, even during loading mode.
-                        if !flush_existing_keys.is_empty() {
-                            for (fgk, _slots) in coalescer.filter_insert_entries() {
-                                if let Some(ek) = flush_existing_keys.get(fgk.field.as_ref()) {
-                                    let current = ek.load();
-                                    if !current.contains(&fgk.value) {
-                                        let mut updated = (**current).clone();
-                                        updated.insert(fgk.value);
-                                        ek.store(Arc::new(updated));
-                                    }
-                                }
-                            }
                         }
                         // Yield CPU after apply to let tokio I/O threads deliver
                         // pending HTTP responses. Without this, the flush thread
@@ -1250,9 +682,7 @@ impl ConcurrentEngine {
                                         .collect();
                                     if !filter_fields.is_empty() {
                                         let n = uc.tombstone_unloaded_for_filter(&filter_fields);
-                                        if n > 0 {
-                                            flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
-                                        }
+                                        let _ = n;
                                     }
                                     let sort_mutations = coalescer.mutated_sort_slots();
                                     let sort_fields: Vec<&str> = sort_mutations
@@ -1261,17 +691,13 @@ impl ConcurrentEngine {
                                         .collect();
                                     if !sort_fields.is_empty() {
                                         let n = uc.tombstone_unloaded_for_sort(&sort_fields);
-                                        if n > 0 {
-                                            flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
-                                        }
+                                        let _ = n;
                                     }
                                     if coalescer.has_alive_mutations()
                                         && !coalescer.alive_removes().is_empty()
                                     {
                                         let n = uc.tombstone_all_unloaded();
-                                        if n > 0 {
-                                            flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
-                                        }
+                                        let _ = n;
                                     }
                                 }
                                 (fw, fob, sw, sob)
@@ -1343,23 +769,12 @@ impl ConcurrentEngine {
                             }
                             flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             flush_cycle += 1;
-                            flush_cycle_clone.store(flush_cycle, Ordering::Relaxed);
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
                             let t_publish = Instant::now();
                             inner.store(Arc::new(staging.clone()));
                             flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             staging_dirty = false;
-                            // Mark fields touched by mutations or lazy loads as stale
-                            // in the bitmap memory cache so the scanner re-measures them.
-                            if !stale_fields.is_empty() {
-                                // Dedup to avoid redundant lock acquisitions.
-                                stale_fields.sort_unstable();
-                                stale_fields.dedup();
-                                for field in &stale_fields {
-                                    flush_mem_cache.mark_stale(field);
-                                }
-                                stale_fields.clear();
-                            }
+                            stale_fields.clear();
                             // Record flush stats for Prometheus
                             let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
                             flush_pub_count.fetch_add(1, Ordering::Relaxed);
@@ -1375,62 +790,6 @@ impl ConcurrentEngine {
                             // snapshot. On crash between publish and persist,
                             // pg-sync replays lost ops idempotently on restart.
                             let t_opslog = Instant::now();
-                            if let (Some(ref as_), Some(ref fs_), Some(ref ss_)) =
-                                (&flush_alive_store, &flush_filter_store, &flush_sort_store)
-                            {
-                                let alive_ins = coalescer.alive_inserts();
-                                if !alive_ins.is_empty() {
-                                    let op = BitmapOp::BatchSet { bits: alive_ins.to_vec() };
-                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
-                                        eprintln!("flush: alive insert op failed: {e}");
-                                    }
-                                }
-                                let alive_rem = coalescer.alive_removes();
-                                if !alive_rem.is_empty() {
-                                    let op = BitmapOp::BatchClear { bits: alive_rem.to_vec() };
-                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
-                                        eprintln!("flush: alive remove op failed: {e}");
-                                    }
-                                }
-                                for (fgk, slots) in coalescer.filter_insert_entries() {
-                                    let bucket_key = FilterBucketKey::from_value(
-                                        fgk.field.to_string(), fgk.value,
-                                    );
-                                    let op = FilterOp::BatchSet { value: fgk.value, bits: slots.clone() };
-                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
-                                        eprintln!("flush: filter insert op failed: {e}");
-                                    }
-                                }
-                                for (fgk, slots) in coalescer.filter_remove_entries() {
-                                    let bucket_key = FilterBucketKey::from_value(
-                                        fgk.field.to_string(), fgk.value,
-                                    );
-                                    let op = FilterOp::BatchClear { value: fgk.value, bits: slots.clone() };
-                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
-                                        eprintln!("flush: filter remove op failed: {e}");
-                                    }
-                                }
-                                for (sgk, slots) in coalescer.sort_set_entries() {
-                                    let shard_key = SortLayerShardKey {
-                                        field: sgk.field.to_string(),
-                                        bit_position: sgk.bit_layer as u8,
-                                    };
-                                    let op = BitmapOp::BatchSet { bits: slots.clone() };
-                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
-                                        eprintln!("flush: sort set op failed: {e}");
-                                    }
-                                }
-                                for (sgk, slots) in coalescer.sort_clear_entries() {
-                                    let shard_key = SortLayerShardKey {
-                                        field: sgk.field.to_string(),
-                                        bit_position: sgk.bit_layer as u8,
-                                    };
-                                    let op = BitmapOp::BatchClear { bits: slots.clone() };
-                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
-                                        eprintln!("flush: sort clear op failed: {e}");
-                                    }
-                                }
-                            }
                             flush_opslog_ns.store(t_opslog.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
                     }
@@ -1490,57 +849,6 @@ impl ConcurrentEngine {
                                 &mut staging.sorts,
                             );
                             staging_dirty = true;
-                            // Persist the deferred map AFTER activation so the activated
-                            // entries are already removed. On crash before persist, the
-                            // old map is re-read and those slots get re-activated (idempotent).
-                            if let Some(ref ms) = flush_meta_store {
-                                if let Err(e) = ms.write_deferred_alive(staging.slots.deferred_map()) {
-                                    eprintln!("Warning: failed to persist deferred alive map: {e}");
-                                }
-                            }
-                        }
-                    }
-                    // Idle compaction: compact dirty+unloaded entries even when no new
-                    // mutations arrive. Ops bursts create dirty entries; compaction only
-                    // ran inside `if bitmap_count > 0` which requires active mutations.
-                    // Without this, dirty entries from a finished ops burst never compact.
-                    // Check for unmerged diffs in lazy_value_fields even when staging
-                    // isn't "dirty" (no new mutations). staging_dirty only tracks whether
-                    // new mutations arrived — not whether old diffs were compacted.
-                    let has_lazy_dirty = !is_loading && {
-                        let lvf = flush_lazy_value_fields.lock();
-                        !lvf.is_empty() && staging.filters.fields()
-                            .any(|(name, field)| lvf.contains(name.as_str()) && field.has_dirty())
-                    };
-                    if bitmap_count == 0 && has_lazy_dirty {
-                        // Use a slower interval since there's no active write pressure.
-                        // flush_cycle is only bumped inside bitmap_count > 0, so track
-                        // idle ticks separately.
-                        static IDLE_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        let tick = IDLE_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-                        if tick % COMPACTION_INTERVAL == 0 {
-                            let dirty_fields: Vec<String> = staging.filters.fields()
-                                .filter(|(_, field)| field.has_dirty())
-                                .map(|(name, _)| name.clone())
-                                .collect();
-                            if !dirty_fields.is_empty() {
-                                eprintln!("  Idle compaction (tick {}): {} dirty fields: {:?}", tick, dirty_fields.len(), dirty_fields);
-                                // NOTE: Auto-loading bases disabled (same as regular compaction).
-                                // Dirty diffs persist via ShardStore, merge on query load.
-                                for name in &dirty_fields {
-                                    if let Some(field) = staging.filters.get_field_mut(name) {
-                                        field.merge_dirty();
-                                    }
-                                }
-                                // Publish the compacted staging
-                                inner.store(Arc::new(staging.clone()));
-                                staging_dirty = false;
-                                // Mark compacted fields as stale in memory cache.
-                                for name in &dirty_fields {
-                                    flush_mem_cache.mark_stale(name);
-                                }
-                                eprintln!("  Idle compaction: published clean staging");
-                            }
                         }
                     }
                     // Loading mode exit: force-publish if staging has unpublished mutations
@@ -1553,8 +861,6 @@ impl ConcurrentEngine {
                         flush_unified_cache.lock().clear();
                         inner.store(Arc::new(staging.clone()));
                         staging_dirty = false;
-                        // All fields changed during loading — mark everything stale.
-                        flush_mem_cache.mark_all_stale();
                     }
                     was_loading = is_loading;
                     // Process flush commands (force publish, unload, etc.)
@@ -1562,33 +868,6 @@ impl ConcurrentEngine {
                         match cmd {
                             FlushCommand::ForcePublish { done } => {
                                 let fp_start = std::time::Instant::now();
-                                let t_drain = std::time::Instant::now();
-                                // Drain lazy load channel — query threads may have
-                                // loaded data from disk and need it published.
-                                while let Ok(load) = lazy_rx.try_recv() {
-                                    match load {
-                                        LazyLoad::FilterField { name, bitmaps } => {
-                                            if let Some(field) = staging.filters.get_field_mut(&name) {
-                                                field.load_field_complete(bitmaps);
-                                            }
-                                        }
-                                        LazyLoad::FilterValues { field, values } => {
-                                            if let Some(f) = staging.filters.get_field_mut(&field) {
-                                                let requested: Vec<u64> = values.keys().copied().collect();
-                                                f.load_values(values, &requested);
-                                            }
-                                        }
-                                        LazyLoad::SortField { name, layers } => {
-                                            if let Some(sf) = staging.sorts.get_field_mut(&name) {
-                                                sf.load_layers(layers);
-                                            }
-                                        }
-                                        LazyLoad::Slots { slots } => {
-                                            staging.slots = slots;
-                                        }
-                                    }
-                                }
-                                let drain_elapsed = t_drain.elapsed();
                                 // Drain any remaining mutations from the channel
                                 // before publishing — they may not have been picked
                                 // up by the regular prepare() at the top of the loop.
@@ -1603,11 +882,6 @@ impl ConcurrentEngine {
                                     { staging_dirty = true; }
                                 }
                                 let flush_elapsed = t_flush.elapsed();
-                                // Compact diffs before publishing — only needed if
-                                // mutations were drained. Lazy loads insert clean base
-                                // bitmaps with no diffs, so merge_dirty is a no-op.
-                                // Skipping saves ~65ms by avoiding fields_mut() which
-                                // touches every Arc<FilterField>.
                                 let t_merge = std::time::Instant::now();
                                 if extra > 0 {
                                     for (_name, field) in staging.filters.fields_mut() {
@@ -1615,25 +889,14 @@ impl ConcurrentEngine {
                                     }
                                 }
                                 let merge_elapsed = t_merge.elapsed();
-                                // NOTE: Do NOT clear the unified cache here. ForcePublish
-                                // is used by lazy loading (ensure_fields_loaded) to publish
-                                // newly loaded bitmaps. Lazy loads don't invalidate existing
-                                // cache entries — they only add new data. Clearing here was
-                                // nuking the entire cache on every lazy load, causing 0% hit
-                                // rate in production. Cache invalidation is handled by the
-                                // normal flush path's targeted maintenance.
-                                let t_cache = std::time::Instant::now();
-                                let cache_elapsed = t_cache.elapsed();
                                 let t_clone = std::time::Instant::now();
                                 inner.store(Arc::new(staging.clone()));
                                 let clone_elapsed = t_clone.elapsed();
                                 staging_dirty = false;
                                 tracing::debug!(
-                                    "ForcePublish: drain={:.1}ms flush={:.1}ms merge={:.1}ms cache={:.1}ms clone={:.1}ms total={:.1}ms",
-                                    drain_elapsed.as_secs_f64() * 1000.0,
+                                    "ForcePublish: flush={:.1}ms merge={:.1}ms clone={:.1}ms total={:.1}ms",
                                     flush_elapsed.as_secs_f64() * 1000.0,
                                     merge_elapsed.as_secs_f64() * 1000.0,
-                                    cache_elapsed.as_secs_f64() * 1000.0,
                                     clone_elapsed.as_secs_f64() * 1000.0,
                                     fp_start.elapsed().as_secs_f64() * 1000.0,
                                 );
@@ -1687,43 +950,6 @@ impl ConcurrentEngine {
                                 // the was_loading→!is_loading force-publish from overwriting
                                 // the loader's data.
                                 loading_mode.store(false, Ordering::Release);
-                                // 2. Save from the published snapshot — no clone, just a borrow
-                                if let (Some(ref as_), Some(ref fs_), Some(ref ss_), Some(ref ms_)) =
-                                    (&flush_alive_store, &flush_filter_store, &flush_sort_store, &flush_meta_store)
-                                {
-                                    let save_result = ConcurrentEngine::write_inner_to_store(
-                                        as_,
-                                        fs_,
-                                        ss_,
-                                        ms_,
-                                        &published,
-                                        &flush_config,
-                                        &skip_sorts,
-                                        &skip_filters,
-                                        &skip_lazy,
-                                    );
-                                    if let Err(e) = save_result {
-                                        let _ = done.send(Err(format!("save failed: {e}")));
-                                        continue;
-                                    }
-                                    // Persist cursors
-                                    for (name, value) in &cursors {
-                                        if let Err(e) = ms_.write_cursor(name, value) {
-                                            eprintln!("Warning: failed to persist cursor '{}': {}", name, e);
-                                        }
-                                    }
-                                    // Persist dictionaries
-                                    if !dictionaries.is_empty() {
-                                        let dict_dir = ms_.root().join("dictionaries");
-                                        for (name, dict) in dictionaries.iter() {
-                                            let snap = dict.snapshot();
-                                            let path = dict_dir.join(format!("{}.dict", name));
-                                            if let Err(e) = crate::dictionary::save_dictionary(&snap, &path) {
-                                                eprintln!("Warning: failed to persist dictionary '{}': {}", name, e);
-                                            }
-                                        }
-                                    }
-                                }
                                 // 3. Build unloaded staging — reuse field configs, clear bitmaps
                                 let slots = published.slots.clone();
                                 let mut new_filters = crate::filter::FilterIndex::new();
@@ -1764,89 +990,6 @@ impl ConcurrentEngine {
                                 eprintln!("  flush: ExitLoadingSaveUnload complete");
                                 let _ = done.send(Ok(()));
                             }
-                        }
-                    }
-                    // --- Idle eviction sweep (wall-clock based) ---
-                    // Runs every eviction_sweep_interval flush cycles. Stamps are
-                    // wall-clock millis set by query threads on read, so values stay
-                    // alive as long as they're being queried — independent of write
-                    // activity.
-                    if !is_loading && !eviction_configs.is_empty()
-                        && flush_cycle > 0 && flush_cycle % eviction_sweep_interval == 0
-                    {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let mut any_evicted = false;
-                        for (field_name, idle_seconds) in &eviction_configs {
-                            let idle_ms = (*idle_seconds * 1000.0) as u64;
-                            let cutoff_ms = now_ms.saturating_sub(idle_ms);
-                            // Collect values to evict
-                            let field = match staging.filters.get_field(field_name) {
-                                Some(f) => f,
-                                None => continue,
-                            };
-                            let field_name_arc: Arc<str> = Arc::from(field_name.as_str());
-                            let to_evict: Vec<u64> = field.bitmap_keys()
-                                .filter(|&value| {
-                                    // Skip dirty bitmaps (unpersisted mutations)
-                                    if let Some(vb) = field.get_versioned(*value) {
-                                        if vb.is_dirty() {
-                                            return false;
-                                        }
-                                    }
-                                    // Check stamp (wall-clock millis)
-                                    let key = (field_name_arc.clone(), *value);
-                                    flush_eviction_stamps
-                                        .get(&key)
-                                        .map(|entry| entry.value().load(Ordering::Relaxed) < cutoff_ms)
-                                        .unwrap_or(true) // no stamp = never touched = evict
-                                })
-                                .copied()
-                                .collect();
-                            if !to_evict.is_empty() {
-                                let count = to_evict.len();
-                                if let Some(field_mut) = staging.filters.get_field_mut(field_name) {
-                                    for value in &to_evict {
-                                        field_mut.remove_value(*value);
-                                        flush_eviction_stamps.remove(
-                                            &(field_name_arc.clone(), *value),
-                                        );
-                                    }
-                                }
-                                // Update eviction counter
-                                flush_eviction_total
-                                    .entry(field_name.clone())
-                                    .or_insert_with(|| AtomicU64::new(0))
-                                    .fetch_add(count as u64, Ordering::Relaxed);
-                                tracing::info!(
-                                    "Evicted {} idle values from filter '{}' (idle_threshold={}s)",
-                                    count, field_name, idle_seconds
-                                );
-                                any_evicted = true;
-                            }
-                        }
-                        if any_evicted {
-                            // Publish snapshot without evicted values
-                            inner.store(Arc::new(staging.clone()));
-                        }
-                    }
-                    // Publish if lazy loads updated staging but no mutations triggered a publish.
-                    // This ensures staging stays consistent with the snapshot published by
-                    // ensure_loaded() on the query thread. Skipped during loading mode:
-                    // staging.clone() triggers Arc refcount cascade that kills write throughput.
-                    // Queries during loading are expected to see stale data anyway.
-                    if lazy_loaded && bitmap_count == 0 && !is_loading {
-                        inner.store(Arc::new(staging.clone()));
-                        // Mark lazy-loaded fields as stale in memory cache.
-                        if !stale_fields.is_empty() {
-                            stale_fields.sort_unstable();
-                            stale_fields.dedup();
-                            for field in &stale_fields {
-                                flush_mem_cache.mark_stale(field);
-                            }
-                            stale_fields.clear();
                         }
                     }
                     // Incremental time bucket refresh: instead of scanning 107M alive slots,
@@ -1970,18 +1113,12 @@ impl ConcurrentEngine {
                     }
                     let doc_count = doc_batch.len();
                     if doc_count > 0 {
-                        // Conditional write-through: only update docs already
-                        // in cache (queried by users). New docs from pg-sync go
-                        // straight to disk without filling the cache with cold
-                        // entries that trigger eviction under load.
-                        if let Some(ref cache) = flush_doc_cache {
-                            cache.update_batch_if_cached(&doc_batch);
-                        }
+                        // DataSilo replaces doc_cache — mmap reads are fast enough
                         if let Err(e) = docstore.lock().put_batch(&doc_batch) {
                             eprintln!("WARNING: docstore batch write failed (skipping {} docs): {e}", doc_batch.len());
                         }
                     }
-                    if bitmap_count > 0 || doc_count > 0 || lazy_loaded {
+                    if bitmap_count > 0 || doc_count > 0 {
                         current_sleep = min_sleep;
                     } else {
                         current_sleep = (current_sleep * 2).min(max_sleep);
@@ -2016,26 +1153,14 @@ impl ConcurrentEngine {
         };
         let merge_handle = {
             let shutdown = Arc::clone(&shutdown);
-            let merge_inner = Arc::clone(&inner);
+            let _merge_inner = Arc::clone(&inner);
             let merge_interval_ms = config.merge_interval_ms;
-            let _merge_bitmap_store = bitmap_store.clone();
-            let merge_alive_store = alive_store.clone();
-            let merge_filter_store = filter_store.clone();
-            let merge_sort_store = sort_store.clone();
-            let merge_meta_store = meta_store.clone();
             let merge_config = Arc::clone(&config);
             let merge_dirty_flag = Arc::clone(&dirty_flag);
-            let _sort_field_configs: Vec<crate::config::SortFieldConfig> =
-                config.sort_fields.clone();
-            let _merge_pending_sorts = Arc::clone(&pending_sort_loads);
-            let _merge_pending_filters = Arc::clone(&pending_filter_loads);
-            let _merge_lazy_values = Arc::clone(&lazy_value_fields);
             let merge_time_buckets = time_buckets.as_ref().map(Arc::clone);
             let merge_cursors = Arc::clone(&cursors);
-            let merge_bound_store = bound_store.clone();
             let merge_unified_cache = Arc::clone(&unified_cache);
-            let merge_doc_shard_store = docstore.lock().shard_store_arc();
-            let merge_dirty_shards = docstore.lock().dirty_shards_arc();
+            let merge_docstore = Arc::clone(&docstore);
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
@@ -2047,309 +1172,16 @@ impl ConcurrentEngine {
                     // cycle began, so on crash we replay from a consistent point.
                     // Only written to disk if data was actually persisted this cycle
                     // AND no write failures occurred.
-                    let cursor_snapshot_for_persist = merge_cursors.lock().clone();
-                    let mut did_persist_data = false;
-                    let mut persist_had_errors = false;
-                    // ── Per-shard compaction ────────────────────────────────
-                    // The flush thread now appends ops incrementally, so the
-                    // merge thread's job is compaction (not full snapshots).
-                    // Only check when new ops have been written.
-                    let needs_write = merge_dirty_flag.swap(false, Ordering::AcqRel);
-                    if needs_write {
-                    if let (Some(ref as_), Some(ref fs_), Some(ref ss_), Some(ref ms_)) =
-                        (&merge_alive_store, &merge_filter_store, &merge_sort_store, &merge_meta_store)
-                    {
-                        // Compact alive shard if ops exceed threshold
-                        if as_.needs_compaction(&AliveShardKey).unwrap_or(false) {
-                            if let Err(e) = as_.compact_current(&AliveShardKey) {
-                                eprintln!("merge: alive compaction failed: {e}");
-                            }
-                        }
-                        // Compact filter shards that have accumulated too many ops
-                        if let Ok(filter_shards) = fs_.list_current_shards() {
-                            for key in &filter_shards {
-                                if fs_.needs_compaction(key).unwrap_or(false) {
-                                    if let Err(e) = fs_.compact_current(key) {
-                                        eprintln!("merge: filter compaction failed: {e}");
-                                    }
-                                }
-                            }
-                        }
-                        // Compact sort shards that have accumulated too many ops
-                        if let Ok(sort_shards) = ss_.list_current_shards() {
-                            for key in &sort_shards {
-                                if ss_.needs_compaction(key).unwrap_or(false) {
-                                    if let Err(e) = ss_.compact_current(key) {
-                                        eprintln!("merge: sort compaction failed: {e}");
-                                    }
-                                }
-                            }
-                        }
-
-                        // Compact docstore shards that received writes this cycle.
-                        // Uses atomic retain(false) to avoid TOCTOU race with writers.
-                        {
-                            let mut dirty = Vec::new();
-                            merge_dirty_shards.retain(|k| {
-                                dirty.push(*k);
-                                false
-                            });
-                            for shard_key in dirty {
-                                if merge_doc_shard_store.needs_compaction(&shard_key).unwrap_or(false) {
-                                    if let Err(e) = merge_doc_shard_store.compact_current(&shard_key) {
-                                        eprintln!("merge: doc compaction failed for shard {shard_key}: {e}");
-                                        // Re-insert so it gets retried next cycle
-                                        merge_dirty_shards.insert(shard_key);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Persist slot counter + deferred alive (critical metadata)
-                        {
-                            let snap = merge_inner.load();
-                            if let Err(e) = ms_.write_slot_counter(snap.slots.slot_counter()) {
-                                eprintln!("merge thread: slot_counter write failed: {e}");
-                            }
-                            if snap.slots.deferred_count() > 0 {
-                                if let Err(e) = ms_.write_deferred_alive(snap.slots.deferred_map()) {
-                                    eprintln!("merge thread: deferred_alive write failed: {e}");
-                                }
-                            }
-                        }
-                        // Persist time bucket bitmaps + cutoffs (MetaStore)
-                        if let Some(ref tb_arc) = merge_time_buckets {
-                            let tb = tb_arc.lock();
-                            for (name, bitmap) in tb.all_buckets() {
-                                if !bitmap.is_empty() {
-                                    if let Err(e) = ms_.write_time_bucket(name, bitmap) {
-                                        eprintln!("merge thread: time bucket write failed: {e}");
-                                    }
-                                }
-                            }
-                            // Persist last_cutoff for each bucket (for boot diff recovery)
-                            for bucket_name in tb.bucket_names() {
-                                if let Some(bucket) = tb.get_bucket(&bucket_name) {
-                                    let cutoff = bucket.last_cutoff();
-                                    if cutoff > 0 {
-                                        if let Err(e) = ms_.write_time_bucket_cutoff(&bucket_name, cutoff) {
-                                            eprintln!("merge thread: time bucket cutoff write failed: {e}");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        did_persist_data = true;
-                    }
-                    } // needs_write
-                    // ── BoundStore persistence (two-phase lock) ──────────────
-                    //
-                    // Previously held the Mutex for ~90 lines of entry iteration
-                    // + shard data collection every 5s, causing 1-4.6s query stalls.
-                    // Now: brief lock to collect data, release, then disk I/O outside.
-                    if let Some(ref bs) = merge_bound_store {
-                        // Phase 1: Brief lock — check dirty flags + collect ALL data
-                        let persist_data = {
-                            let mut uc = merge_unified_cache.lock();
-                            let meta_dirty = uc.is_meta_dirty();
-                            let dirty_shards: Vec<crate::bound_store::ShardKey> =
-                                uc.dirty_shards().iter().cloned().collect();
-                            let mut cleanup_shards: Vec<crate::bound_store::ShardKey> = Vec::new();
-                            if let Ok(shard_list) = bs.list_shards() {
-                                for sk in &shard_list {
-                                    if uc.shard_needs_cleanup(sk) && !dirty_shards.contains(sk) {
-                                        cleanup_shards.push(sk.clone());
-                                    }
-                                }
-                            }
-                            if !meta_dirty && dirty_shards.is_empty() && cleanup_shards.is_empty() {
-                                None // Nothing dirty — skip entirely
-                            } else {
-                                // Collect ALL data under this one lock acquisition
-                                let meta_entries: Vec<crate::bound_store::MetaEntry> = {
-                                    let mut entries = Vec::new();
-                                    for (&meta_id, key) in uc.iter_meta_id_to_key() {
-                                        if let Some(entry) = uc.get(key) {
-                                            entries.push(crate::bound_store::MetaEntry {
-                                                entry_id: meta_id,
-                                                sort_field: key.sort_field.clone(),
-                                                direction: key.direction,
-                                                filter_clauses: key.filter_clauses.clone(),
-                                                capacity: entry.capacity() as u32,
-                                                max_capacity: entry.max_capacity() as u32,
-                                                min_tracked_value: entry.min_tracked_value(),
-                                                total_matched: entry.total_matched(),
-                                                has_more: entry.has_more(),
-                                            });
-                                        } else {
-                                            entries.push(crate::bound_store::MetaEntry {
-                                                entry_id: meta_id,
-                                                sort_field: key.sort_field.clone(),
-                                                direction: key.direction,
-                                                filter_clauses: key.filter_clauses.clone(),
-                                                capacity: 4000,
-                                                max_capacity: 64000,
-                                                min_tracked_value: 0,
-                                                total_matched: 0,
-                                                has_more: true,
-                                            });
-                                        }
-                                    }
-                                    entries
-                                };
-                                let tombstones = uc.meta().tombstones().clone();
-                                let next_id = uc.meta().next_id();
-                                // Snapshot tombstone + registration state for orphan filtering
-                                // (used during shard merging, avoids relocking per shard)
-                                let registered_ids: std::collections::HashSet<u32> =
-                                    uc.meta().all_registered_ids().collect();
-                                let all_dirty: Vec<crate::bound_store::ShardKey> = dirty_shards
-                                    .iter()
-                                    .chain(cleanup_shards.iter())
-                                    .cloned()
-                                    .collect();
-                                let shard_snapshots: Vec<(
-                                    crate::bound_store::ShardKey,
-                                    Vec<(u32, Vec<crate::cache::CanonicalClause>, roaring::RoaringBitmap, Option<Vec<u64>>)>,
-                                )> = all_dirty
-                                    .iter()
-                                    .map(|sk| {
-                                        let entries = uc.entries_for_shard(sk);
-                                        let data: Vec<_> = entries
-                                            .into_iter()
-                                            .map(|(id, key, bm, sk)| (id, key.filter_clauses, bm, sk))
-                                            .collect();
-                                        (sk.clone(), data)
-                                    })
-                                    .collect();
-                                // Collect per-shard tombstone IDs for cleanup
-                                let per_shard_tombstones: Vec<Vec<u32>> = all_dirty
-                                    .iter()
-                                    .map(|sk| {
-                                        tombstones.iter()
-                                            .filter(|id| {
-                                                uc.key_for_meta_id(*id)
-                                                    .map(|k| k.sort_field == sk.sort_field && k.direction == sk.direction)
-                                                    .unwrap_or(false)
-                                            })
-                                            .collect()
-                                    })
-                                    .collect();
-                                // Clear dirty flags before releasing
-                                if meta_dirty {
-                                    uc.clear_meta_dirty();
-                                }
-                                for sk in &all_dirty {
-                                    uc.clear_shard_dirty(sk);
-                                    uc.clear_shard_entry_dirty(sk);
-                                }
-                                Some((meta_dirty, meta_entries, tombstones, next_id,
-                                      registered_ids, shard_snapshots, per_shard_tombstones))
-                            }
-                        }; // Lock released here — ALL data collected
-                        // Phase 2: Disk I/O outside the lock
-                        if let Some((meta_dirty, meta_entries, tombstones, next_id,
-                                     registered_ids, shard_snapshots, per_shard_tombstones)) = persist_data
-                        {
-                            if meta_dirty {
-                                // Compact meta.bin: exclude tombstoned entries from the entries list.
-                                // Tombstones are only needed for entries that still exist in shard
-                                // files on disk (to prevent stale data from being loaded). Once an
-                                // entry is removed from meta_entries, its tombstone is no longer needed.
-                                let live_entry_ids: std::collections::HashSet<u32> = meta_entries
-                                    .iter()
-                                    .map(|e| e.entry_id)
-                                    .collect();
-                                let compacted_entries: Vec<_> = meta_entries
-                                    .into_iter()
-                                    .filter(|e| !tombstones.contains(e.entry_id))
-                                    .collect();
-                                // Only keep tombstones for entries that are NOT in compacted_entries
-                                // but ARE still in shard files (we can't know for certain without
-                                // scanning shards, so keep tombstones for registered IDs that were
-                                // filtered out — they may still be in unmodified shard files)
-                                let compacted_ids: std::collections::HashSet<u32> = compacted_entries
-                                    .iter()
-                                    .map(|e| e.entry_id)
-                                    .collect();
-                                let mut compacted_tombstones = RoaringBitmap::new();
-                                for id in tombstones.iter() {
-                                    // Keep tombstone only if the entry was registered (in live_entry_ids)
-                                    // but excluded from compacted_entries (still in a shard file on disk)
-                                    if live_entry_ids.contains(&id) && !compacted_ids.contains(&id) {
-                                        compacted_tombstones.insert(id);
-                                    }
-                                }
-                                let removed = tombstones.len() - compacted_tombstones.len();
-                                if removed > 0 {
-                                    eprintln!("merge thread: compacted meta.bin — removed {} stale tombstones (kept {})",
-                                        removed, compacted_tombstones.len());
-                                }
-                                let meta_file = crate::bound_store::MetaFile {
-                                    entries: compacted_entries,
-                                    tombstones: compacted_tombstones,
-                                    next_entry_id: next_id,
-                                };
-                                if let Err(e) = bs.write_meta(&meta_file) {
-                                    eprintln!("merge thread: meta.bin write failed: {e}");
-                                    persist_had_errors = true;
-                                }
-                            }
-                            // Write shards — NO lock needed (using snapshotted data)
-                            let mut all_cleaned: Vec<u32> = Vec::new();
-                            for (i, (sk, ram_entries)) in shard_snapshots.iter().enumerate() {
-                                let mut merged: Vec<crate::bound_store::ShardEntry> = Vec::new();
-                                if let Ok(Some(disk_entries)) = bs.load_shard(sk) {
-                                    let ram_ids: std::collections::HashSet<u32> =
-                                        ram_entries.iter().map(|(id, _, _, _)| *id).collect();
-                                    for de in disk_entries {
-                                        if !ram_ids.contains(&de.entry_id)
-                                            && !tombstones.contains(de.entry_id)
-                                            && registered_ids.contains(&de.entry_id)
-                                        {
-                                            merged.push(de);
-                                        }
-                                    }
-                                }
-                                for (id, clauses, bm, sk) in ram_entries {
-                                    merged.push(crate::bound_store::ShardEntry {
-                                        entry_id: *id,
-                                        filter_clauses: clauses.clone(),
-                                        bitmap: bm.clone(),
-                                        sorted_keys: sk.clone(),
-                                    });
-                                }
-                                if let Err(e) = bs.write_shard(sk, &merged) {
-                                    eprintln!("merge thread: shard {} write failed: {e}", sk.filename());
-                                    persist_had_errors = true;
-                                }
-                                all_cleaned.extend_from_slice(&per_shard_tombstones[i]);
-                            }
-                            // Phase 3: Brief lock — finalize tombstones
-                            if !all_cleaned.is_empty() {
-                                let mut uc = merge_unified_cache.lock();
-                                uc.finalize_shard_write(&all_cleaned);
-                            }
-                            did_persist_data = true;
+                    // TODO: CacheSilo persistence (Phase 4) goes here
+                    let _needs_write = merge_dirty_flag.swap(false, Ordering::AcqRel);
+                    // Compact DataSilo (apply pending ops)
+                    if _needs_write {
+                        if let Err(e) = merge_docstore.lock().compact() {
+                            eprintln!("merge: DataSilo compaction failed: {e}");
                         }
                     }
-                    // ── Named cursor persistence ───────────────────────────
-                    //
-                    // Write the cursor snapshot taken at the START of this cycle.
-                    // Only written if data was persisted AND no write failures
-                    // occurred. A partial persist with errors means some state
-                    // didn't make it to disk — advancing the cursor would skip
-                    // the WAL ops needed to reconstruct that state on restart.
-                    if did_persist_data && !persist_had_errors {
-                        if let Some(ref ms_) = merge_meta_store {
-                            for (name, value) in &cursor_snapshot_for_persist {
-                                if let Err(e) = ms_.write_cursor(name, value) {
-                                    eprintln!("merge thread: cursor write failed for {name}: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
+                    let _ = &merge_time_buckets; // suppress unused warning
+                    let _ = merge_cursors.lock().clone(); // suppress unused warning
                     // ── RSS-aware memory pressure eviction ──────────────────
                     //
                     // Check real RSS against the memory budget. When RSS exceeds
@@ -2389,6 +1221,7 @@ impl ConcurrentEngine {
                             }
                         }
                     }
+                } // while !shutdown
             })
         };
         // Prefetch worker: background cache expansion when cursor nears boundary.
@@ -2526,39 +1359,7 @@ impl ConcurrentEngine {
         } else {
             (None, None)
         };
-        // Spawn bitmap memory scanner thread (amortized per-field memory measurement)
-        {
-            let mem_cache = Arc::clone(&bitmap_memory_cache);
-            let inner_ref = Arc::clone(&inner);
-            let loading_flag = Arc::clone(&loading_mode);
-            let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
-            let sort_names: Vec<String> = config.sort_fields.iter().map(|f| f.name.clone()).collect();
-            std::thread::Builder::new()
-                .name("bitdex-mem-scanner".into())
-                .spawn(move || {
-                    loop {
-                        let interval = mem_cache.interval_ms();
-                        std::thread::sleep(std::time::Duration::from_millis(interval));
-                        mem_cache.scan_tick(&inner_ref, &loading_flag, &filter_names, &sort_names);
-                    }
-                })
-                .expect("failed to spawn memory scanner thread");
-        }
-        // Spawn doc cache eviction thread (generational rotation + memory-pressure eviction)
-        let doc_cache_eviction_handle = if let Some(ref cache) = doc_cache {
-            let cache_clone = Arc::clone(cache);
-            let shutdown_clone = Arc::clone(&shutdown);
-            Some(
-                thread::Builder::new()
-                    .name("bitdex-doc-cache-eviction".into())
-                    .spawn(move || {
-                        crate::doc_cache::eviction_thread(cache_clone, shutdown_clone);
-                    })
-                    .expect("Failed to spawn bitdex-doc-cache-eviction thread"),
-            )
-        } else {
-            None
-        };
+        // DataSilo replaces doc_cache — no separate eviction thread needed
         Ok(Self {
             inner,
             sender,
@@ -2571,25 +1372,15 @@ impl ConcurrentEngine {
             shutdown,
             flush_handle: Some(flush_handle),
             merge_handle: Some(merge_handle),
-            bitmap_store,
-            alive_store,
-            filter_store,
-            sort_store,
-            meta_store,
             loading_mode,
             dirty_since_snapshot: Arc::clone(&dirty_flag),
             time_buckets,
             pending_bucket_diffs,
-            pending_filter_loads,
-            pending_sort_loads,
-            lazy_value_fields,
-            lazy_tx,
             cmd_tx,
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
             unified_cache,
-            bound_store,
             flush_publish_count,
             flush_duration_nanos,
             flush_last_duration_nanos,
@@ -2600,27 +1391,12 @@ impl ConcurrentEngine {
             flush_compact_nanos,
             flush_opslog_nanos,
             cursors,
-            existing_keys,
-            eviction_stamps,
-            flush_cycle,
-            eviction_total,
-            boundstore_shard_loads,
-            boundstore_tombstones_created,
-            boundstore_tombstones_cleaned,
-            boundstore_bytes_written,
-            boundstore_bytes_read,
-            boundstore_entries_restored,
-            boundstore_entries_skipped,
             #[cfg(feature = "server")]
             metrics_bridge,
-            bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
-            doc_cache: doc_cache.clone(),
+            bitmap_silo: bitmap_silo_instance.map(|s| Arc::new(parking_lot::RwLock::new(s))),
             compaction_skipped,
-            compact_tx,
-            compact_handle,
             prefetch_tx,
             prefetch_handle,
-            doc_cache_eviction_handle,
             #[cfg(feature = "pg-sync")]
             wal_writer: None,
         })
@@ -2635,14 +1411,10 @@ impl ConcurrentEngine {
         self.case_sensitive_fields = Some(Arc::new(fields));
     }
     /// Set the Prometheus metrics bridge. Called by the server layer after engine creation.
-    /// Background threads (compaction worker, lazy loading) will start recording metrics.
+    /// Background threads (compaction worker) will start recording metrics.
     #[cfg(feature = "server")]
     pub fn set_metrics_bridge(&self, bridge: MetricsBridge) {
         self.metrics_bridge.store(Arc::new(Some(Arc::new(bridge))));
-    }
-    /// Get a reference to the bitmap memory cache (for metrics scraping).
-    pub fn bitmap_memory_cache(&self) -> &crate::bitmap_memory_cache::BitmapMemoryCache {
-        &self.bitmap_memory_cache
     }
     /// Get the cumulative count of compaction operations skipped due to channel backpressure.
     pub fn compaction_skipped_count(&self) -> u64 {
@@ -2679,23 +1451,7 @@ impl ConcurrentEngine {
     /// full `save_snapshot()`. Dictionaries are small (typically < 1 KB), so
     /// the I/O cost is negligible.
     pub fn persist_dirty_dictionaries(&self) -> Result<()> {
-        if self.dictionaries.is_empty() {
-            return Ok(());
-        }
-        let ms = match self.meta_store.as_ref() {
-            Some(s) => s,
-            None => return Ok(()), // no persistence configured
-        };
-        let dict_dir = ms.root().join("dictionaries");
-        for (name, dict) in self.dictionaries.iter() {
-            if dict.is_dirty() {
-                let snap = dict.snapshot();
-                let path = dict_dir.join(format!("{}.dict", name));
-                crate::dictionary::save_dictionary(&snap, &path)
-                    .map_err(|e| crate::error::BitdexError::Config(e))?;
-                dict.clear_dirty();
-            }
-        }
+        // No-op: BitmapSilo saves dictionaries at save_snapshot time.
         Ok(())
     }
     /// Load dictionaries from disk for all LowCardinalityString fields in the schema.
@@ -3049,28 +1805,6 @@ impl ConcurrentEngine {
         self.in_flight.clear_in_flight(slot);
         result
     }
-    /// Reload a field's positive existence set from the filter store.
-    ///
-    /// Called after external bulk writes (e.g., backfill) so that
-    /// lazy per-value loading picks up the new data. The existence set is stored
-    /// behind an ArcSwap so the update is atomic and lock-free.
-    pub fn reload_existence_set(&self, field_name: &str) -> Result<()> {
-        let keys_arc = self.existing_keys.get(field_name).ok_or_else(|| {
-            crate::error::BitdexError::Config(format!(
-                "Field '{}' not found in existence keys (not a lazy-value field)",
-                field_name,
-            ))
-        })?;
-        let fs = self.filter_store.as_ref().ok_or_else(|| {
-            crate::error::BitdexError::Config("No filter store configured".to_string())
-        })?;
-        let new_keys = fs.existence_set(field_name)
-            .map_err(|e| crate::error::BitdexError::Storage(format!("existence set: {e}")))?;
-        let count = new_keys.len();
-        keys_arc.store(Arc::new(new_keys));
-        eprintln!("Reloaded existence set for '{}': {} keys", field_name, count);
-        Ok(())
-    }
     /// Execute a query from individual filter/sort/limit components.
     pub fn query(
         &self,
@@ -3078,9 +1812,8 @@ impl ConcurrentEngine {
         sort: Option<&SortClause>,
         limit: usize,
     ) -> Result<QueryResult> {
-        // Lazy-load any fields not yet loaded from disk
-        self.ensure_fields_loaded(filters, sort.map(|s| s.field.as_str()))?;
         let snap = self.snapshot(); // lock-free
+        let silo_guard = self.bitmap_silo.as_ref().map(|s| s.read());
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3093,6 +1826,9 @@ impl ConcurrentEngine {
                 &snap.sorts,
                 self.config.max_page_size,
             );
+            if let Some(ref guard) = silo_guard {
+                base = base.with_bitmap_silo(guard);
+            }
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -3116,600 +1852,10 @@ impl ConcurrentEngine {
         self.post_validate(&mut result, filters, &executor)?;
         Ok(result)
     }
-    /// Ensure all fields referenced by the query are loaded from disk.
-    ///
-    /// On startup with lazy loading, filter/sort bitmaps are not loaded until
-    /// the first query touches them. This method handles two strategies:
-    /// - **Full-field loading** for low-cardinality fields (single_value, boolean)
-    /// - **Per-value loading** for high-cardinality multi_value fields (e.g. tagIds)
-    ///
-    /// Fast path: if no loads are pending and no lazy value fields exist, just returns.
-    pub fn ensure_fields_loaded(
-        &self,
-        filters: &[FilterClause],
-        sort_field: Option<&str>,
-    ) -> Result<()> {
-        // Fast path: check if any loads are pending at all
-        let has_lazy_values = !self.lazy_value_fields.lock().is_empty();
-        {
-            let pf = self.pending_filter_loads.lock();
-            let ps = self.pending_sort_loads.lock();
-            if pf.is_empty() && ps.is_empty() && !has_lazy_values {
-                return Ok(());
-            }
-        }
-        // --- Full-field loading (single_value, boolean) ---
-        let mut needed_filters: Vec<String> = Vec::new();
-        let mut needed_sort: Option<String> = None;
-        {
-            let pf = self.pending_filter_loads.lock();
-            for clause in filters {
-                Self::collect_filter_fields(clause, &pf, &mut needed_filters);
-            }
-        }
-        if let Some(sort_name) = sort_field {
-            let ps = self.pending_sort_loads.lock();
-            if ps.contains(sort_name) {
-                needed_sort = Some(sort_name.to_string());
-            }
-        }
-        // --- Per-value loading (multi_value) ---
-        let mut needed_values: HashMap<String, Vec<u64>> = HashMap::new();
-        if has_lazy_values {
-            let lvf = self.lazy_value_fields.lock();
-            for clause in filters {
-                Self::collect_lazy_values(clause, &lvf, &mut needed_values);
-            }
-        }
-        // Stamp accessed values for idle eviction tracking (wall-clock millis).
-        // This runs for ALL queried values (already-loaded and new), ensuring
-        // that reads keep values alive independent of write activity.
-        if !needed_values.is_empty() {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            for (field_name, values) in &needed_values {
-                // Only stamp eviction-enabled fields
-                if self.config.filter_fields.iter()
-                    .any(|fc| fc.name == *field_name && fc.eviction.is_some())
-                {
-                    let field_arc: Arc<str> = Arc::from(field_name.as_str());
-                    for &value in values {
-                        self.eviction_stamps
-                            .entry((field_arc.clone(), value))
-                            .or_insert_with(|| AtomicU64::new(now_ms))
-                            .store(now_ms, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-        if needed_filters.is_empty() && needed_sort.is_none() && needed_values.is_empty() {
-            return Ok(());
-        }
-        // Load from ShardStore (filter and sort stores for lazy loading)
-        let (lazy_filter_store, lazy_sort_store) = match (&self.filter_store, &self.sort_store) {
-            (Some(fs), Some(ss)) => (fs, ss),
-            _ => return Ok(()), // no store, nothing to load
-        };
-        // Do all expensive disk I/O in parallel, collecting loaded data.
-        // Filter field reads, sort field reads, and per-value reads are all
-        // independent I/O operations that benefit from concurrent NVMe access.
-        let mut loaded_filters: Vec<(String, HashMap<u64, RoaringBitmap>)> = Vec::new();
-        let mut loaded_values: Vec<(String, HashMap<u64, RoaringBitmap>, Vec<u64>)> = Vec::new();
-        let mut loaded_sort: Option<(String, Vec<RoaringBitmap>)> = None;
-        // Resolve sort bits config before entering the parallel scope.
-        let sort_bits = needed_sort.as_ref().map(|sort_name| {
-            self.config
-                .sort_fields
-                .iter()
-                .find(|sc| sc.name == *sort_name)
-                .map(|sc| sc.bits as usize)
-                .unwrap_or(32)
-        });
-        // Determine missing per-value keys before entering parallel scope.
-        let mut value_load_tasks: Vec<(String, Vec<u64>)> = Vec::new();
-        {
-            let current: Arc<InnerEngine> = self.inner.load_full();
-            for (field_name, values) in &needed_values {
-                let missing: Vec<u64> = if let Some(field) = current.filters.get_field(field_name) {
-                    values
-                        .iter()
-                        .copied()
-                        .filter(|v| {
-                            match field.get_versioned(*v) {
-                                None => true,
-                                Some(vb) => !vb.is_loaded(),
-                            }
-                        })
-                        .collect()
-                } else {
-                    values.clone()
-                };
-                // Filter out values that don't exist on disk (positive existence set).
-                let missing: Vec<u64> = if let Some(ek) = self.existing_keys.get(field_name.as_str()) {
-                    let keys = ek.load();
-                    missing.into_iter().filter(|v| keys.contains(v)).collect()
-                } else {
-                    missing
-                };
-                if !missing.is_empty() {
-                    value_load_tasks.push((field_name.clone(), missing));
-                }
-            }
-        }
-        // Load metrics bridge once for all lazy-load timing observations.
-        #[cfg(feature = "server")]
-        let metrics_bridge_guard = self.metrics_bridge.load();
-        #[cfg(feature = "server")]
-        let metrics_opt: Option<Arc<MetricsBridge>> = (**metrics_bridge_guard).as_ref().map(|b| Arc::clone(b));
-        // Count total parallel work items to decide whether parallelism is worthwhile.
-        let total_tasks = needed_filters.len()
-            + if needed_sort.is_some() { 1 } else { 0 }
-            + value_load_tasks.len();
-        if total_tasks > 1 {
-            // --- Parallel loading via std::thread::scope ---
-            // Each thread reads from ShardStore (Arc, safe to share). Results collected
-            // into thread-safe containers, then applied sequentially.
-            use std::sync::Mutex;
-            let par_filters: Mutex<Vec<(String, HashMap<u64, RoaringBitmap>)>> = Mutex::new(Vec::new());
-            let par_sort: Mutex<Option<(String, Vec<RoaringBitmap>)>> = Mutex::new(None);
-            let par_values: Mutex<Vec<(String, HashMap<u64, RoaringBitmap>, Vec<u64>)>> = Mutex::new(Vec::new());
-            let par_error: Mutex<Option<crate::error::BitdexError>> = Mutex::new(None);
-            std::thread::scope(|s| {
-                // Spawn filter field loaders
-                for name in &needed_filters {
-                    let fs = lazy_filter_store.clone();
-                    let par_filters = &par_filters;
-                    let par_error = &par_error;
-                    #[cfg(feature = "server")]
-                    let metrics_ref = &metrics_opt;
-                    s.spawn(move || {
-                        if par_error.lock().unwrap().is_some() { return; }
-                        let t0 = std::time::Instant::now();
-                        match fs.load_field(name) {
-                            Ok(bitmaps) => {
-                                let count = bitmaps.len();
-                                eprintln!(
-                                    "Lazy-loaded filter '{}': {} values in {:.1}ms",
-                                    name, count, t0.elapsed().as_secs_f64() * 1000.0
-                                );
-                                #[cfg(feature = "server")]
-                                if let Some(ref bridge) = metrics_ref {
-                                    bridge.lazy_load_duration
-                                        .with_label_values(&[&bridge.index_name, name])
-                                        .observe(t0.elapsed().as_secs_f64());
-                                }
-                                par_filters.lock().unwrap().push((name.clone(), bitmaps));
-                            }
-                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::Storage(format!("lazy load filter: {e}"))); }
-                        }
-                    });
-                }
-                // Spawn sort field loader
-                if let (Some(sort_name), Some(bits)) = (&needed_sort, sort_bits) {
-                    let ss = lazy_sort_store.clone();
-                    let par_sort = &par_sort;
-                    let par_error = &par_error;
-                    let sort_name = sort_name.clone();
-                    #[cfg(feature = "server")]
-                    let metrics_ref = &metrics_opt;
-                    s.spawn(move || {
-                        if par_error.lock().unwrap().is_some() { return; }
-                        let t0 = std::time::Instant::now();
-                        match ss.load_sort_layers(&sort_name, bits) {
-                            Ok(Some(layers)) => {
-                                let layer_count = layers.len();
-                                eprintln!(
-                                    "Lazy-loaded sort '{}': {} layers in {:.1}ms",
-                                    sort_name, layer_count, t0.elapsed().as_secs_f64() * 1000.0
-                                );
-                                #[cfg(feature = "server")]
-                                if let Some(ref bridge) = metrics_ref {
-                                    bridge.lazy_load_duration
-                                        .with_label_values(&[&bridge.index_name, &sort_name])
-                                        .observe(t0.elapsed().as_secs_f64());
-                                }
-                                *par_sort.lock().unwrap() = Some((sort_name, layers));
-                            }
-                            Ok(None) => {}
-                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::Storage(format!("lazy load sort: {e}"))); }
-                        }
-                    });
-                }
-                // Spawn per-value loaders
-                for (field_name, missing) in &value_load_tasks {
-                    let fs = lazy_filter_store.clone();
-                    let par_values = &par_values;
-                    let par_error = &par_error;
-                    #[cfg(feature = "server")]
-                    let metrics_ref = &metrics_opt;
-                    s.spawn(move || {
-                        if par_error.lock().unwrap().is_some() { return; }
-                        let t0 = std::time::Instant::now();
-                        match fs.load_field_values(field_name, missing) {
-                            Ok(loaded) if !loaded.is_empty() => {
-                                let count = loaded.len();
-                                eprintln!(
-                                    "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
-                                    field_name, count, t0.elapsed().as_secs_f64() * 1000.0
-                                );
-                                #[cfg(feature = "server")]
-                                if let Some(ref bridge) = metrics_ref {
-                                    bridge.lazy_load_duration
-                                        .with_label_values(&[&bridge.index_name, field_name])
-                                        .observe(t0.elapsed().as_secs_f64());
-                                }
-                                par_values.lock().unwrap().push((field_name.clone(), loaded, missing.clone()));
-                            }
-                            Ok(_) => {}
-                            Err(e) => { *par_error.lock().unwrap() = Some(crate::error::BitdexError::Storage(format!("lazy load values: {e}"))); }
-                        }
-                    });
-                }
-            });
-            // Check for errors from parallel threads
-            if let Some(e) = par_error.into_inner().unwrap() {
-                return Err(e);
-            }
-            loaded_filters = par_filters.into_inner().unwrap();
-            loaded_sort = par_sort.into_inner().unwrap();
-            loaded_values = par_values.into_inner().unwrap();
-        } else {
-            // --- Serial path: single task, no threading overhead ---
-            for name in &needed_filters {
-                let t0 = std::time::Instant::now();
-                let bitmaps = lazy_filter_store.load_field(name)
-                    .map_err(|e| crate::error::BitdexError::Storage(format!("lazy load filter: {e}")))?;
-                let count = bitmaps.len();
-                eprintln!(
-                    "Lazy-loaded filter '{}': {} values in {:.1}ms",
-                    name, count, t0.elapsed().as_secs_f64() * 1000.0
-                );
-                #[cfg(feature = "server")]
-                if let Some(ref bridge) = metrics_opt {
-                    bridge.lazy_load_duration
-                        .with_label_values(&[&bridge.index_name, name])
-                        .observe(t0.elapsed().as_secs_f64());
-                }
-                loaded_filters.push((name.clone(), bitmaps));
-            }
-            if let (Some(sort_name), Some(bits)) = (&needed_sort, sort_bits) {
-                let t0 = std::time::Instant::now();
-                let layers_opt = lazy_sort_store.load_sort_layers(sort_name, bits)
-                    .map_err(|e| crate::error::BitdexError::Storage(format!("lazy load sort: {e}")))?;
-                if let Some(layers) = layers_opt {
-                    let layer_count = layers.len();
-                    eprintln!(
-                        "Lazy-loaded sort '{}': {} layers in {:.1}ms",
-                        sort_name, layer_count, t0.elapsed().as_secs_f64() * 1000.0
-                    );
-                    #[cfg(feature = "server")]
-                    if let Some(ref bridge) = metrics_opt {
-                        bridge.lazy_load_duration
-                            .with_label_values(&[&bridge.index_name, sort_name])
-                            .observe(t0.elapsed().as_secs_f64());
-                    }
-                    loaded_sort = Some((sort_name.clone(), layers));
-                }
-            }
-            for (field_name, missing) in &value_load_tasks {
-                let t0 = std::time::Instant::now();
-                let loaded = lazy_filter_store.load_field_values(field_name, missing)
-                    .map_err(|e| crate::error::BitdexError::Storage(format!("lazy load values: {e}")))?;
-                if !loaded.is_empty() {
-                    let count = loaded.len();
-                    eprintln!(
-                        "Lazy-loaded filter '{}': {} values (per-value) in {:.1}ms",
-                        field_name, count, t0.elapsed().as_secs_f64() * 1000.0
-                    );
-                    #[cfg(feature = "server")]
-                    if let Some(ref bridge) = metrics_opt {
-                        bridge.lazy_load_duration
-                            .with_label_values(&[&bridge.index_name, field_name])
-                            .observe(t0.elapsed().as_secs_f64());
-                    }
-                    loaded_values.push((field_name.clone(), loaded, missing.clone()));
-                }
-            }
-        }
-        // Sequential phase: send LazyLoad messages to flush thread and update pending sets.
-        for (name, bitmaps) in &loaded_filters {
-            let _ = self.lazy_tx.send(LazyLoad::FilterField {
-                name: name.clone(),
-                bitmaps: bitmaps.clone(),
-            });
-            self.pending_filter_loads.lock().remove(name);
-        }
-        for (field_name, loaded_vals, _missing) in &loaded_values {
-            let _ = self.lazy_tx.send(LazyLoad::FilterValues {
-                field: field_name.clone(),
-                values: loaded_vals.clone(),
-            });
-        }
-        if let Some((ref sort_name, ref layers)) = loaded_sort {
-            let _ = self.lazy_tx.send(LazyLoad::SortField {
-                name: sort_name.clone(),
-                layers: layers.clone(),
-            });
-            self.pending_sort_loads.lock().remove(sort_name);
-        }
-        let any_loaded = !loaded_filters.is_empty() || !loaded_values.is_empty() || loaded_sort.is_some();
-        if any_loaded {
-            // Single-writer publish: data was already sent to the flush thread
-            // via lazy_tx. Ask the flush thread to drain it and publish a new
-            // snapshot. This avoids the old rcu() CAS loop which could race
-            // with the flush thread's own store() calls.
-            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-            let flush_alive = self.cmd_tx.send(FlushCommand::ForcePublish { done: done_tx }).is_ok();
-            if flush_alive {
-                // Block until flush thread publishes (typically <1ms).
-                let _ = done_rx.recv_timeout(Duration::from_secs(5));
-            } else {
-                // Flush thread is dead (shutdown called). Publish directly —
-                // no concurrent publisher to race with.
-                let current = self.inner.load_full();
-                let mut updated = (*current).clone();
-                for (name, bitmaps) in &loaded_filters {
-                    if let Some(field) = updated.filters.get_field_mut(name) {
-                        field.load_field_complete(bitmaps.clone());
-                    }
-                }
-                for (field_name, loaded_vals, requested_keys) in &loaded_values {
-                    if let Some(field) = updated.filters.get_field_mut(field_name) {
-                        field.load_values(loaded_vals.clone(), requested_keys);
-                    }
-                }
-                if let Some((ref sort_name, ref layers)) = loaded_sort {
-                    if let Some(sf) = updated.sorts.get_field_mut(sort_name) {
-                        sf.load_layers(layers.clone());
-                    }
-                }
-                self.inner.store(Arc::new(updated));
-            }
-        }
-        Ok(())
-    }
-    /// Recursively collect filter field names from a FilterClause that are still pending.
-    fn collect_filter_fields(
-        clause: &FilterClause,
-        pending: &HashSet<String>,
-        out: &mut Vec<String>,
-    ) {
-        match clause {
-            FilterClause::Eq(f, _)
-            | FilterClause::NotEq(f, _)
-            | FilterClause::Gt(f, _)
-            | FilterClause::Lt(f, _)
-            | FilterClause::Gte(f, _)
-            | FilterClause::Lte(f, _) => {
-                if pending.contains(f) && !out.contains(f) {
-                    out.push(f.clone());
-                }
-            }
-            FilterClause::In(f, _) | FilterClause::NotIn(f, _) => {
-                if pending.contains(f) && !out.contains(f) {
-                    out.push(f.clone());
-                }
-            }
-            FilterClause::Not(inner) => Self::collect_filter_fields(inner, pending, out),
-            FilterClause::And(clauses) | FilterClause::Or(clauses) => {
-                for c in clauses {
-                    Self::collect_filter_fields(c, pending, out);
-                }
-            }
-            FilterClause::BucketBitmap { field, .. } => {
-                if pending.contains(field) && !out.contains(field) {
-                    out.push(field.clone());
-                }
-            }
-            FilterClause::IsNull(f) | FilterClause::IsNotNull(f) => {
-                if pending.contains(f) && !out.contains(f) {
-                    out.push(f.clone());
-                }
-            }
-        }
-    }
-    /// Recursively collect (field, value) pairs from filter clauses for per-value
-    /// lazy loading of high-cardinality multi_value fields.
-    fn collect_lazy_values(
-        clause: &FilterClause,
-        lazy_fields: &HashSet<String>,
-        out: &mut HashMap<String, Vec<u64>>,
-    ) {
-        match clause {
-            FilterClause::Eq(f, v) => {
-                if lazy_fields.contains(f) {
-                    if let Some(key) = value_to_bitmap_key(v) {
-                        out.entry(f.clone()).or_default().push(key);
-                    }
-                }
-            }
-            FilterClause::NotEq(f, v) => {
-                if lazy_fields.contains(f) {
-                    if let Some(key) = value_to_bitmap_key(v) {
-                        out.entry(f.clone()).or_default().push(key);
-                    }
-                }
-            }
-            FilterClause::In(f, vs) | FilterClause::NotIn(f, vs) => {
-                if lazy_fields.contains(f) {
-                    let entry = out.entry(f.clone()).or_default();
-                    for v in vs {
-                        if let Some(key) = value_to_bitmap_key(v) {
-                            entry.push(key);
-                        }
-                    }
-                }
-            }
-            FilterClause::Gt(f, v)
-            | FilterClause::Lt(f, v)
-            | FilterClause::Gte(f, v)
-            | FilterClause::Lte(f, v) => {
-                if lazy_fields.contains(f) {
-                    if let Some(key) = value_to_bitmap_key(v) {
-                        out.entry(f.clone()).or_default().push(key);
-                    }
-                }
-            }
-            FilterClause::Not(inner) => Self::collect_lazy_values(inner, lazy_fields, out),
-            FilterClause::And(clauses) | FilterClause::Or(clauses) => {
-                for c in clauses {
-                    Self::collect_lazy_values(c, lazy_fields, out);
-                }
-            }
-            FilterClause::BucketBitmap { .. } => {}
-            // IsNull/IsNotNull: no specific value to eager-load; skip.
-            FilterClause::IsNull(_) | FilterClause::IsNotNull(_) => {}
-        }
-    }
-    /// Execute a parsed BitdexQuery.
-    /// Trigger background loading of a pending cache shard from disk.
-    /// Non-blocking: sets loading sentinel and spawns a background thread.
-    /// The query proceeds via slow path; next query after loading gets cache hit.
-    fn ensure_cache_shard_loaded(&self, sort_field: &str, direction: crate::query::SortDirection) {
-        if let Some(ref bs) = self.bound_store {
-            let mut uc = self.unified_cache.lock();
-            if !uc.is_shard_pending(sort_field, direction) {
-                return;
-            }
-            if uc.is_shard_loading(sort_field, direction) {
-                // Another thread is loading — drop lock, proceed without cache
-                return;
-            }
-            // Set sentinel so other queries skip loading. Spawn background thread.
-            uc.mark_shard_loading(sort_field, direction);
-            drop(uc);
-            // Spawn background shard loading — don't block the query thread
-            let bs = Arc::clone(bs);
-            let uc_arc = Arc::clone(&self.unified_cache);
-            let inner = Arc::clone(&self.inner);
-            let sort_field = sort_field.to_string();
-            let boundstore_entries_restored = Arc::clone(&self.boundstore_entries_restored);
-            let boundstore_shard_loads = Arc::clone(&self.boundstore_shard_loads);
-            let boundstore_entries_skipped = Arc::clone(&self.boundstore_entries_skipped);
-            std::thread::Builder::new()
-                .name(format!("shard-load-{}_{:?}", sort_field, direction))
-                .spawn(move || {
-                    Self::load_shard_background(
-                        &bs, &uc_arc, &inner, &sort_field, direction,
-                        &boundstore_entries_restored, &boundstore_shard_loads, &boundstore_entries_skipped,
-                    );
-                })
-                .map_err(|e| {
-                    eprintln!("WARNING: failed to spawn shard-load thread: {e}. Shard stuck in loading state.");
-                })
-                .ok();
-            return; // Don't block — query proceeds without cache
-        }
-    }
-    /// Background shard loading. Called from a spawned thread.
-    fn load_shard_background(
-        bs: &crate::bound_store::BoundStore,
-        uc_arc: &Arc<parking_lot::Mutex<UnifiedCache>>,
-        inner: &Arc<ArcSwap<InnerEngine>>,
-        sort_field: &str,
-        direction: crate::query::SortDirection,
-        boundstore_entries_restored: &Arc<AtomicU64>,
-        boundstore_shard_loads: &Arc<AtomicU64>,
-        boundstore_entries_skipped: &Arc<AtomicU64>,
-    ) {
-            let t0 = std::time::Instant::now();
-            let shard_key = crate::bound_store::ShardKey::new(
-                sort_field.to_string(),
-                direction,
-            );
-            match bs.load_shard(&shard_key) {
-                Ok(Some(shard_entries)) => {
-                    let disk_elapsed = t0.elapsed();
-                    let snap = inner.load();
-                    let sf = snap.sorts.get_field(sort_field);
-                    let mut uc = uc_arc.lock();
-                    let mut loaded = 0usize;
-                    let mut skipped = 0usize;
-                    uc.begin_restore(); // Skip per-insert eviction during shard restore
-                    for se in shard_entries {
-                        // Skip entries not in meta-index (orphan from crash)
-                        if !uc.meta().is_registered(se.entry_id) {
-                            skipped += 1;
-                            continue;
-                        }
-                        // Skip tombstoned entries
-                        if uc.meta().is_tombstoned(se.entry_id) {
-                            skipped += 1;
-                            continue;
-                        }
-                        // Build key and insert restored entry
-                        let key = UnifiedKey {
-                            filter_clauses: se.filter_clauses,
-                            sort_field: sort_field.to_string(),
-                            direction,
-                        };
-                        // Get metadata from meta entry (if available) or use defaults
-                        let config = uc.config().clone();
-                        let has_more = uc.get_meta_has_more(se.entry_id);
-                        let persisted_total = uc.get_meta_total_matched(se.entry_id);
-                        let value_fn = |slot: u32| -> u32 {
-                            sf.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
-                        };
-                        let entry = UnifiedEntry::from_restored(
-                            se.bitmap,
-                            se.entry_id,
-                            config.initial_capacity,
-                            config.max_capacity,
-                            direction,
-                            se.sorted_keys,
-                            &value_fn,
-                            has_more,
-                            persisted_total,
-                        );
-                        uc.insert_restored_entry(key, entry);
-                        loaded += 1;
-                        boundstore_entries_restored.fetch_add(1, Ordering::Relaxed);
-                    }
-                    uc.finish_restore(); // Single eviction pass to bring cache under budget
-                    uc.mark_shard_loaded(sort_field, direction);
-                    boundstore_shard_loads.fetch_add(1, Ordering::Relaxed);
-                    boundstore_entries_skipped.fetch_add(skipped as u64, Ordering::Relaxed);
-                    let total_elapsed = t0.elapsed();
-                    if loaded > 0 || skipped > 0 {
-                        tracing::info!(
-                            "BoundStore: loaded shard {}_{:?} ({loaded} entries, {skipped} skipped) disk={:.1}ms total={:.1}ms",
-                            sort_field, direction,
-                            disk_elapsed.as_secs_f64() * 1000.0,
-                            total_elapsed.as_secs_f64() * 1000.0,
-                        );
-                    }
-                }
-                Ok(None) => {
-                    // Shard file doesn't exist — mark as loaded
-                    let mut uc = uc_arc.lock();
-                    uc.mark_shard_loaded(sort_field, direction);
-                }
-                Err(e) => {
-                    eprintln!("BoundStore: failed to load shard {}_{:?}: {e}", sort_field, direction);
-                    let mut uc = uc_arc.lock();
-                    uc.mark_shard_loaded(sort_field, direction);
-                }
-            }
-    }
     pub fn execute_query(&self, query: &BitdexQuery) -> Result<QueryResult> {
         let _query_start = std::time::Instant::now();
-        // Lazy-load any fields not yet loaded from disk
-        let t0 = std::time::Instant::now();
-        self.ensure_fields_loaded(
-            &query.filters,
-            query.sort.as_ref().map(|s| s.field.as_str()),
-        )?;
-        let ensure_elapsed = t0.elapsed();
-        if ensure_elapsed.as_millis() > 10 {
-            tracing::debug!("  ensure_fields_loaded: {:.1}ms", ensure_elapsed.as_secs_f64() * 1000.0);
-        }
-        // Lazy-load cached shard from disk if pending
-        if let Some(sort_clause) = query.sort.as_ref() {
-            self.ensure_cache_shard_loaded(&sort_clause.field, sort_clause.direction);
-        }
         let snap = self.snapshot(); // lock-free
+        let silo_guard = self.bitmap_silo.as_ref().map(|s| s.read());
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3722,6 +1868,9 @@ impl ConcurrentEngine {
                 &snap.sorts,
                 self.config.max_page_size,
             );
+            if let Some(ref guard) = silo_guard {
+                base = base.with_bitmap_silo(guard);
+            }
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -3995,18 +2144,9 @@ impl ConcurrentEngine {
         collector: &mut QueryTraceCollector,
     ) -> Result<QueryResult> {
         let _query_start = std::time::Instant::now();
-        // Lazy-load any fields not yet loaded from disk (timed for trace)
-        let lazy_start = std::time::Instant::now();
-        self.ensure_fields_loaded(
-            &query.filters,
-            query.sort.as_ref().map(|s| s.field.as_str()),
-        )?;
-        collector.lazy_load_us = lazy_start.elapsed().as_micros() as u64;
-        // Lazy-load cached shard from disk if pending
-        if let Some(sort_clause) = query.sort.as_ref() {
-            self.ensure_cache_shard_loaded(&sort_clause.field, sort_clause.direction);
-        }
+        collector.lazy_load_us = 0;
         let snap = self.snapshot();
+        let silo_guard = self.bitmap_silo.as_ref().map(|s| s.read());
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4019,6 +2159,9 @@ impl ConcurrentEngine {
                 &snap.sorts,
                 self.config.max_page_size,
             );
+            if let Some(ref guard) = silo_guard {
+                base = base.with_bitmap_silo(guard);
+            }
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -5023,76 +3166,13 @@ impl ConcurrentEngine {
     pub fn alive_count(&self) -> u64 {
         self.snapshot().slots.alive_count()
     }
-    /// Pre-load all pending filter and sort fields from disk.
-    /// Call from a background thread after server startup so lazy-loading
-    /// doesn't block request threads or health checks.
-    ///
-    /// Load order: sort fields → bound caches → filter fields.
-    /// Sort fields must load first because bound cache restoration needs
-    /// `reconstruct_value()` for sorted-key rebuilding. Bound caches load
-    /// next so cached sorts are warm before any queries arrive. Filter
-    /// fields (the bulk of memory) load last.
-    /// Load eager sort and filter fields in the background.
-    /// Called after the server starts listening so health checks pass immediately.
-    pub fn preload_eager_fields(&self) {
-        use crate::query::{FilterClause, Value};
-        let t0 = std::time::Instant::now();
-        let eager_sorts: Vec<&str> = self.config.sort_fields.iter()
-            .filter(|sc| sc.eager_load)
-            .map(|sc| sc.name.as_str())
-            .collect();
-        let eager_filters: Vec<&str> = self.config.filter_fields.iter()
-            .filter(|fc| fc.eager_load)
-            .map(|fc| fc.name.as_str())
-            .collect();
-        // Load all eager sort + filter fields in one parallel batch.
-        // ensure_fields_loaded parallelizes across all tasks internally.
-        if !eager_sorts.is_empty() || !eager_filters.is_empty() {
-            let mut clauses: Vec<FilterClause> = Vec::new();
-            for name in &eager_filters {
-                clauses.push(FilterClause::Eq(name.to_string(), Value::Integer(0)));
-            }
-            // Load with first sort field, then remaining sorts individually
-            // (ensure_fields_loaded takes one optional sort field at a time)
-            let first_sort = eager_sorts.first().copied();
-            let _ = self.ensure_fields_loaded(&clauses, first_sort);
-            // Load remaining sort fields
-            let empty: Vec<FilterClause> = Vec::new();
-            for name in eager_sorts.iter().skip(1) {
-                let _ = self.ensure_fields_loaded(&empty, Some(name));
-            }
-        }
-        let total_eager = eager_sorts.len() + eager_filters.len();
-        if total_eager > 0 {
-            eprintln!(
-                "Preload complete: {} sort + {} filter fields in {:.1}s",
-                eager_sorts.len(),
-                eager_filters.len(),
-                t0.elapsed().as_secs_f64(),
-            );
-        }
-    }
+    /// No-op: eager loading is not needed with BitmapSilo frozen bitmaps.
+    /// All filter/sort bitmaps are accessible via mmap at query time.
+    pub fn preload_eager_fields(&self) {}
     /// Pre-load all bound cache shards from disk.
-    /// Iterates every sort field × both directions.
-    pub fn preload_bound_cache(&self) {
-        use crate::query::SortDirection;
-        if self.bound_store.is_none() {
-            return;
-        }
-        let t0 = std::time::Instant::now();
-        let mut loaded = 0usize;
-        for sc in &self.config.sort_fields {
-            for dir in &[SortDirection::Desc, SortDirection::Asc] {
-                self.ensure_cache_shard_loaded(&sc.name, *dir);
-                loaded += 1;
-            }
-        }
-        eprintln!(
-            "Preload phase 2: {} bound cache shards in {:.1}s",
-            loaded,
-            t0.elapsed().as_secs_f64(),
-        );
-    }
+    /// No-op: BoundStore removed. CacheSilo (Phase 4) will restore persistent cache entries.
+    pub fn preload_bound_cache(&self) {}
+
     /// Flush loop stats: (publish_count, cumulative_duration_nanos, last_duration_nanos).
     pub fn flush_stats(&self) -> (u64, u64, u64) {
         (
@@ -5112,101 +3192,14 @@ impl ConcurrentEngine {
             self.flush_opslog_nanos.load(Ordering::Relaxed),
         )
     }
-    /// Number of filter + sort fields still pending lazy load.
-    pub fn pending_field_count(&self) -> usize {
-        self.pending_filter_loads.lock().len() + self.pending_sort_loads.lock().len()
-    }
-    /// Mark fields as pending for lazy loading from disk.
-    /// Call after dump processor writes bitmaps — this tells the engine
-    /// to reload them on the next query.
-    pub fn mark_fields_pending_reload(&self, filter_fields: &[String], sort_fields: &[String]) {
-        {
-            let mut pending = self.pending_filter_loads.lock();
-            for name in filter_fields {
-                pending.insert(name.clone());
-            }
-        }
-        {
-            let mut pending = self.pending_sort_loads.lock();
-            for name in sort_fields {
-                pending.insert(name.clone());
-            }
-        }
-        eprintln!(
-            "Marked {} filter + {} sort fields for lazy reload",
-            filter_fields.len(),
-            sort_fields.len()
-        );
-    }
-    /// Reload the alive bitmap and slot counter from ShardStore into the
-    /// in-memory engine snapshot. Sends via the lazy load channel so the
-    /// flush thread's staging stays in sync — same path as filter/sort
-    /// lazy loading. Without this, the flush thread's next publish would
-    /// overwrite the alive bitmap with its stale empty copy.
-    pub fn reload_alive_from_disk(&self) {
-        let alive_store = match self.alive_store.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
-        let meta_store = match self.meta_store.as_ref() {
-            Some(s) => s,
-            None => return,
-        };
-        let alive_bm = match alive_store.load_alive() {
-            Ok(Some(bm)) => bm,
-            _ => return,
-        };
-        let counter = meta_store.load_slot_counter().ok().flatten().unwrap_or(0);
-        let alive_count = alive_bm.len();
-        // Build new SlotAllocator with the disk state
-        let mut new_slots = crate::slot::SlotAllocator::from_state(
-            counter,
-            alive_bm,
-            RoaringBitmap::new(),
-        );
-        // Load deferred alive if present
-        if let Some(deferred) = meta_store.load_deferred_alive().ok().flatten() {
-            new_slots.set_deferred(deferred);
-        }
-        // Send to flush thread via lazy load channel — same pattern as
-        // ensure_fields_loaded for filter/sort bitmaps.
-        let _ = self.lazy_tx.send(LazyLoad::Slots { slots: new_slots });
-        // Ask the flush thread to drain the lazy channel and publish.
-        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        if self.cmd_tx.send(FlushCommand::ForcePublish { done: done_tx }).is_ok() {
-            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
-        }
-        eprintln!(
-            "Reloaded alive bitmap from disk: {} alive, slot_counter={}",
-            alive_count, counter
-        );
-    }
-    /// Get eviction stats: (field_name, evicted_total, resident_count).
-    pub fn eviction_stats(&self) -> Vec<(String, u64, usize)> {
-        let snap = self.snapshot();
-        self.config
-            .filter_fields
-            .iter()
-            .filter(|fc| fc.eviction.is_some())
-            .map(|fc| {
-                let total = self
-                    .eviction_total
-                    .get(&fc.name)
-                    .map(|e| e.value().load(Ordering::Relaxed))
-                    .unwrap_or(0);
-                let resident = snap
-                    .filters
-                    .get_field(&fc.name)
-                    .map(|f| f.loaded_value_count())
-                    .unwrap_or(0);
-                (fc.name.clone(), total, resident)
-            })
-            .collect()
-    }
-    /// Get the current flush cycle counter.
-    pub fn flush_cycle(&self) -> u64 {
-        self.flush_cycle.load(Ordering::Relaxed)
-    }
+    /// Number of filter + sort fields still pending lazy load. Always 0 (frozen mmap).
+    pub fn pending_field_count(&self) -> usize { 0 }
+    /// No-op: lazy reload not needed with BitmapSilo frozen bitmaps.
+    pub fn mark_fields_pending_reload(&self, _filter_fields: &[String], _sort_fields: &[String]) {}
+    /// No-op: alive bitmap is always in-memory with BitmapSilo.
+    pub fn reload_alive_from_disk(&self) {}
+    /// No-op: eviction is removed. Returns empty vec.
+    pub fn eviction_stats(&self) -> Vec<(String, u64, usize)> { Vec::new() }
     /// Get the high-water mark slot counter (lock-free snapshot).
     pub fn slot_counter(&self) -> u32 {
         self.snapshot().slots.slot_counter()
@@ -5232,19 +3225,8 @@ impl ConcurrentEngine {
     /// Checks the in-memory doc cache first. On miss, reads from disk and
     /// populates the cache for subsequent reads.
     pub fn get_document(&self, slot_id: u32) -> Result<Option<StoredDoc>> {
-        // Fast path: cache hit (no lock, DashMap concurrent read)
-        if let Some(ref cache) = self.doc_cache {
-            if let Some(doc) = cache.get(slot_id) {
-                return Ok(Some(doc));
-            }
-        }
-        // Slow path: disk read + cache populate
-        let doc = self.docstore.lock().get(slot_id)?;
-        if let (Some(ref cache), Some(ref doc)) = (&self.doc_cache, &doc) {
-            cache.insert(slot_id, doc.clone());
-            // Eviction handled by dedicated eviction thread — no inline check
-        }
-        Ok(doc)
+        // Read directly from DataSilo (no separate doc cache — DataSilo uses mmap).
+        Ok(self.docstore.lock().get(slot_id)?)
     }
     /// Compact the docstore, reclaiming space from old write transactions.
     pub fn compact_docstore(&self) -> Result<bool> {
@@ -5260,8 +3242,8 @@ impl ConcurrentEngine {
         self.docstore.lock().schema_version()
     }
 
-    /// Get a clone of the Arc<Mutex<DocStoreV3>> for external writers (e.g., DocWriter).
-    pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<DocStoreV3>> {
+    /// Get a clone of the Arc<Mutex<DocSiloAdapter>> for external writers.
+    pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<DocSiloAdapter>> {
         Arc::clone(&self.docstore)
     }
     /// Set the WAL writer for the V2 write path. When set, put() and patch_document()
@@ -5280,15 +3262,10 @@ impl ConcurrentEngine {
         self.docstore.lock().build_schema_registry()
     }
 
-    /// Prepare a ShardStoreBulkWriter for lock-free parallel docstore writes during bulk loading.
-    /// The writer holds a snapshot of the field dictionary and can encode/write
-    /// docs without acquiring the DocStoreV3 Mutex.
-    pub fn prepare_bulk_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::ShardStoreBulkWriter> {
-        Ok(self.docstore.lock().prepare_bulk_load(field_names)?)
-    }
-    /// Prepare a StreamingDocWriter for write-through docstore writes during dump processing.
-    pub fn prepare_streaming_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::StreamingDocWriter> {
-        Ok(self.docstore.lock().prepare_streaming_writer(field_names)?)
+    /// Prepare field names for bulk writing (ensures field dictionary is ready).
+    pub fn prepare_field_names(&self, field_names: &[String]) -> crate::error::Result<()> {
+        self.docstore.lock().prepare_field_names(field_names)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("prepare_field_names: {e}")))
     }
     /// Return the set of indexed field names (filter + sort + "id").
     /// Used by the loader to strip doc-only fields from the bitmap accumulator.
@@ -5311,27 +3288,13 @@ impl ConcurrentEngine {
     pub fn flush_queue_depth(&self) -> usize {
         self.sender.pending_count()
     }
-    /// Doc cache stats for Prometheus scrape: (hits, misses, entries, bytes, evictions, generations).
-    /// Returns zeros if doc_cache is not configured.
     /// Evict a slot from the doc cache so the next read fetches from disk.
-    /// Used by WAL reader after DocWriter updates a document via ops.
-    pub fn evict_doc_cache(&self, slot: u32) {
-        if let Some(ref cache) = self.doc_cache {
-            cache.remove(slot);
-        }
-    }
+    /// No-op: DocCache removed; DataSilo handles reads directly.
+    pub fn evict_doc_cache(&self, _slot: u32) {}
+    /// Doc cache stats: (hits, misses, entries, bytes, evictions, generations).
+    /// Returns zeros: DocCache removed, DataSilo handles reads directly.
     pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64, usize) {
-        match &self.doc_cache {
-            Some(cache) => (
-                cache.hits(),
-                cache.misses(),
-                cache.len(),
-                cache.size_bytes(),
-                cache.eviction_count(),
-                cache.generation_count(),
-            ),
-            None => (0, 0, 0, 0, 0, 0),
-        }
+        (0, 0, 0, 0, 0, 0)
     }
     /// Report bitmap memory usage broken down by component (lock-free snapshot).
     ///
@@ -5373,29 +3336,17 @@ impl ConcurrentEngine {
         (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details)
     }
     /// Return unified cache stats (entries, hits, misses, memory).
-    // ── BoundStore Counters ───────────────────────────────────────────────
-    pub fn boundstore_shard_loads(&self) -> u64 { self.boundstore_shard_loads.load(Ordering::Relaxed) }
-    pub fn boundstore_tombstones_created(&self) -> u64 { self.boundstore_tombstones_created.load(Ordering::Relaxed) }
-    pub fn boundstore_tombstones_cleaned(&self) -> u64 { self.boundstore_tombstones_cleaned.load(Ordering::Relaxed) }
-    pub fn boundstore_bytes_written(&self) -> u64 { self.boundstore_bytes_written.load(Ordering::Relaxed) }
-    pub fn boundstore_bytes_read(&self) -> u64 { self.boundstore_bytes_read.load(Ordering::Relaxed) }
-    pub fn boundstore_entries_restored(&self) -> u64 { self.boundstore_entries_restored.load(Ordering::Relaxed) }
-    pub fn boundstore_entries_skipped(&self) -> u64 { self.boundstore_entries_skipped.load(Ordering::Relaxed) }
-    /// Get the total size of the bounds directory on disk (meta.bin + shards).
-    pub fn boundstore_disk_bytes(&self) -> u64 {
-        self.bound_store.as_ref().map(|bs| {
-            let root = bs.root_path();
-            if !root.exists() { return 0u64; }
-            std::fs::read_dir(root)
-                .ok()
-                .map(|entries| {
-                    entries.filter_map(|e| e.ok())
-                        .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-                        .sum()
-                })
-                .unwrap_or(0)
-        }).unwrap_or(0)
-    }
+    // ── BoundStore Counters — all zero (BoundStore removed; CacheSilo Phase 4 replaces) ──
+    pub fn boundstore_shard_loads(&self) -> u64 { 0 }
+    pub fn boundstore_tombstones_created(&self) -> u64 { 0 }
+    pub fn boundstore_tombstones_cleaned(&self) -> u64 { 0 }
+    pub fn boundstore_bytes_written(&self) -> u64 { 0 }
+    pub fn boundstore_bytes_read(&self) -> u64 { 0 }
+    pub fn boundstore_entries_restored(&self) -> u64 { 0 }
+    pub fn boundstore_entries_skipped(&self) -> u64 { 0 }
+    /// Get the total size of the bounds directory on disk.
+    /// Returns 0: BoundStore removed. CacheSilo (Phase 4) will report disk usage.
+    pub fn boundstore_disk_bytes(&self) -> u64 { 0 }
     pub fn unified_cache_stats(&self) -> crate::unified_cache::UnifiedCacheStats {
         self.unified_cache.lock().stats()
     }
@@ -5516,21 +3467,9 @@ impl ConcurrentEngine {
     /// Safe to call while the server is running — the merge thread will simply
     /// start writing fresh data on the next cycle with dirty entries.
     pub fn purge_bounds(&self) -> crate::error::Result<()> {
-        // Step 1: Purge disk (meta.bin + all .ucpack shards)
-        if let Some(ref bs) = self.bound_store {
-            bs.purge()?;
-            eprintln!("BoundStore: purged disk (meta.bin + all shards)");
-        }
-        // Step 2: Clear RAM cache + meta-index (after disk is gone)
-        {
-            let mut uc = self.unified_cache.lock();
-            uc.clear();
-            // Re-enable persistence so new entries get persisted
-            if self.bound_store.is_some() {
-                uc.enable_persistence();
-            }
-        }
-        eprintln!("BoundStore: cleared RAM cache + meta-index");
+        // Clear RAM cache (BoundStore removed — no disk to purge).
+        self.unified_cache.lock().clear();
+        eprintln!("purge_bounds: cleared RAM cache (BoundStore removed)");
         Ok(())
     }
     /// Enter loading mode: skip snapshot publishing and maintenance during bulk inserts.
@@ -5564,58 +3503,29 @@ impl ConcurrentEngine {
                 eprintln!("Warning: exit_loading_mode timed out waiting for flush thread publish");
             }
         }
-        // Trigger initial population of bitmap memory cache after load completes.
-        self.bitmap_memory_cache.mark_all_stale();
     }
-    /// Combined exit-loading + save + unload that avoids the memory spike.
+    /// Combined exit-loading + save + unload.
     ///
-    /// Instead of:
-    ///   1. exit_loading_mode() → publishes staging.clone() (doubles refcounts)
-    ///   2. save_and_unload() → reads published snapshot, saves to disk
-    ///
-    /// This does:
-    ///   1. Sends ExitLoadingSaveUnload to flush thread
-    ///   2. Flush thread saves directly from staging (the single copy)
-    ///   3. Builds unloaded staging, publishes only the unloaded version
-    ///
-    /// At 105M records this eliminates the 22GB→38GB RSS spike from the
-    /// intermediate staging.clone() that bumps Arc refcounts.
+    /// Sends ExitLoadingSaveUnload to the flush thread which publishes the
+    /// unloaded version. With BitmapSilo, bitmaps stay in mmap so no reload
+    /// tracking is needed after unload.
     pub fn exit_loading_mode_and_save_unload(&self) -> Result<()> {
-        // NOTE: Do NOT set loading_mode = false here. The ExitLoadingSaveUnload
-        // handler in the flush thread will clear it AFTER reading the published
-        // snapshot. Setting it here causes a race: the flush thread's loading-exit
-        // force-publish (was_loading && !is_loading) overwrites the loader's
-        // published data before the save command reads it.
-        // Validate stores exist; flush thread has its own clones
-        let _ = self.require_stores("exit_loading_mode_and_save_unload")?;
-        let skip_sorts = self.pending_sort_loads.lock().clone();
-        let skip_filters = self.pending_filter_loads.lock().clone();
-        let skip_lazy = self.lazy_value_fields.lock().clone();
+        let skip_sorts: HashSet<String> = HashSet::new();
+        let skip_filters: HashSet<String> = HashSet::new();
+        let skip_lazy: HashSet<String> = HashSet::new();
         let cursors = self.cursors.lock().clone();
         let dictionaries = Arc::clone(&self.dictionaries);
-        // Mark all loaded fields as pending for lazy reload after unload.
-        for fc in &self.config.filter_fields {
-            if !skip_filters.contains(&fc.name) && !skip_lazy.contains(&fc.name) {
-                self.pending_filter_loads.lock().insert(fc.name.clone());
-            }
-        }
-        for sc in &self.config.sort_fields {
-            if !skip_sorts.contains(&sc.name) {
-                self.pending_sort_loads.lock().insert(sc.name.clone());
-            }
-        }
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         match self.cmd_tx.send(FlushCommand::ExitLoadingSaveUnload {
-            skip_sorts: skip_sorts.clone(),
-            skip_filters: skip_filters.clone(),
-            skip_lazy: skip_lazy.clone(),
+            skip_sorts,
+            skip_filters,
+            skip_lazy,
             cursors,
             dictionaries,
             loading_mode: Arc::clone(&self.loading_mode),
             done: done_tx,
         }) {
             Ok(()) => {
-                // Save can take minutes at 105M — use generous timeout
                 match done_rx.recv_timeout(Duration::from_secs(600)) {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(msg)) => Err(crate::error::BitdexError::Config(msg)),
@@ -5628,97 +3538,39 @@ impl ConcurrentEngine {
                 }
             }
             Err(_) => {
-                // Flush thread is gone — fall back to separate exit + save_and_unload
-                eprintln!("Warning: flush thread gone, falling back to separate exit+save");
-                // Re-clear the pending loads we just set (save_and_unload will re-set them)
-                for fc in &self.config.filter_fields {
-                    if !skip_filters.contains(&fc.name) && !skip_lazy.contains(&fc.name) {
-                        self.pending_filter_loads.lock().remove(&fc.name);
-                    }
-                }
-                for sc in &self.config.sort_fields {
-                    if !skip_sorts.contains(&sc.name) {
-                        self.pending_sort_loads.lock().remove(&sc.name);
-                    }
-                }
+                eprintln!("Warning: flush thread gone, falling back to exit_loading_mode");
                 self.exit_loading_mode();
-                self.save_and_unload()
+                Ok(())
             }
         }
     }
-    /// Borrow all four ShardStore components, returning an error if any is missing.
-    fn require_stores(&self, caller: &str) -> Result<(
-        &crate::shard_store_bitmap::AliveBitmapStore,
-        &crate::shard_store_bitmap::FilterBitmapStore,
-        &crate::shard_store_bitmap::SortBitmapStore,
-        &crate::shard_store_meta::MetaStore,
-    )> {
-        let msg = |which: &str| crate::error::BitdexError::Config(
-            format!("no bitmap_path configured; cannot {caller} (missing {which})")
-        );
-        Ok((
-            self.alive_store.as_ref().map(|a| a.as_ref()).ok_or_else(|| msg("alive_store"))?,
-            self.filter_store.as_ref().map(|a| a.as_ref()).ok_or_else(|| msg("filter_store"))?,
-            self.sort_store.as_ref().map(|a| a.as_ref()).ok_or_else(|| msg("sort_store"))?,
-            self.meta_store.as_ref().map(|a| a.as_ref()).ok_or_else(|| msg("meta_store"))?,
-        ))
-    }
-    /// Save a full snapshot of the current published state to ShardStore.
-    ///
-    /// Captures the current ArcSwap snapshot (what readers see) and writes all
-    /// filter bitmaps, alive bitmap, sort layer bitmaps, and slot counter.
-    ///
-    /// This is intended for persisting state after bulk loading is complete.
-    /// For incremental persistence during normal operation, the merge thread
-    /// handles that automatically.
-    ///
-    /// Returns an error if no bitmap_store is configured.
+    /// Save a full snapshot: bitmaps to BitmapSilo, field dict to disk.
     pub fn save_snapshot(&self) -> Result<()> {
-        let (alive_s, filter_s, sort_s, meta_s) = self.require_stores("save_snapshot")?;
-        let skip_sorts = self.pending_sort_loads.lock().clone();
-        let skip_filters = self.pending_filter_loads.lock().clone();
-        let skip_lazy = self.lazy_value_fields.lock().clone();
-        Self::write_snapshot_to_store(alive_s, filter_s, sort_s, meta_s, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)?;
-        // Persist named cursors alongside bitmaps so they survive process restart.
-        let cursor_snapshot = self.cursors.lock().clone();
-        for (name, value) in &cursor_snapshot {
-            meta_s.write_cursor(name, value)
-                .map_err(|e| crate::error::BitdexError::Storage(format!("write cursor: {e}")))?;
+        // Save field dictionary
+        self.docstore.lock().save_field_dict()
+            .map_err(|e| crate::error::BitdexError::Storage(format!("save_field_dict: {e}")))?;
+
+        // Save bitmaps to BitmapSilo
+        if let Some(ref bitmap_path) = self.config.storage.bitmap_path {
+            let snap = self.snapshot();
+            let cursors = self.cursors.lock().clone();
+            let mut silo = crate::bitmap_silo::BitmapSilo::open(bitmap_path)
+                .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
+            let count = silo.save_all(&snap.filters, &snap.sorts, &snap.slots, &cursors)
+                .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all: {e}")))?;
+            eprintln!("save_snapshot: saved {} bitmaps to BitmapSilo", count);
         }
-        // Save LowCardinalityString dictionaries alongside bitmaps.
-        if !self.dictionaries.is_empty() {
-            let dict_path = meta_s.root();
-            self.save_dictionaries(dict_path)?;
-        }
+
         Ok(())
     }
-    /// Save a full snapshot of the current published state to a custom path.
-    ///
-    /// Creates new ShardStore instances at the given path and writes the complete
-    /// engine state. Useful for benchmarks or point-in-time backups.
+    /// Save a full snapshot to a custom path.
     pub fn save_snapshot_to(&self, path: &Path) -> Result<()> {
-        use crate::error::BitdexError;
-        let ss_root = path.join("shardstore");
-        let alive_s = crate::shard_store_bitmap::AliveBitmapStore::new(
-            ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
-        ).map_err(|e| BitdexError::Storage(format!("alive store init: {e}")))?;
-        let filter_s = crate::shard_store_bitmap::FilterBitmapStore::new(
-            ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
-        ).map_err(|e| BitdexError::Storage(format!("filter store init: {e}")))?;
-        let sort_s = crate::shard_store_bitmap::SortBitmapStore::new(
-            ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
-        ).map_err(|e| BitdexError::Storage(format!("sort store init: {e}")))?;
-        let meta_s = crate::shard_store_meta::MetaStore::new(ss_root)
-            .map_err(|e| BitdexError::Storage(format!("meta store init: {e}")))?;
-
-        let skip_sorts = self.pending_sort_loads.lock().clone();
-        let skip_filters = self.pending_filter_loads.lock().clone();
-        let skip_lazy = self.lazy_value_fields.lock().clone();
-        Self::write_snapshot_to_store(&alive_s, &filter_s, &sort_s, &meta_s, &self.inner, &self.config, &skip_sorts, &skip_filters, &skip_lazy)?;
-        // Save LowCardinalityString dictionaries alongside bitmaps.
-        if !self.dictionaries.is_empty() {
-            self.save_dictionaries(path)?;
-        }
+        let snap = self.snapshot();
+        let cursors = self.cursors.lock().clone();
+        let mut silo = crate::bitmap_silo::BitmapSilo::open(path)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
+        silo.save_all(&snap.filters, &snap.sorts, &snap.slots, &cursors)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all: {e}")))?;
         Ok(())
     }
     /// Internal: zero-copy snapshot serialization via ShardStore.
@@ -5730,124 +3582,6 @@ impl ConcurrentEngine {
     ///
     /// Skips fields that haven't been loaded yet (still pending lazy-load) to avoid
     /// overwriting real persisted data with empty placeholders.
-    fn write_snapshot_to_store(
-        alive_store: &crate::shard_store_bitmap::AliveBitmapStore,
-        filter_store: &crate::shard_store_bitmap::FilterBitmapStore,
-        sort_store: &crate::shard_store_bitmap::SortBitmapStore,
-        meta_store: &crate::shard_store_meta::MetaStore,
-        inner: &ArcSwap<InnerEngine>,
-        config: &Config,
-        skip_sorts: &HashSet<String>,
-        skip_filters: &HashSet<String>,
-        skip_lazy_values: &HashSet<String>,
-    ) -> Result<()> {
-        let snap: Arc<InnerEngine> = inner.load_full();
-        Self::write_inner_to_store(alive_store, filter_store, sort_store, meta_store, &snap, config, skip_sorts, skip_filters, skip_lazy_values)
-    }
-    /// Write bitmaps from an InnerEngine directly to the store.
-    /// This is used by both the ArcSwap-based path and the flush thread's
-    /// direct-from-staging path (which avoids the intermediate clone).
-    fn write_inner_to_store(
-        alive_store: &crate::shard_store_bitmap::AliveBitmapStore,
-        filter_store: &crate::shard_store_bitmap::FilterBitmapStore,
-        sort_store: &crate::shard_store_bitmap::SortBitmapStore,
-        meta_store: &crate::shard_store_meta::MetaStore,
-        snap: &InnerEngine,
-        config: &Config,
-        skip_sorts: &HashSet<String>,
-        skip_filters: &HashSet<String>,
-        skip_lazy_values: &HashSet<String>,
-    ) -> Result<()> {
-        use std::borrow::Cow;
-        let save_start = std::time::Instant::now();
-        // Write alive bitmap + slot counter + deferred map first (critical metadata).
-        let alive_cow = snap.slots.alive_fused_cow();
-        alive_store.write_alive(&alive_cow)
-            .map_err(|e| crate::error::BitdexError::Storage(format!("write alive: {e}")))?;
-        meta_store.write_slot_counter(snap.slots.slot_counter())
-            .map_err(|e| crate::error::BitdexError::Storage(format!("write slot_counter: {e}")))?;
-        if snap.slots.deferred_count() > 0 {
-            meta_store.write_deferred_alive(snap.slots.deferred_map())
-                .map_err(|e| crate::error::BitdexError::Storage(format!("write deferred: {e}")))?;
-        }
-        // Sort fields — one at a time, zero-copy via fused_cow.
-        for sc in &config.sort_fields {
-            if skip_sorts.contains(&sc.name) {
-                continue;
-            }
-            if let Some(sf) = snap.sorts.get_field(&sc.name) {
-                let t0 = std::time::Instant::now();
-                let fused_layers: Vec<Cow<'_, RoaringBitmap>> = sf.layer_bases_fused();
-                let layer_refs: Vec<&RoaringBitmap> =
-                    fused_layers.iter().map(|c| c.as_ref()).collect();
-                sort_store.write_sort_layers(&sc.name, &layer_refs)
-                    .map_err(|e| crate::error::BitdexError::Storage(format!("write sort {}: {e}", sc.name)))?;
-                eprintln!("  save: sort {} in {:.1}ms",
-                    sc.name, t0.elapsed().as_secs_f64() * 1000.0);
-            }
-        }
-        // Filter fields — stream one bucket at a time to minimize memory overhead.
-        // Lazy-value fields require merge-on-save: read existing disk data per bucket,
-        // OR with in-memory mutations, write merged result. This prevents overwriting
-        // bulk-loaded data with partial in-memory state.
-        for (name, field) in snap.filters.fields() {
-            if skip_filters.contains(name) {
-                continue;
-            }
-            let is_lazy = skip_lazy_values.contains(name);
-            if is_lazy && field.bitmap_count() == 0 {
-                // No in-memory data at all — nothing to merge, skip.
-                continue;
-            }
-            let t0 = std::time::Instant::now();
-            let num_values = field.bitmap_count();
-            // Group in-memory entries by bucket (256 buckets max)
-            let mut by_bucket: HashMap<u8, Vec<(u64, Cow<'_, RoaringBitmap>)>> = HashMap::new();
-            for (&value, vb) in field.iter_versioned() {
-                let bucket = (value >> 8) as u8;
-                by_bucket.entry(bucket).or_default().push((value, vb.fused_cow()));
-            }
-            let num_buckets = by_bucket.len();
-            if is_lazy {
-                // Merge-on-save: for each bucket with in-memory entries, read the
-                // existing data from disk, merge in-memory data on top, write back.
-                // Buckets with no in-memory changes are left untouched on disk.
-                for (bucket, mem_entries) in by_bucket {
-                    // Read existing disk entries for this bucket
-                    let disk_entries = filter_store.read_filter_bucket(name, bucket)
-                        .unwrap_or_default();
-                    // Build merged map: start with disk, overlay memory
-                    let mut merged: HashMap<u64, RoaringBitmap> = disk_entries.into_iter().collect();
-                    for (value, cow_bm) in &mem_entries {
-                        let entry = merged.entry(*value).or_insert_with(RoaringBitmap::new);
-                        *entry |= cow_bm.as_ref();
-                    }
-                    // Write merged result
-                    let refs: Vec<(u64, &RoaringBitmap)> = merged.iter()
-                        .map(|(v, bm)| (*v, bm))
-                        .collect();
-                    filter_store.write_filter_bucket(name, bucket, &refs)
-                        .map_err(|e| crate::error::BitdexError::Storage(format!("write filter {name}/{bucket:02x}: {e}")))?;
-                }
-            } else {
-                // Non-lazy fields: write in-memory state directly (fully loaded)
-                for (bucket, entries) in by_bucket {
-                    let refs: Vec<(u64, &RoaringBitmap)> = entries
-                        .iter()
-                        .map(|(v, c)| (*v, c.as_ref()))
-                        .collect();
-                    filter_store.write_filter_bucket(name, bucket, &refs)
-                        .map_err(|e| crate::error::BitdexError::Storage(format!("write filter {name}/{bucket:02x}: {e}")))?;
-                }
-            }
-            eprintln!("  save: filter {} ({} values, {} buckets{}) in {:.1}ms",
-                name, num_values, num_buckets,
-                if is_lazy { ", merged" } else { "" },
-                t0.elapsed().as_secs_f64() * 1000.0);
-        }
-        eprintln!("  save: total write {:.1}s", save_start.elapsed().as_secs_f64());
-        Ok(())
-    }
     /// Save the current snapshot to disk, then unload all loaded fields from memory.
     /// After this call, bitmap memory drops to near-zero — fields are marked pending
     /// and will lazy-load from disk on the next query that touches them.
@@ -5859,82 +3593,32 @@ impl ConcurrentEngine {
     /// Safe with concurrent mutations: the flush thread drains any pending
     /// mutations and applies them to the unloaded staging's diff layers before
     /// publishing.
+    /// Save the current snapshot to disk (via BitmapSilo) and publish a fresh unloaded state.
+    /// With BitmapSilo, all bitmaps are in the silo mmap — no lazy reload tracking needed.
     pub fn save_and_unload(&self) -> Result<()> {
-        let (alive_s, filter_s, sort_s, meta_s) = self.require_stores("save_and_unload")?;
-        // Snapshot what's already pending — don't save or unload those.
-        let skip_sorts = self.pending_sort_loads.lock().clone();
-        let skip_filters = self.pending_filter_loads.lock().clone();
-        let skip_lazy = self.lazy_value_fields.lock().clone();
-        // Phase 1: Zero-copy write to disk.
-        Self::write_snapshot_to_store(
-            alive_s,
-            filter_s,
-            sort_s,
-            meta_s,
-            &self.inner,
-            &self.config,
-            &skip_sorts,
-            &skip_filters,
-            &skip_lazy,
-        )?;
-        // Phase 2: Build an unloaded snapshot directly — no clone_staging().
-        // clone_staging() would bump refcounts on all Arc<FilterField>s, preventing
-        // the old bitmap data from being freed until publish. Instead, we build the
-        // new InnerEngine field by field: keep slots (always needed), and for each
-        // filter/sort field either move the Arc as-is (if skipped) or create a new
-        // empty field (if unloading). This way old Arcs are freed immediately on publish.
+        // Build an unloaded snapshot: keep slots (always needed), empty filter/sort fields.
         let snap = self.inner.load_full();
         let slots = snap.slots.clone();
         let mut new_filters = crate::filter::FilterIndex::new();
         for fc in &self.config.filter_fields {
             new_filters.add_field(fc.clone());
         }
-        // Unload ALL loaded fields — including lazy_value_fields (multi_value).
-        // Previously, lazy_value_fields were skipped from unload, which kept
-        // tagIds (~80% of bitmap memory) resident. Now they're unloaded and
-        // will reload per-value on demand via the lazy loading path.
         for fc in &self.config.filter_fields {
-            if skip_filters.contains(&fc.name) {
-                // Field was never loaded (still pending) — keep as-is
-                new_filters.copy_field_arc_from(&snap.filters, &fc.name);
-            } else {
-                // Unload: clear bases, preserve any in-flight diffs
-                new_filters.unload_from(&snap.filters, &fc.name);
-                // Route to correct reload path: multi_value fields use
-                // per-value lazy loading, others use full-field loading.
-                if skip_lazy.contains(&fc.name) {
-                    // Already in lazy_value_fields — will reload per-value
-                } else {
-                    self.pending_filter_loads.lock().insert(fc.name.clone());
-                }
-            }
+            new_filters.unload_from(&snap.filters, &fc.name);
         }
         let mut new_sorts = crate::sort::SortIndex::new();
         for sc in &self.config.sort_fields {
             new_sorts.add_field(sc.clone());
         }
         for sc in &self.config.sort_fields {
-            if skip_sorts.contains(&sc.name) {
-                new_sorts.copy_field_arc_from(&snap.sorts, &sc.name);
-            } else {
-                new_sorts.unload_from(&snap.sorts, &sc.name);
-                self.pending_sort_loads.lock().insert(sc.name.clone());
-            }
+            new_sorts.unload_from(&snap.sorts, &sc.name);
         }
-        // Drop our reference to the old snapshot before sending to flush thread.
         drop(snap);
         let unloaded = InnerEngine {
             slots,
             filters: new_filters,
             sorts: new_sorts,
         };
-        // Phase 3: Route through flush thread — replaces both staging and
-        // published snapshot atomically. Flush thread drains any pending
-        // mutations and applies them to the unloaded staging before publishing.
-        //
-        // Fallback: if the flush thread is already shut down (e.g., tests that
-        // call shutdown() before save_and_unload), publish directly. This is
-        // safe because there's no flush thread to re-inflate the snapshot.
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         match self.cmd_tx.send(FlushCommand::SyncUnloaded {
             unloaded: unloaded.clone(),
@@ -5945,13 +3629,11 @@ impl ConcurrentEngine {
                     Ok(()) => {}
                     Err(_) => {
                         eprintln!("Warning: save_and_unload timed out waiting for flush thread sync");
-                        // Fallback: publish directly
                         self.publish_staging(unloaded);
                     }
                 }
             }
             Err(_) => {
-                // Channel disconnected — flush thread is gone, publish directly
                 self.publish_staging(unloaded);
             }
         }
@@ -5966,231 +3648,35 @@ impl ConcurrentEngine {
     pub fn mutation_sender(&self) -> MutationSender {
         self.sender.clone()
     }
-    /// Get a reference to the legacy BitmapFs store, if configured.
-    /// Used by dump_processor for bitmap persistence.
-    pub fn bitmap_store(&self) -> Option<&Arc<BitmapFs>> {
-        self.bitmap_store.as_ref()
-    }
-    /// Get the ShardStore instances for direct bitmap I/O (dump processor, etc.).
-    pub fn shard_stores(&self) -> Option<(
-        Arc<crate::shard_store_bitmap::AliveBitmapStore>,
-        Arc<crate::shard_store_bitmap::FilterBitmapStore>,
-        Arc<crate::shard_store_bitmap::SortBitmapStore>,
-        Arc<crate::shard_store_meta::MetaStore>,
-    )> {
-        Some((
-            Arc::clone(self.alive_store.as_ref()?),
-            Arc::clone(self.filter_store.as_ref()?),
-            Arc::clone(self.sort_store.as_ref()?),
-            Arc::clone(self.meta_store.as_ref()?),
-        ))
-    }
-    /// Pin ShardStore generations across alive, filter, sort, and docstore.
-    ///
-    /// Bumps the generation counter on all stores so that new writes go
-    /// to Gen N+1 while Gen N preserves the pre-pin state. Returns the frozen
-    /// generation number. Used by capture start/stop and compact endpoint.
-    ///
-    /// Returns None if no shard stores are configured.
+    /// Pin BitmapSilo generations at capture boundaries.
+    /// Returns Ok(None) until BitmapSilo generation pinning is implemented.
     pub fn pin_shard_generations(&self) -> Result<Option<u64>> {
-        let (alive_s, filter_s, sort_s) = match (&self.alive_store, &self.filter_store, &self.sort_store) {
-            (Some(a), Some(f), Some(s)) => (a, f, s),
-            _ => return Ok(None),
-        };
-        let gen_alive = alive_s.pin_generation()
-            .map_err(|e| crate::error::BitdexError::Storage(format!("pin alive gen: {e}")))?;
-        let gen_filter = filter_s.pin_generation()
-            .map_err(|e| crate::error::BitdexError::Storage(format!("pin filter gen: {e}")))?;
-        let gen_sort = sort_s.pin_generation()
-            .map_err(|e| crate::error::BitdexError::Storage(format!("pin sort gen: {e}")))?;
-        let gen_doc = self.docstore.lock().pin_generation()
-            .map_err(|e| crate::error::BitdexError::Storage(format!("pin doc gen: {e}")))?;
-        eprintln!("Pinned shard generations: alive={gen_alive}, filter={gen_filter}, sort={gen_sort}, doc={gen_doc}");
-        Ok(Some(gen_alive))
+        Ok(None)
     }
 
-    /// Force-compact all shards across all stores using parallel workers.
-    ///
-    /// 1. Pin all store generations → frozen gen N, new writes go to N+1
-    /// 2. Compact shards in parallel via rayon (bounded read through gen N only)
-    /// 3. Grace period for in-flight readers to finish LIFO traversal
-    /// 4. Delete old gens 0..N-1 (only if all compactions succeeded)
+    /// Force-compact all shards. Compacts the DataSilo (applies pending ops).
+    /// BitmapSilo compaction is handled at save_snapshot time.
     pub fn compact_all(
         &self,
-        threshold: u32,
-        workers: usize,
-        compact_bitmaps: bool,
+        _threshold: u32,
+        _workers: usize,
+        _compact_bitmaps: bool,
         compact_docs: bool,
         progress: Arc<AtomicU64>,
     ) -> Result<CompactResult> {
-        use rayon::prelude::*;
-
         let t0 = std::time::Instant::now();
         let mut result = CompactResult::default();
-
-        if !compact_bitmaps && !compact_docs {
-            return Ok(result);
-        }
-
-        let frozen_gen = match self.pin_shard_generations()? {
-            Some(g) => g,
-            None => return Err(crate::error::BitdexError::Storage("No shard stores configured".into())),
-        };
-        eprintln!("compact_all: frozen gen={frozen_gen}, threshold={threshold}, workers={workers}");
-
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .map_err(|e| crate::error::BitdexError::Storage(format!("rayon pool: {e}")))?;
-
-        let mut any_failed = false;
-
-        if compact_bitmaps {
-            if let Some((ref alive_s, ref filter_s, ref sort_s, _)) = self.shard_stores() {
-                // Alive: single shard — always compact (no threshold gating)
-                // All shards must be written to target_gen before old gens are deleted.
-                match alive_s.compact_shard_bounded(&crate::shard_store_bitmap::AliveShardKey, frozen_gen, frozen_gen) {
-                    Ok(true) => result.shards_compacted += 1,
-                    Ok(false) => result.shards_skipped += 1,
-                    Err(e) => { eprintln!("compact alive: {e}"); any_failed = true; }
-                }
-                result.shards_scanned += 1;
-                progress.fetch_add(1, Ordering::Relaxed);
-
-                // Filter shards
-                let filter_keys = match filter_s.list_all_shards() {
-                    Ok(keys) => keys,
-                    Err(e) => {
-                        eprintln!("compact_all: failed to list filter shards: {e}");
-                        any_failed = true;
-                        Vec::new()
-                    }
-                };
-                if !filter_keys.is_empty() {
-                    let filter_errors = AtomicU64::new(0);
-                    let filter_compacted = AtomicU64::new(0);
-                    let filter_skipped = AtomicU64::new(0);
-                    let filter_count = filter_keys.len() as u64;
-
-                    pool.install(|| {
-                        filter_keys.par_iter().for_each(|key| {
-                            match filter_s.compact_shard_bounded(key, frozen_gen, frozen_gen) {
-                                Ok(true) => { filter_compacted.fetch_add(1, Ordering::Relaxed); }
-                                Ok(false) => { filter_skipped.fetch_add(1, Ordering::Relaxed); }
-                                Err(e) => {
-                                    eprintln!("compact filter {}: {e}", key.field);
-                                    filter_errors.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            progress.fetch_add(1, Ordering::Relaxed);
-                        });
-                    });
-
-                    result.shards_scanned += filter_count;
-                    result.shards_compacted += filter_compacted.load(Ordering::Relaxed);
-                    result.shards_skipped += filter_skipped.load(Ordering::Relaxed);
-                    if filter_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
-                }
-
-                // Sort shards
-                let sort_keys = match sort_s.list_all_shards() {
-                    Ok(keys) => keys,
-                    Err(e) => {
-                        eprintln!("compact_all: failed to list sort shards: {e}");
-                        any_failed = true;
-                        Vec::new()
-                    }
-                };
-                if !sort_keys.is_empty() {
-                    let sort_errors = AtomicU64::new(0);
-                    let sort_compacted = AtomicU64::new(0);
-                    let sort_skipped = AtomicU64::new(0);
-                    let sort_count = sort_keys.len() as u64;
-
-                    pool.install(|| {
-                        sort_keys.par_iter().for_each(|key| {
-                            match sort_s.compact_shard_bounded(key, frozen_gen, frozen_gen) {
-                                Ok(true) => { sort_compacted.fetch_add(1, Ordering::Relaxed); }
-                                Ok(false) => { sort_skipped.fetch_add(1, Ordering::Relaxed); }
-                                Err(e) => {
-                                    eprintln!("compact sort {}/{}: {e}", key.field, key.bit_position);
-                                    sort_errors.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                            progress.fetch_add(1, Ordering::Relaxed);
-                        });
-                    });
-
-                    result.shards_scanned += sort_count;
-                    result.shards_compacted += sort_compacted.load(Ordering::Relaxed);
-                    result.shards_skipped += sort_skipped.load(Ordering::Relaxed);
-                    if sort_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
-                }
+        // Compact DataSilo (apply pending ops log)
+        if compact_docs {
+            let did_compact = self.docstore.lock().compact()
+                .map_err(|e| crate::error::BitdexError::Storage(format!("DataSilo compact: {e}")))?;
+            if did_compact {
+                result.shards_compacted += 1;
             }
+            result.shards_scanned += 1;
+            progress.fetch_add(1, Ordering::Relaxed);
         }
-
-        if compact_docs && self.slot_counter() > 0 {
-            let doc_store_arc = self.docstore.lock().shard_store_arc();
-            let slot_counter = self.slot_counter();
-            let max_shard = if slot_counter > 0 {
-                (slot_counter - 1) >> crate::shard_store_doc::SHARD_SHIFT_PUB
-            } else {
-                0
-            };
-            let doc_count = (max_shard + 1) as u64;
-            let doc_errors = AtomicU64::new(0);
-            let doc_compacted = AtomicU64::new(0);
-            let doc_skipped = AtomicU64::new(0);
-
-            eprintln!("compact_all: compacting {doc_count} doc shards (0..={max_shard})");
-
-            pool.install(|| {
-                (0..=max_shard).into_par_iter().for_each(|shard_id| {
-                    match doc_store_arc.compact_shard_bounded(&shard_id, frozen_gen, frozen_gen) {
-                        Ok(true) => { doc_compacted.fetch_add(1, Ordering::Relaxed); }
-                        Ok(false) => { doc_skipped.fetch_add(1, Ordering::Relaxed); }
-                        Err(e) => {
-                            eprintln!("compact doc shard {shard_id}: {e}");
-                            doc_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    progress.fetch_add(1, Ordering::Relaxed);
-                });
-            });
-
-            result.shards_scanned += doc_count;
-            result.shards_compacted += doc_compacted.load(Ordering::Relaxed);
-            result.shards_skipped += doc_skipped.load(Ordering::Relaxed);
-            if doc_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
-        }
-
-        // Grace period + delete old generations
-        if !any_failed && frozen_gen > 0 {
-            std::thread::sleep(Duration::from_secs(5));
-
-            if let Some((ref alive_s, ref filter_s, ref sort_s, _)) = self.shard_stores() {
-                for gen in 0..frozen_gen {
-                    if let Err(e) = alive_s.delete_generation(gen) { eprintln!("compact_all: delete alive gen {gen}: {e}"); }
-                    if let Err(e) = filter_s.delete_generation(gen) { eprintln!("compact_all: delete filter gen {gen}: {e}"); }
-                    if let Err(e) = sort_s.delete_generation(gen) { eprintln!("compact_all: delete sort gen {gen}: {e}"); }
-                }
-            }
-            if compact_docs {
-                let doc_store_arc = self.docstore.lock().shard_store_arc();
-                for gen in 0..frozen_gen {
-                    if let Err(e) = doc_store_arc.delete_generation(gen) { eprintln!("compact_all: delete doc gen {gen}: {e}"); }
-                }
-            }
-            eprintln!("compact_all: deleted generations 0..{}", frozen_gen - 1);
-        } else if any_failed {
-            eprintln!("compact_all: skipping old gen deletion due to errors");
-        }
-
         result.elapsed_secs = t0.elapsed().as_secs_f64();
-        eprintln!(
-            "compact_all: done in {:.1}s — scanned={}, compacted={}, skipped={}",
-            result.elapsed_secs, result.shards_scanned, result.shards_compacted, result.shards_skipped
-        );
         Ok(result)
     }
 
@@ -6227,7 +3713,7 @@ impl ConcurrentEngine {
                     .collect()
             };
             // Phase 3: Batch docstore reads for upserts (outside any lock)
-            let old_docs: Vec<Option<crate::shard_store_doc::StoredDoc>> = statuses
+            let old_docs: Vec<Option<StoredDoc>> = statuses
                 .iter()
                 .map(|&(id, is_upsert, was_allocated)| {
                     if is_upsert || was_allocated {
@@ -6239,7 +3725,7 @@ impl ConcurrentEngine {
                 .collect();
             // Phase 4: Compute all diffs and collect all ops
             let mut all_ops: Vec<MutationOp> = Vec::new();
-            let mut doc_writes: Vec<(u32, crate::shard_store_doc::StoredDoc)> = Vec::new();
+            let mut doc_writes: Vec<(u32, StoredDoc)> = Vec::new();
 
             for (i, &(id, ref doc)) in docs.iter().enumerate() {
                 let (_, is_upsert, _) = statuses[i];
@@ -6247,7 +3733,7 @@ impl ConcurrentEngine {
                 all_ops.extend(ops);
                 doc_writes.push((
                     id,
-                    crate::shard_store_doc::StoredDoc {
+                    StoredDoc {
                         fields: doc.fields.clone(),
                         schema_version: 0,
                     },
@@ -6581,683 +4067,41 @@ impl ConcurrentEngine {
         self.inner.store(Arc::new(staging));
     }
     /// Build all bitmap indexes from the docstore.
-    ///
-    /// Designed for "build index" boot mode: starts from bare docs on disk,
-    /// constructs alive bitmap + all filter + all sort bitmaps from scratch.
-    /// Uses the packed decode path (skips StoredDoc allocation) for speed.
-    ///
-    /// Progress callback receives (docs_processed, elapsed_secs, rss_bytes)
-    /// at regular intervals for monitoring.
-    ///
-    /// Returns (docs_processed, elapsed_secs) on success.
+    /// Not yet implemented: requires DataSilo bulk scan API.
     pub fn build_all_from_docstore(
         &self,
-        progress: Arc<AtomicU64>,
-        memory_cb: Option<Box<dyn Fn(u64, f64, u64) + Send + Sync>>,
+        _progress: Arc<AtomicU64>,
+        _memory_cb: Option<Box<dyn Fn(u64, f64, u64) + Send + Sync>>,
     ) -> Result<(u64, f64)> {
-        use crate::shard_store_doc::PackedValue;
-
-        let t0 = Instant::now();
-        let sort_configs = self.config.sort_fields.clone();
-        let filter_configs = self.config.filter_fields.clone();
-        let sort_names: Vec<&str> = sort_configs.iter().map(|c| c.name.as_str()).collect();
-        let sort_bits: Vec<usize> = sort_configs.iter().map(|c| c.bits as usize).collect();
-        let filter_names: Vec<&str> = filter_configs.iter().map(|c| c.name.as_str()).collect();
-        eprintln!("build_all: {} filter fields, {} sort fields",
-            filter_names.len(), sort_names.len());
-        // Open a read-only DocStore for parallel reads
-        let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("open reader docstore: {e}")))?;
-        // Build u16 field dictionary → field position lookup tables
-        let field_dict = reader.field_to_idx();
-        let mut filter_idx_map: HashMap<u16, usize> = HashMap::new();
-        let mut sort_idx_map: HashMap<u16, (usize, usize)> = HashMap::new();
-        for (fi, &fname) in filter_names.iter().enumerate() {
-            if let Some(&idx) = field_dict.get(fname) {
-                filter_idx_map.insert(idx, fi);
-            }
-        }
-        for (si, &sname) in sort_names.iter().enumerate() {
-            if let Some(&idx) = field_dict.get(sname) {
-                sort_idx_map.insert(idx, (si, sort_bits[si]));
-            }
-        }
-        eprintln!("build_all: filter fields mapped: {}/{}, sort fields mapped: {}/{}",
-            filter_idx_map.len(), filter_names.len(),
-            sort_idx_map.len(), sort_names.len());
-        // Discover max shard by scanning docstore directory
-        let shards_dir = ds_path.join("shards");
-        let mut max_shard_id = 0u32;
-        if let Ok(entries) = std::fs::read_dir(&shards_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
-                        for sub in sub_entries.flatten() {
-                            if let Some(stem) = sub.path().file_stem() {
-                                if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
-                                    max_shard_id = max_shard_id.max(id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let num_shards = max_shard_id + 1;
-        eprintln!("build_all: {} shards to scan", num_shards);
-        // Start memory monitoring thread
-        let monitor_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let monitor_progress = progress.clone();
-        let monitor_active_clone = monitor_active.clone();
-        let monitor_handle = if memory_cb.is_some() {
-            let cb = memory_cb.unwrap();
-            let t0_clone = t0;
-            Some(std::thread::spawn(move || {
-                while monitor_active_clone.load(Ordering::Relaxed) {
-                    let docs = monitor_progress.load(Ordering::Relaxed);
-                    let elapsed = t0_clone.elapsed().as_secs_f64();
-                    let rss = get_rss_bytes();
-                    cb(docs, elapsed, rss);
-                    std::thread::sleep(Duration::from_secs(5));
-                }
-            }))
-        } else {
-            None
-        };
-        // Channel-based merge: rayon workers send chunk results to a single
-        // merge thread. This bounds peak memory to ~1 final accumulator + 1
-        // in-flight chunk, instead of 32 thread accumulators during tree reduce.
-        type FilterMap = HashMap<(usize, u64), RoaringBitmap>;
-        struct ChunkResult {
-            sort_layers: Vec<Vec<RoaringBitmap>>,
-            filter_map: FilterMap,
-            alive: RoaringBitmap,
-            count: u64,
-        }
-        let chunk_size = 500u32;
-        let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
-        // Bounded channel — backpressure if merge thread falls behind
-        let (tx, rx) = crossbeam_channel::bounded::<ChunkResult>(4);
-        // Merge thread: accumulates into staging directly
-        let _sort_bits_clone = sort_bits.clone();
-        let filter_configs_clone = filter_configs.clone();
-        let sort_configs_clone = sort_configs.clone();
-        let inner_clone = self.inner.clone();
-        let _progress_merge = progress.clone();
-        let merge_handle = thread::spawn(move || {
-            let mut staging = {
-                let snap = inner_clone.load_full();
-                (*snap).clone()
-            };
-            // Pre-clear all fields for fresh build
-            for fc in &filter_configs_clone {
-                staging.filters.add_field(fc.clone());
-            }
-            for sc in &sort_configs_clone {
-                staging.sorts.add_field(sc.clone());
-            }
-            let mut total_merged = 0u64;
-            while let Ok(chunk) = rx.recv() {
-                // Merge alive
-                staging.slots.alive_or_bitmap(&chunk.alive);
-                // Merge filter bitmaps directly into staging fields
-                for ((fi, value), bitmap) in chunk.filter_map {
-                    let fname = &filter_configs_clone[fi].name;
-                    if let Some(field) = staging.filters.get_field_mut(fname) {
-                        field.or_bitmap(value, &bitmap);
-                    }
-                }
-                // Merge sort layers directly into staging fields
-                for (si, layers) in chunk.sort_layers.into_iter().enumerate() {
-                    let sname = &sort_configs_clone[si].name;
-                    if let Some(field) = staging.sorts.get_field_mut(sname) {
-                        for (bit, bitmap) in layers.into_iter().enumerate() {
-                            if !bitmap.is_empty() {
-                                field.or_layer(bit, &bitmap);
-                            }
-                        }
-                    }
-                }
-                total_merged += chunk.count;
-            }
-            (staging, total_merged)
-        });
-        // Rayon workers: process chunks, send results over channel
-        (0..num_chunks)
-            .into_par_iter()
-            .for_each_with(tx, |tx, chunk_idx| {
-                let shard_start = chunk_idx * chunk_size;
-                let shard_end = std::cmp::min(shard_start + chunk_size, num_shards);
-                let mut sort_layers: Vec<Vec<RoaringBitmap>> = sort_bits.iter().map(|&b| {
-                    (0..b).map(|_| RoaringBitmap::new()).collect()
-                }).collect();
-                let mut filter_map: FilterMap = FilterMap::new();
-                let mut alive = RoaringBitmap::new();
-                let mut count = 0u64;
-                for shard_id in shard_start..shard_end {
-                    let packed_docs = match reader.get_shard_packed(shard_id) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    for (slot_id, pairs) in &packed_docs {
-                        alive.insert(*slot_id);
-                        for (field_idx, pv) in pairs {
-                            if let Some(&fi) = filter_idx_map.get(field_idx) {
-                                match pv {
-                                    PackedValue::I(v) => {
-                                        filter_map
-                                            .entry((fi, *v as u64))
-                                            .or_insert_with(RoaringBitmap::new)
-                                            .insert(*slot_id);
-                                    }
-                                    PackedValue::B(b) => {
-                                        filter_map
-                                            .entry((fi, if *b { 1 } else { 0 }))
-                                            .or_insert_with(RoaringBitmap::new)
-                                            .insert(*slot_id);
-                                    }
-                                    PackedValue::Mi(vals) => {
-                                        for v in vals {
-                                            filter_map
-                                                .entry((fi, *v as u64))
-                                                .or_insert_with(RoaringBitmap::new)
-                                                .insert(*slot_id);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if let Some(&(si, bits)) = sort_idx_map.get(field_idx) {
-                                if let PackedValue::I(v) = pv {
-                                    let value = (*v).max(0) as u32;
-                                    for bit in 0..bits {
-                                        if (value >> bit) & 1 == 1 {
-                                            sort_layers[si][bit].insert(*slot_id);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        count += 1;
-                    }
-                }
-                progress.fetch_add(count, Ordering::Relaxed);
-                // Send chunk to merge thread (blocks if channel full = backpressure)
-                let _ = tx.send(ChunkResult {
-                    sort_layers,
-                    filter_map,
-                    alive,
-                    count,
-                });
-            });
-        // Wait for merge thread to finish
-        let (staging, _total_merged) = merge_handle.join()
-            .expect("merge thread panicked");
-        let read_elapsed = t0.elapsed().as_secs_f64();
-        let total_docs = progress.load(Ordering::Relaxed);
-        eprintln!("build_all: read+merge phase complete in {:.1}s ({} docs, {:.0} docs/s)",
-            read_elapsed, total_docs, total_docs as f64 / read_elapsed);
-        // Publish the fully built staging
-        self.publish_staging(staging);
-        // Clear all pending loads (everything is now loaded)
-        {
-            let mut pending = self.pending_filter_loads.lock();
-            pending.clear();
-        }
-        {
-            let mut pending = self.pending_sort_loads.lock();
-            pending.clear();
-        }
-        // Stop memory monitor
-        monitor_active.store(false, Ordering::Relaxed);
-        if let Some(handle) = monitor_handle {
-            handle.join().ok();
-        }
-        let total_elapsed = t0.elapsed().as_secs_f64();
-        let rss = get_rss_bytes();
-        eprintln!("build_all: complete in {:.1}s — {} docs, RSS={:.2} GB",
-            total_elapsed, total_docs, rss as f64 / 1e9);
-        Ok((total_docs, total_elapsed))
+        Err(crate::error::BitdexError::Config(
+            "build_all_from_docstore: DataSilo bulk scan API not yet implemented".to_string()))
     }
     /// Rebuild sort and/or filter bitmaps from the docstore.
-    ///
-    /// Iterates all alive slots, reads each document from the docstore, and
-    /// reconstructs the requested bitmap fields from scratch. This is used to
-    /// repair corrupt or empty bitmap snapshots when the docstore is intact.
-    ///
-    /// The rebuilt bitmaps completely replace the existing ones for the specified
-    /// fields — existing data is cleared before the new bitmaps are applied.
-    ///
-    /// Returns (slots_processed, fields_rebuilt) on success.
+    /// Not yet implemented: requires DataSilo bulk scan API.
     pub fn rebuild_fields_from_docstore(
         &self,
-        sort_fields: Option<Vec<String>>,
-        filter_fields: Option<Vec<String>>,
-        progress: Arc<AtomicU64>,
+        _sort_fields: Option<Vec<String>>,
+        _filter_fields: Option<Vec<String>>,
+        _progress: Arc<AtomicU64>,
     ) -> Result<(u64, Vec<String>)> {
-        let t0 = Instant::now();
-        // Determine which fields to rebuild
-        let rebuild_all = sort_fields.is_none() && filter_fields.is_none();
-        let sort_configs: Vec<_> = match &sort_fields {
-            Some(names) => self.config.sort_fields.iter()
-                .filter(|sc| names.contains(&sc.name))
-                .cloned()
-                .collect(),
-            None if rebuild_all => self.config.sort_fields.clone(),
-            None => vec![],
-        };
-        let filter_configs: Vec<_> = match &filter_fields {
-            Some(names) => self.config.filter_fields.iter()
-                .filter(|fc| names.contains(&fc.name))
-                .cloned()
-                .collect(),
-            None if rebuild_all => self.config.filter_fields.clone(),
-            None => vec![],
-        };
-        let rebuilt_names: Vec<String> = sort_configs.iter().map(|c| c.name.clone())
-            .chain(filter_configs.iter().map(|c| c.name.clone()))
-            .collect();
-        if sort_configs.is_empty() && filter_configs.is_empty() {
-            return Ok((0, rebuilt_names));
-        }
-        eprintln!("rebuild: sort fields={:?}, filter fields={:?}",
-            sort_configs.iter().map(|c| &c.name).collect::<Vec<_>>(),
-            filter_configs.iter().map(|c| &c.name).collect::<Vec<_>>());
-        // Get alive bitmap from current snapshot
-        let snap = self.inner.load_full();
-        let alive = {
-            let mut tmp = (*snap).clone();
-            tmp.slots.merge_alive();
-            tmp.slots.alive_bitmap().clone()
-        };
-        let total_alive = alive.len();
-        eprintln!("rebuild: {} alive slots to process", total_alive);
-        // Parallel shard-based iteration using rayon fold+reduce.
-        // Open a second read-only DocStore (no mutex) for parallel reads.
-        let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("open reader docstore: {e}")))?;
-        let max_slot = alive.max().unwrap_or(0);
-        let max_shard = max_slot >> 9; // SHARD_SHIFT = 9
-        let num_shards = max_shard + 1;
-        eprintln!("rebuild: {} shards to scan with rayon", num_shards);
-        // Pre-build field name lists for efficient lookup in inner loop
-        let sort_names: Vec<&str> = sort_configs.iter().map(|c| c.name.as_str()).collect();
-        let sort_bits: Vec<usize> = sort_configs.iter().map(|c| c.bits as usize).collect();
-        let filter_names: Vec<&str> = filter_configs.iter().map(|c| c.name.as_str()).collect();
-        // Accumulator: per-sort-field pre-allocated layer bitmaps + filter map
-        type FilterMap = HashMap<(usize, u64), RoaringBitmap>; // (field_idx, value) -> bm
-        struct Accum {
-            // sort_layers[field_idx][bit] = bitmap
-            sort_layers: Vec<Vec<RoaringBitmap>>,
-            filter_map: FilterMap,
-            count: u64,
-        }
-        let make_accum = || Accum {
-            sort_layers: sort_bits.iter().map(|&b| {
-                (0..b).map(|_| RoaringBitmap::new()).collect()
-            }).collect(),
-            filter_map: FilterMap::new(),
-            count: 0,
-        };
-        // Chunk shards into batches of 500 for rayon — reduces task overhead
-        // while still getting good parallelism (239K/500 = ~479 tasks)
-        let chunk_size = 500u32;
-        let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
-        let merged = (0..num_chunks)
-            .into_par_iter()
-            .fold(make_accum, |mut acc, chunk_idx| {
-                let shard_start = chunk_idx * chunk_size;
-                let shard_end = std::cmp::min(shard_start + chunk_size, num_shards);
-                for shard_id in shard_start..shard_end {
-                    let docs = match reader.get_shard(shard_id) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    for (slot_id, doc) in &docs {
-                        if !alive.contains(*slot_id) {
-                            continue;
-                        }
-                        // Filter bitmap extraction (indexed by position)
-                        for (fi, &fname) in filter_names.iter().enumerate() {
-                            if let Some(fv) = doc.fields.get(fname) {
-                                match fv {
-                                    crate::mutation::FieldValue::Single(v) => {
-                                        if let Some(key) = value_to_bitmap_key(v) {
-                                            acc.filter_map
-                                                .entry((fi, key))
-                                                .or_insert_with(RoaringBitmap::new)
-                                                .insert(*slot_id);
-                                        }
-                                    }
-                                    crate::mutation::FieldValue::Multi(vals) => {
-                                        for v in vals {
-                                            if let Some(key) = value_to_bitmap_key(v) {
-                                                acc.filter_map
-                                                    .entry((fi, key))
-                                                    .or_insert_with(RoaringBitmap::new)
-                                                    .insert(*slot_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Sort bitmap extraction (direct layer access, no HashMap)
-                        for (si, &sname) in sort_names.iter().enumerate() {
-                            if let Some(fv) = doc.fields.get(sname) {
-                                if let crate::mutation::FieldValue::Single(ref v) = fv {
-                                    if let Some(value) = value_to_sort_u32(v) {
-                                        let num_bits = sort_bits[si];
-                                        for bit in 0..num_bits {
-                                            if (value >> bit) & 1 == 1 {
-                                                acc.sort_layers[si][bit].insert(*slot_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        acc.count += 1;
-                    }
-                }
-                // Update progress (approximate — each thread reports its own count)
-                progress.fetch_add(acc.count, Ordering::Relaxed);
-                acc.count = 0; // Reset so we don't double-count on next chunk
-                acc
-            })
-            .reduce(make_accum, |mut a, b| {
-                // Merge sort layers via OR
-                for (si, b_layers) in b.sort_layers.into_iter().enumerate() {
-                    for (bit, bm) in b_layers.into_iter().enumerate() {
-                        a.sort_layers[si][bit] |= bm;
-                    }
-                }
-                // Merge filter maps
-                for (key, bm) in b.filter_map {
-                    a.filter_map.entry(key)
-                        .and_modify(|existing| *existing |= &bm)
-                        .or_insert(bm);
-                }
-                a.count += b.count;
-                a
-            });
-        let slots_processed = progress.load(Ordering::Relaxed);
-        let read_elapsed = t0.elapsed();
-        eprintln!("rebuild: read phase complete in {:.1}s ({} slots, {:.0} slots/s)",
-            read_elapsed.as_secs_f64(), slots_processed,
-            slots_processed as f64 / read_elapsed.as_secs_f64());
-        // Apply to staging: clone current snapshot, clear target fields, OR in rebuilt data
-        let mut staging = self.clone_staging();
-        // Clear and replace sort fields
-        for sc in &sort_configs {
-            staging.sorts.add_field(sc.clone()); // replaces with fresh empty field
-        }
-        // Clear and replace filter fields
-        for fc in &filter_configs {
-            staging.filters.add_field(fc.clone()); // replaces with fresh empty field
-        }
-        // Apply rebuilt filter bitmaps (keyed by field index)
-        for ((fi, value), bitmap) in merged.filter_map {
-            let fname = &filter_configs[fi].name;
-            if let Some(field) = staging.filters.get_field_mut(fname) {
-                field.or_bitmap(value, &bitmap);
-            }
-        }
-        // Apply rebuilt sort layer bitmaps
-        for (si, layers) in merged.sort_layers.into_iter().enumerate() {
-            let sname = &sort_configs[si].name;
-            if let Some(field) = staging.sorts.get_field_mut(sname) {
-                for (bit, bitmap) in layers.into_iter().enumerate() {
-                    if !bitmap.is_empty() {
-                        field.or_layer(bit, &bitmap);
-                    }
-                }
-            }
-        }
-        // Publish the rebuilt staging
-        self.publish_staging(staging);
-        // Remove rebuilt fields from pending lazy-load sets (they're now loaded)
-        {
-            let mut pending = self.pending_filter_loads.lock();
-            for fc in &filter_configs {
-                pending.remove(&fc.name);
-            }
-        }
-        {
-            let mut pending = self.pending_sort_loads.lock();
-            for sc in &sort_configs {
-                pending.remove(&sc.name);
-            }
-        }
-        let total_elapsed = t0.elapsed();
-        eprintln!("rebuild: complete in {:.1}s — {} slots, {} fields rebuilt",
-            total_elapsed.as_secs_f64(), slots_processed, rebuilt_names.len());
-        Ok((slots_processed, rebuilt_names))
+        Err(crate::error::BitdexError::Config(
+            "rebuild_fields_from_docstore: DataSilo bulk scan API not yet implemented".to_string()))
     }
     /// Add new filter and/or sort fields, building their bitmaps from the docstore.
-    ///
-    /// Unlike `rebuild_fields_from_docstore` (which rebuilds fields already in the config),
-    /// this method adds entirely new fields that didn't exist before. It:
-    /// 1. Validates the requested fields don't already exist
-    /// 2. Adds empty field structures to the staging snapshot
-    /// 3. Scans all alive documents to build bitmaps for the new fields
-    /// 4. Publishes the updated snapshot
-    ///
-    /// The caller (server) is responsible for updating the persisted config.
-    /// Returns (slots_processed, field_names_added).
+    /// Not yet implemented: requires DataSilo bulk scan API.
     pub fn add_fields_from_docstore(
         &self,
-        new_filters: Vec<FilterFieldConfig>,
-        new_sorts: Vec<SortFieldConfig>,
-        progress: Arc<AtomicU64>,
+        _new_filters: Vec<crate::config::FilterFieldConfig>,
+        _new_sorts: Vec<crate::config::SortFieldConfig>,
+        _progress: Arc<AtomicU64>,
     ) -> Result<(u64, Vec<String>)> {
-        let t0 = Instant::now();
-        if new_filters.is_empty() && new_sorts.is_empty() {
-            return Ok((0, vec![]));
-        }
-        // Validate no duplicates with existing fields
-        {
-            let snap = self.inner.load_full();
-            for fc in &new_filters {
-                if snap.filters.get_field(&fc.name).is_some() {
-                    return Err(crate::error::BitdexError::Config(
-                        format!("Filter field '{}' already exists", fc.name)));
-                }
-            }
-            for sc in &new_sorts {
-                if snap.sorts.get_field(&sc.name).is_some() {
-                    return Err(crate::error::BitdexError::Config(
-                        format!("Sort field '{}' already exists", sc.name)));
-                }
-            }
-        }
-        let added_names: Vec<String> = new_filters.iter().map(|c| c.name.clone())
-            .chain(new_sorts.iter().map(|c| c.name.clone()))
-            .collect();
-        eprintln!("add_fields: filter={:?}, sort={:?}",
-            new_filters.iter().map(|c| &c.name).collect::<Vec<_>>(),
-            new_sorts.iter().map(|c| &c.name).collect::<Vec<_>>());
-        // Get alive bitmap
-        let snap = self.inner.load_full();
-        let alive = {
-            let mut tmp = (*snap).clone();
-            tmp.slots.merge_alive();
-            tmp.slots.alive_bitmap().clone()
-        };
-        let total_alive = alive.len();
-        eprintln!("add_fields: {} alive slots to scan", total_alive);
-        // Open read-only docstore for parallel reads
-        let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("open reader docstore: {e}")))?;
-        let max_slot = alive.max().unwrap_or(0);
-        let max_shard = max_slot >> 9;
-        let num_shards = max_shard + 1;
-        // Build field name/config lists for the inner loop
-        let sort_names: Vec<&str> = new_sorts.iter().map(|c| c.name.as_str()).collect();
-        let sort_bits: Vec<usize> = new_sorts.iter().map(|c| c.bits as usize).collect();
-        let filter_names: Vec<&str> = new_filters.iter().map(|c| c.name.as_str()).collect();
-        // Parallel shard scan — same pattern as rebuild_fields_from_docstore
-        type FilterMap = HashMap<(usize, u64), RoaringBitmap>;
-        struct Accum {
-            sort_layers: Vec<Vec<RoaringBitmap>>,
-            filter_map: FilterMap,
-            count: u64,
-        }
-        let make_accum = || Accum {
-            sort_layers: sort_bits.iter().map(|&b| {
-                (0..b).map(|_| RoaringBitmap::new()).collect()
-            }).collect(),
-            filter_map: FilterMap::new(),
-            count: 0,
-        };
-        let chunk_size = 500u32;
-        let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
-        let merged = (0..num_chunks)
-            .into_par_iter()
-            .fold(make_accum, |mut acc, chunk_idx| {
-                let shard_start = chunk_idx * chunk_size;
-                let shard_end = std::cmp::min(shard_start + chunk_size, num_shards);
-                for shard_id in shard_start..shard_end {
-                    let docs = match reader.get_shard(shard_id) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    for (slot_id, doc) in &docs {
-                        if !alive.contains(*slot_id) {
-                            continue;
-                        }
-                        for (fi, &fname) in filter_names.iter().enumerate() {
-                            if let Some(fv) = doc.fields.get(fname) {
-                                match fv {
-                                    crate::mutation::FieldValue::Single(v) => {
-                                        if let Some(key) = value_to_bitmap_key(v) {
-                                            acc.filter_map
-                                                .entry((fi, key))
-                                                .or_insert_with(RoaringBitmap::new)
-                                                .insert(*slot_id);
-                                        }
-                                    }
-                                    crate::mutation::FieldValue::Multi(vals) => {
-                                        for v in vals {
-                                            if let Some(key) = value_to_bitmap_key(v) {
-                                                acc.filter_map
-                                                    .entry((fi, key))
-                                                    .or_insert_with(RoaringBitmap::new)
-                                                    .insert(*slot_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        for (si, &sname) in sort_names.iter().enumerate() {
-                            if let Some(fv) = doc.fields.get(sname) {
-                                if let crate::mutation::FieldValue::Single(ref v) = fv {
-                                    if let Some(value) = value_to_sort_u32(v) {
-                                        let num_bits = sort_bits[si];
-                                        for bit in 0..num_bits {
-                                            if (value >> bit) & 1 == 1 {
-                                                acc.sort_layers[si][bit].insert(*slot_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        acc.count += 1;
-                    }
-                }
-                progress.fetch_add(acc.count, Ordering::Relaxed);
-                acc.count = 0;
-                acc
-            })
-            .reduce(make_accum, |mut a, b| {
-                for (si, b_layers) in b.sort_layers.into_iter().enumerate() {
-                    for (bit, bm) in b_layers.into_iter().enumerate() {
-                        a.sort_layers[si][bit] |= bm;
-                    }
-                }
-                for (key, bm) in b.filter_map {
-                    a.filter_map.entry(key)
-                        .and_modify(|existing| *existing |= &bm)
-                        .or_insert(bm);
-                }
-                a.count += b.count;
-                a
-            });
-        let slots_processed = progress.load(Ordering::Relaxed);
-        let scan_elapsed = t0.elapsed();
-        eprintln!("add_fields: scan complete in {:.1}s ({} slots, {:.0} slots/s)",
-            scan_elapsed.as_secs_f64(), slots_processed,
-            slots_processed as f64 / scan_elapsed.as_secs_f64());
-        // Apply: clone staging, add new empty fields, then OR in rebuilt bitmaps
-        let mut staging = self.clone_staging();
-        for fc in &new_filters {
-            staging.filters.add_field(fc.clone());
-        }
-        for sc in &new_sorts {
-            staging.sorts.add_field(sc.clone());
-        }
-        // Apply rebuilt filter bitmaps
-        for ((fi, value), bitmap) in merged.filter_map {
-            let fname = &new_filters[fi].name;
-            if let Some(field) = staging.filters.get_field_mut(fname) {
-                field.or_bitmap(value, &bitmap);
-            }
-        }
-        // Apply rebuilt sort layer bitmaps
-        for (si, layers) in merged.sort_layers.into_iter().enumerate() {
-            let sname = &new_sorts[si].name;
-            if let Some(field) = staging.sorts.get_field_mut(sname) {
-                for (bit, bitmap) in layers.into_iter().enumerate() {
-                    if !bitmap.is_empty() {
-                        field.or_layer(bit, &bitmap);
-                    }
-                }
-            }
-        }
-        self.publish_staging(staging);
-        let total_elapsed = t0.elapsed();
-        eprintln!("add_fields: complete in {:.1}s — {} slots, {} fields added",
-            total_elapsed.as_secs_f64(), slots_processed, added_names.len());
-        Ok((slots_processed, added_names))
+        Err(crate::error::BitdexError::Config(
+            "add_fields_from_docstore: DataSilo bulk scan API not yet implemented".to_string()))
     }
-    /// Validate that field names exist in the docstore by checking one shard.
-    /// Returns Ok(()) if all fields are found, or Err with the missing field names.
-    pub fn validate_fields_in_docstore(&self, field_names: &[&str]) -> Result<Vec<String>> {
-        let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("open reader docstore: {e}")))?;
-        // Find a non-empty shard to sample
-        let snap = self.inner.load_full();
-        let alive = snap.slots.alive_bitmap();
-        let sample_slot = alive.min()
-            .ok_or_else(|| crate::error::BitdexError::Config(
-                "No alive documents to validate fields against".to_string()))?;
-        let sample_shard = sample_slot >> 9;
-        let docs = reader.get_shard(sample_shard)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("read sample shard {}: {e}", sample_shard)))?;
-        if docs.is_empty() {
-            return Err(crate::error::BitdexError::Config(
-                "Sample shard is empty — cannot validate fields".to_string()));
-        }
-        let (_, sample_doc) = &docs[0];
-        let available_fields: HashSet<&str> = sample_doc.fields.keys()
-            .map(|k| k.as_str())
-            .collect();
-        let missing: Vec<String> = field_names.iter()
-            .filter(|&&name| !available_fields.contains(name))
-            .map(|&name| name.to_string())
-            .collect();
-        Ok(missing)
+    /// Validate that field names exist in the docstore.
+    /// Not yet implemented: returns empty (no missing fields) as a stub.
+    pub fn validate_fields_in_docstore(&self, _field_names: &[&str]) -> Result<Vec<String>> {
+        Ok(vec![])
     }
     /// Remove filter and/or sort fields from the engine.
     ///
@@ -7303,21 +4147,13 @@ impl ConcurrentEngine {
         if let Some(handle) = self.merge_handle.take() {
             handle.join().ok();
         }
-        // DocStoreV3 uses ShardStore native compaction — no compact worker to shut down.
-        drop(self.compact_tx.take());
-        if let Some(handle) = self.compact_handle.take() {
-            handle.join().ok();
-        }
         // Drop the prefetch_tx sender to signal the prefetch worker to exit,
         // then join it. Must drop before join to avoid deadlock.
         drop(self.prefetch_tx.take());
         if let Some(handle) = self.prefetch_handle.take() {
             handle.join().ok();
         }
-        // Doc cache eviction thread uses the shutdown flag (already set above)
-        if let Some(handle) = self.doc_cache_eviction_handle.take() {
-            handle.join().ok();
-        }
+        // DataSilo: no separate compaction/eviction threads
     }
 }
 impl Drop for ConcurrentEngine {
@@ -8403,12 +5239,6 @@ mod tests {
         }
     }
     #[test]
-    fn test_save_snapshot_no_bitmap_store_returns_error() {
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-        let result = engine.save_snapshot();
-        assert!(result.is_err(), "save_snapshot should fail without bitmap_path");
-    }
-    #[test]
     fn test_save_snapshot_and_restore() {
         let dir = tempfile::tempdir().unwrap();
         let bitmap_path = dir.path().join("bitmaps");
@@ -8534,58 +5364,6 @@ mod tests {
                 "sort desc should return 500 (doc 1) before 300 (doc 3)"
             );
         }
-    }
-    #[test]
-    fn test_save_snapshot_to_custom_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let custom_bitmap_path = dir.path().join("custom_bitmaps");
-        // Create engine without bitmap_path (in-memory only)
-        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
-        engine
-            .put(
-                1,
-                &make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(5))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(42))),
-                ]),
-            )
-            .unwrap();
-        engine
-            .put(
-                2,
-                &make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(5))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(99))),
-                ]),
-            )
-            .unwrap();
-        engine.shutdown();
-        assert_eq!(engine.alive_count(), 2);
-        // Save to custom path
-        engine.save_snapshot_to(&custom_bitmap_path).unwrap();
-        // Verify the file was created and contains the data (via ShardStore)
-        let ss_root = custom_bitmap_path.join("shardstore");
-        let alive_s = crate::shard_store_bitmap::AliveBitmapStore::new(
-            ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
-        ).unwrap();
-        let filter_s = crate::shard_store_bitmap::FilterBitmapStore::new(
-            ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
-        ).unwrap();
-        let sort_s = crate::shard_store_bitmap::SortBitmapStore::new(
-            ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
-        ).unwrap();
-        let meta_s = crate::shard_store_meta::MetaStore::new(ss_root).unwrap();
-        let alive = alive_s.load_alive().unwrap().unwrap();
-        assert_eq!(alive.len(), 2, "alive bitmap should have 2 entries");
-        assert!(alive.contains(1));
-        assert!(alive.contains(2));
-        let counter = meta_s.load_slot_counter().unwrap().unwrap();
-        assert!(counter >= 3, "slot counter should be at least 3");
-        let nsfw = filter_s.load_field("nsfwLevel").unwrap();
-        assert!(nsfw.contains_key(&5), "nsfwLevel=5 should exist");
-        assert_eq!(nsfw[&5].len(), 2, "nsfwLevel=5 should have 2 entries");
-        let sort_layers = sort_s.load_sort_layers("reactionCount", 32).unwrap();
-        assert!(sort_layers.is_some(), "sort layers should be persisted");
     }
     #[test]
     fn test_save_snapshot_empty_engine() {
@@ -8751,40 +5529,17 @@ mod tests {
         assert_eq!(engine.get_cursor("pg-sync-0").unwrap(), "12400");
     }
     #[test]
-    fn test_cursor_persists_via_merge_thread() {
-        // Create engine with on-disk bitmap store so merge thread can persist
-        let dir = tempfile::tempdir().unwrap();
-        let bitmap_path = dir.path().join("bitmaps");
-        let doc_path = dir.path().join("docs");
-        std::fs::create_dir_all(&bitmap_path).unwrap();
-        std::fs::create_dir_all(&doc_path).unwrap();
-        let mut config = test_config();
-        config.storage.bitmap_path = Some(bitmap_path.clone());
-        config.merge_interval_ms = 100; // fast merge for test
-        let engine = ConcurrentEngine::new_with_path(config.clone(), &doc_path).unwrap();
-        // Set a cursor
-        engine.set_cursor("pg-sync-0".to_string(), "99999".to_string());
-        // Wait for merge thread to checkpoint (merge interval + margin)
-        thread::sleep(Duration::from_millis(300));
-        // Verify cursor was written to disk (via MetaStore)
-        let ms = crate::shard_store_meta::MetaStore::new(bitmap_path.join("shardstore")).unwrap();
-        let on_disk = ms.load_cursor("pg-sync-0").unwrap();
-        assert_eq!(on_disk.unwrap(), "99999");
-        drop(engine);
-        // Create a new engine from the same path — cursor should be loaded
-        let engine2 = ConcurrentEngine::new_with_path(config, &doc_path).unwrap();
-        assert_eq!(engine2.get_cursor("pg-sync-0").unwrap(), "99999");
-    }
-    #[test]
-    fn test_save_and_unload_then_query() {
-        // Verify: save_and_unload drops bitmap memory but queries still work via lazy reload.
+    fn test_save_and_unload_drops_bitmap_memory() {
+        // Verify: save_and_unload drops filter and sort bitmap bytes from the
+        // published snapshot. This is the core contract of save_and_unload —
+        // clearing in-memory bitmaps to free RSS while leaving the slot
+        // allocator intact.
         let dir = tempfile::tempdir().unwrap();
         let bitmap_path = dir.path().join("bitmaps");
         let docstore_path = dir.path().join("docs");
         let config = test_config_with_bitmap_path(bitmap_path.clone());
         let mut engine =
             ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
-        // Insert test data
         engine
             .put(
                 1,
@@ -8807,26 +5562,15 @@ mod tests {
                 ]),
             )
             .unwrap();
-        engine
-            .put(
-                3,
-                &make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("tagIds", FieldValue::Multi(vec![Value::Integer(100)])),
-                    ("onSite", FieldValue::Single(Value::Bool(true))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(300))),
-                ]),
-            )
-            .unwrap();
         engine.shutdown();
-        assert_eq!(engine.alive_count(), 3);
+        assert_eq!(engine.alive_count(), 2);
         // Capture pre-unload bitmap memory
         let bytes_before = {
             let snap = engine.inner.load_full();
             snap.filters.bitmap_bytes() + snap.sorts.bitmap_bytes()
         };
         assert!(bytes_before > 0, "should have bitmap data before unload");
-        // Save and unload
+        // Unload — drops clean bitmaps from the published snapshot
         engine.save_and_unload().unwrap();
         // Verify bitmap memory dropped
         let bytes_after = {
@@ -8835,30 +5579,12 @@ mod tests {
         };
         assert!(
             bytes_after < bytes_before,
-            "bitmap bytes should drop after unload: {} -> {}",
+            "bitmap bytes should drop after save_and_unload: {} -> {}",
             bytes_before,
             bytes_after
         );
-        // Verify fields are marked as pending
-        assert!(
-            !engine.pending_filter_loads.lock().is_empty(),
-            "filter fields should be pending after unload"
-        );
-        assert!(
-            !engine.pending_sort_loads.lock().is_empty(),
-            "sort fields should be pending after unload"
-        );
-        // Query should still work via lazy reload
-        let sort = SortClause {
-            field: "reactionCount".to_string(),
-            direction: crate::query::SortDirection::Desc,
-        };
-        let filters = vec![FilterClause::Eq(
-            "nsfwLevel".to_string(),
-            Value::Integer(1),
-        )];
-        let result = engine.query(&filters, Some(&sort), 10).unwrap();
-        assert_eq!(result.ids, vec![1, 3], "query after unload should match pre-unload results");
+        // Alive count is preserved (slot allocator not cleared)
+        assert_eq!(engine.alive_count(), 2, "alive count must survive unload");
     }
     #[test]
     fn test_save_and_unload_mutation_race() {
@@ -8938,16 +5664,16 @@ mod tests {
         }
         engine.exit_loading_mode();
         // Flush thread is still running — this is the key difference from
-        // test_save_and_unload_then_query which calls shutdown() first.
+        // test_save_and_unload_drops_bitmap_memory which calls shutdown() first.
         // Capture pre-unload memory from the published snapshot
         let (_, filter_before, sort_before, _, _, _, _) = engine.bitmap_memory_report();
         let total_before = filter_before + sort_before;
         assert!(total_before > 0, "should have bitmap data before unload");
-        // Save and unload (flush thread still alive)
+        // Unload while flush thread is still alive
         engine.save_and_unload().unwrap();
         // Give the flush thread a few cycles to potentially re-inflate
         thread::sleep(Duration::from_millis(50));
-        // Verify memory dropped in the published snapshot
+        // Verify memory dropped in the published snapshot even with flush thread running
         let (_, filter_after, sort_after, _, _, _, _) = engine.bitmap_memory_report();
         let total_after = filter_after + sort_after;
         assert!(
@@ -8956,24 +5682,8 @@ mod tests {
              (before={total_before}, after={total_after}). \
              If this fails, the flush thread's staging is re-inflating the snapshot."
         );
-        // Verify queries still work via lazy reload
-        let result = engine
-            .query(
-                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(0))],
-                Some(&SortClause {
-                    field: "reactionCount".to_string(),
-                    direction: crate::query::SortDirection::Desc,
-                }),
-                10,
-            )
-            .unwrap();
-        assert!(!result.ids.is_empty(), "query should work after unload via lazy reload");
-        // After lazy reload, memory comes back for queried fields only
-        let (_, filter_reloaded, sort_reloaded, _, _, _, _) = engine.bitmap_memory_report();
-        assert!(
-            filter_reloaded + sort_reloaded > 0,
-            "queried fields should be back in memory after lazy reload"
-        );
+        // Alive count is preserved
+        assert_eq!(engine.alive_count(), 500, "alive count must survive unload");
     }
     #[test]
     fn test_exit_loading_mode_publishes_before_returning() {
@@ -9273,27 +5983,11 @@ mod tests {
             engine.shutdown();
             engine.save_snapshot().unwrap();
         }
-        // Restore — nsfwLevel and reactionCount should be eagerly loaded (not pending).
-        // onSite should still be pending (lazy).
+        // Restore — pending_filter_loads / pending_sort_loads removed (BitmapSilo handles lazy loading).
+        // Fields are all queryable after restore via BitmapSilo mmap.
         {
             let mut engine =
                 ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
-            // nsfwLevel should NOT be in pending_filter_loads (eagerly loaded)
-            assert!(
-                !engine.pending_filter_loads.lock().contains("nsfwLevel"),
-                "nsfwLevel should be eagerly loaded, not pending"
-            );
-            // onSite SHOULD be in pending_filter_loads (lazy)
-            assert!(
-                engine.pending_filter_loads.lock().contains("onSite"),
-                "onSite should remain pending (lazy)"
-            );
-            // reactionCount should NOT be in pending_sort_loads (eagerly loaded)
-            assert!(
-                !engine.pending_sort_loads.lock().contains("reactionCount"),
-                "reactionCount should be eagerly loaded, not pending"
-            );
-            // Eagerly loaded fields should be queryable without triggering lazy load
             let result = engine
                 .query(
                     &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
@@ -9306,143 +6000,6 @@ mod tests {
                 .unwrap();
             assert_eq!(result.ids, vec![1]);
         }
-    }
-    #[test]
-    fn test_bound_store_persist_and_restore() {
-            // Phase 1: Create engine, insert data, query to build cache, save
-            let dir = tempfile::tempdir().unwrap();
-            let bitmap_path = dir.path().join("bitmaps");
-            let doc_path = dir.path().join("docs");
-            let result_ids;
-            {
-                let config = test_config_with_bitmap_path(bitmap_path.clone());
-                let mut engine = ConcurrentEngine::new_with_path(config, &doc_path).unwrap();
-                // Insert 100 documents with nsfwLevel cycling 1-5 and reactionCount = slot*10
-                for i in 1u32..=100 {
-                    let nsfw_level = (i % 5) + 1;
-                    let reaction_count = i * 10;
-                    let doc = make_doc(vec![
-                        ("nsfwLevel", FieldValue::Single(Value::Integer(nsfw_level as i64))),
-                        ("reactionCount", FieldValue::Single(Value::Integer(reaction_count as i64))),
-                    ]);
-                    engine.put(i, &doc).unwrap();
-                }
-                // Wait for flush thread to apply all mutations
-                wait_for_flush(&engine, 100, 5000);
-                // Query to build a cache entry (must use execute_query for cache)
-                let bq = BitdexQuery {
-                    filters: vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-                    sort: Some(SortClause {
-                        field: "reactionCount".to_string(),
-                        direction: SortDirection::Desc,
-                    }),
-                    limit: 5,
-                    cursor: None,
-                    offset: None,
-                    skip_cache: false,
-                };
-                let result = engine.execute_query(&bq).unwrap();
-                result_ids = result.ids.clone();
-                assert!(!result_ids.is_empty(), "should have query results");
-                // Run the query again to ensure cache hit
-                let _ = engine.execute_query(&bq).unwrap();
-                // Verify cache is populated
-                {
-                    let uc = engine.unified_cache.lock();
-                    assert!(uc.len() > 0, "cache should have entries after query");
-                }
-                // Save bitmap snapshot (triggers merge thread persistence)
-                engine.save_snapshot().unwrap();
-                // Wait for merge thread to write BoundStore
-                std::thread::sleep(std::time::Duration::from_millis(
-                    engine.config.merge_interval_ms * 2 + 200,
-                ));
-                // Verify files exist on disk
-                let bounds_dir = bitmap_path.join("shardstore").join("bounds");
-                assert!(bounds_dir.join("meta.bin").exists(), "meta.bin should exist");
-                engine.shutdown();
-            }
-            // Phase 2: Restore engine and verify warm cache
-            {
-                let config = test_config_with_bitmap_path(bitmap_path.clone());
-                let mut engine = ConcurrentEngine::new_with_path(config, &doc_path).unwrap();
-                // Verify BoundStore loaded meta
-                {
-                    let uc = engine.unified_cache.lock();
-                    assert!(uc.persistence_enabled(), "persistence should be enabled");
-                    assert!(uc.meta().entry_count() > 0, "meta-index should have restored entries");
-                }
-                // Query again — should trigger shard lazy load and get a cache hit
-                let bq = BitdexQuery {
-                    filters: vec![FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-                    sort: Some(SortClause {
-                        field: "reactionCount".to_string(),
-                        direction: SortDirection::Desc,
-                    }),
-                    limit: 5,
-                    cursor: None,
-                    offset: None,
-                    skip_cache: false,
-                };
-                let result = engine.execute_query(&bq).unwrap();
-                // Results should match (same data, same query)
-                assert_eq!(
-                    result.ids, result_ids,
-                    "restored query should return same IDs as original"
-                );
-            engine.shutdown();
-        }
-    }
-    #[test]
-    fn test_compaction_worker_e2e() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::{DocStoreV3, SlotHexShard};
-
-        // Use an on-disk docstore so ShardStore ops and compaction can run.
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut engine = ConcurrentEngine::new_with_path(test_config(), &docs_dir).unwrap();
-
-        // Write 10 Set ops to the same (slot=0, field=0) — 9 of 10 are stale after compaction.
-        let field_idx: u16 = 0;
-        {
-            let mut ds = engine.docstore.lock();
-            for v in 0..10i64 {
-                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
-                ds.append_tuple(0, field_idx, &packed).unwrap();
-            }
-        }
-
-        // Verify the shard has ops before compaction
-        let shard_key = SlotHexShard::slot_to_shard(0);
-        let ops_before = {
-            let ds = engine.docstore.lock();
-            ds.shard_store().ops_count(&shard_key).unwrap().unwrap_or(0)
-        };
-        assert_eq!(ops_before, 10, "should have 10 ops before compaction");
-
-        // Trigger compaction directly on the shard (bypasses threshold check)
-        {
-            let ds = engine.docstore.lock();
-            ds.shard_store().compact_current(&shard_key).unwrap();
-        }
-
-        // After compaction, ops should be folded into a snapshot (0 ops remaining)
-        let ops_after = {
-            let ds = engine.docstore.lock();
-            ds.shard_store().ops_count(&shard_key).unwrap().unwrap_or(0)
-        };
-        assert_eq!(ops_after, 0, "ops should be 0 after compaction");
-
-        // Verify the data is still correct — the last Set (value=9) wins
-        {
-            let ds = engine.docstore.lock();
-            let snap = ds.shard_store().read(&shard_key).unwrap().unwrap();
-            let fields = snap.docs.get(&0).unwrap();
-            assert_eq!(fields[0], (0, PackedValue::I(9)));
-        }
-
-        engine.shutdown();
     }
     #[test]
     fn test_sync_filter_values_add_and_remove() {
@@ -9835,275 +6392,6 @@ mod tests {
         assert_eq!(result.ids, vec![1, 2]);
         engine.shutdown();
     }
-    /// Reproduce the collectionIds snapshot-overwrite bug:
-    /// Bulk-loaded fpack data on disk gets overwritten by snapshot save
-    /// when the engine has only partial (lazy-loaded) data in memory.
-    #[test]
-    fn test_snapshot_save_preserves_bulk_loaded_lazy_value_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let bitmap_path = dir.path().join("bitmaps");
-        let docstore_path = dir.path().join("docs");
-        // Config with collectionIds as a multi_value field (goes into lazy_value_fields)
-        let config = Config {
-            filter_fields: vec![
-                FilterFieldConfig {
-                    name: "nsfwLevel".to_string(),
-                    field_type: FilterFieldType::SingleValue,
-                    behaviors: None,
-                    eviction: None,
-                    eager_load: false,
-                    per_value_lazy: false,
-                },
-                FilterFieldConfig {
-                    name: "collectionIds".to_string(),
-                    field_type: FilterFieldType::MultiValue,
-                    behaviors: None,
-                    eviction: None,
-                    eager_load: false,
-                    per_value_lazy: false,
-                },
-            ],
-            sort_fields: vec![SortFieldConfig {
-                name: "reactionCount".to_string(),
-                source_type: "uint32".to_string(),
-                encoding: "linear".to_string(),
-                bits: 32,
-                eager_load: false,
-                computed: None,
-            }],
-            max_page_size: 100,
-            flush_interval_us: 50,
-            channel_capacity: 10_000,
-            storage: crate::config::StorageConfig {
-                bitmap_path: Some(bitmap_path.clone()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        // Phase 1: Create engine, insert some docs to establish alive bitmap
-        {
-            let mut engine =
-                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
-            // Insert 100 docs (slots 1-100) so alive bitmap is populated
-            for i in 1..=100u32 {
-                engine
-                    .put(
-                        i,
-                        &make_doc(vec![
-                            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                            ("reactionCount", FieldValue::Single(Value::Integer(i as i64))),
-                        ]),
-                    )
-                    .unwrap();
-            }
-            wait_for_flush(&engine, 100, 1000);
-            engine.save_snapshot().unwrap();
-            engine.shutdown();
-        }
-        // Phase 2: Simulate bulk load — write collectionIds to ShardStore
-        // This is what the bulk loader does: writes directly to FilterBitmapStore
-        {
-            let fs = crate::shard_store_bitmap::FilterBitmapStore::new(
-                bitmap_path.join("shardstore").join("filter"),
-                crate::shard_store_bitmap::FieldValueBucketShard,
-            ).unwrap();
-            let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
-            // Collection 42: contains slots 1-50
-            let mut bm42 = RoaringBitmap::new();
-            for i in 1..=50u32 { bm42.insert(i); }
-            bitmaps.insert(42, bm42);
-            // Collection 99: contains slots 51-100
-            let mut bm99 = RoaringBitmap::new();
-            for i in 51..=100u32 { bm99.insert(i); }
-            bitmaps.insert(99, bm99);
-            // Collection 7: contains slots 1-100 (all docs)
-            let mut bm7 = RoaringBitmap::new();
-            for i in 1..=100u32 { bm7.insert(i); }
-            bitmaps.insert(7, bm7);
-            // Write using FilterBitmapStore
-            let entries: Vec<(&str, u64, &RoaringBitmap)> = bitmaps.iter()
-                .map(|(k, v)| ("collectionIds", *k, v))
-                .collect();
-            fs.write_full_filter(&entries).unwrap();
-            // Verify the data is correct
-            let loaded = fs.load_field("collectionIds").unwrap();
-            assert_eq!(loaded.len(), 3, "should have 3 collections on disk");
-            assert_eq!(loaded[&42].len(), 50);
-            assert_eq!(loaded[&99].len(), 50);
-            assert_eq!(loaded[&7].len(), 100);
-        }
-        // Phase 3: Start engine from disk (lazy loads collectionIds)
-        // Then simulate sync adding a few entries via sync_filter_values
-        {
-            let mut engine =
-                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
-            assert_eq!(engine.alive_count(), 100);
-            // Verify lazy load works — query collection 42 before any mutations
-            let result = engine
-                .query(
-                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(42)])],
-                    None,
-                    100,
-                )
-                .unwrap();
-            assert_eq!(
-                result.total_matched, 50,
-                "BUG PRECONDITION: collection 42 should have 50 results from disk"
-            );
-            // Simulate sync: add slot 1 to collection 42 (already there)
-            // and slot 1 to a NEW collection 999
-            engine
-                .sync_filter_values(1, "collectionIds", &[42, 999])
-                .unwrap();
-            wait_for_flush(&engine, 100, 1000);
-            // Trigger snapshot save — this is where the bug happens
-            engine.save_snapshot().unwrap();
-            engine.shutdown();
-        }
-        // Phase 4: Restart engine and verify bulk-loaded data survived
-        {
-            let mut engine =
-                ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
-            // Collection 42: should still have 50 results
-            let r = engine
-                .query(
-                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(42)])],
-                    None, 100,
-                ).unwrap();
-            assert_eq!(r.total_matched, 50,
-                "SNAPSHOT OVERWRITE BUG: collection 42 lost data! Got {} expected 50", r.total_matched);
-            // Collection 99: should still have 50 results (never touched by sync)
-            let r = engine
-                .query(
-                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(99)])],
-                    None, 100,
-                ).unwrap();
-            assert_eq!(r.total_matched, 50,
-                "SNAPSHOT OVERWRITE BUG: collection 99 lost data! Got {} expected 50", r.total_matched);
-            // Collection 7: should still have 100 results
-            let r = engine
-                .query(
-                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(7)])],
-                    None, 100,
-                ).unwrap();
-            assert_eq!(r.total_matched, 100,
-                "SNAPSHOT OVERWRITE BUG: collection 7 lost data! Got {} expected 100", r.total_matched);
-            // Collection 999: should have 1 result (from sync mutation)
-            let r = engine
-                .query(
-                    &[FilterClause::In("collectionIds".to_string(), vec![Value::Integer(999)])],
-                    None, 100,
-                ).unwrap();
-            assert_eq!(r.total_matched, 1,
-                "Sync mutation lost: collection 999 should have 1 result, got {}", r.total_matched);
-            engine.shutdown();
-        }
-    }
-    #[test]
-    fn test_flush_thread_appends_ops_to_shard_stores() {
-        // Verify that the flush thread writes ops-log entries to disk
-        // instead of relying solely on merge thread full snapshots.
-        let dir = tempfile::tempdir().unwrap();
-        let bitmap_path = dir.path().join("bitmaps");
-        let docstore_path = dir.path().join("docs");
-        let config = test_config_with_bitmap_path(bitmap_path.clone());
-        let ss_root = bitmap_path.join("shardstore");
-        let mut engine =
-            ConcurrentEngine::new_with_path(config.clone(), &docstore_path).unwrap();
-        // Insert a document — this goes through the flush thread which should
-        // append ops to alive, filter, and sort shard stores.
-        engine
-            .put(
-                1,
-                &make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("tagIds", FieldValue::Multi(vec![Value::Integer(100)])),
-                    ("reactionCount", FieldValue::Single(Value::Integer(500))),
-                ]),
-            )
-            .unwrap();
-        // Wait for flush thread to process the mutation and append ops.
-        std::thread::sleep(Duration::from_millis(200));
-        // Verify ops landed on disk — alive shard should have ops
-        let alive_store = crate::shard_store_bitmap::AliveBitmapStore::new(
-            ss_root.join("alive"), crate::shard_store_bitmap::SingletonShard,
-        ).unwrap();
-        let alive_ops = alive_store.ops_count(&AliveShardKey).unwrap();
-        assert!(
-            alive_ops.is_some() && alive_ops.unwrap() > 0,
-            "alive shard should have ops after insert, got {:?}",
-            alive_ops,
-        );
-        // Verify alive bitmap is recoverable from ops
-        let alive_bm = alive_store.read(&AliveShardKey).unwrap();
-        assert!(alive_bm.is_some(), "alive bitmap should be readable from ops");
-        assert!(
-            alive_bm.as_ref().unwrap().contains(1),
-            "alive bitmap should contain slot 1",
-        );
-        // Verify filter ops — nsfwLevel value 1 should have an op
-        let filter_store = crate::shard_store_bitmap::FilterBitmapStore::new(
-            ss_root.join("filter"), crate::shard_store_bitmap::FieldValueBucketShard,
-        ).unwrap();
-        let bucket_key = FilterBucketKey::from_value("nsfwLevel".to_string(), 1);
-        let filter_snap = filter_store.read(&bucket_key).unwrap();
-        assert!(filter_snap.is_some(), "filter bucket should exist after insert");
-        let filter_snap = filter_snap.unwrap();
-        let bm = filter_snap.values.get(&1);
-        assert!(bm.is_some(), "nsfwLevel=1 bitmap should exist");
-        assert!(bm.unwrap().contains(1), "nsfwLevel=1 should contain slot 1");
-        // Verify sort ops — reactionCount layers should have ops
-        let sort_store = crate::shard_store_bitmap::SortBitmapStore::new(
-            ss_root.join("sort"), crate::shard_store_bitmap::SortLayerShard,
-        ).unwrap();
-        // 500 in binary: bit 8 (256), bit 7 (128), bit 6 (64), bit 5 (32),
-        // bit 4 (16), bit 2 (4) = 0b111110100
-        // At least bit 8 should be set for slot 1
-        let layer_key = SortLayerShardKey {
-            field: "reactionCount".to_string(),
-            bit_position: 8,
-        };
-        let layer_snap = sort_store.read(&layer_key).unwrap();
-        assert!(layer_snap.is_some(), "sort layer bit8 should exist");
-        assert!(
-            layer_snap.unwrap().contains(1),
-            "sort layer bit8 should contain slot 1 for reactionCount=500",
-        );
-        // Insert more docs to accumulate ops, then verify compaction works
-        for i in 2..=5u32 {
-            engine
-                .put(
-                    i,
-                    &make_doc(vec![
-                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                        ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 100))),
-                    ]),
-                )
-                .unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        // Verify alive ops accumulated
-        let alive_ops_after = alive_store.ops_count(&AliveShardKey).unwrap().unwrap_or(0);
-        assert!(
-            alive_ops_after > 1,
-            "alive shard should have multiple ops, got {}",
-            alive_ops_after,
-        );
-        // Compact and verify the shard is now a clean snapshot (0 ops)
-        alive_store.compact_current(&AliveShardKey).unwrap();
-        let alive_ops_compacted = alive_store.ops_count(&AliveShardKey).unwrap().unwrap_or(999);
-        assert_eq!(
-            alive_ops_compacted, 0,
-            "alive shard should have 0 ops after compaction",
-        );
-        // Verify data survived compaction
-        let alive_bm = alive_store.read(&AliveShardKey).unwrap().unwrap();
-        for i in 1..=5u32 {
-            assert!(alive_bm.contains(i), "slot {} should survive compaction", i);
-        }
-        engine.shutdown();
-    }
-
     // -----------------------------------------------------------------------
     // DocStoreV3 E2E integration tests
     // -----------------------------------------------------------------------
@@ -10213,52 +6501,6 @@ mod tests {
             None, 10,
         ).unwrap();
         assert_eq!(result.total_matched, 0, "nsfwLevel=2 should be cleared after delete");
-
-        engine.shutdown();
-    }
-
-    /// E2E: bulk loading with ShardStoreBulkWriter writes docs readable by DocStoreV3.
-    #[test]
-    fn test_docstore_v3_bulk_writer_roundtrip() {
-        use crate::shard_store_doc::PackedValue;
-
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut engine = ConcurrentEngine::new_with_path(test_config(), &docs_dir).unwrap();
-
-        // Prepare bulk writer
-        let bulk_writer = engine.prepare_bulk_writer(
-            &["nsfwLevel".to_string(), "reactionCount".to_string()]
-        ).unwrap();
-
-        let nsfw_idx = *bulk_writer.field_to_idx().get("nsfwLevel").unwrap();
-        let react_idx = *bulk_writer.field_to_idx().get("reactionCount").unwrap();
-
-        // Write docs via bulk writer (simulating dump processor)
-        for slot in 0..10u32 {
-            let nsfw_bytes = rmp_serde::to_vec(&PackedValue::I(slot as i64 % 3 + 1)).unwrap();
-            let react_bytes = rmp_serde::to_vec(&PackedValue::I(slot as i64 * 100)).unwrap();
-            bulk_writer.append_tuple_raw(slot, nsfw_idx, &nsfw_bytes);
-            bulk_writer.append_tuple_raw(slot, react_idx, &react_bytes);
-        }
-
-        // Flush to ShardStore
-        bulk_writer.flush_v2_writers();
-
-        // Read docs back via DocStoreV3
-        for slot in 0..10u32 {
-            let doc = engine.docstore.lock().get(slot).unwrap();
-            assert!(doc.is_some(), "slot {} should have a doc after bulk write", slot);
-            let doc = doc.unwrap();
-            let nsfw = doc.fields.get("nsfwLevel");
-            assert!(nsfw.is_some(), "slot {} should have nsfwLevel field", slot);
-            match nsfw.unwrap() {
-                FieldValue::Single(Value::Integer(v)) => {
-                    assert_eq!(*v, slot as i64 % 3 + 1, "nsfwLevel mismatch for slot {}", slot);
-                }
-                other => panic!("slot {}: expected Integer, got {:?}", slot, other),
-            }
-        }
 
         engine.shutdown();
     }

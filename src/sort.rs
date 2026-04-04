@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use roaring::RoaringBitmap;
+use roaring::{FrozenRoaringBitmap, RoaringBitmap};
 
 use crate::config::SortFieldConfig;
 use crate::versioned_bitmap::VersionedBitmap;
@@ -104,6 +104,14 @@ impl SortField {
         }
     }
 
+    /// Mark all layers as backed by BitmapSilo (unloaded).
+    /// The frozen base will be read from BitmapSilo at query time.
+    pub fn mark_layers_backed(&mut self) {
+        for layer in &mut self.bit_layers {
+            layer.mark_unloaded();
+        }
+    }
+
     /// Bulk-clear a bit layer for multiple slots.
     pub fn clear_layer_bulk(&mut self, bit: usize, slots: &[u32]) {
         if let Some(layer) = self.bit_layers.get_mut(bit) {
@@ -142,6 +150,22 @@ impl SortField {
         descending: bool,
         cursor: Option<(u64, u32)>,
     ) -> Vec<u32> {
+        self.top_n_frozen(candidates, limit, descending, cursor, None)
+    }
+
+    /// Frozen-aware top-N sort traversal.
+    ///
+    /// When `frozen_layers` is provided and a bit layer is unloaded (base empty,
+    /// is_loaded=false), reads the frozen bitmap from the provided slice instead.
+    /// This enables near-zero heap sort traversal from mmap'd BitmapSilo data.
+    pub fn top_n_frozen<'a>(
+        &self,
+        candidates: &RoaringBitmap,
+        limit: usize,
+        descending: bool,
+        cursor: Option<(u64, u32)>,
+        frozen_layers: Option<&[Option<FrozenRoaringBitmap<'a>>]>,
+    ) -> Vec<u32> {
         if candidates.is_empty() || limit == 0 {
             return Vec::new();
         }
@@ -150,7 +174,7 @@ impl SortField {
         let effective_candidates;
         let candidates = if let Some((cursor_sort_value, cursor_slot_id)) = cursor {
             effective_candidates =
-                self.apply_cursor_filter(candidates, descending, cursor_sort_value, cursor_slot_id);
+                self.apply_cursor_filter_frozen(candidates, descending, cursor_sort_value, cursor_slot_id, frozen_layers);
             &effective_candidates
         } else {
             candidates
@@ -161,10 +185,10 @@ impl SortField {
         }
 
         // MSB-to-LSB bifurcation: collect top-N slots via bitmap AND operations
-        let top_n_bitmap = self.bifurcate(candidates, limit, descending);
+        let top_n_bitmap = self.bifurcate_frozen(candidates, limit, descending, frozen_layers);
 
         // Reconstruct values ONLY for the final top-N slots and sort them
-        self.order_results(&top_n_bitmap, descending)
+        self.order_results_frozen(&top_n_bitmap, descending, frozen_layers)
     }
 
     /// MSB-to-LSB bifurcation traversal.
@@ -176,6 +200,17 @@ impl SortField {
         candidates: &RoaringBitmap,
         limit: usize,
         descending: bool,
+    ) -> RoaringBitmap {
+        self.bifurcate_frozen(candidates, limit, descending, None)
+    }
+
+    /// Frozen-aware bifurcation. Uses frozen layers for unloaded bit layers.
+    fn bifurcate_frozen<'a>(
+        &self,
+        candidates: &RoaringBitmap,
+        limit: usize,
+        descending: bool,
+        frozen_layers: Option<&[Option<FrozenRoaringBitmap<'a>>]>,
     ) -> RoaringBitmap {
         let total = candidates.len() as usize;
         if total <= limit {
@@ -192,30 +227,26 @@ impl SortField {
                 break;
             }
 
-            debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in bifurcate");
-            let layer: &RoaringBitmap = self.bit_layers[bit].base();
-
-            // preferred = slots that have the "better" bit value at this position
-            let preferred = if descending {
-                // Descending: prefer bit SET (higher values)
-                &remaining & layer
+            // Get the effective layer: in-memory if loaded, frozen if not
+            let preferred = if self.bit_layers[bit].is_loaded() {
+                debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in bifurcate");
+                let layer: &RoaringBitmap = self.bit_layers[bit].base();
+                if descending { &remaining & layer } else { &remaining - layer }
+            } else if let Some(frozen) = frozen_layers.and_then(|fl| fl.get(bit)).and_then(|f| f.as_ref()) {
+                // Use frozen layer from BitmapSilo mmap
+                if descending { &remaining & frozen } else { &remaining - frozen }
             } else {
-                // Ascending: prefer bit CLEAR (lower values)
-                &remaining - layer
+                // No data for this layer — skip (equivalent to all-zeros layer)
+                continue;
             };
 
             let preferred_count = preferred.len() as usize;
 
             if preferred_count == 0 {
-                // No slots have the preferred bit — all remaining are equivalent at
-                // this layer, continue to next bit with the same remaining set
                 continue;
             } else if preferred_count >= remaining_limit {
-                // More preferred slots than we need — narrow to preferred and continue
                 remaining = preferred;
             } else {
-                // Fewer preferred slots than limit — all preferred are winners.
-                // Collect them, reduce limit, continue with the rest.
                 result |= &preferred;
                 remaining -= &preferred;
                 remaining_limit -= preferred_count;
@@ -224,8 +255,6 @@ impl SortField {
 
         // After all layers, if we still need more slots, take them from remaining
         if remaining_limit > 0 && !remaining.is_empty() {
-            // remaining slots all have equal sort values at this point;
-            // take up to remaining_limit from them
             let mut taken = 0;
             for slot in remaining.iter() {
                 if taken >= remaining_limit {
@@ -240,13 +269,20 @@ impl SortField {
     }
 
     /// Order the top-N result bitmap into a sorted Vec.
-    ///
-    /// Reconstructs sort values ONLY for the small result set (not all candidates),
-    /// then sorts by value with slot ID tiebreaker.
     fn order_results(&self, result_bitmap: &RoaringBitmap, descending: bool) -> Vec<u32> {
+        self.order_results_frozen(result_bitmap, descending, None)
+    }
+
+    /// Frozen-aware ordering: reconstructs sort values using frozen layers when needed.
+    fn order_results_frozen<'a>(
+        &self,
+        result_bitmap: &RoaringBitmap,
+        descending: bool,
+        frozen_layers: Option<&[Option<FrozenRoaringBitmap<'a>>]>,
+    ) -> Vec<u32> {
         let mut entries: Vec<(u32, u32)> = result_bitmap
             .iter()
-            .map(|slot| (slot, self.reconstruct_value(slot)))
+            .map(|slot| (slot, self.reconstruct_value_frozen(slot, frozen_layers)))
             .collect();
 
         if descending {
@@ -259,11 +295,6 @@ impl SortField {
     }
 
     /// Apply cursor-based filtering to candidates using bitmap operations.
-    ///
-    /// Walks bit layers from MSB to LSB, using the cursor's sort value bits to partition
-    /// candidates into "strictly better than cursor", "equal so far", and "strictly worse".
-    /// Only "strictly better" and the portion of "equal" that passes the slot ID tiebreaker
-    /// are retained.
     fn apply_cursor_filter(
         &self,
         candidates: &RoaringBitmap,
@@ -271,12 +302,20 @@ impl SortField {
         cursor_sort_value: u64,
         cursor_slot_id: u32,
     ) -> RoaringBitmap {
+        self.apply_cursor_filter_frozen(candidates, descending, cursor_sort_value, cursor_slot_id, None)
+    }
+
+    /// Frozen-aware cursor filtering.
+    fn apply_cursor_filter_frozen<'a>(
+        &self,
+        candidates: &RoaringBitmap,
+        descending: bool,
+        cursor_sort_value: u64,
+        cursor_slot_id: u32,
+        frozen_layers: Option<&[Option<FrozenRoaringBitmap<'a>>]>,
+    ) -> RoaringBitmap {
         let cursor_value = cursor_sort_value as u32;
 
-        // We partition candidates into three groups as we descend bit layers:
-        // - confirmed: slots whose sort value is strictly "better" than cursor (definitely included)
-        // - equal: slots whose sort value matches cursor at all bits examined so far (still ambiguous)
-        // - excluded: everything else (dropped)
         let mut confirmed = RoaringBitmap::new();
         let mut equal = candidates.clone();
 
@@ -286,47 +325,41 @@ impl SortField {
             }
 
             let cursor_bit_set = (cursor_value >> bit) & 1 == 1;
-            debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in apply_cursor_filter");
-            let layer: &RoaringBitmap = self.bit_layers[bit].base();
 
-            let equal_with_bit_set = &equal & layer;
-            let equal_with_bit_clear = &equal - layer;
+            // Get effective layer (in-memory or frozen)
+            let (equal_with_bit_set, equal_with_bit_clear) = if self.bit_layers[bit].is_loaded() {
+                debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in apply_cursor_filter");
+                let layer: &RoaringBitmap = self.bit_layers[bit].base();
+                (&equal & layer, &equal - layer)
+            } else if let Some(frozen) = frozen_layers.and_then(|fl| fl.get(bit)).and_then(|f| f.as_ref()) {
+                (&equal & frozen, &equal - frozen)
+            } else {
+                // No data — treat as all-zeros (all slots have bit clear)
+                (RoaringBitmap::new(), equal.clone())
+            };
 
             if descending {
-                // Descending: we want slots with value LESS than cursor (they come after cursor)
                 if cursor_bit_set {
-                    // Cursor has bit set. Slots with bit clear have LOWER value → confirmed (after cursor).
-                    // Slots with bit set are still equal.
                     confirmed |= &equal_with_bit_clear;
                     equal = equal_with_bit_set;
                 } else {
-                    // Cursor has bit clear. Slots with bit set have HIGHER value → exclude (before cursor).
-                    // Slots with bit clear are still equal.
                     equal = equal_with_bit_clear;
                 }
             } else {
-                // Ascending: we want slots with value GREATER than cursor (they come after cursor)
                 if cursor_bit_set {
-                    // Cursor has bit set. Slots with bit clear have LOWER value → exclude (before cursor).
-                    // Slots with bit set are still equal.
                     equal = equal_with_bit_set;
                 } else {
-                    // Cursor has bit clear. Slots with bit set have HIGHER value → confirmed (after cursor).
-                    // Slots with bit clear are still equal.
                     confirmed |= &equal_with_bit_set;
                     equal = equal_with_bit_clear;
                 }
             }
         }
 
-        // After all bits: `equal` contains slots with the exact same sort value as cursor.
-        // Apply slot ID tiebreaker using bitmap range ops (O(containers) not O(slots)).
+        // Slot ID tiebreaker
         if !equal.is_empty() {
             if descending {
-                // Descending: slots with lower slot_id come after cursor
                 equal.remove_range(cursor_slot_id..=u32::MAX);
             } else {
-                // Ascending: slots with higher slot_id come after cursor
                 equal.remove_range(0..=cursor_slot_id);
             }
             confirmed |= equal;
@@ -338,10 +371,26 @@ impl SortField {
     /// Reconstruct the sort value for a given slot by reading from the base bitmap.
     /// Requires that all layers have been merged.
     pub fn reconstruct_value(&self, slot: u32) -> u32 {
+        self.reconstruct_value_frozen(slot, None)
+    }
+
+    /// Frozen-aware value reconstruction.
+    pub fn reconstruct_value_frozen<'a>(
+        &self,
+        slot: u32,
+        frozen_layers: Option<&[Option<FrozenRoaringBitmap<'a>>]>,
+    ) -> u32 {
         let mut value = 0u32;
         for bit in 0..self.num_bits {
-            debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in reconstruct_value");
-            if self.bit_layers[bit].base().contains(slot) {
+            let contains = if self.bit_layers[bit].is_loaded() {
+                debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in reconstruct_value");
+                self.bit_layers[bit].base().contains(slot)
+            } else if let Some(frozen) = frozen_layers.and_then(|fl| fl.get(bit)).and_then(|f| f.as_ref()) {
+                frozen.contains(slot)
+            } else {
+                false
+            };
+            if contains {
                 value |= 1 << bit;
             }
         }
@@ -391,6 +440,12 @@ impl SortField {
         }
     }
 
+    /// Get fused (base + diff) bitmaps for all layers.
+    /// Used by BitmapSilo to serialize the complete sort state.
+    pub fn layers_fused(&self) -> Vec<RoaringBitmap> {
+        self.bit_layers.iter().map(|vb| vb.fused()).collect()
+    }
+
     /// Load persisted base bitmaps into the sort layers, replacing existing bases.
     /// Each layer becomes a clean VersionedBitmap (no diff).
     pub fn load_layers(&mut self, layers: Vec<RoaringBitmap>) {
@@ -418,15 +473,6 @@ impl SortField {
     /// `Cow::Owned` when the layer has pending diffs.
     pub fn layer_bases_fused(&self) -> Vec<Cow<'_, RoaringBitmap>> {
         self.bit_layers.iter().map(|vb| vb.fused_cow()).collect()
-    }
-
-    /// Drop all base bitmaps and mark layers as unloaded.
-    /// The diff layers are preserved so mutations can accumulate
-    /// while the sort field is not in memory.
-    pub fn clear_bases_and_unload(&mut self) {
-        for layer in &mut self.bit_layers {
-            layer.clear_base_and_unload();
-        }
     }
 
     /// Return the serialized byte size of all bit layer bitmaps.

@@ -26,8 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
-use crate::shard_store_doc::PackedValue;
-use crate::shard_store_doc::StreamingDocWriter;
+use crate::doc_format::PackedValue;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
 use crate::dump_expression::ExprValue as NateExprValue;
@@ -906,41 +905,6 @@ fn parse_field_to_str<'a>(bytes: &'a [u8]) -> Option<&'a str> {
 }
 
 /// Parse a single delimited line into fields. Handles quoted fields.
-/// Zero-allocation fast path for two-column multi-value CSVs.
-/// Extracts two integer columns by index without allocating a Vec of fields.
-/// Returns (slot_value, value_value) as (u32, i64).
-#[inline]
-fn parse_two_cols_fast(line: &[u8], delimiter: u8, slot_idx: usize, value_idx: usize) -> Option<(u32, i64)> {
-    let max_idx = slot_idx.max(value_idx);
-    let mut col = 0;
-    let mut start = 0;
-    let mut slot_val: Option<i64> = None;
-    let mut value_val: Option<i64> = None;
-
-    for i in 0..line.len() {
-        if line[i] == delimiter {
-            if col == slot_idx {
-                slot_val = parse_i64_fast(&line[start..i]);
-            }
-            if col == value_idx {
-                value_val = parse_i64_fast(&line[start..i]);
-            }
-            col += 1;
-            start = i + 1;
-            if col > max_idx { break; }
-        }
-    }
-    // Last field (no trailing delimiter)
-    if col == slot_idx && slot_val.is_none() {
-        slot_val = parse_i64_fast(&line[start..]);
-    }
-    if col == value_idx && value_val.is_none() {
-        value_val = parse_i64_fast(&line[start..]);
-    }
-
-    Some((slot_val? as u32, value_val?))
-}
-
 fn parse_delimited_line<'a>(line: &'a [u8], delimiter: u8) -> Vec<&'a [u8]> {
     let mut fields = Vec::new();
     let mut start = 0;
@@ -1122,62 +1086,14 @@ impl ShardPreCreator {
         let handle = std::thread::Builder::new()
             .name("shard-precreator".into())
             .spawn(move || {
-                let mut created_up_to: u32 = 0;
-                let mut files_created: u32 = 0;
+                let files_created: u32 = 0;
                 let mut bitmap_dirs_done = false;
-                let mut docstore_dirs_done = false;
+                let _docstore_root = docstore_root; // DataSilo needs no shard pre-creation
 
+                // DataSilo does not use per-shard files — no pre-creation needed.
+                // Only pre-create filter bitmap bucket dirs for ShardStore bitmap persistence.
                 loop {
                     let current_max_slot = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
-                    let target_shard = current_max_slot >> 9; // SHARD_SHIFT = 9
-
-                    // Pre-create all 256 hex subdirectories once (eliminates per-file create_dir_all)
-                    if !docstore_dirs_done && current_max_slot > 0 {
-                        // Derive shards dir from DocStoreV3::shard_path to match ShardStore layout.
-                        // shard_path returns root/gen_NNN/shards/xx/NNNNNN.shard — go up 2 levels for shards dir.
-                        let sample_path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, 0);
-                        let shards_dir = sample_path.parent().unwrap().parent().unwrap();
-                        for hex in 0..=255u8 {
-                            let _ = std::fs::create_dir_all(shards_dir.join(format!("{:02x}", hex)));
-                        }
-                        docstore_dirs_done = true;
-                        eprintln!("  ShardPreCreator: docstore hex dirs created at {}", shards_dir.display());
-                    }
-
-                    // Create docstore shard files up to target (no create_dir_all per file)
-                    while created_up_to < target_shard {
-                        created_up_to += 1;
-                        let path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, created_up_to);
-                        if let Ok(f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)
-                        {
-                            let meta = f.metadata().ok();
-                            if meta.map(|m| m.len()).unwrap_or(0) == 0 {
-                                // Write a full valid ShardStore header (28 bytes).
-                                // Previous code only wrote the 4-byte magic, leaving
-                                // stubs that append_ops_to_shard can't read (needs 28).
-                                let header = crate::shard_store::ShardHeader {
-                                    version: crate::shard_store::SHARD_VERSION,
-                                    ops_section_offset: crate::shard_store::HEADER_SIZE as u64,
-                                    snapshot_len: 0,
-                                    ops_count: 0,
-                                    flags: 0,
-                                };
-                                let mut buf = Vec::with_capacity(crate::shard_store::HEADER_SIZE);
-                                header.encode(&mut buf);
-                                let mut bw = std::io::BufWriter::new(f);
-                                use std::io::Write as _;
-                                let _ = bw.write_all(&buf);
-                                let _ = bw.flush();
-                            }
-                        }
-                        files_created += 1;
-                        if files_created % 50_000 == 0 {
-                            eprintln!("  ShardPreCreator: {}K docstore files created", files_created / 1000);
-                        }
-                    }
 
                     // Create filter bitmap dirs once (first time watermark > 0)
                     if !bitmap_dirs_done && current_max_slot > 0 {
@@ -1196,35 +1112,7 @@ impl ShardPreCreator {
                     }
 
                     if done.load(std::sync::atomic::Ordering::Relaxed) {
-                        // Final sweep for any remaining shards
-                        let final_max = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
-                        let final_shard = final_max >> 9;
-                        while created_up_to < final_shard {
-                            created_up_to += 1;
-                            let path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, created_up_to);
-                            if let Ok(f) = std::fs::OpenOptions::new()
-                                .create(true).append(true).open(&path)
-                            {
-                                let meta = f.metadata().ok();
-                                if meta.map(|m| m.len()).unwrap_or(0) == 0 {
-                                    let header = crate::shard_store::ShardHeader {
-                                        version: crate::shard_store::SHARD_VERSION,
-                                        ops_section_offset: crate::shard_store::HEADER_SIZE as u64,
-                                        snapshot_len: 0,
-                                        ops_count: 0,
-                                        flags: 0,
-                                    };
-                                    let mut buf = Vec::with_capacity(crate::shard_store::HEADER_SIZE);
-                                    header.encode(&mut buf);
-                                    let mut bw = std::io::BufWriter::new(f);
-                                    use std::io::Write as _;
-                                    let _ = bw.write_all(&buf);
-                                    let _ = bw.flush();
-                                }
-                            }
-                            files_created += 1;
-                        }
-                        eprintln!("  ShardPreCreator: done — {} files created (max shard {})", files_created, created_up_to);
+                        eprintln!("  ShardPreCreator: done — DataSilo needs no shard pre-creation");
                         return files_created;
                     }
 
@@ -1257,38 +1145,107 @@ pub fn process_dump(
     shutdown: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<PhaseResult, String> {
     let t_total = Instant::now();
-    let mut result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema, slot_watermark.as_ref(), shutdown.as_ref())?;
-    eprintln!("  Dump {} process_dump_with_progress returned in {:.1}s", request.name, t_total.elapsed().as_secs_f64());
-    let (alive_s, filter_s, sort_s, meta_s) = engine
-        .shard_stores()
-        .ok_or_else(|| "no bitmap_path configured; cannot process dump".to_string())?;
-    let bitmap_path = engine.config().storage.bitmap_path.as_ref()
-        .ok_or_else(|| "no bitmap_path configured".to_string())?.clone();
-    let dictionaries = engine.dictionaries_arc();
-    let t_save = Instant::now();
-    save_phase_to_disk(&mut result, &alive_s, &filter_s, &sort_s, &meta_s, &bitmap_path, &dictionaries, &request.name, request.sets_alive)?;
-    eprintln!("  Dump {} save_phase_to_disk in {:.1}s", request.name, t_save.elapsed().as_secs_f64());
+
+    let result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema, slot_watermark.as_ref(), shutdown.as_ref())?;
+
+    // Apply bitmaps to engine staging (in-memory).
+    // This is the core bitmap transfer: filter maps, sort maps, alive bitmap.
+    let t_apply = Instant::now();
+    {
+        let mut staging = engine.clone_staging();
+
+        // Convert sort_maps from HashMap<String, Vec<RoaringBitmap>> to HashMap<String, HashMap<usize, RoaringBitmap>>
+        let sort_maps_indexed: HashMap<String, HashMap<usize, RoaringBitmap>> = result.sort_maps
+            .iter()
+            .map(|(name, layers)| {
+                let indexed: HashMap<usize, RoaringBitmap> = layers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bm)| !bm.is_empty())
+                    .map(|(i, bm)| (i, bm.clone()))
+                    .collect();
+                (name.clone(), indexed)
+            })
+            .collect();
+
+        ConcurrentEngine::apply_bitmap_maps(
+            &mut staging,
+            result.filter_maps.clone(),
+            sort_maps_indexed,
+            result.alive.clone(),
+        );
+
+        // Update slot counter to max_slot + 1 via from_state
+        if result.max_slot > 0 {
+            let current_counter = staging.slots.slot_counter();
+            if result.max_slot + 1 > current_counter {
+                // Rebuild slot allocator with updated counter
+                staging.slots = crate::slot::SlotAllocator::from_state(
+                    result.max_slot + 1,
+                    staging.slots.alive_bitmap().clone(),
+                    roaring::RoaringBitmap::new(),
+                );
+            }
+        }
+
+        // Apply deferred alive slots
+        if !result.deferred_slots.is_empty() {
+            staging.slots.set_deferred(result.deferred_slots.clone());
+        }
+
+        engine.publish_staging(staging);
+    }
+    eprintln!("  Dump {} apply_bitmaps in {:.1}s", request.name, t_apply.elapsed().as_secs_f64());
+
+    // Save bitmaps to BitmapSilo for persistence across restarts.
+    if engine.config().storage.bitmap_path.is_some() {
+        let t_save = Instant::now();
+        engine.save_snapshot()
+            .map_err(|e| format!("save_snapshot: {e}"))?;
+        eprintln!("  Dump {} save_snapshot in {:.1}s", request.name, t_save.elapsed().as_secs_f64());
+    }
+
+    // Compact doc silo after each phase.
+    let t_compact = Instant::now();
+    compact_after_dumps(engine)?;
+    eprintln!("  Dump {} compact in {:.1}s", request.name, t_compact.elapsed().as_secs_f64());
+
+    // Persist LCS dictionaries after each phase.
+    if let Some(ref bitmap_path) = engine.config().storage.bitmap_path {
+        engine.save_dictionaries(bitmap_path)
+            .map_err(|e| format!("save_dictionaries: {e}"))?;
+    }
+
     eprintln!("  Dump {} total process_dump in {:.1}s", request.name, t_total.elapsed().as_secs_f64());
     Ok(result)
 }
 
-/// Reload fields after dump phases complete. Call ONCE after the last dump.
-pub fn reload_after_dumps(engine: &ConcurrentEngine, had_alive_phase: bool) {
+/// Compact the doc silo after all dump phases complete.
+/// This merges all ops (from all phases) into the data file.
+/// Call ONCE after the last dump phase, before reload_after_dumps.
+pub fn compact_after_dumps(engine: &ConcurrentEngine) -> Result<(), String> {
     let t = Instant::now();
-    let filter_names: Vec<String> = engine.config()
-        .filter_fields.iter().map(|f| f.name.clone()).collect();
-    let sort_names: Vec<String> = engine.config()
-        .sort_fields.iter().map(|f| f.name.clone()).collect();
-    let t_mark = Instant::now();
-    engine.mark_fields_pending_reload(&filter_names, &sort_names);
-    let mark_s = t_mark.elapsed().as_secs_f64();
-    let mut alive_s = 0.0;
-    if had_alive_phase {
-        let t_alive = Instant::now();
-        engine.reload_alive_from_disk();
-        alive_s = t_alive.elapsed().as_secs_f64();
-    }
-    eprintln!("  Dump reload: mark_pending={:.2}s alive_reload={:.2}s total={:.2}s", mark_s, alive_s, t.elapsed().as_secs_f64());
+    let ds = engine.docstore_arc();
+    let mut ds_lock = ds.lock();
+    let count = ds_lock.silo_mut().compact()
+        .map_err(|e| format!("compact: {e}"))?;
+    eprintln!("  Dump compact: {} docs in {:.2}s", count, t.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// Post-dump hook. Called after the last dump phase completes.
+/// With DataSilo, bitmaps are already applied to engine staging during process_dump.
+/// No disk reload needed — bitmaps are in-memory.
+pub fn reload_after_dumps(engine: &ConcurrentEngine, _had_alive_phase: bool) {
+    // Bitmaps are already in the engine staging from process_dump's apply_bitmap_maps.
+    // No need to mark fields for lazy reload from disk (BitmapSilo Phase 5).
+    // Just clear the unified cache to ensure queries see fresh bitmap data.
+    engine.clear_unified_cache();
+    let snap = engine.snapshot_public();
+    eprintln!(
+        "  Dump reload: alive={}, no disk reload needed (bitmaps applied in-memory)",
+        snap.slots.alive_count()
+    );
 }
 
 /// Process a dump phase with optional external progress counter.
@@ -1382,54 +1339,27 @@ pub fn process_dump_with_progress(
         })
         .unwrap_or_default();
 
-    // Prepare BulkWriter for docstore — exclude filter_only fields so that
-    // field_to_idx().get(target) returns None and docstore writes are skipped.
-    let mut all_target_names: Vec<String> = target_fields
+    // Ensure field names are registered in the DocSiloAdapter before dump.
+    // Include config-computed sort field names (e.g., sortAt = GREATEST(...)) since
+    // those are written via extra_i64_fields and must have a field index.
+    let mut doc_target_names: Vec<String> = target_fields
         .iter()
         .filter(|t| !filter_only_fields.contains(*t))
         .cloned()
         .collect();
-    // Also include config-computed sort field targets (e.g., sortAt) so the
-    // BulkWriter can write their values to docstore.
-    // ONLY for the sets_alive phase (images) — later phases (resources, tools,
-    // techniques, metrics) lack the source fields (existedAt, publishedAt) and
-    // would write sortAt=GREATEST(0,0)=0, which overwrites the correct value
-    // from the images phase via DocStore V2 LIFO scan.
-    if request.sets_alive {
-        for sc in &config.sort_fields {
-            if sc.computed.is_some() && !all_target_names.contains(&sc.name) {
-                all_target_names.push(sc.name.clone());
-            }
+    for sf in &config.sort_fields {
+        if sf.computed.is_some() && !doc_target_names.contains(&sf.name) {
+            doc_target_names.push(sf.name.clone());
         }
     }
-    let bulk_writer = Arc::new(
-        engine
-            .prepare_streaming_writer(&all_target_names)
-            .map_err(|e| format!("prepare_streaming_writer: {e}"))?,
-    );
-
-    // Log docstore field dictionary for debugging computed field persistence
-    {
-        let field_idx = bulk_writer.field_to_idx();
-        let computed_targets: Vec<&str> = computed_defs.iter().map(|d| d.target.as_str()).collect();
-        for ct in &computed_targets {
-            if !field_idx.contains_key(*ct) {
-                eprintln!("  WARNING: computed field '{}' NOT in BulkWriter field_idx — will NOT be written to docstore", ct);
-            }
-        }
-        if !computed_targets.is_empty() {
-            eprintln!("  Docstore field_idx has {} fields, computed targets: {:?}", field_idx.len(), computed_targets);
-        }
-        // Log config-computed sort fields presence in field_idx
-        for sc in &config.sort_fields {
-            if sc.computed.is_some() {
-                let in_idx = field_idx.contains_key(&sc.name);
-                eprintln!("  [diag] config-computed sort '{}': in field_idx={}, sources={:?}",
-                    sc.name, in_idx, sc.computed.as_ref().map(|c| &c.source_fields));
-            }
-        }
-    }
-
+    engine.prepare_field_names(&doc_target_names)
+        .map_err(|e| format!("prepare_field_names: {e}"))?;
+    // Get the field_to_idx mapping for doc encoding during parse.
+    let doc_field_to_idx: Arc<HashMap<String, u16>> = {
+        let ds = engine.docstore_arc();
+        let ds_lock = ds.lock();
+        Arc::new(ds_lock.field_to_idx().clone())
+    };
     // Mmap the CSV/TSV file.
     // IMPORTANT: The mmap is scoped tightly around the parse phase (see the
     // `mmap_scope` block below). After parsing completes and the PhaseResult
@@ -1504,8 +1434,11 @@ pub fn process_dump_with_progress(
         .as_secs();
     let has_deferred_alive = config.deferred_alive.is_some() && request.sets_alive;
 
-    // Tags optimization: if only multi-value field with small IDs, use Vec indexing
-    let is_tags_optimization = request.fields.len() == 1
+    // Detect multi-value-only phases (tags, tools, techniques).
+    // These have a single multi-value field and no enrichment/computed fields.
+    // After parse, we invert the accumulated bitmaps to reconstruct per-slot arrays
+    // and write them to the DataSilo ops log — one Merge op per slot.
+    let is_multi_value_only = request.fields.len() == 1
         && !request.sets_alive
         && request.computed_fields.is_empty()
         && request.enrichment.is_empty()
@@ -1514,26 +1447,8 @@ pub fn process_dump_with_progress(
             target == "tagIds" || target == "toolIds" || target == "techniqueIds"
         };
 
-    if is_tags_optimization {
-        let result = process_multi_value_phase(
-            request,
-            body,
-            delimiter,
-            &col_index,
-            &filter_expr,
-            &bulk_writer,
-            &progress_counter,
-            slot_watermark,
-            shutdown,
-        );
-        // Drop the mmap immediately after parsing — prevents zombie processes.
-        drop(mmap);
-        drop(file);
-        eprintln!("  Dump {}: mmap released", request.name);
-        return result;
-    }
-
     emit_stage(&request.name, "parallel_parse", "start", &t, 0);
+
     // General phase processing with rayon parallelism
     let ranges = split_mmap_ranges(body, rayon::current_num_threads());
     let total = AtomicU64::new(0);
@@ -1621,6 +1536,8 @@ pub fn process_dump_with_progress(
 
     // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
     // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
+    // Thread result includes doc_ops: encoded Merge ops to write to DataSilo after parse.
+    // For multi-value-only phases, doc_ops is empty (bitmap inversion post-pass writes docs).
     type ThreadResult = (
         HashMap<String, HashMap<u64, RoaringBitmap>>,
         HashMap<String, Vec<RoaringBitmap>>,
@@ -1628,17 +1545,36 @@ pub fn process_dump_with_progress(
         Vec<(u32, u64)>,
         u64,
         u32,
+        Vec<(u32, Vec<u8>)>, // doc_ops: (slot, encoded Merge op bytes)
     );
+
+    // Prepare parallel ops writer for direct mmap writes from rayon threads.
+    // Each thread writes doc ops directly to the mmap'd ops log at 32M+ ops/s.
+    let parallel_ops_writer: Option<Arc<datasilo::ParallelOpsWriter>> = if !is_multi_value_only {
+        let estimated_rows = (body.len() / 100).max(1000);
+        let estimated_bytes = estimated_rows as u64 * 400; // ~300 bytes per doc + framing
+        let ds = engine.docstore_arc();
+        let ds_lock = ds.lock();
+        match ds_lock.silo().prepare_parallel_ops(estimated_bytes) {
+            Ok(pw) => Some(Arc::new(pw)),
+            Err(e) => {
+                eprintln!("  Dump {}: parallel ops writer failed (falling back to batch): {e}", request.name);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let pw_ref = &parallel_ops_writer;
 
     let thread_results: Vec<ThreadResult> = ranges
         .par_iter()
         .map(|&(range_start, range_end)| {
             let chunk = &body[range_start..range_end];
 
-            let field_idx_cache: &HashMap<String, u16> = bulk_writer.field_to_idx();
+            // Use the shared field_to_idx for doc encoding.
+            let field_idx_cache: &HashMap<String, u16> = doc_field_to_idx.as_ref();
             let col_idx_ref: &HashMap<String, usize> = col_index.as_ref();
-            let mut serialize_buf: Vec<u8> = Vec::with_capacity(64);
-
 
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
                 .iter()
@@ -1666,8 +1602,16 @@ pub fn process_dump_with_progress(
             }
             let mut alive = RoaringBitmap::new();
             let mut deferred: Vec<(u32, u64)> = Vec::new();
-            let mut tuple_buf: Vec<(u16, u32, u32)> = Vec::with_capacity(20);
-            let mut write_buf: Vec<u8> = Vec::with_capacity(256);
+            // Doc ops collected during parse — written to DataSilo after fold/reduce.
+            // For multi-value-only phases, no doc ops are collected here (post-pass handles it).
+            let mut doc_ops: Vec<(u32, Vec<u8>)> = if is_multi_value_only || pw_ref.is_some() {
+                Vec::new() // not needed when using parallel ops writer
+            } else {
+                Vec::with_capacity(4096)
+            };
+            // Thread-local cursor for parallel ops writer (1MB regions)
+            let mut ops_local_cursor: usize = 0;
+            let mut ops_local_end: usize = 0;
             let mut count = 0u64;
             let mut max_slot: u32 = 0;
             let mut line_start = 0;
@@ -1799,23 +1743,25 @@ pub fn process_dump_with_progress(
                     if let Some(pub_str) = enriched_get("publishedAt") {
                         if let Ok(pub_secs) = pub_str.parse::<u64>() {
                             if pub_secs > now_unix {
-                                // Write docstore only, skip all bitmaps
-                                write_docstore_row_indexed(
-                                    &row,
-                                    &enriched,
-                                    computed_defs_ref,
-                                    &indexed_fields_buf,
-                                    col_idx,
-                                    slot,
-                                    request_fields,
-                                    &bulk_writer,
-                                    &field_idx_cache,
-                                    &boolean_fields,
-                                    &config_computed_sort_vals,
-                                    &mut serialize_buf,
-                                    &mut tuple_buf,
-                                    &mut write_buf,
-                                );
+                                // Write doc op (deferred rows need their doc data stored),
+                                // but skip all bitmap operations.
+                                if !is_multi_value_only {
+                                    let pw_arg = pw_ref.as_ref().map(|pw| (pw.as_ref(), &mut ops_local_cursor, &mut ops_local_end));
+                                    collect_doc_op(
+                                        &row,
+                                        &enriched,
+                                        computed_defs_ref,
+                                        &indexed_fields_buf,
+                                        col_idx,
+                                        slot,
+                                        request_fields,
+                                        &field_idx_cache,
+                                        &boolean_fields,
+                                        &config_computed_sort_vals,
+                                        &mut doc_ops,
+                                        pw_arg,
+                                    );
+                                }
                                 deferred.push((slot, pub_secs));
                                 count += 1;
                                 if count % LOG_INTERVAL == 0 {
@@ -2062,23 +2008,24 @@ pub fn process_dump_with_progress(
                     }
                 }
 
-                // Write docstore (direct + enriched + dump computed fields)
-                write_docstore_row_indexed(
-                    &row,
-                    &enriched,
-                    computed_defs_ref,
-                    &indexed_fields_buf,
-                    col_idx,
-                    slot,
-                    request_fields,
-                    &bulk_writer,
-                    &field_idx_cache,
-                    &boolean_fields,
-                    &config_computed_sort_vals,
-                    &mut serialize_buf,
-                    &mut tuple_buf,
-                    &mut write_buf,
-                );
+                // Write doc op — directly to mmap if parallel writer available, else collect.
+                if !is_multi_value_only {
+                    let pw_arg = pw_ref.as_ref().map(|pw| (pw.as_ref(), &mut ops_local_cursor, &mut ops_local_end));
+                    collect_doc_op(
+                        &row,
+                        &enriched,
+                        computed_defs_ref,
+                        &indexed_fields_buf,
+                        col_idx,
+                        slot,
+                        request_fields,
+                        &field_idx_cache,
+                        &boolean_fields,
+                        &config_computed_sort_vals,
+                        &mut doc_ops,
+                        pw_arg,
+                    );
+                }
 
                 count += 1;
                 if count % LOG_INTERVAL == 0 {
@@ -2094,9 +2041,7 @@ pub fn process_dump_with_progress(
             total_ref.fetch_add(remainder, Ordering::Relaxed);
             if let Some(ref p) = ext_progress { p.fetch_add(remainder, Ordering::Relaxed); }
 
-            // Flush timing
-
-            (filter_maps, sort_maps, alive, deferred, count, max_slot)
+            (filter_maps, sort_maps, alive, deferred, count, max_slot, doc_ops)
         })
         .collect();
 
@@ -2125,7 +2070,8 @@ pub fn process_dump_with_progress(
     }
 
     emit_stage(&request.name, "merge", "start", &t, total.load(Ordering::Relaxed));
-    // Merge all thread results — parallel tree reduction
+    // Merge all thread results — parallel tree reduction.
+    // doc_ops are collected separately (not merged in parallel — just concatenated).
     type MergeAccum = (
         HashMap<String, HashMap<u64, RoaringBitmap>>,
         HashMap<String, Vec<RoaringBitmap>>,
@@ -2133,19 +2079,21 @@ pub fn process_dump_with_progress(
         BTreeMap<u64, Vec<u32>>,
         u64,
         u32,
+        Vec<(u32, Vec<u8>)>, // doc_ops accumulated across threads
     );
 
-    let (merged_filters, merged_sorts, merged_alive, merged_deferred, total_count, max_slot) =
+    let (merged_filters, merged_sorts, merged_alive, merged_deferred, total_count, max_slot, all_doc_ops) =
         thread_results
             .into_par_iter()
             .fold(
                 || -> MergeAccum {
-                    (HashMap::new(), HashMap::new(), RoaringBitmap::new(), BTreeMap::new(), 0u64, 0u32)
+                    (HashMap::new(), HashMap::new(), RoaringBitmap::new(), BTreeMap::new(), 0u64, 0u32, Vec::new())
                 },
-                |mut acc, (filter_maps, sort_maps, alive, deferred, count, thread_max)| {
+                |mut acc, (filter_maps, sort_maps, alive, deferred, count, thread_max, doc_ops)| {
                     acc.2 |= alive;
                     acc.4 += count;
                     if thread_max > acc.5 { acc.5 = thread_max; }
+                    acc.6.extend(doc_ops);
 
                     for (slot, activate_at) in deferred {
                         acc.3.entry(activate_at).or_default().push(slot);
@@ -2172,12 +2120,13 @@ pub fn process_dump_with_progress(
             )
             .reduce(
                 || -> MergeAccum {
-                    (HashMap::new(), HashMap::new(), RoaringBitmap::new(), BTreeMap::new(), 0u64, 0u32)
+                    (HashMap::new(), HashMap::new(), RoaringBitmap::new(), BTreeMap::new(), 0u64, 0u32, Vec::new())
                 },
-                |mut a, b| {
+                |mut a, mut b| {
                     a.2 |= b.2;
                     a.4 += b.4;
                     if b.5 > a.5 { a.5 = b.5; }
+                    a.6.append(&mut b.6);
 
                     for (activate_at, slots) in b.3 {
                         a.3.entry(activate_at).or_default().extend(slots);
@@ -2205,9 +2154,57 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
-    // Finalize streaming writer: flush BufWriters, update ops_count headers, sync.
-    if let Err(e) = bulk_writer.finalize() {
-        eprintln!("  dump {}: StreamingDocWriter finalize error: {e}", request.name);
+    // Write doc ops to DataSilo ops log.
+    // For non-multi-value phases: write the collected per-row Merge ops.
+    // For multi-value-only phases: invert the filter bitmaps to reconstruct per-slot arrays,
+    // then write one Merge op per slot.
+    {
+        let t_doc = Instant::now();
+        let ds = engine.docstore_arc();
+        let mut ds_lock = ds.lock();
+
+        if is_multi_value_only {
+            // Bitmap inversion post-pass: for each (value_id, bitmap) pair, iterate the bitmap
+            // to build per-slot tag/tool/technique arrays, then write one Merge op per slot.
+            // Uses a temporary slot→values HashMap built from the merged filter bitmaps.
+            let target = request.fields[0].target();
+            if let Some(field_idx_val) = doc_field_to_idx.get(target) {
+                let fidx = *field_idx_val;
+                // Build slot → Vec<i64> from the merged bitmap
+                let mut slot_values: HashMap<u32, Vec<i64>> = HashMap::new();
+                if let Some(value_map) = merged_filters.get(target) {
+                    for (&value_id, bitmap) in value_map {
+                        for slot in bitmap.iter() {
+                            slot_values.entry(slot).or_default().push(value_id as i64);
+                        }
+                    }
+                }
+                let mv_ops: Vec<(u32, Vec<u8>)> = slot_values.into_iter().map(|(slot, values)| {
+                    let fields = vec![(fidx, PackedValue::Mi(values))];
+                    let bytes = crate::doc_format::encode_merge_fields(slot, &fields);
+                    (slot, bytes)
+                }).collect();
+                eprintln!("  Dump {}: multi-value post-pass wrote {} doc ops ({:.1}s)",
+                    request.name, mv_ops.len(), t_doc.elapsed().as_secs_f64());
+                if !mv_ops.is_empty() {
+                    ds_lock.silo_mut().append_ops_batch(&mv_ops)
+                        .map_err(|e| format!("append_ops_batch (multi-value): {e}"))?;
+                }
+            }
+        } else if parallel_ops_writer.is_some() {
+            // Doc ops were already written directly to the mmap'd ops log during parse.
+            // Just flush the mmap.
+            ds_lock.silo().flush_ops()
+                .map_err(|e| format!("flush_ops: {e}"))?;
+            eprintln!("  Dump {}: doc ops written inline via parallel mmap ({:.1}s)",
+                request.name, t_doc.elapsed().as_secs_f64());
+        } else if !all_doc_ops.is_empty() {
+            eprintln!("  Dump {}: writing {} doc ops to DataSilo (batch) ({:.1}s)",
+                request.name, all_doc_ops.len(), t_doc.elapsed().as_secs_f64());
+            ds_lock.silo_mut().append_ops_batch(&all_doc_ops)
+                .map_err(|e| format!("append_ops_batch: {e}"))?;
+        }
+        eprintln!("  Dump {}: doc write done in {:.1}s", request.name, t_doc.elapsed().as_secs_f64());
     }
 
     let elapsed = t.elapsed();
@@ -2229,647 +2226,8 @@ pub fn process_dump_with_progress(
     })
 }
 
-// ---------------------------------------------------------------------------
-// save_phase_to_disk — extracted save logic for pipeline save
-// ---------------------------------------------------------------------------
-
-/// Save a PhaseResult's bitmaps to ShardStore. Drains filter/sort HashMaps
-/// incrementally as each field is written to free memory while saving.
-///
-/// Call this after `process_dump_with_progress` to persist bitmaps.
-/// Can be run on a background thread via `SaveHandle::spawn`.
-pub fn save_phase_to_disk(
-    result: &mut PhaseResult,
-    alive_store: &crate::shard_store_bitmap::AliveBitmapStore,
-    filter_store: &crate::shard_store_bitmap::FilterBitmapStore,
-    sort_store: &crate::shard_store_bitmap::SortBitmapStore,
-    meta_store: &crate::shard_store_meta::MetaStore,
-    bitmap_path: &Path,
-    dictionaries: &HashMap<String, FieldDictionary>,
-    dump_name: &str,
-    sets_alive: bool,
-) -> Result<(), String> {
-    let t = Instant::now();
-    emit_stage(dump_name, "bitmap_save", "start", &t, result.row_count);
-
-    let save_start = Instant::now();
-    let t_filter_save = Instant::now();
-
-    // Parallel filter saves — drain into per-bucket Vecs, write buckets in parallel.
-    // Same pattern as the old BitmapFs path: parallel per-bucket writes with
-    // incremental drop. Each bucket drops after its shard file is written.
-    let filter_items: Vec<_> = result.filter_maps.drain()
-        .filter(|(_, values)| !values.is_empty())
-        .collect();
-
-    // Pre-create shard directories for all fields (avoids per-write create_dir_all)
-    for (field_name, _) in &filter_items {
-        let buckets: Vec<u8> = (0..=255u8).collect();
-        filter_store.ensure_filter_dirs(field_name, &buckets)
-            .map_err(|e| format!("ensure_filter_dirs({field_name}): {e}"))?;
-    }
-
-    // Bucket and parallel-write each field
-    let filter_results: Vec<Result<(String, usize), String>> = filter_items
-        .into_par_iter()
-        .map(|(field_name, values)| {
-            let count = values.len();
-            // Drain into per-bucket owned Vecs
-            let mut by_bucket: HashMap<u8, Vec<(u64, RoaringBitmap)>> = HashMap::new();
-            for (value, bm) in values {
-                let bucket = ((value >> 8) & 0xFF) as u8;
-                by_bucket.entry(bucket).or_default().push((value, bm));
-            }
-            // Parallel bucket writes within each field
-            let buckets: Vec<_> = by_bucket.into_iter().collect();
-            buckets.into_par_iter().try_for_each(|(bucket, entries)| -> Result<(), String> {
-                let refs: Vec<(u64, &RoaringBitmap)> = entries.iter()
-                    .map(|(v, bm)| (*v, bm))
-                    .collect();
-                filter_store.write_filter_bucket_raw(&field_name, bucket, &refs)
-                    .map_err(|e| format!("write_bucket({field_name}, {bucket:02x}): {e}"))?;
-                drop(entries); // free this bucket's bitmaps
-                Ok(())
-            })?;
-            Ok((field_name, count))
-        })
-        .collect();
-    for r in filter_results {
-        let (field_name, count) = r?;
-        eprintln!("  Saved filter {}: {} values", field_name, count);
-    }
-
-    let filter_save_s = t_filter_save.elapsed().as_secs_f64();
-    let t_sort_save = Instant::now();
-    // Parallel sort field saves via ShardStore — drain for memory release
-    let sort_items: Vec<_> = result.sort_maps.drain()
-        .filter(|(_, layers)| !layers.is_empty() && layers.iter().any(|bm| !bm.is_empty()))
-        .collect();
-    // Pre-create sort field dirs
-    for (field_name, _) in &sort_items {
-        sort_store.ensure_sort_dir(field_name)
-            .map_err(|e| format!("ensure_sort_dir({field_name}): {e}"))?;
-    }
-    let sort_results: Vec<Result<(String, usize), String>> = sort_items
-        .par_iter()
-        .map(|(field_name, layers)| {
-            let layer_refs: Vec<&RoaringBitmap> = layers.iter().collect();
-            sort_store.write_sort_layers(field_name, &layer_refs)
-                .map_err(|e| format!("write_sort_layers({field_name}): {e}"))?;
-            Ok((field_name.to_string(), layers.len()))
-        })
-        .collect();
-    for r in sort_results {
-        let (field_name, num_layers) = r?;
-        eprintln!("  Saved sort {}: {} layers", field_name, num_layers);
-    }
-
-    let sort_save_s = t_sort_save.elapsed().as_secs_f64();
-    let t_meta_save = Instant::now();
-
-    if sets_alive {
-        alive_store
-            .write_alive(&result.alive)
-            .map_err(|e| format!("write_alive: {e}"))?;
-        eprintln!("  Saved alive bitmap: {} bits", result.alive.len());
-
-        // Slot counter: max of alive + deferred slots
-        let max_deferred = result.deferred_slots
-            .values()
-            .flat_map(|v| v.iter())
-            .copied()
-            .max()
-            .unwrap_or(0);
-        let slot_counter = result.max_slot.max(max_deferred).saturating_add(1);
-        meta_store
-            .write_slot_counter(slot_counter)
-            .map_err(|e| format!("write_slot_counter: {e}"))?;
-
-        if !result.deferred_slots.is_empty() {
-            meta_store
-                .write_deferred_alive(&result.deferred_slots)
-                .map_err(|e| format!("write_deferred_alive: {e}"))?;
-            let deferred_total: usize = result.deferred_slots.values().map(|v| v.len()).sum();
-            eprintln!("  Saved deferred alive: {} slots", deferred_total);
-        }
-    }
-
-    let meta_save_s = t_meta_save.elapsed().as_secs_f64();
-
-    // Persist LCS dictionaries
-    let dict_dir = bitmap_path.join("dictionaries");
-    std::fs::create_dir_all(&dict_dir).ok();
-    for (name, dict) in dictionaries {
-        let snap = dict.snapshot();
-        if snap.forward.is_empty() {
-            continue;
-        }
-        let path = dict_dir.join(format!("{name}.dict"));
-        if let Err(e) = crate::dictionary::save_dictionary(&snap, &path) {
-            eprintln!("WARNING: failed to save dictionary for '{name}': {e}");
-        } else {
-            eprintln!("  Saved dictionary '{name}': {} entries", snap.forward.len());
-        }
-    }
-
-    let total_save_s = save_start.elapsed().as_secs_f64();
-    eprintln!("  Save breakdown: filter={:.2}s sort={:.2}s alive_meta={:.2}s total={:.2}s",
-        filter_save_s, sort_save_s, meta_save_s, total_save_s);
-    eprintln!(
-        r#"{{"dump":"{}","stage":"save_timing","filter_s":{:.3},"sort_s":{:.3},"alive_meta_s":{:.3},"total_s":{:.3}}}"#,
-        dump_name, filter_save_s, sort_save_s, meta_save_s, total_save_s,
-    );
-    emit_stage(dump_name, "bitmap_save", "done", &t, result.row_count);
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// SaveHandle — background thread for bitmap persistence
-// ---------------------------------------------------------------------------
-
-/// Handle to a background save thread. The caller should `join()` this
-/// before any operation that depends on the save being complete (e.g.,
-/// `mark_fields_pending_reload`, `reload_alive_from_disk`).
-pub struct SaveHandle {
-    handle: Option<std::thread::JoinHandle<Result<(), String>>>,
-    unit_handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl SaveHandle {
-    /// Spawn a background thread that saves a PhaseResult to ShardStore.
-    /// Takes ownership of the PhaseResult so bitmaps can be dropped
-    /// incrementally as each field is written.
-    pub fn spawn(
-        mut result: PhaseResult,
-        alive_store: Arc<crate::shard_store_bitmap::AliveBitmapStore>,
-        filter_store: Arc<crate::shard_store_bitmap::FilterBitmapStore>,
-        sort_store: Arc<crate::shard_store_bitmap::SortBitmapStore>,
-        meta_store: Arc<crate::shard_store_meta::MetaStore>,
-        bitmap_path: std::path::PathBuf,
-        dictionaries: Arc<HashMap<String, FieldDictionary>>,
-        dump_name: String,
-        sets_alive: bool,
-    ) -> Self {
-        let handle = std::thread::Builder::new()
-            .name(format!("save-{}", dump_name))
-            .spawn(move || {
-                save_phase_to_disk(
-                    &mut result,
-                    &alive_store,
-                    &filter_store,
-                    &sort_store,
-                    &meta_store,
-                    &bitmap_path,
-                    &dictionaries,
-                    &dump_name,
-                    sets_alive,
-                )
-            })
-            .expect("failed to spawn save thread");
-        SaveHandle {
-            handle: Some(handle),
-            unit_handle: None,
-        }
-    }
-
-    /// Block until the save completes. Returns the save result.
-    pub fn join(mut self) -> Result<(), String> {
-        if let Some(h) = self.handle.take() {
-            h.join().map_err(|e| format!("save thread panicked: {:?}", e))?
-        } else if let Some(h) = self.unit_handle.take() {
-            h.join().map_err(|e| format!("save thread panicked: {:?}", e))
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Create a no-op handle (for phases that have no save work).
-    pub fn noop() -> Self {
-        SaveHandle { handle: None, unit_handle: None }
-    }
-
-    /// Wrap an existing JoinHandle (e.g., a monitor thread that does save + reload).
-    pub fn from_join_handle(handle: std::thread::JoinHandle<()>) -> Self {
-        SaveHandle {
-            handle: None,
-            unit_handle: Some(handle),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Multi-value phase (tags, tools, techniques optimization)
-// ---------------------------------------------------------------------------
-
-/// Optimized processor for simple multi-value phases (two columns: value_id, slot_id).
-/// Uses Vec indexing for tags (MAX_TAG_ID=300K preallocated).
-fn process_multi_value_phase(
-    request: &DumpRequest,
-    body: &[u8],
-    delimiter: u8,
-    col_index: &Arc<HashMap<String, usize>>,
-    filter_expr: &Option<FilterExpression>,
-    bulk_writer: &Arc<StreamingDocWriter>,
-    progress_counter: &Option<Arc<AtomicU64>>,
-    slot_watermark: Option<&Arc<AtomicU64>>,
-    shutdown: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
-) -> Result<PhaseResult, String> {
-    let target = request.fields[0].target().to_string();
-    let value_column = request.fields[0].column().to_string();
-    let slot_field = &request.slot_field;
-
-    const MAX_TAG_ID: usize = 300_000;
-    let use_vec = target == "tagIds"; // Only tagIds uses vec optimization
-
-    let field_idx = bulk_writer.field_to_idx().get(&target).copied();
-
-    let ranges = split_mmap_ranges(body, rayon::current_num_threads());
-    let total = AtomicU64::new(0);
-    let total_ref = &total;
-
-    // For the vec path (tagIds): docstore writes are deferred to a post-pass after
-    // bitmap merge. We invert the merged bitmaps shard-by-shard and write one Merge
-    // op per slot with the complete multi-value array. This reduces 4.5B individual
-    // writes to ~109M (one per slot) and fixes the correctness bug where Set overwrote
-    // previous values instead of accumulating.
-    //
-    // For the HashMap path (tools/techniques): use the old channel-based writer since
-    // these are small datasets where per-row Set ops are fine.
-    let (doc_tx, doc_rx) = if !use_vec && field_idx.is_some() {
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<(u32, i64)>>(64);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let doc_writer_handle = doc_rx.map(|rx| {
-        let bw = Arc::clone(bulk_writer);
-        let fidx = field_idx.unwrap();
-        std::thread::spawn(move || {
-            let mut buf = Vec::with_capacity(32);
-            for batch in rx {
-                for (slot, value) in batch {
-                    buf.clear();
-                    if rmp_serde::encode::write(&mut buf, &PackedValue::Mi(vec![value])).is_ok() {
-                        bw.append_tuple_raw(slot, fidx, &buf);
-                    }
-                }
-            }
-            if let Err(e) = bw.finalize() {
-                eprintln!("StreamingDocWriter: multi-value finalize error: {e}");
-            }
-        })
-    });
-
-    // Resolve column indices upfront for zero-alloc fast path
-    let value_col_idx = col_index.get(value_column.as_str()).copied();
-    let slot_col_idx = col_index.get(slot_field.as_str()).copied();
-    let can_fast_path = filter_expr.is_none() && value_col_idx.is_some() && slot_col_idx.is_some();
-    let value_idx = value_col_idx.unwrap_or(0);
-    let slot_idx = slot_col_idx.unwrap_or(1);
-
-    let t_mv = Instant::now();
-    emit_stage(&request.name, "parallel_parse", "start", &t_mv, 0);
-
-    if use_vec {
-
-        let thread_results: Vec<Vec<RoaringBitmap>> = ranges
-            .par_iter()
-            .map(|&(range_start, range_end)| {
-                let chunk = &body[range_start..range_end];
-                let mut bitmaps: Vec<RoaringBitmap> =
-                    (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect();
-                let mut local_max_slot: u32 = 0;
-                let mut count = 0u64;
-                let mut line_start = 0;
-
-                for i in 0..chunk.len() {
-                    if chunk[i] != b'\n' {
-                        continue;
-                    }
-                    let line = &chunk[line_start..i];
-                    line_start = i + 1;
-                    let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    // Fast path: zero-alloc binary parse for simple two-column CSV
-                    // (no filter expression, column indices known). Avoids Vec allocation
-                    // from parse_delimited_line — saves ~80s on 5.4B tag rows.
-                    let (slot, value) = if can_fast_path {
-                        match parse_two_cols_fast(line, delimiter, slot_idx, value_idx) {
-                            Some((s, v)) => (s, v as usize),
-                            None => continue,
-                        }
-                    } else {
-                        let fields = parse_delimited_line(line, delimiter);
-                        let row = ParsedRow {
-                            fields,
-                            col_index: col_index.as_ref(),
-                        };
-                        if let Some(ref fexpr) = filter_expr {
-                            let csv_row = row.to_csv_row();
-                            if !fexpr.eval(&csv_row, None) {
-                                continue;
-                            }
-                        }
-                        let s = match row.slot(slot_field) { Some(s) => s, None => continue };
-                        let v = match row.get_i64(&value_column) { Some(v) => v as usize, None => continue };
-                        (s, v)
-                    };
-
-                    if slot > local_max_slot { local_max_slot = slot; }
-
-                    if value < MAX_TAG_ID {
-                        bitmaps[value].insert(slot);
-                    }
-                    count += 1;
-                    if count % LOG_INTERVAL == 0 {
-                        total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
-                        if let Some(ref p) = progress_counter { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
-                        if let Some(ref sf) = shutdown { if sf() { break; } }
-                    }
-                }
-                let remainder = count % LOG_INTERVAL;
-                total_ref.fetch_add(remainder, Ordering::Relaxed);
-                if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
-                // Flush final watermark for this thread
-                if let Some(ref wm) = slot_watermark {
-                    wm.fetch_max(local_max_slot as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                bitmaps
-            })
-            .collect();
-
-        // Merge Vec<RoaringBitmap> — parallel tree reduction
-        let merged_vec = thread_results
-            .into_par_iter()
-            .reduce(
-                || (0..MAX_TAG_ID).map(|_| RoaringBitmap::new()).collect::<Vec<_>>(),
-                |mut dst, src| {
-                    for (i, bm) in src.into_iter().enumerate() {
-                        if !bm.is_empty() {
-                            dst[i] |= bm;
-                        }
-                    }
-                    dst
-                },
-            );
-
-        let total_rows = total.load(Ordering::Relaxed);
-        // Collect non-empty tag IDs for iteration
-        let non_empty_tags: Vec<usize> = merged_vec.iter()
-            .enumerate()
-            .filter(|(_, bm)| !bm.is_empty())
-            .map(|(i, _)| i)
-            .collect();
-        let distinct_count = non_empty_tags.len();
-        eprintln!(
-            "  Dump {} ({target}): {} rows, {} distinct values",
-            request.name, total_rows, distinct_count,
-        );
-
-        emit_stage(&request.name, "parallel_parse", "done", &t_mv, total_rows);
-
-        // ── Post-pass: invert bitmaps → per-slot tag arrays, write Merge ops ──
-        //
-        // Process in shard ranges (1M slots each) using rayon parallelism.
-        // For each shard: count tags per slot, build flat array, write Merge ops.
-        // Uses min/max per-tag to skip bitmaps that don't overlap the shard.
-        //
-        // Benchmarked at ~5 min for 4.5B tag entries at 109M slots (synthetic).
-        // DashMap alternative was tested and is 3-5x slower due to lock contention.
-        if let Some(fidx) = field_idx {
-            let t_doc = Instant::now();
-            const SHARD_SIZE: u32 = 1_000_000;
-            let max_slot = non_empty_tags.iter()
-                .filter_map(|&tag| merged_vec[tag].max())
-                .max()
-                .unwrap_or(0);
-            let num_shards = (max_slot / SHARD_SIZE) + 1;
-
-            // Pre-compute min/max slot per tag for fast range skipping
-            let tag_ranges: Vec<(usize, u32, u32)> = non_empty_tags.iter()
-                .filter_map(|&tag| {
-                    let bm = &merged_vec[tag];
-                    Some((tag, bm.min()?, bm.max()?))
-                })
-                .collect();
-
-            let total_docs_written = AtomicU64::new(0);
-            let bw_ref = &*bulk_writer;
-            let merged_ref = &merged_vec;
-            let tag_ranges_ref = &tag_ranges;
-
-            (0..num_shards).into_par_iter().for_each(|shard_idx| {
-                let shard_start = shard_idx * SHARD_SIZE;
-                let shard_end = shard_start + SHARD_SIZE;
-
-                // Filter to tags that overlap this shard
-                let relevant_tags: Vec<usize> = tag_ranges_ref.iter()
-                    .filter(|&&(_, min, max)| max >= shard_start && min < shard_end)
-                    .map(|&(tag, _, _)| tag)
-                    .collect();
-                if relevant_tags.is_empty() { return; }
-
-                // Pass 1: count tags per slot
-                let mut counts = vec![0u32; SHARD_SIZE as usize];
-                for &tag_id in &relevant_tags {
-                    for slot in merged_ref[tag_id].iter() {
-                        if slot < shard_start { continue; }
-                        if slot >= shard_end { break; }
-                        counts[(slot - shard_start) as usize] += 1;
-                    }
-                }
-
-                // Pass 2: prefix sum
-                let mut offsets = vec![0u32; SHARD_SIZE as usize];
-                let mut current_offset = 0u32;
-                for i in 0..SHARD_SIZE as usize {
-                    offsets[i] = current_offset;
-                    current_offset += counts[i];
-                }
-                let total_tags = current_offset as usize;
-                if total_tags == 0 { return; }
-
-                // Pass 3: fill flat tag array
-                let mut flat_tags = vec![0i64; total_tags];
-                let mut cursors = offsets.clone();
-                for &tag_id in &relevant_tags {
-                    for slot in merged_ref[tag_id].iter() {
-                        if slot < shard_start { continue; }
-                        if slot >= shard_end { break; }
-                        let idx = (slot - shard_start) as usize;
-                        let pos = cursors[idx] as usize;
-                        flat_tags[pos] = tag_id as i64;
-                        cursors[idx] += 1;
-                    }
-                }
-
-                // Pass 4: write one Merge per slot
-                let mut shard_docs = 0u64;
-                for i in 0..SHARD_SIZE as usize {
-                    if counts[i] > 0 {
-                        let start = offsets[i] as usize;
-                        let end = start + counts[i] as usize;
-                        let tags = &flat_tags[start..end];
-                        let slot = shard_start + i as u32;
-                        bw_ref.write_merge_doc(slot, &[
-                            (fidx, PackedValue::Mi(tags.to_vec())),
-                        ]);
-                        shard_docs += 1;
-                    }
-                }
-                total_docs_written.fetch_add(shard_docs, Ordering::Relaxed);
-            });
-
-            if let Err(e) = bulk_writer.finalize() {
-                eprintln!("  dump {}: StreamingDocWriter finalize error: {e}", request.name);
-            }
-            let docs = total_docs_written.load(Ordering::Relaxed);
-            eprintln!(
-                "  Dump {} docstore post-pass: {} docs in {:.1}s ({} shards, {:.0} docs/sec)",
-                request.name, docs, t_doc.elapsed().as_secs_f64(), num_shards,
-                docs as f64 / t_doc.elapsed().as_secs_f64().max(0.001)
-            );
-        }
-
-        // Convert to HashMap for return
-        let mut filter_map: HashMap<u64, RoaringBitmap> = HashMap::new();
-        for (i, bm) in merged_vec.into_iter().enumerate() {
-            if !bm.is_empty() {
-                filter_map.insert(i as u64, bm);
-            }
-        }
-        let mut filter_maps = HashMap::new();
-        filter_maps.insert(target, filter_map);
-
-        Ok(PhaseResult {
-            row_count: total_rows,
-            filter_maps,
-            sort_maps: HashMap::new(),
-            alive: RoaringBitmap::new(),
-            deferred_slots: BTreeMap::new(),
-            max_slot: 0,
-        })
-    } else {
-        // HashMap path for tools, techniques (smaller datasets)
-        // Also collect per-slot value lists for docstore writes
-        let thread_results: Vec<HashMap<u64, RoaringBitmap>> = ranges
-            .par_iter()
-            .map(|&(range_start, range_end)| {
-                let chunk = &body[range_start..range_end];
-                let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
-                let mut doc_batch: Vec<(u32, i64)> = Vec::with_capacity(10_000);
-                let mut count = 0u64;
-                let mut line_start = 0;
-                let mut local_max_slot: u32 = 0;
-
-                for i in 0..chunk.len() {
-                    if chunk[i] != b'\n' {
-                        continue;
-                    }
-                    let line = &chunk[line_start..i];
-                    line_start = i + 1;
-                    let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let (slot, value) = if can_fast_path {
-                        match parse_two_cols_fast(line, delimiter, slot_idx, value_idx) {
-                            Some((s, v)) => (s, v as u64),
-                            None => continue,
-                        }
-                    } else {
-                        let fields = parse_delimited_line(line, delimiter);
-                        let row = ParsedRow {
-                            fields,
-                            col_index: col_index.as_ref(),
-                        };
-                        if let Some(ref fexpr) = filter_expr {
-                            let csv_row = row.to_csv_row();
-                            if !fexpr.eval(&csv_row, None) {
-                                continue;
-                            }
-                        }
-                        let s = match row.slot(slot_field) { Some(s) => s, None => continue };
-                        let v = match row.get_u64(&value_column) { Some(v) => v, None => continue };
-                        (s, v)
-                    };
-
-                    if slot > local_max_slot { local_max_slot = slot; }
-
-                    bitmaps
-                        .entry(value)
-                        .or_insert_with(RoaringBitmap::new)
-                        .insert(slot);
-                    // Batch for writer thread
-                    if doc_tx.is_some() {
-                        doc_batch.push((slot, value as i64));
-                        if doc_batch.len() >= 10_000 {
-                            if let Some(ref tx) = doc_tx {
-                                let _ = tx.send(std::mem::take(&mut doc_batch));
-                                doc_batch = Vec::with_capacity(10_000);
-                            }
-                        }
-                    }
-                    count += 1;
-                    if count % LOG_INTERVAL == 0 {
-                        total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
-                        if let Some(ref p) = progress_counter { p.fetch_add(LOG_INTERVAL, Ordering::Relaxed); }
-                        if let Some(ref sf) = shutdown { if sf() { break; } }
-                    }
-                }
-                if !doc_batch.is_empty() {
-                    if let Some(ref tx) = doc_tx {
-                        let _ = tx.send(doc_batch);
-                    }
-                }
-                let remainder = count % LOG_INTERVAL;
-                total_ref.fetch_add(remainder, Ordering::Relaxed);
-                if let Some(ref p) = progress_counter { p.fetch_add(remainder, Ordering::Relaxed); }
-                // Flush final watermark for this thread
-                if let Some(ref wm) = slot_watermark {
-                    wm.fetch_max(local_max_slot as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                bitmaps
-            })
-            .collect();
-
-        // Docstore writes already done inline per-row
-
-        // Merge
-        let mut merged: HashMap<u64, RoaringBitmap> = HashMap::new();
-        for bitmaps in thread_results {
-            for (val, bm) in bitmaps {
-                merged.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
-            }
-        }
-
-        let total_rows = total.load(Ordering::Relaxed);
-        eprintln!(
-            "  Dump {} ({target}): {} rows, {} distinct values",
-            request.name,
-            total_rows,
-            merged.len(),
-        );
-
-        let mut filter_maps = HashMap::new();
-        filter_maps.insert(target, merged);
-
-        Ok(PhaseResult {
-            row_count: total_rows,
-            filter_maps,
-            sort_maps: HashMap::new(),
-            alive: RoaringBitmap::new(),
-            deferred_slots: BTreeMap::new(),
-            max_slot: 0,
-        })
-    }
-}
+// SaveHandle deleted — no separate save step with DataSilo.
+// Bitmaps go to engine staging, docs go to ops log, compact merges.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -2905,13 +2263,10 @@ fn collect_enrichment_targets(config: &EnrichmentConfig, targets: &mut Vec<Strin
     }
 }
 
-/// Write a single row's data to the docstore via BulkWriter (indexed path).
-///
-/// - `boolean_fields`: set of field names declared as Boolean in the data schema.
-///   Used to coerce PG COPY "t"/"f" strings to `PackedValue::B` instead of `PackedValue::S`.
-/// - `extra_i64_fields`: config-computed sort values (e.g., sortAt = GREATEST(existedAt, publishedAt))
-///   to write alongside direct/enriched fields in a single `append_tuples_raw` call.
-fn write_docstore_row_indexed(
+/// Encode a row's fields into a Merge op.
+/// If `pw` is provided, writes directly to the mmap'd ops log (32M+ ops/s).
+/// Otherwise collects into `doc_ops` Vec for batch write after parse.
+fn collect_doc_op(
     row: &ParsedRow,
     enriched: &dump_enrichment::EnrichedFields,
     computed_defs: &[ComputedFieldDef],
@@ -2919,33 +2274,19 @@ fn write_docstore_row_indexed(
     col_idx: &HashMap<String, usize>,
     slot: u32,
     request_fields: &[DumpFieldMapping],
-    bulk_writer: &Arc<StreamingDocWriter>,
     field_idx: &HashMap<String, u16>,
     boolean_fields: &HashSet<String>,
     extra_i64_fields: &[(&str, i64)],
-    serialize_buf: &mut Vec<u8>,
-    tuple_buf: &mut Vec<(u16, u32, u32)>,
-    write_buf: &mut Vec<u8>,
+    doc_ops: &mut Vec<(u32, Vec<u8>)>,
+    pw: Option<(&datasilo::ParallelOpsWriter, &mut usize, &mut usize)>,
 ) {
-    serialize_buf.clear();
-    tuple_buf.clear();
-
     // Build skip set: fields provided by extra_i64_fields (config-computed sort values
     // like sortAt = GREATEST) take priority over direct/enriched/computed writes.
     // Without this, a data_schema mapping (e.g., sortAtUnix → sortAt) that fails to
     // find its source column could overwrite the correct computed value with 0.
     let extra_skip: std::collections::HashSet<&str> = extra_i64_fields.iter().map(|&(t, _)| t).collect();
 
-    // Collect all fields into serialize_buf, track (field_idx, offset, len) in tuple_buf
-    macro_rules! collect_packed {
-        ($fidx:expr, $value:expr) => {
-            let start = serialize_buf.len() as u32;
-            if rmp_serde::encode::write(serialize_buf, $value).is_ok() {
-                let len = serialize_buf.len() as u32 - start;
-                tuple_buf.push(($fidx, start, len));
-            }
-        };
-    }
+    let mut fields: Vec<(u16, PackedValue)> = Vec::with_capacity(20);
 
     // Direct fields — skip fields that will be written by extra_i64_fields
     for mapping in request_fields {
@@ -2954,16 +2295,16 @@ fn write_docstore_row_indexed(
         let column = mapping.column();
         if let Some(&fidx) = field_idx.get(target) {
             if let Some(v) = row.get_i64(column) {
-                collect_packed!(fidx, &PackedValue::I(v));
+                fields.push((fidx, PackedValue::I(v)));
             } else if let Some(s) = row.get_str(column) {
                 if boolean_fields.contains(target) {
                     match s {
-                        "t" | "true" => { collect_packed!(fidx, &PackedValue::B(true)); }
-                        "f" | "false" => { collect_packed!(fidx, &PackedValue::B(false)); }
-                        _ => { collect_packed!(fidx, &PackedValue::S(s.to_string())); }
+                        "t" | "true" => { fields.push((fidx, PackedValue::B(true))); }
+                        "f" | "false" => { fields.push((fidx, PackedValue::B(false))); }
+                        _ => { fields.push((fidx, PackedValue::S(s.to_string()))); }
                     }
                 } else {
-                    collect_packed!(fidx, &PackedValue::S(s.to_string()));
+                    fields.push((fidx, PackedValue::S(s.to_string())));
                 }
             }
         }
@@ -2974,15 +2315,15 @@ fn write_docstore_row_indexed(
         if extra_skip.contains(target.as_str()) { continue; }
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             if let Ok(v) = value.parse::<i64>() {
-                collect_packed!(fidx, &PackedValue::I(v));
+                fields.push((fidx, PackedValue::I(v)));
             } else if boolean_fields.contains(target.as_str()) {
                 match value.as_str() {
-                    "t" | "true" => { collect_packed!(fidx, &PackedValue::B(true)); }
-                    "f" | "false" => { collect_packed!(fidx, &PackedValue::B(false)); }
-                    _ => { collect_packed!(fidx, &PackedValue::S(value.clone())); }
+                    "t" | "true" => { fields.push((fidx, PackedValue::B(true))); }
+                    "f" | "false" => { fields.push((fidx, PackedValue::B(false))); }
+                    _ => { fields.push((fidx, PackedValue::S(value.clone()))); }
                 }
             } else {
-                collect_packed!(fidx, &PackedValue::S(value.clone()));
+                fields.push((fidx, PackedValue::S(value.clone())));
             }
         }
     }
@@ -2992,15 +2333,15 @@ fn write_docstore_row_indexed(
         if extra_skip.contains(target.as_str()) { continue; }
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             match value {
-                NateExprValue::Int(v) => { collect_packed!(fidx, &PackedValue::I(*v)); }
+                NateExprValue::Int(v) => { fields.push((fidx, PackedValue::I(*v))); }
                 NateExprValue::Bool(b) => {
                     if boolean_fields.contains(target.as_str()) {
-                        collect_packed!(fidx, &PackedValue::B(*b));
+                        fields.push((fidx, PackedValue::B(*b)));
                     } else {
-                        collect_packed!(fidx, &PackedValue::I(if *b { 1 } else { 0 }));
+                        fields.push((fidx, PackedValue::I(if *b { 1 } else { 0 })));
                     }
                 }
-                NateExprValue::Str(ref s) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
+                NateExprValue::Str(ref s) => { fields.push((fidx, PackedValue::S(s.clone()))); }
                 NateExprValue::Null => {}
             }
         }
@@ -3011,15 +2352,15 @@ fn write_docstore_row_indexed(
         if extra_skip.contains(def.target.as_str()) { continue; }
         if let Some(&fidx) = field_idx.get(def.target.as_str()) {
             match def.eval_indexed(indexed_fields, col_idx, None) {
-                Some(NateExprValue::Int(v)) => { collect_packed!(fidx, &PackedValue::I(v)); }
+                Some(NateExprValue::Int(v)) => { fields.push((fidx, PackedValue::I(v))); }
                 Some(NateExprValue::Bool(b)) => {
                     if boolean_fields.contains(def.target.as_str()) {
-                        collect_packed!(fidx, &PackedValue::B(b));
+                        fields.push((fidx, PackedValue::B(b)));
                     } else {
-                        collect_packed!(fidx, &PackedValue::I(if b { 1 } else { 0 }));
+                        fields.push((fidx, PackedValue::I(if b { 1 } else { 0 })));
                     }
                 }
-                Some(NateExprValue::Str(ref s)) => { collect_packed!(fidx, &PackedValue::S(s.clone())); }
+                Some(NateExprValue::Str(ref s)) => { fields.push((fidx, PackedValue::S(s.clone()))); }
                 _ => {}
             }
         }
@@ -3032,82 +2373,20 @@ fn write_docstore_row_indexed(
         // GREATEST(0,0)=0). A prior phase wrote the real value; don't overwrite it.
         if value == 0 { continue; }
         if let Some(&fidx) = field_idx.get(target) {
-            collect_packed!(fidx, &PackedValue::I(value));
+            fields.push((fidx, PackedValue::I(value)));
         }
     }
 
-    // One lock acquisition for all fields
-    if !tuple_buf.is_empty() {
-        let refs: Vec<(u16, &[u8])> = tuple_buf.iter()
-            .map(|&(idx, off, len)| (idx, &serialize_buf[off as usize..(off + len) as usize]))
-            .collect();
-        bulk_writer.append_tuples_merge(slot, &refs, write_buf);
-    }
-}
-
-/// Write a single row's data to the docstore via BulkWriter (legacy HashMap path).
-fn write_docstore_row(
-    row: &ParsedRow,
-    enriched_values: &HashMap<String, String>,
-    computed_defs: &[ComputedFieldDef],
-    csv_row: &CsvRow,
-    slot: u32,
-    request_fields: &[DumpFieldMapping],
-    bulk_writer: &Arc<StreamingDocWriter>,
-) {
-    let field_idx = bulk_writer.field_to_idx();
-
-    // Write direct fields
-    for mapping in request_fields {
-        let target = mapping.target();
-        let column = mapping.column();
-
-        if let Some(&fidx) = field_idx.get(target) {
-            if let Some(v) = row.get_i64(column) {
-                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
-            } else if let Some(s) = row.get_str(column) {
-                let packed = rmp_serde::to_vec(&PackedValue::S(s.to_string())).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
-            }
-        }
-    }
-
-    // Write enriched fields
-    for (target, value) in enriched_values {
-        if let Some(&fidx) = field_idx.get(target.as_str()) {
-            if let Ok(v) = value.parse::<i64>() {
-                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
-            } else {
-                let packed =
-                    rmp_serde::to_vec(&PackedValue::S(value.clone())).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
-            }
-        }
-    }
-
-    // Write computed fields (Nate's ComputedFieldDef API)
-    for def in computed_defs {
-        if let Some(&fidx) = field_idx.get(def.target.as_str()) {
-            match def.eval(csv_row, None) {
-                Some(NateExprValue::Int(v)) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                Some(NateExprValue::Bool(b)) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::I(if b { 1 } else { 0 })).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                Some(NateExprValue::Str(ref s)) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::S(s.clone())).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                _ => {}
-            }
+    if !fields.is_empty() {
+        let bytes = crate::doc_format::encode_merge_fields(slot, &fields);
+        if let Some((writer, local_cursor, local_end)) = pw {
+            writer.write_put(slot, &bytes, local_cursor, local_end);
+        } else {
+            doc_ops.push((slot, bytes));
         }
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -3590,22 +2869,12 @@ mod tests {
         }
     }
 
-    /// Test that write_docstore_row_indexed correctly coerces PG boolean strings
-    /// ("t"/"f") to PackedValue::B for fields declared as boolean in the data schema.
+    /// Test that collect_doc_op encodes boolean fields correctly and collects into doc_ops.
     #[test]
     fn test_boolean_coercion_in_docstore_write() {
-        use crate::shard_store_doc::DocStoreV3;
-        use crate::shard_store_doc::PackedValue;
-        use std::sync::Arc;
-
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut ds = DocStoreV3::open(&docs_dir).unwrap();
-
-        let field_names = vec!["poi".to_string(), "type".to_string()];
-        let bulk_writer = Arc::new(ds.prepare_streaming_writer(&field_names).unwrap());
-        let field_idx = bulk_writer.field_to_idx().clone();
-
+        let mut field_idx: HashMap<String, u16> = HashMap::new();
+        field_idx.insert("poi".to_string(), 0);
+        field_idx.insert("type".to_string(), 1);
         let mut boolean_fields = HashSet::new();
         boolean_fields.insert("poi".to_string());
 
@@ -3628,48 +2897,25 @@ mod tests {
         let indexed_fields = row.to_indexed_fields();
         let col_idx = row.col_index_ref();
         let extra_i64: Vec<(&str, i64)> = vec![];
+        let mut doc_ops: Vec<(u32, Vec<u8>)> = Vec::new();
 
-        let mut serialize_buf = Vec::new();
-        let mut tuple_buf = Vec::new();
-        let mut write_buf = Vec::new();
-
-        write_docstore_row_indexed(
+        collect_doc_op(
             &row, &enriched, &computed_defs, &indexed_fields, col_idx,
-            1, &request_fields, &bulk_writer, &field_idx,
+            1, &request_fields, &field_idx,
             &boolean_fields, &extra_i64,
-            &mut serialize_buf, &mut tuple_buf, &mut write_buf,
+            &mut doc_ops, None,
         );
-        bulk_writer.finalize().unwrap();
-
-        // Read back via DocStoreV3 — fields are FieldValue, not JSON
-        let doc = ds.get(1).unwrap().unwrap();
-        match doc.fields.get("poi") {
-            Some(crate::mutation::FieldValue::Single(crate::query::Value::Bool(false))) => {}
-            other => panic!("poi should be boolean false, got: {:?}", other),
-        }
-        match doc.fields.get("type") {
-            Some(crate::mutation::FieldValue::Single(crate::query::Value::String(s))) => {
-                assert_eq!(s, "Checkpoint");
-            }
-            other => panic!("type should be string 'Checkpoint', got: {:?}", other),
-        }
+        // Should have produced one doc op for slot 1
+        assert_eq!(doc_ops.len(), 1);
+        assert_eq!(doc_ops[0].0, 1);
     }
 
-    /// Test that extra_i64_fields (config-computed sorts) are written to docstore.
+    /// Test that collect_doc_op with extra_i64_fields encodes config-computed sort values.
     #[test]
     fn test_extra_i64_fields_in_docstore_write() {
-        use crate::shard_store_doc::DocStoreV3;
-        use crate::shard_store_doc::PackedValue;
-        use std::sync::Arc;
-
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut ds = DocStoreV3::open(&docs_dir).unwrap();
-
-        let field_names = vec!["userId".to_string(), "sortAt".to_string()];
-        let bulk_writer = Arc::new(ds.prepare_streaming_writer(&field_names).unwrap());
-        let field_idx = bulk_writer.field_to_idx().clone();
-
+        let mut field_idx: HashMap<String, u16> = HashMap::new();
+        field_idx.insert("userId".to_string(), 0);
+        field_idx.insert("sortAt".to_string(), 1);
         let boolean_fields = HashSet::new();
         let col_index: HashMap<String, usize> = [
             ("id".to_string(), 0),
@@ -3684,32 +2930,17 @@ mod tests {
         let computed_defs: Vec<ComputedFieldDef> = vec![];
         let indexed_fields = row.to_indexed_fields();
         let col_idx = row.col_index_ref();
-
         let extra_i64: Vec<(&str, i64)> = vec![("sortAt", 1711234567)];
+        let mut doc_ops: Vec<(u32, Vec<u8>)> = Vec::new();
 
-        let mut serialize_buf = Vec::new();
-        let mut tuple_buf = Vec::new();
-        let mut write_buf = Vec::new();
-
-        write_docstore_row_indexed(
+        collect_doc_op(
             &row, &enriched, &computed_defs, &indexed_fields, col_idx,
-            1, &request_fields, &bulk_writer, &field_idx,
+            1, &request_fields, &field_idx,
             &boolean_fields, &extra_i64,
-            &mut serialize_buf, &mut tuple_buf, &mut write_buf,
+            &mut doc_ops, None,
         );
-        bulk_writer.finalize().unwrap();
-
-        // Read back via DocStoreV3
-        let doc = ds.get(1).unwrap().unwrap();
-        match doc.fields.get("userId") {
-            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(42))) => {}
-            other => panic!("userId should be 42, got: {:?}", other),
-        }
-        match doc.fields.get("sortAt") {
-            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(v))) => {
-                assert_eq!(*v, 1711234567, "sortAt should be written via extra_i64_fields");
-            }
-            other => panic!("sortAt should be 1711234567, got: {:?}", other),
-        }
+        // Should have produced one doc op for slot 1 (userId + sortAt)
+        assert_eq!(doc_ops.len(), 1);
+        assert_eq!(doc_ops[0].0, 1);
     }
 }

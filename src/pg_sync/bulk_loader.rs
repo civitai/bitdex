@@ -418,122 +418,21 @@ const FINALIZE_CHUNK_SIZE: u32 = 65_536;
 /// Processes alive slots in 65K-block chunks aligned to roaring container
 /// boundaries for efficient `bitmap.range()` iteration.
 fn finalize_from_bitmaps(
-    bulk_writer: &crate::shard_store_doc::ShardStoreBulkWriter,
-    schema: &crate::config::DataSchema,
-    alive: &RoaringBitmap,
-    image_scalars: &HashMap<u32, ImageScalars>,
-    resource_enrichments: &HashMap<u32, ResourceEnrichment>,
-    tag_bitmaps: &HashMap<u64, RoaringBitmap>,
-    tool_bitmaps: &HashMap<u64, RoaringBitmap>,
-    technique_bitmaps: &HashMap<u64, RoaringBitmap>,
-    mv_bitmaps: &HashMap<u64, RoaringBitmap>,
+    _schema: &crate::config::DataSchema,
+    _alive: &RoaringBitmap,
+    _image_scalars: &HashMap<u32, ImageScalars>,
+    _resource_enrichments: &HashMap<u32, ResourceEnrichment>,
+    _tag_bitmaps: &HashMap<u64, RoaringBitmap>,
+    _tool_bitmaps: &HashMap<u64, RoaringBitmap>,
+    _technique_bitmaps: &HashMap<u64, RoaringBitmap>,
+    _mv_bitmaps: &HashMap<u64, RoaringBitmap>,
 ) -> Result<(u64, u64), String> {
-    use rayon::prelude::*;
-
-    let total = alive.len() as u64;
-    eprintln!("finalize_from_bitmaps: reconstructing {} docs from bitmaps...", total);
-
-    // Determine the range of slots to process
-    let max_slot = alive.max().unwrap_or(0);
-    let num_chunks = (max_slot / FINALIZE_CHUNK_SIZE) + 1;
-
-    eprintln!(
-        "  Processing {} chunks of {} slots (max_slot={})",
-        num_chunks, FINALIZE_CHUNK_SIZE, max_slot
-    );
-
-    // Process chunks in parallel via rayon
-    let chunk_results: Vec<(u64, u64)> = (0..=num_chunks)
-        .into_par_iter()
-        .map(|chunk_idx| {
-            let chunk_start = chunk_idx * FINALIZE_CHUNK_SIZE;
-            let chunk_end = chunk_start + FINALIZE_CHUNK_SIZE;
-
-            // Get alive slots in this chunk
-            let chunk_alive: Vec<u32> = alive.range(chunk_start..chunk_end).collect();
-            if chunk_alive.is_empty() {
-                return (0u64, 0u64);
-            }
-
-            // Reconstruct multi-value fields for all slots in this chunk
-            // For each multi-value field, iterate all value bitmaps and check
-            // which slots in this chunk are set.
-            let mut chunk_tags: Vec<Vec<u32>> = vec![Vec::new(); FINALIZE_CHUNK_SIZE as usize];
-            let mut chunk_tools: Vec<Vec<u32>> = vec![Vec::new(); FINALIZE_CHUNK_SIZE as usize];
-            let mut chunk_techniques: Vec<Vec<u32>> = vec![Vec::new(); FINALIZE_CHUNK_SIZE as usize];
-            let mut chunk_mvs: Vec<Vec<u32>> = vec![Vec::new(); FINALIZE_CHUNK_SIZE as usize];
-
-            // Reconstruct tagIds
-            for (&tag_id, bm) in tag_bitmaps {
-                for slot in bm.range(chunk_start..chunk_end) {
-                    chunk_tags[(slot - chunk_start) as usize].push(tag_id as u32);
-                }
-            }
-
-            // Reconstruct toolIds
-            for (&tool_id, bm) in tool_bitmaps {
-                for slot in bm.range(chunk_start..chunk_end) {
-                    chunk_tools[(slot - chunk_start) as usize].push(tool_id as u32);
-                }
-            }
-
-            // Reconstruct techniqueIds
-            for (&tech_id, bm) in technique_bitmaps {
-                for slot in bm.range(chunk_start..chunk_end) {
-                    chunk_techniques[(slot - chunk_start) as usize].push(tech_id as u32);
-                }
-            }
-
-            // Reconstruct modelVersionIds
-            for (&mv_id, bm) in mv_bitmaps {
-                for slot in bm.range(chunk_start..chunk_end) {
-                    chunk_mvs[(slot - chunk_start) as usize].push(mv_id as u32);
-                }
-            }
-
-            // Build JSON docs and encode
-            let encoded: Vec<(u32, Vec<u8>)> = chunk_alive
-                .iter()
-                .filter_map(|&slot| {
-                    let scalars = image_scalars.get(&slot)?;
-                    let enrichment = resource_enrichments.get(&slot);
-                    let offset = (slot - chunk_start) as usize;
-
-                    let json = scalars_to_json(
-                        slot,
-                        scalars,
-                        enrichment,
-                        &chunk_tags[offset],
-                        &chunk_tools[offset],
-                        &chunk_techniques[offset],
-                        &chunk_mvs[offset],
-                    );
-                    let bytes = bulk_writer.encode_json(&json, schema);
-                    Some((slot, bytes))
-                })
-                .collect();
-
-            let docs = encoded.len() as u64;
-            let bytes: u64 = encoded.iter().map(|(_, b)| b.len() as u64).sum();
-
-            // Write to docstore
-            bulk_writer.write_batch_encoded(encoded);
-
-            (docs, bytes)
-        })
-        .collect();
-
-    let docs_written: u64 = chunk_results.iter().map(|(d, _)| d).sum();
-    let bytes_written: u64 = chunk_results.iter().map(|(_, b)| b).sum();
-
-    eprintln!(
-        "finalize_from_bitmaps: finalized {} docs, {} MB encoded",
-        docs_written,
-        bytes_written / (1024 * 1024)
-    );
-
-    Ok((docs_written, bytes_written))
+    // TODO: Rewrite for DataSilo when V1 bulk loader is needed
+    Err("finalize_from_bitmaps: not yet ported to DataSilo".to_string())
 }
+
+// Old V1 finalize_from_bitmaps removed (used ShardStoreBulkWriter)
+// V2 dump pipeline (dump_processor.rs) handles doc finalization via DataSilo
 
 /// Convert compact ImageScalars + reconstructed multi-value fields to a
 /// JSON document matching the Bitdex data schema.

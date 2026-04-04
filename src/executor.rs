@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use roaring::RoaringBitmap;
+use crate::bitmap_silo::BitmapSilo;
 use crate::dictionary::FieldDictionary;
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
@@ -39,6 +40,10 @@ pub struct QueryExecutor<'a> {
     /// Live dictionaries for LowCardinalityString fields — used as fallback
     /// when string_maps snapshot doesn't have a recently-added value.
     dictionaries: Option<&'a HashMap<String, FieldDictionary>>,
+    /// BitmapSilo for frozen bitmap reads. When a filter/sort bitmap's base is
+    /// unloaded (is_loaded=false), the executor reads the frozen bitmap directly
+    /// from the silo's mmap — zero heap allocation for the base data.
+    bitmap_silo: Option<&'a BitmapSilo>,
 }
 impl<'a> QueryExecutor<'a> {
     pub fn new(
@@ -57,6 +62,7 @@ impl<'a> QueryExecutor<'a> {
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: None,
+            bitmap_silo: None,
         }
     }
     /// Attach string maps for MappedString field reverse lookup.
@@ -74,6 +80,13 @@ impl<'a> QueryExecutor<'a> {
     /// Used as fallback when the string_maps snapshot doesn't have a recently-added value.
     pub fn with_dictionaries(mut self, dicts: &'a HashMap<String, FieldDictionary>) -> Self {
         self.dictionaries = Some(dicts);
+        self
+    }
+    /// Attach a BitmapSilo for frozen bitmap reads.
+    /// When filter/sort bitmaps are unloaded, the executor reads frozen data
+    /// directly from the silo's mmap (zero-copy, near-zero heap).
+    pub fn with_bitmap_silo(mut self, silo: &'a BitmapSilo) -> Self {
+        self.bitmap_silo = Some(silo);
         self
     }
     /// Attach a time bucket manager for in-executor bucket snapping (C3).
@@ -137,6 +150,84 @@ impl<'a> QueryExecutor<'a> {
         }
         None
     }
+    /// Get the effective bitmap for a filter field+value, using frozen fallback.
+    ///
+    /// 1. If the VersionedBitmap exists and is loaded → use its fused() result
+    /// 2. If the VersionedBitmap exists but is unloaded → frozen base from silo + diff
+    /// 3. If no VersionedBitmap exists → try frozen from silo
+    /// 4. None → value doesn't exist anywhere
+    fn get_effective_bitmap(&self, field_name: &str, value: u64) -> Option<RoaringBitmap> {
+        if let Some(field) = self.filters.get_field(field_name) {
+            if let Some(vb) = field.get_versioned(value) {
+                if vb.is_loaded() {
+                    // In-memory base is valid
+                    return Some(vb.fused());
+                }
+                // Base is unloaded — try frozen from silo, apply diff
+                if let Some(silo) = self.bitmap_silo {
+                    if let Some(frozen) = silo.get_frozen_filter(field_name, value) {
+                        if vb.is_dirty() {
+                            // frozen_base | sets - clears
+                            let mut result = frozen.to_owned();
+                            result |= &vb.diff().sets;
+                            result -= &vb.diff().clears;
+                            return Some(result);
+                        } else {
+                            // No diffs, just the frozen base — materialize for compatibility
+                            return Some(frozen.to_owned());
+                        }
+                    }
+                }
+                // No frozen backup — return what we have (empty base + diff)
+                return Some(vb.fused());
+            }
+        }
+        // Value not in FilterIndex — try silo directly
+        if let Some(silo) = self.bitmap_silo {
+            if let Some(frozen) = silo.get_frozen_filter(field_name, value) {
+                return Some(frozen.to_owned());
+            }
+        }
+        None
+    }
+
+    /// AND a frozen or in-memory filter bitmap into an accumulator.
+    /// Like get_effective_bitmap but intersects with candidates directly,
+    /// avoiding full materialization when possible.
+    fn and_effective_bitmap(&self, acc: &RoaringBitmap, field_name: &str, value: u64) -> Option<RoaringBitmap> {
+        if let Some(field) = self.filters.get_field(field_name) {
+            if let Some(vb) = field.get_versioned(value) {
+                if vb.is_loaded() {
+                    // In-memory: use existing diff-aware AND
+                    return Some(if vb.is_dirty() {
+                        vb.apply_diff(acc)
+                    } else {
+                        acc & vb.base().as_ref()
+                    });
+                }
+                // Unloaded — try frozen AND
+                if let Some(silo) = self.bitmap_silo {
+                    if let Some(frozen) = silo.get_frozen_filter(field_name, value) {
+                        let mut result = acc & &frozen;
+                        if vb.is_dirty() {
+                            result |= acc & &vb.diff().sets;
+                            result -= &vb.diff().clears;
+                        }
+                        return Some(result);
+                    }
+                }
+                return Some(vb.apply_diff(acc));
+            }
+        }
+        // Not in FilterIndex — try silo
+        if let Some(silo) = self.bitmap_silo {
+            if let Some(frozen) = silo.get_frozen_filter(field_name, value) {
+                return Some(acc & &frozen);
+            }
+        }
+        None
+    }
+
     /// Build a bitmap for a single id = N filter (intersected with alive).
     fn id_bitmap_single(&self, value: &Value) -> Result<RoaringBitmap> {
         let slot = match value {
@@ -379,38 +470,38 @@ impl<'a> QueryExecutor<'a> {
         match clause {
             FilterClause::Eq(field, value) => {
                 if field == "id" { return None; }
-                let ff = self.filters.get_field(field)?;
                 let key = self.resolve_value_key(field, value)?;
-                let vb = ff.get_versioned(key)?;
-                // AND accumulator directly with the base/fused bitmap by reference
-                let cow = vb.fused_cow();
-                *acc &= cow.as_ref();
-                Some(Ok(()))
+                // Frozen-aware AND
+                if let Some(intersection) = self.and_effective_bitmap(acc, field, key) {
+                    *acc = intersection;
+                    return Some(Ok(()));
+                }
+                None
             }
             FilterClause::In(field, values) => {
                 if field == "id" { return None; }
-                let ff = self.filters.get_field(field)?;
                 // Distribute AND over OR: (acc & val1) | (acc & val2) | ...
-                // When acc is small, this avoids materializing the full union.
                 let mut union = RoaringBitmap::new();
+                let mut found_any = false;
                 for v in values {
                     if let Some(key) = self.resolve_value_key(field, v) {
-                        if let Some(vb) = ff.get_versioned(key) {
-                            let cow = vb.fused_cow();
-                            union |= &*acc & cow.as_ref();
+                        if let Some(intersection) = self.and_effective_bitmap(acc, field, key) {
+                            union |= &intersection;
+                            found_any = true;
                         }
                     }
                 }
-                *acc = union;
-                Some(Ok(()))
+                if found_any || self.filters.get_field(field).is_some() || self.bitmap_silo.is_some() {
+                    *acc = union;
+                    return Some(Ok(()));
+                }
+                None
             }
             FilterClause::BucketBitmap { bitmap, .. } => {
                 *acc &= bitmap.as_ref();
                 Some(Ok(()))
             }
             FilterClause::Not(inner) => {
-                // Not(inner) with accumulator: acc -= (acc & inner)
-                // Evaluates inner only against the accumulator, not the full universe.
                 match self.evaluate_clause_with_candidates(inner, acc) {
                     Ok(inner_hits) => {
                         *acc -= &inner_hits;
@@ -421,31 +512,25 @@ impl<'a> QueryExecutor<'a> {
             }
             FilterClause::NotEq(field, value) => {
                 if field == "id" { return None; }
-                if let Some(ff) = self.filters.get_field(field) {
-                    if let Some(key) = self.resolve_value_key(field, value) {
-                        if let Some(vb) = ff.get_versioned(key) {
-                            *acc -= vb.fused_cow().as_ref();
-                            return Some(Ok(()));
-                        }
-                    }
+                let key = self.resolve_value_key(field, value)?;
+                if let Some(bm) = self.get_effective_bitmap(field, key) {
+                    *acc -= &bm;
+                    return Some(Ok(()));
                 }
                 None
             }
             FilterClause::NotIn(field, values) => {
                 if field == "id" { return None; }
-                if let Some(ff) = self.filters.get_field(field) {
-                    for v in values {
-                        if let Some(key) = self.resolve_value_key(field, v) {
-                            if let Some(vb) = ff.get_versioned(key) {
-                                *acc -= vb.fused_cow().as_ref();
-                            }
+                for v in values {
+                    if let Some(key) = self.resolve_value_key(field, v) {
+                        if let Some(bm) = self.get_effective_bitmap(field, key) {
+                            *acc -= &bm;
                         }
                     }
-                    return Some(Ok(()));
                 }
-                None
+                Some(Ok(()))
             }
-            _ => None, // Can't fast-path range clauses
+            _ => None,
         }
     }
     /// Evaluate a clause narrowed to a candidate set.
@@ -453,31 +538,23 @@ impl<'a> QueryExecutor<'a> {
     fn evaluate_clause_with_candidates(&self, clause: &FilterClause, candidates: &RoaringBitmap) -> Result<RoaringBitmap> {
         match clause {
             FilterClause::Eq(field, value) => {
-                if let Some(ff) = self.filters.get_field(field) {
-                    if let Some(key) = self.resolve_value_key(field, value) {
-                        if let Some(vb) = ff.get_versioned(key) {
-                            return Ok(candidates & vb.fused_cow().as_ref());
-                        }
+                if let Some(key) = self.resolve_value_key(field, value) {
+                    if let Some(intersection) = self.and_effective_bitmap(candidates, field, key) {
+                        return Ok(intersection);
                     }
-                    return Ok(RoaringBitmap::new());
                 }
-                let full = self.evaluate_clause(clause)?;
-                Ok(candidates & &full)
+                Ok(RoaringBitmap::new())
             }
             FilterClause::In(field, values) => {
-                if let Some(ff) = self.filters.get_field(field) {
-                    let mut result = RoaringBitmap::new();
-                    for v in values {
-                        if let Some(key) = self.resolve_value_key(field, v) {
-                            if let Some(vb) = ff.get_versioned(key) {
-                                result |= candidates & vb.fused_cow().as_ref();
-                            }
+                let mut result = RoaringBitmap::new();
+                for v in values {
+                    if let Some(key) = self.resolve_value_key(field, v) {
+                        if let Some(intersection) = self.and_effective_bitmap(candidates, field, key) {
+                            result |= &intersection;
                         }
                     }
-                    return Ok(result);
                 }
-                let full = self.evaluate_clause(clause)?;
-                Ok(candidates & &full)
+                Ok(result)
             }
             FilterClause::And(inner) => {
                 let mut result = candidates.clone();
@@ -504,72 +581,59 @@ impl<'a> QueryExecutor<'a> {
     pub(crate) fn evaluate_clause(&self, clause: &FilterClause) -> Result<RoaringBitmap> {
         match clause {
             FilterClause::Eq(field, value) => {
-                // Special case: "id" means slot ID — construct bitmap directly
                 if field == "id" {
                     return self.id_bitmap_single(value);
                 }
-                // Try Tier 1 (snapshot FilterIndex) first — diff-aware read
-                if let Some(filter_field) = self.filters.get_field(field) {
-                    let key = match self.resolve_value_key(field, value) {
-                        Some(k) => k,
-                        // Unknown string value (e.g. LCS value never inserted).
-                        // Return empty bitmap — the value simply doesn't match anything.
-                        None => return Ok(RoaringBitmap::new()),
-                    };
-                    return Ok(filter_field
-                        .get_versioned(key)
-                        .map(|vb| vb.fused())
-                        .unwrap_or_default());
+                let key = match self.resolve_value_key(field, value) {
+                    Some(k) => k,
+                    None => return Ok(RoaringBitmap::new()),
+                };
+                // Frozen-aware: tries in-memory, then silo
+                if let Some(bm) = self.get_effective_bitmap(field, key) {
+                    return Ok(bm);
+                }
+                if self.filters.get_field(field).is_some() || self.bitmap_silo.is_some() {
+                    return Ok(RoaringBitmap::new());
                 }
                 Err(BitdexError::FieldNotFound(field.clone()))
             }
             FilterClause::NotEq(field, value) => {
-                // Use andnot optimization: compute the small negated bitmap
-                // and subtract from alive, instead of computing the large complement
                 let eq_bitmap = self.evaluate_clause(&FilterClause::Eq(field.clone(), value.clone()))?;
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &eq_bitmap;
-                // Also subtract null bitmap: null values are not "not equal" — they are unknown.
-                if let Some(filter_field) = self.filters.get_field(field) {
-                    if let Some(null_vb) = filter_field.get_versioned(crate::filter::NULL_BITMAP_KEY) {
-                        result -= null_vb.fused_cow().as_ref();
-                    }
+                // Subtract null bitmap
+                if let Some(null_bm) = self.get_effective_bitmap(field, crate::filter::NULL_BITMAP_KEY) {
+                    result -= &null_bm;
                 }
                 Ok(result)
             }
             FilterClause::In(field, values) => {
-                // Special case: "id" means slot ID — construct bitmap directly
                 if field == "id" {
                     return self.id_bitmap_multi(values);
                 }
-                // Try Tier 1 first — diff-aware union
-                if let Some(filter_field) = self.filters.get_field(field) {
-                    let keys: Vec<u64> = values
-                        .iter()
-                        .filter_map(|v| self.resolve_value_key(field, v))
-                        .collect();
-                    let mut result = RoaringBitmap::new();
-                    for &key in &keys {
-                        if let Some(vb) = filter_field.get_versioned(key) {
-                            result |= vb.fused_cow().as_ref();
-                        }
+                let keys: Vec<u64> = values
+                    .iter()
+                    .filter_map(|v| self.resolve_value_key(field, v))
+                    .collect();
+                let mut result = RoaringBitmap::new();
+                for &key in &keys {
+                    if let Some(bm) = self.get_effective_bitmap(field, key) {
+                        result |= &bm;
                     }
-                    return Ok(result);
                 }
-                Err(BitdexError::FieldNotFound(field.clone()))
+                if result.is_empty() && self.filters.get_field(field).is_none() && self.bitmap_silo.is_none() {
+                    return Err(BitdexError::FieldNotFound(field.clone()));
+                }
+                Ok(result)
             }
             FilterClause::NotIn(field, values) => {
-                // NotIn = alive - In(field, values)
                 let in_bitmap = self.evaluate_clause(&FilterClause::In(field.clone(), values.clone()))?;
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &in_bitmap;
-                // Also subtract null bitmap: null values are not "not in" — they are unknown.
-                if let Some(filter_field) = self.filters.get_field(field) {
-                    if let Some(null_vb) = filter_field.get_versioned(crate::filter::NULL_BITMAP_KEY) {
-                        result -= null_vb.fused_cow().as_ref();
-                    }
+                if let Some(null_bm) = self.get_effective_bitmap(field, crate::filter::NULL_BITMAP_KEY) {
+                    result -= &null_bm;
                 }
                 Ok(result)
             }
@@ -601,38 +665,28 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::Or(clauses) => {
                 let mut result = RoaringBitmap::new();
                 for clause in clauses {
-                    // Use fused_cow for Eq/In sub-clauses to avoid cloning
-                    // large bitmaps (e.g. isPublished=true at 100M bits).
-                    // Falls back to evaluate_clause for complex sub-clauses.
+                    // Fast path: Eq/In use frozen-aware get_effective_bitmap
                     match clause {
                         FilterClause::Eq(field, value) if field != "id" => {
-                            if let Some(ff) = self.filters.get_field(field) {
-                                if let Some(key) = self.resolve_value_key(field, value) {
-                                    if let Some(vb) = ff.get_versioned(key) {
-                                        result |= vb.fused_cow().as_ref();
-                                        continue;
-                                    }
+                            if let Some(key) = self.resolve_value_key(field, value) {
+                                if let Some(bm) = self.get_effective_bitmap(field, key) {
+                                    result |= &bm;
                                 }
-                                // Value not found — contributes nothing to OR
-                                continue;
                             }
-                            // Field not found — fall through to evaluate_clause
+                            continue;
                         }
                         FilterClause::In(field, values) if field != "id" => {
-                            if let Some(ff) = self.filters.get_field(field) {
-                                for v in values {
-                                    if let Some(key) = self.resolve_value_key(field, v) {
-                                        if let Some(vb) = ff.get_versioned(key) {
-                                            result |= vb.fused_cow().as_ref();
-                                        }
+                            for v in values {
+                                if let Some(key) = self.resolve_value_key(field, v) {
+                                    if let Some(bm) = self.get_effective_bitmap(field, key) {
+                                        result |= &bm;
                                     }
                                 }
-                                continue;
                             }
+                            continue;
                         }
                         _ => {}
                     }
-                    // Fallback for NotEq, Not, nested Or/And, etc.
                     let bitmap = self.evaluate_clause(clause)?;
                     result |= &bitmap;
                 }
@@ -669,20 +723,12 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::BucketBitmap { bitmap, .. } => Ok(bitmap.as_ref().clone()),
             // IsNull: return the null sentinel bitmap for the field, or empty if none.
             FilterClause::IsNull(field) => {
-                let filter_field = self.filters.get_field(field)
-                    .ok_or_else(|| BitdexError::FieldNotFound(field.to_string()))?;
-                Ok(filter_field
-                    .get_versioned(crate::filter::NULL_BITMAP_KEY)
-                    .map(|vb| vb.fused())
+                Ok(self.get_effective_bitmap(field, crate::filter::NULL_BITMAP_KEY)
                     .unwrap_or_default())
             }
             // IsNotNull: alive minus the null bitmap.
             FilterClause::IsNotNull(field) => {
-                let filter_field = self.filters.get_field(field)
-                    .ok_or_else(|| BitdexError::FieldNotFound(field.to_string()))?;
-                let null_bitmap = filter_field
-                    .get_versioned(crate::filter::NULL_BITMAP_KEY)
-                    .map(|vb| vb.fused())
+                let null_bitmap = self.get_effective_bitmap(field, crate::filter::NULL_BITMAP_KEY)
                     .unwrap_or_default();
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
@@ -702,24 +748,35 @@ impl<'a> QueryExecutor<'a> {
     where
         F: Fn(u64, u64) -> bool,
     {
-        let filter_field = self
-            .filters
-            .get_field(field)
-            .ok_or_else(|| BitdexError::FieldNotFound(field.to_string()))?;
+        let has_field = self.filters.get_field(field).is_some();
+        if !has_field && self.bitmap_silo.is_none() {
+            return Err(BitdexError::FieldNotFound(field.to_string()));
+        }
         let target = value_to_bitmap_key(value)
             .ok_or_else(|| BitdexError::InvalidValue {
                 field: field.to_string(),
                 reason: "cannot convert to bitmap key for range filter".to_string(),
             })?;
         let mut result = RoaringBitmap::new();
-        for (&key, vb) in filter_field.iter_versioned() {
-            // Skip the null sentinel key — null is not a real value for range comparisons
-            if key == crate::filter::NULL_BITMAP_KEY { continue; }
-            if predicate(key, target) {
-                if vb.is_dirty() {
-                    result |= vb.fused();
-                } else {
-                    result |= vb.base().as_ref();
+        // Iterate in-memory values (may be loaded or unloaded placeholders)
+        if let Some(filter_field) = self.filters.get_field(field) {
+            for (&key, vb) in filter_field.iter_versioned() {
+                if key == crate::filter::NULL_BITMAP_KEY { continue; }
+                if predicate(key, target) {
+                    if let Some(bm) = self.get_effective_bitmap(field, key) {
+                        result |= &bm;
+                    }
+                }
+            }
+        } else if let Some(silo) = self.bitmap_silo {
+            // No in-memory field — scan silo entries
+            for (f, key) in silo.filter_entries() {
+                if f != field { continue; }
+                if key == crate::filter::NULL_BITMAP_KEY { continue; }
+                if predicate(key, target) {
+                    if let Some(frozen) = silo.get_frozen_filter(field, key) {
+                        result |= frozen.to_owned();
+                    }
                 }
             }
         }
@@ -800,16 +857,38 @@ impl<'a> QueryExecutor<'a> {
             .ok_or_else(|| BitdexError::FieldNotFound(sort.field.clone()))?;
         let descending = sort.direction == SortDirection::Desc;
         let cursor_param = cursor.map(|c| (c.sort_value, c.slot_id));
-        let sorted_slots = sort_field.top_n(candidates, limit, descending, cursor_param);
+        // Build frozen layers for any unloaded sort layers
+        let frozen_layers = self.build_frozen_sort_layers(&sort.field, sort_field.num_bits());
+        let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
+            Some(frozen_layers.as_slice())
+        } else {
+            None
+        };
+        let sorted_slots = sort_field.top_n_frozen(candidates, limit, descending, cursor_param, frozen_ref);
         let ids: Vec<i64> = sorted_slots.iter().map(|&s| s as i64).collect();
         let next_cursor = sorted_slots.last().map(|&last_slot| {
-            let sort_value = sort_field.reconstruct_value(last_slot) as u64;
+            let sort_value = sort_field.reconstruct_value_frozen(last_slot, frozen_ref) as u64;
             crate::query::CursorPosition {
                 sort_value,
                 slot_id: last_slot,
             }
         });
         Ok((ids, next_cursor))
+    }
+
+    /// Build frozen sort layers from BitmapSilo for unloaded sort layers.
+    fn build_frozen_sort_layers(&self, field_name: &str, num_bits: usize) -> Vec<Option<roaring::FrozenRoaringBitmap<'_>>> {
+        let silo = match self.bitmap_silo {
+            Some(s) => s,
+            None => {
+                let mut v = Vec::with_capacity(num_bits);
+                v.resize_with(num_bits, || None);
+                return v;
+            }
+        };
+        (0..num_bits)
+            .map(|bit| silo.get_frozen_sort_layer(field_name, bit))
+            .collect()
     }
     /// Paginate using pre-sorted packed keys (binary search fast path for initial-capacity entries).
     ///
@@ -912,7 +991,13 @@ impl<'a> QueryExecutor<'a> {
             } else {
                 None
             };
-            let sorted_slots = sort_field.top_n(bucket_bm, remaining, descending, bucket_cursor);
+            let frozen_layers = self.build_frozen_sort_layers(&sort_clause.field, sort_field.num_bits());
+            let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
+                Some(frozen_layers.as_slice())
+            } else {
+                None
+            };
+            let sorted_slots = sort_field.top_n_frozen(bucket_bm, remaining, descending, bucket_cursor, frozen_ref);
             for &slot in &sorted_slots {
                 result_ids.push(slot as i64);
                 last_slot = Some(slot);
@@ -922,8 +1007,14 @@ impl<'a> QueryExecutor<'a> {
                 }
             }
         }
+        let frozen_layers = self.build_frozen_sort_layers(&sort_clause.field, sort_field.num_bits());
+        let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
+            Some(frozen_layers.as_slice())
+        } else {
+            None
+        };
         let next_cursor = last_slot.map(|slot| {
-            let sort_value = sort_field.reconstruct_value(slot) as u64;
+            let sort_value = sort_field.reconstruct_value_frozen(slot, frozen_ref) as u64;
             crate::query::CursorPosition {
                 sort_value,
                 slot_id: slot,
@@ -949,18 +1040,21 @@ impl<'a> QueryExecutor<'a> {
             .get_field(&sort.field)
             .ok_or_else(|| BitdexError::FieldNotFound(sort.field.clone()))?;
         let descending = sort.direction == SortDirection::Desc;
-        // Reconstruct values and collect into Vec
+        let frozen_layers = self.build_frozen_sort_layers(&sort.field, sort_field.num_bits());
+        let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
+            Some(frozen_layers.as_slice())
+        } else {
+            None
+        };
         let mut entries: Vec<(u32, u32)> = candidates
             .iter()
-            .map(|slot| (slot, sort_field.reconstruct_value(slot)))
+            .map(|slot| (slot, sort_field.reconstruct_value_frozen(slot, frozen_ref)))
             .collect();
-        // Sort by value, tiebreak by slot ID
         if descending {
             entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
         } else {
             entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
         }
-        // Apply cursor filtering
         if let Some(cursor) = cursor {
             let cursor_value = cursor.sort_value as u32;
             let cursor_slot = cursor.slot_id;
@@ -972,11 +1066,10 @@ impl<'a> QueryExecutor<'a> {
                 }
             });
         }
-        // Take limit
         let result_slots: Vec<u32> = entries.iter().take(limit).map(|&(slot, _)| slot).collect();
         let ids: Vec<i64> = result_slots.iter().map(|&s| s as i64).collect();
         let next_cursor = result_slots.last().map(|&last_slot| {
-            let sort_value = sort_field.reconstruct_value(last_slot) as u64;
+            let sort_value = sort_field.reconstruct_value_frozen(last_slot, frozen_ref) as u64;
             crate::query::CursorPosition {
                 sort_value,
                 slot_id: last_slot,
@@ -1047,7 +1140,7 @@ mod tests {
         filters: FilterIndex,
         sorts: SortIndex,
         config: Config,
-        docstore: crate::shard_store_doc::DocStoreV3,
+        docstore: crate::doc_silo_adapter::DocSiloAdapter,
     }
     impl TestHarness {
         fn new() -> Self {
@@ -1055,7 +1148,7 @@ mod tests {
             let slots = SlotAllocator::new();
             let mut filters = FilterIndex::new();
             let mut sorts = SortIndex::new();
-            let docstore = crate::shard_store_doc::DocStoreV3::open_temp().unwrap();
+            let docstore = crate::doc_silo_adapter::DocSiloAdapter::open_temp().unwrap();
 
             for fc in &config.filter_fields {
                 filters.add_field(fc.clone());

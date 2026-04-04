@@ -1,6 +1,4 @@
-pub mod bitmap_fs;
-pub mod bitmap_memory_cache;
-pub mod bound_store;
+pub mod bitmap_silo;
 pub mod bucket_diff_log;
 pub mod dump_enrichment;
 pub mod dump_expression;
@@ -15,7 +13,8 @@ pub mod concurrent_engine;
 pub mod config;
 pub mod dictionary;
 
-pub mod doc_cache;
+pub mod doc_format;
+pub mod doc_silo_adapter;
 pub mod engine;
 pub mod error;
 pub mod ingester;
@@ -27,15 +26,9 @@ pub mod meta_index;
 pub mod mutation;
 pub mod parser;
 pub mod planner;
-pub mod preset;
 pub mod query;
 pub mod query_metrics;
-pub mod field_handler;
 pub mod radix_sort;
-pub mod shard_store;
-pub mod shard_store_bitmap;
-pub mod shard_store_doc;
-pub mod shard_store_meta;
 #[cfg(feature = "server")]
 pub mod metrics;
 #[cfg(feature = "server")]

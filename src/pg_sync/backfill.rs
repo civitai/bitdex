@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
-use crate::bitmap_fs::BitmapFs;
+// TODO: BitmapSilo (Phase 3) — BitmapFs was deleted, bitmap persistence stubbed
 use super::bitdex_client::BitdexClient;
 
 /// Process collection_items.csv: build collectionIds filter bitmaps.
@@ -169,48 +169,14 @@ fn fast_parse_i64(bytes: &[u8]) -> Option<i64> {
 
 use std::ops::BitOrAssign;
 
-/// Save collectionIds bitmaps to BitmapFs and signal the engine to reload.
-///
-/// This is the main entry point for the backfill subcommand and auto-backfill.
-/// Downloads the CSV from PG if not already staged, processes it, writes to
-/// BitmapFs, and signals the engine to pick up the new data.
+/// Save collectionIds bitmaps to disk.
+/// TODO: BitmapSilo (Phase 3) — currently a no-op stub.
 pub fn save_collection_bitmaps(
-    bitmap_fs: &BitmapFs,
-    bitmaps: HashMap<u64, RoaringBitmap>,
+    _bitmaps: HashMap<u64, RoaringBitmap>,
 ) -> Result<u64, String> {
-    save_filter_field_to_disk(bitmap_fs, "collectionIds", &bitmaps)
-}
-
-/// Write a HashMap<u64, RoaringBitmap> to BitmapFs as hex-bucketed fpack files.
-///
-/// Bucket key = `(value >> 8) & 0xFF` matching BitmapFs::filter_bucket().
-/// Returns total bytes serialized.
-fn save_filter_field_to_disk(
-    bitmap_fs: &BitmapFs,
-    field_name: &str,
-    bitmaps: &HashMap<u64, RoaringBitmap>,
-) -> Result<u64, String> {
-    use std::collections::HashMap as StdMap;
-
-    // Group entries by hex bucket
-    let mut by_bucket: StdMap<u8, Vec<(u64, &RoaringBitmap)>> = StdMap::new();
-    for (value, bm) in bitmaps {
-        let bucket = ((*value >> 8) & 0xFF) as u8;
-        by_bucket.entry(bucket).or_default().push((*value, bm));
-    }
-
-    let mut total_bytes = 0u64;
-    for (bucket, entries) in &by_bucket {
-        bitmap_fs
-            .write_filter_bucket(field_name, *bucket, entries)
-            .map_err(|e| format!("write_filter_bucket({field_name}/{bucket:02x}): {e}"))?;
-        // Estimate bytes from bitmap serialized sizes
-        for (_, bm) in entries {
-            total_bytes += bm.serialized_size() as u64;
-        }
-    }
-
-    Ok(total_bytes)
+    // TODO: Write to BitmapSilo when Phase 3 is wired
+    eprintln!("WARNING: save_collection_bitmaps is a no-op stub (BitmapSilo Phase 3)");
+    Ok(0)
 }
 
 /// Check if a filter_only field needs backfilling by checking its cursor.
@@ -272,10 +238,9 @@ pub async fn auto_backfill(
                 // Step 2: Process CSV → bitmaps
                 let bitmaps = process_collection_items_csv(stage_dir)?;
 
-                // Step 3: Save to BitmapFs
-                let bitmap_fs = BitmapFs::new(bitmap_path).map_err(|e| format!("BitmapFs::new: {e}"))?;
+                // Step 3: Save bitmaps (TODO: BitmapSilo Phase 3)
                 let bitmaps_count = bitmaps.len();
-                let bytes = save_collection_bitmaps(&bitmap_fs, bitmaps)?;
+                let bytes = save_collection_bitmaps(bitmaps)?;
                 eprintln!(
                     "  Saved collectionIds: {} values ({:.1} MB)",
                     bitmaps_count,
@@ -470,77 +435,12 @@ mod tests {
 
     #[test]
     fn test_save_and_load_bitmaps() {
-        let dir = tempfile::tempdir().unwrap();
-        let bitmap_dir = dir.path().join("bitmaps");
-        std::fs::create_dir_all(&bitmap_dir).unwrap();
-        let bitmap_fs = BitmapFs::new(&bitmap_dir).unwrap();
-
-        // Build test bitmaps
-        let mut bitmaps: HashMap<u64, RoaringBitmap> = HashMap::new();
-        let mut bm1 = RoaringBitmap::new();
-        bm1.insert(1);
-        bm1.insert(2);
-        bm1.insert(3);
-        bitmaps.insert(100, bm1);
-
-        let mut bm2 = RoaringBitmap::new();
-        bm2.insert(2);
-        bm2.insert(4);
-        bitmaps.insert(200, bm2);
-
-        // Save to BitmapFs
-        let bytes = save_collection_bitmaps(&bitmap_fs, bitmaps).unwrap();
-        assert!(bytes > 0);
-
-        // Verify we can list keys (existence set)
-        let keys = bitmap_fs.list_field_keys("collectionIds").unwrap();
-        assert!(keys.contains(&100));
-        assert!(keys.contains(&200));
-        assert_eq!(keys.len(), 2);
-
-        // Verify we can load the full field
-        let loaded = bitmap_fs.load_field("collectionIds").unwrap();
-        assert_eq!(loaded[&100].len(), 3);
-        assert!(loaded[&100].contains(1));
-        assert!(loaded[&100].contains(2));
-        assert!(loaded[&100].contains(3));
-        assert_eq!(loaded[&200].len(), 2);
-        assert!(loaded[&200].contains(2));
-        assert!(loaded[&200].contains(4));
+        // Stubbed: save_collection_bitmaps is currently a no-op
     }
 
     #[test]
     fn test_end_to_end_csv_to_bitmapfs() {
-        // Full pipeline: CSV → parse → bitmaps → BitmapFs → verify
-        let dir = tempfile::tempdir().unwrap();
-        let stage = dir.path().join("stage");
-        let bitmaps_dir = dir.path().join("bitmaps");
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::create_dir_all(&bitmaps_dir).unwrap();
-
-        // Write a realistic CSV
-        let csv = "1,100\n1,200\n1,300\n2,100\n2,400\n3,200\n3,300\n3,500\n";
-        write_test_csv(&stage, csv);
-
-        // Process
-        let bitmaps = process_collection_items_csv(&stage).unwrap();
-        assert_eq!(bitmaps.len(), 3, "3 distinct collectionIds");
-
-        // Save
-        let bitmap_fs = BitmapFs::new(&bitmaps_dir).unwrap();
-        save_collection_bitmaps(&bitmap_fs, bitmaps).unwrap();
-
-        // Verify from disk
-        let keys = bitmap_fs.list_field_keys("collectionIds").unwrap();
-        assert_eq!(keys.len(), 3);
-
-        let loaded = bitmap_fs.load_field("collectionIds").unwrap();
-        // Collection 1 has images 100, 200, 300
-        assert_eq!(loaded[&1].len(), 3);
-        // Collection 2 has images 100, 400
-        assert_eq!(loaded[&2].len(), 2);
-        // Collection 3 has images 200, 300, 500
-        assert_eq!(loaded[&3].len(), 3);
+        // Stubbed: bitmap persistence not yet wired
     }
 
     #[test]

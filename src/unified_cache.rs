@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use roaring::RoaringBitmap;
-use crate::bound_store::ShardKey;
 use crate::cache::CanonicalClause;
 use crate::filter::FilterIndex;
 use crate::meta_index::{CacheEntryId, MetaIndex};
@@ -21,6 +20,21 @@ use crate::query::SortDirection;
 use crate::radix_sort::RadixSortIndex;
 use crate::sort::SortIndex;
 use crate::write_coalescer::FilterGroupKey;
+// ── ShardKey (moved from bound_store.rs) ────────────────────────────────
+
+/// Key for a cache shard: (sort_field, direction).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ShardKey {
+    pub sort_field: String,
+    pub direction: SortDirection,
+}
+
+impl ShardKey {
+    pub fn new(sort_field: String, direction: SortDirection) -> Self {
+        Self { sort_field, direction }
+    }
+}
+
 // ── Two-Phase Maintenance Types ──────────────────────────────────────────
 //
 // These types support lock-free cache maintenance: the flush thread collects

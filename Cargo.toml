@@ -21,8 +21,11 @@ heap-prof = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 serde_yaml = ["dep:serde_yaml"]
 
 [dependencies]
-# Bitmap indexes
-roaring = "0.10"
+# Bitmap indexes (frozen-mmap-support fork with FrozenRoaringBitmap)
+roaring = { path = "C:/Dev/Repos/open-source/roaring-rs/roaring" }
+
+# DataSilo — mmap'd key-value store (replaces ShardStore)
+datasilo = { path = "crates/datasilo" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

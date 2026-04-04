@@ -22,7 +22,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{Config, DataSchema, FieldValueType, FilterFieldConfig, SortFieldConfig};
-use crate::shard_store_doc::StoredDoc;
+use crate::doc_format::StoredDoc;
 use crate::executor::{CaseSensitiveFields, StringMaps};
 use crate::loader;
 use crate::metrics::Metrics;
@@ -2302,17 +2302,8 @@ async fn handle_patch_config(
                             .map(|name| FilterClause::Eq(name.clone(), Value::Integer(0)))
                             .collect();
 
-                        // Load each newly-eager sort field
-                        for sname in &newly_eager_sorts {
-                            let _ = engine_clone.ensure_fields_loaded(&clauses, Some(sname));
-                        }
-                        // Load remaining filter-only fields
-                        if !clauses.is_empty() {
-                            let _ = engine_clone.ensure_fields_loaded(&clauses, None);
-                        }
-
                         eprintln!(
-                            "Config patch: loaded {} eager filter + {} eager sort fields",
+                            "Config patch: {} eager filter + {} eager sort fields (BitmapSilo handles lazy loading)",
                             newly_eager_filters.len(),
                             newly_eager_sorts.len(),
                         );
@@ -3233,7 +3224,7 @@ async fn handle_stats(
     Json(serde_json::json!({
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
-        "flush_cycle": engine.flush_cycle(),
+        "flush_cycle": 0u64,
         "slot_bitmap_bytes": slot_bytes,
         "filter_bitmap_bytes": filter_bytes,
         "sort_bitmap_bytes": sort_bytes,
@@ -3844,13 +3835,9 @@ async fn handle_reload_field(
         }
     };
 
-    match engine.reload_existence_set(&field) {
-        Ok(()) => Json(serde_json::json!({"reloaded": field})).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("{e}")})),
-        ).into_response(),
-    }
+    // Existence sets are no longer used (BitmapSilo replaced lazy loading).
+    let _ = engine;
+    Json(serde_json::json!({"reloaded": field, "note": "existence sets removed, no-op"})).into_response()
 }
 
 async fn handle_remove_fields(
@@ -4567,13 +4554,11 @@ async fn handle_rescan_memory(
 ) -> impl IntoResponse {
     let guard = state.index.lock();
     match guard.as_ref() {
-        Some(idx) => {
-            idx.engine.bitmap_memory_cache().mark_all_stale();
+        Some(_idx) => {
+            // BitmapSilo uses mmap — no heap bitmap scanner needed.
             Json(serde_json::json!({
                 "status": "ok",
-                "message": "All fields marked stale. Scanner will process them in batches.",
-                "scanner_interval_ms": idx.engine.bitmap_memory_cache().interval_ms(),
-                "scanner_batch_size": idx.engine.bitmap_memory_cache().batch_size(),
+                "message": "Bitmap memory scanner removed (BitmapSilo uses mmap).",
             }))
         }
         None => {
@@ -4699,33 +4684,10 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(uc.prefetches as i64);
 
-            // Per-field bitmap memory gauges.
-            // Uses cached scanner totals instead of iterating all bitmaps (52s at 107M).
-            // The bitmap_memory_cache is populated by a background scanner thread
-            // that processes dirty fields in small batches.
-            if state.metrics_bitmap_memory.load(Ordering::Relaxed) {
-                let mem_cache = engine.bitmap_memory_cache();
-                m.slot_bitmap_bytes
-                    .with_label_values(&[name])
-                    .set(mem_cache.cached_slot_bytes() as i64);
-                for (field, bytes, count) in mem_cache.cached_filter_memory() {
-                    m.filter_bitmap_bytes
-                        .with_label_values(&[name, &field])
-                        .set(bytes as i64);
-                    m.filter_bitmap_count
-                        .with_label_values(&[name, &field])
-                        .set(count as i64);
-                }
-                for (field, bytes) in mem_cache.cached_sort_memory() {
-                    m.sort_bitmap_bytes
-                        .with_label_values(&[name, &field])
-                        .set(bytes as i64);
-                }
-            }
-            // NOTE: The old bitmap_memory_report() code that iterated all bitmaps
-            // synchronously on every scrape is replaced above. If you need to verify
-            // scanner accuracy, temporarily call engine.bitmap_memory_report() and
-            // compare against the cached values.
+            // Per-field bitmap memory gauges removed: BitmapSilo uses mmap, not heap bitmaps.
+            // The old bitmap_memory_cache scanner was removed along with lazy loading.
+            // If per-field memory metrics are needed in the future, iterate the BitmapSilo
+            // mmap sizes instead of heap bitmap allocations.
 
             // Flush pipeline stats
             let (pub_count, _cumulative_nanos, last_nanos) = engine.flush_stats();

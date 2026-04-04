@@ -18,7 +18,7 @@ publish = false
 # Feel free to add dependencies as needed. This crate is disposable.
 
 [dependencies]
-roaring = "0.10"
+roaring = { path = "C:/Dev/Repos/open-source/roaring-rs/roaring" }
 dashmap = "6"
 parking_lot = "0.12"
 rand = "0.8"
@@ -28,3 +28,4 @@ datasilo = { path = "../crates/datasilo" }
 tempfile = "3"
 rmp-serde = "1"
 rmpv = "1"
+crc32fast = "1"

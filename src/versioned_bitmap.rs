@@ -303,6 +303,12 @@ impl VersionedBitmap {
         self.is_loaded = true;
     }
 
+    /// Mark this bitmap as unloaded (base is an empty placeholder).
+    /// The frozen base will be read from BitmapSilo at query time.
+    pub fn mark_unloaded(&mut self) {
+        self.is_loaded = false;
+    }
+
     /// Replace the diff with a new Arc. Used by the flush thread publish pattern
     /// to swap in a fresh diff after snapshotting the current one.
     pub fn swap_diff(&mut self, new_diff: Arc<BitmapDiff>) {

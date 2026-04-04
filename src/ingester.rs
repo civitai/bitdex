@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
-use crate::shard_store_doc::DocStoreV3;
+use crate::doc_silo_adapter::DocSiloAdapter;
+use crate::doc_format::StoredDoc;
 use crate::error::Result;
 use crate::loader::BitmapAccum;
 use crate::write_coalescer::{MutationOp, MutationSender};
@@ -200,27 +201,26 @@ impl<'a> BitmapSink for AccumSink<'a> {
     }
 }
 
-/// Document sink: wraps an Arc<DocStore> for V2 tuple appends.
+/// Document sink: wraps a DocSiloAdapter for doc writes.
 ///
-/// Provides a thin wrapper that appends field-value tuples to the docstore's
-/// V2 shard files. Thread-safe via DocStore's internal per-shard locking.
+/// Thread-safe via internal Mutex. Writes whole documents (not individual tuples).
 pub struct DocSink {
-    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
+    docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
 }
 
 impl DocSink {
-    pub fn new(docstore: Arc<parking_lot::Mutex<DocStoreV3>>) -> Self {
+    pub fn new(docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>) -> Self {
         Self { docstore }
     }
 
-    /// Append a single field-value tuple to the docstore.
-    pub fn append(&self, slot: u32, field_idx: u16, value: &[u8]) -> Result<()> {
-        Ok(self.docstore.lock().append_tuple(slot, field_idx, value)?)
+    /// Write a complete document to the silo.
+    pub fn put(&self, slot: u32, doc: &StoredDoc) -> Result<()> {
+        Ok(self.docstore.lock().put(slot, doc)?)
     }
 
-    /// Batch append tuples to the docstore.
-    pub fn append_batch(&self, tuples: Vec<(u32, u16, Vec<u8>)>) -> Result<()> {
-        Ok(self.docstore.lock().append_tuples_batch(tuples)?)
+    /// Write a batch of documents.
+    pub fn put_batch(&self, docs: &[(u32, StoredDoc)]) -> Result<()> {
+        Ok(self.docstore.lock().put_batch(docs)?)
     }
 }
 
@@ -266,10 +266,10 @@ impl<B: BitmapSink> Ingester<B> {
         self.bitmap_sink.alive_insert(slot);
     }
 
-    /// Append a doc tuple through the doc sink (if present).
-    pub fn doc_append(&self, slot: u32, field_idx: u16, value: &[u8]) -> Result<()> {
+    /// Write a document through the doc sink (if present).
+    pub fn doc_put(&self, slot: u32, doc: &StoredDoc) -> Result<()> {
         if let Some(ref ds) = self.doc_sink {
-            ds.append(slot, field_idx, value)?;
+            ds.put(slot, doc)?;
         }
         Ok(())
     }
@@ -377,27 +377,24 @@ mod tests {
     }
 
     #[test]
-    fn test_doc_sink_append() {
-        // DocSink wrapping a real on-disk DocStoreV3 should persist tuples.
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+    fn test_doc_sink_put() {
+        use crate::doc_silo_adapter::DocSiloAdapter;
 
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut store = DocStoreV3::open(&docs_dir).unwrap();
-        let _bw = store.prepare_bulk_load(&["val".to_string()]).unwrap();
-        let val_idx: u16 = 0;
+        let mut adapter = DocSiloAdapter::open_temp().unwrap();
+        adapter.ensure_field_index("val").unwrap();
 
-        let store = Arc::new(parking_lot::Mutex::new(store));
+        let store = Arc::new(parking_lot::Mutex::new(adapter));
         let sink = DocSink::new(Arc::clone(&store));
 
-        // Append a tuple via DocSink
-        let packed = rmp_serde::to_vec(&PackedValue::I(42)).unwrap();
-        sink.append(5, val_idx, &packed).unwrap();
+        // Write a doc via DocSink
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("val".to_string(), crate::mutation::FieldValue::Single(crate::query::Value::Integer(42)));
+        let doc = StoredDoc { fields, schema_version: 0 };
+        sink.put(5, &doc).unwrap();
 
         // Read via get and verify
-        let doc = store.lock().get(5).unwrap().unwrap();
-        match &doc.fields["val"] {
+        let loaded = store.lock().get(5).unwrap().unwrap();
+        match &loaded.fields["val"] {
             crate::mutation::FieldValue::Single(crate::query::Value::Integer(42)) => {}
             other => panic!("expected val=42, got: {:?}", other),
         }
@@ -405,18 +402,12 @@ mod tests {
 
     #[test]
     fn test_ingester_full_pipeline() {
-        // Ingester with RecordingSink + DocSink should route bitmap ops to the
-        // recording sink and doc tuples to the docstore.
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_silo_adapter::DocSiloAdapter;
 
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut store = DocStoreV3::open(&docs_dir).unwrap();
-        let _bw = store.prepare_bulk_load(&["color".to_string()]).unwrap();
-        let color_idx: u16 = 0;
+        let mut adapter = DocSiloAdapter::open_temp().unwrap();
+        adapter.ensure_field_index("color").unwrap();
 
-        let store = Arc::new(parking_lot::Mutex::new(store));
+        let store = Arc::new(parking_lot::Mutex::new(adapter));
         let doc_sink = DocSink::new(Arc::clone(&store));
         let bitmap_sink = RecordingSink::new();
 
@@ -427,9 +418,11 @@ mod tests {
         ingester.sort_set(Arc::from("reactionCount"), 3, 100);
         ingester.alive_insert(100);
 
-        // Emit a doc tuple
-        let packed = rmp_serde::to_vec(&PackedValue::I(7)).unwrap();
-        ingester.doc_append(100, color_idx, &packed).unwrap();
+        // Write a doc
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("color".to_string(), crate::mutation::FieldValue::Single(crate::query::Value::Integer(7)));
+        let doc = StoredDoc { fields, schema_version: 0 };
+        ingester.doc_put(100, &doc).unwrap();
 
         // Flush bitmaps
         ingester.flush().unwrap();
@@ -441,8 +434,8 @@ mod tests {
         assert_eq!(ingester.bitmap_sink.sort_sets[0], ("reactionCount".to_string(), 3, 100));
         assert_eq!(ingester.bitmap_sink.alive_inserts, vec![100]);
 
-        let doc = store.lock().get(100).unwrap().unwrap();
-        match &doc.fields["color"] {
+        let loaded = store.lock().get(100).unwrap().unwrap();
+        match &loaded.fields["color"] {
             crate::mutation::FieldValue::Single(crate::query::Value::Integer(7)) => {}
             other => panic!("expected color=7, got: {:?}", other),
         }

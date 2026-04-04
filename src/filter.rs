@@ -119,6 +119,19 @@ impl FilterField {
     pub fn bitmap_keys(&self) -> impl Iterator<Item = &u64> {
         self.bitmaps.keys()
     }
+    /// Iterate over all (value, fused_bitmap) pairs for serialization.
+    /// Each bitmap is the merged base + diffs (the complete current state).
+    pub fn bitmaps_fused(&self) -> impl Iterator<Item = (u64, RoaringBitmap)> + '_ {
+        self.bitmaps.iter().map(|(&value, vb)| (value, vb.fused()))
+    }
+    /// Mark a value as backed by the BitmapSilo (unloaded placeholder).
+    /// Creates a VersionedBitmap::new_unloaded() so the executor knows to read
+    /// the frozen base from the silo at query time. No-op if the value already exists.
+    pub fn mark_value_backed(&mut self, value: u64) {
+        self.bitmaps.entry(value)
+            .or_insert_with(VersionedBitmap::new_unloaded);
+    }
+
     /// Remove a value's bitmap from the field (used by idle eviction).
     /// The bitmap can be re-loaded from disk on the next query.
     pub fn remove_value(&mut self, value: u64) {
@@ -204,48 +217,6 @@ impl FilterField {
     /// Return the serialized byte size of all bitmaps in this field.
     pub fn bitmap_bytes(&self) -> usize {
         self.bitmaps.values().map(|vb| vb.bitmap_bytes()).sum()
-    }
-    /// Drop all base bitmaps and mark every value as unloaded.
-    /// The diff layers are preserved so mutations can accumulate
-    /// while the field is not in memory.
-    pub fn clear_bases_and_unload(&mut self) {
-        for vb in self.bitmaps.values_mut() {
-            vb.clear_base_and_unload();
-        }
-    }
-    /// Reload a complete field from disk, merging persisted bases into any
-    /// existing diff-only placeholders. After loading, all values are marked loaded
-    /// so merge_dirty() can compact their diffs normally.
-    pub fn load_field_complete(&mut self, data: HashMap<u64, RoaringBitmap>) {
-        for (value, bitmap) in data {
-            self.bitmaps
-                .entry(value)
-                .or_insert_with(VersionedBitmap::new_unloaded)
-                .load_base(&bitmap);
-        }
-        // Mark any diff-only values (mutated while unloaded, not on disk) as loaded
-        for vb in self.bitmaps.values_mut() {
-            vb.mark_loaded();
-        }
-    }
-    /// Reload specific values from disk (for per-value lazy loading of high-cardinality fields).
-    /// Only the requested values are marked as loaded; others remain unloaded.
-    pub fn load_values(&mut self, data: HashMap<u64, RoaringBitmap>, requested: &[u64]) {
-        for &value in requested {
-            if let Some(bitmap) = data.get(&value) {
-                self.bitmaps
-                    .entry(value)
-                    .or_insert_with(VersionedBitmap::new_unloaded)
-                    .load_base(bitmap);
-            } else {
-                // Value wasn't on disk — it's a new value created since last save.
-                // Mark it as loaded so its diffs can be compacted.
-                self.bitmaps
-                    .entry(value)
-                    .or_insert_with(VersionedBitmap::new_empty)
-                    .mark_loaded();
-            }
-        }
     }
     /// Merge all dirty VersionedBitmaps in this field.
     pub fn merge_all(&mut self) {

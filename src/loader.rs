@@ -28,7 +28,7 @@ use crate::dictionary::FieldDictionary;
 use crate::mutation::{Document, FieldValue};
 use crate::query::Value;
 #[cfg(test)]
-use crate::shard_store_doc::StoredDoc;
+use crate::doc_format::StoredDoc;
 
 /// Statistics from a completed load operation.
 #[derive(Debug, Clone)]
@@ -319,8 +319,8 @@ pub fn load_ndjson(
         }
     });
 
-    // Prepare BulkWriter before Stage 2 so encoding happens in the rayon fold.
-    // This eliminates rayon contention — all CPU work in one pool pass.
+    // Register field names with the docstore field dictionary.
+    // TODO: BitmapSilo (Phase 3) — replace with DataSilo BulkWriter when wired.
     let all_field_names: Vec<String> = schema
         .fields
         .iter()
@@ -329,11 +329,8 @@ pub fn load_ndjson(
         .collect();
     // Set up field defaults for write-side elision before creating the BulkWriter
     engine.set_docstore_defaults(schema);
-    let bulk_writer = Arc::new(
-        engine
-            .prepare_bulk_writer(&all_field_names)
-            .expect("prepare_bulk_writer"),
-    );
+    engine.prepare_field_names(&all_field_names).expect("prepare_field_names");
+    let bulk_writer = Arc::new(()); // TODO: BitmapSilo Phase 3 — stub, replace with DataSilo BulkWriter
 
     // ---- Stage 2: Fused parse + bitmap build + doc encode thread ----
     // Rayon fold+reduce: JSON → bitmap maps + pre-encoded msgpack bytes in one pass.
@@ -409,9 +406,9 @@ pub fn load_ndjson(
                                     }
                                 };
 
-                                // Encode doc directly from JSON — no StoredDoc allocation
-                                let bytes = writer.encode_json_with_dicts(&json, schema, dicts);
-                                acc.encoded_docs.push((slot, bytes));
+                                // TODO: BitmapSilo (Phase 3) — encode doc via DataSilo BulkWriter.
+                                // For now, skip doc encoding (bitmaps still built correctly).
+                                let _ = writer; // suppress unused warning
 
                                 // Build bitmaps directly from JSON
                                 acc.alive.insert(slot);
@@ -487,13 +484,9 @@ pub fn load_ndjson(
             }
         }
 
-        // Spawn docstore writer with pre-encoded bytes — pure I/O, no rayon contention.
-        if !chunk.encoded_docs.is_empty() {
-            let writer = Arc::clone(&bulk_writer);
-            ds_handles.push(thread::spawn(move || {
-                writer.write_batch_encoded(chunk.encoded_docs);
-            }));
-        }
+        // TODO: BitmapSilo (Phase 3) — write encoded docs via DataSilo BulkWriter.
+        // For now, skip docstore writes (bitmaps applied correctly above).
+        let _ = &bulk_writer; // suppress unused warning
     }
 
     // Wait for remaining threads

@@ -1,7 +1,7 @@
 use std::path::Path;
 use crate::concurrency::InFlightTracker;
 use crate::config::Config;
-use crate::shard_store_doc::DocStoreV3;
+use crate::doc_silo_adapter::DocSiloAdapter;
 use crate::error::Result;
 use crate::executor::QueryExecutor;
 use crate::filter::FilterIndex;
@@ -20,7 +20,7 @@ pub struct Engine {
     filters: FilterIndex,
     sorts: SortIndex,
     in_flight: InFlightTracker,
-    docstore: DocStoreV3,
+    docstore: DocSiloAdapter,
     config: Config,
 }
 impl Engine {
@@ -30,7 +30,7 @@ impl Engine {
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let docstore = DocStoreV3::open(docstore_path)?;
+        let docstore = DocSiloAdapter::open(docstore_path)?;
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
@@ -53,7 +53,7 @@ impl Engine {
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let docstore = DocStoreV3::open_temp()?;
+        let docstore = DocSiloAdapter::open_temp()?;
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
