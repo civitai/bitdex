@@ -1,11 +1,10 @@
-//! DocSiloAdapter — compatibility layer providing DocStoreV3-like interface over DataSilo.
+//! DocSiloAdapter — DataSilo-backed document store with field dictionary encoding.
 //!
-//! This adapter lets ConcurrentEngine, mutation, ops_processor, and other consumers
-//! use the same get/put interface they had with DocStoreV3, but backed by DataSilo's
-//! mmap'd storage. This minimizes changes during the ShardStore → DataSilo migration.
+//! Provides the get/put interface used by ConcurrentEngine, mutation, and ops_processor,
+//! backed by DataSilo's mmap'd storage.
 //!
 //! The adapter manages:
-//! - Field name ↔ index mappings (same as DocStoreV3's field dictionary)
+//! - Field name ↔ index mappings (field dictionary)
 //! - Encoding/decoding via DocOpCodec format (71ns encode, 16ns decode)
 //! - Schema versioning and field defaults
 //! - ParallelWriter creation for dump pipeline
@@ -16,7 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::config::DataSchema;
 use crate::doc_format::{self, PackedValue, StoredDoc};
 
-/// Drop-in replacement for DocStoreV3, backed by DataSilo.
+/// DataSilo-backed document store adapter.
 pub struct DocSiloAdapter {
     silo: datasilo::DataSilo,
     root: PathBuf,

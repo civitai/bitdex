@@ -71,9 +71,6 @@ pub struct Config {
     /// RSS fraction to evict down to (default 0.75).
     #[serde(default = "default_memory_pressure_target")]
     pub memory_pressure_target: f64,
-    /// Document cache settings (in-memory cache for docstore reads).
-    #[serde(default)]
-    pub doc_cache: DocCacheConfigEntry,
     /// Bitmap memory scanner settings. Replaces the expensive per-scrape
     /// bitmap_memory_report() with incremental background scanning.
     #[serde(default)]
@@ -166,7 +163,6 @@ impl Default for Config {
             storage: StorageConfig::default(),
             eviction_sweep_interval: default_eviction_sweep_interval(),
             compact_threshold_pct: default_compact_threshold_pct(),
-            doc_cache: DocCacheConfigEntry::default(),
             memory_scanner: MemoryScannerConfig::default(),
             enabled_metrics: None,
             disabled_metrics: None,
@@ -503,37 +499,6 @@ impl Default for StorageConfig {
         }
     }
 }
-fn default_doc_cache_max_bytes() -> u64 {
-    1_073_741_824 // 1 GB — matches DocCacheConfig::default()
-}
-fn default_doc_cache_generation_interval() -> u64 {
-    60
-}
-fn default_doc_cache_max_generations() -> usize {
-    30
-}
-/// Document cache configuration (generational eviction with lock-free reads).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocCacheConfigEntry {
-    /// Maximum cache size in bytes. Eviction drops oldest generations when exceeded. Default 1 GB.
-    #[serde(default = "default_doc_cache_max_bytes")]
-    pub max_bytes: u64,
-    /// How often (in seconds) to rotate to a new generation. Default: 60.
-    #[serde(default = "default_doc_cache_generation_interval")]
-    pub generation_interval_secs: u64,
-    /// Maximum number of generations before merging the oldest two. Default: 30.
-    #[serde(default = "default_doc_cache_max_generations")]
-    pub max_generations: usize,
-}
-impl Default for DocCacheConfigEntry {
-    fn default() -> Self {
-        Self {
-            max_bytes: default_doc_cache_max_bytes(),
-            generation_interval_secs: default_doc_cache_generation_interval(),
-            max_generations: default_doc_cache_max_generations(),
-        }
-    }
-}
 /// Bitmap memory scanner configuration.
 ///
 /// The scanner runs a background thread that incrementally measures per-field
@@ -854,7 +819,6 @@ mod tests {
         assert_eq!(config.cache.max_capacity, 64_000);
         assert_eq!(config.cache.min_filter_size, 0);
         assert_eq!(config.cache.decay_rate, 0.95);
-        assert_eq!(config.doc_cache.max_bytes, 1_073_741_824);
         assert_eq!(config.autovac_interval_secs, 3600);
         assert_eq!(config.merge_interval_ms, 5000);
         assert_eq!(config.prometheus_port, 9090);

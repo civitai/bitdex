@@ -10,7 +10,7 @@
 //!   4. Evaluate filter expressions (skip rows that don't pass)
 //!   5. Evaluate computed field expressions
 //!   6. Build filter/sort bitmaps + append docstore tuples
-//!   7. Save bitmaps to ShardStore, drop from memory
+//!   7. Save bitmaps to BitmapSilo, drop from memory
 //!
 //! Processing is sequential per phase (no cross-phase parallelism in V2).
 
@@ -1091,7 +1091,7 @@ impl ShardPreCreator {
                 let _docstore_root = docstore_root; // DataSilo needs no shard pre-creation
 
                 // DataSilo does not use per-shard files — no pre-creation needed.
-                // Only pre-create filter bitmap bucket dirs for ShardStore bitmap persistence.
+                // Only pre-create filter bitmap bucket dirs for BitmapSilo persistence.
                 loop {
                     let current_max_slot = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
 

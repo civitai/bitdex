@@ -210,7 +210,6 @@ pub struct ConcurrentEngine {
     /// Metrics bridge: prometheus handles set by server layer, read by background threads.
     #[cfg(feature = "server")]
     metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>>,
-    // doc_cache: REMOVED (DataSilo mmap reads at 23M/s replace it)
     /// BitmapSilo for frozen bitmap reads. Queries read filter/sort bitmaps
     /// directly from the silo's mmap via FrozenRoaringBitmap::view().
     /// RwLock: readers (queries) share access; writer (save_snapshot) gets exclusive.
@@ -222,7 +221,6 @@ pub struct ConcurrentEngine {
     prefetch_tx: Option<Sender<UnifiedKey>>,
     /// Background prefetch worker thread handle.
     prefetch_handle: Option<JoinHandle<()>>,
-    // doc_cache_eviction_handle: REMOVED
     /// WAL writer for Sync V2 write path. When set, put() and patch_document()
     /// decompose documents into ops and write to WAL instead of directly to coalescer.
     /// The WAL reader thread picks up ops and routes through apply_ops_batch.
@@ -749,7 +747,7 @@ impl ConcurrentEngine {
                                 // NOTE: Auto-loading bases for dirty+unloaded entries is disabled.
                                 // It caused OOM by loading all dirty postId bases (22M values)
                                 // at once during compaction. Dirty diffs on unloaded fields are
-                                // small and persist safely via ShardStore ops log. They'll be
+                                // small and persist safely via BitmapSilo ops log. They'll be
                                 // merged when the field is eventually loaded by a query.
                                 // Only make_mut + merge on fields that actually have dirty diffs
                                 for name in &dirty_fields {
@@ -1103,7 +1101,7 @@ impl ConcurrentEngine {
                     }
                     let doc_count = doc_batch.len();
                     if doc_count > 0 {
-                        // DataSilo replaces doc_cache — mmap reads are fast enough
+                        // DataSilo mmap reads are fast enough — no cache needed
                         if let Err(e) = docstore.lock().put_batch(&doc_batch) {
                             eprintln!("WARNING: docstore batch write failed (skipping {} docs): {e}", doc_batch.len());
                         }
@@ -1349,7 +1347,7 @@ impl ConcurrentEngine {
         } else {
             (None, None)
         };
-        // DataSilo replaces doc_cache — no separate eviction thread needed
+        // DataSilo mmap reads require no separate eviction thread
         Ok(Self {
             inner,
             sender,
@@ -3277,14 +3275,6 @@ impl ConcurrentEngine {
     pub fn flush_queue_depth(&self) -> usize {
         self.sender.pending_count()
     }
-    /// Evict a slot from the doc cache so the next read fetches from disk.
-    /// No-op: DocCache removed; DataSilo handles reads directly.
-    pub fn evict_doc_cache(&self, _slot: u32) {}
-    /// Doc cache stats: (hits, misses, entries, bytes, evictions, generations).
-    /// Returns zeros: DocCache removed, DataSilo handles reads directly.
-    pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64, usize) {
-        (0, 0, 0, 0, 0, 0)
-    }
     /// Report bitmap memory usage broken down by component (lock-free snapshot).
     ///
     /// Returns (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes,
@@ -3556,7 +3546,7 @@ impl ConcurrentEngine {
             .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all: {e}")))?;
         Ok(())
     }
-    /// Internal: zero-copy snapshot serialization via ShardStore.
+    /// Internal: zero-copy snapshot serialization via BitmapSilo.
     ///
     /// Reads the published snapshot through Arc refs — no InnerEngine clone.
     /// Uses `fused_cow()` to borrow base bitmaps directly (zero copy when clean)
@@ -6376,7 +6366,7 @@ mod tests {
         engine.shutdown();
     }
     // -----------------------------------------------------------------------
-    // DocStoreV3 E2E integration tests
+    // DataSilo E2E integration tests
     // -----------------------------------------------------------------------
 
     /// E2E: put() writes doc through flush thread → docstore, then get reads it back.
@@ -6392,25 +6382,25 @@ mod tests {
         // Wait for flush thread to persist the doc
         wait_for_flush(&engine, 1, 500);
 
-        // Read the doc back from DocStoreV3
+        // Read the doc back from DataSilo
         let doc = engine.docstore.lock().get(1).unwrap();
         assert!(doc.is_some(), "doc should be readable after put + flush");
         let doc = doc.unwrap();
         assert_eq!(
             doc.fields.get("nsfwLevel"),
             Some(&FieldValue::Single(Value::Integer(5))),
-            "nsfwLevel should roundtrip through DocStoreV3"
+            "nsfwLevel should roundtrip through DataSilo"
         );
         assert_eq!(
             doc.fields.get("reactionCount"),
             Some(&FieldValue::Single(Value::Integer(42))),
-            "reactionCount should roundtrip through DocStoreV3"
+            "reactionCount should roundtrip through DataSilo"
         );
 
         engine.shutdown();
     }
 
-    /// E2E: upsert reads old doc from DocStoreV3 for diff, clears stale bits.
+    /// E2E: upsert reads old doc from DataSilo for diff, clears stale bits.
     #[test]
     fn test_docstore_v3_upsert_reads_old_doc() {
         let mut engine = ConcurrentEngine::new(test_config()).unwrap();
@@ -6429,7 +6419,7 @@ mod tests {
         ).unwrap();
         assert_eq!(result.ids, vec![1], "nsfwLevel=1 should match before upsert");
 
-        // Upsert with nsfwLevel=3 — this requires reading old doc from DocStoreV3
+        // Upsert with nsfwLevel=3 — this requires reading old doc from DataSilo
         engine.put(1, &make_doc(vec![
             ("nsfwLevel", FieldValue::Single(Value::Integer(3))),
             ("reactionCount", FieldValue::Single(Value::Integer(10))),
@@ -6460,7 +6450,7 @@ mod tests {
         engine.shutdown();
     }
 
-    /// E2E: delete reads old doc from DocStoreV3 to clear all bitmap bits.
+    /// E2E: delete reads old doc from DataSilo to clear all bitmap bits.
     #[test]
     fn test_docstore_v3_delete_reads_old_doc() {
         let mut engine = ConcurrentEngine::new(test_config()).unwrap();
@@ -6474,7 +6464,7 @@ mod tests {
         // Doc should exist
         assert!(engine.docstore.lock().get(1).unwrap().is_some());
 
-        // Delete — this reads old doc from DocStoreV3 to clear filter/sort bits
+        // Delete — this reads old doc from DataSilo to clear filter/sort bits
         engine.delete(1).unwrap();
         wait_for_flush(&engine, 0, 500);
 

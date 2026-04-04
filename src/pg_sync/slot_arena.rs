@@ -660,7 +660,7 @@ impl SlotArena {
     }
 
     /// Finalize all populated slots to the docstore.
-    /// TODO: Rewrite for DataSilo ParallelWriter (V1 ShardStoreBulkWriter removed)
+    /// TODO: Rewrite for DataSilo ParallelWriter
     pub fn finalize_to_docstore(
         &self,
         _schema: &DataSchema,

@@ -431,7 +431,6 @@ fn finalize_from_bitmaps(
     Err("finalize_from_bitmaps: not yet ported to DataSilo".to_string())
 }
 
-// Old V1 finalize_from_bitmaps removed (used ShardStoreBulkWriter)
 // V2 dump pipeline (dump_processor.rs) handles doc finalization via DataSilo
 
 /// Convert compact ImageScalars + reconstructed multi-value fields to a

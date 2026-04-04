@@ -1,7 +1,7 @@
-//! Backfill filter_only fields from Postgres via COPY CSV → BitmapFs.
+//! Backfill filter_only fields from Postgres via COPY CSV → BitmapSilo.
 //!
 //! Uses the same pattern as the single-pass bulk loader: mmap CSV, rayon
-//! parallel parse, build HashMap<u64, RoaringBitmap>, save to BitmapFs.
+//! parallel parse, build HashMap<u64, RoaringBitmap>, save to BitmapSilo.
 //! Runs while the BitDex server is live — no downtime needed.
 //!
 //! After writing bitmaps to disk, signals the engine to reload the field's
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
-// TODO: BitmapSilo (Phase 3) — BitmapFs was deleted, bitmap persistence stubbed
+// TODO: BitmapSilo (Phase 3) — bitmap persistence stubbed, needs BitmapSilo write path
 use super::bitdex_client::BitdexClient;
 
 /// Process collection_items.csv: build collectionIds filter bitmaps.
@@ -202,7 +202,7 @@ pub async fn mark_backfilled(client: &BitdexClient, field_name: &str) -> Result<
 /// For each filter_only field without a backfill cursor:
 /// 1. Download CollectionItem CSV from PG via COPY (if not staged)
 /// 2. Process CSV → bitmaps (mmap + rayon)
-/// 3. Save to BitmapFs (atomic fpack writes)
+/// 3. Save to BitmapSilo
 /// 4. Signal engine to reload existence set
 /// 5. Set backfill cursor
 ///

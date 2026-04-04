@@ -116,18 +116,6 @@ pub struct Metrics {
     pub save_snapshot_seconds: HistogramVec,
     pub flush_queue_depth: IntGauge,
 
-    // -- Phase 2.5: Doc cache --
-    pub doc_cache_hit_total: IntGaugeVec,
-    pub doc_cache_miss_total: IntGaugeVec,
-    pub doc_cache_entries: IntGaugeVec,
-    pub doc_cache_bytes: IntGaugeVec,
-    pub doc_cache_evictions_total: IntGaugeVec,
-    pub doc_cache_generations: IntGaugeVec,
-    pub doc_cache_backlog: IntGaugeVec,
-
-    // -- Phase 2.5: ShardStore ops (stub — wired when Phase 1 lands) --
-    pub shardstore_ops_count: IntGaugeVec,
-
     // -- Phase 2.5: PG-Sync observability --
     pub pgsync_cycle_seconds: HistogramVec,
     pub pgsync_rows_fetched_total: IntCounterVec,
@@ -586,50 +574,6 @@ impl Metrics {
         )
         .unwrap();
 
-        // Phase 2.5: Doc cache — synced from DocCache atomics on each scrape
-        let doc_cache_hit_total = IntGaugeVec::new(
-            Opts::new("bitdex_doc_cache_hit_total", "Document cache cumulative hits"),
-            &["index"],
-        )
-        .unwrap();
-        let doc_cache_miss_total = IntGaugeVec::new(
-            Opts::new("bitdex_doc_cache_miss_total", "Document cache cumulative misses"),
-            &["index"],
-        )
-        .unwrap();
-        let doc_cache_entries = IntGaugeVec::new(
-            Opts::new("bitdex_doc_cache_entries", "Document cache entry count"),
-            &["index"],
-        )
-        .unwrap();
-        let doc_cache_bytes = IntGaugeVec::new(
-            Opts::new("bitdex_doc_cache_bytes", "Document cache memory bytes"),
-            &["index"],
-        )
-        .unwrap();
-        let doc_cache_evictions_total = IntGaugeVec::new(
-            Opts::new("bitdex_doc_cache_evictions_total", "Document cache cumulative evictions"),
-            &["index"],
-        )
-        .unwrap();
-        let doc_cache_generations = IntGaugeVec::new(
-            Opts::new("bitdex_doc_cache_generations", "Document cache active generation count"),
-            &["index"],
-        )
-        .unwrap();
-        let doc_cache_backlog = IntGaugeVec::new(
-            Opts::new("bitdex_doc_cache_backlog", "Document cache write-through channel backlog"),
-            &["index"],
-        )
-        .unwrap();
-
-        // Phase 2.5: ShardStore ops stub (wired when Phase 1 lands)
-        let shardstore_ops_count = IntGaugeVec::new(
-            Opts::new("bitdex_shardstore_ops_count", "Pending ops per shard store"),
-            &["index", "store"],
-        )
-        .unwrap();
-
         // Phase 2.5: PG-Sync observability
         let pgsync_cycle_buckets = vec![0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
         let pgsync_cycle_seconds = HistogramVec::new(
@@ -816,14 +760,6 @@ impl Metrics {
         registry.register(Box::new(docstore_concurrent_reads.clone())).unwrap();
         registry.register(Box::new(save_snapshot_seconds.clone())).unwrap();
         registry.register(Box::new(flush_queue_depth.clone())).unwrap();
-        registry.register(Box::new(doc_cache_hit_total.clone())).unwrap();
-        registry.register(Box::new(doc_cache_miss_total.clone())).unwrap();
-        registry.register(Box::new(doc_cache_entries.clone())).unwrap();
-        registry.register(Box::new(doc_cache_bytes.clone())).unwrap();
-        registry.register(Box::new(doc_cache_evictions_total.clone())).unwrap();
-        registry.register(Box::new(doc_cache_generations.clone())).unwrap();
-        registry.register(Box::new(doc_cache_backlog.clone())).unwrap();
-        registry.register(Box::new(shardstore_ops_count.clone())).unwrap();
         registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
         registry.register(Box::new(pgsync_rows_fetched_total.clone())).unwrap();
         registry.register(Box::new(pgsync_cursor_position.clone())).unwrap();
@@ -915,14 +851,6 @@ impl Metrics {
             docstore_concurrent_reads,
             save_snapshot_seconds,
             flush_queue_depth,
-            doc_cache_hit_total,
-            doc_cache_miss_total,
-            doc_cache_entries,
-            doc_cache_bytes,
-            doc_cache_evictions_total,
-            doc_cache_generations,
-            doc_cache_backlog,
-            shardstore_ops_count,
             pgsync_cycle_seconds,
             pgsync_rows_fetched_total,
             pgsync_cursor_position,

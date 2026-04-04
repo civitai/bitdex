@@ -20,7 +20,7 @@ use crate::query::SortDirection;
 use crate::radix_sort::RadixSortIndex;
 use crate::sort::SortIndex;
 use crate::write_coalescer::FilterGroupKey;
-// ── ShardKey (moved from bound_store.rs) ────────────────────────────────
+// ── ShardKey ────────────────────────────────────────────────────────────
 
 /// Key for a cache shard: (sort_field, direction).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -1217,15 +1217,6 @@ impl BitdexServer {
                                     // Flush pending docstore writes (DocWriter buffers tuples)
                                     doc_writer.flush();
 
-                                    // Invalidate doc cache for mutated entities so
-                                    // GET /documents returns fresh data after ops.
-                                    if applied > 0 {
-                                        for entry in &entries {
-                                            let slot = entry.entity_id as u32;
-                                            engine.evict_doc_cache(slot);
-                                        }
-                                    }
-
                                     // WAL read-side metrics
                                     if applied > 0 {
                                         wal_state.metrics.wal_ops_processed_total.inc_by(applied as u64);
@@ -4059,7 +4050,7 @@ async fn handle_capture_start(
 
     match state.capture.start(&req) {
         Ok(status) => {
-            // Pin ShardStore generations at capture start boundary.
+            // Pin BitmapSilo generations at capture start boundary.
             // Gen N = pre-capture state, Gen N+1 = where mutations during capture go.
             if let Some(ref idx) = *state.index.lock() {
                 match idx.engine.pin_shard_generations() {
@@ -4129,7 +4120,7 @@ async fn handle_capture_stop(
 ) -> impl IntoResponse {
     match state.capture.stop() {
         Ok(status) => {
-            // Pin ShardStore generations at capture stop boundary.
+            // Pin BitmapSilo generations at capture stop boundary.
             // Gen N+1 = mutations during capture, Gen N+2 = post-capture.
             if let Some(ref idx) = *state.index.lock() {
                 match idx.engine.pin_shard_generations() {
@@ -4414,16 +4405,15 @@ async fn handle_debug_memory(
 ) -> impl IntoResponse {
     let rss_bytes = crate::concurrent_engine::get_rss_bytes() as u64;
 
-    let (engine, engine_name, uc_bytes, doc_cache_bytes) = {
+    let (engine, engine_name, uc_bytes) = {
         let guard = state.index.lock();
         if let Some(idx) = guard.as_ref() {
             let engine = Arc::clone(&idx.engine);
             let name = idx.definition.name.clone();
             let uc = engine.unified_cache_stats();
-            let (_, _, _, dc_bytes, _, _) = engine.doc_cache_stats();
-            (Some(engine), name, uc.memory_bytes as u64, dc_bytes)
+            (Some(engine), name, uc.memory_bytes as u64)
         } else {
-            (None, String::new(), 0, 0)
+            (None, String::new(), 0)
         }
     };
 
@@ -4437,7 +4427,7 @@ async fn handle_debug_memory(
     };
 
     let bitmap_total = slot_bytes + filter_bytes + sort_bytes;
-    let tracked_total = bitmap_total + uc_bytes + doc_cache_bytes;
+    let tracked_total = bitmap_total + uc_bytes;
     let untracked = rss_bytes.saturating_sub(tracked_total);
 
     let pod_limit: u64 = std::env::var("BITDEX_MEMORY_LIMIT_BYTES")
@@ -4446,11 +4436,6 @@ async fn handle_debug_memory(
         .unwrap_or(32 * 1024 * 1024 * 1024);
 
     let headroom = pod_limit.saturating_sub(rss_bytes);
-    let non_doc_tracked = tracked_total.saturating_sub(doc_cache_bytes);
-    let safe_doc_cache = pod_limit
-        .saturating_sub(non_doc_tracked)
-        .saturating_sub(untracked)
-        .saturating_sub(2 * 1024 * 1024 * 1024);
 
     Json(serde_json::json!({
         "index": engine_name,
@@ -4461,7 +4446,6 @@ async fn handle_debug_memory(
             "sort_bitmaps": sort_bytes,
             "bitmap_total": bitmap_total,
             "unified_cache": uc_bytes,
-            "doc_cache": doc_cache_bytes,
         },
         "tracked_total": tracked_total,
         "untracked": untracked,
@@ -4469,14 +4453,12 @@ async fn handle_debug_memory(
             "pod_limit": pod_limit,
             "rss_current": rss_bytes,
             "headroom": headroom,
-            "safe_doc_cache_max": safe_doc_cache,
         },
         "human": {
             "rss": format!("{:.2} GB", rss_bytes as f64 / 1e9),
             "tracked": format!("{:.2} GB", tracked_total as f64 / 1e9),
             "untracked": format!("{:.2} GB", untracked as f64 / 1e9),
             "headroom": format!("{:.2} GB", headroom as f64 / 1e9),
-            "safe_doc_cache": format!("{:.2} GB", safe_doc_cache as f64 / 1e9),
         }
     }))
 }
@@ -4772,19 +4754,8 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             // Phase 2.5: Flush queue depth
             m.flush_queue_depth.set(engine.flush_queue_depth() as i64);
 
-            // Doc cache stats (synced from DocCache atomic counters)
-            let t4 = std::time::Instant::now();
-            let (dc_hits, dc_misses, dc_entries, dc_bytes, dc_evictions, dc_generations) = engine.doc_cache_stats();
-            let t_doc_cache = t4.elapsed();
-            m.doc_cache_hit_total.with_label_values(&[name]).set(dc_hits as i64);
-            m.doc_cache_miss_total.with_label_values(&[name]).set(dc_misses as i64);
-            m.doc_cache_entries.with_label_values(&[name]).set(dc_entries as i64);
-            m.doc_cache_bytes.with_label_values(&[name]).set(dc_bytes as i64);
-            m.doc_cache_evictions_total.with_label_values(&[name]).set(dc_evictions as i64);
-            m.doc_cache_generations.with_label_values(&[name]).set(dc_generations as i64);
-
-            eprintln!("[metrics-timing] cache_stats={:?} doc_cache={:?} total={:?}",
-                t_cache_stats, t_doc_cache, metrics_start.elapsed());
+            eprintln!("[metrics-timing] cache_stats={:?} total={:?}",
+                t_cache_stats, metrics_start.elapsed());
         }
     }
 

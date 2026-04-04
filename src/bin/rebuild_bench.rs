@@ -118,7 +118,7 @@ fn bench_raw_io(docs_path: &Path, num_shards: u32) -> (f64, u64, u64) {
             Ok(data) => {
                 bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
                 // Decompress to measure decompression throughput
-                // ShardStore format — count bytes as decompressed (no separate compression layer)
+                // BitmapSilo format — count bytes as decompressed (no separate compression layer)
                 bytes_decompressed.fetch_add(data.len() as u64, Ordering::Relaxed);
                 shards_read.fetch_add(1, Ordering::Relaxed);
             }

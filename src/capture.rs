@@ -2,7 +2,7 @@
 //!
 //! Manages the lifecycle of traffic + state captures for production debugging.
 //! A capture session records all HTTP requests during a time window and pins
-//! ShardStore generations at the boundaries for later replay.
+//! BitmapSilo generations at the boundaries for later replay.
 //!
 //! ## Lifecycle
 //!
@@ -13,8 +13,7 @@
 //! ## Integration points
 //!
 //! - **Traffic recording**: axum middleware checks `is_recording()` and appends to caplog
-//! - **Gen pin**: On start/stop, calls a hook to bump the ShardStore generation counter
-//!   (placeholder until Adam lands ShardStore — currently a no-op)
+//! - **Gen pin**: On start/stop, calls a hook to bump the BitmapSilo generation counter
 //! - **Prometheus scrape**: Metrics snapshot saved at start and stop boundaries
 
 use std::io::{BufWriter, Write};
@@ -71,9 +70,9 @@ pub struct CaptureSession {
     pub metrics_start_path: Option<PathBuf>,
     /// Path to metrics_stop.prom (written on capture stop).
     pub metrics_stop_path: Option<PathBuf>,
-    /// ShardStore generation pinned at capture start (pre-capture state).
+    /// BitmapSilo generation pinned at capture start (pre-capture state).
     pub gen_start: Option<u64>,
-    /// ShardStore generation pinned at capture stop (mutations during capture).
+    /// BitmapSilo generation pinned at capture stop (mutations during capture).
     pub gen_stop: Option<u64>,
 }
 
@@ -303,7 +302,7 @@ impl CaptureManager {
         }
     }
 
-    /// Record the ShardStore generation pinned at capture start.
+    /// Record the BitmapSilo generation pinned at capture start.
     pub fn set_gen_start(&self, gen: u64) {
         let mut guard = self.session.lock();
         if let Some(ref mut s) = *guard {
@@ -311,7 +310,7 @@ impl CaptureManager {
         }
     }
 
-    /// Record the ShardStore generation pinned at capture stop.
+    /// Record the BitmapSilo generation pinned at capture stop.
     pub fn set_gen_stop(&self, gen: u64) {
         let mut guard = self.session.lock();
         if let Some(ref mut s) = *guard {
@@ -647,9 +646,9 @@ pub struct CaptureStatus {
     pub duration_seconds: Option<u64>,
     pub requests_recorded: u64,
     pub session_dir: Option<String>,
-    /// ShardStore generation pinned at capture start.
+    /// BitmapSilo generation pinned at capture start.
     pub gen_start: Option<u64>,
-    /// ShardStore generation pinned at capture stop.
+    /// BitmapSilo generation pinned at capture stop.
     pub gen_stop: Option<u64>,
 }
 
