@@ -202,7 +202,7 @@ impl<'a> QueryExecutor<'a> {
                     return Some(if vb.is_dirty() {
                         vb.apply_diff(acc)
                     } else {
-                        acc & vb.base().as_ref()
+                        acc & vb.base()
                     });
                 }
                 // Unloaded — try frozen AND

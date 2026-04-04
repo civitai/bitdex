@@ -62,16 +62,16 @@ impl Default for BitmapDiff {
 /// The base bitmap is the last-compacted state. The diff accumulates changes
 /// (inserts and removes) that haven't been merged into the base yet.
 ///
-/// Both `base` and `diff` are `Arc`-wrapped for cheap snapshot cloning:
-/// publishing a new snapshot just copies the Arc pointers. `Arc::make_mut()`
-/// provides clone-on-write when the flush thread mutates while readers
-/// still hold references to the previous snapshot.
+/// `diff` is `Arc`-wrapped so the flush thread can atomically swap it via
+/// `swap_diff()`. `base` is a plain `RoaringBitmap` — with the V3 frozen mmap
+/// architecture, published snapshots read base bitmaps from BitmapSilo's mmap
+/// rather than from an Arc, so the Arc wrapper is unnecessary overhead.
 ///
 /// Query-time fusion via `apply_diff()` applies the diff to a small candidate
 /// set, avoiding a full base clone.
 #[derive(Debug, Clone)]
 pub struct VersionedBitmap {
-    base: Arc<RoaringBitmap>,
+    base: RoaringBitmap,
     diff: Arc<BitmapDiff>,
     generation: u64,
     /// Whether the base bitmap contains real data (true) or is an empty placeholder
@@ -85,7 +85,7 @@ impl VersionedBitmap {
     /// Create a new VersionedBitmap wrapping the given base bitmap.
     pub fn new(base: RoaringBitmap) -> Self {
         Self {
-            base: Arc::new(base),
+            base,
             diff: Arc::new(BitmapDiff::new()),
             generation: 0,
             is_loaded: true,
@@ -102,20 +102,10 @@ impl VersionedBitmap {
     /// write to the diff layer; `merge()` is blocked until the base is reloaded.
     pub fn new_unloaded() -> Self {
         Self {
-            base: Arc::new(RoaringBitmap::new()),
+            base: RoaringBitmap::new(),
             diff: Arc::new(BitmapDiff::new()),
             generation: 0,
             is_loaded: false,
-        }
-    }
-
-    /// Create a new VersionedBitmap from an existing Arc<RoaringBitmap>.
-    pub fn from_arc(base: Arc<RoaringBitmap>) -> Self {
-        Self {
-            base,
-            diff: Arc::new(BitmapDiff::new()),
-            generation: 0,
-            is_loaded: true,
         }
     }
 
@@ -149,7 +139,7 @@ impl VersionedBitmap {
     /// 2. OR in candidates AND diff.sets (newly added bits that are in candidates)
     /// 3. Subtract diff.clears (removed bits)
     pub fn apply_diff(&self, candidates: &RoaringBitmap) -> RoaringBitmap {
-        let mut result = candidates & self.base.as_ref();
+        let mut result = candidates & &self.base;
         result |= candidates & &self.diff.sets;
         result -= &self.diff.clears;
         result
@@ -161,9 +151,9 @@ impl VersionedBitmap {
     /// When the diff is empty, returns a clone of the base (cheap Arc refcount bump).
     pub fn fused(&self) -> RoaringBitmap {
         if self.diff.is_empty() {
-            return self.base.as_ref().clone();
+            return self.base.clone();
         }
-        let mut result = self.base.as_ref().clone();
+        let mut result = self.base.clone();
         result |= &self.diff.sets;
         result -= &self.diff.clears;
         result
@@ -173,9 +163,9 @@ impl VersionedBitmap {
     /// creates a temporary merged bitmap only when dirty. Used for zero-copy serialization.
     pub fn fused_cow(&self) -> Cow<'_, RoaringBitmap> {
         if self.diff.is_empty() {
-            Cow::Borrowed(self.base.as_ref())
+            Cow::Borrowed(&self.base)
         } else {
-            let mut result = self.base.as_ref().clone();
+            let mut result = self.base.clone();
             result |= &self.diff.sets;
             result -= &self.diff.clears;
             Cow::Owned(result)
@@ -183,7 +173,7 @@ impl VersionedBitmap {
     }
 
     /// Access the base bitmap directly. Sort layers always use merged bases.
-    pub fn base(&self) -> &Arc<RoaringBitmap> {
+    pub fn base(&self) -> &RoaringBitmap {
         &self.base
     }
 
@@ -227,9 +217,8 @@ impl VersionedBitmap {
         if self.diff.is_empty() || !self.is_loaded {
             return;
         }
-        let base = Arc::make_mut(&mut self.base);
-        *base |= &self.diff.sets;
-        *base -= &self.diff.clears;
+        self.base |= &self.diff.sets;
+        self.base -= &self.diff.clears;
         self.diff = Arc::new(BitmapDiff::new());
         self.generation += 1;
     }
@@ -259,8 +248,7 @@ impl VersionedBitmap {
     /// because RoaringBitmap's |= operates on compressed containers directly
     /// instead of per-bit Arc::make_mut + clears.remove + sets.insert.
     pub fn or_into_base(&mut self, bitmap: &RoaringBitmap) {
-        let base = Arc::make_mut(&mut self.base);
-        *base |= bitmap;
+        self.base |= bitmap;
     }
 
     /// Whether this bitmap's base contains real data (not an unloaded placeholder).
@@ -271,7 +259,7 @@ impl VersionedBitmap {
     /// Drop the base bitmap and mark as unloaded. The diff layer is preserved
     /// so mutations can accumulate while the field is not in memory.
     pub fn clear_base_and_unload(&mut self) {
-        self.base = Arc::new(RoaringBitmap::new());
+        self.base = RoaringBitmap::new();
         self.is_loaded = false;
     }
 
@@ -280,7 +268,7 @@ impl VersionedBitmap {
     /// but the base (which was just saved to disk) can be dropped entirely.
     pub fn clone_diff_only(&self) -> Self {
         Self {
-            base: Arc::new(RoaringBitmap::new()),
+            base: RoaringBitmap::new(),
             diff: Arc::clone(&self.diff),
             generation: self.generation,
             is_loaded: false,
@@ -291,8 +279,7 @@ impl VersionedBitmap {
     /// Used when reloading a field from disk after it was unloaded —
     /// the OR merges the persisted data into whatever placeholder state exists.
     pub fn load_base(&mut self, bitmap: &RoaringBitmap) {
-        let base = Arc::make_mut(&mut self.base);
-        *base |= bitmap;
+        self.base |= bitmap;
         self.is_loaded = true;
     }
 
@@ -414,32 +401,27 @@ mod tests {
     }
 
     #[test]
-    fn merge_strong_count() {
+    fn merge_applies_diff_to_base() {
         let base = RoaringBitmap::new();
         let mut vb = VersionedBitmap::new(base);
         vb.insert(1);
-
-        // strong_count == 1 → no clone needed
-        let base_ptr_before = Arc::as_ptr(vb.base());
-        vb.merge();
-        let base_ptr_after = Arc::as_ptr(vb.base());
-        // When strong_count is 1, Arc::make_mut doesn't allocate a new Arc
-        assert_eq!(base_ptr_before, base_ptr_after);
-
-        // Now clone to bump strong_count > 1
         vb.insert(2);
-        let _snapshot = vb.clone();
-        assert!(Arc::strong_count(vb.base()) > 1);
 
-        let base_ptr_before = Arc::as_ptr(vb.base());
+        // Merge should apply diff to base
         vb.merge();
-        let base_ptr_after = Arc::as_ptr(vb.base());
-        // When strong_count > 1, Arc::make_mut clones → different pointer
-        assert_ne!(base_ptr_before, base_ptr_after);
+        assert!(vb.base().contains(1));
+        assert!(vb.base().contains(2));
+        assert!(!vb.is_dirty());
+        assert_eq!(vb.generation(), 1);
+
+        // Clone shares the diff Arc (diff is still Arc-wrapped)
+        vb.insert(3);
+        let _snapshot = vb.clone();
+        assert!(Arc::ptr_eq(vb.diff(), _snapshot.diff()));
     }
 
     #[test]
-    fn clone_shares_arcs() {
+    fn clone_shares_diff_arc() {
         let mut base = RoaringBitmap::new();
         base.insert(1);
         base.insert(2);
@@ -448,9 +430,9 @@ mod tests {
 
         let clone = vb.clone();
 
-        // Both base and diff Arc pointers should be the same (cheap clone)
-        assert!(Arc::ptr_eq(vb.base(), clone.base()));
+        // diff Arc pointer should be the same (cheap clone); base is cloned by value
         assert!(Arc::ptr_eq(vb.diff(), clone.diff()));
+        assert_eq!(vb.base(), clone.base());
     }
 
     #[test]
@@ -564,16 +546,15 @@ mod tests {
     }
 
     #[test]
-    fn from_arc_constructor() {
+    fn new_constructor_owns_base() {
         let mut bm = RoaringBitmap::new();
         bm.insert(42);
-        let arc = Arc::new(bm);
-        let arc_clone = Arc::clone(&arc);
 
-        let vb = VersionedBitmap::from_arc(arc);
+        let vb = VersionedBitmap::new(bm);
         assert!(vb.contains(42));
-        // The Arc should be shared
-        assert!(Arc::ptr_eq(vb.base(), &arc_clone));
+        assert!(vb.base().contains(42));
+        assert!(vb.is_loaded());
+        assert!(!vb.is_dirty());
     }
 
     #[test]

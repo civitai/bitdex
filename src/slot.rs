@@ -146,7 +146,7 @@ impl SlotAllocator {
     /// Get a reference to the alive bitmap's base. This is ANDed into every query.
     /// Requires that the alive bitmap has been merged (no pending diff).
     pub fn alive_bitmap(&self) -> &RoaringBitmap {
-        self.alive.base().as_ref()
+        self.alive.base()
     }
 
     /// Zero-copy alive bitmap: borrows the base when clean, creates a temp

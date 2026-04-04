@@ -126,7 +126,7 @@ impl SortField {
     pub fn layer(&self, bit: usize) -> Option<&RoaringBitmap> {
         self.bit_layers.get(bit).map(|vb| {
             debug_assert!(!vb.is_dirty(), "sort layer {bit} has unmerged diff");
-            vb.base().as_ref()
+            vb.base()
         })
     }
 
@@ -217,7 +217,7 @@ impl SortField {
             // Get the effective layer: in-memory if loaded, frozen if not
             let preferred = if self.bit_layers[bit].is_loaded() {
                 debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in bifurcate");
-                let layer: &RoaringBitmap = self.bit_layers[bit].base();
+                let layer = self.bit_layers[bit].base();
                 if descending { &remaining & layer } else { &remaining - layer }
             } else if let Some(frozen) = frozen_layers.and_then(|fl| fl.get(bit)).and_then(|f| f.as_ref()) {
                 // Use frozen layer from BitmapSilo mmap
@@ -300,7 +300,7 @@ impl SortField {
             // Get effective layer (in-memory or frozen)
             let (equal_with_bit_set, equal_with_bit_clear) = if self.bit_layers[bit].is_loaded() {
                 debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in apply_cursor_filter");
-                let layer: &RoaringBitmap = self.bit_layers[bit].base();
+                let layer = self.bit_layers[bit].base();
                 (&equal & layer, &equal - layer)
             } else if let Some(frozen) = frozen_layers.and_then(|fl| fl.get(bit)).and_then(|f| f.as_ref()) {
                 (&equal & frozen, &equal - frozen)
@@ -434,7 +434,7 @@ impl SortField {
             .iter()
             .map(|vb| {
                 debug_assert!(!vb.is_dirty(), "persisting dirty sort layer");
-                vb.base().as_ref()
+                vb.base()
             })
             .collect()
     }

@@ -108,7 +108,7 @@ impl FilterField {
     /// Returns the base only (ignoring any pending diff). Use `get_versioned()`
     /// for diff-aware reads, or `apply_diff_eq()` for fused reads.
     pub fn get(&self, value: u64) -> Option<&RoaringBitmap> {
-        self.bitmaps.get(&value).map(|vb| vb.base().as_ref())
+        self.bitmaps.get(&value).map(|vb| vb.base())
     }
     /// Get the raw VersionedBitmap for a specific value, including its diff layer.
     /// Use this when you need to fuse diffs at read time.
@@ -149,7 +149,7 @@ impl FilterField {
             if vb.is_dirty() {
                 vb.apply_diff(candidates)
             } else {
-                candidates & vb.base().as_ref()
+                candidates & vb.base()
             }
         })
     }
@@ -163,7 +163,7 @@ impl FilterField {
                 if vb.is_dirty() {
                     result |= vb.apply_diff(candidates);
                 } else {
-                    result |= candidates & vb.base().as_ref();
+                    result |= candidates & vb.base();
                 }
             }
         }
@@ -182,7 +182,7 @@ impl FilterField {
         let mut result = RoaringBitmap::new();
         for value in values {
             if let Some(vb) = self.bitmaps.get(value) {
-                result |= vb.base().as_ref();
+                result |= vb.base();
             }
         }
         result
@@ -192,10 +192,10 @@ impl FilterField {
     pub fn intersection(&self, values: &[u64]) -> Option<RoaringBitmap> {
         let mut iter = values.iter();
         let first = iter.next()?;
-        let mut result: RoaringBitmap = self.bitmaps.get(first)?.base().as_ref().clone();
+        let mut result: RoaringBitmap = self.bitmaps.get(first)?.base().clone();
         for value in iter {
             match self.bitmaps.get(value) {
-                Some(vb) => result &= vb.base().as_ref(),
+                Some(vb) => result &= vb.base(),
                 None => return Some(RoaringBitmap::new()), // Empty intersection
             }
         }
@@ -203,7 +203,7 @@ impl FilterField {
     }
     /// Iterate over all (value, bitmap) pairs (base only, no diff fusion).
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &RoaringBitmap)> {
-        self.bitmaps.iter().map(|(k, vb)| (k, vb.base().as_ref()))
+        self.bitmaps.iter().map(|(k, vb)| (k, vb.base()))
     }
     /// Iterate over all (value, VersionedBitmap) pairs for diff-aware access.
     /// Used by range scans that need to fuse diffs.
