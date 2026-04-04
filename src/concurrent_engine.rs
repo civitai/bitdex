@@ -261,7 +261,7 @@ impl ConcurrentEngine {
         // Restore from BitmapSilo: alive+meta loaded to heap; filter/sort stay frozen in mmap
         let mut slots = crate::slot::SlotAllocator::new();
         let mut restored_cursors: HashMap<String, String> = HashMap::new();
-        let mut bitmap_silo_instance: Option<crate::bitmap_silo::BitmapSilo> = None;
+        let mut bitmap_silo_arc: Option<Arc<parking_lot::RwLock<crate::bitmap_silo::BitmapSilo>>> = None;
         if let Some(ref bitmap_path) = config.storage.bitmap_path {
             match crate::bitmap_silo::BitmapSilo::open(bitmap_path) {
                 Ok(silo) if silo.has_data() => {
@@ -293,7 +293,7 @@ impl ConcurrentEngine {
                     let sort_count = silo.mark_sorts_backed(&mut sorts);
                     eprintln!("BitmapSilo: marked {} sort layers as frozen-backed", sort_count);
                     eprintln!("BitmapSilo: restore complete in {:.1}ms", t_restore.elapsed().as_secs_f64() * 1000.0);
-                    bitmap_silo_instance = Some(silo);
+                    bitmap_silo_arc = Some(Arc::new(parking_lot::RwLock::new(silo)));
                 }
                 Ok(_) => {
                     eprintln!("BitmapSilo: no data found, starting fresh");
@@ -558,7 +558,7 @@ impl ConcurrentEngine {
                 cursors,
                 #[cfg(feature = "server")]
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
-                bitmap_silo: bitmap_silo_instance.map(|s| Arc::new(parking_lot::RwLock::new(s))),
+                bitmap_silo: bitmap_silo_arc.clone(),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 prefetch_tx: None,
                 prefetch_handle: None,
@@ -1205,6 +1205,7 @@ impl ConcurrentEngine {
             let merge_unified_cache = Arc::clone(&unified_cache);
             let merge_docstore = Arc::clone(&docstore);
             let merge_cache_silo = cache_silo_arc.clone();
+            let merge_bitmap_silo = bitmap_silo_arc.clone();
 
             thread::Builder::new()
                 .name("bitdex-merge".to_string())
@@ -1227,6 +1228,16 @@ impl ConcurrentEngine {
                         if needs_compact {
                             if let Err(e) = cs_arc.write().compact() {
                                 eprintln!("merge: CacheSilo compaction failed: {e}");
+                            }
+                        }
+                    }
+
+                    // Compact BitmapSilo when it has accumulated enough dead space.
+                    if let Some(ref bs_arc) = merge_bitmap_silo {
+                        let needs_compact = bs_arc.read().needs_compaction();
+                        if needs_compact {
+                            if let Err(e) = bs_arc.write().compact() {
+                                eprintln!("merge: BitmapSilo compaction failed: {e}");
                             }
                         }
                     }
@@ -1432,7 +1443,7 @@ impl ConcurrentEngine {
             cursors,
             #[cfg(feature = "server")]
             metrics_bridge,
-            bitmap_silo: bitmap_silo_instance.map(|s| Arc::new(parking_lot::RwLock::new(s))),
+            bitmap_silo: bitmap_silo_arc.clone(),
             compaction_skipped,
             prefetch_tx,
             prefetch_handle,

@@ -52,7 +52,7 @@ impl BitmapSilo {
                 buffer_ratio: 1.2,    // bitmaps don't change size much
                 min_entry_size: 64,   // small bitmaps are common
                 alignment: 32,        // FrozenRoaringBitmap requires 32-byte aligned data
-                compact_threshold: 0.0, // bitmaps are rewritten in full on save, no auto-compact
+                compact_threshold: 0.20, // compact when 20% dead space
             },
         )?;
 
@@ -284,6 +284,16 @@ impl BitmapSilo {
     /// Check if the silo has data (non-empty data file or ops).
     pub fn has_data(&self) -> bool {
         self.silo.data_bytes() > 0 || self.silo.has_ops()
+    }
+
+    /// Whether the silo needs compaction (dead space exceeds threshold).
+    pub fn needs_compaction(&self) -> bool {
+        self.silo.needs_compaction()
+    }
+
+    /// Compact the silo — merge ops into the data file, reclaim dead space.
+    pub fn compact(&mut self) -> io::Result<u64> {
+        self.silo.compact()
     }
 
     // ── Frozen accessors (zero-copy from mmap) ────────────────────────
