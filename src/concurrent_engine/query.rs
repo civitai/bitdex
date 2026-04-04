@@ -8,10 +8,10 @@ use std::time::Instant;
 use parking_lot::MutexGuard;
 use super::ConcurrentEngine;
 use crate::cache;
-use crate::cache_silo::UnifiedKey;
+use crate::silos::cache_silo::UnifiedKey;
 use crate::error::Result;
-use crate::executor::QueryExecutor;
-use crate::planner;
+use crate::engine::executor::QueryExecutor;
+use crate::query::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause};
 use crate::query_metrics::{QueryTrace, QueryTraceCollector, SortTrace};
 use crate::time_buckets::TimeBucketManager;
@@ -143,7 +143,7 @@ impl ConcurrentEngine {
                         sort_field: sort_clause.field.clone(),
                         direction: sort_clause.direction,
                     };
-                    (crate::cache_silo::hash_unified_key(&ukey), ukey)
+                    (crate::silos::cache_silo::hash_unified_key(&ukey), ukey)
                 })
             } else {
                 None
@@ -270,7 +270,7 @@ impl ConcurrentEngine {
                 // Build entry bitmap
                 let mut bm = roaring::RoaringBitmap::new();
                 for &slot in &sorted_slots { bm.insert(slot); }
-                let entry_data = crate::cache_silo::CacheEntryData {
+                let entry_data = crate::silos::cache_silo::CacheEntryData {
                     key: ukey.clone(),
                     bitmap: bm,
                     min_tracked_value,

@@ -19,9 +19,9 @@ use serde_json::Value as JsonValue;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
-use crate::doc_format::PackedValue;
-use crate::doc_silo_adapter::DocSiloAdapter;
-use crate::filter::{FilterFieldType, NULL_BITMAP_KEY};
+use crate::silos::doc_format::PackedValue;
+use crate::silos::doc_silo_adapter::DocSiloAdapter;
+use crate::engine::filter::{FilterFieldType, NULL_BITMAP_KEY};
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
 use crate::pg_sync::op_dedup::dedup_ops;
@@ -109,7 +109,7 @@ impl DocWriter {
         for (slot, field_updates) in pending {
             // Read existing doc and merge
             let mut doc = ds.get(slot).ok().flatten().unwrap_or_else(|| {
-                crate::doc_format::StoredDoc {
+                crate::silos::doc_format::StoredDoc {
                     fields: HashMap::new(),
                     schema_version: 0,
                 }
@@ -218,7 +218,7 @@ fn qvalue_to_json(v: &QValue) -> JsonValue {
 /// are treated as deletions and their old bitmap bits are cleared.
 pub fn document_to_ops(
     new_doc: &crate::mutation::Document,
-    old_doc: Option<&crate::doc_format::StoredDoc>,
+    old_doc: Option<&crate::silos::doc_format::StoredDoc>,
     config: &crate::config::Config,
     is_patch: bool,
 ) -> Vec<Op> {
@@ -230,7 +230,7 @@ pub fn document_to_ops(
         let old_val = old_fields.get(field_name);
         // Check if this is a multi-value field (tagIds, toolIds, etc.)
         let is_multi_value = config.filter_fields.iter()
-            .any(|f| f.name == *field_name && f.field_type == crate::filter::FilterFieldType::MultiValue);
+            .any(|f| f.name == *field_name && f.field_type == crate::engine::filter::FilterFieldType::MultiValue);
         if is_multi_value {
             // Multi-value: compute add/remove sets
             let old_ints = extract_multi_ints(old_val);
@@ -283,7 +283,7 @@ pub fn document_to_ops(
             if !new_doc.fields.contains_key(field_name) {
                 // Field was removed
                 let is_multi_value = config.filter_fields.iter()
-                    .any(|f| f.name == *field_name && f.field_type == crate::filter::FilterFieldType::MultiValue);
+                    .any(|f| f.name == *field_name && f.field_type == crate::engine::filter::FilterFieldType::MultiValue);
                 if is_multi_value {
                     for v in extract_multi_ints(Some(old_val)) {
                         ops.push(Op::Remove {
@@ -1122,7 +1122,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use crate::config::{Config, DataSchema, FieldMapping, FieldValueType, FilterFieldConfig, SortFieldConfig};
-    use crate::filter::FilterFieldType;
+    use crate::engine::filter::FilterFieldType;
     use crate::ingester::BitmapSink;
     /// A test sink that records all operations for verification.
     struct RecordingSink {
@@ -1581,8 +1581,8 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_doc_writer_write_set() {
-        use crate::doc_format::PackedValue;
-        use crate::doc_silo_adapter::DocSiloAdapter;
+        use crate::silos::doc_format::PackedValue;
+        use crate::silos::doc_silo_adapter::DocSiloAdapter;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -1607,7 +1607,7 @@ mod tests {
     }
     #[test]
     fn test_doc_writer_write_add_remove() {
-        use crate::doc_silo_adapter::DocSiloAdapter;
+        use crate::silos::doc_silo_adapter::DocSiloAdapter;
 
         let mut store = DocSiloAdapter::open_temp().unwrap();
         store.ensure_field_index("tagIds").unwrap();
@@ -1618,7 +1618,7 @@ mod tests {
             fields.insert("tagIds".to_string(), crate::mutation::FieldValue::Multi(
                 vec![crate::query::Value::Integer(100), crate::query::Value::Integer(200)]
             ));
-            let doc = crate::doc_format::StoredDoc { fields, schema_version: 0 };
+            let doc = crate::silos::doc_format::StoredDoc { fields, schema_version: 0 };
             store.lock().put(5, &doc).unwrap();
         }
         // Add a value
@@ -1665,7 +1665,7 @@ mod tests {
     /// Validates the production ops pipeline docstore write path.
     #[test]
     fn test_docstore_v3_doc_writer_e2e_roundtrip() {
-        use crate::doc_silo_adapter::DocSiloAdapter;
+        use crate::silos::doc_silo_adapter::DocSiloAdapter;
 
         let mut store = DocSiloAdapter::open_temp().unwrap();
         store.ensure_field_index("sortAt").unwrap();
@@ -1873,7 +1873,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_json_to_packed_types() {
-        use crate::doc_format::PackedValue;
+        use crate::silos::doc_format::PackedValue;
 
         assert_eq!(json_to_packed(&json!(42)), Some(PackedValue::I(42)));
         assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
@@ -1912,7 +1912,7 @@ mod tests {
         // Old doc: nsfwLevel=8
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::silos::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // New doc: nsfwLevel=16
         let mut new_fields = std::collections::HashMap::new();
@@ -1932,7 +1932,7 @@ mod tests {
         let mut fields = std::collections::HashMap::new();
         fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
 
-        let old_doc = crate::doc_format::StoredDoc { fields: fields.clone(), schema_version: 0 };
+        let old_doc = crate::silos::doc_format::StoredDoc { fields: fields.clone(), schema_version: 0 };
         let new_doc = Document { fields };
         let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
         assert!(ops.is_empty(), "unchanged fields should produce no ops");
@@ -1945,7 +1945,7 @@ mod tests {
         // Old doc has nsfwLevel=8 AND reactionCount sort field
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::silos::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH only sends userId=42 (nsfwLevel absent from patch)
         let mut new_fields = std::collections::HashMap::new();
@@ -2011,7 +2011,7 @@ mod tests {
         }];
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
-            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::engine::filter::NULL_BITMAP_KEY),
             "null set on nullable field should insert NULL_BITMAP_KEY sentinel"
         );
     }
@@ -2031,11 +2031,11 @@ mod tests {
         }];
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
-            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::filter::NULL_BITMAP_KEY),
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::engine::filter::NULL_BITMAP_KEY),
             "non-null set on nullable field should insert value bitmap bit"
         );
         assert!(
-            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::engine::filter::NULL_BITMAP_KEY),
             "non-null set on nullable field should remove NULL_BITMAP_KEY sentinel"
         );
     }
@@ -2055,7 +2055,7 @@ mod tests {
         }];
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
-            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::engine::filter::NULL_BITMAP_KEY),
             "null remove on nullable field should remove NULL_BITMAP_KEY sentinel"
         );
     }
@@ -2103,12 +2103,12 @@ mod tests {
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         // Old value should be removed
         assert!(
-            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::filter::NULL_BITMAP_KEY),
+            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::engine::filter::NULL_BITMAP_KEY),
             "old blockedFor value should be removed from bitmap"
         );
         // Null sentinel should be inserted
         assert!(
-            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::engine::filter::NULL_BITMAP_KEY),
             "null set should insert NULL_BITMAP_KEY sentinel"
         );
     }

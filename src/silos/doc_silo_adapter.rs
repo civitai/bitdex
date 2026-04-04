@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use crate::config::DataSchema;
-use crate::doc_format::{self, PackedValue, StoredDoc};
+use crate::silos::doc_format::{self, PackedValue, StoredDoc};
 
 /// DataSilo-backed document store adapter.
 pub struct DocSiloAdapter {
@@ -154,7 +154,7 @@ impl DocSiloAdapter {
         for mapping in &schema.fields {
             if let Some(ref default_val) = mapping.default_value {
                 if let Some(&idx) = self.field_to_idx.get(&mapping.target) {
-                    if let Some(pv) = crate::doc_format::json_to_packed_with_dict(
+                    if let Some(pv) = crate::silos::doc_format::json_to_packed_with_dict(
                         default_val, mapping, false, None,
                     ) {
                         self.field_defaults.insert(idx, pv);

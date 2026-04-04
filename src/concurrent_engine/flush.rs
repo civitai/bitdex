@@ -7,8 +7,8 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::Receiver;
 use roaring::RoaringBitmap;
 use crate::config::Config;
-use crate::doc_format::StoredDoc;
-use crate::doc_silo_adapter::DocSiloAdapter;
+use crate::silos::doc_format::StoredDoc;
+use crate::silos::doc_silo_adapter::DocSiloAdapter;
 use crate::mutation::{FieldRegistry, MutationOp};
 use crate::time_buckets::TimeBucketManager;
 use super::flush_batch::FlushBatch;
@@ -16,13 +16,13 @@ use super::flush_batch::FlushBatch;
 /// All captured state passed into the flush thread by value.
 /// Each field corresponds to an Arc (or plain value) cloned in `build()`.
 pub struct FlushArgs {
-    pub slots: Arc<parking_lot::RwLock<crate::slot::SlotAllocator>>,
-    pub filters: Arc<parking_lot::RwLock<crate::filter::FilterIndex>>,
-    pub sorts: Arc<parking_lot::RwLock<crate::sort::SortIndex>>,
+    pub slots: Arc<parking_lot::RwLock<crate::engine::slot::SlotAllocator>>,
+    pub filters: Arc<parking_lot::RwLock<crate::engine::filter::FilterIndex>>,
+    pub sorts: Arc<parking_lot::RwLock<crate::engine::sort::SortIndex>>,
     pub shutdown: Arc<AtomicBool>,
     pub docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
     pub flush_interval_us: u64,
-    pub cache_silo: Option<Arc<parking_lot::RwLock<crate::cache_silo::CacheSilo>>>,
+    pub cache_silo: Option<Arc<parking_lot::RwLock<crate::silos::cache_silo::CacheSilo>>>,
     pub dirty_flag: Arc<AtomicBool>,
     pub time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
     pub pending_diffs: Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,

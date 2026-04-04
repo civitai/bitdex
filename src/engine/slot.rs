@@ -6,7 +6,7 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::error::{BitdexError, Result};
-use crate::versioned_bitmap::VersionedBitmap;
+use crate::engine::versioned_bitmap::VersionedBitmap;
 
 /// Manages slot allocation, the alive bitmap, and the clean bitmap for slot recycling.
 ///

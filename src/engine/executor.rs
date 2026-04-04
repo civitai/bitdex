@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use roaring::RoaringBitmap;
-use crate::bitmap_silo::BitmapSilo;
+use crate::silos::bitmap_silo::BitmapSilo;
 use crate::dictionary::FieldDictionary;
 use crate::error::{BitdexError, Result};
-use crate::filter::FilterIndex;
-use crate::planner;
+use crate::engine::filter::FilterIndex;
+use crate::query::planner;
 use crate::query::{FilterClause, SortClause, SortDirection, Value};
 use crate::query_metrics::{ClauseTrace, QueryTraceCollector};
-use crate::slot::SlotAllocator;
-use crate::sort::SortIndex;
+use crate::engine::slot::SlotAllocator;
+use crate::engine::sort::SortIndex;
 use crate::types::QueryResult;
 /// Convert a Value to a u64 bitmap key for filter indexing.
 /// For MappedString fields, call `resolve_value_key` instead which consults the string_map.
@@ -548,7 +548,7 @@ impl<'a> QueryExecutor<'a> {
                 let mut result = alive.clone();
                 result -= &eq_bitmap;
                 // Subtract null bitmap
-                if let Some(null_bm) = self.get_effective_bitmap(field, crate::filter::NULL_BITMAP_KEY) {
+                if let Some(null_bm) = self.get_effective_bitmap(field, crate::engine::filter::NULL_BITMAP_KEY) {
                     result -= &null_bm;
                 }
                 Ok(result)
@@ -577,7 +577,7 @@ impl<'a> QueryExecutor<'a> {
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &in_bitmap;
-                if let Some(null_bm) = self.get_effective_bitmap(field, crate::filter::NULL_BITMAP_KEY) {
+                if let Some(null_bm) = self.get_effective_bitmap(field, crate::engine::filter::NULL_BITMAP_KEY) {
                     result -= &null_bm;
                 }
                 Ok(result)
@@ -668,12 +668,12 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::BucketBitmap { bitmap, .. } => Ok(bitmap.as_ref().clone()),
             // IsNull: return the null sentinel bitmap for the field, or empty if none.
             FilterClause::IsNull(field) => {
-                Ok(self.get_effective_bitmap(field, crate::filter::NULL_BITMAP_KEY)
+                Ok(self.get_effective_bitmap(field, crate::engine::filter::NULL_BITMAP_KEY)
                     .unwrap_or_default())
             }
             // IsNotNull: alive minus the null bitmap.
             FilterClause::IsNotNull(field) => {
-                let null_bitmap = self.get_effective_bitmap(field, crate::filter::NULL_BITMAP_KEY)
+                let null_bitmap = self.get_effective_bitmap(field, crate::engine::filter::NULL_BITMAP_KEY)
                     .unwrap_or_default();
                 let alive = self.slots.alive_bitmap();
                 let mut result = alive.clone();
@@ -706,7 +706,7 @@ impl<'a> QueryExecutor<'a> {
         // Iterate in-memory values (may be loaded or unloaded placeholders)
         if let Some(filter_field) = self.filters.get_field(field) {
             for (&key, _vb) in filter_field.iter_versioned() {
-                if key == crate::filter::NULL_BITMAP_KEY { continue; }
+                if key == crate::engine::filter::NULL_BITMAP_KEY { continue; }
                 if predicate(key, target) {
                     if let Some(bm) = self.get_effective_bitmap(field, key) {
                         result |= &bm;
@@ -717,7 +717,7 @@ impl<'a> QueryExecutor<'a> {
             // No in-memory field — scan silo entries
             for (f, key) in silo.filter_entries() {
                 if f != field { continue; }
-                if key == crate::filter::NULL_BITMAP_KEY { continue; }
+                if key == crate::engine::filter::NULL_BITMAP_KEY { continue; }
                 if predicate(key, target) {
                     if let Some(frozen) = silo.get_frozen_filter(field, key) {
                         result |= frozen.to_owned();
@@ -1027,7 +1027,7 @@ impl<'a> QueryExecutor<'a> {
 mod tests {
     use super::*;
     use crate::config::{BucketConfig, Config, FilterFieldConfig, SortFieldConfig};
-    use crate::filter::FilterFieldType;
+    use crate::engine::filter::FilterFieldType;
     use crate::mutation::{Document, FieldValue, MutationEngine};
     use crate::time_buckets::TimeBucketManager;
     fn test_config() -> Config {
@@ -1085,7 +1085,7 @@ mod tests {
         filters: FilterIndex,
         sorts: SortIndex,
         config: Config,
-        docstore: crate::doc_silo_adapter::DocSiloAdapter,
+        docstore: crate::silos::doc_silo_adapter::DocSiloAdapter,
     }
     impl TestHarness {
         fn new() -> Self {
@@ -1093,7 +1093,7 @@ mod tests {
             let slots = SlotAllocator::new();
             let mut filters = FilterIndex::new();
             let mut sorts = SortIndex::new();
-            let docstore = crate::doc_silo_adapter::DocSiloAdapter::open_temp().unwrap();
+            let docstore = crate::silos::doc_silo_adapter::DocSiloAdapter::open_temp().unwrap();
 
             for fc in &config.filter_fields {
                 filters.add_field(fc.clone());

@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use crossbeam_channel::Receiver;
-use crate::filter::FilterIndex;
+use crate::engine::filter::FilterIndex;
 use crate::mutation::MutationOp;
-use crate::slot::SlotAllocator;
-use crate::sort::SortIndex;
+use crate::engine::slot::SlotAllocator;
+use crate::engine::sort::SortIndex;
 use super::FilterGroupKey;
 
 /// Key for grouping sort operations by target bit layer.

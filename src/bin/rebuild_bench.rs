@@ -17,8 +17,8 @@ use std::time::Instant;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
-use bitdex_v2::doc_format::{PackedValue, StoredDoc};
-use bitdex_v2::doc_silo_adapter::DocSiloAdapter;
+use bitdex_v2::silos::doc_format::{PackedValue, StoredDoc};
+use bitdex_v2::silos::doc_silo_adapter::DocSiloAdapter;
 use bitdex_v2::mutation::{value_to_bitmap_key, value_to_sort_u32};
 use bitdex_v2::query::Value;
 

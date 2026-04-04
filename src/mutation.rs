@@ -3,13 +3,13 @@ use std::sync::Arc;
 use crossbeam_channel::Sender;
 use roaring::RoaringBitmap;
 use crate::config::{ComputedOp, ComputedField, Config};
-use crate::doc_silo_adapter::DocSiloAdapter;
-use crate::doc_format::StoredDoc;
+use crate::silos::doc_silo_adapter::DocSiloAdapter;
+use crate::silos::doc_format::StoredDoc;
 use crate::error::{BitdexError, Result};
-use crate::filter::FilterIndex;
+use crate::engine::filter::FilterIndex;
 use crate::query::Value;
-use crate::slot::SlotAllocator;
-use crate::sort::SortIndex;
+use crate::engine::slot::SlotAllocator;
+use crate::engine::sort::SortIndex;
 
 /// A bitmap mutation request submitted by any thread.
 /// Field names use Arc<str> to avoid heap allocation per op.
@@ -589,7 +589,7 @@ pub fn value_to_bitmap_key(val: &Value) -> Option<u64> {
         Value::Integer(v) => {
             let key = *v as u64;
             // Guard: -1i64 as u64 == u64::MAX == NULL_BITMAP_KEY. Reject it.
-            if key == crate::filter::NULL_BITMAP_KEY { None } else { Some(key) }
+            if key == crate::engine::filter::NULL_BITMAP_KEY { None } else { Some(key) }
         }
         Value::Float(_) | Value::String(_) => None,
     }
@@ -911,7 +911,7 @@ impl<'a> MutationEngine<'a> {
     }
     /// Clear filter bitmap bits for a field value.
     fn clear_filter_bits(
-        filter_field: &mut crate::filter::FilterField,
+        filter_field: &mut crate::engine::filter::FilterField,
         id: u32,
         val: &FieldValue,
     ) {
@@ -932,7 +932,7 @@ impl<'a> MutationEngine<'a> {
     }
     /// Set filter bitmap bits for a field value.
     fn set_filter_bits(
-        filter_field: &mut crate::filter::FilterField,
+        filter_field: &mut crate::engine::filter::FilterField,
         id: u32,
         val: &FieldValue,
     ) {
@@ -1059,7 +1059,7 @@ impl<'a> MutationEngine<'a> {
 mod tests {
     use super::*;
     use crate::config::{FilterFieldConfig, SortFieldConfig};
-    use crate::filter::FilterFieldType;
+    use crate::engine::filter::FilterFieldType;
     fn test_config() -> Config {
         Config {
             filter_fields: vec![
@@ -1600,7 +1600,7 @@ mod tests {
     #[test]
     fn test_diff_document_partial_deferred_alive() {
         use crate::config::{DeferredAliveConfig, FilterFieldConfig, SortFieldConfig};
-        use crate::filter::FilterFieldType;
+        use crate::engine::filter::FilterFieldType;
         use crate::mutation::MutationOp;
         let mut config = Config::default();
         config.filter_fields = vec![FilterFieldConfig {
@@ -1628,7 +1628,7 @@ mod tests {
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(16)));
         old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(1000)));
-        let old_doc = crate::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::silos::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH changes publishedAt to far future (year 2050)
         let future_ts = 2524608000i64;

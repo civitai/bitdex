@@ -1,14 +1,14 @@
 use std::path::Path;
 use crate::concurrency::InFlightTracker;
 use crate::config::Config;
-use crate::doc_silo_adapter::DocSiloAdapter;
+use crate::silos::doc_silo_adapter::DocSiloAdapter;
 use crate::error::Result;
-use crate::executor::QueryExecutor;
-use crate::filter::FilterIndex;
+use crate::engine::executor::QueryExecutor;
+use crate::engine::filter::FilterIndex;
 use crate::mutation::{Document, MutationEngine, PatchPayload};
 use crate::query::{BitdexQuery, FilterClause, SortClause};
-use crate::slot::SlotAllocator;
-use crate::sort::SortIndex;
+use crate::engine::slot::SlotAllocator;
+use crate::engine::sort::SortIndex;
 use crate::types::QueryResult;
 /// The top-level Bitdex engine tying all components together.
 ///
@@ -332,7 +332,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::config::{FilterFieldConfig, SortFieldConfig};
-    use crate::filter::FilterFieldType;
+    use crate::engine::filter::FilterFieldType;
     use crate::mutation::FieldValue;
     use crate::query::{SortDirection, Value};
     fn test_config() -> Config {

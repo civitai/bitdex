@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
-use crate::doc_format::PackedValue;
+use crate::silos::doc_format::PackedValue;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
 use crate::dump_expression::ExprValue as NateExprValue;
@@ -1179,7 +1179,7 @@ pub fn process_dump(
             let current_counter = staging.slots.slot_counter();
             if result.max_slot + 1 > current_counter {
                 // Rebuild slot allocator with updated counter
-                staging.slots = crate::slot::SlotAllocator::from_state(
+                staging.slots = crate::engine::slot::SlotAllocator::from_state(
                     result.max_slot + 1,
                     staging.slots.alive_bitmap().clone(),
                     roaring::RoaringBitmap::new(),
@@ -2180,7 +2180,7 @@ pub fn process_dump_with_progress(
                 }
                 let mv_ops: Vec<(u32, Vec<u8>)> = slot_values.into_iter().map(|(slot, values)| {
                     let fields = vec![(fidx, PackedValue::Mi(values))];
-                    let bytes = crate::doc_format::encode_merge_fields(slot, &fields);
+                    let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
                     (slot, bytes)
                 }).collect();
                 eprintln!("  Dump {}: multi-value post-pass wrote {} doc ops ({:.1}s)",
@@ -2377,7 +2377,7 @@ fn collect_doc_op(
     }
 
     if !fields.is_empty() {
-        let bytes = crate::doc_format::encode_merge_fields(slot, &fields);
+        let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
         if let Some((writer, local_cursor, local_end)) = pw {
             writer.write_put(slot, &bytes, local_cursor, local_end);
         } else {

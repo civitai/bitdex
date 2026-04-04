@@ -1,6 +1,4 @@
-pub mod bitmap_silo;
 pub mod bucket_diff_log;
-pub mod cache_silo;
 pub mod dump_enrichment;
 pub mod dump_expression;
 #[cfg(feature = "pg-sync")]
@@ -14,31 +12,26 @@ pub mod concurrent_engine;
 pub mod config;
 pub mod dictionary;
 
-pub mod doc_format;
-pub mod doc_silo_adapter;
 pub mod engine;
+pub mod engine_facade;
+pub mod silos;
+pub mod query;
+
 pub mod error;
 pub mod ingester;
-pub mod executor;
-pub mod filter;
 pub mod loader;
 pub mod meta_index;
 pub mod mutation;
 pub mod parser;
-pub mod planner;
-pub mod query;
 pub mod query_metrics;
 pub mod radix_sort;
 #[cfg(feature = "server")]
 pub mod metrics;
 #[cfg(feature = "server")]
 pub mod server;
-pub mod slot;
-pub mod sort;
 pub mod time_buckets;
 pub mod types;
 // unified_cache removed in Phase 3 — CacheSilo is the sole cache now
-pub mod versioned_bitmap;
 #[cfg(feature = "pg-sync")]
 pub mod dump_processor;
 #[cfg(feature = "pg-sync")]

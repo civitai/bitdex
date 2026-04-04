@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use roaring::RoaringBitmap;
 use crate::config::FilterFieldConfig;
-use crate::versioned_bitmap::VersionedBitmap;
+use crate::engine::versioned_bitmap::VersionedBitmap;
 
 /// Reserved bitmap key for null values on nullable filter fields.
 /// Null ops insert/remove this key in the existing value bitmap HashMap,

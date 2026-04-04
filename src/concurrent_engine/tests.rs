@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::{FilterFieldConfig, SortFieldConfig};
-use crate::filter::FilterFieldType;
+use crate::engine::filter::FilterFieldType;
 use crate::mutation::{diff_document, Document, FieldRegistry, FieldValue};
 use crate::query::{BitdexQuery, FilterClause, SortClause, SortDirection, Value};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ impl ConcurrentEngine {
         let registry = FieldRegistry::from_config(&self.config);
         let ops = diff_document(id, None, doc, &self.config, false, &registry);
         self.send_mutation_ops(ops)?;
-        let stored = crate::doc_format::StoredDoc {
+        let stored = crate::silos::doc_format::StoredDoc {
             fields: doc.fields.clone(),
             schema_version: 0,
         };

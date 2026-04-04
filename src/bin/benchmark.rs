@@ -30,7 +30,7 @@ use rand::Rng;
 use rayon::prelude::*;
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
-use bitdex_v2::filter::FilterFieldType;
+use bitdex_v2::engine::filter::FilterFieldType;
 use bitdex_v2::mutation::{Document, FieldValue};
 use bitdex_v2::query::{BitdexQuery, CursorPosition, FilterClause, SortClause, SortDirection, Value};
 // ---------------------------------------------------------------------------

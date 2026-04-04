@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use crate::filter::FilterIndex;
+use crate::engine::filter::FilterIndex;
 use crate::query::{FilterClause, Value};
-use crate::slot::SlotAllocator;
+use crate::engine::slot::SlotAllocator;
 /// Threshold below which we skip bitmap sort traversal and use a simple in-memory sort.
 /// For very small result sets, extracting IDs and sorting is faster than walking 32 bit layers.
 const SORT_FIRST_THRESHOLD: u64 = 1000;
@@ -88,7 +88,7 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
         // IsNull: use the null bitmap's length if it exists, else assume rare (~10% of alive).
         FilterClause::IsNull(field) => {
             if let Some(ff) = filters.get_field(field) {
-                ff.cardinality(crate::filter::NULL_BITMAP_KEY)
+                ff.cardinality(crate::engine::filter::NULL_BITMAP_KEY)
             } else {
                 alive_count / 10
             }
@@ -96,7 +96,7 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
         // IsNotNull: alive minus the null count.
         FilterClause::IsNotNull(field) => {
             let null_count = if let Some(ff) = filters.get_field(field) {
-                ff.cardinality(crate::filter::NULL_BITMAP_KEY)
+                ff.cardinality(crate::engine::filter::NULL_BITMAP_KEY)
             } else {
                 alive_count / 10
             };
@@ -239,9 +239,9 @@ pub fn should_use_andnot(clause: &FilterClause, filters: &FilterIndex, alive_cou
 mod tests {
     use super::*;
     use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
-    use crate::filter::FilterFieldType;
+    use crate::engine::filter::FilterFieldType;
     use crate::mutation::{Document, FieldValue, MutationEngine};
-    use crate::sort::SortIndex;
+    use crate::engine::sort::SortIndex;
     fn test_config() -> Config {
         Config {
             filter_fields: vec![
@@ -295,7 +295,7 @@ mod tests {
         filters: FilterIndex,
         sorts: SortIndex,
         config: Config,
-        docstore: crate::doc_silo_adapter::DocSiloAdapter,
+        docstore: crate::silos::doc_silo_adapter::DocSiloAdapter,
     }
     impl TestHarness {
         fn new() -> Self {
@@ -303,7 +303,7 @@ mod tests {
             let slots = SlotAllocator::new();
             let mut filters = FilterIndex::new();
             let mut sorts = SortIndex::new();
-            let docstore = crate::doc_silo_adapter::DocSiloAdapter::open_temp().unwrap();
+            let docstore = crate::silos::doc_silo_adapter::DocSiloAdapter::open_temp().unwrap();
 
             for fc in &config.filter_fields {
                 filters.add_field(fc.clone());

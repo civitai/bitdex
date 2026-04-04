@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 
 use roaring::{FrozenRoaringBitmap, RoaringBitmap};
 
-use crate::filter::FilterIndex;
-use crate::sort::SortIndex;
-use crate::slot::SlotAllocator;
+use crate::engine::filter::FilterIndex;
+use crate::engine::sort::SortIndex;
+use crate::engine::slot::SlotAllocator;
 
 /// Reserved key for the alive bitmap.
 const KEY_ALIVE: u32 = 0;
@@ -548,7 +548,7 @@ impl BitmapSilo {
 mod tests {
     use super::*;
     use crate::config::{FilterFieldConfig, SortFieldConfig};
-    use crate::filter::FilterFieldType;
+    use crate::engine::filter::FilterFieldType;
 
     #[test]
     fn test_save_and_load_roundtrip() {
@@ -681,7 +681,7 @@ mod tests {
         layer0.insert_range(0..50);
         sort_field.or_layer(0, &layer0);
 
-        let slots = crate::slot::SlotAllocator::from_state(100, {
+        let slots = crate::engine::slot::SlotAllocator::from_state(100, {
             let mut bm = RoaringBitmap::new();
             bm.insert_range(0..100);
             bm

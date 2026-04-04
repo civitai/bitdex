@@ -4,7 +4,7 @@ use std::sync::Arc;
 use roaring::{FrozenRoaringBitmap, RoaringBitmap};
 
 use crate::config::SortFieldConfig;
-use crate::versioned_bitmap::VersionedBitmap;
+use crate::engine::versioned_bitmap::VersionedBitmap;
 
 /// Sort layer bitmaps for a single sortable field.
 ///

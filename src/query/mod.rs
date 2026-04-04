@@ -539,3 +539,5 @@ mod tests {
         assert_eq!(roundtrip.cursor.unwrap().slot_id, 42);
     }
 }
+
+pub mod planner;

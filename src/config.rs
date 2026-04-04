@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 use crate::error::{BitdexError, Result};
-pub use crate::filter::FilterFieldType;
+pub use crate::engine::filter::FilterFieldType;
 /// Top-level Bitdex V2 configuration.
 ///
 /// Loaded from TOML or YAML files. Designed for future hot-reloadability:
@@ -1332,7 +1332,7 @@ ms_to_seconds = true
             filter_fields: vec![
                 FilterFieldConfig {
                     name: "nsfwLevel".to_string(),
-                    field_type: crate::filter::FilterFieldType::SingleValue,
+                    field_type: crate::engine::filter::FilterFieldType::SingleValue,
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
@@ -1340,7 +1340,7 @@ ms_to_seconds = true
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
-                    field_type: crate::filter::FilterFieldType::MultiValue,
+                    field_type: crate::engine::filter::FilterFieldType::MultiValue,
                     behaviors: None,
                     eviction: None,
                     eager_load: true,

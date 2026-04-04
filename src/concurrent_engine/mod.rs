@@ -14,10 +14,10 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender};
 use roaring::RoaringBitmap;
 use crate::config::Config;
-use crate::doc_format::{StoredDoc};
-use crate::doc_silo_adapter::DocSiloAdapter;
+use crate::silos::doc_format::{StoredDoc};
+use crate::silos::doc_silo_adapter::DocSiloAdapter;
 use crate::error::Result;
-use crate::executor::{CaseSensitiveFields, StringMaps};
+use crate::engine::executor::{CaseSensitiveFields, StringMaps};
 use crate::mutation::FieldRegistry;
 use crate::time_buckets::TimeBucketManager;
 use crate::mutation::{MutationOp, MutationSender};
@@ -45,9 +45,9 @@ pub struct MetricsBridge {
 /// to atomically swap its contents into the live engine under write locks.
 #[derive(Clone)]
 pub struct InnerEngine {
-    pub slots: crate::slot::SlotAllocator,
-    pub filters: crate::filter::FilterIndex,
-    pub sorts: crate::sort::SortIndex,
+    pub slots: crate::engine::slot::SlotAllocator,
+    pub filters: crate::engine::filter::FilterIndex,
+    pub sorts: crate::engine::sort::SortIndex,
 }
 /// Thread-safe engine using ArcSwap for lock-free snapshot reads.
 ///
@@ -75,11 +75,11 @@ pub struct CompactResult {
 /// bitmaps offline and `publish_staging()` to swap them in.
 pub struct ConcurrentEngine {
     /// Slot allocator: alive bitmap + slot counter + deferred alive set.
-    slots: Arc<parking_lot::RwLock<crate::slot::SlotAllocator>>,
+    slots: Arc<parking_lot::RwLock<crate::engine::slot::SlotAllocator>>,
     /// Filter index: one VersionedBitmap per field × value.
-    filters: Arc<parking_lot::RwLock<crate::filter::FilterIndex>>,
+    filters: Arc<parking_lot::RwLock<crate::engine::filter::FilterIndex>>,
     /// Sort index: per-field bit-layer bitmaps.
-    sorts: Arc<parking_lot::RwLock<crate::sort::SortIndex>>,
+    sorts: Arc<parking_lot::RwLock<crate::engine::sort::SortIndex>>,
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
     docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
@@ -103,7 +103,7 @@ pub struct ConcurrentEngine {
     /// CacheSilo: persistent cache backed by DataSilo.
     /// Flush thread writes new entries; merge thread compacts.
     /// None when bitmap_path is not configured.
-    cache_silo: Option<Arc<parking_lot::RwLock<crate::cache_silo::CacheSilo>>>,
+    cache_silo: Option<Arc<parking_lot::RwLock<crate::silos::cache_silo::CacheSilo>>>,
     /// Flush loop stats: total flush cycles that applied mutations (monotonic counter).
     flush_apply_count: Arc<AtomicU64>,
     /// Flush loop stats: cumulative flush duration in nanoseconds.
@@ -130,7 +130,7 @@ pub struct ConcurrentEngine {
     /// BitmapSilo for frozen bitmap reads. Queries read filter/sort bitmaps
     /// directly from the silo's mmap via FrozenRoaringBitmap::view().
     /// RwLock: readers (queries) share access; writer (save_snapshot) gets exclusive.
-    bitmap_silo: Option<Arc<parking_lot::RwLock<crate::bitmap_silo::BitmapSilo>>>,
+    bitmap_silo: Option<Arc<parking_lot::RwLock<crate::silos::bitmap_silo::BitmapSilo>>>,
     /// Compaction skip counter.
     compaction_skipped: Arc<AtomicU64>,
 }
@@ -192,8 +192,8 @@ impl ConcurrentEngine {
     }
 
     fn build(config: Config, docstore: DocSiloAdapter) -> Result<Self> {
-        let mut filters = crate::filter::FilterIndex::new();
-        let mut sorts = crate::sort::SortIndex::new();
+        let mut filters = crate::engine::filter::FilterIndex::new();
+        let mut sorts = crate::engine::sort::SortIndex::new();
         // All fields are in-memory (no tier 2 distinction).
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
@@ -204,11 +204,11 @@ impl ConcurrentEngine {
         let field_registry = FieldRegistry::from_config(&config);
 
         // Restore from BitmapSilo: alive+meta loaded to heap; filter/sort stay frozen in mmap
-        let mut slots = crate::slot::SlotAllocator::new();
+        let mut slots = crate::engine::slot::SlotAllocator::new();
         let mut restored_cursors: HashMap<String, String> = HashMap::new();
-        let mut bitmap_silo_arc: Option<Arc<parking_lot::RwLock<crate::bitmap_silo::BitmapSilo>>> = None;
+        let mut bitmap_silo_arc: Option<Arc<parking_lot::RwLock<crate::silos::bitmap_silo::BitmapSilo>>> = None;
         if let Some(ref bitmap_path) = config.storage.bitmap_path {
-            match crate::bitmap_silo::BitmapSilo::open(bitmap_path) {
+            match crate::silos::bitmap_silo::BitmapSilo::open(bitmap_path) {
                 Ok(silo) if silo.has_data() => {
                     let t_restore = std::time::Instant::now();
                     // Load alive bitmap with pending ops applied — used by SlotAllocator.
@@ -222,7 +222,7 @@ impl ConcurrentEngine {
                             .map(|v| v as u32)
                             .unwrap_or(0);
                         let alive_count = alive.len();
-                        slots = crate::slot::SlotAllocator::from_state(
+                        slots = crate::engine::slot::SlotAllocator::from_state(
                             slot_counter,
                             alive,
                             roaring::RoaringBitmap::new(),
@@ -252,10 +252,10 @@ impl ConcurrentEngine {
         }
         // CacheSilo: open the persistent cache store.
         // No in-memory UnifiedCache — the silo IS the cache. Queries read directly via get_entry().
-        let cache_silo_arc: Option<Arc<parking_lot::RwLock<crate::cache_silo::CacheSilo>>> =
+        let cache_silo_arc: Option<Arc<parking_lot::RwLock<crate::silos::cache_silo::CacheSilo>>> =
             config.storage.bitmap_path.as_ref().and_then(|bp| {
                 let silo_path = std::path::Path::new(bp).join("cache_silo");
-                match crate::cache_silo::CacheSilo::open(&silo_path) {
+                match crate::silos::cache_silo::CacheSilo::open(&silo_path) {
                     Ok(silo) => {
                         eprintln!("CacheSilo: opened at {}", silo_path.display());
                         Some(Arc::new(parking_lot::RwLock::new(silo)))
@@ -1025,7 +1025,7 @@ impl ConcurrentEngine {
             let filters_r = self.filters.read();
             let sorts_r = self.sorts.read();
             let slots_r = self.slots.read();
-            let mut silo = crate::bitmap_silo::BitmapSilo::open(bitmap_path)
+            let mut silo = crate::silos::bitmap_silo::BitmapSilo::open(bitmap_path)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
             let count = silo.save_all(&*filters_r, &*sorts_r, &*slots_r, &cursors)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all: {e}")))?;
@@ -1040,7 +1040,7 @@ impl ConcurrentEngine {
         let filters_r = self.filters.read();
         let sorts_r = self.sorts.read();
         let slots_r = self.slots.read();
-        let mut silo = crate::bitmap_silo::BitmapSilo::open(path)
+        let mut silo = crate::silos::bitmap_silo::BitmapSilo::open(path)
             .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
         silo.save_all(&*filters_r, &*sorts_r, &*slots_r, &cursors)
             .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all: {e}")))?;
@@ -1075,14 +1075,14 @@ impl ConcurrentEngine {
             let filters_r = self.filters.read();
             let sorts_r = self.sorts.read();
             let new_slots = slots_r.clone();
-            let mut new_filters = crate::filter::FilterIndex::new();
+            let mut new_filters = crate::engine::filter::FilterIndex::new();
             for fc in &self.config.filter_fields {
                 new_filters.add_field(fc.clone());
             }
             for fc in &self.config.filter_fields {
                 new_filters.unload_from(&*filters_r, &fc.name);
             }
-            let mut new_sorts = crate::sort::SortIndex::new();
+            let mut new_sorts = crate::engine::sort::SortIndex::new();
             for sc in &self.config.sort_fields {
                 new_sorts.add_field(sc.clone());
             }
