@@ -2320,30 +2320,22 @@ async fn handle_load(
     tokio::task::spawn_blocking(move || {
         let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
 
-        // Enter loading mode
-        engine.enter_loading_mode();
-
         match loader::load_ndjson(&engine, &schema, &path, limit, threads, chunk_size, docstore_batch_size, max_writer_threads, progress.clone()) {
             Ok(stats) => {
                 let alive;
 
                 if save_snapshot {
-                    // Combined exit-loading + save + unload: saves directly from
-                    // staging without an intermediate full publish, eliminating the
-                    // memory spike from staging.clone() at scale.
                     guard.tasks.set_saving(task_id);
 
                     let snap_start = Instant::now();
-                    if let Err(e) = engine.exit_loading_mode_and_save_unload() {
-                        eprintln!("Warning: failed to exit_loading_mode_and_save_unload: {e}");
+                    if let Err(e) = engine.save_and_unload() {
+                        eprintln!("Warning: failed to save_and_unload: {e}");
                     } else {
-                        eprintln!("exit_loading_mode_and_save_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
+                        eprintln!("save_and_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
                     }
                     // Alive bitmap is always preserved during unload
                     alive = engine.alive_count();
                 } else {
-                    // Just exit loading mode — no save needed
-                    engine.exit_loading_mode();
                     alive = engine.alive_count();
                 }
 
@@ -2356,7 +2348,6 @@ async fn handle_load(
                 guard.defuse();
             }
             Err(e) => {
-                engine.exit_loading_mode();
                 guard.tasks.set_error(task_id, e.to_string());
                 guard.defuse();
             }
@@ -2759,99 +2750,22 @@ async fn handle_documents_batch(
 }
 
 async fn handle_upsert(
-    State(state): State<SharedState>,
+    State(_state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(req): Json<UpsertRequest>,
+    Json(_req): Json<UpsertRequest>,
 ) -> impl IntoResponse {
-    let engine = {
-        let guard = state.index.lock();
-        match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => {
-                Arc::clone(&idx.engine)
-            }
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    // Get schema and dictionaries for the upsert
-    let (schema, has_lcs) = {
-        let guard = state.index.lock();
-        let idx = guard.as_ref().unwrap();
-        let has_lcs = idx.definition.data_schema.fields.iter().any(|f| f.value_type == FieldValueType::LowCardinalityString);
-        (idx.definition.data_schema.clone(), has_lcs)
-    };
-
-    // Run upserts on a blocking thread — engine.put() does sync disk I/O
-    // (docstore reads for diffing) that would starve the tokio runtime.
-    let documents = req.documents;
-    let engine_clone = Arc::clone(&engine);
-    let schema_clone = schema.clone();
-    let (upserted, errors) = tokio::task::spawn_blocking(move || {
-        let mut upserted = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-
-        for (i, doc_json) in documents.iter().enumerate() {
-            let dicts = if has_lcs { Some(engine_clone.dictionaries()) } else { None };
-            match loader::json_to_document_with_dicts(doc_json, &schema_clone, dicts) {
-                Ok((slot, doc)) => {
-                    if let Err(e) = engine_clone.put(slot, &doc) {
-                        errors.push(format!("doc[{}] id={}: {}", i, slot, e));
-                    } else {
-                        upserted += 1;
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("doc[{}]: {}", i, e));
-                }
-            }
-        }
-
-        (upserted, errors)
-    }).await.expect("spawn_blocking join");
-
-    // Set cursor if provided (after mutations are submitted to coalescer)
-    if let Some(cursor) = req.cursor {
-        engine.set_cursor(cursor.name, cursor.value);
-    }
-
-    // Rebuild reverse maps if LCS dictionaries gained new values.
-    // Ensures newly-upserted string values are reverse-mappable when serving documents.
-    // Query-time resolution already falls through to live dictionaries (no rebuild needed).
-    if has_lcs && upserted > 0 {
-        // Persist dirty dictionaries before updating reverse maps.
-        // This ensures dictionary mappings survive crashes — a doc on disk
-        // always has its integer keys resolvable via the persisted dictionary.
-        if let Err(e) = engine.persist_dirty_dictionaries() {
-            eprintln!("warning: failed to persist LCS dictionaries: {}", e);
-        }
-
-        let mut guard = state.index.lock();
-        if let Some(ref mut idx) = *guard {
-            let dicts = engine.dictionaries();
-            let reverse_maps = build_reverse_string_maps_with_dicts(&idx.definition.data_schema, Some(dicts));
-            idx.reverse_maps = Arc::new(reverse_maps);
-        }
-    }
-
-    state
-        .metrics
-        .upsert_total
-        .with_label_values(&[&name])
-        .inc_by(upserted);
-
-    if errors.is_empty() {
-        Json(serde_json::json!({"upserted": upserted})).into_response()
-    } else {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({"upserted": upserted, "errors": errors})),
-        ).into_response()
-    }
+    // Direct upsert via PUT is no longer supported. All document writes
+    // flow through the ops pipeline (POST /ops). Use the bitdex-sync
+    // sidecar to deliver writes from Postgres.
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": format!(
+                "Direct upsert is not implemented for index '{}'; all writes flow through the ops pipeline",
+                name
+            )
+        })),
+    ).into_response()
 }
 
 /// PATCH /api/indexes/{name}/documents/patch

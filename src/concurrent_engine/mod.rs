@@ -12,13 +12,12 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender};
 use roaring::RoaringBitmap;
-use crate::concurrency::InFlightTracker;
 use crate::config::Config;
 use crate::doc_format::{StoredDoc};
 use crate::doc_silo_adapter::DocSiloAdapter;
 use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, StringMaps};
-use crate::mutation::{diff_document, Document, FieldRegistry};
+use crate::mutation::FieldRegistry;
 use crate::time_buckets::TimeBucketManager;
 use crate::mutation::{MutationOp, MutationSender};
 
@@ -86,7 +85,6 @@ pub struct ConcurrentEngine {
     docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
     config: Arc<Config>,
     field_registry: FieldRegistry,
-    in_flight: InFlightTracker,
     shutdown: Arc<AtomicBool>,
     flush_handle: Option<JoinHandle<()>>,
     merge_handle: Option<JoinHandle<()>>,
@@ -213,8 +211,10 @@ impl ConcurrentEngine {
             match crate::bitmap_silo::BitmapSilo::open(bitmap_path) {
                 Ok(silo) if silo.has_data() => {
                     let t_restore = std::time::Instant::now();
-                    // Load alive bitmap + metadata (always owned — used by SlotAllocator)
-                    if let Ok(Some(alive)) = silo.load_alive() {
+                    // Load alive bitmap with pending ops applied — used by SlotAllocator.
+                    // get_alive_with_ops() reads the frozen base + scans both ops logs,
+                    // so the restored bitmap reflects all written but not yet compacted ops.
+                    if let Some(alive) = silo.get_alive_with_ops() {
                         let meta = silo.load_meta().ok().flatten();
                         let slot_counter = meta.as_ref()
                             .and_then(|m| m.get("slot_counter"))
@@ -441,7 +441,6 @@ impl ConcurrentEngine {
                 docstore,
                 config,
                 field_registry,
-                in_flight: InFlightTracker::new(),
                 shutdown,
                 flush_handle: None,
                 merge_handle: None,
@@ -908,7 +907,6 @@ impl ConcurrentEngine {
             docstore,
             config,
             field_registry,
-            in_flight: InFlightTracker::new(),
             shutdown,
             flush_handle: Some(flush_handle),
             merge_handle: Some(merge_handle),
@@ -1064,91 +1062,46 @@ impl ConcurrentEngine {
         Ok(())
     }
 
-    /// PUT(id, document) -- full replace with upsert semantics.
-    ///
-    /// 1. Mark in-flight
-    /// 2. Check alive status (lock-free snapshot)
-    /// 3. Read old doc from docstore if upsert
-    /// 4. Diff old vs new -> MutationOps
-    /// 5. Send ops to silo / coalescer channel
-    /// 6. Enqueue doc write to docstore channel (flush thread batches these)
-    /// 7. Clear in-flight
-    pub fn put(&self, id: u32, doc: &Document) -> Result<()> {
-        self.in_flight.mark_in_flight(id);
-        let result = (|| -> Result<()> {
-            let (is_upsert, was_allocated) = {
-                let slots_r = self.slots.read();
-                let alive = slots_r.is_alive(id);
-                let alloc = if !alive { slots_r.was_ever_allocated(id) } else { false };
-                (alive, alloc)
-            };
-            let old_doc = if is_upsert || was_allocated {
-                self.docstore.lock().get(id)?
-            } else {
-                None
-            };
-            let ops = diff_document(id, old_doc.as_ref(), doc, &self.config, is_upsert, &self.field_registry);
-            self.send_mutation_ops(ops)?;
-            let stored = StoredDoc {
-                fields: doc.fields.clone(),
-                schema_version: 0,
-            };
-            self.doc_tx.send((id, stored)).map_err(|_| {
-                crate::error::BitdexError::CapacityExceeded(
-                    "docstore channel disconnected".to_string(),
-                )
-            })?;
-            Ok(())
-        })();
-        self.in_flight.clear_in_flight(id);
-        result
-    }
     /// DELETE(id) -- clean delete: clear filter/sort bitmaps then alive bit.
     ///
     /// Reads the doc from the docstore to determine exactly which filter and sort
     /// bitmaps need clearing. This makes filter bitmaps always clean (no stale bits),
     /// eliminating the alive AND from the query hot path.
     pub fn delete(&self, id: u32) -> Result<()> {
-        self.in_flight.mark_in_flight(id);
-        let result = (|| -> Result<()> {
-            // Read the doc to know which bitmaps to clear
-            let old_doc = self.docstore.lock().get(id)?;
-            let mut ops = Vec::new();
-            // Generate filter/sort cleanup ops from the stored doc
-            if let Some(doc) = &old_doc {
-                for fc in &self.config.filter_fields {
-                    if let Some(val) = doc.fields.get(&fc.name) {
-                        let arc_name = self.field_registry.get(&fc.name);
-                        crate::mutation::collect_filter_remove_ops(&mut ops, &arc_name, id, val);
-                    }
+        // Read the doc to know which bitmaps to clear
+        let old_doc = self.docstore.lock().get(id)?;
+        let mut ops = Vec::new();
+        // Generate filter/sort cleanup ops from the stored doc
+        if let Some(doc) = &old_doc {
+            for fc in &self.config.filter_fields {
+                if let Some(val) = doc.fields.get(&fc.name) {
+                    let arc_name = self.field_registry.get(&fc.name);
+                    crate::mutation::collect_filter_remove_ops(&mut ops, &arc_name, id, val);
                 }
-                for sc in &self.config.sort_fields {
-                    if let Some(val) = doc.fields.get(&sc.name) {
-                        if let crate::mutation::FieldValue::Single(v) = val {
-                            if let Some(sort_val) = crate::mutation::value_to_sort_u32(v) {
-                                let arc_name = self.field_registry.get(&sc.name);
-                                let num_bits = sc.bits as usize;
-                                for bit in 0..num_bits {
-                                    if (sort_val >> bit) & 1 == 1 {
-                                        ops.push(MutationOp::SortClear {
-                                            field: arc_name.clone(),
-                                            bit_layer: bit,
-                                            slots: vec![id],
-                                        });
-                                    }
+            }
+            for sc in &self.config.sort_fields {
+                if let Some(val) = doc.fields.get(&sc.name) {
+                    if let crate::mutation::FieldValue::Single(v) = val {
+                        if let Some(sort_val) = crate::mutation::value_to_sort_u32(v) {
+                            let arc_name = self.field_registry.get(&sc.name);
+                            let num_bits = sc.bits as usize;
+                            for bit in 0..num_bits {
+                                if (sort_val >> bit) & 1 == 1 {
+                                    ops.push(MutationOp::SortClear {
+                                        field: arc_name.clone(),
+                                        bit_layer: bit,
+                                        slots: vec![id],
+                                    });
                                 }
                             }
                         }
                     }
                 }
             }
-            // Clear the alive bit last
-            ops.push(MutationOp::AliveRemove { slots: vec![id] });
-            self.send_mutation_ops(ops)?;
-            Ok(())
-        })();
-        self.in_flight.clear_in_flight(id);
-        result
+        }
+        // Clear the alive bit last
+        ops.push(MutationOp::AliveRemove { slots: vec![id] });
+        self.send_mutation_ops(ops)
     }
     /// Clone the current live state into an InnerEngine. Public API for tests and tools.
     pub fn snapshot_public(&self) -> InnerEngine {
@@ -1521,10 +1474,6 @@ impl ConcurrentEngine {
         Ok(result)
     }
 
-    /// Get a reference to the in-flight tracker.
-    pub fn in_flight(&self) -> &InFlightTracker {
-        &self.in_flight
-    }
     /// Publish a staging InnerEngine as the current live state and invalidate all caches.
     ///
     /// Called after bulk-load paths that build bitmaps offline. Takes write locks

@@ -61,10 +61,8 @@ impl ConcurrentEngine {
         };
         let (filter_arc, use_simple_sort) =
             self.resolve_filters(&executor, filters, tb_guard.as_deref(), now_unix)?;
-        let mut result =
+        let result =
             executor.execute_from_bitmap(&filter_arc, sort, limit, None, use_simple_sort)?;
-        // Post-validation against in-flight writes
-        self.post_validate(&mut result, filters, &executor)?;
         Ok(result)
     }
 
@@ -217,7 +215,6 @@ impl ConcurrentEngine {
                                 }
                             }
                         }
-                        self.post_validate(&mut result, &query.filters, &executor)?;
                         return Ok(result);
                     }
                     // Cache boundary exceeded — fall through to full recompute below.
@@ -321,7 +318,6 @@ impl ConcurrentEngine {
                         }
                     }
                 }
-                self.post_validate(&mut result, &query.filters, &executor)?;
                 return Ok(result);
             }
         }
@@ -351,7 +347,6 @@ impl ConcurrentEngine {
                 }
             }
         }
-        self.post_validate(&mut result, &query.filters, &executor)?;
         Ok(result)
     }
 
@@ -434,33 +429,4 @@ impl ConcurrentEngine {
         Ok((filter_bitmap, plan.use_simple_sort))
     }
 
-    /// Post-validate query results against in-flight writes.
-    fn post_validate(
-        &self,
-        result: &mut QueryResult,
-        filters: &[FilterClause],
-        executor: &QueryExecutor,
-    ) -> Result<()> {
-        if !self.in_flight.has_in_flight() {
-            return Ok(());
-        }
-        let overlapping = self.in_flight.find_overlapping(&result.ids);
-        if overlapping.is_empty() {
-            return Ok(());
-        }
-        // The executor holds references to the snapshot's bitmap state
-        // so we can revalidate in-flight slots.
-        let mut invalid_slots: Vec<u32> = Vec::new();
-        for &slot in &overlapping {
-            if !executor.slot_matches_filters(slot, filters)? {
-                invalid_slots.push(slot);
-            }
-        }
-        if !invalid_slots.is_empty() {
-            result
-                .ids
-                .retain(|id| !invalid_slots.contains(&(*id as u32)));
-        }
-        Ok(())
-    }
 }
