@@ -209,6 +209,36 @@ impl DocSiloAdapter {
         self.save_field_dict()
     }
 
+    /// Get all documents in a shard (treating shard_id as a slot range).
+    ///
+    /// With DataSilo, documents are stored per-slot rather than per-file-shard.
+    /// This method returns a single-element vec for the slot at `shard_id`, or an
+    /// empty vec if the slot has no document.  Callers that iterate over a range of
+    /// shard IDs therefore get one slot per call — consistent with the DataSilo model.
+    pub fn get_shard(&self, shard_id: u32) -> io::Result<Vec<(u32, StoredDoc)>> {
+        match self.get(shard_id)? {
+            Some(doc) => Ok(vec![(shard_id, doc)]),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Get all documents in a shard in packed (index-keyed) form.
+    ///
+    /// Returns `Vec<(slot_id, Vec<(field_idx, PackedValue)>)>` without converting
+    /// field indices to names.  Used by the packed-rebuild benchmark path that avoids
+    /// the `StoredDoc` HashMap allocation entirely.
+    pub fn get_shard_packed(&self, shard_id: u32) -> io::Result<Vec<(u32, Vec<(u16, PackedValue)>)>> {
+        let bytes = match self.silo.get_with_ops(shard_id) {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fields = doc_format::decode_doc_fields(&bytes)?;
+        Ok(vec![(shard_id, fields)])
+    }
+
     /// Get the data root path.
     pub fn root(&self) -> &Path {
         &self.root
