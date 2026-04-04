@@ -243,12 +243,84 @@ impl OpsLog {
                 }
                 OP_TAG_DELETE => {
                     if pos + 4 + 4 > data.len() { break; }
-                    pos += 4; // key
-                    pos += 4; // crc
-                    count += 1;
+                    let _key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let payload_end = pos;
+                    let expected_crc = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let actual_crc = crc32fast::hash(&data[entry_start..payload_end]);
+                    if actual_crc == expected_crc {
+                        count += 1;
+                    }
                 }
                 _ => {
                     // Unknown tag — skip padding
+                    while pos < data.len() && data[pos] == 0 { pos += 1; }
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Iterate over all ops (puts AND deletes) without allocating a Vec.
+    /// The callback receives full `SiloOp` values including Delete tombstones.
+    pub fn for_each_ops<F>(&self, mut f: F) -> io::Result<u64>
+    where F: FnMut(SiloOp)
+    {
+        let mmap = match &self.mmap {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+        let end = self.cursor.load(Ordering::Relaxed) as usize;
+        if end == 0 { return Ok(0); }
+
+        let data = &mmap[..end.min(mmap.len())];
+        let mut pos = 0;
+        let mut count = 0u64;
+
+        while pos < data.len() {
+            if data[pos] == 0 {
+                while pos < data.len() && data[pos] == 0 { pos += 1; }
+                continue;
+            }
+            let entry_start = pos;
+            let tag = data[pos];
+            pos += 1;
+
+            match tag {
+                OP_TAG_PUT => {
+                    if pos + 8 > data.len() { break; }
+                    let key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let value_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    if pos + value_len + 4 > data.len() { break; }
+                    let value = &data[pos..pos + value_len];
+                    pos += value_len;
+                    let payload_end = pos;
+                    let expected_crc = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let actual_crc = crc32fast::hash(&data[entry_start..payload_end]);
+                    if actual_crc == expected_crc {
+                        f(SiloOp::Put { key, value: value.to_vec() });
+                        count += 1;
+                    }
+                }
+                OP_TAG_DELETE => {
+                    if pos + 4 + 4 > data.len() { break; }
+                    let key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let payload_end = pos;
+                    let expected_crc = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let actual_crc = crc32fast::hash(&data[entry_start..payload_end]);
+                    if actual_crc == expected_crc {
+                        f(SiloOp::Delete { key });
+                        count += 1;
+                    }
+                }
+                _ => {
                     while pos < data.len() && data[pos] == 0 { pos += 1; }
                 }
             }

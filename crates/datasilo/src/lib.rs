@@ -242,6 +242,12 @@ impl DataSilo {
         log.ensure_capacity(needed)
     }
 
+    /// Delete an entry by key. Appends a Delete tombstone to the ops log.
+    /// The entry is removed from the data file on the next compaction.
+    pub fn delete(&self, key: u32) -> io::Result<()> {
+        self.ops_log.lock().append(&SiloOp::Delete { key })
+    }
+
     // ── Read path ───────────────────────────────────────────────────────
 
     /// Read an entry by key from the data file (no ops overlay).
@@ -257,21 +263,30 @@ impl DataSilo {
 
     /// Read an entry with ops overlay (returns owned data).
     /// Scans the ops log for the latest value of this key.
-    /// Use after writes when you need read-after-write consistency without compacting.
+    /// Handles both Put (update) and Delete (tombstone) ops.
     pub fn get_with_ops(&self, key: u32) -> Option<Vec<u8>> {
-        // Scan ops log for latest value of this key
+        // Scan ops log for latest op affecting this key
         let log = self.ops_log.lock();
-        let mut latest: Option<Vec<u8>> = None;
-        let _ = log.for_each(|op_key, value| {
-            if op_key == key {
-                latest = Some(value.to_vec());
+        let mut latest: Option<Option<Vec<u8>>> = None; // Some(Some(v)) = put, Some(None) = deleted
+        let _ = log.for_each_ops(|op| {
+            match op {
+                SiloOp::Put { key: k, value } if k == key => {
+                    latest = Some(Some(value));
+                }
+                SiloOp::Delete { key: k } if k == key => {
+                    latest = Some(None); // tombstone
+                }
+                _ => {}
             }
         });
-        if latest.is_some() {
-            return latest;
+        match latest {
+            Some(Some(v)) => Some(v),   // latest op was a put
+            Some(None) => None,          // latest op was a delete
+            None => {
+                // No ops for this key — fall back to data file
+                self.get(key).map(|s| s.to_vec())
+            }
         }
-        // Fall back to data file
-        self.get(key).map(|s| s.to_vec())
     }
 
     // ── Metadata ────────────────────────────────────────────────────────
@@ -308,17 +323,25 @@ impl DataSilo {
 
     /// Cold compaction: no existing data file.
     /// Scan ops log for last value per key, write data file + index.
+    /// Deleted keys (tombstones) are excluded from the output.
     fn compact_cold(&mut self) -> io::Result<u64> {
         // Collect last value per key from ops log (last-write-wins).
-        // For initial dump this holds all entries — at 109M × ~300B = ~33GB in HashMap.
-        // Acceptable on 128GB machine. For 32GB pods, would need streaming approach.
+        // Deletes remove the entry entirely (tombstone).
         let mut entries: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
         let mut max_key: u32 = 0;
         {
             let log = self.ops_log.lock();
-            log.for_each(|key, value| {
-                entries.insert(key, value.to_vec());
-                if key > max_key { max_key = key; }
+            log.for_each_ops(|op| {
+                match op {
+                    SiloOp::Put { key, value } => {
+                        entries.insert(key, value);
+                        if key > max_key { max_key = key; }
+                    }
+                    SiloOp::Delete { key } => {
+                        entries.remove(&key);
+                        if key > max_key { max_key = key; }
+                    }
+                }
             })?;
         }
         if entries.is_empty() { return Ok(0); }
@@ -407,21 +430,31 @@ impl DataSilo {
 
     /// Hot compaction: existing data file with pre-allocated buffer slots.
     /// For each op, write in-place if it fits in the allocated slot, otherwise overflow.
+    /// Delete tombstones zero out the index entry (length=0, allocated=0).
     fn compact_hot(&mut self) -> io::Result<u64> {
-        // Collect last value per key from ops log
-        let mut ops: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+        // Collect last value per key from ops log (deletes stored as None)
+        let mut ops: std::collections::HashMap<u32, Option<Vec<u8>>> = std::collections::HashMap::new();
         let mut max_key: u32 = 0;
         {
             let log = self.ops_log.lock();
-            log.for_each(|key, value| {
-                ops.insert(key, value.to_vec());
-                if key > max_key { max_key = key; }
+            log.for_each_ops(|op| {
+                match op {
+                    SiloOp::Put { key, value } => {
+                        ops.insert(key, Some(value));
+                        if key > max_key { max_key = key; }
+                    }
+                    SiloOp::Delete { key } => {
+                        ops.insert(key, None);
+                        if key > max_key { max_key = key; }
+                    }
+                }
             })?;
         }
         if ops.is_empty() { return Ok(0); }
 
         let count = ops.len() as u64;
         let mut in_place = 0u64;
+        let mut deleted = 0u64;
         let mut overflows: Vec<(u32, Vec<u8>)> = Vec::new();
 
         // Drop read-only data mmap so we can open as writable
@@ -434,8 +467,28 @@ impl DataSilo {
             unsafe { memmap2::MmapMut::map_mut(&f)? }
         };
 
-        // Phase 1: In-place updates for ops that fit in allocated space
-        for (&key, value) in &ops {
+        // Phase 1: In-place updates for ops that fit, and tombstone deletes
+        for (&key, value_opt) in &ops {
+            // Handle deletes: zero out the index entry
+            let value = match value_opt {
+                Some(v) => v,
+                None => {
+                    // Tombstone: clear the index entry so get() returns None
+                    if key < self.index_len {
+                        let zero_entry = IndexEntry { offset: 0, length: 0, allocated: 0 };
+                        if let Some(ref mut index_mmap) = self.index_mmap {
+                            let pos = key as usize * INDEX_ENTRY_SIZE;
+                            if pos + INDEX_ENTRY_SIZE <= index_mmap.len() {
+                                let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(zero_entry) };
+                                index_mmap[pos..pos + INDEX_ENTRY_SIZE].copy_from_slice(&bytes);
+                            }
+                        }
+                    }
+                    deleted += 1;
+                    continue;
+                }
+            };
+
             if key >= self.index_len {
                 overflows.push((key, value.clone()));
                 continue;
@@ -450,7 +503,6 @@ impl DataSilo {
                 let start = entry.offset as usize;
                 if start + value.len() <= data_mmap_mut.len() {
                     data_mmap_mut[start..start + value.len()].copy_from_slice(value);
-                    // Update length in index (allocated stays the same)
                     let new_entry = IndexEntry {
                         offset: entry.offset,
                         length: value.len() as u32,
@@ -731,5 +783,74 @@ mod tests {
         assert_eq!(silo.get(1).unwrap(), b"a");
         assert_eq!(silo.get(2).unwrap(), b"b");
         assert_eq!(silo.get(3).unwrap(), b"c");
+    }
+
+    #[test]
+    fn test_delete_cold_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
+
+        silo.append_op(1, b"hello").unwrap();
+        silo.append_op(2, b"world").unwrap();
+        silo.append_op(3, b"foo").unwrap();
+        silo.delete(2).unwrap();
+        silo.compact().unwrap();
+
+        // Key 1 and 3 should exist, key 2 should be deleted
+        assert_eq!(silo.get(1).unwrap(), b"hello");
+        assert!(silo.get(2).is_none(), "deleted key should return None");
+        assert_eq!(silo.get(3).unwrap(), b"foo");
+    }
+
+    #[test]
+    fn test_delete_hot_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
+
+        // Phase 1: write and compact (cold)
+        silo.append_op(1, b"hello").unwrap();
+        silo.append_op(2, b"world").unwrap();
+        silo.compact().unwrap();
+        assert_eq!(silo.get(2).unwrap(), b"world");
+
+        // Phase 2: delete via ops, compact again (hot)
+        silo.delete(2).unwrap();
+        silo.compact().unwrap();
+
+        assert_eq!(silo.get(1).unwrap(), b"hello");
+        assert!(silo.get(2).is_none(), "deleted key should return None after hot compact");
+    }
+
+    #[test]
+    fn test_delete_get_with_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
+
+        // Write and compact so data is in the data file
+        silo.append_op(1, b"hello").unwrap();
+        silo.compact().unwrap();
+        assert_eq!(silo.get(1).unwrap(), b"hello");
+
+        // Delete via ops (not yet compacted)
+        silo.delete(1).unwrap();
+
+        // get() still returns data from the data file (no ops overlay)
+        assert_eq!(silo.get(1).unwrap(), b"hello");
+        // get_with_ops() should return None (delete tombstone in ops)
+        assert!(silo.get_with_ops(1).is_none(), "get_with_ops should respect delete tombstone");
+    }
+
+    #[test]
+    fn test_delete_then_reinsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
+
+        silo.append_op(1, b"original").unwrap();
+        silo.delete(1).unwrap();
+        silo.append_op(1, b"reinserted").unwrap();
+        silo.compact().unwrap();
+
+        // Last write wins — reinsert after delete
+        assert_eq!(silo.get(1).unwrap(), b"reinserted");
     }
 }
