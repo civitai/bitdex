@@ -53,6 +53,9 @@ tar = "0.4"
 # Parallel sort / iteration
 rayon = "1"
 
+# Fast hash map (AES-NI accelerated, drop-in HashMap/HashSet replacement)
+ahash = "0.8"
+
 # Allocator (handles concurrent allocation much better than Windows CRT)
 rpmalloc = "0.2"
 
@@ -148,6 +151,10 @@ harness = false
 
 [[bench]]
 name = "bound_store_bench"
+harness = false
+
+[[bench]]
+name = "parse_alloc_bench"
 harness = false
 
 [[bin]]

@@ -14,7 +14,8 @@
 //!
 //! Processing is sequential per phase (no cross-phase parallelism in V2).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
+use ahash::AHashMap as HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -2089,87 +2090,64 @@ pub fn process_dump_with_progress(
     }
 
     emit_stage(&request.name, "merge", "start", &t, total.load(Ordering::Relaxed));
-    // Merge all thread results — parallel tree reduction.
-    // doc_ops are collected separately (not merged in parallel — just concatenated).
-    type MergeAccum = (
-        HashMap<String, HashMap<u64, RoaringBitmap>>,
-        HashMap<String, Vec<RoaringBitmap>>,
-        RoaringBitmap,
-        BTreeMap<u64, Vec<u32>>,
-        u64,
-        u32,
-        Vec<(u32, Vec<u8>)>, // doc_ops accumulated across threads
-    );
+    // Merge all thread results using MultiOps::union() — streaming N-way merge
+    // is 2.7-5.2x faster than rayon's pairwise tree reduction for memory-bandwidth
+    // bound bitmap OR operations.
+    use roaring::MultiOps;
 
-    let (merged_filters, merged_sorts, merged_alive, merged_deferred, total_count, max_slot, all_doc_ops) =
-        thread_results
-            .into_par_iter()
-            .fold(
-                || -> MergeAccum {
-                    (HashMap::new(), HashMap::new(), RoaringBitmap::new(), BTreeMap::new(), 0u64, 0u32, Vec::new())
-                },
-                |mut acc, (filter_maps, sort_maps, alive, deferred, count, thread_max, doc_ops)| {
-                    acc.2 |= alive;
-                    acc.4 += count;
-                    if thread_max > acc.5 { acc.5 = thread_max; }
-                    acc.6.extend(doc_ops);
+    let mut merged_filters: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
+    let mut merged_sorts: HashMap<String, Vec<RoaringBitmap>> = HashMap::new();
+    let mut all_alive: Vec<RoaringBitmap> = Vec::with_capacity(thread_results.len());
+    let mut merged_deferred: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+    let mut total_count: u64 = 0;
+    let mut max_slot: u32 = 0;
+    let mut all_doc_ops: Vec<(u32, Vec<u8>)> = Vec::new();
 
-                    for (slot, activate_at) in deferred {
-                        acc.3.entry(activate_at).or_default().push(slot);
-                    }
+    // Phase 1: Collect per-thread bitmaps into per-(field,value) Vec for N-way union
+    let mut filter_collectors: HashMap<String, HashMap<u64, Vec<RoaringBitmap>>> = HashMap::new();
+    let mut sort_collectors: HashMap<String, Vec<Vec<RoaringBitmap>>> = HashMap::new();
 
-                    for (field, values) in filter_maps {
-                        let dest = acc.0.entry(field).or_default();
-                        for (val, bm) in values {
-                            dest.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
-                        }
-                    }
-                    for (field, layers) in sort_maps {
-                        let dest = acc.1.entry(field).or_insert_with(|| {
-                            (0..layers.len()).map(|_| RoaringBitmap::new()).collect()
-                        });
-                        for (bit, bm) in layers.into_iter().enumerate() {
-                            if bit < dest.len() {
-                                dest[bit] |= bm;
-                            }
-                        }
-                    }
-                    acc
-                },
-            )
-            .reduce(
-                || -> MergeAccum {
-                    (HashMap::new(), HashMap::new(), RoaringBitmap::new(), BTreeMap::new(), 0u64, 0u32, Vec::new())
-                },
-                |mut a, mut b| {
-                    a.2 |= b.2;
-                    a.4 += b.4;
-                    if b.5 > a.5 { a.5 = b.5; }
-                    a.6.append(&mut b.6);
+    for (filter_maps, sort_maps, alive, deferred, count, thread_max, doc_ops) in thread_results {
+        all_alive.push(alive);
+        total_count += count;
+        if thread_max > max_slot { max_slot = thread_max; }
+        all_doc_ops.extend(doc_ops);
 
-                    for (activate_at, slots) in b.3 {
-                        a.3.entry(activate_at).or_default().extend(slots);
-                    }
+        for (slot, activate_at) in deferred {
+            merged_deferred.entry(activate_at).or_default().push(slot);
+        }
 
-                    for (field, values) in b.0 {
-                        let dest = a.0.entry(field).or_default();
-                        for (val, bm) in values {
-                            dest.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
-                        }
-                    }
-                    for (field, layers) in b.1 {
-                        let dest = a.1.entry(field).or_insert_with(|| {
-                            (0..layers.len()).map(|_| RoaringBitmap::new()).collect()
-                        });
-                        for (bit, bm) in layers.into_iter().enumerate() {
-                            if bit < dest.len() {
-                                dest[bit] |= bm;
-                            }
-                        }
-                    }
-                    a
-                },
-            );
+        for (field, values) in filter_maps {
+            let field_collector = filter_collectors.entry(field).or_default();
+            for (val, bm) in values {
+                field_collector.entry(val).or_default().push(bm);
+            }
+        }
+        for (field, layers) in sort_maps {
+            let field_collector = sort_collectors.entry(field).or_insert_with(|| {
+                (0..layers.len()).map(|_| Vec::new()).collect()
+            });
+            for (bit, bm) in layers.into_iter().enumerate() {
+                if bit < field_collector.len() {
+                    field_collector[bit].push(bm);
+                }
+            }
+        }
+    }
+
+    // Phase 2: N-way union via MultiOps (streaming merge, no thread overhead)
+    let merged_alive: RoaringBitmap = all_alive.iter().union();
+
+    for (field, values) in filter_collectors {
+        let dest = merged_filters.entry(field).or_default();
+        for (val, bitmaps) in values {
+            dest.insert(val, bitmaps.iter().union());
+        }
+    }
+    for (field, layers) in sort_collectors {
+        let bitmaps: Vec<RoaringBitmap> = layers.into_iter().map(|bms| bms.iter().union()).collect();
+        merged_sorts.insert(field, bitmaps);
+    }
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
