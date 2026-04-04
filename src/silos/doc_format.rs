@@ -544,6 +544,17 @@ pub fn encode_merge_fields(slot: u32, fields: &[(u16, PackedValue)]) -> Vec<u8> 
     buf
 }
 
+/// Encode a Merge op into a caller-provided buffer. Zero allocation.
+pub fn encode_merge_fields_into(slot: u32, fields: &[(u16, PackedValue)], buf: &mut Vec<u8>) {
+    buf.clear();
+    buf.push(OP_TAG_MERGE);
+    buf.extend_from_slice(&slot.to_le_bytes());
+    buf.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+    for (field_idx, value) in fields {
+        encode_field_pair(*field_idx, value, buf);
+    }
+}
+
 /// Encode a Create op for a slot with given field tuples.
 pub fn encode_create_fields(slot: u32, fields: &[(u16, PackedValue)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(7 + fields.len() * 12);

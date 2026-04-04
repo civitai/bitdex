@@ -127,6 +127,15 @@ impl ParallelOpsWriter {
         self.write_frame(&frame_buf, local_cursor, local_end)
     }
 
+    /// Write a Put op reusing a caller-provided buffer. Zero allocation per call.
+    /// The buffer is cleared and reused — caller keeps it across rows.
+    #[inline]
+    pub fn write_put_reuse(&self, key: u32, value: &[u8], buf: &mut Vec<u8>, local_cursor: &mut usize, local_end: &mut usize) -> bool {
+        buf.clear();
+        OpsLog::encode_put_into(buf, key, value);
+        self.write_frame(buf, local_cursor, local_end)
+    }
+
     /// Write a pre-encoded frame directly to the mmap. Thread-safe, lock-free.
     #[inline]
     pub fn write_frame(&self, frame: &[u8], local_cursor: &mut usize, local_end: &mut usize) -> bool {

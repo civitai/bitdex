@@ -1602,6 +1602,9 @@ pub fn process_dump_with_progress(
             // Thread-local cursor for parallel ops writer (1MB regions)
             let mut ops_local_cursor: usize = 0;
             let mut ops_local_end: usize = 0;
+            // Thread-local scratch buffers for zero-alloc doc encoding + framing
+            let mut doc_encode_buf: Vec<u8> = Vec::with_capacity(512);
+            let mut frame_buf: Vec<u8> = Vec::with_capacity(512);
             let mut count = 0u64;
             let mut max_slot: u32 = 0;
             let mut line_start = 0;
@@ -1737,6 +1740,7 @@ pub fn process_dump_with_progress(
                                 // but skip all bitmap operations.
                                 if !is_multi_value_only {
                                     let pw_arg = pw_ref.as_ref().map(|pw| (pw.as_ref(), &mut ops_local_cursor, &mut ops_local_end));
+                                    let scratch = if pw_arg.is_some() { Some((&mut doc_encode_buf, &mut frame_buf)) } else { None };
                                     collect_doc_op(
                                         &row,
                                         &enriched,
@@ -1750,6 +1754,7 @@ pub fn process_dump_with_progress(
                                         &config_computed_sort_vals,
                                         &mut doc_ops,
                                         pw_arg,
+                                        scratch,
                                     );
                                 }
                                 deferred.push((slot, pub_secs));
@@ -2001,6 +2006,7 @@ pub fn process_dump_with_progress(
                 // Write doc op — directly to mmap if parallel writer available, else collect.
                 if !is_multi_value_only {
                     let pw_arg = pw_ref.as_ref().map(|pw| (pw.as_ref(), &mut ops_local_cursor, &mut ops_local_end));
+                    let scratch = if pw_arg.is_some() { Some((&mut doc_encode_buf, &mut frame_buf)) } else { None };
                     collect_doc_op(
                         &row,
                         &enriched,
@@ -2014,6 +2020,7 @@ pub fn process_dump_with_progress(
                         &config_computed_sort_vals,
                         &mut doc_ops,
                         pw_arg,
+                        scratch,
                     );
                 }
 
@@ -2269,6 +2276,7 @@ fn collect_doc_op(
     extra_i64_fields: &[(&str, i64)],
     doc_ops: &mut Vec<(u32, Vec<u8>)>,
     pw: Option<(&datasilo::ParallelOpsWriter, &mut usize, &mut usize)>,
+    scratch: Option<(&mut Vec<u8>, &mut Vec<u8>)>, // (doc_encode_buf, frame_buf) for zero-alloc pw path
 ) {
     // Build skip set: fields provided by extra_i64_fields (config-computed sort values
     // like sortAt = GREATEST) take priority over direct/enriched/computed writes.
@@ -2368,10 +2376,12 @@ fn collect_doc_op(
     }
 
     if !fields.is_empty() {
-        let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
-        if let Some((writer, local_cursor, local_end)) = pw {
-            writer.write_put(slot, &bytes, local_cursor, local_end);
+        if let (Some((writer, local_cursor, local_end)), Some((doc_buf, frame_buf))) = (pw, scratch) {
+            // Zero-alloc path: reuse thread-local buffers
+            crate::silos::doc_format::encode_merge_fields_into(slot, &fields, doc_buf);
+            writer.write_put_reuse(slot, doc_buf, frame_buf, local_cursor, local_end);
         } else {
+            let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
             doc_ops.push((slot, bytes));
         }
     }
@@ -2893,7 +2903,7 @@ mod tests {
             &row, &enriched, &computed_defs, &indexed_fields, col_idx,
             1, &request_fields, &field_idx,
             &boolean_fields, &extra_i64,
-            &mut doc_ops, None,
+            &mut doc_ops, None, None,
         );
         // Should have produced one doc op for slot 1
         assert_eq!(doc_ops.len(), 1);
@@ -2927,7 +2937,7 @@ mod tests {
             &row, &enriched, &computed_defs, &indexed_fields, col_idx,
             1, &request_fields, &field_idx,
             &boolean_fields, &extra_i64,
-            &mut doc_ops, None,
+            &mut doc_ops, None, None,
         );
         // Should have produced one doc op for slot 1 (userId + sortAt)
         assert_eq!(doc_ops.len(), 1);
