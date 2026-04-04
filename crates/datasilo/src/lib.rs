@@ -22,7 +22,7 @@ use rayon::prelude::*;
 mod ops_log;
 pub mod hash_index;
 
-pub use ops_log::{SiloOp, OpsLog};
+pub use ops_log::{SiloOp, SiloOpRef, OpsLog};
 pub use hash_index::HashIndex;
 
 // ---------------------------------------------------------------------------
@@ -571,19 +571,20 @@ impl DataSilo {
     /// Deleted keys (tombstones) are excluded from the output.
     /// `frozen_is_b`: true = ops_b is frozen, false = ops_a is frozen.
     fn compact_cold_from(&mut self, frozen_is_b: bool) -> io::Result<u64> {
-        // Collect last value per key from frozen ops log (last-write-wins).
-        // Deletes remove the entry entirely (tombstone).
-        let mut entries: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+        // Zero-copy scan: collect (key → mmap_offset, value_len) instead of copying values.
+        // LWW dedup: last Put wins, Delete removes.
+        // Values stay in the source mmap until the write phase reads them directly.
+        let mut entries: std::collections::HashMap<u32, (usize, usize)> = std::collections::HashMap::new();
         let mut max_key: u32 = 0;
         {
             let log = if frozen_is_b { self.ops_b.lock() } else { self.ops_a.lock() };
-            log.for_each_ops(|op| {
+            log.for_each_ops_ref(|op| {
                 match op {
-                    SiloOp::Put { key, value } => {
-                        entries.insert(key, value);
+                    SiloOpRef::Put { key, offset, len } => {
+                        entries.insert(key, (offset, len));
                         if key > max_key { max_key = key; }
                     }
-                    SiloOp::Delete { key } => {
+                    SiloOpRef::Delete { key } => {
                         entries.remove(&key);
                         if key > max_key { max_key = key; }
                     }
@@ -597,10 +598,6 @@ impl DataSilo {
         let buffer_ratio = self.config.buffer_ratio;
         let min_entry_size = self.config.min_entry_size;
 
-        // Drop old mmaps before writing
-        self.index_mmap = None;
-        self.data_mmap = None;
-
         // Sort keys and compute per-entry layout (offsets must be sequential)
         let mut keys: Vec<u32> = entries.keys().copied().collect();
         keys.sort_unstable();
@@ -608,21 +605,35 @@ impl DataSilo {
         // Phase 1: Compute entry layouts — offset, length, allocated (sequential)
         struct EntryLayout { key: u32, offset: u64, length: u32, allocated: u32 }
         let mut layouts: Vec<EntryLayout> = Vec::with_capacity(keys.len());
-        let mut offset: u64 = 0;
+        let mut data_offset: u64 = 0;
         for &key in &keys {
             if align > 1 {
-                offset = (offset + align - 1) & !(align - 1);
+                data_offset = (data_offset + align - 1) & !(align - 1);
             }
-            let len = entries[&key].len() as u32;
-            let mut allocated = ((len as f32 * buffer_ratio).ceil() as u32)
+            let (_, len) = entries[&key];
+            let len32 = len as u32;
+            let mut allocated = ((len32 as f32 * buffer_ratio).ceil() as u32)
                 .max(min_entry_size);
             if align > 1 {
                 allocated = ((allocated as u64 + align - 1) & !(align - 1)) as u32;
             }
-            layouts.push(EntryLayout { key, offset, length: len, allocated });
-            offset += allocated as u64;
+            layouts.push(EntryLayout { key, offset: data_offset, length: len32, allocated });
+            data_offset += allocated as u64;
         }
-        let total_data_size = offset;
+        let total_data_size = data_offset;
+
+        // Get pointer to source mmap for zero-copy reads during write phase
+        let source_mmap_ptr: usize = {
+            let log = if frozen_is_b { self.ops_b.lock() } else { self.ops_a.lock() };
+            match log.mmap_data() {
+                Some(data) => data.as_ptr() as usize,
+                None => return Err(io::Error::new(io::ErrorKind::Other, "source mmap unavailable")),
+            }
+        };
+
+        // Drop old mmaps before writing
+        self.index_mmap = None;
+        self.data_mmap = None;
 
         // Phase 2: Pre-allocate data file + index as mmap
         let data_path = self.path.join("data.bin");
@@ -630,7 +641,6 @@ impl DataSilo {
             .create(true).read(true).write(true).truncate(true).open(&data_path)?;
         data_file.set_len(total_data_size)?;
         let mut data_mmap = unsafe { memmap2::MmapMut::map_mut(&data_file)? };
-        // Sequential hint: bulk write pass reads/writes monotonically increasing offsets.
         #[cfg(unix)] let _ = data_mmap.advise(memmap2::Advice::Sequential);
 
         let index_count = max_key as usize + 1;
@@ -641,23 +651,21 @@ impl DataSilo {
         let mut index_mmap = unsafe { memmap2::MmapMut::map_mut(&index_file)? };
 
         // Phase 3: Write entries to mmap (parallel memcpy via rayon)
-        // Each entry writes to a pre-computed offset — no overlap, safe for parallel.
-        // Store pointers as usize to satisfy Send+Sync for rayon closures.
-        // Safety: each layout targets a unique, non-overlapping region in the mmap.
+        // Zero-copy: reads value bytes directly from source ops log mmap.
         let data_base = data_mmap.as_mut_ptr() as usize;
         let index_base = index_mmap.as_mut_ptr() as usize;
         let data_mmap_len = data_mmap.len();
         let index_mmap_len = index_mmap.len();
 
         layouts.par_iter().for_each(|layout| {
-            let value = &entries[&layout.key];
+            let (src_offset, src_len) = entries[&layout.key];
             let start = layout.offset as usize;
-            if start + value.len() <= data_mmap_len {
+            if start + src_len <= data_mmap_len {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        value.as_ptr(),
+                        (source_mmap_ptr + src_offset) as *const u8,
                         (data_base + start) as *mut u8,
-                        value.len(),
+                        src_len,
                     );
                 }
             }
@@ -687,13 +695,13 @@ impl DataSilo {
         self.index_mmap = Some(index_mmap);
         self.index_len = index_count as u32;
         self.load_data()?;
-        self.data_len = offset;
+        self.data_len = total_data_size;
         self.dead_bytes.store(0, Ordering::Relaxed); // full rewrite = no dead space
 
         // NOTE: caller (compact()) truncates the frozen log after this returns.
 
         eprintln!("DataSilo: cold compacted {} entries, {:.1}MB data, {:.1}MB index",
-            count, offset as f64 / 1e6,
+            count, total_data_size as f64 / 1e6,
             (index_count * INDEX_ENTRY_SIZE) as f64 / 1e6);
         Ok(count)
     }

@@ -572,7 +572,6 @@ fn load_records(path: &PathBuf, limit: usize, remap_ids: bool) -> Vec<(u32, Docu
 fn print_bitmap_memory(engine: &ConcurrentEngine) {
     let (slot_bytes, filter_bytes, sort_bytes, _cache_entries, cache_bytes, filter_details, sort_details) =
         engine.bitmap_memory_report();
-    let uc = engine.unified_cache_stats();
     let total = slot_bytes + filter_bytes + sort_bytes + cache_bytes;
     println!("--- Bitmap Memory (pure Bitdex, excludes docstore/allocator) ---");
     println!("  Slots (alive+clean):  {:>10}", format_bytes(slot_bytes as u64));
@@ -584,8 +583,7 @@ fn print_bitmap_memory(engine: &ConcurrentEngine) {
     for (name, bytes) in &sort_details {
         println!("    {:<22}              {:>10}", name, format_bytes(*bytes as u64));
     }
-    println!("  Unified cache:        {:>10}  ({} entries, {} hits, {} misses)",
-        format_bytes(uc.memory_bytes as u64), uc.entries, uc.hits, uc.misses);
+    println!("  Cache (on-disk silo):  {:>10}", format_bytes(cache_bytes as u64));
     println!("  ----------------------------------------");
     println!("  Total bitmap memory:  {:>10}", format_bytes(total as u64));
     println!();
@@ -1079,7 +1077,7 @@ fn main() {
         // -------------------------------------------------------------------
         println!("--- Phase 5b: Unified Cache Effectiveness (cold vs warm) ---");
         println!();
-        engine.clear_unified_cache();
+        engine.clear_cache();
         struct BoundTestSpec {
             name: &'static str,
             filters: Vec<FilterClause>,
@@ -1149,12 +1147,7 @@ fn main() {
                 bt.name, cold_ms, warm_stats.p50_ms, warm_stats.p95_ms, speedup);
         }
         println!();
-        // Report unified cache stats after effectiveness test
-        {
-            let uc = engine.unified_cache_stats();
-            println!("  Unified cache after effectiveness test: {} entries, {} hits, {} misses",
-                uc.entries, uc.hits, uc.misses);
-        }
+        // Cache stats removed — CacheSilo has no in-memory stats tracking
         println!();
         // -------------------------------------------------------------------
         // Phase 5c: Deep Pagination Benchmark
@@ -1214,13 +1207,7 @@ fn main() {
             }
         }
         drop(snap);
-        // Report unified cache stats after pagination
-        {
-            let uc = engine.unified_cache_stats();
-            println!();
-            println!("  Unified cache after pagination: {} entries, {} hits, {} misses",
-                uc.entries, uc.hits, uc.misses);
-        }
+        // Cache stats removed — CacheSilo has no in-memory stats tracking
         println!();
     }
     // -----------------------------------------------------------------------

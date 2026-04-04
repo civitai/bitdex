@@ -19,6 +19,7 @@ pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "de
 simd = ["roaring/simd"]
 heap-prof = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 serde_yaml = ["dep:serde_yaml"]
+dump-timing = []
 
 [dependencies]
 # Bitmap indexes (frozen-mmap-support fork with FrozenRoaringBitmap)

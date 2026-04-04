@@ -2896,19 +2896,6 @@ async fn handle_stats(
     let (slot_bytes, filter_bytes, sort_bytes) = tokio::task::spawn_blocking(move || {
         engine2.bitmap_memory_totals()
     }).await.unwrap_or((0, 0, 0));
-    let uc = engine.unified_cache_stats();
-    let entries: Vec<serde_json::Value> = engine.unified_cache_entry_details().into_iter().map(|e| {
-        serde_json::json!({
-            "sort_field": e.sort_field,
-            "direction": e.direction,
-            "filter_count": e.filter_count,
-            "cardinality": e.cardinality,
-            "capacity": e.capacity,
-            "max_capacity": e.max_capacity,
-            "has_more": e.has_more,
-            "min_tracked_value": e.min_tracked_value,
-        })
-    }).collect();
     Json(serde_json::json!({
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
@@ -2916,18 +2903,6 @@ async fn handle_stats(
         "slot_bitmap_bytes": slot_bytes,
         "filter_bitmap_bytes": filter_bytes,
         "sort_bitmap_bytes": sort_bytes,
-        "unified_cache_entries": uc.entries,
-        "unified_cache_hits": uc.hits,
-        "unified_cache_misses": uc.misses,
-        "unified_cache_bytes": uc.memory_bytes,
-        "unified_cache_meta_entries": uc.meta_index_entries,
-        "unified_cache_meta_bytes": uc.meta_index_bytes,
-        "unified_cache_persistence_enabled": uc.persistence_enabled,
-        "unified_cache_tombstones": uc.tombstone_count,
-        "unified_cache_pending_shards": uc.pending_shard_count,
-        "unified_cache_dirty_shards": uc.dirty_shard_count,
-        "unified_cache_meta_dirty": uc.meta_dirty,
-        "unified_cache_entry_details": entries,
         "queries_in_flight": state.queries_in_flight.load(Ordering::Relaxed),
         "queries_in_flight_peak": state.queries_in_flight_peak.load(Ordering::Relaxed),
         "queries_rejected": state.metrics.queries_rejected_total.get(),
@@ -2953,7 +2928,7 @@ async fn handle_clear_cache(
         }
     };
 
-    engine.clear_unified_cache();
+    engine.clear_cache();
     Json(serde_json::json!({"cleared": true, "scope": "ram_only"})).into_response()
 }
 
@@ -3873,8 +3848,7 @@ async fn handle_debug_memory(
         if let Some(idx) = guard.as_ref() {
             let engine = Arc::clone(&idx.engine);
             let name = idx.definition.name.clone();
-            let uc = engine.unified_cache_stats();
-            (Some(engine), name, uc.memory_bytes as u64)
+            (Some(engine), name, 0u64)
         } else {
             (None, String::new(), 0)
         }
@@ -4069,52 +4043,8 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(engine.slot_counter() as i64);
 
-            // Cache gauges
-            let t0 = std::time::Instant::now();
-            let uc = engine.unified_cache_stats();
-            let t_cache_stats = t0.elapsed();
-            m.cache_entries
-                .with_label_values(&[name])
-                .set(uc.entries as i64);
-            m.cache_bytes
-                .with_label_values(&[name])
-                .set(uc.memory_bytes as i64);
-            m.cache_hits_total
-                .with_label_values(&[name])
-                .set(uc.hits as i64);
-            m.cache_misses_total
-                .with_label_values(&[name])
-                .set(uc.misses as i64);
-            m.cache_inserts_total
-                .with_label_values(&[name])
-                .set(uc.inserts as i64);
-            m.cache_updates_total
-                .with_label_values(&[name])
-                .set(uc.updates as i64);
-            m.cache_evictions_total
-                .with_label_values(&[name])
-                .set(uc.evictions as i64);
-            m.cache_invalidations_total
-                .with_label_values(&[name])
-                .set(uc.invalidations as i64);
-            m.cache_entries_initial
-                .with_label_values(&[name])
-                .set(uc.entries_initial as i64);
-            m.cache_entries_expanded
-                .with_label_values(&[name])
-                .set(uc.entries_expanded as i64);
-            m.cache_extensions_total
-                .with_label_values(&[name])
-                .set(uc.extensions as i64);
-            m.cache_wall_hits_total
-                .with_label_values(&[name])
-                .set(uc.wall_hits as i64);
-            m.cache_prefetch_total
-                .with_label_values(&[name])
-                .set(uc.prefetches as i64);
-            m.cache_silo_hits_total
-                .with_label_values(&[name])
-                .set(uc.silo_hits as i64);
+            // Cache gauges removed — CacheSilo has no in-memory stats tracking.
+            // Cache hit/miss counts tracked separately in query path metrics.
 
             // Per-field bitmap memory gauges removed: BitmapSilo uses mmap, not heap bitmaps.
             // The old bitmap_memory_cache scanner was removed along with lazy loading.
@@ -4151,8 +4081,7 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             // Phase 2.5: Flush queue depth
             m.flush_queue_depth.set(engine.flush_queue_depth() as i64);
 
-            eprintln!("[metrics-timing] cache_stats={:?} total={:?}",
-                t_cache_stats, metrics_start.elapsed());
+            eprintln!("[metrics-timing] total={:?}", metrics_start.elapsed());
         }
     }
 

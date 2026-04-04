@@ -112,45 +112,7 @@ pub struct ConcurrentEngine {
     pub(crate) compaction_skipped: Arc<AtomicU64>,
 }
 
-/// Stub cache statistics returned by unified_cache_stats().
-/// CacheSilo has no in-memory entry tracking — all persistence is on disk.
-#[derive(Debug, Default, Clone)]
-pub struct CacheStats {
-    pub entries: usize,
-    pub hits: usize,
-    pub misses: usize,
-    pub memory_bytes: usize,
-    pub meta_index_entries: usize,
-    pub meta_index_bytes: usize,
-    pub persistence_enabled: bool,
-    pub tombstone_count: usize,
-    pub pending_shard_count: usize,
-    pub dirty_shard_count: usize,
-    pub meta_dirty: bool,
-    pub inserts: usize,
-    pub updates: usize,
-    pub evictions: usize,
-    pub invalidations: usize,
-    pub entries_initial: usize,
-    pub entries_expanded: usize,
-    pub extensions: usize,
-    pub wall_hits: usize,
-    pub prefetches: usize,
-    pub silo_hits: usize,
-}
-
-/// Stub per-entry cache detail returned by unified_cache_entry_details().
-#[derive(Debug, Clone)]
-pub struct CacheEntryDetail {
-    pub sort_field: String,
-    pub direction: String,
-    pub filter_count: usize,
-    pub cardinality: usize,
-    pub capacity: usize,
-    pub max_capacity: usize,
-    pub has_more: bool,
-    pub min_tracked_value: u32,
-}
+// CacheStats and CacheEntryDetail stubs removed — CacheSilo has no in-memory entry tracking.
 
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
@@ -863,14 +825,6 @@ impl ConcurrentEngine {
             .collect();
         (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details)
     }
-    /// Return stub cache stats (CacheSilo has no in-memory entry tracking).
-    pub fn unified_cache_stats(&self) -> CacheStats {
-        CacheStats::default()
-    }
-    /// Return stub per-entry cache details (CacheSilo has no in-memory entry tracking).
-    pub fn unified_cache_entry_details(&self) -> Vec<CacheEntryDetail> {
-        Vec::new()
-    }
     /// Rebuild all time bucket bitmaps from scratch by scanning the sort field
     /// for all alive slots. Use after a bulk dump or when buckets are empty/stale.
     /// Returns (bucket_count, total_slots_scanned) or an error.
@@ -951,17 +905,16 @@ impl ConcurrentEngine {
         }
     }
     /// Clear all CacheSilo entries. Stale entries will be recomputed on next query miss.
-    pub fn clear_unified_cache(&self) {
+    pub fn clear_cache(&self) {
         if let Some(ref silo_arc) = self.cache_silo {
-            // Compact silo by truncating ops log — simplest way to drop all entries.
             if let Err(e) = silo_arc.write().compact() {
-                eprintln!("clear_unified_cache: compact error: {e}");
+                eprintln!("clear_cache: compact error: {e}");
             }
         }
     }
     /// Purge the CacheSilo: entries are recomputed on next query miss.
     pub fn purge_bounds(&self) -> crate::error::Result<()> {
-        self.clear_unified_cache();
+        self.clear_cache();
         eprintln!("purge_bounds: cleared CacheSilo");
         Ok(())
     }
@@ -1116,7 +1069,7 @@ impl ConcurrentEngine {
     }
     fn invalidate_all_caches(&self) {
         // CacheSilo entries become stale after bulk loads; they'll be recomputed on miss.
-        // Full purge via clear_unified_cache() is available if needed.
+        // Full purge via clear_cache() is available if needed.
     }
     /// Apply pre-built bitmap maps directly to a staging snapshot.
     /// Used by the fused parse+bitmap loader to skip the decompose/merge/apply pipeline.
