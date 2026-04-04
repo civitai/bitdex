@@ -2046,23 +2046,19 @@ async fn handle_patch_config(
                 if let Some(ref cache_patch) = patch.cache {
                     if let Some(v) = cache_patch.max_entries {
                         idx.definition.config.cache.max_entries = v;
-                        idx.engine.set_cache_max_entries(v);
+                        // CacheSilo handles cache sizing via compaction
                     }
                     if let Some(v) = cache_patch.max_bytes {
                         idx.definition.config.cache.max_bytes = v;
-                        idx.engine.set_cache_max_bytes(v);
                     }
                     if let Some(v) = cache_patch.initial_capacity {
                         idx.definition.config.cache.initial_capacity = v;
-                        idx.engine.set_cache_initial_capacity(v);
                     }
                     if let Some(v) = cache_patch.max_capacity {
                         idx.definition.config.cache.max_capacity = v;
-                        idx.engine.set_cache_max_capacity(v);
                     }
                     if let Some(v) = cache_patch.min_filter_size {
                         idx.definition.config.cache.min_filter_size = v;
-                        idx.engine.set_cache_min_filter_size(v);
                     }
                     if let Some(v) = cache_patch.decay_rate {
                         idx.definition.config.cache.decay_rate = v;
@@ -2081,11 +2077,9 @@ async fn handle_patch_config(
                     }
                     if let Some(v) = cache_patch.max_maintenance_work {
                         idx.definition.config.cache.max_maintenance_work = v;
-                        idx.engine.set_max_maintenance_work(v);
                     }
                     if let Some(v) = cache_patch.max_maintenance_ms {
                         idx.definition.config.cache.max_maintenance_ms = v;
-                        idx.engine.set_max_maintenance_ms(v);
                     }
                 }
 
