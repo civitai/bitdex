@@ -40,11 +40,12 @@ pub struct BitmapSilo {
     path: PathBuf,
     /// Maps logical bitmap name → silo key.
     /// Format: "filter:{field}:{value}" or "sort:{field}:{bit}" → u32
-    name_to_key: HashMap<String, u32>,
+    /// Protected by RwLock for concurrent mutation method access.
+    name_to_key: parking_lot::RwLock<HashMap<String, u32>>,
     /// Reverse mapping for loading.
-    key_to_name: HashMap<u32, String>,
+    key_to_name: parking_lot::RwLock<HashMap<u32, String>>,
     /// Next available key for new bitmaps.
-    next_key: u32,
+    next_key: std::sync::atomic::AtomicU32,
 }
 
 impl BitmapSilo {
@@ -74,25 +75,37 @@ impl BitmapSilo {
             (HashMap::new(), HashMap::new(), KEY_BITMAP_START)
         };
 
-        Ok(Self { silo, path: path.to_path_buf(), name_to_key, key_to_name, next_key })
+        Ok(Self {
+            silo,
+            path: path.to_path_buf(),
+            name_to_key: parking_lot::RwLock::new(name_to_key),
+            key_to_name: parking_lot::RwLock::new(key_to_name),
+            next_key: std::sync::atomic::AtomicU32::new(next_key),
+        })
     }
 
     /// Save the current manifest to disk.
     fn save_manifest(&self) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(&self.name_to_key)
+        let json = serde_json::to_string_pretty(&*self.name_to_key.read())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         std::fs::write(self.path.join("bitmap_manifest.json"), json)
     }
 
     /// Get or assign a silo key for a logical bitmap name.
-    fn ensure_key(&mut self, name: &str) -> u32 {
-        if let Some(&key) = self.name_to_key.get(name) {
+    fn ensure_key(&self, name: &str) -> u32 {
+        // Fast path: read lock
+        if let Some(&key) = self.name_to_key.read().get(name) {
             return key;
         }
-        let key = self.next_key;
-        self.next_key += 1;
-        self.name_to_key.insert(name.to_string(), key);
-        self.key_to_name.insert(key, name.to_string());
+        // Slow path: write lock to insert
+        let mut map = self.name_to_key.write();
+        // Double-check after acquiring write lock
+        if let Some(&key) = map.get(name) {
+            return key;
+        }
+        let key = self.next_key.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        map.insert(name.to_string(), key);
+        self.key_to_name.write().insert(key, name.to_string());
         key
     }
 
@@ -194,7 +207,11 @@ impl BitmapSilo {
     /// Load all filter bitmaps into a FilterIndex.
     pub fn load_filters(&self, filters: &mut FilterIndex) -> io::Result<u64> {
         let mut count = 0u64;
-        for (name, &key) in &self.name_to_key {
+        let entries: Vec<(String, u32)> = self.name_to_key.read()
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (name, key) in entries {
             if !name.starts_with("filter:") { continue; }
             let bytes = match self.silo.get(key) {
                 Some(b) => b,
@@ -225,7 +242,11 @@ impl BitmapSilo {
         // Collect all sort layers per field
         let mut field_layers: HashMap<String, Vec<(usize, RoaringBitmap)>> = HashMap::new();
 
-        for (name, &key) in &self.name_to_key {
+        let entries: Vec<(String, u32)> = self.name_to_key.read()
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        for (name, key) in entries {
             if !name.starts_with("sort:") { continue; }
             let bytes = match self.silo.get(key) {
                 Some(b) => b,
@@ -294,12 +315,10 @@ impl BitmapSilo {
     // ── Mutation ops (individual bit set/clear) ────────────────────────
 
     /// Set a single bit in a filter bitmap. Appends a SetBit op to the ops log.
+    /// Auto-creates the key if this is the first write for this field+value.
     pub fn filter_set(&self, field: &str, value: u64, slot: u32) -> io::Result<()> {
         let name = format!("filter:{}:{}", field, value);
-        let key = match self.name_to_key.get(&name) {
-            Some(&k) => k,
-            None => return Ok(()), // unknown bitmap — skip silently
-        };
+        let key = self.ensure_key(&name);
         let mut buf = [0u8; 5];
         buf[0] = OP_SET_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -307,12 +326,10 @@ impl BitmapSilo {
     }
 
     /// Clear a single bit in a filter bitmap. Appends a ClearBit op to the ops log.
+    /// Auto-creates the key if this is the first write for this field+value.
     pub fn filter_clear(&self, field: &str, value: u64, slot: u32) -> io::Result<()> {
         let name = format!("filter:{}:{}", field, value);
-        let key = match self.name_to_key.get(&name) {
-            Some(&k) => k,
-            None => return Ok(()),
-        };
+        let key = self.ensure_key(&name);
         let mut buf = [0u8; 5];
         buf[0] = OP_CLEAR_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -320,12 +337,10 @@ impl BitmapSilo {
     }
 
     /// Set a single bit in a sort layer bitmap.
+    /// Auto-creates the key if this is the first write for this field+bit.
     pub fn sort_set(&self, field: &str, bit_idx: usize, slot: u32) -> io::Result<()> {
         let name = format!("sort:{}:{}", field, bit_idx);
-        let key = match self.name_to_key.get(&name) {
-            Some(&k) => k,
-            None => return Ok(()),
-        };
+        let key = self.ensure_key(&name);
         let mut buf = [0u8; 5];
         buf[0] = OP_SET_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -333,12 +348,10 @@ impl BitmapSilo {
     }
 
     /// Clear a single bit in a sort layer bitmap.
+    /// Auto-creates the key if this is the first write for this field+bit.
     pub fn sort_clear(&self, field: &str, bit_idx: usize, slot: u32) -> io::Result<()> {
         let name = format!("sort:{}:{}", field, bit_idx);
-        let key = match self.name_to_key.get(&name) {
-            Some(&k) => k,
-            None => return Ok(()),
-        };
+        let key = self.ensure_key(&name);
         let mut buf = [0u8; 5];
         buf[0] = OP_CLEAR_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -367,14 +380,14 @@ impl BitmapSilo {
     /// Returns the frozen base | pending_sets - pending_clears.
     pub fn get_filter_with_ops(&self, field: &str, value: u64) -> Option<RoaringBitmap> {
         let name = format!("filter:{}:{}", field, value);
-        let key = *self.name_to_key.get(&name)?;
+        let key = *self.name_to_key.read().get(&name)?;
         self.get_bitmap_with_ops(key)
     }
 
     /// Read a sort layer bitmap with pending ops applied.
     pub fn get_sort_layer_with_ops(&self, field: &str, bit: usize) -> Option<RoaringBitmap> {
         let name = format!("sort:{}:{}", field, bit);
-        let key = *self.name_to_key.get(&name)?;
+        let key = *self.name_to_key.read().get(&name)?;
         self.get_bitmap_with_ops(key)
     }
 
@@ -441,8 +454,8 @@ impl BitmapSilo {
     /// Returns None if the field+value isn't in the silo.
     pub fn get_frozen_filter(&self, field: &str, value: u64) -> Option<FrozenRoaringBitmap<'_>> {
         let name = format!("filter:{}:{}", field, value);
-        let key = self.name_to_key.get(&name)?;
-        let bytes = self.silo.get(*key)?;
+        let key = *self.name_to_key.read().get(&name)?;
+        let bytes = self.silo.get(key)?;
         FrozenRoaringBitmap::view(bytes).ok()
     }
 
@@ -450,25 +463,28 @@ impl BitmapSilo {
     /// Returns None if the field+bit isn't in the silo.
     pub fn get_frozen_sort_layer(&self, field: &str, bit: usize) -> Option<FrozenRoaringBitmap<'_>> {
         let name = format!("sort:{}:{}", field, bit);
-        let key = self.name_to_key.get(&name)?;
-        let bytes = self.silo.get(*key)?;
+        let key = *self.name_to_key.read().get(&name)?;
+        let bytes = self.silo.get(key)?;
         FrozenRoaringBitmap::view(bytes).ok()
     }
 
     /// Iterate all filter (field_name, value) pairs stored in the silo.
-    pub fn filter_entries(&self) -> impl Iterator<Item = (&str, u64)> {
-        self.name_to_key.keys().filter_map(|name| {
-            let stripped = name.strip_prefix("filter:")?;
-            let (field, val_str) = stripped.rsplit_once(':')?;
-            let value: u64 = val_str.parse().ok()?;
-            Some((field, value))
-        })
+    pub fn filter_entries(&self) -> impl Iterator<Item = (String, u64)> {
+        let entries: Vec<(String, u64)> = self.name_to_key.read().keys()
+            .filter_map(|name| {
+                let stripped = name.strip_prefix("filter:")?;
+                let (field, val_str) = stripped.rsplit_once(':')?;
+                let value: u64 = val_str.parse().ok()?;
+                Some((field.to_string(), value))
+            })
+            .collect();
+        entries.into_iter()
     }
 
     /// Check if a sort field has any layers stored.
     pub fn has_sort_field(&self, field: &str) -> bool {
         let prefix = format!("sort:{}:", field);
-        self.name_to_key.keys().any(|k| k.starts_with(&prefix))
+        self.name_to_key.read().keys().any(|k| k.starts_with(&prefix))
     }
 
     // ── Backed loading (mark as unloaded, read frozen at query time) ──
@@ -478,8 +494,11 @@ impl BitmapSilo {
     /// to fall back to frozen reads from the silo.
     pub fn mark_filters_backed(&self, filters: &mut FilterIndex) -> u64 {
         let mut count = 0u64;
-        for (name, &_key) in &self.name_to_key {
-            if !name.starts_with("filter:") { continue; }
+        let names: Vec<String> = self.name_to_key.read().keys()
+            .filter(|n| n.starts_with("filter:"))
+            .cloned()
+            .collect();
+        for name in names {
             let parts: Vec<&str> = name.splitn(3, ':').collect();
             if parts.len() != 3 { continue; }
             let field_name = parts[1];
@@ -500,8 +519,11 @@ impl BitmapSilo {
         let mut count = 0u64;
         // Collect field names that have sort data
         let mut fields: HashMap<String, usize> = HashMap::new();
-        for name in self.name_to_key.keys() {
-            if !name.starts_with("sort:") { continue; }
+        let names: Vec<String> = self.name_to_key.read().keys()
+            .filter(|n| n.starts_with("sort:"))
+            .cloned()
+            .collect();
+        for name in names {
             let parts: Vec<&str> = name.splitn(3, ':').collect();
             if parts.len() != 3 { continue; }
             let field_name = parts[1];

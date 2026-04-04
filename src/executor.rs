@@ -153,42 +153,19 @@ impl<'a> QueryExecutor<'a> {
     /// Get the effective bitmap for a filter field+value, using frozen fallback.
     ///
     /// Get the effective bitmap for a filter field+value.
-    ///
-    /// Combines data from BitmapSilo (frozen base + silo ops) with in-memory
-    /// VersionedBitmap diffs (mutations not yet written to silo). During the
-    /// Phase 2→4 transition, both sources may have data. Once mutations go
-    /// directly to the silo ops log (Phase 2 complete), the VersionedBitmap
-    /// fallback becomes unnecessary.
+    /// Primary: BitmapSilo ops-on-read (frozen base + pending mutations from ops log).
+    /// Fallback: in-memory VersionedBitmap (for tests without a silo).
     fn get_effective_bitmap(&self, field_name: &str, value: u64) -> Option<RoaringBitmap> {
-        // Start with BitmapSilo ops-on-read (frozen base + pending silo ops)
-        let silo_bitmap = self.bitmap_silo
-            .and_then(|silo| silo.get_filter_with_ops(field_name, value));
-
-        // Check in-memory VersionedBitmap for mutations not yet in silo
-        let mem_bitmap = self.filters.get_field(field_name)
-            .and_then(|field| field.get_versioned(value))
-            .filter(|vb| vb.is_dirty()) // only if there are pending diffs
-            .map(|vb| vb.fused());
-
-        match (silo_bitmap, mem_bitmap) {
-            (Some(silo), Some(mem)) => {
-                // Union: silo has the base + silo ops, mem has in-memory diffs
-                Some(&silo | &mem)
-            }
-            (Some(silo), None) => Some(silo),
-            (None, Some(mem)) => Some(mem),
-            (None, None) => {
-                // Neither has data — try VersionedBitmap base (for tests without silo)
-                self.filters.get_field(field_name)
-                    .and_then(|field| field.get_versioned(value))
-                    .map(|vb| vb.fused())
-            }
+        // Primary: silo ops-on-read
+        if let Some(silo) = self.bitmap_silo {
+            return silo.get_filter_with_ops(field_name, value);
         }
+        // Fallback: in-memory VersionedBitmap (tests without silo)
+        self.filters.get_field(field_name)
+            .and_then(|field| field.get_versioned(value))
+            .map(|vb| vb.fused())
     }
 
-    /// AND a frozen or in-memory filter bitmap into an accumulator.
-    /// Like get_effective_bitmap but intersects with candidates directly,
-    /// avoiding full materialization when possible.
     /// AND a filter bitmap into an accumulator.
     /// Uses get_effective_bitmap then intersects with acc.
     fn and_effective_bitmap(&self, acc: &RoaringBitmap, field_name: &str, value: u64) -> Option<RoaringBitmap> {
