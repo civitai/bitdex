@@ -71,11 +71,6 @@ pub struct Metrics {
 
     // -- Tier 2: Lazy loading --
     pub lazy_load_duration_seconds: HistogramVec,
-    pub pending_fields: IntGaugeVec,
-
-    // -- Eviction --
-    pub eviction_total: IntGaugeVec,
-    pub eviction_resident_values: IntGaugeVec,
 
     // -- Shard compaction (merge thread) --
     pub compaction_total: IntCounterVec,
@@ -94,18 +89,6 @@ pub struct Metrics {
     pub queries_in_flight: IntGauge,
     pub queries_in_flight_peak: IntGauge,
     pub queries_rejected_total: IntCounter,
-
-    // -- BoundStore (cache persistence) --
-    pub boundstore_meta_entries: IntGaugeVec,
-    pub boundstore_tombstones: IntGaugeVec,
-    pub boundstore_pending_shards: IntGaugeVec,
-    pub boundstore_disk_bytes: IntGaugeVec,
-    pub boundstore_shard_loads_total: IntGaugeVec,
-    pub boundstore_tombstones_created: IntGaugeVec,
-    pub boundstore_tombstones_cleaned: IntGaugeVec,
-    pub boundstore_entries_restored: IntGaugeVec,
-    pub boundstore_bytes_written: IntGaugeVec,
-    pub boundstore_bytes_read: IntGaugeVec,
 
     // -- HTTP round-trip (wall-clock from request arrival to response sent) --
     pub http_response_seconds: HistogramVec,
@@ -418,33 +401,6 @@ impl Metrics {
         )
         .unwrap();
 
-        let pending_fields = IntGaugeVec::new(
-            Opts::new(
-                "bitdex_pending_fields",
-                "Filter+sort fields not yet loaded into memory",
-            ),
-            &["index"],
-        )
-        .unwrap();
-
-        let eviction_total = IntGaugeVec::new(
-            Opts::new(
-                "bitdex_eviction_total",
-                "Total values evicted from filter fields since startup",
-            ),
-            &["index", "field"],
-        )
-        .unwrap();
-
-        let eviction_resident_values = IntGaugeVec::new(
-            Opts::new(
-                "bitdex_eviction_resident_values",
-                "Currently resident value count for eviction-enabled fields",
-            ),
-            &["index", "field"],
-        )
-        .unwrap();
-
         // Shard compaction metrics
         let compaction_total = IntCounterVec::new(
             Opts::new("bitdex_compaction_total", "Total shard compactions performed"),
@@ -498,48 +454,6 @@ impl Metrics {
         ).unwrap();
         let queries_rejected_total = IntCounter::new(
             "bitdex_queries_rejected_total", "Queries rejected by backpressure",
-        ).unwrap();
-
-        // BoundStore metrics
-        let boundstore_meta_entries = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_meta_entries", "Cache entries registered in meta-index"),
-            &["index"],
-        ).unwrap();
-        let boundstore_tombstones = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_tombstones", "Current tombstone count"),
-            &["index"],
-        ).unwrap();
-        let boundstore_pending_shards = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_pending_shards", "Shards awaiting lazy load"),
-            &["index"],
-        ).unwrap();
-        let boundstore_disk_bytes = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_disk_bytes", "Total bounds directory size on disk"),
-            &["index"],
-        ).unwrap();
-        let boundstore_shard_loads_total = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_shard_loads_total", "Cumulative shard load events"),
-            &["index"],
-        ).unwrap();
-        let boundstore_tombstones_created = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_tombstones_created_total", "Cumulative tombstones created"),
-            &["index"],
-        ).unwrap();
-        let boundstore_tombstones_cleaned = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_tombstones_cleaned_total", "Cumulative tombstones cleaned"),
-            &["index"],
-        ).unwrap();
-        let boundstore_entries_restored = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_entries_restored_total", "Cumulative entries loaded from shard"),
-            &["index"],
-        ).unwrap();
-        let boundstore_bytes_written = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_bytes_written_total", "Cumulative bytes written to bounds"),
-            &["index"],
-        ).unwrap();
-        let boundstore_bytes_read = IntGaugeVec::new(
-            Opts::new("bitdex_boundstore_bytes_read_total", "Cumulative bytes read from bounds"),
-            &["index"],
         ).unwrap();
 
         // Phase 2.5: DocStore I/O observability
@@ -724,15 +638,6 @@ impl Metrics {
         registry
             .register(Box::new(lazy_load_duration_seconds.clone()))
             .unwrap();
-        registry
-            .register(Box::new(pending_fields.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(eviction_total.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(eviction_resident_values.clone()))
-            .unwrap();
         registry.register(Box::new(compaction_total.clone())).unwrap();
         registry.register(Box::new(compaction_duration_seconds.clone())).unwrap();
         registry.register(Box::new(compaction_skipped_total.clone())).unwrap();
@@ -745,16 +650,6 @@ impl Metrics {
         registry.register(Box::new(queries_in_flight.clone())).unwrap();
         registry.register(Box::new(queries_in_flight_peak.clone())).unwrap();
         registry.register(Box::new(queries_rejected_total.clone())).unwrap();
-        registry.register(Box::new(boundstore_meta_entries.clone())).unwrap();
-        registry.register(Box::new(boundstore_tombstones.clone())).unwrap();
-        registry.register(Box::new(boundstore_pending_shards.clone())).unwrap();
-        registry.register(Box::new(boundstore_disk_bytes.clone())).unwrap();
-        registry.register(Box::new(boundstore_shard_loads_total.clone())).unwrap();
-        registry.register(Box::new(boundstore_tombstones_created.clone())).unwrap();
-        registry.register(Box::new(boundstore_tombstones_cleaned.clone())).unwrap();
-        registry.register(Box::new(boundstore_entries_restored.clone())).unwrap();
-        registry.register(Box::new(boundstore_bytes_written.clone())).unwrap();
-        registry.register(Box::new(boundstore_bytes_read.clone())).unwrap();
         // Phase 2.5
         registry.register(Box::new(docstore_read_seconds.clone())).unwrap();
         registry.register(Box::new(docstore_concurrent_reads.clone())).unwrap();
@@ -821,9 +716,6 @@ impl Metrics {
             flush_timebucket_nanos,
             flush_compact_nanos,
             lazy_load_duration_seconds,
-            pending_fields,
-            eviction_total,
-            eviction_resident_values,
             compaction_total,
             compaction_duration_seconds,
             compaction_skipped_total,
@@ -836,16 +728,6 @@ impl Metrics {
             queries_in_flight,
             queries_in_flight_peak,
             queries_rejected_total,
-            boundstore_meta_entries,
-            boundstore_tombstones,
-            boundstore_pending_shards,
-            boundstore_disk_bytes,
-            boundstore_shard_loads_total,
-            boundstore_tombstones_created,
-            boundstore_tombstones_cleaned,
-            boundstore_entries_restored,
-            boundstore_bytes_written,
-            boundstore_bytes_read,
             // Phase 2.5
             docstore_read_seconds,
             docstore_concurrent_reads,

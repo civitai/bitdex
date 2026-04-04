@@ -29,6 +29,11 @@ const KEY_META: u32 = 1;
 /// First key available for filter/sort bitmaps.
 const KEY_BITMAP_START: u32 = 2;
 
+// Ops value type tags for bitmap mutations
+const OP_FULL_BITMAP: u8 = 0x00;  // Full frozen bitmap (from save_all/compaction)
+const OP_SET_BIT: u8 = 0x01;      // Set a single bit: [0x01][u32 slot]
+const OP_CLEAR_BIT: u8 = 0x02;    // Clear a single bit: [0x02][u32 slot]
+
 /// Persistent bitmap storage.
 pub struct BitmapSilo {
     silo: datasilo::DataSilo,
@@ -284,6 +289,140 @@ impl BitmapSilo {
     /// Check if the silo has data (non-empty data file or ops).
     pub fn has_data(&self) -> bool {
         self.silo.data_bytes() > 0 || self.silo.has_ops()
+    }
+
+    // ── Mutation ops (individual bit set/clear) ────────────────────────
+
+    /// Set a single bit in a filter bitmap. Appends a SetBit op to the ops log.
+    pub fn filter_set(&self, field: &str, value: u64, slot: u32) -> io::Result<()> {
+        let name = format!("filter:{}:{}", field, value);
+        let key = match self.name_to_key.get(&name) {
+            Some(&k) => k,
+            None => return Ok(()), // unknown bitmap — skip silently
+        };
+        let mut buf = [0u8; 5];
+        buf[0] = OP_SET_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.silo.append_op(key, &buf)
+    }
+
+    /// Clear a single bit in a filter bitmap. Appends a ClearBit op to the ops log.
+    pub fn filter_clear(&self, field: &str, value: u64, slot: u32) -> io::Result<()> {
+        let name = format!("filter:{}:{}", field, value);
+        let key = match self.name_to_key.get(&name) {
+            Some(&k) => k,
+            None => return Ok(()),
+        };
+        let mut buf = [0u8; 5];
+        buf[0] = OP_CLEAR_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.silo.append_op(key, &buf)
+    }
+
+    /// Set a single bit in a sort layer bitmap.
+    pub fn sort_set(&self, field: &str, bit_idx: usize, slot: u32) -> io::Result<()> {
+        let name = format!("sort:{}:{}", field, bit_idx);
+        let key = match self.name_to_key.get(&name) {
+            Some(&k) => k,
+            None => return Ok(()),
+        };
+        let mut buf = [0u8; 5];
+        buf[0] = OP_SET_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.silo.append_op(key, &buf)
+    }
+
+    /// Clear a single bit in a sort layer bitmap.
+    pub fn sort_clear(&self, field: &str, bit_idx: usize, slot: u32) -> io::Result<()> {
+        let name = format!("sort:{}:{}", field, bit_idx);
+        let key = match self.name_to_key.get(&name) {
+            Some(&k) => k,
+            None => return Ok(()),
+        };
+        let mut buf = [0u8; 5];
+        buf[0] = OP_CLEAR_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.silo.append_op(key, &buf)
+    }
+
+    /// Set a bit in the alive bitmap.
+    pub fn alive_set(&self, slot: u32) -> io::Result<()> {
+        let mut buf = [0u8; 5];
+        buf[0] = OP_SET_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.silo.append_op(KEY_ALIVE, &buf)
+    }
+
+    /// Clear a bit in the alive bitmap.
+    pub fn alive_clear(&self, slot: u32) -> io::Result<()> {
+        let mut buf = [0u8; 5];
+        buf[0] = OP_CLEAR_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.silo.append_op(KEY_ALIVE, &buf)
+    }
+
+    // ── Ops-on-read (frozen base + pending mutations) ─────────────────
+
+    /// Read a filter bitmap with pending ops applied.
+    /// Returns the frozen base | pending_sets - pending_clears.
+    pub fn get_filter_with_ops(&self, field: &str, value: u64) -> Option<RoaringBitmap> {
+        let name = format!("filter:{}:{}", field, value);
+        let key = *self.name_to_key.get(&name)?;
+        self.get_bitmap_with_ops(key)
+    }
+
+    /// Read a sort layer bitmap with pending ops applied.
+    pub fn get_sort_layer_with_ops(&self, field: &str, bit: usize) -> Option<RoaringBitmap> {
+        let name = format!("sort:{}:{}", field, bit);
+        let key = *self.name_to_key.get(&name)?;
+        self.get_bitmap_with_ops(key)
+    }
+
+    /// Read the alive bitmap with pending ops applied.
+    pub fn get_alive_with_ops(&self) -> Option<RoaringBitmap> {
+        self.get_bitmap_with_ops(KEY_ALIVE)
+    }
+
+    /// Internal: read frozen base from data file + scan ops log for pending mutations.
+    fn get_bitmap_with_ops(&self, key: u32) -> Option<RoaringBitmap> {
+        // Start with frozen base from data file (or empty if not yet compacted)
+        let mut bitmap = match self.silo.get(key) {
+            Some(bytes) if !bytes.is_empty() => {
+                FrozenRoaringBitmap::view(bytes).ok()?.to_owned()
+            }
+            _ => RoaringBitmap::new(),
+        };
+
+        // Scan both ops logs for pending set/clear mutations
+        let mut found_any = false;
+        let _ = self.silo.scan_ops_for_key(key, |value| {
+            if value.is_empty() { return; }
+            match value[0] {
+                OP_SET_BIT if value.len() >= 5 => {
+                    let slot = u32::from_le_bytes(value[1..5].try_into().unwrap());
+                    bitmap.insert(slot);
+                    found_any = true;
+                }
+                OP_CLEAR_BIT if value.len() >= 5 => {
+                    let slot = u32::from_le_bytes(value[1..5].try_into().unwrap());
+                    bitmap.remove(slot);
+                    found_any = true;
+                }
+                _ => {
+                    // Legacy or full bitmap value — replace base entirely
+                    if let Ok(frozen) = FrozenRoaringBitmap::view(value) {
+                        bitmap = frozen.to_owned();
+                        found_any = true;
+                    }
+                }
+            }
+        });
+
+        if bitmap.is_empty() && !found_any {
+            None
+        } else {
+            Some(bitmap)
+        }
     }
 
     /// Whether the silo needs compaction (dead space exceeds threshold).

@@ -293,6 +293,25 @@ impl DataSilo {
         if end <= mmap.len() { Some(&mmap[start..end]) } else { None }
     }
 
+    /// Scan both ops logs for ALL values written to a key, calling `f` for each.
+    /// Unlike `get_with_ops` (which returns only the last value), this yields every
+    /// op in chronological order (A then B). Used by BitmapSilo for ops-on-read
+    /// where individual set/clear mutations must all be applied.
+    pub fn scan_ops_for_key<F>(&self, key: u32, mut f: F) -> io::Result<()>
+    where F: FnMut(&[u8])
+    {
+        let log_a = self.ops_a.lock();
+        let log_b = self.ops_b.lock();
+        // Scan A (may be frozen/older) then B (active/newer)
+        log_a.for_each(|op_key, value| {
+            if op_key == key { f(value); }
+        })?;
+        log_b.for_each(|op_key, value| {
+            if op_key == key { f(value); }
+        })?;
+        Ok(())
+    }
+
     /// Read an entry with ops overlay (returns owned data).
     /// Scans BOTH ops logs (A and B) for the latest value of this key.
     /// Last-write-wins across both logs (frozen log has older ops, active has newer).

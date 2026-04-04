@@ -340,8 +340,6 @@ struct AppState {
     /// Toggleable metric groups — disable expensive metrics without redeploy.
     /// Default: all enabled. PATCH /config to toggle at runtime.
     metrics_bitmap_memory: AtomicBool,
-    metrics_eviction_stats: AtomicBool,
-    metrics_boundstore_disk: AtomicBool,
     /// WAL writer for V2 ops endpoint. Created lazily on first ops POST.
     #[cfg(feature = "pg-sync")]
     ops_wal: Mutex<Option<crate::ops_wal::WalWriter>>,
@@ -918,7 +916,7 @@ struct ConfigPatch {
     #[serde(default)]
     trace_buffer_size: Option<usize>,
     /// Toggle expensive metric groups at runtime. Array of group names to enable.
-    /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
+    /// Groups: "bitmap_memory"
     /// DEPRECATED: Use disabled_metrics instead.
     /// If provided, ONLY listed groups are enabled (others disabled).
     #[serde(default)]
@@ -1078,8 +1076,6 @@ impl BitdexServer {
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
             capture: crate::capture::CaptureManager::new(&self.data_dir),
             metrics_bitmap_memory: AtomicBool::new(true),
-            metrics_eviction_stats: AtomicBool::new(true),
-            metrics_boundstore_disk: AtomicBool::new(true),
             #[cfg(feature = "pg-sync")]
             ops_wal: Mutex::new(None),
             #[cfg(feature = "pg-sync")]
@@ -1127,21 +1123,13 @@ impl BitdexServer {
             if let Some(ref disabled) = config.disabled_metrics {
                 // Opt-out model: everything ON except what's listed
                 let bm = !disabled.iter().any(|g| g == "bitmap_memory");
-                let ev = !disabled.iter().any(|g| g == "eviction_stats");
-                let bd = !disabled.iter().any(|g| g == "boundstore_disk");
                 state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
-                state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
-                eprintln!("Restored disabled_metrics from config: {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", disabled);
+                eprintln!("Restored disabled_metrics from config: {:?} (bitmap_memory={bm})", disabled);
             } else if let Some(ref groups) = config.enabled_metrics {
                 // Legacy opt-in model (deprecated)
                 let bm = groups.iter().any(|g| g == "bitmap_memory");
-                let ev = groups.iter().any(|g| g == "eviction_stats");
-                let bd = groups.iter().any(|g| g == "boundstore_disk");
                 state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
-                state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
-                eprintln!("Restored enabled_metrics (legacy) from config: {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
+                eprintln!("Restored enabled_metrics (legacy) from config: {:?} (bitmap_memory={bm})", groups);
             }
             // If neither is set: all metrics default to ON (AtomicBool defaults true)
         }
@@ -1415,30 +1403,6 @@ impl BitdexServer {
         // The server won't accept traffic until all eager bitmaps are loaded
         // and cache shards are restored. This prevents cold-start stampedes
         // where queries arrive before bitmaps are in memory.
-        {
-            let engine_arc = shutdown_state.index.lock()
-                .as_ref()
-                .map(|s| Arc::clone(&s.engine));
-            if let Some(ref engine) = engine_arc {
-                // Phase 5: Eager fields (bitmaps needed for queries)
-                let phase_start = std::time::Instant::now();
-                engine.preload_eager_fields();
-                let phase5_elapsed = phase_start.elapsed();
-                eprintln!("  Boot phase: eager_fields completed in {}ms", phase5_elapsed.as_millis());
-                state.metrics.boot_phase_seconds
-                    .with_label_values(&["eager_fields"])
-                    .set(phase5_elapsed.as_secs() as i64);
-
-                // Phase 6: Bound cache shards (persisted cache entries)
-                let phase_start = std::time::Instant::now();
-                engine.preload_bound_cache();
-                let phase6_elapsed = phase_start.elapsed();
-                eprintln!("  Boot phase: bound_cache completed in {}ms", phase6_elapsed.as_millis());
-                state.metrics.boot_phase_seconds
-                    .with_label_values(&["bound_cache"])
-                    .set(phase6_elapsed.as_secs() as i64);
-            }
-        }
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -1640,12 +1604,9 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 /// Deletes the bitmaps directory, runs `build_all_from_docstore`, then
 /// `save_and_unload` to persist and free memory.
 fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
-    use crate::concurrent_engine::get_rss_bytes;
-
     let guard = state.index.lock();
     let idx = guard.as_ref().ok_or("No index found — cannot rebuild without config")?;
 
-    let engine = Arc::clone(&idx.engine);
     let index_name = idx.definition.name.clone();
     let bitmap_path = state.data_dir.join("indexes").join(&index_name).join("bitmaps");
     drop(guard);
@@ -1661,60 +1622,9 @@ fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
         eprintln!("  done");
     }
 
-    // Step 2: Build all bitmap indexes from docstore
-    let rss_start = get_rss_bytes();
-    eprintln!("Building bitmap indexes from docstore...");
-    eprintln!("  RSS before build: {:.2} GB", rss_start as f64 / 1e9);
-
-    let progress = Arc::new(AtomicU64::new(0));
-    let progress_clone = progress.clone();
-
-    let memory_cb: Box<dyn Fn(u64, f64, u64) + Send + Sync> = Box::new(move |docs, elapsed, rss| {
-        if elapsed > 0.0 {
-            eprintln!("  [{:>6.1}s] {:>10} docs ({:>7.0} docs/s)  RSS={:.2} GB",
-                elapsed, docs, docs as f64 / elapsed, rss as f64 / 1e9);
-        }
-    });
-
-    let (total_docs, build_elapsed) = engine
-        .build_all_from_docstore(progress_clone, Some(memory_cb))
-        .map_err(|e| format!("build_all_from_docstore: {e}"))?;
-
-    let rss_after_build = get_rss_bytes();
-    eprintln!("Build complete: {} docs in {:.1}s ({:.0} docs/s), RSS={:.2} GB",
-        total_docs, build_elapsed, total_docs as f64 / build_elapsed, rss_after_build as f64 / 1e9);
-
-    // Step 3: Persist bitmaps to disk and unload from memory
-    eprintln!("Persisting bitmaps to disk...");
-    let persist_start = std::time::Instant::now();
-
-    engine.save_and_unload().map_err(|e| format!("save_and_unload: {e}"))?;
-
-    let persist_elapsed = persist_start.elapsed().as_secs_f64();
-    let rss_final = get_rss_bytes();
-    let total_elapsed = build_elapsed + persist_elapsed;
-
-    eprintln!("\n=== REBUILD COMPLETE ===");
-    eprintln!("  Docs:          {}", total_docs);
-    eprintln!("  Build:         {:.1}s", build_elapsed);
-    eprintln!("  Persist:       {:.1}s", persist_elapsed);
-    eprintln!("  Total:         {:.1}s ({:.1} min)", total_elapsed, total_elapsed / 60.0);
-    eprintln!("  RSS final:     {:.2} GB", rss_final as f64 / 1e9);
-    eprintln!("Server will now start with lazy bitmap loading.\n");
-
-    // Update task registry so the API reflects the rebuild
-    let guard = state.index.lock();
-    if let Some(idx) = guard.as_ref() {
-        if let Ok((tid, progress)) = idx.tasks.try_start(TaskType::Rebuild) {
-            progress.store(total_docs, Ordering::Release);
-            idx.tasks.set_complete(tid, Some(serde_json::json!({
-                "records_loaded": total_docs,
-                "elapsed_secs": total_elapsed,
-            })));
-        }
-    }
-
-    Ok(())
+    // Step 2: Build all bitmap indexes from docstore (not yet implemented — DataSilo bulk scan API pending)
+    eprintln!("rebuild_on_boot: build_all_from_docstore not yet implemented (DataSilo bulk scan API pending)");
+    Err("rebuild_on_boot: DataSilo bulk scan API not yet implemented".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -2247,24 +2157,16 @@ async fn handle_patch_config(
                 // Toggle metric groups — disabled_metrics takes precedence
                 if let Some(ref disabled) = patch.disabled_metrics {
                     let bm = !disabled.iter().any(|g| g == "bitmap_memory");
-                    let ev = !disabled.iter().any(|g| g == "eviction_stats");
-                    let bd = !disabled.iter().any(|g| g == "boundstore_disk");
                     state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                    state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
-                    state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
                     idx.definition.config.disabled_metrics = Some(disabled.clone());
                     idx.definition.config.enabled_metrics = None; // clear legacy
-                    eprintln!("Config patch: disabled_metrics = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", disabled);
+                    eprintln!("Config patch: disabled_metrics = {:?} (bitmap_memory={bm})", disabled);
                 } else if let Some(ref groups) = patch.enabled_metrics {
                     // Legacy opt-in (deprecated)
                     let bm = groups.iter().any(|g| g == "bitmap_memory");
-                    let ev = groups.iter().any(|g| g == "eviction_stats");
-                    let bd = groups.iter().any(|g| g == "boundstore_disk");
                     state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                    state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
-                    state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
                     idx.definition.config.enabled_metrics = Some(groups.clone());
-                    eprintln!("Config patch: enabled_metrics (legacy) = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
+                    eprintln!("Config patch: enabled_metrics (legacy) = {:?} (bitmap_memory={bm})", groups);
                 }
 
                 // Persist updated config
@@ -3205,13 +3107,6 @@ async fn handle_stats(
             "min_tracked_value": e.min_tracked_value,
         })
     }).collect();
-    let eviction: Vec<serde_json::Value> = engine.eviction_stats().into_iter().map(|(name, total, resident)| {
-        serde_json::json!({
-            "field": name,
-            "evicted_total": total,
-            "resident_values": resident,
-        })
-    }).collect();
     Json(serde_json::json!({
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
@@ -3230,16 +3125,7 @@ async fn handle_stats(
         "unified_cache_pending_shards": uc.pending_shard_count,
         "unified_cache_dirty_shards": uc.dirty_shard_count,
         "unified_cache_meta_dirty": uc.meta_dirty,
-        "unified_cache_disk_bytes": engine.boundstore_disk_bytes(),
-        "unified_cache_shard_load_count": engine.boundstore_shard_loads(),
-        "unified_cache_tombstones_created": engine.boundstore_tombstones_created(),
-        "unified_cache_tombstones_cleaned": engine.boundstore_tombstones_cleaned(),
-        "unified_cache_entries_restored": engine.boundstore_entries_restored(),
-        "unified_cache_entries_skipped": engine.boundstore_entries_skipped(),
-        "unified_cache_bytes_written": engine.boundstore_bytes_written(),
-        "unified_cache_bytes_read": engine.boundstore_bytes_read(),
         "unified_cache_entry_details": entries,
-        "eviction": eviction,
         "queries_in_flight": state.queries_in_flight.load(Ordering::Relaxed),
         "queries_in_flight_peak": state.queries_in_flight_peak.load(Ordering::Relaxed),
         "queries_rejected": state.metrics.queries_rejected_total.get(),
@@ -3415,99 +3301,23 @@ async fn handle_warm_cache(
 async fn handle_rebuild(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(req): Json<RebuildRequest>,
+    _req: Json<RebuildRequest>,
 ) -> impl IntoResponse {
-    let (engine, config, tasks) = {
+    // Verify the index exists
+    {
         let guard = state.index.lock();
-        match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => (
-                Arc::clone(&idx.engine),
-                idx.definition.config.clone(),
-                Arc::clone(&idx.tasks),
-            ),
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    // Validate field names
-    if let Some(ref sort_names) = req.sort_fields {
-        for name in sort_names {
-            if !config.sort_fields.iter().any(|sc| &sc.name == name) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("Unknown sort field: {}", name)})),
-                ).into_response();
-            }
-        }
-    }
-    if let Some(ref filter_names) = req.filter_fields {
-        for name in filter_names {
-            if !config.filter_fields.iter().any(|fc| &fc.name == name) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("Unknown filter field: {}", name)})),
-                ).into_response();
-            }
-        }
-    }
-
-    let (task_id, progress) = match tasks.try_start(TaskType::Rebuild) {
-        Ok(v) => v,
-        Err(active_info) => {
+        if guard.as_ref().map(|idx| idx.definition.name != name).unwrap_or(true) {
             return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "A task is already running",
-                    "active_task": serde_json::to_value(&active_info).unwrap(),
-                })),
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
             ).into_response();
         }
-    };
+    }
 
-    let sort_fields = req.sort_fields;
-    let filter_fields = req.filter_fields;
-    let save = req.save_snapshot;
-
-    let tasks_clone = Arc::clone(&tasks);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
-
-        match engine.rebuild_fields_from_docstore(sort_fields, filter_fields, progress.clone()) {
-            Ok((slots, fields)) => {
-                if save {
-                    guard.tasks.set_saving(task_id);
-
-                    let snap_start = Instant::now();
-                    if let Err(e) = engine.save_and_unload() {
-                        eprintln!("rebuild: failed to save_and_unload: {e}");
-                    } else {
-                        eprintln!("rebuild: save_and_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
-                    }
-                }
-
-                guard.tasks.set_complete(task_id, Some(serde_json::json!({
-                    "records_loaded": slots,
-                    "fields": fields,
-                })));
-                guard.defuse();
-
-                eprintln!("rebuild: done — {} slots, {} fields", slots, fields.len());
-            }
-            Err(e) => {
-                guard.tasks.set_error(task_id, format!("Rebuild failed: {}", e));
-                guard.defuse();
-            }
-        }
-    });
-
+    // rebuild_fields_from_docstore is not yet implemented (DataSilo bulk scan API pending)
     (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"task_id": task_id})),
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "rebuild_fields_from_docstore not yet implemented"})),
     ).into_response()
 }
 
@@ -3667,140 +3477,21 @@ async fn handle_add_fields(
         ).into_response();
     }
 
-    let (engine, tasks) = {
-        let mut guard = state.index.lock();
-        match guard.as_mut() {
-            Some(idx) if idx.definition.name == name => {
-                // Validate no duplicate field names with existing config
-                for fc in &req.filter_fields {
-                    if idx.definition.config.filter_fields.iter().any(|f| f.name == fc.name) {
-                        return (
-                            StatusCode::CONFLICT,
-                            Json(serde_json::json!({"error": format!("Filter field '{}' already exists", fc.name)})),
-                        ).into_response();
-                    }
-                }
-                for sc in &req.sort_fields {
-                    if idx.definition.config.sort_fields.iter().any(|f| f.name == sc.name) {
-                        return (
-                            StatusCode::CONFLICT,
-                            Json(serde_json::json!({"error": format!("Sort field '{}' already exists", sc.name)})),
-                        ).into_response();
-                    }
-                }
-
-                // Update the persisted config with the new fields
-                idx.definition.config.filter_fields.extend(req.filter_fields.clone());
-                idx.definition.config.sort_fields.extend(req.sort_fields.clone());
-
-                // Save updated config
-                let index_dir = state.data_dir.join("indexes").join(&name);
-                if let Err(e) = idx.definition.save_yaml(&index_dir) {
-                    // Rollback config changes
-                    for fc in &req.filter_fields {
-                        idx.definition.config.filter_fields.retain(|f| f.name != fc.name);
-                    }
-                    for sc in &req.sort_fields {
-                        idx.definition.config.sort_fields.retain(|f| f.name != sc.name);
-                    }
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": format!("Failed to persist config: {e}")})),
-                    ).into_response();
-                }
-
-                (
-                    Arc::clone(&idx.engine),
-                    Arc::clone(&idx.tasks),
-                )
-            }
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    // Validate fields exist in docstore (unless skipped)
-    if !req.skip_validation {
-        let all_names: Vec<&str> = req.filter_fields.iter().map(|f| f.name.as_str())
-            .chain(req.sort_fields.iter().map(|f| f.name.as_str()))
-            .collect();
-
-        match engine.validate_fields_in_docstore(&all_names) {
-            Ok(missing) if !missing.is_empty() => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("Fields not found in docstore: {:?}", missing),
-                        "hint": "Set skip_validation=true to add fields that may not exist in all documents"
-                    })),
-                ).into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Validation failed: {e}")})),
-                ).into_response();
-            }
-            _ => {}
+    // Verify the index exists
+    {
+        let guard = state.index.lock();
+        if guard.as_ref().map(|idx| idx.definition.name != name).unwrap_or(true) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+            ).into_response();
         }
     }
 
-    let (task_id, progress) = match tasks.try_start(TaskType::AddFields) {
-        Ok(v) => v,
-        Err(active_info) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "A task is already running",
-                    "active_task": serde_json::to_value(&active_info).unwrap(),
-                })),
-            ).into_response();
-        }
-    };
-
-    let filter_fields = req.filter_fields;
-    let sort_fields = req.sort_fields;
-    let save = req.save_snapshot;
-
-    let tasks_clone = Arc::clone(&tasks);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
-
-        match engine.add_fields_from_docstore(filter_fields, sort_fields, progress) {
-            Ok((slots, fields)) => {
-                if save {
-                    guard.tasks.set_saving(task_id);
-
-                    let snap_start = Instant::now();
-                    if let Err(e) = engine.save_and_unload() {
-                        eprintln!("add_fields: save_and_unload failed: {e}");
-                    } else {
-                        eprintln!("add_fields: save_and_unload in {:.1}s", snap_start.elapsed().as_secs_f64());
-                    }
-                }
-
-                guard.tasks.set_complete(task_id, Some(serde_json::json!({
-                    "records_loaded": slots,
-                    "fields": fields,
-                })));
-                guard.defuse();
-
-                eprintln!("add_fields: done — {} slots, {} fields", slots, fields.len());
-            }
-            Err(e) => {
-                guard.tasks.set_error(task_id, format!("Add fields failed: {}", e));
-                guard.defuse();
-            }
-        }
-    });
-
+    // add_fields_from_docstore is not yet implemented (DataSilo bulk scan API pending)
     (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"task_id": task_id})),
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "add_fields_from_docstore not yet implemented"})),
     ).into_response()
 }
 
@@ -4397,14 +4088,12 @@ async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Memory budget endpoint — shows where every GB of RSS goes.
+/// Memory budget endpoint — shows where every GB of tracked bitmap memory goes.
 /// Bitmap totals run on a blocking thread (can be slow at 107M records).
 /// Designed for manual debugging, not Prometheus scraping.
 async fn handle_debug_memory(
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
-    let rss_bytes = crate::concurrent_engine::get_rss_bytes() as u64;
-
     let (engine, engine_name, uc_bytes) = {
         let guard = state.index.lock();
         if let Some(idx) = guard.as_ref() {
@@ -4428,18 +4117,9 @@ async fn handle_debug_memory(
 
     let bitmap_total = slot_bytes + filter_bytes + sort_bytes;
     let tracked_total = bitmap_total + uc_bytes;
-    let untracked = rss_bytes.saturating_sub(tracked_total);
-
-    let pod_limit: u64 = std::env::var("BITDEX_MEMORY_LIMIT_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32 * 1024 * 1024 * 1024);
-
-    let headroom = pod_limit.saturating_sub(rss_bytes);
 
     Json(serde_json::json!({
         "index": engine_name,
-        "rss_bytes": rss_bytes,
         "tracked": {
             "alive_bitmap": slot_bytes,
             "filter_bitmaps": filter_bytes,
@@ -4448,17 +4128,10 @@ async fn handle_debug_memory(
             "unified_cache": uc_bytes,
         },
         "tracked_total": tracked_total,
-        "untracked": untracked,
-        "budget": {
-            "pod_limit": pod_limit,
-            "rss_current": rss_bytes,
-            "headroom": headroom,
-        },
         "human": {
-            "rss": format!("{:.2} GB", rss_bytes as f64 / 1e9),
             "tracked": format!("{:.2} GB", tracked_total as f64 / 1e9),
-            "untracked": format!("{:.2} GB", untracked as f64 / 1e9),
-            "headroom": format!("{:.2} GB", headroom as f64 / 1e9),
+            "bitmaps": format!("{:.2} GB", bitmap_total as f64 / 1e9),
+            "cache": format!("{:.2} GB", uc_bytes as f64 / 1e9),
         }
     }))
 }
@@ -4689,24 +4362,6 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.flush_compact_nanos.with_label_values(&[name]).set(compact_ns as i64);
             let _ = opslog_ns; // TODO: add bitdex_flush_opslog_nanos Prometheus metric
 
-            // Pending fields (lazy loading)
-            let pending = engine.pending_field_count();
-            m.pending_fields
-                .with_label_values(&[name])
-                .set(pending as i64);
-
-            // Eviction stats (gated — iterates per-field eviction data)
-            if state.metrics_eviction_stats.load(Ordering::Relaxed) {
-                for (field, total, resident) in engine.eviction_stats() {
-                    m.eviction_total
-                        .with_label_values(&[name, &field])
-                        .set(total as i64);
-                    m.eviction_resident_values
-                        .with_label_values(&[name, &field])
-                        .set(resident as i64);
-                }
-            }
-
             // Compaction skipped (scrape-time from atomic counter)
             m.compaction_skipped_total
                 .with_label_values(&[name])
@@ -4715,41 +4370,6 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             // Sync peak from atomic to Prometheus gauge
             m.queries_in_flight_peak
                 .set(state.queries_in_flight_peak.load(Ordering::Relaxed));
-
-            // BoundStore stats
-            m.boundstore_meta_entries
-                .with_label_values(&[name])
-                .set(uc.meta_index_entries as i64);
-            m.boundstore_tombstones
-                .with_label_values(&[name])
-                .set(uc.tombstone_count as i64);
-            m.boundstore_pending_shards
-                .with_label_values(&[name])
-                .set(uc.pending_shard_count as i64);
-            // Disk bytes scan gated — does sync I/O (directory listing)
-            if state.metrics_boundstore_disk.load(Ordering::Relaxed) {
-                m.boundstore_disk_bytes
-                    .with_label_values(&[name])
-                    .set(engine.boundstore_disk_bytes() as i64);
-            }
-            m.boundstore_shard_loads_total
-                .with_label_values(&[name])
-                .set(engine.boundstore_shard_loads() as i64);
-            m.boundstore_tombstones_created
-                .with_label_values(&[name])
-                .set(engine.boundstore_tombstones_created() as i64);
-            m.boundstore_tombstones_cleaned
-                .with_label_values(&[name])
-                .set(engine.boundstore_tombstones_cleaned() as i64);
-            m.boundstore_entries_restored
-                .with_label_values(&[name])
-                .set(engine.boundstore_entries_restored() as i64);
-            m.boundstore_bytes_written
-                .with_label_values(&[name])
-                .set(engine.boundstore_bytes_written() as i64);
-            m.boundstore_bytes_read
-                .with_label_values(&[name])
-                .set(engine.boundstore_bytes_read() as i64);
 
             // Phase 2.5: Flush queue depth
             m.flush_queue_depth.set(engine.flush_queue_depth() as i64);

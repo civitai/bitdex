@@ -59,18 +59,6 @@ pub struct Config {
     /// won't be marked alive until that time arrives. Only one field per document.
     #[serde(default)]
     pub deferred_alive: Option<DeferredAliveConfig>,
-    /// Memory budget in bytes for RSS-aware cache eviction. When RSS exceeds
-    /// `memory_pressure_threshold` of this budget, the flush thread evicts cache
-    /// entries until RSS drops below `memory_pressure_target`.
-    /// Auto-detected from cgroup v2 / env var if not set.
-    #[serde(default)]
-    pub memory_budget_bytes: Option<u64>,
-    /// RSS fraction that triggers memory-pressure eviction (default 0.80).
-    #[serde(default = "default_memory_pressure_threshold")]
-    pub memory_pressure_threshold: f64,
-    /// RSS fraction to evict down to (default 0.75).
-    #[serde(default = "default_memory_pressure_target")]
-    pub memory_pressure_target: f64,
     /// Bitmap memory scanner settings. Replaces the expensive per-scrape
     /// bitmap_memory_report() with incremental background scanning.
     #[serde(default)]
@@ -78,14 +66,14 @@ pub struct Config {
     /// Enabled metric groups. Controls which expensive metric groups are
     /// collected on the Prometheus scrape endpoint.
     /// DEPRECATED: Use `disabled_metrics` (opt-out model) instead.
-    /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
+    /// Groups: "bitmap_memory"
     /// When `None` (default), all groups are enabled (backward compatible).
     /// When `Some(vec)`, only the listed groups are enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_metrics: Option<Vec<String>>,
     /// Metric groups to DISABLE (opt-out model). Default: None = all ON.
     /// Takes precedence over `enabled_metrics` when present.
-    /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
+    /// Groups: "bitmap_memory"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_metrics: Option<Vec<String>>,
     /// Headless mode: skip all background threads (flush, merge, eviction).
@@ -121,12 +109,6 @@ fn default_compact_threshold_pct() -> u64 {
 }
 fn default_eviction_sweep_interval() -> u64 {
     1000
-}
-fn default_memory_pressure_threshold() -> f64 {
-    0.80
-}
-fn default_memory_pressure_target() -> f64 {
-    0.75
 }
 fn default_channel_capacity() -> usize {
     100_000
@@ -167,9 +149,6 @@ impl Default for Config {
             enabled_metrics: None,
             disabled_metrics: None,
             deferred_alive: None,
-            memory_budget_bytes: None,
-            memory_pressure_threshold: default_memory_pressure_threshold(),
-            memory_pressure_target: default_memory_pressure_target(),
             headless: false,
             data_schema: DataSchema::default(),
         }

@@ -37,11 +37,10 @@ const LOG_INTERVAL: u64 = 1_000_000;
 /// Emit a structured JSON stage marker to stderr for phase monitoring.
 /// Zero overhead — only called at stage transitions, not per row.
 fn emit_stage(dump_name: &str, stage: &str, detail: &str, t0: &Instant, rows: u64) {
-    let rss = crate::concurrent_engine::get_rss_bytes();
     let elapsed_ms = t0.elapsed().as_millis();
     eprintln!(
-        r#"{{"dump":"{}","stage":"{}","detail":"{}","elapsed_ms":{},"rss_bytes":{},"rss_gb":{:.3},"rows":{}}}"#,
-        dump_name, stage, detail, elapsed_ms, rss, rss as f64 / 1e9, rows
+        r#"{{"dump":"{}","stage":"{}","detail":"{}","elapsed_ms":{},"rows":{}}}"#,
+        dump_name, stage, detail, elapsed_ms, rows
     );
 }
 

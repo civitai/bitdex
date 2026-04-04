@@ -76,58 +76,6 @@ enum FlushCommand {
         done: crossbeam_channel::Sender<std::result::Result<(), String>>,
     },
 }
-// ---------------------------------------------------------------------------
-// RSS memory tracking (cross-platform)
-// ---------------------------------------------------------------------------
-pub fn get_rss_bytes() -> u64 {
-    #[cfg(target_os = "windows")]
-    {
-        use std::mem::MaybeUninit;
-        #[repr(C)]
-        #[allow(non_snake_case)]
-        struct ProcessMemoryCounters {
-            cb: u32,
-            page_fault_count: u32,
-            peak_working_set_size: usize,
-            working_set_size: usize,
-            quota_peak_paged_pool_usage: usize,
-            quota_paged_pool_usage: usize,
-            quota_peak_non_paged_pool_usage: usize,
-            quota_non_paged_pool_usage: usize,
-            pagefile_usage: usize,
-            peak_pagefile_usage: usize,
-        }
-        extern "system" {
-            fn GetCurrentProcess() -> isize;
-        }
-        #[link(name = "psapi")]
-        extern "system" {
-            fn GetProcessMemoryInfo(process: isize, ppsmemCounters: *mut ProcessMemoryCounters, cb: u32) -> i32;
-        }
-        unsafe {
-            let process = GetCurrentProcess();
-            let mut pmc: MaybeUninit<ProcessMemoryCounters> = MaybeUninit::zeroed();
-            if GetProcessMemoryInfo(process, pmc.as_mut_ptr(), std::mem::size_of::<ProcessMemoryCounters>() as u32) != 0 {
-                (*pmc.as_ptr()).working_set_size as u64
-            } else {
-                0
-            }
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-            if let Some(rss_pages) = statm.split_whitespace().nth(1) {
-                if let Ok(pages) = rss_pages.parse::<u64>() {
-                    return pages * 4096;
-                }
-            }
-        }
-        0
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    { 0 }
-}
 /// Inner bitmap state published as immutable snapshots via ArcSwap.
 ///
 /// All fields are Clone via Arc-per-bitmap CoW. Cloning bumps refcounts
@@ -1200,9 +1148,7 @@ impl ConcurrentEngine {
         let merge_handle = {
             let shutdown = Arc::clone(&shutdown);
             let merge_interval_ms = config.merge_interval_ms;
-            let merge_config = Arc::clone(&config);
             let merge_dirty_flag = Arc::clone(&dirty_flag);
-            let merge_unified_cache = Arc::clone(&unified_cache);
             let merge_docstore = Arc::clone(&docstore);
             let merge_cache_silo = cache_silo_arc.clone();
             let merge_bitmap_silo = bitmap_silo_arc.clone();
@@ -1238,36 +1184,6 @@ impl ConcurrentEngine {
                         if needs_compact {
                             if let Err(e) = bs_arc.write().compact() {
                                 eprintln!("merge: BitmapSilo compaction failed: {e}");
-                            }
-                        }
-                    }
-
-                    // RSS-aware memory pressure eviction: check real RSS against budget,
-                    // evict cache entries until RSS drops below target.
-                    let rss = get_rss_bytes();
-                    let budget = merge_config.memory_budget_bytes
-                        .unwrap_or_else(|| crate::memory_pressure::detect_memory_budget(None));
-                    let threshold = (budget as f64 * merge_config.memory_pressure_threshold) as u64;
-                    let target = (budget as f64 * merge_config.memory_pressure_target) as u64;
-                    if rss > threshold {
-                        let mut evicted = 0u64;
-                        let mut rounds = 0u32;
-                        loop {
-                            {
-                                let mut uc = merge_unified_cache.lock();
-                                if uc.len() == 0 { break; }
-                                uc.evict_batch();
-                            }
-                            evicted += 1;
-                            rounds += 1;
-                            let new_rss = get_rss_bytes();
-                            if new_rss <= target || rounds >= 50 {
-                                eprintln!(
-                                    "memory pressure: evicted {} batches, RSS {:.2} GB → {:.2} GB (budget {:.2} GB, target {:.2} GB)",
-                                    evicted, rss as f64 / 1e9, new_rss as f64 / 1e9,
-                                    budget as f64 / 1e9, target as f64 / 1e9,
-                                );
-                                break;
                             }
                         }
                     }
@@ -3216,13 +3132,6 @@ impl ConcurrentEngine {
     pub fn alive_count(&self) -> u64 {
         self.snapshot().slots.alive_count()
     }
-    /// No-op: eager loading is not needed with BitmapSilo frozen bitmaps.
-    /// All filter/sort bitmaps are accessible via mmap at query time.
-    pub fn preload_eager_fields(&self) {}
-    /// Pre-load all bound cache shards from disk.
-    /// No-op: BoundStore removed. CacheSilo (Phase 4) will restore persistent cache entries.
-    pub fn preload_bound_cache(&self) {}
-
     /// Flush loop stats: (publish_count, cumulative_duration_nanos, last_duration_nanos).
     pub fn flush_stats(&self) -> (u64, u64, u64) {
         (
@@ -3242,14 +3151,6 @@ impl ConcurrentEngine {
             self.flush_opslog_nanos.load(Ordering::Relaxed),
         )
     }
-    /// Number of filter + sort fields still pending lazy load. Always 0 (frozen mmap).
-    pub fn pending_field_count(&self) -> usize { 0 }
-    /// No-op: lazy reload not needed with BitmapSilo frozen bitmaps.
-    pub fn mark_fields_pending_reload(&self, _filter_fields: &[String], _sort_fields: &[String]) {}
-    /// No-op: alive bitmap is always in-memory with BitmapSilo.
-    pub fn reload_alive_from_disk(&self) {}
-    /// No-op: eviction is removed. Returns empty vec.
-    pub fn eviction_stats(&self) -> Vec<(String, u64, usize)> { Vec::new() }
     /// Get the high-water mark slot counter (lock-free snapshot).
     pub fn slot_counter(&self) -> u32 {
         self.snapshot().slots.slot_counter()
@@ -3377,18 +3278,6 @@ impl ConcurrentEngine {
             .collect();
         (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details)
     }
-    /// Return unified cache stats (entries, hits, misses, memory).
-    // ── BoundStore Counters — all zero (BoundStore removed; CacheSilo Phase 4 replaces) ──
-    pub fn boundstore_shard_loads(&self) -> u64 { 0 }
-    pub fn boundstore_tombstones_created(&self) -> u64 { 0 }
-    pub fn boundstore_tombstones_cleaned(&self) -> u64 { 0 }
-    pub fn boundstore_bytes_written(&self) -> u64 { 0 }
-    pub fn boundstore_bytes_read(&self) -> u64 { 0 }
-    pub fn boundstore_entries_restored(&self) -> u64 { 0 }
-    pub fn boundstore_entries_skipped(&self) -> u64 { 0 }
-    /// Get the total size of the bounds directory on disk.
-    /// Returns 0: BoundStore removed. CacheSilo (Phase 4) will report disk usage.
-    pub fn boundstore_disk_bytes(&self) -> u64 { 0 }
     pub fn unified_cache_stats(&self) -> crate::unified_cache::UnifiedCacheStats {
         self.unified_cache.lock().stats()
     }
@@ -4101,43 +3990,6 @@ impl ConcurrentEngine {
         staging.slots.alive_or_bitmap(&accum.alive);
         // Store back — in loading mode, no snapshot publish overhead
         self.inner.store(Arc::new(staging));
-    }
-    /// Build all bitmap indexes from the docstore.
-    /// Not yet implemented: requires DataSilo bulk scan API.
-    pub fn build_all_from_docstore(
-        &self,
-        _progress: Arc<AtomicU64>,
-        _memory_cb: Option<Box<dyn Fn(u64, f64, u64) + Send + Sync>>,
-    ) -> Result<(u64, f64)> {
-        Err(crate::error::BitdexError::Config(
-            "build_all_from_docstore: DataSilo bulk scan API not yet implemented".to_string()))
-    }
-    /// Rebuild sort and/or filter bitmaps from the docstore.
-    /// Not yet implemented: requires DataSilo bulk scan API.
-    pub fn rebuild_fields_from_docstore(
-        &self,
-        _sort_fields: Option<Vec<String>>,
-        _filter_fields: Option<Vec<String>>,
-        _progress: Arc<AtomicU64>,
-    ) -> Result<(u64, Vec<String>)> {
-        Err(crate::error::BitdexError::Config(
-            "rebuild_fields_from_docstore: DataSilo bulk scan API not yet implemented".to_string()))
-    }
-    /// Add new filter and/or sort fields, building their bitmaps from the docstore.
-    /// Not yet implemented: requires DataSilo bulk scan API.
-    pub fn add_fields_from_docstore(
-        &self,
-        _new_filters: Vec<crate::config::FilterFieldConfig>,
-        _new_sorts: Vec<crate::config::SortFieldConfig>,
-        _progress: Arc<AtomicU64>,
-    ) -> Result<(u64, Vec<String>)> {
-        Err(crate::error::BitdexError::Config(
-            "add_fields_from_docstore: DataSilo bulk scan API not yet implemented".to_string()))
-    }
-    /// Validate that field names exist in the docstore.
-    /// Not yet implemented: returns empty (no missing fields) as a stub.
-    pub fn validate_fields_in_docstore(&self, _field_names: &[&str]) -> Result<Vec<String>> {
-        Ok(vec![])
     }
     /// Remove filter and/or sort fields from the engine.
     ///
