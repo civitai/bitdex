@@ -429,7 +429,7 @@ pub struct FieldMeta {
     /// trigger deferred alive instead of immediate alive. ms_to_seconds indicates
     /// whether the field value is in milliseconds (needs /1000 for epoch comparison).
     deferred_alive_field: Option<(String, bool)>,
-    /// Field registry for Arc<str> interning (kept for future DocSink use)
+    /// Field registry for Arc<str> interning
     #[allow(dead_code)]
     registry: FieldRegistry,
 }
