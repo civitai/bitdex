@@ -16,16 +16,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use serde_json::Value as JsonValue;
-use crate::concurrent_engine::ConcurrentEngine;
+use crate::engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
 use crate::silos::doc_format::PackedValue;
 use crate::silos::doc_silo_adapter::DocSiloAdapter;
 use crate::engine::filter::{FilterFieldType, NULL_BITMAP_KEY};
-use crate::ingester::BitmapSink;
+use crate::sync::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
-use crate::pg_sync::op_dedup::dedup_ops;
-use crate::pg_sync::ops::{EntityOps, Op};
+use crate::sync::op_dedup::dedup_ops;
+use crate::sync::ops::{EntityOps, Op};
 use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 // ---------------------------------------------------------------------------
 // DocWriter — writes field values to docstore alongside bitmap mutations
@@ -1123,7 +1123,7 @@ mod tests {
     use serde_json::json;
     use crate::config::{Config, DataSchema, FieldMapping, FieldValueType, FilterFieldConfig, SortFieldConfig};
     use crate::engine::filter::FilterFieldType;
-    use crate::ingester::BitmapSink;
+    use crate::sync::ingester::BitmapSink;
     /// A test sink that records all operations for verification.
     struct RecordingSink {
         filter_inserts: Vec<(String, u64, u32)>,

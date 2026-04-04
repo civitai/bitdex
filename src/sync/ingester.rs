@@ -9,7 +9,7 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::error::Result;
-use crate::loader::BitmapAccum;
+use super::loader::BitmapAccum;
 use crate::mutation::{MutationOp, MutationSender};
 
 /// Trait for sinking bitmap mutations during document ingestion.

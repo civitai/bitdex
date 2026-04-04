@@ -14,7 +14,7 @@ use std::time::Instant;
 use roaring::RoaringBitmap;
 use sqlx::PgPool;
 
-use crate::loader::BitmapAccum;
+use super::loader::BitmapAccum;
 
 use super::copy_queries;
 

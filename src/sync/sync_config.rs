@@ -14,7 +14,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::pg_sync::trigger_gen::SyncSource;
+use crate::sync::trigger_gen::SyncSource;
 
 /// Top-level sync config parsed from the YAML file.
 #[derive(Debug, Clone, Deserialize)]
@@ -649,7 +649,7 @@ triggers: []
         sql.push_str("-- -----------------------------------------------------------------------\n");
         sql.push_str("-- Part 1: V2 Tables (BitdexOps + bitdex_cursors + cleanup trigger)\n");
         sql.push_str("-- -----------------------------------------------------------------------\n\n");
-        sql.push_str(crate::pg_sync::queries::SETUP_V2_SQL);
+        sql.push_str(crate::sync::queries::SETUP_V2_SQL);
         sql.push_str("\n\n");
 
         // Part 2: Per-trigger SQL
@@ -658,8 +658,8 @@ triggers: []
         sql.push_str("-- -----------------------------------------------------------------------\n\n");
 
         for (i, trigger) in config.triggers.iter().enumerate() {
-            let name = crate::pg_sync::trigger_gen::trigger_name(trigger);
-            let trigger_sql = crate::pg_sync::trigger_gen::generate_trigger_sql(trigger);
+            let name = crate::sync::trigger_gen::trigger_name(trigger);
+            let trigger_sql = crate::sync::trigger_gen::generate_trigger_sql(trigger);
 
             sql.push_str(&format!("-- [{}/{}] Table: {} → Trigger: {}\n", i + 1, config.triggers.len(), trigger.table, name));
             if let Some(ref tt) = trigger.table_type {
@@ -683,7 +683,7 @@ triggers: []
         sql.push_str(&format!("-- Tables created: BitdexOps, bitdex_cursors\n"));
         sql.push_str(&format!("-- Triggers: {}\n", config.triggers.len()));
         for trigger in &config.triggers {
-            let name = crate::pg_sync::trigger_gen::trigger_name(trigger);
+            let name = crate::sync::trigger_gen::trigger_name(trigger);
             sql.push_str(&format!("--   {} on \"{}\"\n", name, trigger.table));
         }
         sql.push_str("--\n");

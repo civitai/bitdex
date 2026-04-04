@@ -24,12 +24,12 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
-use crate::concurrent_engine::ConcurrentEngine;
+use crate::engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
 use crate::silos::doc_format::PackedValue;
-use crate::dump_enrichment;
-use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
-use crate::dump_expression::ExprValue as NateExprValue;
+use super::dump_enrichment;
+use super::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
+use super::dump_expression::ExprValue as NateExprValue;
 
 const LOG_INTERVAL: u64 = 1_000_000;
 
@@ -2779,7 +2779,7 @@ mod tests {
         };
         config.storage.bitmap_path = Some(bitmap_path.clone());
 
-        let engine = crate::concurrent_engine::ConcurrentEngine::new_with_path(
+        let engine = crate::engine::concurrent_engine::ConcurrentEngine::new_with_path(
             config, docs_path.as_path(),
         ).unwrap();
 
@@ -2882,7 +2882,7 @@ mod tests {
             DumpFieldMapping::Short("type".to_string()),
         ];
 
-        let enriched = crate::dump_enrichment::EnrichedFields::default();
+        let enriched = super::dump_enrichment::EnrichedFields::default();
         let computed_defs: Vec<ComputedFieldDef> = vec![];
         let indexed_fields = row.to_indexed_fields();
         let col_idx = row.col_index_ref();
@@ -2916,7 +2916,7 @@ mod tests {
         let row = ParsedRow { fields, col_index: &col_index };
 
         let request_fields = vec![DumpFieldMapping::Short("userId".to_string())];
-        let enriched = crate::dump_enrichment::EnrichedFields::default();
+        let enriched = super::dump_enrichment::EnrichedFields::default();
         let computed_defs: Vec<ComputedFieldDef> = vec![];
         let indexed_fields = row.to_indexed_fields();
         let col_idx = row.col_index_ref();

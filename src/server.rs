@@ -20,11 +20,11 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
-use crate::concurrent_engine::ConcurrentEngine;
+use crate::engine::ConcurrentEngine;
 use crate::config::{Config, DataSchema, FieldValueType, FilterFieldConfig, SortFieldConfig};
 use crate::silos::doc_format::StoredDoc;
 use crate::engine::executor::{CaseSensitiveFields, StringMaps};
-use crate::loader;
+use crate::sync::loader;
 use crate::metrics::Metrics;
 use crate::mutation::FieldValue;
 use crate::query::{BitdexQuery, Value};
@@ -345,10 +345,10 @@ struct AppState {
     ops_wal: Mutex<Option<crate::ops_wal::WalWriter>>,
     /// Latest sync source metadata (cursor, lag) keyed by source name.
     #[cfg(feature = "pg-sync")]
-    sync_meta: Mutex<std::collections::HashMap<String, crate::pg_sync::ops::SyncMeta>>,
+    sync_meta: Mutex<std::collections::HashMap<String, crate::sync::ops::SyncMeta>>,
     /// Dump registry for tracking table dump lifecycle.
     #[cfg(feature = "pg-sync")]
-    dump_registry: Mutex<crate::pg_sync::dump::DumpRegistry>,
+    dump_registry: Mutex<crate::sync::dump::DumpRegistry>,
     /// Shared slot watermark for progressive shard pre-creation.
     /// Updated by dump phases as they see new max slot IDs.
     #[cfg(feature = "pg-sync")]
@@ -1076,7 +1076,7 @@ impl BitdexServer {
             #[cfg(feature = "pg-sync")]
             dump_registry: {
                 let dumps_path = self.data_dir.join("dumps.json");
-                let mut reg = crate::pg_sync::dump::DumpRegistry::load(&dumps_path);
+                let mut reg = crate::sync::dump::DumpRegistry::load(&dumps_path);
                 // Auto-clear stale dump state after PVC wipe: if dumps.json has
                 // Complete entries but no bitmaps exist, the PVC was wiped.
                 let indexes_dir = self.data_dir.join("indexes");
@@ -1084,9 +1084,9 @@ impl BitdexServer {
                     .map(|entries| entries.filter_map(|e| e.ok())
                         .any(|e| e.path().join("bitmaps").exists()))
                     .unwrap_or(false);
-                if !has_bitmaps && reg.dumps.values().any(|d| d.status == crate::pg_sync::dump::DumpStatus::Complete) {
+                if !has_bitmaps && reg.dumps.values().any(|d| d.status == crate::sync::dump::DumpStatus::Complete) {
                     eprintln!("WARNING: dumps.json has Complete entries but no bitmaps found — clearing stale dump state (PVC wipe detected)");
-                    reg = crate::pg_sync::dump::DumpRegistry::default();
+                    reg = crate::sync::dump::DumpRegistry::default();
                     reg.save(&dumps_path).ok();
                 }
                 Mutex::new(reg)
@@ -1177,7 +1177,7 @@ impl BitdexServer {
                                     // Build FieldMeta, CoalescerSink, and DocWriter for the ops processor
                                     let meta = crate::ops_processor::FieldMeta::from_config(engine.config());
                                     let sender = engine.mutation_sender();
-                                    let mut sink = crate::ingester::CoalescerSink::new(sender);
+                                    let mut sink = crate::sync::ingester::CoalescerSink::new(sender);
                                     let mut doc_writer = crate::ops_processor::DocWriter::new(
                                         engine.docstore_arc(),
                                     );
@@ -1534,7 +1534,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         // Phase 4: Metrics bridge wiring
         let phase_start = std::time::Instant::now();
         // Wire Prometheus metrics bridge into the engine's background threads.
-        engine.set_metrics_bridge(crate::concurrent_engine::MetricsBridge {
+        engine.set_metrics_bridge(crate::engine::concurrent_engine::MetricsBridge {
             lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
             compaction_total: state.metrics.compaction_total.clone(),
             compaction_duration: state.metrics.compaction_duration_seconds.clone(),
@@ -1784,7 +1784,7 @@ async fn handle_create_index(
     }
 
     // Wire Prometheus metrics bridge into the engine's background threads.
-    engine.set_metrics_bridge(crate::concurrent_engine::MetricsBridge {
+    engine.set_metrics_bridge(crate::engine::concurrent_engine::MetricsBridge {
         lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
         compaction_total: state.metrics.compaction_total.clone(),
         compaction_duration: state.metrics.compaction_duration_seconds.clone(),
@@ -4157,7 +4157,7 @@ async fn handle_pgsync_metrics(
 async fn handle_ops(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(batch): Json<crate::pg_sync::ops::OpsBatch>,
+    Json(batch): Json<crate::sync::ops::OpsBatch>,
 ) -> impl IntoResponse {
     // Verify index exists
     {
@@ -4302,7 +4302,7 @@ async fn handle_register_dump(
     // Detect V2 DumpRequest by presence of csv_path
     if body.get("csv_path").is_some() {
         // V2: parse DumpRequest and process asynchronously
-        let request: crate::dump_processor::DumpRequest = match serde_json::from_value(body) {
+        let request: crate::sync::dump_processor::DumpRequest = match serde_json::from_value(body) {
             Ok(r) => r,
             Err(e) => {
                 return (
@@ -4368,7 +4368,7 @@ async fn handle_register_dump(
             let bitmap_path = engine.config().storage.bitmap_path.clone();
             let filter_names: Vec<String> = engine.config()
                 .filter_fields.iter().map(|f| f.name.clone()).collect();
-            let _precreator = crate::dump_processor::ShardPreCreator::spawn(
+            let _precreator = crate::sync::dump_processor::ShardPreCreator::spawn(
                 Arc::clone(&state.slot_watermark),
                 Arc::clone(&state.precreator_done),
                 docstore_root,
@@ -4400,7 +4400,7 @@ async fn handle_register_dump(
                 let shutdown_check: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                     shutdown_flag.shutting_down.load(std::sync::atomic::Ordering::Relaxed)
                 });
-                crate::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema), Some(slot_watermark), Some(shutdown_check))
+                crate::sync::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema), Some(slot_watermark), Some(shutdown_check))
             })
             .await;
 
@@ -4416,7 +4416,7 @@ async fn handle_register_dump(
                         tasks.set_error(task_id, msg.clone());
                         let mut reg = state_clone.dump_registry.lock();
                         if let Some(entry) = reg.dumps.get_mut(&dump_name_inner) {
-                            entry.status = crate::pg_sync::dump::DumpStatus::Failed(msg);
+                            entry.status = crate::sync::dump::DumpStatus::Failed(msg);
                         }
                         let dumps_path = state_clone.data_dir.join("dumps.json");
                         reg.save(&dumps_path).ok();
@@ -4426,7 +4426,7 @@ async fn handle_register_dump(
                     // Reload fields only for the alive phase (images).
                     // Other phases just save to disk — fields get loaded lazily on first query.
                     if phase_sets_alive {
-                        crate::dump_processor::reload_after_dumps(&engine_for_reload, true);
+                        crate::sync::dump_processor::reload_after_dumps(&engine_for_reload, true);
                     }
 
                     // Save bitmaps + compact doc silo after each phase completes.
@@ -4441,7 +4441,7 @@ async fn handle_register_dump(
                     }
                     {
                         let t_compact = std::time::Instant::now();
-                        if let Err(e) = crate::dump_processor::compact_after_dumps(&engine_for_reload) {
+                        if let Err(e) = crate::sync::dump_processor::compact_after_dumps(&engine_for_reload) {
                             eprintln!("WARNING: compact after dump '{}': {e}", dump_name_inner);
                         } else {
                             eprintln!("  Dump {} compact in {:.1}s", dump_name_inner, t_compact.elapsed().as_secs_f64());
@@ -4459,7 +4459,7 @@ async fn handle_register_dump(
                     // Mark dump as complete in registry
                     let mut reg = state_clone.dump_registry.lock();
                     if let Some(entry) = reg.dumps.get_mut(&dump_name_inner) {
-                        entry.status = crate::pg_sync::dump::DumpStatus::Complete;
+                        entry.status = crate::sync::dump::DumpStatus::Complete;
                         entry.ops_processed = row_count;
                         entry.completed_at = Some(
                             std::time::SystemTime::now()
@@ -4595,7 +4595,7 @@ async fn handle_sync_lag(
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
     let sync_meta = state.sync_meta.lock();
-    let sources: Vec<&crate::pg_sync::ops::SyncMeta> = sync_meta.values().collect();
+    let sources: Vec<&crate::sync::ops::SyncMeta> = sync_meta.values().collect();
     Json(serde_json::json!({ "sources": sources }))
 }
 

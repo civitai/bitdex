@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::dictionary::FieldDictionary;
-use crate::dump_expression::{
+use super::dump_expression::{
     ColumnIndex, ComputedFieldDef, CsvRow, ExprValue, FilterExpression,
 };
 
@@ -543,7 +543,7 @@ impl EnrichmentManager {
     }
 
     /// Enrich a row using indexed fields (zero-allocation hot path).
-    pub fn enrich_row_indexed(&self, fields: &[Option<&str>], col_idx: &crate::dump_expression::ColumnIndex) -> EnrichedFields {
+    pub fn enrich_row_indexed(&self, fields: &[Option<&str>], col_idx: &super::dump_expression::ColumnIndex) -> EnrichedFields {
         let mut combined = EnrichedFields::default();
         for (table, config) in self.tables.values() {
             let enriched = table.enrich_indexed(fields, col_idx, config);
