@@ -1682,7 +1682,7 @@ pub fn process_dump_with_progress(
                 // Computed early so both the deferred alive path and normal path can include them
                 // in the docstore write. Without this, deferred rows get sortAt:0 in docstore.
                 let config_computed_sort_vals: Vec<(&str, i64)> = if !config_computed_sorts_ref.is_empty() {
-                    let mut row_sv: HashMap<&str, u32> = HashMap::new();
+                    let mut row_sv: HashMap<&str, u32> = HashMap::with_capacity(8);
                     for fm in request_fields {
                         let t = fm.target();
                         if sort_bits_ref.contains_key(t) || config_computed_sources_ref.contains(t) {
@@ -1942,8 +1942,7 @@ pub fn process_dump_with_progress(
                 // These use the per-row sort values already set above.
                 if !config_computed_sorts_ref.is_empty() {
                     // Collect per-row sort values from direct fields, enrichment, and dump computed fields.
-                    // We need the u32 values that were just set in sort_maps.
-                    let mut row_sort_vals: HashMap<&str, u32> = HashMap::new();
+                    let mut row_sort_vals: HashMap<&str, u32> = HashMap::with_capacity(8);
 
                     // Direct fields (sort fields + computed sort sources)
                     for field_mapping in request_fields {
