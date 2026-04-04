@@ -1540,7 +1540,9 @@ pub fn process_dump_with_progress(
 
     // Prepare parallel ops writer for direct mmap writes from rayon threads.
     // Each thread writes doc ops directly to the mmap'd ops log at 32M+ ops/s.
-    let parallel_ops_writer: Option<Arc<datasilo::ParallelOpsWriter>> = if !is_multi_value_only {
+    // Prepare parallel ops writer for ALL phases (including multi-value).
+    // For MV phases, the post-pass uses it to write doc ops in parallel.
+    let parallel_ops_writer: Option<Arc<datasilo::ParallelOpsWriter>> = {
         let estimated_rows = (body.len() / 100).max(1000);
         let estimated_bytes = estimated_rows as u64 * 400; // ~300 bytes per doc + framing
         let ds = engine.docstore_arc();
@@ -1552,8 +1554,6 @@ pub fn process_dump_with_progress(
                 None
             }
         }
-    } else {
-        None
     };
     let pw_ref = &parallel_ops_writer;
 
@@ -2175,17 +2175,34 @@ pub fn process_dump_with_progress(
                         }
                     }
                 }
-                let mv_ops: Vec<(u32, Vec<u8>)> = slot_values.into_iter().map(|(slot, values)| {
-                    let fields = vec![(fidx, PackedValue::Mi(values))];
-                    let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
-                    (slot, bytes)
-                }).collect();
-                eprintln!("  Dump {}: multi-value post-pass wrote {} doc ops ({:.1}s)",
-                    request.name, mv_ops.len(), t_doc.elapsed().as_secs_f64());
-                if !mv_ops.is_empty() {
-                    ds_lock.silo_mut().append_ops_batch(&mv_ops)
-                        .map_err(|e| format!("append_ops_batch (multi-value): {e}"))?;
+                let mv_count = slot_values.len();
+                if mv_count > 0 {
+                    if let Some(ref pw) = parallel_ops_writer {
+                        // Parallel path: encode + write directly to mmap
+                        use rayon::prelude::*;
+                        let mv_entries: Vec<(u32, Vec<i64>)> = slot_values.into_iter().collect();
+                        mv_entries.par_iter().for_each(|(slot, values)| {
+                            let fields = vec![(fidx, PackedValue::Mi(values.clone()))];
+                            let bytes = crate::silos::doc_format::encode_merge_fields(*slot, &fields);
+                            let mut c = 0usize;
+                            let mut e = 0usize;
+                            pw.write_put(*slot, &bytes, &mut c, &mut e);
+                        });
+                        ds_lock.silo().flush_ops()
+                            .map_err(|e| format!("flush_ops (multi-value parallel): {e}"))?;
+                    } else {
+                        // Sequential fallback
+                        let mv_ops: Vec<(u32, Vec<u8>)> = slot_values.into_iter().map(|(slot, values)| {
+                            let fields = vec![(fidx, PackedValue::Mi(values))];
+                            let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
+                            (slot, bytes)
+                        }).collect();
+                        ds_lock.silo_mut().append_ops_batch(&mv_ops)
+                            .map_err(|e| format!("append_ops_batch (multi-value): {e}"))?;
+                    }
                 }
+                eprintln!("  Dump {}: multi-value post-pass wrote {} doc ops ({:.1}s)",
+                    request.name, mv_count, t_doc.elapsed().as_secs_f64());
             }
         } else if parallel_ops_writer.is_some() {
             // Doc ops were already written directly to the mmap'd ops log during parse.
