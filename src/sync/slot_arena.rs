@@ -228,6 +228,9 @@ impl SlotArena {
                 crate::error::BitdexError::Storage(format!("SlotArena: mmap: {e}"))
             })?
         };
+        // Random hint: write phase has each rayon thread writing to arbitrary slot
+        // offsets determined by document ID — access pattern is uniformly scattered.
+        #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Random);
 
         eprintln!(
             "SlotArena: allocated {} MB for {} slots at {}",
@@ -666,6 +669,8 @@ impl SlotArena {
         _schema: &DataSchema,
         _alive: &RoaringBitmap,
     ) -> Result<(u64, u64)> {
+        // TODO(madvise): when implemented, switch hint to Sequential before the
+        // 0..max_slot scan: `let _ = self.mmap.advise(memmap2::Advice::Sequential);`
         Err(crate::error::BitdexError::Storage(
             "finalize_to_docstore: not yet ported to DataSilo".to_string()
         ))
@@ -673,6 +678,11 @@ impl SlotArena {
 
     /// Clean up the arena file.
     pub fn cleanup(self) -> std::io::Result<()> {
+        // DONTNEED before drop: immediately reclaims RSS on Linux (up to ~54 GB at
+        // 107M slots) before the OS-level munmap completes.
+        #[cfg(target_os = "linux")]
+        let _ = unsafe { self.mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        // (On non-Linux Unix, the drop/munmap itself frees pages promptly enough.)
         drop(self.mmap);
         drop(self._file);
         std::fs::remove_file(&self.arena_path)

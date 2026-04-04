@@ -493,7 +493,8 @@ impl<'a> ParsedRow<'a> {
 
     /// Fill a pre-allocated buffer with indexed fields (reuse across rows).
     /// Avoids Vec allocation per row — just clear and refill.
-    pub fn fill_indexed_fields<'b>(&'b self, buf: &mut Vec<Option<&'b str>>) {
+    /// Uses lifetime 'a (mmap chunk) not 'b (row borrow) so the Vec can live outside the loop.
+    pub fn fill_indexed_fields(&self, buf: &mut Vec<Option<&'a str>>) {
         buf.clear();
         for bytes in &self.fields {
             buf.push(parse_field_to_str(bytes));
@@ -1361,6 +1362,8 @@ pub fn process_dump_with_progress(
         .map_err(|e| format!("open {}: {e}", csv_path.display()))?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }
         .map_err(|e| format!("mmap {}: {e}", csv_path.display()))?;
+    // Sequential hint: single front-to-back scan split across rayon threads.
+    #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Sequential);
     let data = &mmap[..];
     let delimiter = detect_delimiter(data, &request.format);
 
@@ -1609,6 +1612,11 @@ pub fn process_dump_with_progress(
             let mut count = 0u64;
             let mut max_slot: u32 = 0;
             let mut line_start = 0;
+            // Reusable buffer for indexed fields — avoids Vec alloc per row.
+            // Lifetime 'a is the mmap chunk, so refs survive across loop iterations.
+            let mut indexed_fields_buf: Vec<Option<&str>> = Vec::new();
+            // Reusable buffer for enrichment results — avoids Vec realloc per row.
+            let mut enriched_buf = dump_enrichment::EnrichedFields::default();
 
             for i in 0..chunk.len() {
                 if chunk[i] != b'\n' {
@@ -1641,8 +1649,8 @@ pub fn process_dump_with_progress(
                     }
                 }
 
-                // Build indexed fields (Vec<Option<&str>> — per-row allocation)
-                let indexed_fields_buf = row.to_indexed_fields();
+                // Reuse indexed fields buffer (clear + refill, no alloc after first row)
+                row.fill_indexed_fields(&mut indexed_fields_buf);
                 let col_idx = row.col_index_ref();
 
                 // Apply filter via indexed path (zero-allocation)
@@ -1653,15 +1661,14 @@ pub fn process_dump_with_progress(
                 }
 
 
-                // Resolve enrichment via indexed path (no CsvRow HashMap)
-                let enriched = if enrichment_mgr_ref.table_count() > 0 {
-                    Some(enrichment_mgr_ref.enrich_row_indexed(&indexed_fields_buf, col_idx))
+                // Resolve enrichment via indexed path — reuse buffer (no Vec realloc after first row)
+                if enrichment_mgr_ref.table_count() > 0 {
+                    enrichment_mgr_ref.enrich_row_indexed_into(&indexed_fields_buf, col_idx, &mut enriched_buf);
                 } else {
-                    None
-                };
-
-                // Collect enriched field values (avoid HashMap — linear scan is fine for <10 fields)
-                let enriched = enriched.unwrap_or_default();
+                    enriched_buf.fields.clear();
+                    enriched_buf.computed.clear();
+                }
+                let enriched = &enriched_buf;
                 // Build a simple lookup closure for enriched values
                 let enriched_get = |target: &str| -> Option<&str> {
                     for (t, v) in &enriched.fields {
@@ -1832,8 +1839,8 @@ pub fn process_dump_with_progress(
                             };
                             if let Some(key) = bitmap_key {
                                 fm.entry(key)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(slot);
+                                    .or_default()
+                                    .push(slot);
                             }
                         }
                         // Sort bitmap
@@ -1860,15 +1867,15 @@ pub fn process_dump_with_progress(
                             let key = if *b { 1u64 } else { 0u64 };
                             if let Some(fm) = filter_maps.get_mut(target.as_str()) {
                                 fm.entry(key)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(slot);
+                                    .or_default()
+                                    .push(slot);
                             }
                         }
                         NateExprValue::Int(n) => {
                             if let Some(fm) = filter_maps.get_mut(target.as_str()) {
                                 fm.entry(*n as u64)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(slot);
+                                    .or_default()
+                                    .push(slot);
                             }
                             if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
                                 let val32 = (*n).max(0) as u32;
@@ -1893,11 +1900,9 @@ pub fn process_dump_with_progress(
                         Some(NateExprValue::Int(v)) if def.value_column.is_none() => {
                             // Regular computed field — use value directly as bitmap key
                             if let Some(fm) = filter_maps.get_mut(&def.target) {
-                                {
-                                    fm.entry(v as u64)
-                                        .or_insert_with(RoaringBitmap::new)
-                                        .insert(slot);
-                                }
+                                fm.entry(v as u64)
+                                    .or_default()
+                                    .push(slot);
                             }
                             if let Some(&bits) = sort_bits_ref.get(&def.target) {
                                 let val32 = v.max(0) as u32;
@@ -1917,8 +1922,8 @@ pub fn process_dump_with_progress(
                                 if filter_field_names_ref.contains(&def.target) {
                                     if let Some(fm) = filter_maps.get_mut(&def.target) {
                                         fm.entry(v as u64)
-                                            .or_insert_with(RoaringBitmap::new)
-                                            .insert(slot);
+                                            .or_default()
+                                            .push(slot);
                                     }
                                 }
                             }
@@ -1927,11 +1932,9 @@ pub fn process_dump_with_progress(
                             // Boolean computed field (e.g. hasMeta, isPublished)
                             let key = if b { 1u64 } else { 0u64 };
                             if let Some(fm) = filter_maps.get_mut(&def.target) {
-                                {
-                                    fm.entry(key)
-                                        .or_insert_with(RoaringBitmap::new)
-                                        .insert(slot);
-                                }
+                                fm.entry(key)
+                                    .or_default()
+                                    .push(slot);
                             }
                         }
                         _ => {} // Null or non-matching pattern
@@ -2039,6 +2042,8 @@ pub fn process_dump_with_progress(
             if let Some(ref p) = ext_progress { p.fetch_add(remainder, Ordering::Relaxed); }
 
             // Convert sort_vecs to sort_maps via sort + from_sorted_iter (5.86x faster)
+            // Note: filter bitmaps stay as direct RoaringBitmap::insert — high-cardinality fields
+            // (userId etc) create millions of tiny Vecs where sort+from_sorted_iter is slower.
             let sort_maps: HashMap<String, Vec<RoaringBitmap>> = sort_vecs.into_iter().map(|(field, layers)| {
                 let bitmaps: Vec<RoaringBitmap> = layers.into_iter().map(|mut slots| {
                     if slots.is_empty() {
@@ -2060,6 +2065,10 @@ pub fn process_dump_with_progress(
     // Drop the mmap immediately after parsing — prevents zombie processes from
     // holding 80+ GB of virtual memory if the process is force-killed during
     // the merge/save phase. NLL ensures the borrow of `body`/`data` has ended.
+    // DONTNEED before drop: immediately reduces RSS on Linux before the OS-level
+    // unmap completes. Especially important for 80+ GB CSV files.
+    #[cfg(target_os = "linux")]
+    let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
     drop(mmap);
     drop(file);
     eprintln!("  Dump {}: mmap released", request.name);

@@ -349,6 +349,8 @@ impl DataSilo {
             .create(true).read(true).write(true).truncate(true).open(&data_path)?;
         data_file.set_len(total_data_size)?;
         let mut data_mmap = unsafe { memmap2::MmapMut::map_mut(&data_file)? };
+        // Sequential hint: bulk write pass reads/writes monotonically increasing offsets.
+        #[cfg(unix)] let _ = data_mmap.advise(memmap2::Advice::Sequential);
 
         let index_count = max_key as usize + 1;
         let index_path = self.path.join("index.bin");
@@ -628,6 +630,8 @@ impl DataSilo {
             .create(true).read(true).write(true).truncate(true).open(&data_path)?;
         data_file.set_len(total_data_size)?;
         let mut data_mmap = unsafe { memmap2::MmapMut::map_mut(&data_file)? };
+        // Sequential hint: bulk write pass reads/writes monotonically increasing offsets.
+        #[cfg(unix)] let _ = data_mmap.advise(memmap2::Advice::Sequential);
 
         let index_count = max_key as usize + 1;
         let index_path = self.path.join("index.bin");
@@ -1069,6 +1073,8 @@ impl DataSilo {
         let f = OpenOptions::new().read(true).write(true).open(&p)?;
         if f.metadata()?.len() < INDEX_ENTRY_SIZE as u64 { return Ok(()); }
         let mmap = unsafe { memmap2::MmapMut::map_mut(&f)? };
+        // Random hint: index lookups address arbitrary slots by key hash.
+        #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Random);
         self.index_len = (mmap.len() / INDEX_ENTRY_SIZE) as u32;
         self.index_mmap = Some(mmap);
         Ok(())
@@ -1081,6 +1087,14 @@ impl DataSilo {
         let meta = f.metadata()?;
         if meta.len() == 0 { return Ok(()); }
         let mmap = unsafe { memmap2::Mmap::map(&f)? };
+        // Random hint: doc lookups access scattered offsets by slot ID.
+        #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Random);
+        // HugePage hint on large data files (>512 MB) to reduce TLB pressure.
+        // Linux-only; no-op on all other platforms.
+        #[cfg(target_os = "linux")]
+        if meta.len() > 512 * 1024 * 1024 {
+            let _ = mmap.advise(memmap2::Advice::HugePage);
+        }
         self.data_len = meta.len();
         self.data_mmap = Some(mmap);
         Ok(())

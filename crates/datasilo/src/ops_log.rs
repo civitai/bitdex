@@ -67,6 +67,8 @@ impl OpsLog {
             // Open existing log — find the actual data end by scanning for valid ops
             let file = OpenOptions::new().read(true).write(true).open(&path)?;
             let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+            // Sequential hint: ops log is always read/written front-to-back.
+            #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Sequential);
             let data_end = Self::find_data_end(&mmap);
             Ok(Self {
                 path,
@@ -95,6 +97,8 @@ impl OpsLog {
             .open(&self.path)?;
         file.set_len(new_size)?;
         let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        // Sequential hint: ops log is always appended to and scanned front-to-back.
+        #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Sequential);
         self.mmap = Some(mmap);
         self.capacity = new_size;
         Ok(())

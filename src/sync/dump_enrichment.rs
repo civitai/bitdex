@@ -242,6 +242,8 @@ impl EnrichmentTable {
         let file = std::fs::File::open(&config.csv_path)?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap: {e}")))?;
+        // Sequential hint: single front-to-back parallel scan; pages freed after read.
+        #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Sequential);
         let raw = &mmap[..];
 
         // Column names from config or first line
@@ -400,27 +402,37 @@ impl EnrichmentTable {
         config: &EnrichmentConfig,
     ) -> EnrichedFields {
         let mut result = EnrichedFields::default();
+        self.enrich_indexed_into(parent_fields, parent_col_idx, config, &mut result);
+        result
+    }
 
+    /// Enrich into a pre-allocated buffer (avoids Vec reallocation across rows).
+    pub fn enrich_indexed_into(
+        &self,
+        parent_fields: &[Option<&str>],
+        parent_col_idx: &ColumnIndex,
+        config: &EnrichmentConfig,
+        result: &mut EnrichedFields,
+    ) {
         let join_value = match parent_col_idx.get(&config.join_on) {
             Some(&idx) => match parent_fields.get(idx) {
                 Some(Some(v)) if !v.is_empty() => *v,
-                _ => return result,
+                _ => return,
             },
-            None => return result,
+            None => return,
         };
 
         let join_key: i64 = match join_value.parse() {
             Ok(k) => k,
-            Err(_) => return result,
+            Err(_) => return,
         };
 
         let lookup_row = match self.get(join_key) {
             Some(row) => row,
-            None => return result,
+            None => return,
         };
 
-        self.enrich_from_lookup(lookup_row, join_key, config, &mut result);
-        result
+        self.enrich_from_lookup(lookup_row, join_key, config, result);
     }
 
     /// Core enrichment: extract fields + eval computed from a lookup row.
@@ -545,12 +557,18 @@ impl EnrichmentManager {
     /// Enrich a row using indexed fields (zero-allocation hot path).
     pub fn enrich_row_indexed(&self, fields: &[Option<&str>], col_idx: &super::dump_expression::ColumnIndex) -> EnrichedFields {
         let mut combined = EnrichedFields::default();
-        for (table, config) in self.tables.values() {
-            let enriched = table.enrich_indexed(fields, col_idx, config);
-            combined.fields.extend(enriched.fields);
-            combined.computed.extend(enriched.computed);
-        }
+        self.enrich_row_indexed_into(fields, col_idx, &mut combined);
         combined
+    }
+
+    /// Enrich a row into a pre-allocated buffer (reuse across rows).
+    /// Avoids Vec reallocation — clear + refill. String allocs still per-row.
+    pub fn enrich_row_indexed_into(&self, fields: &[Option<&str>], col_idx: &super::dump_expression::ColumnIndex, out: &mut EnrichedFields) {
+        out.fields.clear();
+        out.computed.clear();
+        for (table, config) in self.tables.values() {
+            table.enrich_indexed_into(fields, col_idx, config, out);
+        }
     }
 
     /// Drop all tables to free memory. Call after the phase completes.

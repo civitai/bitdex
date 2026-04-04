@@ -139,6 +139,8 @@ impl HashIndex {
 
         // SAFETY: The file was just created and set to the correct length.
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        // Random hint: hash table probes are uniformly distributed across the file.
+        #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Random);
 
         // Write header.
         write_u64(&mut mmap, 0, MAGIC);
@@ -159,6 +161,8 @@ impl HashIndex {
 
         // SAFETY: The file is open and we trust its contents (checked via magic).
         let mmap = unsafe { MmapMut::map_mut(&file)? };
+        // Random hint: hash table probes are uniformly distributed across the file.
+        #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Random);
 
         if mmap.len() < HEADER_SIZE {
             return Err(SiloError::InvalidFile);
