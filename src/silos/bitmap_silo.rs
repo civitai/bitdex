@@ -501,43 +501,60 @@ impl BitmapSilo {
 
     /// Internal: read frozen base from data file + scan ops log for pending mutations.
     fn get_bitmap_with_ops(&self, key: u32) -> Option<RoaringBitmap> {
-        // Start with frozen base from data file (or empty if not yet compacted)
-        let mut bitmap = match self.silo.get(key) {
-            Some(bytes) if !bytes.is_empty() => {
-                FrozenRoaringBitmap::view(bytes).ok()?.to_owned()
-            }
-            _ => RoaringBitmap::new(),
-        };
+        // Get frozen base from data file
+        let frozen_base = self.silo.get(key)
+            .and_then(|bytes| if bytes.is_empty() { None } else { FrozenRoaringBitmap::view(bytes).ok() });
 
-        // Scan both ops logs for pending set/clear mutations
-        let mut found_any = false;
+        // Collect pending set/clear ops from both ops logs
+        let mut sets: Vec<u32> = Vec::new();
+        let mut clears: Vec<u32> = Vec::new();
+        let mut full_replace: Option<RoaringBitmap> = None;
+
         let _ = self.silo.scan_ops_for_key(key, |value| {
             if value.is_empty() { return; }
             match value[0] {
                 OP_SET_BIT if value.len() >= 5 => {
                     let slot = u32::from_le_bytes(value[1..5].try_into().unwrap());
-                    bitmap.insert(slot);
-                    found_any = true;
+                    sets.push(slot);
                 }
                 OP_CLEAR_BIT if value.len() >= 5 => {
                     let slot = u32::from_le_bytes(value[1..5].try_into().unwrap());
-                    bitmap.remove(slot);
-                    found_any = true;
+                    clears.push(slot);
                 }
                 _ => {
                     // Legacy or full bitmap value — replace base entirely
                     if let Ok(frozen) = FrozenRoaringBitmap::view(value) {
-                        bitmap = frozen.to_owned();
-                        found_any = true;
+                        full_replace = Some(frozen.to_owned());
+                        sets.clear();
+                        clears.clear();
                     }
                 }
             }
         });
 
-        if bitmap.is_empty() && !found_any {
-            None
-        } else {
-            Some(bitmap)
+        // If we got a full replacement, apply remaining ops to it
+        if let Some(mut bitmap) = full_replace {
+            for &slot in &sets { bitmap.insert(slot); }
+            for &slot in &clears { bitmap.remove(slot); }
+            return Some(bitmap);
+        }
+
+        if sets.is_empty() && clears.is_empty() {
+            // No ops — return frozen base as owned (or None if no base)
+            return frozen_base.map(|f| f.to_owned());
+        }
+
+        // Container-level CoW: only copies containers touched by ops
+        sets.sort_unstable();
+        clears.sort_unstable();
+        match frozen_base {
+            Some(frozen) => Some(frozen.apply_ops(&sets, &clears)),
+            None => {
+                // No base — build from ops alone
+                let mut bitmap = RoaringBitmap::new();
+                for &slot in &sets { bitmap.insert(slot); }
+                Some(bitmap)
+            }
         }
     }
 

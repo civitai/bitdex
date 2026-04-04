@@ -30,10 +30,10 @@ pub fn run_janitor(
             }
         }
 
-        // Compact CacheSilo when it has accumulated enough dead space.
+        // Compact CacheSilo aggressively — it's small (hundreds of entries)
+        // and stale ops degrade query cache hit performance.
         if let Some(ref cs_arc) = cache_silo {
-            let needs_compact = cs_arc.read().needs_compaction();
-            if needs_compact {
+            if cs_arc.read().has_ops() {
                 if let Err(e) = cs_arc.write().compact() {
                     eprintln!("janitor: CacheSilo compaction failed: {e}");
                 }

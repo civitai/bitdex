@@ -387,6 +387,11 @@ impl CacheSilo {
     pub fn needs_compaction(&self) -> bool {
         self.silo.needs_compaction()
     }
+
+    /// Whether the silo has any pending ops.
+    pub fn has_ops(&self) -> bool {
+        self.silo.has_ops()
+    }
 }
 
 // ---------------------------------------------------------------------------
