@@ -14,7 +14,7 @@ use crate::doc_format::{StoredDoc};
 use crate::doc_silo_adapter::DocSiloAdapter;
 use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
-use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, Document, FieldRegistry, PatchPayload};
+use crate::mutation::{diff_document, Document, FieldRegistry};
 use crate::planner;
 use crate::query::{BitdexQuery, FilterClause, SortClause};
 use crate::query_metrics::{QueryTrace, QueryTraceCollector, SortTrace};
@@ -210,7 +210,7 @@ pub struct MetricsBridge {
     pub compaction_duration: prometheus::HistogramVec,
     pub index_name: String,
 }
-/// Staging buffer used by bulk-load paths (put_bulk_loading, apply_bitmap_maps).
+/// Staging buffer used by bulk-load paths (apply_bitmap_maps).
 /// Callers build bitmaps into this struct offline and then call publish_staging()
 /// to atomically swap its contents into the live engine under write locks.
 #[derive(Clone)]
@@ -221,7 +221,7 @@ pub struct InnerEngine {
 }
 /// Thread-safe engine using ArcSwap for lock-free snapshot reads.
 ///
-/// Writers call `put`/`patch`/`delete` which compute diffs and send
+/// Writers call `put`/`delete` which compute diffs and send
 /// MutationOps to a channel. A background flush thread applies batched
 /// mutations to a private staging copy, then atomically publishes a
 /// new snapshot via ArcSwap::store().
@@ -241,7 +241,7 @@ pub struct CompactResult {
 /// multiple readers share access lock-free while flush thread holds
 /// write locks only for the duration of batch application.
 ///
-/// Bulk-load callers use `clone_staging()` + `put_bulk_loading()` to build
+/// Bulk-load callers use `clone_staging()` + `apply_bitmap_maps()` to build
 /// bitmaps offline and `publish_staging()` to swap them in.
 pub struct ConcurrentEngine {
     /// Slot allocator: alive bitmap + slot counter + deferred alive set.
@@ -304,11 +304,6 @@ pub struct ConcurrentEngine {
     bitmap_silo: Option<Arc<parking_lot::RwLock<crate::bitmap_silo::BitmapSilo>>>,
     /// Compaction skip counter.
     compaction_skipped: Arc<AtomicU64>,
-    /// WAL writer for Sync V2 write path. When set, put() and patch_document()
-    /// decompose documents into ops and write to WAL instead of directly to coalescer.
-    /// The WAL reader thread picks up ops and routes through apply_ops_batch.
-    #[cfg(feature = "pg-sync")]
-    wal_writer: Option<Arc<crate::ops_wal::WalWriter>>,
 }
 
 /// Stub cache statistics returned by unified_cache_stats().
@@ -639,8 +634,6 @@ impl ConcurrentEngine {
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
                 bitmap_silo: bitmap_silo_arc.clone(),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
-                #[cfg(feature = "pg-sync")]
-                wal_writer: None,
             });
         }
         let flush_handle = {
@@ -1108,8 +1101,6 @@ impl ConcurrentEngine {
             metrics_bridge,
             bitmap_silo: bitmap_silo_arc.clone(),
             compaction_skipped,
-            #[cfg(feature = "pg-sync")]
-            wal_writer: None,
         })
     }
     /// Set the string maps for MappedString field query resolution.
@@ -1248,155 +1239,27 @@ impl ConcurrentEngine {
     /// 2. Check alive status (lock-free snapshot)
     /// 3. Read old doc from docstore if upsert
     /// 4. Diff old vs new -> MutationOps
-    /// 5. Send ops to coalescer channel
+    /// 5. Send ops to silo / coalescer channel
     /// 6. Enqueue doc write to docstore channel (flush thread batches these)
     /// 7. Clear in-flight
     pub fn put(&self, id: u32, doc: &Document) -> Result<()> {
-        // [2.7] WAL path: decompose to ops and write to WAL. The WAL reader
-        // thread handles bitmap mutations + docstore writes asynchronously.
-        #[cfg(feature = "pg-sync")]
-        if let Some(ref wal) = self.wal_writer {
-            return self.put_via_wal(id, doc, wal);
-        }
-        // Legacy direct path (when WAL writer is not configured)
-        self.in_flight.mark_in_flight(id);
-        let result = self.put_inner(id, doc);
-        self.in_flight.clear_in_flight(id);
-        result
-    }
-    /// PUT via WAL: decompose document into field-level ops and append to WAL.
-    /// Returns after fsync — mutations become visible when WAL reader processes them.
-    #[cfg(feature = "pg-sync")]
-    fn put_via_wal(&self, id: u32, doc: &Document, wal: &crate::ops_wal::WalWriter) -> Result<()> {
-        let is_alive = self.is_slot_alive(id);
-        // Read old doc for upsert diffing
-        let old_doc = if is_alive {
-            self.docstore.lock().get(id)?
-        } else {
-            None
-        };
-        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config, false);
-        let creates_slot = !is_alive;
-        let entry = crate::pg_sync::ops::EntityOps {
-            entity_id: id as i64,
-            ops,
-            creates_slot,
-        };
-        wal.append_batch(&[entry]).map_err(|e| {
-            crate::error::BitdexError::Storage(format!("WAL write failed: {e}"))
-        })?;
-        Ok(())
-    }
-    /// PATCH via WAL: decompose partial document into field-level ops and append to WAL.
-    #[cfg(feature = "pg-sync")]
-    fn patch_document_via_wal(&self, id: u32, doc: &Document, wal: &crate::ops_wal::WalWriter) -> Result<()> {
-        let is_alive = self.is_slot_alive(id);
-        if !is_alive {
-            // New slot — full PUT via WAL
-            return self.put_via_wal(id, doc, wal);
-        }
-        // Read old doc for diffing
-        let old_doc = self.docstore.lock().get(id)?;
-        // For PATCH, only emit ops for fields present in the new doc
-        let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config, true);
-        if ops.is_empty() {
-            return Ok(());
-        }
-        let entry = crate::pg_sync::ops::EntityOps {
-            entity_id: id as i64,
-            ops,
-            creates_slot: false,
-        };
-        wal.append_batch(&[entry]).map_err(|e| {
-            crate::error::BitdexError::Storage(format!("WAL write failed: {e}"))
-        })?;
-        Ok(())
-    }
-    /// Inner PUT logic shared by put() and patch_document() (for new slots).
-    /// Caller must handle in_flight marking.
-    fn put_inner(&self, id: u32, doc: &Document) -> Result<()> {
-        // Check alive status under read lock
-        let (is_upsert, was_allocated) = {
-            let slots_r = self.slots.read();
-            let alive = slots_r.is_alive(id);
-            let alloc = if !alive { slots_r.was_ever_allocated(id) } else { false };
-            (alive, alloc)
-        };
-        // Read old doc from docstore if needed
-        let old_doc = if is_upsert || was_allocated {
-            self.docstore.lock().get(id)?
-        } else {
-            None
-        };
-        // Compute diff purely -> Vec<MutationOp>
-        let ops = diff_document(id, old_doc.as_ref(), doc, &self.config, is_upsert, &self.field_registry);
-        // Send ops to coalescer channel
-        self.send_mutation_ops(ops)?;
-        // Enqueue doc write — flush thread will batch these
-        let stored = StoredDoc {
-            fields: doc.fields.clone(),
-            schema_version: 0,
-        };
-        self.doc_tx.send((id, stored)).map_err(|_| {
-            crate::error::BitdexError::CapacityExceeded(
-                "docstore channel disconnected".to_string(),
-            )
-        })?;
-        Ok(())
-    }
-    /// PATCH(id, partial_fields) -- merge only provided fields into existing doc.
-    /// Uses diff_document_partial which skips fields not present in the new doc.
-    /// Also merges provided fields into the stored document.
-    pub fn patch(&self, id: u32, patch: &PatchPayload) -> Result<()> {
         self.in_flight.mark_in_flight(id);
         let result = (|| -> Result<()> {
-            // Verify the slot is alive under read lock
-            if !self.slots.read().is_alive(id) {
-                return Err(crate::error::BitdexError::SlotNotFound(id));
-            }
-            let ops = diff_patch(id, patch, &self.config, &self.field_registry);
+            let (is_upsert, was_allocated) = {
+                let slots_r = self.slots.read();
+                let alive = slots_r.is_alive(id);
+                let alloc = if !alive { slots_r.was_ever_allocated(id) } else { false };
+                (alive, alloc)
+            };
+            let old_doc = if is_upsert || was_allocated {
+                self.docstore.lock().get(id)?
+            } else {
+                None
+            };
+            let ops = diff_document(id, old_doc.as_ref(), doc, &self.config, is_upsert, &self.field_registry);
             self.send_mutation_ops(ops)?;
-            Ok(())
-        })();
-        self.in_flight.clear_in_flight(id);
-        result
-    }
-    /// PATCH with a Document — partial update using diff_document_partial.
-    /// Only fields present in the doc are diffed and updated. Missing fields
-    /// are left untouched in both bitmaps and docstore.
-    pub fn patch_document(&self, id: u32, doc: &Document) -> Result<()> {
-        // [2.7] WAL path: decompose to ops and write to WAL.
-        #[cfg(feature = "pg-sync")]
-        if let Some(ref wal) = self.wal_writer {
-            return self.patch_document_via_wal(id, doc, wal);
-        }
-        self.in_flight.mark_in_flight(id);
-        let result = (|| -> Result<()> {
-            let is_alive = self.slots.read().is_alive(id);
-            if !is_alive {
-                // Slot doesn't exist yet — fall through to full PUT semantics.
-                // This handles new records (e.g., images created after the bulk load).
-                return self.put_inner(id, doc);
-            }
-            // Read old doc for diffing
-            let old_doc = self.docstore.lock().get(id)?;
-            // Compute partial diff — only fields present in doc are processed
-            let ops = crate::mutation::diff_document_partial(
-                id, old_doc.as_ref(), doc, &self.config, &self.field_registry,
-            );
-            // Send bitmap mutations
-            if !ops.is_empty() {
-                self.send_mutation_ops(ops)?;
-            }
-            // Merge provided fields into stored doc (preserve existing fields)
-            let mut merged_fields = old_doc
-                .map(|d| d.fields)
-                .unwrap_or_default();
-            for (k, v) in &doc.fields {
-                merged_fields.insert(k.clone(), v.clone());
-            }
             let stored = StoredDoc {
-                fields: merged_fields,
+                fields: doc.fields.clone(),
                 schema_version: 0,
             };
             self.doc_tx.send((id, stored)).map_err(|_| {
@@ -1454,68 +1317,6 @@ impl ConcurrentEngine {
             Ok(())
         })();
         self.in_flight.clear_in_flight(id);
-        result
-    }
-    /// SYNC filter values for a slot on a filter_only multi-value field.
-    ///
-    /// Replaces all filter bitmap memberships for the given slot on the named field.
-    /// Scans loaded bitmaps to find old values, diffs against new values, and sends
-    /// targeted FilterInsert/FilterRemove ops. No docstore involvement.
-    ///
-    /// Used by the outbox poller for filter_only fields like collectionIds where
-    /// the membership data comes from a separate table (CollectionItem), not the
-    /// image document.
-    pub fn sync_filter_values(&self, slot: u32, field_name: &str, new_values: &[u64]) -> Result<()> {
-        self.in_flight.mark_in_flight(slot);
-        let result = (|| -> Result<()> {
-            // Skip if slot is not alive — the image hasn't been inserted yet.
-            // The next outbox event for this image will trigger a PATCH (which
-            // now falls through to PUT), and that will handle the full insert.
-            // Setting filter bitmaps before the slot is alive would be pointless
-            // since queries require alive status.
-            if !self.slots.read().is_alive(slot) {
-                return Ok(());
-            }
-            // Find old values by scanning loaded bitmaps for this field
-            let old_values: Vec<u64> = {
-                let filters_r = self.filters.read();
-                match filters_r.get_field(field_name) {
-                    Some(field) => field
-                        .bitmap_keys()
-                        .filter(|&&v| {
-                            field.get(v).map_or(false, |bm| bm.contains(slot))
-                        })
-                        .copied()
-                        .collect(),
-                    None => Vec::new(),
-                }
-            };
-            let new_set: std::collections::HashSet<u64> = new_values.iter().copied().collect();
-            let old_set: std::collections::HashSet<u64> = old_values.iter().copied().collect();
-            let arc_name = self.field_registry.get(field_name);
-            let mut ops = Vec::new();
-            // Remove slot from bitmaps for values no longer present
-            for &val in old_set.difference(&new_set) {
-                ops.push(MutationOp::FilterRemove {
-                    field: arc_name.clone(),
-                    value: val,
-                    slots: vec![slot],
-                });
-            }
-            // Insert slot into bitmaps for newly added values
-            for &val in new_set.difference(&old_set) {
-                ops.push(MutationOp::FilterInsert {
-                    field: arc_name.clone(),
-                    value: val,
-                    slots: vec![slot],
-                });
-            }
-            if !ops.is_empty() {
-                self.send_mutation_ops(ops)?;
-            }
-            Ok(())
-        })();
-        self.in_flight.clear_in_flight(slot);
         result
     }
     /// Execute a query from individual filter/sort/limit components.
@@ -2034,12 +1835,6 @@ impl ConcurrentEngine {
     pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<DocSiloAdapter>> {
         Arc::clone(&self.docstore)
     }
-    /// Set the WAL writer for the V2 write path. When set, put() and patch_document()
-    /// decompose documents into ops and write to WAL instead of directly to coalescer.
-    #[cfg(feature = "pg-sync")]
-    pub fn set_wal_writer(&mut self, writer: Arc<crate::ops_wal::WalWriter>) {
-        self.wal_writer = Some(writer);
-    }
     /// Check if a slot is alive (for non-alive slot filtering in ops processing).
     pub fn is_slot_alive(&self, slot: u32) -> bool {
         self.slots.read().is_alive(slot)
@@ -2360,118 +2155,6 @@ impl ConcurrentEngine {
     pub fn in_flight(&self) -> &InFlightTracker {
         &self.in_flight
     }
-    /// PUT_MANY -- batch version of put() for throughput experiments.
-    ///
-    /// Batches the work: one snapshot load for all alive/allocation checks,
-    /// computes all diffs, sends all ops, enqueues all docstore writes, then clears
-    /// in-flight tracking.
-    ///
-    /// EXPERIMENTAL: This is a temporary method for benchmarking put_many vs put-in-loop.
-    pub fn put_many(&self, docs: &[(u32, Document)]) -> Result<()> {
-        // Phase 1: Mark all in-flight
-        for &(id, _) in docs {
-            self.in_flight.mark_in_flight(id);
-        }
-        let result = (|| -> Result<()> {
-            // Phase 2: Single read lock for all alive/allocation checks
-            let statuses: Vec<(u32, bool, bool)> = {
-                let slots_r = self.slots.read();
-                docs.iter()
-                    .map(|&(id, _)| {
-                        let alive = slots_r.is_alive(id);
-                        let alloc = if !alive { slots_r.was_ever_allocated(id) } else { false };
-                        (id, alive, alloc)
-                    })
-                    .collect()
-            };
-            // Phase 3: Batch docstore reads for upserts (outside any lock)
-            let old_docs: Vec<Option<StoredDoc>> = statuses
-                .iter()
-                .map(|&(id, is_upsert, was_allocated)| {
-                    if is_upsert || was_allocated {
-                        self.docstore.lock().get(id).ok().flatten()
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            // Phase 4: Compute all diffs and collect all ops
-            let mut all_ops: Vec<MutationOp> = Vec::new();
-            let mut doc_writes: Vec<(u32, StoredDoc)> = Vec::new();
-
-            for (i, &(id, ref doc)) in docs.iter().enumerate() {
-                let (_, is_upsert, _) = statuses[i];
-                let ops = diff_document(id, old_docs[i].as_ref(), doc, &self.config, is_upsert, &self.field_registry);
-                all_ops.extend(ops);
-                doc_writes.push((
-                    id,
-                    StoredDoc {
-                        fields: doc.fields.clone(),
-                        schema_version: 0,
-                    },
-                ));
-            }
-            // Phase 5: Send all ops to both silo and coalescer
-            self.send_mutation_ops(all_ops)?;
-            // Phase 6: Enqueue all doc writes
-            for item in doc_writes {
-                self.doc_tx.send(item).map_err(|_| {
-                    crate::error::BitdexError::CapacityExceeded(
-                        "docstore channel disconnected".to_string(),
-                    )
-                })?;
-            }
-            Ok(())
-        })();
-        // Phase 7: Clear all in-flight
-        for &(id, _) in docs {
-            self.in_flight.clear_in_flight(id);
-        }
-        result
-    }
-    /// PUT_BULK -- high-throughput bulk insert for initial data loading.
-    ///
-    /// Bypasses the write coalescer entirely. Documents are decomposed into
-    /// per-bitmap operations in parallel across N worker threads, each building
-    /// thread-local HashMaps of RoaringBitmaps. Thread results are merged, then
-    /// applied directly to a staging InnerEngine copy and published via ArcSwap.
-    ///
-    /// This is ~10x faster than put() for bulk loads because:
-    /// - No per-doc channel send/receive overhead
-    /// - No diff computation (fresh inserts, no old doc lookup)
-    /// - Parallel JSON decompose + bitmap building
-    /// - Single snapshot publish at the end
-    ///
-    /// Assumes all slot IDs are fresh inserts (not upserts). For mixed
-    /// insert/update workloads, use put() or put_many().
-    ///
-    /// Documents are persisted to the docstore after bitmap updates.
-    /// Returns the number of documents successfully inserted.
-    /// Bulk-insert documents into the engine with parallel decomposition.
-    ///
-    /// Returns `(count, docstore_handle)` where the handle can be joined to wait
-    /// for background docstore persistence. Bitmaps are published immediately.
-    pub fn put_bulk(&self, docs: Vec<(u32, Document)>, num_threads: usize) -> Result<(usize, JoinHandle<()>)> {
-        if docs.is_empty() {
-            let handle = thread::spawn(|| {});
-            return Ok((0, handle));
-        }
-        // Clone live state, apply bulk bitmaps, then publish
-        let mut staging = self.clone_staging();
-        let count = Self::put_bulk_into(&self.config, &mut staging, &docs, num_threads);
-        self.publish_staging(staging);
-        // Background docstore persistence
-        let docstore_handle = self.spawn_docstore_writer(docs);
-        Ok((count, docstore_handle))
-    }
-    /// Bulk-insert directly into a mutable InnerEngine without cloning or publishing.
-    ///
-    /// This is the "loading mode" variant — avoids the Arc::make_mut deep-clone cascade
-    /// that happens when the published snapshot shares Arc references with the staging copy.
-    /// Use this when loading many chunks sequentially: build up the InnerEngine, then publish once.
-    pub fn put_bulk_loading(&self, staging: &mut InnerEngine, docs: &[(u32, Document)], num_threads: usize) -> usize {
-        Self::put_bulk_into(&self.config, staging, docs, num_threads)
-    }
     /// Publish a staging InnerEngine as the current live state and invalidate all caches.
     ///
     /// Called after bulk-load paths that build bitmaps offline. Takes write locks
@@ -2498,50 +2181,6 @@ impl ConcurrentEngine {
         // CacheSilo entries become stale after bulk loads; they'll be recomputed on miss.
         // Full purge via clear_unified_cache() is available if needed.
     }
-    /// Persist documents to the docstore on a background thread.
-    /// Returns a JoinHandle to wait for completion. The docs Vec is consumed.
-    pub fn spawn_docstore_writer(&self, docs: Vec<(u32, Document)>) -> JoinHandle<()> {
-        let docstore = Arc::clone(&self.docstore);
-        thread::spawn(move || {
-            let batch_size = 100_000;
-            let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
-            for (slot, doc) in docs {
-                batch.push((slot, StoredDoc { fields: doc.fields, schema_version: 0 }));
-                if batch.len() >= batch_size {
-                    if let Err(e) = docstore.lock().put_batch(&batch) {
-                        eprintln!("put_bulk: docstore batch write failed: {e}");
-                    }
-                    batch.clear();
-                }
-            }
-            if !batch.is_empty() {
-                if let Err(e) = docstore.lock().put_batch(&batch) {
-                    eprintln!("put_bulk: docstore batch write failed: {e}");
-                }
-            }
-        })
-    }
-    /// Write documents to the docstore synchronously (inline, no background thread).
-    /// Used during bulk loading to bound memory — docs are written immediately and freed
-    /// after the next bitmap chunk flush instead of lingering in a background thread.
-    pub fn write_docs_to_docstore(&self, docs: &[(u32, Document)]) {
-        let batch_size = 10_000;
-        let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
-        for (slot, doc) in docs {
-            batch.push((*slot, StoredDoc { fields: doc.fields.clone(), schema_version: 0 }));
-            if batch.len() >= batch_size {
-                if let Err(e) = self.docstore.lock().put_batch(&batch) {
-                    eprintln!("write_docs_to_docstore: batch write failed: {e}");
-                }
-                batch.clear();
-            }
-        }
-        if !batch.is_empty() {
-            if let Err(e) = self.docstore.lock().put_batch(&batch) {
-                eprintln!("write_docs_to_docstore: batch write failed: {e}");
-            }
-        }
-    }
     /// Apply pre-built bitmap maps directly to a staging snapshot.
     /// Used by the fused parse+bitmap loader to skip the decompose/merge/apply pipeline.
     pub fn apply_bitmap_maps(
@@ -2565,178 +2204,6 @@ impl ConcurrentEngine {
             }
         }
         staging.slots.alive_or_bitmap(&alive);
-    }
-    /// Core decompose + merge + apply logic, shared by put_bulk() and put_bulk_loading().
-    fn put_bulk_into(config: &Config, staging: &mut InnerEngine, docs: &[(u32, Document)], num_threads: usize) -> usize {
-        let t0 = std::time::Instant::now();
-        let num_threads = num_threads.max(1).min(docs.len());
-        let filter_configs: Vec<_> = config.filter_fields.clone();
-        let sort_configs: Vec<_> = config.sort_fields.clone();
-        struct ThreadResult {
-            filter_maps: HashMap<(String, u64), RoaringBitmap>,
-            sort_maps: HashMap<(String, usize), RoaringBitmap>,
-            alive_bitmap: RoaringBitmap,
-            count: usize,
-        }
-        let chunk_size = (docs.len() + num_threads - 1) / num_threads;
-        let filter_configs_ref = &filter_configs;
-        let sort_configs_ref = &sort_configs;
-        let thread_results: Vec<ThreadResult> = thread::scope(|s| {
-            let handles: Vec<_> = (0..num_threads)
-                .map(|t| {
-                    let start = t * chunk_size;
-                    let end = (start + chunk_size).min(docs.len());
-                    if start >= end {
-                        return s.spawn(move || ThreadResult {
-                            filter_maps: HashMap::new(),
-                            sort_maps: HashMap::new(),
-                            alive_bitmap: RoaringBitmap::new(),
-                            count: 0,
-                        });
-                    }
-                    s.spawn(move || {
-                        let slice = &docs[start..end];
-                        let mut filter_maps: HashMap<(String, u64), RoaringBitmap> =
-                            HashMap::with_capacity(65_000);
-                        let mut sort_maps: HashMap<(String, usize), RoaringBitmap> =
-                            HashMap::with_capacity(256);
-                        let mut alive_bitmap = RoaringBitmap::new();
-                        for &(slot, ref doc) in slice {
-                            alive_bitmap.insert(slot);
-                            for fc in filter_configs_ref {
-                                if let Some(fv) = doc.fields.get(&fc.name) {
-                                    match fv {
-                                        crate::mutation::FieldValue::Single(v) => {
-                                            if let Some(key) = value_to_bitmap_key(v) {
-                                                filter_maps
-                                                    .entry((fc.name.clone(), key))
-                                                    .or_insert_with(RoaringBitmap::new)
-                                                    .insert(slot);
-                                            }
-                                        }
-                                        crate::mutation::FieldValue::Multi(vals) => {
-                                            for v in vals {
-                                                if let Some(key) = value_to_bitmap_key(v) {
-                                                    filter_maps
-                                                        .entry((fc.name.clone(), key))
-                                                        .or_insert_with(RoaringBitmap::new)
-                                                        .insert(slot);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            for sc in sort_configs_ref {
-                                if let Some(fv) = doc.fields.get(&sc.name) {
-                                    if let crate::mutation::FieldValue::Single(
-                                        crate::query::Value::Integer(v),
-                                    ) = fv
-                                    {
-                                        let value = *v as u32;
-                                        let num_bits = sc.bits as usize;
-                                        for bit in 0..num_bits {
-                                            if (value >> bit) & 1 == 1 {
-                                                sort_maps
-                                                    .entry((sc.name.clone(), bit))
-                                                    .or_insert_with(RoaringBitmap::new)
-                                                    .insert(slot);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        ThreadResult {
-                            filter_maps,
-                            sort_maps,
-                            alive_bitmap,
-                            count: slice.len(),
-                        }
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        let t1 = t0.elapsed();
-        // Phase 2: Merge thread results
-        let mut merged_filters: HashMap<(String, u64), RoaringBitmap> = HashMap::new();
-        let mut merged_sorts: HashMap<(String, usize), RoaringBitmap> = HashMap::new();
-        let mut merged_alive = RoaringBitmap::new();
-        let mut total_count: usize = 0;
-        for result in &thread_results {
-            total_count += result.count;
-            merged_alive |= &result.alive_bitmap;
-        }
-        for result in &thread_results {
-            for ((field, value), bm) in &result.filter_maps {
-                merged_filters
-                    .entry((field.clone(), *value))
-                    .and_modify(|e| *e |= bm)
-                    .or_insert_with(|| bm.clone());
-            }
-            for ((field, bit), bm) in &result.sort_maps {
-                merged_sorts
-                    .entry((field.clone(), *bit))
-                    .and_modify(|e| *e |= bm)
-                    .or_insert_with(|| bm.clone());
-            }
-        }
-        // Drop thread results to free memory before apply phase
-        drop(thread_results);
-        let t2 = t0.elapsed();
-        // Phase 3: Apply to staging — OR directly into base (bypasses diff layer)
-        for ((field_name, value), bitmap) in merged_filters {
-            if let Some(field) = staging.filters.get_field_mut(&field_name) {
-                field.or_bitmap(value, &bitmap);
-            }
-        }
-        for ((field_name, bit), bitmap) in merged_sorts {
-            if let Some(field) = staging.sorts.get_field_mut(&field_name) {
-                field.or_layer(bit, &bitmap);
-            }
-        }
-        staging.slots.alive_or_bitmap(&merged_alive);
-        let t3 = t0.elapsed();
-        eprintln!("put_bulk phases: decompose={:.2}s merge={:.2}s apply={:.2}s total={:.2}s",
-            t1.as_secs_f64(),
-            (t2 - t1).as_secs_f64(),
-            (t3 - t2).as_secs_f64(),
-            t3.as_secs_f64());
-        total_count
-    }
-    /// Apply a BitmapAccum's accumulated bitmaps directly to staging.
-    ///
-    /// Used by the dump pipeline (Sync V2) to apply ops-derived bitmaps
-    /// without going through the coalescer channel.
-    ///
-    /// ORs filter bitmaps, sort layer bitmaps, and alive bitmap into staging.
-    pub fn apply_accum(&self, accum: &crate::loader::BitmapAccum) {
-        // Apply filter bitmaps under write lock
-        {
-            let mut filters_w = self.filters.write();
-            for (field_name, value_map) in &accum.filter_maps {
-                if let Some(field) = filters_w.get_field_mut(field_name) {
-                    for (&value, bitmap) in value_map {
-                        field.or_bitmap(value, bitmap);
-                    }
-                }
-            }
-        }
-        // Apply sort layer bitmaps under write lock
-        {
-            let mut sorts_w = self.sorts.write();
-            for (field_name, layer_map) in &accum.sort_maps {
-                if let Some(field) = sorts_w.get_field_mut(field_name) {
-                    for (&bit_layer, bitmap) in layer_map {
-                        field.or_layer(bit_layer, bitmap);
-                    }
-                }
-            }
-        }
-        // Apply alive bitmap under write lock
-        self.slots.write().alive_or_bitmap(&accum.alive);
-        self.dirty_flag.store(true, Ordering::Release);
     }
     /// Remove filter and/or sort fields from the engine.
     ///
@@ -3560,266 +3027,6 @@ mod tests {
         let result = engine.query(&[], None, 1000).unwrap();
         assert_eq!(result.ids.len(), 40, "all 40 docs should be alive");
     }
-    // ---- put_bulk tests ----
-    #[test]
-    fn test_put_bulk_basic() {
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-        let docs: Vec<(u32, Document)> = (1..=100u32)
-            .map(|i| {
-                (
-                    i,
-                    make_doc(vec![
-                        ("nsfwLevel", FieldValue::Single(Value::Integer((i % 5) as i64 + 1))),
-                        (
-                            "reactionCount",
-                            FieldValue::Single(Value::Integer(i as i64 * 10)),
-                        ),
-                    ]),
-                )
-            })
-            .collect();
-        let (count, ds_handle) = engine.put_bulk(docs, 4).unwrap();
-        ds_handle.join().unwrap();
-        assert_eq!(count, 100);
-        assert_eq!(engine.alive_count(), 100);
-        // Filter query
-        let result = engine
-            .query(
-                &[FilterClause::Eq(
-                    "nsfwLevel".to_string(),
-                    Value::Integer(1),
-                )],
-                None,
-                1000,
-            )
-            .unwrap();
-        assert_eq!(result.total_matched, 20); // 1,6,11,...,96 → 20 docs
-        // Sorted query
-        let sort = SortClause {
-            field: "reactionCount".to_string(),
-            direction: SortDirection::Desc,
-        };
-        let result = engine
-            .query(
-                &[FilterClause::Eq(
-                    "nsfwLevel".to_string(),
-                    Value::Integer(1),
-                )],
-                Some(&sort),
-                3,
-            )
-            .unwrap();
-        // Top 3 by reactionCount desc with nsfwLevel=1: slots 100(1000), 95(950), 90(900)
-        assert_eq!(result.ids, vec![100, 95, 90]);
-    }
-    #[test]
-    fn test_put_bulk_with_multi_value() {
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-        let docs = vec![
-            (
-                1,
-                make_doc(vec![(
-                    "tagIds",
-                    FieldValue::Multi(vec![Value::Integer(100), Value::Integer(200)]),
-                )]),
-            ),
-            (
-                2,
-                make_doc(vec![(
-                    "tagIds",
-                    FieldValue::Multi(vec![Value::Integer(200), Value::Integer(300)]),
-                )]),
-            ),
-            (
-                3,
-                make_doc(vec![(
-                    "tagIds",
-                    FieldValue::Multi(vec![Value::Integer(100), Value::Integer(300)]),
-                )]),
-            ),
-        ];
-        let (_, ds_handle) = engine.put_bulk(docs, 2).unwrap();
-        ds_handle.join().unwrap();
-        let result = engine
-            .query(
-                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(200))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.total_matched, 2); // docs 1 and 2
-        let result = engine
-            .query(
-                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(100))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.total_matched, 2); // docs 1 and 3
-    }
-    #[test]
-    fn test_put_bulk_single_thread() {
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-        let docs: Vec<(u32, Document)> = (1..=10u32)
-            .map(|i| {
-                (
-                    i,
-                    make_doc(vec![
-                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                        (
-                            "reactionCount",
-                            FieldValue::Single(Value::Integer(i as i64)),
-                        ),
-                    ]),
-                )
-            })
-            .collect();
-        let (count, ds_handle) = engine.put_bulk(docs, 1).unwrap();
-        ds_handle.join().unwrap();
-        assert_eq!(count, 10);
-        assert_eq!(engine.alive_count(), 10);
-    }
-    #[test]
-    fn test_put_bulk_then_query_with_sort() {
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-        let docs: Vec<(u32, Document)> = vec![
-            (
-                10,
-                make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(500))),
-                ]),
-            ),
-            (
-                20,
-                make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(100))),
-                ]),
-            ),
-            (
-                30,
-                make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("reactionCount", FieldValue::Single(Value::Integer(300))),
-                ]),
-            ),
-        ];
-        let (_, ds_handle) = engine.put_bulk(docs, 2).unwrap();
-        ds_handle.join().unwrap();
-        let sort = SortClause {
-            field: "reactionCount".to_string(),
-            direction: SortDirection::Desc,
-        };
-        let result = engine
-            .query(
-                &[FilterClause::Eq(
-                    "nsfwLevel".to_string(),
-                    Value::Integer(1),
-                )],
-                Some(&sort),
-                10,
-            )
-            .unwrap();
-        assert_eq!(result.ids, vec![10, 30, 20]); // 500, 300, 100
-    }
-    #[test]
-    fn test_put_bulk_persists_to_docstore() {
-        // Verify that put_bulk() persists docs so subsequent put() upserts can diff correctly.
-        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
-        let docs: Vec<(u32, Document)> = vec![
-            (1, make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                ("reactionCount", FieldValue::Single(Value::Integer(100))),
-            ])),
-            (2, make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
-                ("reactionCount", FieldValue::Single(Value::Integer(200))),
-            ])),
-        ];
-        let (count, ds_handle) = engine.put_bulk(docs, 2).unwrap();
-        ds_handle.join().unwrap(); // Wait for docstore persistence
-        assert_eq!(count, 2);
-        // put_bulk publishes directly — bitmaps visible immediately
-        assert_eq!(engine.alive_count(), 2);
-        // Verify initial state: nsfwLevel=1 should match slot 1
-        let result = engine.query(
-            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
-            None, 10,
-        ).unwrap();
-        assert_eq!(result.ids, vec![1]);
-        // Now upsert slot 1 with changed nsfwLevel (1 → 3).
-        // This requires docstore to have the old doc so it can clear the nsfwLevel=1 bitmap bit.
-        let updated = make_doc(vec![
-            ("nsfwLevel", FieldValue::Single(Value::Integer(3))),
-            ("reactionCount", FieldValue::Single(Value::Integer(100))),
-        ]);
-        engine.put(1, &updated).unwrap();
-        wait_for_flush(&engine, 2, 5_000);
-        // nsfwLevel=1 should now be EMPTY (slot 1 moved to nsfwLevel=3)
-        let result = engine.query(
-            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
-            None, 10,
-        ).unwrap();
-        assert_eq!(result.total_matched, 0, "Stale nsfwLevel=1 bit not cleared — docstore persistence failed");
-        // nsfwLevel=3 should match slot 1
-        let result = engine.query(
-            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(3))],
-            None, 10,
-        ).unwrap();
-        assert_eq!(result.ids, vec![1]);
-        engine.shutdown();
-    }
-    #[test]
-    fn test_put_bulk_loading_then_persist() {
-        // Verify that put_bulk_loading + manual docstore persistence works correctly.
-        let engine = ConcurrentEngine::new(test_config()).unwrap();
-        let docs: Vec<(u32, Document)> = vec![
-            (1, make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                ("reactionCount", FieldValue::Single(Value::Integer(100))),
-            ])),
-            (2, make_doc(vec![
-                ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
-                ("reactionCount", FieldValue::Single(Value::Integer(200))),
-            ])),
-        ];
-        // Use loading mode
-        let mut staging = engine.clone_staging();
-        let count = engine.put_bulk_loading(&mut staging, &docs, 2);
-        assert_eq!(count, 2);
-        // Persist docs separately
-        let ds_handle = engine.spawn_docstore_writer(docs);
-        ds_handle.join().unwrap();
-        // Publish staging
-        engine.publish_staging(staging);
-        // Bitmaps visible immediately after publish
-        assert_eq!(engine.alive_count(), 2);
-        // Verify initial state
-        let result = engine.query(
-            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
-            None, 10,
-        ).unwrap();
-        assert_eq!(result.ids, vec![1]);
-        // Upsert slot 1 with changed nsfwLevel
-        let updated = make_doc(vec![
-            ("nsfwLevel", FieldValue::Single(Value::Integer(3))),
-            ("reactionCount", FieldValue::Single(Value::Integer(100))),
-        ]);
-        engine.put(1, &updated).unwrap();
-        wait_for_flush(&engine, 2, 5_000);
-        // Verify diff worked correctly
-        let result = engine.query(
-            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
-            None, 10,
-        ).unwrap();
-        assert_eq!(result.total_matched, 0, "Stale nsfwLevel=1 bit not cleared — docstore persistence failed");
-        let result = engine.query(
-            &[FilterClause::Eq("nsfwLevel".into(), Value::Integer(3))],
-            None, 10,
-        ).unwrap();
-        assert_eq!(result.ids, vec![1]);
-    }
     // ---- Snapshot save/restore tests ----
     fn test_config_with_bitmap_path(bitmap_path: std::path::PathBuf) -> Config {
         Config {
@@ -4453,96 +3660,6 @@ mod tests {
             assert_eq!(result.ids, vec![1]);
         }
     }
-    #[test]
-    fn test_sync_filter_values_add_and_remove() {
-        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
-        // Insert a doc with tagIds [100, 200]
-        engine
-            .put(
-                1,
-                &make_doc(vec![(
-                    "tagIds",
-                    FieldValue::Multi(vec![Value::Integer(100), Value::Integer(200)]),
-                )]),
-            )
-            .unwrap();
-        wait_for_flush(&engine, 1, 500);
-        // Verify initial state
-        let result = engine
-            .query(
-                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(100))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.ids, vec![1]);
-        // Sync to [200, 300] — removes 100, keeps 200, adds 300
-        engine.sync_filter_values(1, "tagIds", &[200, 300]).unwrap();
-        // Wait for mutations to flush
-        thread::sleep(Duration::from_millis(50));
-        // Tag 100 should no longer match
-        let result = engine
-            .query(
-                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(100))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.total_matched, 0);
-        // Tag 200 should still match
-        let result = engine
-            .query(
-                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(200))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.ids, vec![1]);
-        // Tag 300 should now match
-        let result = engine
-            .query(
-                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(300))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.ids, vec![1]);
-        engine.shutdown();
-    }
-    #[test]
-    fn test_sync_filter_values_clear_all() {
-        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
-        engine
-            .put(
-                1,
-                &make_doc(vec![(
-                    "tagIds",
-                    FieldValue::Multi(vec![Value::Integer(10), Value::Integer(20)]),
-                )]),
-            )
-            .unwrap();
-        wait_for_flush(&engine, 1, 500);
-        // Sync to empty — removes all values
-        engine.sync_filter_values(1, "tagIds", &[]).unwrap();
-        thread::sleep(Duration::from_millis(50));
-        let result = engine
-            .query(
-                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(10))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.total_matched, 0);
-        engine.shutdown();
-    }
-    #[test]
-    fn test_sync_filter_values_slot_not_alive_skips() {
-        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
-        // Sync on non-existent slot should skip silently (not error)
-        let result = engine.sync_filter_values(999, "tagIds", &[100]);
-        assert!(result.is_ok(), "sync_filter_values should skip non-alive slots");
-        engine.shutdown();
-    }
     /// Reproduce the WAL reader stall: ops for alive slots should be applied,
     /// not silently skipped. This test exercises the exact code path used by
     /// the server WAL reader thread.
@@ -4617,80 +3734,6 @@ mod tests {
         assert_eq!(skipped3, 0);
         assert_eq!(errors3, 0);
 
-        engine.shutdown();
-    }
-    #[test]
-    fn test_patch_document_creates_new_slot() {
-        // PATCH on a non-existent slot should fall through to PUT,
-        // creating the document and setting bitmaps.
-        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
-        let doc = make_doc(vec![
-            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-            ("tagIds", FieldValue::Multi(vec![Value::Integer(42)])),
-        ]);
-        // Slot 999 doesn't exist — patch should create it via PUT fallback
-        engine.patch_document(999, &doc).unwrap();
-        wait_for_flush(&engine, 1, 500);
-        // Verify the slot is alive and queryable
-        assert_eq!(engine.alive_count(), 1);
-        let result = engine
-            .query(
-                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.ids, vec![999]);
-        // Verify tag bitmap was set
-        let result = engine
-            .query(
-                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(42))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.ids, vec![999]);
-        engine.shutdown();
-    }
-    #[test]
-    fn test_patch_document_updates_existing_slot() {
-        // PATCH on an existing slot should still work as partial update.
-        let mut engine = ConcurrentEngine::new(test_config()).unwrap();
-        // Create the slot first via PUT
-        engine
-            .put(
-                1,
-                &make_doc(vec![
-                    ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
-                    ("tagIds", FieldValue::Multi(vec![Value::Integer(10)])),
-                ]),
-            )
-            .unwrap();
-        wait_for_flush(&engine, 1, 500);
-        // PATCH only nsfwLevel — tagIds should be preserved
-        let patch = make_doc(vec![
-            ("nsfwLevel", FieldValue::Single(Value::Integer(2))),
-        ]);
-        engine.patch_document(1, &patch).unwrap();
-        thread::sleep(Duration::from_millis(50));
-        // nsfwLevel should be updated
-        let result = engine
-            .query(
-                &[FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(2))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.ids, vec![1]);
-        // tagIds should still be there (not wiped by PATCH)
-        let result = engine
-            .query(
-                &[FilterClause::Eq("tagIds".to_string(), Value::Integer(10))],
-                None,
-                100,
-            )
-            .unwrap();
-        assert_eq!(result.ids, vec![1]);
         engine.shutdown();
     }
     // --- Write path audit items 2.11, 2.15, 2.16, 2.17 ---

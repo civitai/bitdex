@@ -2856,163 +2856,34 @@ async fn handle_upsert(
 
 /// PATCH /api/indexes/{name}/documents/patch
 ///
-/// Partial update: merges only provided fields into existing documents.
-/// Fields absent from the payload are left untouched in bitmaps and docstore.
-/// Slots that are not alive return an error (use upsert for initial creation).
+/// Not implemented — use upsert (PUT) for all document writes.
 async fn handle_patch_documents(
-    State(state): State<SharedState>,
+    State(_state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(req): Json<UpsertRequest>,
+    Json(_req): Json<UpsertRequest>,
 ) -> impl IntoResponse {
-    let engine = {
-        let guard = state.index.lock();
-        match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    let (schema, has_lcs) = {
-        let guard = state.index.lock();
-        let idx = guard.as_ref().unwrap();
-        let has_lcs = idx.definition.data_schema.fields.iter().any(|f| f.value_type == FieldValueType::LowCardinalityString);
-        (idx.definition.data_schema.clone(), has_lcs)
-    };
-
-    // Run patch_document on a blocking thread to avoid starving the tokio
-    // runtime. patch_document does sync disk I/O (reads old doc for diffing)
-    // and 5000 patches per pg-sync cycle would exhaust the async thread pool.
-    let documents = req.documents;
-    let engine_clone = Arc::clone(&engine);
-    let schema_clone = schema.clone();
-    let (patched, errors) = tokio::task::spawn_blocking(move || {
-        let mut patched = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-
-        for (i, doc_json) in documents.iter().enumerate() {
-            let dicts = if has_lcs { Some(engine_clone.dictionaries()) } else { None };
-            match loader::json_to_document_with_dicts(doc_json, &schema_clone, dicts) {
-                Ok((slot, doc)) => {
-                    match engine_clone.patch_document(slot, &doc) {
-                        Ok(()) => patched += 1,
-                        Err(crate::error::BitdexError::SlotNotFound(_)) => {
-                            errors.push(format!("doc[{}] id={}: not alive (use upsert for new docs)", i, slot));
-                        }
-                        Err(e) => {
-                            errors.push(format!("doc[{}] id={}: {}", i, slot, e));
-                        }
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("doc[{}]: {}", i, e));
-                }
-            }
-        }
-
-        (patched, errors)
-    }).await.expect("spawn_blocking join");
-
-    if let Some(cursor) = req.cursor {
-        engine.set_cursor(cursor.name, cursor.value);
-    }
-
-    if has_lcs && patched > 0 {
-        if let Err(e) = engine.persist_dirty_dictionaries() {
-            eprintln!("warning: failed to persist LCS dictionaries: {}", e);
-        }
-        let mut guard = state.index.lock();
-        if let Some(ref mut idx) = *guard {
-            let dicts = engine.dictionaries();
-            let reverse_maps = build_reverse_string_maps_with_dicts(&idx.definition.data_schema, Some(dicts));
-            idx.reverse_maps = Arc::new(reverse_maps);
-        }
-    }
-
-    state.metrics.upsert_total.with_label_values(&[&name]).inc_by(patched);
-
-    if errors.is_empty() {
-        Json(serde_json::json!({"patched": patched})).into_response()
-    } else {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({"patched": patched, "errors": errors})),
-        ).into_response()
-    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": format!("PATCH is not implemented for index '{}'; use PUT upsert instead", name)
+        })),
+    )
 }
 
-/// Sync filter values for a filter_only multi-value field.
+/// Sync filter values — not implemented.
 ///
-/// Accepts a batch of (slot, values) pairs and replaces all bitmap memberships
-/// for each slot on the named field. Used by the outbox poller for fields like
-/// collectionIds where membership comes from a separate table.
+/// This endpoint is no longer supported. Use upsert (PUT) for all document writes.
 async fn handle_filter_sync(
-    State(state): State<SharedState>,
+    State(_state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(req): Json<FilterSyncRequest>,
+    Json(_req): Json<FilterSyncRequest>,
 ) -> impl IntoResponse {
-    // Validate field exists and is a multi_value filter field
-    let engine = {
-        let guard = state.index.lock();
-        match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => {
-                let is_multi_value = idx.definition.config.filter_fields.iter().any(|f| {
-                    f.name == req.field
-                        && matches!(f.field_type, crate::filter::FilterFieldType::MultiValue)
-                });
-                let is_filter_only = idx.definition.data_schema.fields.iter().any(|f| {
-                    f.target == req.field && f.filter_only
-                });
-                if !is_multi_value || !is_filter_only {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": format!("Field '{}' is not a filter_only multi_value field", req.field)
-                        })),
-                    ).into_response();
-                }
-                Arc::clone(&idx.engine)
-            }
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    let mut synced = 0u64;
-    let mut errors: Vec<String> = Vec::new();
-
-    for (i, entry) in req.documents.iter().enumerate() {
-        match engine.sync_filter_values(entry.id, &req.field, &entry.values) {
-            Ok(()) => synced += 1,
-            Err(e) => errors.push(format!("doc[{}] id={}: {}", i, entry.id, e)),
-        }
-    }
-
-    state.metrics.upsert_total.with_label_values(&[&name]).inc_by(synced);
-
-    if errors.is_empty() {
-        Json(serde_json::json!({"synced": synced})).into_response()
-    } else if synced == 0 {
-        // Total failure — no documents synced
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"synced": 0, "errors": errors})),
-        ).into_response()
-    } else {
-        // Partial failure
-        (
-            StatusCode::MULTI_STATUS,
-            Json(serde_json::json!({"synced": synced, "errors": errors})),
-        ).into_response()
-    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": format!("filter_sync is not implemented for index '{}'; use PUT upsert instead", name)
+        })),
+    )
 }
 
 async fn handle_delete_docs(
