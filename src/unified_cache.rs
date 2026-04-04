@@ -19,7 +19,13 @@ use crate::meta_index::{CacheEntryId, MetaIndex};
 use crate::query::SortDirection;
 use crate::radix_sort::RadixSortIndex;
 use crate::sort::SortIndex;
-use crate::write_coalescer::FilterGroupKey;
+/// Key for grouping filter operations by target bitmap.
+/// Moved here from write_coalescer after WriteCoalescer was deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FilterGroupKey {
+    pub field: Arc<str>,
+    pub value: u64,
+}
 // ── ShardKey ────────────────────────────────────────────────────────────
 
 /// Key for a cache shard: (sort_field, direction).

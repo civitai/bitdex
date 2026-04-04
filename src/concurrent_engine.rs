@@ -25,7 +25,188 @@ use crate::unified_cache::{
     evaluate_filter_work, evaluate_sort_work,
 };
 use crate::mutation::{MutationOp, MutationSender};
-use crate::write_coalescer::WriteCoalescer;
+use crate::unified_cache::FilterGroupKey;
+use crate::filter::FilterIndex;
+use crate::sort::SortIndex;
+use crate::slot::SlotAllocator;
+
+/// Key for grouping sort operations by target bit layer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SortGroupKey {
+    field: Arc<str>,
+    bit_layer: usize,
+}
+
+/// Accumulates MutationOps and applies them in bulk to staging.
+/// Replaces WriteCoalescer/WriteBatch after write_coalescer.rs was deleted.
+struct FlushBatch {
+    ops: Vec<MutationOp>,
+    filter_inserts: HashMap<FilterGroupKey, Vec<u32>>,
+    filter_removes: HashMap<FilterGroupKey, Vec<u32>>,
+    sort_sets: HashMap<SortGroupKey, Vec<u32>>,
+    sort_clears: HashMap<SortGroupKey, Vec<u32>>,
+    alive_inserts: Vec<u32>,
+    alive_removes: Vec<u32>,
+    deferred_alive: Vec<(u32, u64)>,
+}
+
+impl FlushBatch {
+    fn new() -> Self {
+        Self {
+            ops: Vec::new(),
+            filter_inserts: HashMap::new(),
+            filter_removes: HashMap::new(),
+            sort_sets: HashMap::new(),
+            sort_clears: HashMap::new(),
+            alive_inserts: Vec::new(),
+            alive_removes: Vec::new(),
+            deferred_alive: Vec::new(),
+        }
+    }
+
+    fn push_ops(&mut self, ops: Vec<MutationOp>) {
+        self.ops.extend(ops);
+    }
+
+    fn drain_channel(&mut self, rx: &crossbeam_channel::Receiver<MutationOp>) {
+        while let Ok(op) = rx.try_recv() {
+            self.ops.push(op);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    fn group_and_sort(&mut self) {
+        self.filter_inserts.clear();
+        self.filter_removes.clear();
+        self.sort_sets.clear();
+        self.sort_clears.clear();
+        self.alive_inserts.clear();
+        self.alive_removes.clear();
+        self.deferred_alive.clear();
+        for op in self.ops.drain(..) {
+            match op {
+                MutationOp::FilterInsert { field, value, slots } => {
+                    self.filter_inserts
+                        .entry(FilterGroupKey { field, value })
+                        .or_default()
+                        .extend(slots);
+                }
+                MutationOp::FilterRemove { field, value, slots } => {
+                    self.filter_removes
+                        .entry(FilterGroupKey { field, value })
+                        .or_default()
+                        .extend(slots);
+                }
+                MutationOp::SortSet { field, bit_layer, slots } => {
+                    self.sort_sets
+                        .entry(SortGroupKey { field, bit_layer })
+                        .or_default()
+                        .extend(slots);
+                }
+                MutationOp::SortClear { field, bit_layer, slots } => {
+                    self.sort_clears
+                        .entry(SortGroupKey { field, bit_layer })
+                        .or_default()
+                        .extend(slots);
+                }
+                MutationOp::AliveInsert { slots } => {
+                    self.alive_inserts.extend(slots);
+                }
+                MutationOp::AliveRemove { slots } => {
+                    self.alive_removes.extend(slots);
+                }
+                MutationOp::DeferredAlive { slot, activate_at } => {
+                    self.deferred_alive.push((slot, activate_at));
+                }
+            }
+        }
+        for slots in self.filter_inserts.values_mut() { slots.sort_unstable(); }
+        for slots in self.filter_removes.values_mut() { slots.sort_unstable(); }
+        for slots in self.sort_sets.values_mut() { slots.sort_unstable(); }
+        for slots in self.sort_clears.values_mut() { slots.sort_unstable(); }
+        self.alive_inserts.sort_unstable();
+        self.alive_removes.sort_unstable();
+    }
+
+    fn has_alive_mutations(&self) -> bool {
+        !self.alive_inserts.is_empty() || !self.alive_removes.is_empty()
+    }
+
+    fn mutated_filter_fields(&self) -> HashSet<&str> {
+        let mut fields = HashSet::new();
+        for key in self.filter_inserts.keys() { fields.insert(&*key.field); }
+        for key in self.filter_removes.keys() { fields.insert(&*key.field); }
+        fields
+    }
+
+    fn mutated_sort_slots(&self) -> HashMap<&str, HashSet<u32>> {
+        let mut result: HashMap<&str, HashSet<u32>> = HashMap::new();
+        for (key, slots) in &self.sort_sets {
+            result.entry(&key.field).or_default().extend(slots);
+        }
+        for (key, slots) in &self.sort_clears {
+            result.entry(&key.field).or_default().extend(slots);
+        }
+        result
+    }
+
+    fn apply(
+        &self,
+        slots: &mut SlotAllocator,
+        filters: &mut FilterIndex,
+        sorts: &mut SortIndex,
+    ) {
+        // Removes before inserts: on upsert, remove-old then insert-new is safe
+        for (key, slot_ids) in &self.filter_removes {
+            if let Some(field) = filters.get_field_mut(&key.field) {
+                field.remove_bulk(key.value, slot_ids);
+            }
+        }
+        for (key, slot_ids) in &self.filter_inserts {
+            if let Some(field) = filters.get_field_mut(&key.field) {
+                field.insert_bulk(key.value, slot_ids.iter().copied());
+            }
+        }
+        // Clears before sets: on slot recycling, clear-old then set-new is safe
+        for (key, slot_ids) in &self.sort_clears {
+            if let Some(field) = sorts.get_field_mut(&key.field) {
+                field.clear_layer_bulk(key.bit_layer, slot_ids);
+            }
+        }
+        for (key, slot_ids) in &self.sort_sets {
+            if let Some(field) = sorts.get_field_mut(&key.field) {
+                field.set_layer_bulk(key.bit_layer, slot_ids.iter().copied());
+            }
+        }
+        if !self.alive_inserts.is_empty() {
+            slots.alive_insert_bulk(self.alive_inserts.iter().copied());
+        }
+        for &slot in &self.alive_removes {
+            slots.alive_remove_one(slot);
+        }
+        for &(slot, activate_at) in &self.deferred_alive {
+            slots.schedule_alive(slot, activate_at);
+        }
+        // Eager merge sort diffs
+        let mut mutated_sort_fields: HashSet<&str> = HashSet::new();
+        for key in self.sort_sets.keys() { mutated_sort_fields.insert(&key.field); }
+        for key in self.sort_clears.keys() { mutated_sort_fields.insert(&key.field); }
+        for field_name in &mutated_sort_fields {
+            if let Some(field) = sorts.get_field_mut(field_name) {
+                field.merge_dirty();
+            }
+        }
+        slots.merge_alive();
+    }
+}
+
 /// Bridge for passing Prometheus metric handles from the server layer into
 /// the engine's background threads (compaction worker).
 /// Only available when compiled with the `server` feature.
@@ -442,7 +623,9 @@ impl ConcurrentEngine {
         // Flush thread owns a staging clone; readers see published snapshots
         let mut staging = inner_engine.clone();
         let inner = Arc::new(ArcSwap::new(Arc::new(inner_engine)));
-        let (mut coalescer, sender) = WriteCoalescer::new(config.channel_capacity);
+        let (mutation_tx, mutation_rx): (crossbeam_channel::Sender<MutationOp>, crossbeam_channel::Receiver<MutationOp>) =
+            crossbeam_channel::bounded(config.channel_capacity);
+        let sender = MutationSender { tx: mutation_tx };
         let shutdown = Arc::new(AtomicBool::new(false));
         let config = Arc::new(config);
         // Docstore write channel — bounded for backpressure
@@ -539,6 +722,7 @@ impl ConcurrentEngine {
             let flush_opslog_ns = Arc::clone(&flush_opslog_nanos);
             let flush_config = Arc::clone(&config);
             let flush_field_registry = field_registry.clone();
+            let flush_mutation_rx = mutation_rx;
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
                 let max_sleep = Duration::from_micros(flush_interval_us * 10);
@@ -547,6 +731,7 @@ impl ConcurrentEngine {
                 let mut was_loading = false;
                 let mut staging_dirty = false; // tracks unpublished mutations from loading mode
                 let mut flush_cycle: u64 = 0;
+                let mut batch = FlushBatch::new();
                 // Compact filter diffs every N flush cycles (~5s at 100μs interval).
                 // Keeps diff layers small so apply_diff/fused stay fast.
                 const COMPACTION_INTERVAL: u64 = 50;
@@ -554,7 +739,14 @@ impl ConcurrentEngine {
                     thread::sleep(current_sleep);
                     let is_loading = flush_loading_mode.load(Ordering::Relaxed);
                     // Phase 1: Drain channel and group/sort (no lock, pure CPU work)
-                    let bitmap_count = coalescer.prepare();
+                    batch.drain_channel(&flush_mutation_rx);
+                    let bitmap_count = if !batch.is_empty() {
+                        let count = batch.len();
+                        batch.group_and_sort();
+                        count
+                    } else {
+                        0
+                    };
                     let mut stale_fields: Vec<String> = Vec::new();
                     // Phase 2: Apply mutations to staging (private, no lock needed)
                     let flush_start = Instant::now();
@@ -562,23 +754,23 @@ impl ConcurrentEngine {
                         staging_dirty = true;
                         flush_dirty_flag.store(true, Ordering::Release);
                         let t_apply = Instant::now();
-                        coalescer.apply_prepared(
+                        batch.apply(
                             &mut staging.slots,
                             &mut staging.filters,
                             &mut staging.sorts,
                         );
                         flush_apply_ns.store(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         // Collect mutated field names for bitmap memory cache staleness tracking.
-                        for fgk in coalescer.filter_insert_entries().keys() {
+                        for fgk in batch.filter_inserts.keys() {
                             stale_fields.push(fgk.field.to_string());
                         }
-                        for fgk in coalescer.filter_remove_entries().keys() {
+                        for fgk in batch.filter_removes.keys() {
                             stale_fields.push(fgk.field.to_string());
                         }
-                        for sgk in coalescer.sort_set_entries().keys() {
+                        for sgk in batch.sort_sets.keys() {
                             stale_fields.push(sgk.field.to_string());
                         }
-                        for sgk in coalescer.sort_clear_entries().keys() {
+                        for sgk in batch.sort_clears.keys() {
                             stale_fields.push(sgk.field.to_string());
                         }
                         // Yield CPU after apply to let tokio I/O threads deliver
@@ -594,24 +786,22 @@ impl ConcurrentEngine {
                             // qualifying buckets, remove deleted slots from all buckets.
                             let t_tb = Instant::now();
                             if let Some(ref tb_arc) = flush_time_buckets {
-                                let alive_inserts = coalescer.alive_inserts();
-                                let alive_removes = coalescer.alive_removes();
-                                if !alive_inserts.is_empty() || !alive_removes.is_empty() {
+                                if !batch.alive_inserts.is_empty() || !batch.alive_removes.is_empty() {
                                     let now_secs = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs();
                                     let mut tb = tb_arc.lock();
-                                    if !alive_inserts.is_empty() {
+                                    if !batch.alive_inserts.is_empty() {
                                         let sort_field_name = tb.sort_field_name().to_string();
                                         if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
-                                            for &slot in alive_inserts {
+                                            for &slot in &batch.alive_inserts {
                                                 let ts = sort_field.reconstruct_value(slot) as u64;
                                                 tb.insert_slot(slot, ts, now_secs);
                                             }
                                         }
                                     }
-                                    for &slot in alive_removes {
+                                    for &slot in &batch.alive_removes {
                                         tb.remove_slot(slot);
                                     }
                                 }
@@ -630,21 +820,21 @@ impl ConcurrentEngine {
                                 let mut uc = flush_unified_cache.lock();
                                 // Targeted alive removal (fast: O(1) per entry per remove)
                                 if !uc.is_empty() {
-                                    for &slot in coalescer.alive_removes() {
+                                    for &slot in &batch.alive_removes {
                                         uc.remove_slot_from_all(slot);
                                     }
                                 }
                                 // Collect filter maintenance work
-                                let (fw, fob) = if !coalescer.mutated_filter_fields().is_empty() {
+                                let (fw, fob) = if !batch.mutated_filter_fields().is_empty() {
                                     uc.collect_filter_work(
-                                        coalescer.filter_insert_entries(),
-                                        coalescer.filter_remove_entries(),
+                                        &batch.filter_inserts,
+                                        &batch.filter_removes,
                                     )
                                 } else {
                                     (Vec::new(), Vec::new())
                                 };
                                 // Collect sort maintenance work
-                                let sort_mutations = coalescer.mutated_sort_slots();
+                                let sort_mutations = batch.mutated_sort_slots();
                                 let (sw, sob) = if !sort_mutations.is_empty() {
                                     uc.collect_sort_work(&sort_mutations)
                                 } else {
@@ -654,7 +844,7 @@ impl ConcurrentEngine {
                                 // Runs even when cache is empty — meta-index may be
                                 // populated from meta.bin after restart (§3.2).
                                 if uc.persistence_enabled() {
-                                    let filter_fields: Vec<&str> = coalescer
+                                    let filter_fields: Vec<&str> = batch
                                         .mutated_filter_fields()
                                         .iter()
                                         .copied()
@@ -663,7 +853,7 @@ impl ConcurrentEngine {
                                         let n = uc.tombstone_unloaded_for_filter(&filter_fields);
                                         let _ = n;
                                     }
-                                    let sort_mutations = coalescer.mutated_sort_slots();
+                                    let sort_mutations = batch.mutated_sort_slots();
                                     let sort_fields: Vec<&str> = sort_mutations
                                         .keys()
                                         .copied()
@@ -672,8 +862,8 @@ impl ConcurrentEngine {
                                         let n = uc.tombstone_unloaded_for_sort(&sort_fields);
                                         let _ = n;
                                     }
-                                    if coalescer.has_alive_mutations()
-                                        && !coalescer.alive_removes().is_empty()
+                                    if batch.has_alive_mutations()
+                                        && !batch.alive_removes.is_empty()
                                     {
                                         let n = uc.tombstone_all_unloaded();
                                         let _ = n;
@@ -802,9 +992,8 @@ impl ConcurrentEngine {
                             .as_secs();
                         let activated = staging.slots.activate_due(now_unix);
                         if !activated.is_empty() {
-                            // Collect all mutation ops for activated slots into a WriteBatch,
-                            // then apply in bulk (same path as normal mutations).
-                            let mut activation_batch = crate::write_coalescer::WriteBatch::new();
+                            // Collect all mutation ops for activated slots and apply in bulk.
+                            let mut activation_batch = FlushBatch::new();
                             {
                                 let ds = docstore.lock();
                                 for &slot in &activated {
@@ -866,13 +1055,22 @@ impl ConcurrentEngine {
                                 let fp_start = std::time::Instant::now();
                                 // Drain any remaining mutations from the channel
                                 // before publishing — they may not have been picked
-                                // up by the regular prepare() at the top of the loop.
+                                // up by the regular drain at the top of the loop.
                                 let t_flush = std::time::Instant::now();
-                                let extra = coalescer.flush(
-                                    &mut staging.slots,
-                                    &mut staging.filters,
-                                    &mut staging.sorts,
-                                );
+                                let mut extra_batch = FlushBatch::new();
+                                extra_batch.drain_channel(&flush_mutation_rx);
+                                let extra = if !extra_batch.is_empty() {
+                                    let count = extra_batch.len();
+                                    extra_batch.group_and_sort();
+                                    extra_batch.apply(
+                                        &mut staging.slots,
+                                        &mut staging.filters,
+                                        &mut staging.sorts,
+                                    );
+                                    count
+                                } else {
+                                    0
+                                };
                                 if extra > 0 {
                                     #[allow(unused_assignments)]
                                     { staging_dirty = true; }
@@ -901,16 +1099,23 @@ impl ConcurrentEngine {
                             }
                             FlushCommand::SyncUnloaded { unloaded, done } => {
                                 // Drain any mutations that arrived between the save
-                                // snapshot and now. prepare() drains + groups without
-                                // applying, so we can swap staging first.
-                                let pending = coalescer.prepare();
+                                // snapshot and now, then swap staging.
+                                let mut pending_batch = FlushBatch::new();
+                                pending_batch.drain_channel(&flush_mutation_rx);
+                                let pending = if !pending_batch.is_empty() {
+                                    let count = pending_batch.len();
+                                    pending_batch.group_and_sort();
+                                    count
+                                } else {
+                                    0
+                                };
                                 // Replace staging with the unloaded version.
                                 staging = unloaded;
                                 // Apply drained mutations to the new unloaded staging.
                                 // These go into diff layers (bases are empty/unloaded),
                                 // which is correct — they'll merge on lazy reload.
                                 if pending > 0 {
-                                    coalescer.apply_prepared(
+                                    pending_batch.apply(
                                         &mut staging.slots,
                                         &mut staging.filters,
                                         &mut staging.sorts,
@@ -1120,10 +1325,16 @@ impl ConcurrentEngine {
                     }
                 }
                 // Final flush on shutdown
-                let count = coalescer.prepare();
+                let mut shutdown_batch = FlushBatch::new();
+                shutdown_batch.drain_channel(&flush_mutation_rx);
+                let count = if !shutdown_batch.is_empty() {
+                    let c = shutdown_batch.len();
+                    shutdown_batch.group_and_sort();
+                    c
+                } else { 0 };
                 if count > 0 {
                     flush_dirty_flag.store(true, Ordering::Release);
-                    coalescer.apply_prepared(
+                    shutdown_batch.apply(
                         &mut staging.slots,
                         &mut staging.filters,
                         &mut staging.sorts,
