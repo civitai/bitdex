@@ -407,7 +407,6 @@ impl ConcurrentEngine {
             let shutdown = Arc::clone(&shutdown);
             let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
-            let flush_cache_silo = cache_silo_arc.clone();
             let flush_dirty_flag = Arc::clone(&dirty_flag);
             let flush_time_buckets = time_buckets.as_ref().map(Arc::clone);
             let flush_pending_diffs = Arc::clone(&pending_bucket_diffs);
@@ -434,7 +433,6 @@ impl ConcurrentEngine {
                     shutdown,
                     docstore,
                     flush_interval_us,
-                    cache_silo: flush_cache_silo,
                     dirty_flag: flush_dirty_flag,
                     time_buckets: flush_time_buckets,
                     pending_diffs: flush_pending_diffs,
@@ -982,8 +980,8 @@ impl ConcurrentEngine {
             .map_err(|e| crate::error::BitdexError::Storage(format!("save_field_dict: {e}")))?;
 
         if let Some(ref silo_arc) = self.bitmap_silo {
-            // Ops-on-read path: bitmaps already written incrementally to silo ops log.
-            // Flush metadata (slot_counter, cursors) and compact ops → frozen snapshot.
+            // Live-silo path (ops-on-read): bitmaps already written incrementally.
+            // Only need to flush metadata (slot_counter, cursors) and compact ops log.
             let cursors = self.cursors.lock().clone();
             let slot_counter = self.slots.read().slot_counter();
             {
@@ -997,6 +995,18 @@ impl ConcurrentEngine {
                     .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::compact: {e}")))?;
                 eprintln!("save_snapshot: compacted {} silo entries", count);
             }
+        } else if let Some(ref bitmap_path) = self.config.storage.bitmap_path {
+            // No live silo (e.g. engine started fresh, no prior snapshot to restore from).
+            // Fall back to serializing the full in-memory state to a new silo.
+            let cursors = self.cursors.lock().clone();
+            let filters_r = self.filters.read();
+            let sorts_r = self.sorts.read();
+            let slots_r = self.slots.read();
+            let mut silo = crate::silos::bitmap_silo::BitmapSilo::open(bitmap_path)
+                .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
+            let count = silo.save_all_parallel(&*filters_r, &*sorts_r, &*slots_r, &cursors)
+                .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all_parallel: {e}")))?;
+            eprintln!("save_snapshot: wrote {} bitmaps to new silo (no prior snapshot)", count);
         }
 
         Ok(())

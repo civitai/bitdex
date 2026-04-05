@@ -110,17 +110,6 @@ impl FlushBatch {
         self.alive_removes.sort_unstable();
     }
 
-    pub fn has_alive_mutations(&self) -> bool {
-        !self.alive_inserts.is_empty() || !self.alive_removes.is_empty()
-    }
-
-    pub fn mutated_filter_fields(&self) -> HashSet<&str> {
-        let mut fields = HashSet::new();
-        for key in self.filter_inserts.keys() { fields.insert(&*key.field); }
-        for key in self.filter_removes.keys() { fields.insert(&*key.field); }
-        fields
-    }
-
     pub fn apply(
         &self,
         slots: &mut SlotAllocator,
