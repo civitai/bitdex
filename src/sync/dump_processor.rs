@@ -1295,6 +1295,10 @@ pub fn process_dump_with_progress(
     let config = engine.config();
     let filter_field_names: HashSet<String> =
         config.filter_fields.iter().map(|f| f.name.clone()).collect();
+    let multi_value_fields: HashSet<String> = config.filter_fields.iter()
+        .filter(|f| f.field_type == crate::engine::filter::FilterFieldType::MultiValue)
+        .map(|f| f.name.clone())
+        .collect();
     let sort_bits: HashMap<String, u8> = config
         .sort_fields
         .iter()
@@ -1458,18 +1462,9 @@ pub fn process_dump_with_progress(
         .as_secs();
     let has_deferred_alive = config.deferred_alive.is_some() && request.sets_alive;
 
-    // Detect multi-value-only phases (tags, tools, techniques).
-    // These have a single multi-value field and no enrichment/computed fields.
-    // After parse, we invert the accumulated bitmaps to reconstruct per-slot arrays
-    // and write them to the DataSilo ops log — one Merge op per slot.
-    let is_multi_value_only = request.fields.len() == 1
-        && !request.sets_alive
-        && request.computed_fields.is_empty()
-        && request.enrichment.is_empty()
-        && {
-            let target = request.fields[0].target();
-            target == "tagIds" || target == "toolIds" || target == "techniqueIds"
-        };
+    // Multi-value fields (tagIds, toolIds, etc.) now use the same per-row Merge
+    // doc op path as standard fields. Each row emits a single-element Mi array;
+    // compaction concatenates arrays for the same slot.
 
     emit_stage(&request.name, "parallel_parse", "start", &t, 0);
 
@@ -1572,7 +1567,7 @@ pub fn process_dump_with_progress(
     // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
     // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
     // Thread result includes doc_ops: encoded Merge ops to write to DataSilo after parse.
-    // For multi-value-only phases, doc_ops is empty (bitmap inversion post-pass writes docs).
+    // Doc ops are written per-row during parse (multi-value fields use Mi merge concatenation).
     type ThreadResult = (
         HashMap<String, HashMap<u64, RoaringBitmap>>,
         HashMap<String, Vec<RoaringBitmap>>,
@@ -1607,7 +1602,7 @@ pub fn process_dump_with_progress(
     let doc_field_plan = build_doc_field_plan(
         request_fields, enrichment_targets_ref, &computed_defs,
         &extra_i64_targets, doc_field_to_idx.as_ref(), &boolean_fields,
-        filter_field_names_ref,
+        filter_field_names_ref, &multi_value_fields,
     );
     let doc_field_plan_ref = &doc_field_plan;
 
@@ -1644,8 +1639,8 @@ pub fn process_dump_with_progress(
             let mut alive = RoaringBitmap::new();
             let mut deferred: Vec<(u32, u64)> = Vec::new();
             // Doc ops collected during parse — written to DataSilo after fold/reduce.
-            // For multi-value-only phases, no doc ops are collected here (post-pass handles it).
-            let mut doc_ops: Vec<(u64, Vec<u8>)> = if is_multi_value_only || pw_ref.is_some() {
+            // Doc ops collected per-row (multi-value fields emit Mi([value]) per row).
+            let mut doc_ops: Vec<(u64, Vec<u8>)> = if pw_ref.is_some() {
                 Vec::new() // not needed when using parallel ops writer
             } else {
                 Vec::with_capacity(4096)
@@ -1830,7 +1825,7 @@ pub fn process_dump_with_progress(
                             if pub_secs > now_unix {
                                 // Write doc op (deferred rows need their doc data stored),
                                 // but skip all bitmap operations.
-                                if !is_multi_value_only {
+                                {
                                     let pw_arg = pw_ref.as_ref().map(|pw| (pw.as_ref(), &mut ops_local_cursor, &mut ops_local_end));
                                     let scratch = if pw_arg.is_some() { Some((&mut doc_encode_buf, &mut frame_buf)) } else { None };
                                     collect_doc_op(
@@ -2046,7 +2041,7 @@ pub fn process_dump_with_progress(
                 // Write doc op — directly to mmap if parallel writer available, else collect.
                 #[cfg(feature = "dump-timing")]
                 let _t_doc = std::time::Instant::now();
-                if !is_multi_value_only {
+                {
                     #[cfg(feature = "dump-timing")]
                     let _t_fc = std::time::Instant::now();
                     let mut doc_fields: Vec<(u16, DumpFieldValue)> = Vec::with_capacity(20);
@@ -2311,60 +2306,14 @@ pub fn process_dump_with_progress(
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
     // Write doc ops to DataSilo ops log.
-    // For non-multi-value phases: write the collected per-row Merge ops.
-    // For multi-value-only phases: invert the filter bitmaps to reconstruct per-slot arrays,
-    // then write one Merge op per slot.
+    // All phases (including multi-value) write per-row Merge ops during parse.
+    // Multi-value fields emit Mi([value]) per row; compaction concatenates arrays per slot.
     {
         let t_doc = Instant::now();
         let ds = engine.docstore_arc();
         let mut ds_lock = ds.lock();
 
-        if is_multi_value_only {
-            // Bitmap inversion post-pass: for each (value_id, bitmap) pair, iterate the bitmap
-            // to build per-slot tag/tool/technique arrays, then write one Merge op per slot.
-            // Uses a temporary slot→values HashMap built from the merged filter bitmaps.
-            let target = request.fields[0].target();
-            if let Some(field_idx_val) = doc_field_to_idx.get(target) {
-                let fidx = *field_idx_val;
-                // Build slot → Vec<i64> from the merged bitmap
-                let mut slot_values: HashMap<u32, Vec<i64>> = HashMap::new();
-                if let Some(value_map) = merged_filters.get(target) {
-                    for (&value_id, bitmap) in value_map {
-                        for slot in bitmap.iter() {
-                            slot_values.entry(slot).or_default().push(value_id as i64);
-                        }
-                    }
-                }
-                let mv_count = slot_values.len();
-                if mv_count > 0 {
-                    if let Some(ref pw) = parallel_ops_writer {
-                        // Parallel path: encode + write directly to mmap
-                        use rayon::prelude::*;
-                        let mv_entries: Vec<(u32, Vec<i64>)> = slot_values.into_iter().collect();
-                        mv_entries.par_iter().for_each(|(slot, values)| {
-                            let fields = vec![(fidx, PackedValue::Mi(values.clone()))];
-                            let bytes = crate::silos::doc_format::encode_merge_fields(*slot, &fields);
-                            let mut c = 0usize;
-                            let mut e = 0usize;
-                            pw.write_put(*slot as u64, &bytes, &mut c, &mut e);
-                        });
-                        ds_lock.silo().flush_ops()
-                            .map_err(|e| format!("flush_ops (multi-value parallel): {e}"))?;
-                    } else {
-                        // Sequential fallback
-                        let mv_ops: Vec<(u64, Vec<u8>)> = slot_values.into_iter().map(|(slot, values)| {
-                            let fields = vec![(fidx, PackedValue::Mi(values))];
-                            let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
-                            (slot as u64, bytes)
-                        }).collect();
-                        ds_lock.silo_mut().append_ops_batch(&mv_ops)
-                            .map_err(|e| format!("append_ops_batch (multi-value): {e}"))?;
-                    }
-                }
-                eprintln!("  Dump {}: multi-value post-pass wrote {} doc ops ({:.1}s)",
-                    request.name, mv_count, t_doc.elapsed().as_secs_f64());
-            }
-        } else if let Some(ref pw) = parallel_ops_writer {
+        if let Some(ref pw) = parallel_ops_writer {
             // Doc ops were already written directly to the mmap'd ops log during parse.
             // Check for overflow (correctness: dropped ops = missing docs)
             let dropped = pw.overflow_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -2494,6 +2443,7 @@ enum DumpFieldValue<'a> {
     Int(i64),
     Bool(bool),
     Str(&'a str),
+    MultiInt(Vec<i64>),
 }
 
 /// Encode a Merge op from DumpFieldValues into a buffer.
@@ -2506,6 +2456,7 @@ fn encode_dump_merge(slot: u32, fields: &[(u16, DumpFieldValue)], buf: &mut Vec<
             DumpFieldValue::Int(v) => crate::silos::doc_format::write_field_int(*field_idx, *v, buf),
             DumpFieldValue::Bool(v) => crate::silos::doc_format::write_field_bool(*field_idx, *v, buf),
             DumpFieldValue::Str(s) => crate::silos::doc_format::write_field_str(*field_idx, s, buf),
+            DumpFieldValue::MultiInt(v) => crate::silos::doc_format::write_field_multi_int(*field_idx, v, buf),
         }
     }
 }
@@ -2535,6 +2486,9 @@ enum DocValueType {
     Boolean,
     String,
     IntOrString,
+    /// Multi-value integer field — each row contributes one element to an array.
+    /// Compaction merges Mi arrays via concatenation.
+    MultiInt,
 }
 
 /// One entry in the compiled doc field plan.
@@ -2553,6 +2507,7 @@ fn build_doc_field_plan(
     field_idx: &std::collections::HashMap<String, u16>,
     boolean_fields: &HashSet<String>,
     filter_field_names: &HashSet<String>,
+    multi_value_fields: &HashSet<String>,
 ) -> Vec<DocFieldPlanEntry> {
     let extra_skip: std::collections::HashSet<&str> = extra_i64_targets.iter().map(|s| s.as_str()).collect();
     let mut plan = Vec::new();
@@ -2562,7 +2517,9 @@ fn build_doc_field_plan(
         let target = mapping.target();
         if extra_skip.contains(target) { continue; }
         if let Some(&fidx) = field_idx.get(target) {
-            let vtype = if boolean_fields.contains(target) {
+            let vtype = if multi_value_fields.contains(target) {
+                DocValueType::MultiInt
+            } else if boolean_fields.contains(target) {
                 DocValueType::Boolean
             } else {
                 DocValueType::IntOrString
@@ -2640,9 +2597,17 @@ fn execute_doc_plan<'a>(
         match &entry.source {
             DocFieldSource::Direct { column } => {
                 if let Some(v) = row.get_i64(column) {
-                    fields.push((entry.doc_field_idx, DumpFieldValue::Int(v)));
+                    match entry.value_type {
+                        DocValueType::MultiInt => fields.push((entry.doc_field_idx, DumpFieldValue::MultiInt(vec![v]))),
+                        _ => fields.push((entry.doc_field_idx, DumpFieldValue::Int(v))),
+                    }
                 } else if let Some(s) = row.get_str(column).or_else(|| enriched_map.get(column.as_str()).copied()) {
                     match entry.value_type {
+                        DocValueType::MultiInt => {
+                            if let Ok(v) = s.parse::<i64>() {
+                                fields.push((entry.doc_field_idx, DumpFieldValue::MultiInt(vec![v])));
+                            }
+                        }
                         DocValueType::Boolean => {
                             match s { "t" | "true" => fields.push((entry.doc_field_idx, DumpFieldValue::Bool(true))),
                                        "f" | "false" => fields.push((entry.doc_field_idx, DumpFieldValue::Bool(false))),
