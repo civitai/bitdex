@@ -129,28 +129,64 @@ pub fn run_flush_thread(args: FlushArgs) {
                         let sort_field_name = tb.sort_field_name().to_string();
                         let field_name = tb.field_name().to_string();
                         let bucket_names: Vec<String> = tb.bucket_names();
-                        let sorts_r = flush_sorts.read();
-                        if let Some(sort_field) = sorts_r.get_field(&sort_field_name) {
-                            for &slot in &batch.alive_inserts {
-                                let ts = sort_field.reconstruct_value(slot) as u64;
-                                // Determine which buckets this slot qualifies for (same logic as insert_slot)
-                                let qualifying: Vec<String> = bucket_names.iter()
-                                    .filter(|name| {
-                                        if let Some(bucket) = tb.get_bucket(name) {
-                                            let cutoff = now_secs.saturating_sub(bucket.duration_secs);
-                                            ts >= cutoff && ts <= now_secs
-                                        } else {
-                                            false
-                                        }
-                                    })
-                                    .cloned()
-                                    .collect();
-                                tb.insert_slot(slot, ts, now_secs);
-                                // Mirror to silo
-                                if let Some(ref silo_arc) = flush_bitmap_silo {
+                        // Reconstruct sort values via silo when silo is active
+                        // (in-memory SortIndex is not updated when has_silo is true).
+                        let mut reconstruct_via_silo = false;
+                        if has_silo {
+                            if let Some(ref silo_arc) = flush_bitmap_silo {
+                                // Look up num_bits for this sort field from config.
+                                if let Some(sc) = flush_config.sort_fields.iter().find(|s| s.name == sort_field_name) {
+                                    let num_bits = sc.bits as usize;
                                     let silo = silo_arc.read();
-                                    for bucket_name in &qualifying {
-                                        let _ = silo.bucket_set(&field_name, bucket_name, slot);
+                                    for &slot in &batch.alive_inserts {
+                                        let ts = crate::engine::frozen_sort::frozen_reconstruct_value(
+                                            &silo, &sort_field_name, num_bits, slot,
+                                        ) as u64;
+                                        let qualifying: Vec<String> = bucket_names.iter()
+                                            .filter(|name| {
+                                                if let Some(bucket) = tb.get_bucket(name) {
+                                                    let cutoff = now_secs.saturating_sub(bucket.duration_secs);
+                                                    ts >= cutoff && ts <= now_secs
+                                                } else {
+                                                    false
+                                                }
+                                            })
+                                            .cloned()
+                                            .collect();
+                                        tb.insert_slot(slot, ts, now_secs);
+                                        for bucket_name in &qualifying {
+                                            let _ = silo.bucket_set(&field_name, bucket_name, slot);
+                                        }
+                                    }
+                                    reconstruct_via_silo = true;
+                                }
+                            }
+                        }
+                        if !reconstruct_via_silo {
+                            // In-memory path (no silo, or silo sort field not found in config).
+                            let sorts_r = flush_sorts.read();
+                            if let Some(sort_field) = sorts_r.get_field(&sort_field_name) {
+                                for &slot in &batch.alive_inserts {
+                                    let ts = sort_field.reconstruct_value(slot) as u64;
+                                    // Determine which buckets this slot qualifies for (same logic as insert_slot)
+                                    let qualifying: Vec<String> = bucket_names.iter()
+                                        .filter(|name| {
+                                            if let Some(bucket) = tb.get_bucket(name) {
+                                                let cutoff = now_secs.saturating_sub(bucket.duration_secs);
+                                                ts >= cutoff && ts <= now_secs
+                                            } else {
+                                                false
+                                            }
+                                        })
+                                        .cloned()
+                                        .collect();
+                                    tb.insert_slot(slot, ts, now_secs);
+                                    // Mirror to silo
+                                    if let Some(ref silo_arc) = flush_bitmap_silo {
+                                        let silo = silo_arc.read();
+                                        for bucket_name in &qualifying {
+                                            let _ = silo.bucket_set(&field_name, bucket_name, slot);
+                                        }
                                     }
                                 }
                             }

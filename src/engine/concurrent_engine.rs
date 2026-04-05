@@ -548,6 +548,8 @@ impl ConcurrentEngine {
             | MutationOp::FilterRemove { .. }
             | MutationOp::SortSet { .. }
             | MutationOp::SortClear { .. }
+            | MutationOp::AliveInsert { .. }
+            | MutationOp::AliveRemove { .. }
         ));
         if !has_field_ops {
             return;
@@ -561,6 +563,9 @@ impl ConcurrentEngine {
                 | MutationOp::SortSet { field, .. }
                 | MutationOp::SortClear { field, .. } => {
                     guard.insert(field.to_string(), new_epoch);
+                }
+                MutationOp::AliveInsert { .. } | MutationOp::AliveRemove { .. } => {
+                    guard.insert("__alive__".to_string(), new_epoch);
                 }
                 _ => {}
             }
@@ -726,7 +731,15 @@ impl ConcurrentEngine {
         self.send_mutation_ops(ops)
     }
     /// Get the number of alive documents.
+    ///
+    /// When a BitmapSilo is present, reads from the silo (includes ops-log replay)
+    /// rather than from the stale in-memory SlotAllocator.
     pub fn alive_count(&self) -> u64 {
+        if let Some(ref silo_arc) = self.bitmap_silo {
+            if let Some(alive) = silo_arc.read().get_alive_with_ops() {
+                return alive.len();
+            }
+        }
         self.slots.read().alive_count()
     }
     /// Flush loop stats: (apply_count, cumulative_duration_nanos, last_duration_nanos).
@@ -754,8 +767,21 @@ impl ConcurrentEngine {
         self.slots.read().slot_counter()
     }
     /// Reconstruct the sort value for a given slot in the named sort field.
-    /// Returns None if the field is not found in the in-memory sort index.
+    ///
+    /// When a BitmapSilo is present, reads from the silo (correct when in-memory
+    /// SortIndex is not updated). Falls back to in-memory SortIndex otherwise.
+    /// Returns None if the field is not found in either source.
     pub fn reconstruct_sort_value(&self, field: &str, slot: u32) -> Option<u32> {
+        if let Some(ref silo_arc) = self.bitmap_silo {
+            // Look up num_bits from config for this sort field.
+            if let Some(sc) = self.config.sort_fields.iter().find(|s| s.name == field) {
+                let num_bits = sc.bits as usize;
+                let silo = silo_arc.read();
+                return Some(crate::engine::frozen_sort::frozen_reconstruct_value(
+                    &silo, field, num_bits, slot,
+                ));
+            }
+        }
         self.sorts.read().get_field(field).map(|f| f.reconstruct_value(slot))
     }
     // ---- Named cursors ----
@@ -1112,34 +1138,62 @@ impl ConcurrentEngine {
     /// Used by the NDJSON loader to apply accumulated bitmaps from a parsed chunk
     /// without the staging InnerEngine pattern. Takes write locks briefly to OR-merge
     /// filter/sort bitmaps and alive bits into the existing live state.
+    ///
+    /// When a BitmapSilo is present, writes are directed to the silo via
+    /// `write_dump_maps()` (batch frozen write) and the in-memory indexes are skipped,
+    /// since all reads go through the silo when it is active.
     pub fn merge_bitmap_maps(
         &self,
         filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
         sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
         alive: RoaringBitmap,
     ) {
-        {
-            let mut filters_w = self.filters.write();
-            for (field_name, value_map) in filter_maps {
-                if let Some(field) = filters_w.get_field_mut(&field_name) {
-                    for (value, bitmap) in value_map {
-                        field.or_bitmap(value, &bitmap);
+        if let Some(ref silo_arc) = self.bitmap_silo {
+            // Silo present: route writes to the silo only (reads bypass in-memory indexes).
+            // Convert sort_maps: HashMap<usize, RoaringBitmap> → Vec<RoaringBitmap> (indexed by bit layer).
+            let silo_sort_maps: HashMap<String, Vec<RoaringBitmap>> = sort_maps.into_iter()
+                .map(|(field_name, bit_map)| {
+                    let max_bit = bit_map.keys().copied().max().map(|b| b + 1).unwrap_or(0);
+                    let mut layers = vec![RoaringBitmap::new(); max_bit];
+                    for (bit, bm) in bit_map {
+                        if bit < max_bit {
+                            layers[bit] = bm;
+                        }
+                    }
+                    (field_name, layers)
+                })
+                .collect();
+            let slot_counter = self.slots.read().slot_counter();
+            let cursors = self.cursors.lock().clone();
+            let mut silo = silo_arc.write();
+            if let Err(e) = silo.write_dump_maps(filter_maps, silo_sort_maps, &alive, slot_counter, &cursors) {
+                tracing::warn!("merge_bitmap_maps: silo write_dump_maps failed: {e}");
+            }
+        } else {
+            // No silo: apply to in-memory indexes only (legacy/test path).
+            {
+                let mut filters_w = self.filters.write();
+                for (field_name, value_map) in filter_maps {
+                    if let Some(field) = filters_w.get_field_mut(&field_name) {
+                        for (value, bitmap) in value_map {
+                            field.or_bitmap(value, &bitmap);
+                        }
                     }
                 }
             }
-        }
-        {
-            let mut sorts_w = self.sorts.write();
-            for (field_name, bit_map) in sort_maps {
-                if let Some(field) = sorts_w.get_field_mut(&field_name) {
-                    for (bit, bitmap) in bit_map {
-                        field.or_layer(bit, &bitmap);
+            {
+                let mut sorts_w = self.sorts.write();
+                for (field_name, bit_map) in sort_maps {
+                    if let Some(field) = sorts_w.get_field_mut(&field_name) {
+                        for (bit, bitmap) in bit_map {
+                            field.or_layer(bit, &bitmap);
+                        }
                     }
                 }
             }
-        }
-        {
-            self.slots.write().alive_or_bitmap(&alive);
+            {
+                self.slots.write().alive_or_bitmap(&alive);
+            }
         }
         self.dirty_flag.store(true, Ordering::Release);
         self.invalidate_all_caches();

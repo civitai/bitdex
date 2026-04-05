@@ -154,13 +154,11 @@ impl<'a> QueryExecutor<'a> {
     }
 
     /// Alive count consistent with `alive_bitmap()`.
+    ///
+    /// Derives from the cached `alive_bitmap()` so both methods always agree
+    /// within a single query execution (avoids double-computing the silo alive set).
     fn alive_count(&self) -> u64 {
-        if let Some(silo) = self.bitmap_silo {
-            if let Some(alive) = silo.get_alive_with_ops() {
-                return alive.len();
-            }
-        }
-        self.slots.alive_count()
+        self.alive_bitmap().len()
     }
 
     /// Attach a time bucket manager for in-executor bucket snapping (C3).
