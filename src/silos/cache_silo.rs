@@ -313,12 +313,12 @@ impl CacheSilo {
     /// Persist a cache entry. Called by the flush thread after cache update.
     pub fn save_entry(&self, key_hash: u32, entry: &CacheEntryData) -> io::Result<()> {
         let bytes = entry.encode();
-        self.silo.append_op(key_hash, &bytes)
+        self.silo.append_op(key_hash as u64, &bytes)
     }
 
     /// Remove a persisted cache entry. Called on eviction.
     pub fn delete_entry(&self, key_hash: u32) -> io::Result<()> {
-        self.silo.delete(key_hash)
+        self.silo.delete(key_hash as u64)
     }
 
     /// Read a single entry by key hash. Checks both ops logs (last-write-wins) and
@@ -327,7 +327,7 @@ impl CacheSilo {
     ///
     /// Used by the query fast path to check the persistent cache.
     pub fn get_entry(&self, key_hash: u32) -> Option<CacheEntryData> {
-        let bytes = self.silo.get_with_ops(key_hash)?;
+        let bytes = self.silo.get_with_ops(key_hash as u64)?;
         match CacheEntryData::decode(&bytes) {
             Ok(entry) => Some(entry),
             Err(e) => {
@@ -346,7 +346,7 @@ impl CacheSilo {
         use std::collections::HashMap;
 
         // Collect last op per key from the ops log (last-write-wins, like DataSilo compaction).
-        let mut latest: HashMap<u32, Option<Vec<u8>>> = HashMap::new();
+        let mut latest: HashMap<u64, Option<Vec<u8>>> = HashMap::new();
         let log = self.silo.ops_log().lock();
         let _ = log.for_each_ops(|op| {
             match op {
@@ -362,11 +362,11 @@ impl CacheSilo {
 
         let mut results = Vec::new();
 
-        // Entries with ops overlay
+        // Entries with ops overlay — cast key back to u32 for CacheSilo's public API
         for (key, maybe_val) in &latest {
             if let Some(bytes) = maybe_val {
                 match CacheEntryData::decode(bytes) {
-                    Ok(entry) => results.push((*key, entry)),
+                    Ok(entry) => results.push((*key as u32, entry)),
                     Err(e) => {
                         eprintln!("CacheSilo: decode error for key {key}: {e} (skipping)");
                     }
@@ -378,13 +378,13 @@ impl CacheSilo {
         // Entries only in the data file (compacted, no ops overlay)
         // We iterate all index slots and skip any key already handled via ops.
         let index_cap = self.silo.index_capacity();
-        for key in 0..index_cap {
+        for key in 0..index_cap as u64 {
             if latest.contains_key(&key) {
                 continue; // ops overlay already processed this key
             }
             if let Some(bytes) = self.silo.get(key) {
                 match CacheEntryData::decode(bytes) {
-                    Ok(entry) => results.push((key, entry)),
+                    Ok(entry) => results.push((key as u32, entry)),
                     Err(e) => {
                         eprintln!("CacheSilo: decode error for key {key} (data file): {e} (skipping)");
                     }

@@ -69,7 +69,7 @@ impl DocSiloAdapter {
 
     /// Get a document by slot ID.
     pub fn get(&self, slot: u32) -> io::Result<Option<StoredDoc>> {
-        let bytes = match self.silo.get_with_ops(slot) {
+        let bytes = match self.silo.get_with_ops(slot as u64) {
             Some(b) => b,
             None => return Ok(None),
         };
@@ -85,14 +85,14 @@ impl DocSiloAdapter {
     pub fn put(&mut self, slot: u32, doc: &StoredDoc) -> io::Result<()> {
         let fields = self.encode_stored_doc_auto(doc);
         let bytes = doc_format::encode_merge_fields(slot, &fields);
-        self.silo.append_op(slot, &bytes)
+        self.silo.append_op(slot as u64, &bytes)
     }
 
     /// Write a batch of documents. Auto-registers any new field names.
     pub fn put_batch(&mut self, docs: &[(u32, StoredDoc)]) -> io::Result<()> {
-        let ops: Vec<(u32, Vec<u8>)> = docs.iter().map(|(slot, doc)| {
+        let ops: Vec<(u64, Vec<u8>)> = docs.iter().map(|(slot, doc)| {
             let fields = self.encode_stored_doc_auto(doc);
-            (*slot, doc_format::encode_merge_fields(*slot, &fields))
+            (*slot as u64, doc_format::encode_merge_fields(*slot, &fields))
         }).collect();
         self.silo.append_ops_batch(&ops)
     }
@@ -227,7 +227,7 @@ impl DocSiloAdapter {
     /// field indices to names.  Used by the packed-rebuild benchmark path that avoids
     /// the `StoredDoc` HashMap allocation entirely.
     pub fn get_shard_packed(&self, shard_id: u32) -> io::Result<Vec<(u32, Vec<(u16, PackedValue)>)>> {
-        let bytes = match self.silo.get_with_ops(shard_id) {
+        let bytes = match self.silo.get_with_ops(shard_id as u64) {
             Some(b) => b,
             None => return Ok(Vec::new()),
         };
