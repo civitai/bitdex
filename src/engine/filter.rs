@@ -173,10 +173,6 @@ impl FilterField {
     pub fn cardinality(&self, value: u64) -> u64 {
         self.bitmaps.get(&value).map_or(0, |vb| vb.base_len())
     }
-    /// Get the number of distinct values tracked.
-    pub fn distinct_count(&self) -> usize {
-        self.bitmaps.len()
-    }
     /// Compute the union of bitmaps for multiple values (OR).
     pub fn union(&self, values: &[u64]) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();

@@ -554,17 +554,6 @@ impl ConcurrentEngine {
         }
         Ok(())
     }
-    /// Persist dirty dictionaries to disk. Call after upserts that may have
-    /// created new LowCardinalityString values. Only writes dictionaries that
-    /// have new entries since the last persist, and clears their dirty flags.
-    ///
-    /// This ensures dictionary mappings survive crashes even before the next
-    /// full `save_snapshot()`. Dictionaries are small (typically < 1 KB), so
-    /// the I/O cost is negligible.
-    pub fn persist_dirty_dictionaries(&self) -> Result<()> {
-        // No-op: BitmapSilo saves dictionaries at save_snapshot time.
-        Ok(())
-    }
     /// Load dictionaries from disk for all LowCardinalityString fields in the schema.
     pub fn load_dictionaries(
         schema: &crate::config::DataSchema,
@@ -739,20 +728,11 @@ impl ConcurrentEngine {
         // Read directly from DataSilo (no separate doc cache — DataSilo uses mmap).
         Ok(self.docstore.lock().get(slot_id)?)
     }
-    /// Compact the docstore, reclaiming space from old write transactions.
-    pub fn compact_docstore(&self) -> Result<bool> {
-        Ok(self.docstore.lock().compact()?)
-    }
     /// Configure docstore field defaults from a DataSchema.
     /// Must be called before `prepare_bulk_writer()` so the BulkWriter inherits the defaults.
     pub fn set_docstore_defaults(&self, schema: &crate::config::DataSchema) {
         self.docstore.lock().set_field_defaults(schema);
     }
-    /// Get the current schema version from the docstore.
-    pub fn docstore_schema_version(&self) -> u8 {
-        self.docstore.lock().schema_version()
-    }
-
     /// Get a clone of the Arc<Mutex<DocSiloAdapter>> for external writers.
     pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<DocSiloAdapter>> {
         Arc::clone(&self.docstore)
@@ -770,19 +750,6 @@ impl ConcurrentEngine {
     pub fn prepare_field_names(&self, field_names: &[String]) -> crate::error::Result<()> {
         self.docstore.lock().prepare_field_names(field_names)
             .map_err(|e| crate::error::BitdexError::Storage(format!("prepare_field_names: {e}")))
-    }
-    /// Return the set of indexed field names (filter + sort + "id").
-    /// Used by the loader to strip doc-only fields from the bitmap accumulator.
-    pub fn indexed_field_names(&self) -> std::collections::HashSet<String> {
-        let mut s = std::collections::HashSet::new();
-        for f in &self.config.filter_fields {
-            s.insert(f.name.clone());
-        }
-        for f in &self.config.sort_fields {
-            s.insert(f.name.clone());
-        }
-        s.insert("id".to_string());
-        s
     }
     /// Get the current pending buffer depth. Always 0 (tier 2 removed).
     pub fn pending_depth(&self) -> usize {

@@ -90,30 +90,38 @@ impl<'a> QueryExecutor<'a> {
             bitmap_silo,
         }
     }
-    /// Attach string maps for MappedString field reverse lookup.
-    /// Enables querying with `Value::String("SD 1.5")` on MappedString fields.
-    pub fn with_string_maps(mut self, maps: &'a StringMaps) -> Self {
-        self.string_maps = Some(maps);
+
+    /// Attach a sort-bits map so frozen-only sort traversal can be used for fields
+    /// not present in the in-memory SortIndex.
+    ///
+    /// `bits` maps sort field name → number of bit layers (from `SortFieldConfig.bits`).
+    /// When a sort query arrives for a field absent from `self.sorts` but present in
+    /// the BitmapSilo, the executor uses `frozen_sort::frozen_top_n` with this bit count.
+    pub fn with_sort_bits(mut self, bits: &'a HashMap<String, usize>) -> Self {
+        self.sort_bits = Some(bits);
         self
     }
-    /// Attach case-sensitive field set for string matching control.
-    pub fn with_case_sensitive_fields(mut self, fields: &'a CaseSensitiveFields) -> Self {
-        self.case_sensitive_fields = Some(fields);
-        self
+    /// Get the alive bitmap, preferring BitmapSilo ops-on-read over in-memory.
+    /// Cached after first call for consistency within a single query.
+    fn alive_bitmap(&self) -> &RoaringBitmap {
+        self.alive_cache.get_or_init(|| {
+            if let Some(silo) = self.bitmap_silo {
+                if let Some(alive) = silo.get_alive_with_ops() {
+                    return alive;
+                }
+            }
+            self.slots.alive_bitmap().clone()
+        })
     }
-    /// Attach live dictionaries for LowCardinalityString field query resolution.
-    /// Used as fallback when the string_maps snapshot doesn't have a recently-added value.
-    pub fn with_dictionaries(mut self, dicts: &'a HashMap<String, FieldDictionary>) -> Self {
-        self.dictionaries = Some(dicts);
-        self
+
+    /// Alive count consistent with `alive_bitmap()`.
+    ///
+    /// Derives from the cached `alive_bitmap()` so both methods always agree
+    /// within a single query execution (avoids double-computing the silo alive set).
+    fn alive_count(&self) -> u64 {
+        self.alive_bitmap().len()
     }
-    /// Attach a BitmapSilo for frozen bitmap reads.
-    /// When filter/sort bitmaps are unloaded, the executor reads frozen data
-    /// directly from the silo's mmap (zero-copy, near-zero heap).
-    pub fn with_bitmap_silo(mut self, silo: &'a BitmapSilo) -> Self {
-        self.bitmap_silo = Some(silo);
-        self
-    }
+
     /// Attach a time bucket manager for in-executor bucket snapping (C3).
     /// Range filters on the bucketed field will be snapped to pre-computed bitmaps.
     pub fn with_time_buckets(mut self, tb: &'a crate::time_buckets::TimeBucketManager, now: u64) -> Self {
@@ -264,17 +272,6 @@ impl<'a> QueryExecutor<'a> {
             cursor: next_cursor,
             total_matched,
         })
-    }
-    /// Check if a single slot matches all the given filter clauses.
-    /// Used by post-validation to revalidate slots that overlap with in-flight writes.
-    pub fn slot_matches_filters(&self, slot: u32, clauses: &[FilterClause]) -> Result<bool> {
-        for clause in clauses {
-            let bitmap = self.evaluate_clause(clause)?;
-            if !bitmap.contains(slot) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
     /// Execute from a pre-computed filter bitmap: alive AND + sort + paginate.
     /// Used when the caller handles cache interaction separately.

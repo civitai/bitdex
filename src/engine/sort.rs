@@ -376,6 +376,7 @@ impl SortField {
     /// Iterates every slot in `universe` and reconstructs its value from the
     /// bit layers. O(universe_size * num_bits) — acceptable when the matching
     /// fraction is small (e.g. a 300-second window out of 86400 seconds).
+    #[cfg(test)]
     pub fn slots_in_range(
         &self,
         universe: &RoaringBitmap,
@@ -427,25 +428,6 @@ impl SortField {
                 self.bit_layers[i] = VersionedBitmap::new(bm);
             }
         }
-    }
-
-    /// Get base bitmap references for all layers (for persistence).
-    /// Only valid when layers are clean (merged).
-    pub fn layer_bases(&self) -> Vec<&RoaringBitmap> {
-        self.bit_layers
-            .iter()
-            .map(|vb| {
-                debug_assert!(!vb.is_dirty(), "persisting dirty sort layer");
-                vb.base()
-            })
-            .collect()
-    }
-
-    /// Get fused bitmap references for all layers (for zero-copy persistence).
-    /// Returns `Cow::Borrowed` when the layer is clean (zero copy),
-    /// `Cow::Owned` when the layer has pending diffs.
-    pub fn layer_bases_fused(&self) -> Vec<Cow<'_, RoaringBitmap>> {
-        self.bit_layers.iter().map(|vb| vb.fused_cow()).collect()
     }
 
     /// Return the serialized byte size of all bit layer bitmaps.
