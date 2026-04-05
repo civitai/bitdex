@@ -32,15 +32,6 @@ pub struct MetricsBridge {
     pub compaction_duration: prometheus::HistogramVec,
     pub index_name: String,
 }
-/// Staging buffer used by bulk-load paths (apply_bitmap_maps).
-/// Callers build bitmaps into this struct offline and then call publish_staging()
-/// to atomically swap its contents into the live engine under write locks.
-#[derive(Clone)]
-pub struct InnerEngine {
-    pub slots: crate::engine::slot::SlotAllocator,
-    pub filters: crate::engine::filter::FilterIndex,
-    pub sorts: crate::engine::sort::SortIndex,
-}
 /// Thread-safe engine using ArcSwap for lock-free snapshot reads.
 ///
 /// Writers call `put`/`delete` which compute diffs and send
@@ -63,8 +54,8 @@ pub struct CompactResult {
 /// multiple readers share access lock-free while flush thread holds
 /// write locks only for the duration of batch application.
 ///
-/// Bulk-load callers use `clone_staging()` + `apply_bitmap_maps()` to build
-/// bitmaps offline and `publish_staging()` to swap them in.
+/// Bulk-load callers use `merge_bitmap_maps()` to OR-merge pre-built bitmaps
+/// directly into the live state under write locks.
 pub struct ConcurrentEngine {
     /// Slot allocator: alive bitmap + slot counter + deferred alive set.
     pub(crate) slots: Arc<parking_lot::RwLock<crate::engine::slot::SlotAllocator>>,
@@ -1107,55 +1098,46 @@ impl ConcurrentEngine {
         Ok(result)
     }
 
-    /// Publish a staging InnerEngine as the current live state and invalidate all caches.
-    ///
-    /// Called after bulk-load paths that build bitmaps offline. Takes write locks
-    /// on all three fields briefly to swap in the new state.
-    pub fn publish_staging(&self, staging: InnerEngine) {
-        *self.slots.write() = staging.slots;
-        *self.filters.write() = staging.filters;
-        *self.sorts.write() = staging.sorts;
-        self.dirty_flag.store(true, Ordering::Release);
-        self.invalidate_all_caches();
-    }
-    /// Clone the current live state into a staging InnerEngine for offline mutation.
-    pub fn clone_staging(&self) -> InnerEngine {
-        let slots_r = self.slots.read();
-        let filters_r = self.filters.read();
-        let sorts_r = self.sorts.read();
-        InnerEngine {
-            slots: slots_r.clone(),
-            filters: filters_r.clone(),
-            sorts: sorts_r.clone(),
-        }
-    }
     fn invalidate_all_caches(&self) {
         // CacheSilo entries become stale after bulk loads; they'll be recomputed on miss.
         // Full purge via clear_cache() is available if needed.
     }
-    /// Apply pre-built bitmap maps directly to a staging snapshot.
-    /// Used by the fused parse+bitmap loader to skip the decompose/merge/apply pipeline.
-    pub fn apply_bitmap_maps(
-        staging: &mut InnerEngine,
+    /// Merge pre-built bitmap maps directly into the live engine state.
+    ///
+    /// Used by the NDJSON loader to apply accumulated bitmaps from a parsed chunk
+    /// without the staging InnerEngine pattern. Takes write locks briefly to OR-merge
+    /// filter/sort bitmaps and alive bits into the existing live state.
+    pub fn merge_bitmap_maps(
+        &self,
         filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
         sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
         alive: RoaringBitmap,
     ) {
-        for (field_name, value_map) in filter_maps {
-            if let Some(field) = staging.filters.get_field_mut(&field_name) {
-                for (value, bitmap) in value_map {
-                    field.or_bitmap(value, &bitmap);
+        {
+            let mut filters_w = self.filters.write();
+            for (field_name, value_map) in filter_maps {
+                if let Some(field) = filters_w.get_field_mut(&field_name) {
+                    for (value, bitmap) in value_map {
+                        field.or_bitmap(value, &bitmap);
+                    }
                 }
             }
         }
-        for (field_name, bit_map) in sort_maps {
-            if let Some(field) = staging.sorts.get_field_mut(&field_name) {
-                for (bit, bitmap) in bit_map {
-                    field.or_layer(bit, &bitmap);
+        {
+            let mut sorts_w = self.sorts.write();
+            for (field_name, bit_map) in sort_maps {
+                if let Some(field) = sorts_w.get_field_mut(&field_name) {
+                    for (bit, bitmap) in bit_map {
+                        field.or_layer(bit, &bitmap);
+                    }
                 }
             }
         }
-        staging.slots.alive_or_bitmap(&alive);
+        {
+            self.slots.write().alive_or_bitmap(&alive);
+        }
+        self.dirty_flag.store(true, Ordering::Release);
+        self.invalidate_all_caches();
     }
     /// Signal background threads to stop (non-blocking, works through Arc).
     /// Threads will exit on their next loop iteration. Use this when you can't
