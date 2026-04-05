@@ -257,10 +257,13 @@ impl ConcurrentEngine {
                 let mut bm = roaring::RoaringBitmap::new();
                 for &slot in &sorted_slots { bm.insert(slot); }
                 // Tag the entry with the current epoch so staleness can be detected.
+                // Include __alive__ so inserts/deletes invalidate cached results that
+                // implicitly depend on the alive set (e.g. negation queries, count queries).
                 let current_epoch = self.mutation_epoch();
-                let entry_field_epochs: Vec<(String, u64)> = ukey.filter_clauses.iter()
+                let mut entry_field_epochs: Vec<(String, u64)> = ukey.filter_clauses.iter()
                     .map(|c| (c.field.clone(), self.field_epoch(&c.field)))
                     .collect();
+                entry_field_epochs.push(("__alive__".to_string(), self.field_epoch("__alive__")));
                 let entry_data = crate::silos::cache_silo::CacheEntryData {
                     key: ukey.clone(),
                     bitmap: bm,
