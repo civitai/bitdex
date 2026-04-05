@@ -1580,7 +1580,7 @@ pub fn process_dump_with_progress(
         Vec<(u32, u64)>,
         u64,
         u32,
-        Vec<(u32, Vec<u8>)>, // doc_ops: (slot, encoded Merge op bytes)
+        Vec<(u64, Vec<u8>)>, // doc_ops: (slot, encoded Merge op bytes)
     );
 
     // Prepare parallel ops writer for direct mmap writes from rayon threads.
@@ -1645,7 +1645,7 @@ pub fn process_dump_with_progress(
             let mut deferred: Vec<(u32, u64)> = Vec::new();
             // Doc ops collected during parse — written to DataSilo after fold/reduce.
             // For multi-value-only phases, no doc ops are collected here (post-pass handles it).
-            let mut doc_ops: Vec<(u32, Vec<u8>)> = if is_multi_value_only || pw_ref.is_some() {
+            let mut doc_ops: Vec<(u64, Vec<u8>)> = if is_multi_value_only || pw_ref.is_some() {
                 Vec::new() // not needed when using parallel ops writer
             } else {
                 Vec::with_capacity(4096)
@@ -2067,7 +2067,7 @@ pub fn process_dump_with_progress(
                             { timings.doc_pack_encode += _t_enc.elapsed().as_nanos() as u64; }
                             #[cfg(feature = "dump-timing")]
                             let _t_wr = std::time::Instant::now();
-                            pw.write_put_reuse(slot, &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
+                            pw.write_put_reuse(slot as u64, &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
                             #[cfg(feature = "dump-timing")]
                             { timings.doc_mmap_write += _t_wr.elapsed().as_nanos() as u64; }
                         } else {
@@ -2075,7 +2075,7 @@ pub fn process_dump_with_progress(
                             let bytes = doc_encode_buf.clone();
                             #[cfg(feature = "dump-timing")]
                             { timings.doc_pack_encode += _t_enc.elapsed().as_nanos() as u64; }
-                            doc_ops.push((slot, bytes));
+                            doc_ops.push((slot as u64, bytes));
                         }
                     }
                 }
@@ -2200,7 +2200,7 @@ pub fn process_dump_with_progress(
         let mut merged_deferred: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         let mut total_count: u64 = 0;
         let mut max_slot: u32 = 0;
-        let mut all_doc_ops: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut all_doc_ops: Vec<(u64, Vec<u8>)> = Vec::new();
 
         let mut filter_collectors: HashMap<String, HashMap<u64, Vec<RoaringBitmap>>> = HashMap::new();
         let mut sort_collectors: HashMap<String, Vec<Vec<RoaringBitmap>>> = HashMap::new();
@@ -2253,7 +2253,7 @@ pub fn process_dump_with_progress(
         let mut merged_deferred: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         let mut total_count: u64 = 0;
         let mut max_slot: u32 = 0;
-        let mut all_doc_ops: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut all_doc_ops: Vec<(u64, Vec<u8>)> = Vec::new();
 
         for (filter_maps, sort_maps, alive, deferred, count, thread_max, doc_ops) in thread_results {
             merged_alive |= alive;
@@ -2346,16 +2346,16 @@ pub fn process_dump_with_progress(
                             let bytes = crate::silos::doc_format::encode_merge_fields(*slot, &fields);
                             let mut c = 0usize;
                             let mut e = 0usize;
-                            pw.write_put(*slot, &bytes, &mut c, &mut e);
+                            pw.write_put(*slot as u64, &bytes, &mut c, &mut e);
                         });
                         ds_lock.silo().flush_ops()
                             .map_err(|e| format!("flush_ops (multi-value parallel): {e}"))?;
                     } else {
                         // Sequential fallback
-                        let mv_ops: Vec<(u32, Vec<u8>)> = slot_values.into_iter().map(|(slot, values)| {
+                        let mv_ops: Vec<(u64, Vec<u8>)> = slot_values.into_iter().map(|(slot, values)| {
                             let fields = vec![(fidx, PackedValue::Mi(values))];
                             let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
-                            (slot, bytes)
+                            (slot as u64, bytes)
                         }).collect();
                         ds_lock.silo_mut().append_ops_batch(&mv_ops)
                             .map_err(|e| format!("append_ops_batch (multi-value): {e}"))?;
@@ -2719,7 +2719,7 @@ fn collect_doc_op(
     field_idx: &HashMap<String, u16>,
     boolean_fields: &HashSet<String>,
     extra_i64_fields: &[(&str, i64)],
-    doc_ops: &mut Vec<(u32, Vec<u8>)>,
+    doc_ops: &mut Vec<(u64, Vec<u8>)>,
     pw: Option<(&datasilo::ParallelOpsWriter, &mut usize, &mut usize)>,
     scratch: Option<(&mut Vec<u8>, &mut Vec<u8>)>, // (doc_encode_buf, frame_buf) for zero-alloc pw path
 ) -> (u64, u64, u64) { // (field_collect_ns, pack_encode_ns, mmap_write_ns) — always 0 without dump-timing
@@ -2837,7 +2837,7 @@ fn collect_doc_op(
             { pack_encode_ns = _t_enc.elapsed().as_nanos() as u64; }
             #[cfg(feature = "dump-timing")]
             let _t_wr = std::time::Instant::now();
-            writer.write_put_reuse(slot, doc_buf, frame_buf, local_cursor, local_end);
+            writer.write_put_reuse(slot as u64, doc_buf, frame_buf, local_cursor, local_end);
             #[cfg(feature = "dump-timing")]
             { mmap_write_ns = _t_wr.elapsed().as_nanos() as u64; }
         } else {
@@ -2846,7 +2846,7 @@ fn collect_doc_op(
             let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
             #[cfg(feature = "dump-timing")]
             { pack_encode_ns = _t_enc.elapsed().as_nanos() as u64; }
-            doc_ops.push((slot, bytes));
+            doc_ops.push((slot as u64, bytes));
         }
     }
 
@@ -3380,7 +3380,7 @@ mod tests {
         let indexed_fields = row.to_indexed_fields();
         let col_idx = row.col_index_ref();
         let extra_i64: Vec<(&str, i64)> = vec![];
-        let mut doc_ops: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut doc_ops: Vec<(u64, Vec<u8>)> = Vec::new();
 
         collect_doc_op(
             &row, &enriched, &computed_defs, &indexed_fields, col_idx,
@@ -3414,7 +3414,7 @@ mod tests {
         let indexed_fields = row.to_indexed_fields();
         let col_idx = row.col_index_ref();
         let extra_i64: Vec<(&str, i64)> = vec![("sortAt", 1711234567)];
-        let mut doc_ops: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut doc_ops: Vec<(u64, Vec<u8>)> = Vec::new();
 
         collect_doc_op(
             &row, &enriched, &computed_defs, &indexed_fields, col_idx,
