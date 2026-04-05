@@ -53,6 +53,7 @@ struct Config {
     admin_token: Option<String>,
     max_query_concurrency: u32,
     trace_buffer_size: usize,
+    read_only: bool,
 }
 
 /// Get the directory containing the current executable.
@@ -99,6 +100,7 @@ fn parse_config() -> Config {
     let mut cli_enable_traces = false;
     let mut cli_max_query_concurrency: Option<u32> = None;
     let mut cli_trace_buffer_size: Option<usize> = None;
+    let mut cli_read_only = false;
 
     let mut i = 1;
     while i < cli_args.len() {
@@ -144,6 +146,9 @@ fn parse_config() -> Config {
             "--trace-buffer-size" => {
                 i += 1;
                 cli_trace_buffer_size = Some(cli_args[i].parse().expect("--trace-buffer-size must be a number"));
+            }
+            "--read-only" => {
+                cli_read_only = true;
             }
             other => {
                 eprintln!("Unknown argument: {other}");
@@ -253,7 +258,10 @@ fn parse_config() -> Config {
         }
     }
 
-    Config { port, data_dir, index: cli_index, index_dir, rebuild, default_query_format, log_level, enable_traces, admin_token, max_query_concurrency, trace_buffer_size }
+    // --read-only or BITDEX_READ_ONLY=1 env var
+    let read_only = cli_read_only || std::env::var("BITDEX_READ_ONLY").map(|v| v == "1" || v == "true").unwrap_or(false);
+
+    Config { port, data_dir, index: cli_index, index_dir, rebuild, default_query_format, log_level, enable_traces, admin_token, max_query_concurrency, trace_buffer_size, read_only }
 }
 
 #[tokio::main]
@@ -316,6 +324,10 @@ async fn main() {
     if config.max_query_concurrency > 0 {
         eprintln!("  max-query-concurrency: {}", config.max_query_concurrency);
         server = server.with_max_query_concurrency(config.max_query_concurrency);
+    }
+    if config.read_only {
+        eprintln!("  read-only: true (write endpoints return 503)");
+        server = server.with_read_only(true);
     }
     server.serve(addr).await.expect("Server failed");
 }

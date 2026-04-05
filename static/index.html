@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BitDex V2 — Civitai Demo</title>
+<title>BitDex V2</title>
 <style>
   :root {
     --bg: #0a0e14; --surface: #12171f; --surface-2: #1a2030; --border: #252d3a;
@@ -11,7 +11,7 @@
     --accent: #3b82f6; --accent-hover: #60a5fa; --accent-glow: rgba(59,130,246,0.15);
     --success: #22c55e; --error: #ef4444; --orange: #f59e0b;
     --card-bg: #151c28; --card-hover: #1c2536;
-    --header-h: 48px; --filter-h: auto;
+    --header-h: 48px;
     --radius: 8px; --radius-lg: 12px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -20,8 +20,6 @@
     background: var(--bg); color: var(--text); line-height: 1.5;
     overflow-y: scroll;
   }
-
-  /* Fixed Header */
   .header {
     position: fixed; top: 0; left: 0; right: 0; z-index: 100;
     background: var(--surface); border-bottom: 1px solid var(--border);
@@ -35,8 +33,7 @@
   .logo span { color: var(--accent); }
   .stats-row {
     display: flex; gap: 16px; font-size: 12px; color: var(--text-dim);
-    font-variant-numeric: tabular-nums; flex: 1; justify-content: flex-start;
-    overflow: hidden;
+    font-variant-numeric: tabular-nums; flex: 1; overflow: hidden;
   }
   .stat-item b { color: var(--text); font-weight: 600; }
   .stat-item .timing { color: var(--success); font-weight: 700; }
@@ -50,20 +47,17 @@
   .toggle-btn:hover { border-color: var(--accent); color: var(--text); }
   .toggle-btn.active { background: var(--accent-glow); border-color: var(--accent); color: var(--accent); }
 
-  /* Filter Panel */
   .filter-panel {
     position: fixed; top: var(--header-h); left: 0; right: 0; z-index: 90;
     background: var(--surface); border-bottom: 1px solid var(--border);
     overflow: hidden; transition: max-height 0.3s ease, padding 0.3s ease;
-    max-height: 400px; padding: 12px 20px;
+    max-height: 500px; padding: 12px 20px;
   }
   .filter-panel.collapsed { max-height: 0; padding: 0 20px; }
   .filter-grid {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px;
   }
-  .field {
-    display: flex; flex-direction: column; gap: 2px;
-  }
+  .field { display: flex; flex-direction: column; gap: 2px; }
   .field label {
     font-size: 10px; font-weight: 600; color: var(--text-muted);
     text-transform: uppercase; letter-spacing: 0.5px;
@@ -75,50 +69,30 @@
   }
   .field select:focus, .field input:focus { border-color: var(--accent); }
   .field input::placeholder { color: var(--text-muted); }
-
-  /* NSFW checkbox group */
-  .nsfw-group {
-    display: flex; flex-wrap: wrap; gap: 4px;
-  }
-  .nsfw-group label {
+  .checklist-group { display: flex; flex-wrap: wrap; gap: 4px; }
+  .checklist-group label {
     display: flex; align-items: center; gap: 3px;
     font-size: 11px; font-weight: 500; color: var(--text-dim);
     text-transform: none; letter-spacing: 0; cursor: pointer;
   }
-  .nsfw-group input[type="checkbox"] {
-    width: 14px; height: 14px; accent-color: var(--accent);
-  }
+  .checklist-group input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent); }
 
-  .sort-row {
-    display: flex; gap: 8px; margin-top: 8px; align-items: end; flex-wrap: wrap;
-  }
+  .sort-row { display: flex; gap: 8px; margin-top: 8px; align-items: end; flex-wrap: wrap; }
   .sort-row .field { min-width: 140px; }
 
-  /* Content Area */
-  .content {
-    padding-top: calc(var(--header-h) + 12px);
-    min-height: 100vh;
-    transition: padding-top 0.3s ease;
-  }
+  .content { padding-top: calc(var(--header-h) + 12px); min-height: 100vh; transition: padding-top 0.3s ease; }
   .content.filters-open { padding-top: calc(var(--header-h) + 200px); }
 
-  /* Image Grid */
   .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 8px;
-    padding: 8px 16px;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px; padding: 8px 16px;
   }
   .card {
     background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius);
-    overflow: hidden; cursor: pointer; transition: all 0.2s;
-    position: relative;
+    overflow: hidden; cursor: pointer; transition: all 0.2s; position: relative;
   }
   .card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
-  .card-img {
-    width: 100%; aspect-ratio: 1; object-fit: cover;
-    background: var(--surface-2); display: block;
-  }
+  .card-img { width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--surface-2); display: block; }
   .card-img.placeholder {
     display: flex; align-items: center; justify-content: center;
     font-size: 32px; color: var(--text-muted); aspect-ratio: 1;
@@ -127,22 +101,16 @@
     padding: 6px 8px; font-size: 11px; color: var(--text-dim);
     display: flex; justify-content: space-between; align-items: center;
   }
-  .card-meta .reactions { color: var(--orange); font-weight: 600; }
-  .card-meta .slot-id { color: var(--text-muted); font-variant-numeric: tabular-nums; }
   .card-badge {
-    position: absolute; top: 6px; right: 6px;
-    background: rgba(0,0,0,0.7); border-radius: 4px;
-    padding: 2px 6px; font-size: 10px; color: var(--text-dim);
-    backdrop-filter: blur(4px);
+    position: absolute; border-radius: 4px; padding: 2px 6px;
+    font-size: 10px; color: var(--text-dim); backdrop-filter: blur(4px);
+    background: rgba(0,0,0,0.7);
   }
-  .card-dims {
-    position: absolute; top: 6px; left: 6px;
-    background: rgba(0,0,0,0.7); border-radius: 4px;
-    padding: 2px 6px; font-size: 10px; color: var(--text-dim);
-    backdrop-filter: blur(4px);
-  }
+  .card-badge.top-right { top: 6px; right: 6px; }
+  .card-badge.top-left { top: 6px; left: 6px; }
+  .card-badge.bottom-right { bottom: 30px; right: 6px; }
+  .card-badge.bottom-left { bottom: 30px; left: 6px; }
 
-  /* Detail Modal */
   .modal-overlay {
     display: none; position: fixed; inset: 0; z-index: 200;
     background: rgba(0,0,0,0.8); backdrop-filter: blur(4px);
@@ -152,27 +120,24 @@
   .modal {
     background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
     max-width: 900px; width: 95vw; max-height: 90vh; overflow-y: auto;
-    display: flex; flex-direction: column;
+    display: flex; flex-direction: column; position: relative;
   }
   .modal-img { width: 100%; max-height: 60vh; object-fit: contain; background: var(--bg); }
   .modal-body { padding: 16px; }
   .modal-body h3 { font-size: 14px; margin-bottom: 8px; }
-  .modal-fields {
-    display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
-    font-size: 12px;
-  }
+  .modal-fields { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 12px; }
   .modal-fields dt { color: var(--text-dim); font-weight: 500; }
   .modal-fields dd { color: var(--text); word-break: break-all; }
+  .modal-fields dd a { color: var(--accent); text-decoration: none; }
+  .modal-fields dd a:hover { text-decoration: underline; }
+  .modal-fields dd code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px; background: var(--bg); padding: 1px 4px; border-radius: 3px; }
   .modal-close {
     position: absolute; top: 12px; right: 12px;
     background: rgba(0,0,0,0.6); border: none; border-radius: 50%;
-    width: 32px; height: 32px; color: #fff; font-size: 18px; cursor: pointer;
+    width: 32px; height: 32px; color: #fff; font-size: 18px; cursor: pointer; z-index: 1;
   }
 
-  /* Raw JSON Toggle */
-  .raw-panel {
-    display: none; padding: 8px 16px;
-  }
+  .raw-panel { display: none; padding: 8px 16px; }
   .raw-panel.open { display: block; }
   .raw-panel textarea {
     width: 100%; min-height: 100px; background: var(--bg);
@@ -187,40 +152,30 @@
     padding: 4px 14px; font-size: 12px; cursor: pointer;
   }
 
-  /* Loading / Scroll sentinel */
   .scroll-sentinel { height: 1px; }
-  .load-more-indicator {
-    text-align: center; padding: 20px; color: var(--text-dim); font-size: 13px;
-  }
+  .load-more-indicator { text-align: center; padding: 20px; color: var(--text-dim); font-size: 13px; }
   .error-toast {
     position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
     background: var(--error); color: #fff; padding: 8px 20px; border-radius: 8px;
     font-size: 13px; z-index: 300; display: none;
   }
   .error-toast.show { display: block; }
-
-  /* Spinner */
   @keyframes spin { to { transform: rotate(360deg); } }
   .spinner {
     width: 20px; height: 20px; border: 2px solid var(--border);
     border-top-color: var(--accent); border-radius: 50%;
     animation: spin 0.6s linear infinite; display: inline-block;
   }
-
-  /* Empty state */
-  .empty-state {
-    text-align: center; padding: 60px 20px; color: var(--text-dim);
-  }
+  .empty-state { text-align: center; padding: 60px 20px; color: var(--text-dim); }
   .empty-state .big { font-size: 48px; margin-bottom: 12px; }
   .empty-state p { font-size: 14px; }
 </style>
 </head>
 <body>
 
-<!-- Fixed Header -->
 <div class="header">
   <div class="header-bar">
-    <div class="logo">Bit<span>Dex</span> V2</div>
+    <div class="logo" id="logo">Bit<span>Dex</span> V2</div>
     <div class="stats-row">
       <span class="stat-item">Records: <b id="stat-alive">--</b></span>
       <span class="stat-item" id="query-stats" style="display:none">
@@ -236,128 +191,16 @@
   </div>
 </div>
 
-<!-- Filter Panel -->
 <div class="filter-panel" id="filter-panel">
-  <div class="filter-grid">
-    <div class="field" style="grid-column: span 2">
-      <label>NSFW Level</label>
-      <div class="nsfw-group" id="nsfw-group">
-        <label><input type="checkbox" value="1" checked> PG</label>
-        <label><input type="checkbox" value="2"> PG-13</label>
-        <label><input type="checkbox" value="4"> Mature</label>
-        <label><input type="checkbox" value="8"> X</label>
-        <label><input type="checkbox" value="16"> XXX</label>
-        <label><input type="checkbox" value="32"> Blocked</label>
-      </div>
-    </div>
-    <div class="field">
-      <label>Type</label>
-      <select id="f-type">
-        <option value="">Any</option>
-        <option value="image">Image</option>
-        <option value="video">Video</option>
-        <option value="audio">Audio</option>
-      </select>
-    </div>
-    <div class="field">
-      <label>Base Model</label>
-      <select id="f-baseModel">
-        <option value="">Any</option>
-        <option value="SD 1.5">SD 1.5</option>
-        <option value="SD 2.1">SD 2.1</option>
-        <option value="SDXL 1.0">SDXL 1.0</option>
-        <option value="Pony">Pony</option>
-        <option value="Flux.1 D">Flux.1 D</option>
-        <option value="Flux.1 S">Flux.1 S</option>
-        <option value="Illustrious">Illustrious</option>
-        <option value="40">Illustrious</option>
-        <option value="41">NoobAI</option>
-        <option value="30">Flux.1 S</option>
-        <option value="32">Flux.1 D2</option>
-      </select>
-    </div>
-    <div class="field">
-      <label>Tag IDs</label>
-      <input type="text" id="f-tagIds" placeholder="1234, 5678">
-    </div>
-    <div class="field">
-      <label>User ID</label>
-      <input type="text" id="f-userId" placeholder="42069">
-    </div>
-    <div class="field">
-      <label>Model Versions</label>
-      <input type="text" id="f-modelVersionIds" placeholder="100, 200">
-    </div>
-    <div class="field">
-      <label>Tool IDs</label>
-      <input type="text" id="f-toolIds" placeholder="1, 2">
-    </div>
-    <div class="field">
-      <label>Technique IDs</label>
-      <input type="text" id="f-techniqueIds" placeholder="1, 2">
-    </div>
-    <div class="field">
-      <label>Has Meta</label>
-      <select id="f-hasMeta"><option value="">Any</option><option value="true">Yes</option><option value="false">No</option></select>
-    </div>
-    <div class="field">
-      <label>On Site</label>
-      <select id="f-onSite"><option value="">Any</option><option value="true">Yes</option><option value="false">No</option></select>
-    </div>
-    <div class="field">
-      <label>POI</label>
-      <select id="f-poi"><option value="">Any</option><option value="true">Yes</option><option value="false">No</option></select>
-    </div>
-    <div class="field">
-      <label>Minor</label>
-      <select id="f-minor"><option value="">Any</option><option value="true">Yes</option><option value="false">No</option></select>
-    </div>
-  </div>
-  <div class="sort-row">
-    <div class="field">
-      <label>Sort By</label>
-      <select id="sort-field">
-        <option value="">Newest (slot order)</option>
-        <option value="reactionCount" selected>Most Reactions</option>
-        <option value="sortAt">Date</option>
-        <option value="commentCount">Most Comments</option>
-        <option value="collectedCount">Most Collected</option>
-        <option value="id">ID</option>
-      </select>
-    </div>
-    <div class="field">
-      <label>Direction</label>
-      <select id="sort-dir">
-        <option value="Desc" selected>Desc</option>
-        <option value="Asc">Asc</option>
-      </select>
-    </div>
-    <div class="field">
-      <label>Page Size</label>
-      <input type="number" id="limit" value="40" min="1" max="200" style="width:70px">
-    </div>
-    <div class="field">
-      <label>Time Range</label>
-      <select id="f-timeRange">
-        <option value="" selected>All Time</option>
-        <option value="24h">Last 24h</option>
-        <option value="7d">Last 7 days</option>
-        <option value="30d">Last 30 days</option>
-        <option value="1y">Last year</option>
-      </select>
-    </div>
-  </div>
+  <div class="filter-grid" id="filter-grid"></div>
+  <div class="sort-row" id="sort-row"></div>
 </div>
 
-<!-- Raw JSON -->
 <div class="raw-panel" id="raw-panel">
   <textarea id="raw-query" spellcheck="false"></textarea>
-  <div class="raw-actions">
-    <button onclick="runRawQuery()">Run JSON Query</button>
-  </div>
+  <div class="raw-actions"><button onclick="runRawQuery()">Run JSON Query</button></div>
 </div>
 
-<!-- Main Content -->
 <div class="content filters-open" id="content">
   <div class="grid" id="grid"></div>
   <div class="load-more-indicator" id="load-indicator" style="display:none">
@@ -366,13 +209,12 @@
   <div class="scroll-sentinel" id="scroll-sentinel"></div>
   <div class="empty-state" id="empty-state">
     <div class="big">&#x1F50D;</div>
-    <p>Adjust filters above to explore the dataset</p>
+    <p>Loading configuration...</p>
   </div>
 </div>
 
-<!-- Detail Modal -->
 <div class="modal-overlay" id="modal" onclick="if(event.target===this)closeModal()">
-  <div class="modal" style="position:relative">
+  <div class="modal">
     <button class="modal-close" onclick="closeModal()">&times;</button>
     <img class="modal-img" id="modal-img" src="" alt="">
     <div class="modal-body">
@@ -381,269 +223,84 @@
   </div>
 </div>
 
-<!-- Error Toast -->
 <div class="error-toast" id="error-toast"></div>
 
 <script>
-// ── Configuration ──
-// API base URL — default empty string means same origin.
-// Change this if the UI is served separately from the BitDex server.
+// ── State ──
 const API_URL = '';
-// Index name — discovered from server on startup
 let INDEX_NAME = null;
-// Civitai image CDN base
-const IMG_BASE = 'https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA';
+let engineConfig = null;   // from GET /api/indexes/{name}
+let uiConfig = {};         // from GET /api/indexes/{name}/ui-config
+let dictionaries = {};     // from GET /api/indexes/{name}/dictionaries
+let currentCursor = null;
+let isLoading = false;
+let hasMore = true;
+let totalShown = 0;
+let currentQueryId = 0;
+let debounceTimer = null;
+let filtersVisible = true;
 
-// Build API path for this index
-function apiPath(suffix) {
-  return `${API_URL}/api/indexes/${INDEX_NAME}${suffix}`;
-}
-
-// Discover the first available index from the server
-async function discoverIndex() {
+// ── Init ──
+(async () => {
+  // 1. Discover index
   try {
     const res = await fetch(`${API_URL}/api/indexes`);
     const data = await res.json();
     if (data.indexes && data.indexes.length > 0) {
       INDEX_NAME = data.indexes[0].name;
-      console.log(`Using index: ${INDEX_NAME}`);
     } else {
-      console.error('No indexes found on server');
+      showError('No indexes found'); return;
     }
-  } catch (e) {
-    console.error('Failed to discover index:', e);
-  }
+  } catch (e) { showError('Failed to connect to server'); return; }
+
+  const api = (suffix) => `${API_URL}/api/indexes/${INDEX_NAME}${suffix}`;
+
+  // 2. Fetch config, dictionaries, and ui-config in parallel
+  const [configRes, dictRes, uiRes] = await Promise.all([
+    fetch(api('')).then(r => r.json()).catch(() => null),
+    fetch(api('/dictionaries')).then(r => r.json()).catch(() => ({})),
+    fetch(api('/ui-config')).then(r => r.json()).catch(() => ({})),
+  ]);
+
+  if (!configRes) { showError('Failed to load index config'); return; }
+  engineConfig = configRes;
+  dictionaries = dictRes || {};
+  uiConfig = uiRes || {};
+
+  // 3. Set title
+  if (uiConfig.title) document.title = uiConfig.title;
+  document.getElementById('stat-alive').textContent =
+    Number(configRes.stats?.alive_count || 0).toLocaleString();
+
+  // 4. Build UI from config
+  buildFilterPanel();
+  buildSortRow();
+  loadUrlState();
+  attachListeners();
+  setupInfiniteScroll();
+  setTimeout(() => onFilterChange(), 100);
+})();
+
+// ── Helpers ──
+function api(suffix) { return `${API_URL}/api/indexes/${INDEX_NAME}${suffix}`; }
+
+function getFilterConfig(fieldName) {
+  return uiConfig.filters?.[fieldName] || {};
 }
 
-// State
-let currentCursor = null;
-let isLoading = false;
-let hasMore = true;
-let totalShown = 0;
-let totalMatched = 0;
-let lastQueryTime = 0;
-let debounceTimer = null;
-let filtersVisible = true;
-let currentQueryId = 0;
-
-// Civitai image URL from GUID
-function imgUrl(guid, width = 400) {
-  if (!guid) return null;
-  return `${IMG_BASE}/${guid}/width=${width}/image.jpeg`;
+function getFieldType(fieldName) {
+  const ff = engineConfig?.config?.filter_fields?.find(f => f.name === fieldName);
+  return ff?.field_type || 'unknown';
 }
 
-// Civitai base model name from integer ID (reverse of string_map in config)
-const BASE_MODEL_NAMES = {
-  1: 'SD 1.4', 2: 'SD 1.5', 3: 'SD 1.5 LCM', 4: 'SD 2.0', 5: 'SD 2.0 768',
-  6: 'SD 2.1', 7: 'SD 2.1 768', 10: 'SDXL 0.9', 11: 'SDXL 1.0', 12: 'SDXL 1.0 LCM',
-  13: 'SDXL Distilled', 14: 'SDXL Turbo', 15: 'SDXL Lightning', 16: 'SDXL Hyper',
-  20: 'Pony', 30: 'Flux.1 S', 31: 'Flux.1 D', 32: 'Flux.1 D2',
-  40: 'Illustrious', 41: 'NoobAI', 50: 'Stable Cascade',
-  60: 'SVD', 61: 'SVD XT', 70: 'Stable Audio',
-  80: 'HunyuanDiT', 81: 'HunyuanVideo', 82: 'Mochi', 83: 'LTXV', 84: 'CogVideoX',
-  90: 'Kolors', 91: 'Lumina', 92: 'PixArt a', 93: 'PixArt E',
-};
-
-// Build Query JSON from UI controls
-function buildQuery(cursor) {
-  const filters = [];
-
-  // NSFW Level — multi-checkbox → In clause
-  const nsfwChecked = [...document.querySelectorAll('#nsfw-group input[type="checkbox"]:checked')]
-    .map(cb => parseInt(cb.value));
-  if (nsfwChecked.length > 0 && nsfwChecked.length < 6) {
-    if (nsfwChecked.length === 1) {
-      filters.push({ Eq: ['nsfwLevel', { Integer: nsfwChecked[0] }] });
-    } else {
-      filters.push({ In: ['nsfwLevel', nsfwChecked.map(v => ({ Integer: v }))] });
-    }
-  }
-
-  const type_ = document.getElementById('f-type').value;
-  if (type_) filters.push({ Eq: ['type', { String: type_ }] });
-
-  const baseModel = document.getElementById('f-baseModel').value;
-  if (baseModel) filters.push({ Eq: ['baseModel', { String: baseModel }] });
-
-  // Integer list fields
-  for (const field of ['tagIds', 'modelVersionIds', 'toolIds', 'techniqueIds']) {
-    const val = document.getElementById('f-' + field).value.trim();
-    if (val) {
-      const ids = val.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
-      if (ids.length === 1) filters.push({ Eq: [field, { Integer: ids[0] }] });
-      else if (ids.length > 1) filters.push({ In: [field, ids.map(v => ({ Integer: v }))] });
-    }
-  }
-
-  const userId = document.getElementById('f-userId').value.trim();
-  if (userId && !isNaN(parseInt(userId))) filters.push({ Eq: ['userId', { Integer: parseInt(userId) }] });
-
-  for (const field of ['hasMeta', 'onSite', 'poi', 'minor']) {
-    const val = document.getElementById('f-' + field).value;
-    if (val) filters.push({ Eq: [field, { Bool: val === 'true' }] });
-  }
-
-  // Time range filter — sends Gte on publishedAtUnix, snapped to time buckets server-side
-  const timeRange = document.getElementById('f-timeRange').value;
-  if (timeRange) {
-    const durations = { '24h': 86400, '7d': 604800, '30d': 2592000, '1y': 31536000 };
-    const cutoff = Math.floor(Date.now() / 1000) - durations[timeRange];
-    filters.push({ Gte: ['sortAtUnix', { Integer: cutoff }] });
-  }
-
-  const sortField = document.getElementById('sort-field').value;
-  const sortDir = document.getElementById('sort-dir').value;
-  const limit = parseInt(document.getElementById('limit').value) || 40;
-
-  const query = { filters, limit, include_docs: true };
-  if (sortField) query.sort = { field: sortField, direction: sortDir };
-  if (cursor) query.cursor = cursor;
-  return query;
+function hasDictionary(fieldName) {
+  return dictionaries[fieldName] && Object.keys(dictionaries[fieldName]).length > 0;
 }
 
-// Stats
-async function fetchStats() {
-  try {
-    const r = await fetch(apiPath('/stats'));
-    if (!r.ok) return;
-    const d = await r.json();
-    document.getElementById('stat-alive').textContent = Number(d.alive_count).toLocaleString();
-  } catch(e) {}
+function dictLabel(fieldName, intValue) {
+  return dictionaries[fieldName]?.[String(intValue)] || String(intValue);
 }
 
-function updateQueryStats(elapsedUs, matched, shown) {
-  const el = document.getElementById('query-stats');
-  el.style.display = '';
-  let timeStr;
-  if (elapsedUs < 1000) timeStr = elapsedUs + '\u00B5s';
-  else if (elapsedUs < 1000000) timeStr = (elapsedUs / 1000).toFixed(1) + 'ms';
-  else timeStr = (elapsedUs / 1000000).toFixed(2) + 's';
-  document.getElementById('stat-time').textContent = timeStr;
-  document.getElementById('stat-matched').textContent = Number(matched).toLocaleString();
-  document.getElementById('stat-returned').textContent = Number(shown).toLocaleString();
-}
-
-// Query Execution
-async function executeQuery(query, append = false) {
-  if (isLoading) return;
-  isLoading = true;
-
-  const qid = ++currentQueryId;
-
-  if (!append) {
-    document.getElementById('grid').innerHTML = '';
-    totalShown = 0;
-    currentCursor = null;
-    hasMore = true;
-    document.getElementById('empty-state').style.display = 'none';
-  }
-  document.getElementById('load-indicator').style.display = '';
-
-  try {
-    const r = await fetch(apiPath('/query'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(query),
-    });
-    const d = await r.json();
-
-    if (qid !== currentQueryId) { isLoading = false; return; }
-
-    if (d.error) {
-      showError(d.error);
-      isLoading = false;
-      document.getElementById('load-indicator').style.display = 'none';
-      return;
-    }
-
-    totalMatched = d.total_matched;
-    lastQueryTime = d.elapsed_us;
-    currentCursor = d.cursor || null;
-    hasMore = !!d.cursor && d.ids.length > 0;
-
-    if (d.ids.length > 0) {
-      renderCards(d.ids, d.documents || [], append);
-      totalShown += d.ids.length;
-    }
-
-    updateQueryStats(d.elapsed_us, d.total_matched, totalShown);
-
-    if (!append && d.ids.length === 0) {
-      document.getElementById('empty-state').style.display = '';
-      document.getElementById('empty-state').innerHTML = '<div class="big">&#x1F4ED;</div><p>No results match your filters</p>';
-    }
-  } catch(e) {
-    if (qid === currentQueryId) showError('Network error: ' + e.message);
-  }
-
-  isLoading = false;
-  document.getElementById('load-indicator').style.display = 'none';
-}
-
-// Render Image Cards — documents come inline from the query response (parallel to slotIds)
-function renderCards(slotIds, documents, append) {
-  const grid = document.getElementById('grid');
-  const frag = document.createDocumentFragment();
-
-  for (let i = 0; i < slotIds.length; i++) {
-    const slotId = slotIds[i];
-    const fields = documents[i] || null;
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.onclick = () => openModal(slotId, fields);
-
-    const url = extractField(fields, 'url');
-    const reactions = extractField(fields, 'reactionCount');
-    const width = extractField(fields, 'width');
-    const height = extractField(fields, 'height');
-    const baseModelId = extractField(fields, 'baseModel');
-
-    const thumbUrl = imgUrl(url, 400);
-
-    if (thumbUrl) {
-      const img = document.createElement('img');
-      img.className = 'card-img';
-      img.loading = 'lazy';
-      img.src = thumbUrl;
-      img.alt = `Image ${slotId}`;
-      img.onerror = function() { this.style.display = 'none'; };
-      card.appendChild(img);
-    } else {
-      const ph = document.createElement('div');
-      ph.className = 'card-img placeholder';
-      ph.textContent = '\u{1F5BC}';
-      card.appendChild(ph);
-    }
-
-    if (width && height) {
-      const badge = document.createElement('div');
-      badge.className = 'card-dims';
-      badge.textContent = `${width}\u00D7${height}`;
-      card.appendChild(badge);
-    }
-
-    // Show base model name (Civitai-specific label)
-    const baseModelName = BASE_MODEL_NAMES[baseModelId];
-    if (baseModelName) {
-      const badge = document.createElement('div');
-      badge.className = 'card-badge';
-      badge.textContent = baseModelName;
-      card.appendChild(badge);
-    }
-
-    const meta = document.createElement('div');
-    meta.className = 'card-meta';
-    meta.innerHTML = `<span class="reactions">${reactions != null ? '\u2764 ' + Number(reactions).toLocaleString() : ''}</span>` +
-                     `<span class="slot-id">#${slotId}</span>`;
-    card.appendChild(meta);
-
-    frag.appendChild(card);
-  }
-
-  grid.appendChild(frag);
-}
-
-// Extract a field value from the docstore format
 function extractField(fields, name) {
   if (!fields || !fields[name]) return null;
   const v = fields[name];
@@ -664,79 +321,551 @@ function extractField(fields, name) {
   return v;
 }
 
-// Detail Modal
+function isEmpty(val) {
+  if (val === null || val === undefined) return true;
+  if (val === 0) return true;
+  if (val === '') return true;
+  if (val === false) return true;
+  if (Array.isArray(val) && val.length === 0) return true;
+  return false;
+}
+
+function formatValue(val, format) {
+  if (val === null || val === undefined) return '';
+  switch (format) {
+    case 'number': return Number(val).toLocaleString();
+    case 'timestamp': {
+      if (!val || val === 0) return '';
+      const d = new Date(val * 1000);
+      return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    }
+    case 'count': {
+      if (!Array.isArray(val)) return String(val);
+      if (val.length > 20) return `[${val.length} items] ${val.slice(0, 20).join(', ')}...`;
+      return val.join(', ');
+    }
+    default: return String(val);
+  }
+}
+
+function fillTemplate(template, fields, mainValue) {
+  let result = template.replace('{value}', mainValue || '');
+  // Replace {fieldName} patterns
+  result = result.replace(/\{(\w+)\}/g, (_, key) => {
+    if (key === 'value') return mainValue || '';
+    return extractField(fields, key) ?? '';
+  });
+  return result;
+}
+
+// ── Build Filter Panel ──
+function buildFilterPanel() {
+  const grid = document.getElementById('filter-grid');
+  grid.innerHTML = '';
+
+  const filterFields = engineConfig?.config?.filter_fields || [];
+
+  for (const ff of filterFields) {
+    const fc = getFilterConfig(ff.name);
+    if (fc.control === 'hidden') continue;
+
+    const label = fc.label || ff.name;
+    const fieldType = ff.field_type;
+    const control = fc.control || autoControl(ff.name, fieldType);
+
+    const div = document.createElement('div');
+    div.className = 'field';
+    if (fc.span) div.style.gridColumn = `span ${fc.span}`;
+
+    if (control === 'checklist') {
+      div.innerHTML = `<label>${label}</label>`;
+      const group = document.createElement('div');
+      group.className = 'checklist-group';
+      group.id = `filter-${ff.name}`;
+      const options = fc.options || getDictionaryOptions(ff.name);
+      for (const opt of options) {
+        const lbl = document.createElement('label');
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = opt.value;
+        if (fc.default && fc.default.includes(opt.value)) cb.checked = true;
+        lbl.appendChild(cb);
+        lbl.appendChild(document.createTextNode(' ' + opt.label));
+        group.appendChild(lbl);
+      }
+      div.appendChild(group);
+    } else if (control === 'select') {
+      const options = fc.options || getDictionaryOptions(ff.name);
+      const isBoolean = fieldType === 'boolean';
+      div.innerHTML = `<label>${label}</label>
+        <select id="filter-${ff.name}">
+          <option value="">Any</option>
+          ${isBoolean
+            ? '<option value="true">Yes</option><option value="false">No</option>'
+            : options.map(o => `<option value="${o.value}">${o.label}</option>`).join('')
+          }
+        </select>`;
+    } else {
+      // input (number or csv)
+      const inputType = fc.input_type || (fieldType === 'multi_value' ? 'csv' : 'number');
+      const placeholder = fc.placeholder || (inputType === 'csv' ? '1, 2, 3' : '');
+      div.innerHTML = `<label>${label}</label>
+        <input type="text" id="filter-${ff.name}" placeholder="${placeholder}" data-input-type="${inputType}">`;
+    }
+
+    grid.appendChild(div);
+  }
+}
+
+function autoControl(fieldName, fieldType) {
+  if (fieldType === 'boolean') return 'select';
+  if (fieldType === 'multi_value') return 'input';
+  if (hasDictionary(fieldName)) return 'select';
+  return 'input';
+}
+
+function getDictionaryOptions(fieldName) {
+  const dict = dictionaries[fieldName];
+  if (!dict) return [];
+  return Object.entries(dict)
+    .map(([id, label]) => ({ value: id, label }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+// ── Build Sort Row ──
+function buildSortRow() {
+  const row = document.getElementById('sort-row');
+  row.innerHTML = '';
+  const sortFields = engineConfig?.config?.sort_fields || [];
+  const sortLabels = uiConfig.sort?.labels || {};
+  const defaultField = uiConfig.sort?.default_field || '';
+  const defaultDir = uiConfig.sort?.default_direction || 'Desc';
+  const pageSize = uiConfig.display?.page_size || 100;
+
+  // Sort field
+  const sf = document.createElement('div');
+  sf.className = 'field';
+  sf.innerHTML = `<label>Sort By</label>
+    <select id="sort-field">
+      <option value="">Newest (slot order)</option>
+      ${sortFields.map(s => `<option value="${s.name}" ${s.name === defaultField ? 'selected' : ''}>${sortLabels[s.name] || s.name}</option>`).join('')}
+    </select>`;
+  row.appendChild(sf);
+
+  // Direction
+  const sd = document.createElement('div');
+  sd.className = 'field';
+  sd.innerHTML = `<label>Direction</label>
+    <select id="sort-dir">
+      <option value="Desc" ${defaultDir === 'Desc' ? 'selected' : ''}>Desc</option>
+      <option value="Asc" ${defaultDir === 'Asc' ? 'selected' : ''}>Asc</option>
+    </select>`;
+  row.appendChild(sd);
+
+  // Page size
+  const ps = document.createElement('div');
+  ps.className = 'field';
+  ps.innerHTML = `<label>Page Size</label>
+    <input type="number" id="limit" value="${pageSize}" min="1" max="200" style="width:70px">`;
+  row.appendChild(ps);
+
+  // Time range (from engine config time_buckets)
+  const buckets = engineConfig?.config?.time_buckets?.range_buckets || [];
+  if (buckets.length > 0) {
+    const tr = document.createElement('div');
+    tr.className = 'field';
+    tr.innerHTML = `<label>Time Range</label>
+      <select id="filter-timeRange">
+        <option value="">All Time</option>
+        ${buckets.map(b => `<option value="${b.name}">${b.name}</option>`).join('')}
+      </select>`;
+    row.appendChild(tr);
+  }
+}
+
+// ── URL State ──
+function saveUrlState() {
+  const params = new URLSearchParams();
+  const filterFields = engineConfig?.config?.filter_fields || [];
+
+  for (const ff of filterFields) {
+    const fc = getFilterConfig(ff.name);
+    if (fc.control === 'hidden') continue;
+    const control = fc.control || autoControl(ff.name, ff.field_type);
+
+    if (control === 'checklist') {
+      const checked = [...document.querySelectorAll(`#filter-${ff.name} input:checked`)].map(cb => cb.value);
+      const defaults = (fc.default || []).map(String);
+      // Only save to URL if different from defaults
+      if (JSON.stringify(checked.sort()) !== JSON.stringify(defaults.sort())) {
+        if (checked.length) params.set(ff.name, checked.join(','));
+      }
+    } else if (control === 'select') {
+      const val = document.getElementById(`filter-${ff.name}`)?.value;
+      if (val) params.set(ff.name, val);
+    } else {
+      const val = document.getElementById(`filter-${ff.name}`)?.value?.trim();
+      if (val) params.set(ff.name, val);
+    }
+  }
+
+  // Time range
+  const timeRange = document.getElementById('filter-timeRange')?.value;
+  if (timeRange) params.set('timeRange', timeRange);
+
+  // Sort
+  const sortField = document.getElementById('sort-field')?.value;
+  const sortDir = document.getElementById('sort-dir')?.value;
+  const limit = document.getElementById('limit')?.value;
+  const defaultSort = uiConfig.sort?.default_field || '';
+  const defaultDir = uiConfig.sort?.default_direction || 'Desc';
+  const defaultLimit = String(uiConfig.display?.page_size || 100);
+
+  if (sortField && sortField !== defaultSort) params.set('sort', sortField);
+  if (sortDir && sortDir !== defaultDir) params.set('dir', sortDir);
+  if (limit && limit !== defaultLimit) params.set('limit', limit);
+
+  const qs = params.toString();
+  const newUrl = qs ? `${location.pathname}?${qs}` : location.pathname;
+  history.replaceState(null, '', newUrl);
+}
+
+function loadUrlState() {
+  const params = new URLSearchParams(location.search);
+  if (params.size === 0) return;
+
+  const filterFields = engineConfig?.config?.filter_fields || [];
+
+  for (const ff of filterFields) {
+    const fc = getFilterConfig(ff.name);
+    if (fc.control === 'hidden') continue;
+    const val = params.get(ff.name);
+    if (!val) continue;
+
+    const control = fc.control || autoControl(ff.name, ff.field_type);
+
+    if (control === 'checklist') {
+      const values = val.split(',');
+      const cbs = document.querySelectorAll(`#filter-${ff.name} input[type="checkbox"]`);
+      cbs.forEach(cb => { cb.checked = values.includes(cb.value); });
+    } else if (control === 'select') {
+      const el = document.getElementById(`filter-${ff.name}`);
+      if (el) el.value = val;
+    } else {
+      const el = document.getElementById(`filter-${ff.name}`);
+      if (el) el.value = val;
+    }
+  }
+
+  if (params.get('timeRange')) {
+    const el = document.getElementById('filter-timeRange');
+    if (el) el.value = params.get('timeRange');
+  }
+  if (params.get('sort')) document.getElementById('sort-field').value = params.get('sort');
+  if (params.get('dir')) document.getElementById('sort-dir').value = params.get('dir');
+  if (params.get('limit')) document.getElementById('limit').value = params.get('limit');
+}
+
+// ── Build Query ──
+function buildQuery(cursor) {
+  const filters = [];
+  const filterFields = engineConfig?.config?.filter_fields || [];
+
+  for (const ff of filterFields) {
+    const fc = getFilterConfig(ff.name);
+    if (fc.control === 'hidden') continue;
+    const control = fc.control || autoControl(ff.name, ff.field_type);
+
+    if (control === 'checklist') {
+      const checked = [...document.querySelectorAll(`#filter-${ff.name} input:checked`)].map(cb => cb.value);
+      const total = document.querySelectorAll(`#filter-${ff.name} input`).length;
+      if (checked.length > 0 && checked.length < total) {
+        const vals = checked.map(v => {
+          const n = Number(v);
+          return isNaN(n) ? { String: v } : { Integer: n };
+        });
+        if (vals.length === 1) filters.push({ Eq: [ff.name, vals[0]] });
+        else filters.push({ In: [ff.name, vals] });
+      }
+    } else if (control === 'select') {
+      const val = document.getElementById(`filter-${ff.name}`)?.value;
+      if (!val) continue;
+      if (ff.field_type === 'boolean') {
+        filters.push({ Eq: [ff.name, { Bool: val === 'true' }] });
+      } else {
+        const n = Number(val);
+        filters.push({ Eq: [ff.name, isNaN(n) ? { String: val } : { Integer: n }] });
+      }
+    } else {
+      const raw = document.getElementById(`filter-${ff.name}`)?.value?.trim();
+      if (!raw) continue;
+      const inputType = document.getElementById(`filter-${ff.name}`)?.dataset?.inputType;
+      if (inputType === 'csv') {
+        const ids = raw.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
+        if (ids.length === 1) filters.push({ Eq: [ff.name, { Integer: ids[0] }] });
+        else if (ids.length > 1) filters.push({ In: [ff.name, ids.map(v => ({ Integer: v }))] });
+      } else {
+        const n = parseInt(raw);
+        if (!isNaN(n)) filters.push({ Eq: [ff.name, { Integer: n }] });
+      }
+    }
+  }
+
+  // Time range
+  const timeRange = document.getElementById('filter-timeRange')?.value;
+  if (timeRange) {
+    const buckets = engineConfig?.config?.time_buckets?.range_buckets || [];
+    const bucket = buckets.find(b => b.name === timeRange);
+    if (bucket) {
+      const filterField = engineConfig?.config?.time_buckets?.filter_field;
+      if (filterField) {
+        const cutoff = Math.floor(Date.now() / 1000) - bucket.duration_secs;
+        filters.push({ Gte: [filterField, { Integer: cutoff }] });
+      }
+    }
+  }
+
+  const sortField = document.getElementById('sort-field')?.value;
+  const sortDir = document.getElementById('sort-dir')?.value;
+  const limit = parseInt(document.getElementById('limit')?.value) || 100;
+
+  const query = { filters, limit, include_docs: true };
+  if (sortField) query.sort = { field: sortField, direction: sortDir };
+  if (cursor) query.cursor = cursor;
+  return query;
+}
+
+// ── Execute Query ──
+async function executeQuery(query, append = false) {
+  if (isLoading) return;
+  isLoading = true;
+  const qid = ++currentQueryId;
+
+  if (!append) {
+    document.getElementById('grid').innerHTML = '';
+    totalShown = 0;
+    currentCursor = null;
+    hasMore = true;
+    document.getElementById('empty-state').style.display = 'none';
+  }
+  document.getElementById('load-indicator').style.display = '';
+
+  try {
+    const r = await fetch(api('/query'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(query),
+    });
+    const d = await r.json();
+    if (qid !== currentQueryId) { isLoading = false; return; }
+    if (d.error) { showError(d.error); isLoading = false; document.getElementById('load-indicator').style.display = 'none'; return; }
+
+    currentCursor = d.cursor || null;
+    hasMore = !!d.cursor && d.ids.length > 0;
+
+    if (d.ids.length > 0) {
+      renderCards(d.ids, d.documents || [], append);
+      totalShown += d.ids.length;
+    }
+
+    updateQueryStats(d.elapsed_us, d.total_matched, totalShown);
+
+    if (!append && d.ids.length === 0) {
+      const es = document.getElementById('empty-state');
+      es.style.display = '';
+      es.innerHTML = '<div class="big">&#x1F4ED;</div><p>No results match your filters</p>';
+    }
+  } catch(e) {
+    if (qid === currentQueryId) showError('Network error: ' + e.message);
+  }
+
+  isLoading = false;
+  document.getElementById('load-indicator').style.display = 'none';
+}
+
+function updateQueryStats(elapsedUs, matched, shown) {
+  document.getElementById('query-stats').style.display = '';
+  let t;
+  if (elapsedUs < 1000) t = elapsedUs + '\u00B5s';
+  else if (elapsedUs < 1000000) t = (elapsedUs / 1000).toFixed(1) + 'ms';
+  else t = (elapsedUs / 1000000).toFixed(2) + 's';
+  document.getElementById('stat-time').textContent = t;
+  document.getElementById('stat-matched').textContent = Number(matched).toLocaleString();
+  document.getElementById('stat-returned').textContent = Number(shown).toLocaleString();
+}
+
+// ── Render Cards ──
+function renderCards(slotIds, documents, append) {
+  const grid = document.getElementById('grid');
+  const frag = document.createDocumentFragment();
+  const cardCfg = uiConfig.card || {};
+
+  for (let i = 0; i < slotIds.length; i++) {
+    const slotId = slotIds[i];
+    const fields = documents[i] || null;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.onclick = () => openModal(slotId, fields);
+
+    // Image
+    const imgCfg = cardCfg.image;
+    if (imgCfg) {
+      const imgVal = extractField(fields, imgCfg.field);
+      const thumbWidth = imgCfg.thumbnail_width || 400;
+      const tmpl = imgCfg.template || '{value}';
+      const thumbUrl = imgVal ? fillTemplate(tmpl.replace('{width}', thumbWidth), fields, imgVal) : null;
+      if (thumbUrl) {
+        const img = document.createElement('img');
+        img.className = 'card-img'; img.loading = 'lazy'; img.src = thumbUrl;
+        img.onerror = function() { this.style.display = 'none'; };
+        card.appendChild(img);
+      } else {
+        const ph = document.createElement('div');
+        ph.className = 'card-img placeholder'; ph.textContent = '\u{1F5BC}';
+        card.appendChild(ph);
+      }
+    }
+
+    // Badges
+    for (const badge of (cardCfg.badges || [])) {
+      let text;
+      if (badge.fields) {
+        const vals = badge.fields.map(f => extractField(fields, f));
+        if (vals.some(v => v == null)) continue;
+        text = badge.template ? fillTemplate(badge.template, fields, vals[0]) : vals.join(' ');
+      } else {
+        const val = extractField(fields, badge.field);
+        if (val == null) continue;
+        text = hasDictionary(badge.field) ? dictLabel(badge.field, val) : String(val);
+      }
+      const el = document.createElement('div');
+      el.className = `card-badge ${badge.position || 'top-right'}`;
+      el.textContent = text;
+      card.appendChild(el);
+    }
+
+    // Meta
+    const meta = document.createElement('div');
+    meta.className = 'card-meta';
+    const metaCfg = cardCfg.meta || {};
+    const leftCfg = metaCfg.left;
+    const rightCfg = metaCfg.right;
+    let leftText = '', rightText = '';
+    if (leftCfg) {
+      const val = leftCfg.field === '_slot_id' ? slotId : extractField(fields, leftCfg.field);
+      if (val != null) leftText = (leftCfg.prefix || '') + formatValue(val, leftCfg.format);
+    }
+    if (rightCfg) {
+      const val = rightCfg.field === '_slot_id' ? slotId : extractField(fields, rightCfg.field);
+      if (val != null) rightText = (rightCfg.prefix || '') + formatValue(val, rightCfg.format);
+    }
+    meta.innerHTML = `<span style="color:var(--orange);font-weight:600">${leftText}</span><span style="color:var(--text-muted)">${rightText}</span>`;
+    card.appendChild(meta);
+
+    frag.appendChild(card);
+  }
+  grid.appendChild(frag);
+}
+
+// ── Detail Modal ──
 function openModal(slotId, fields) {
   const modal = document.getElementById('modal');
   const img = document.getElementById('modal-img');
   const dl = document.getElementById('modal-fields');
-
-  const url = extractField(fields, 'url');
-  const bigUrl = imgUrl(url, 1200);
-  img.src = bigUrl || '';
-  img.style.display = bigUrl ? '' : 'none';
-
   dl.innerHTML = '';
-  if (fields) {
-    const order = ['id', 'url', 'baseModel', 'nsfwLevel', 'type', 'width', 'height',
-                   'reactionCount', 'commentCount', 'collectedCount', 'userId', 'postId',
-                   'hasMeta', 'onSite', 'hash', 'availability', 'tagIds', 'modelVersionIds',
-                   'toolIds', 'techniqueIds', 'sortAt', 'poi', 'minor'];
-    const shown = new Set();
-    for (const key of order) {
-      if (fields[key]) {
-        shown.add(key);
-        let val = extractField(fields, key);
-        // Civitai-specific: show base model name
-        if (key === 'baseModel' && typeof val === 'number') {
-          val = BASE_MODEL_NAMES[val] || `Unknown (${val})`;
-        }
-        addModalField(dl, key, val);
+
+  const detailCfg = uiConfig.detail || {};
+  const detailFields = detailCfg.fields || [];
+  const hiddenFields = new Set(detailCfg.hidden || []);
+  const shownFields = new Set();
+
+  // Render image if first detail field is display:image
+  const imgField = detailFields.find(f => f.display === 'image');
+  if (imgField) {
+    const val = extractField(fields, imgField.field);
+    if (val && imgField.template) {
+      let url = fillTemplate(imgField.template, fields, val);
+      img.src = url;
+      img.style.display = '';
+      // Set width/height if configured
+      if (imgField.width_field && imgField.height_field) {
+        const w = extractField(fields, imgField.width_field);
+        const h = extractField(fields, imgField.height_field);
+        if (w && h) { img.width = w; img.height = h; }
       }
+    } else {
+      img.style.display = 'none';
     }
-    for (const key of Object.keys(fields)) {
-      if (!shown.has(key)) addModalField(dl, key, extractField(fields, key));
+    shownFields.add(imgField.field);
+  } else {
+    img.style.display = 'none';
+  }
+
+  // Slot ID first
+  addModalRow(dl, 'slot_id', slotId);
+
+  // Configured fields
+  for (const fc of detailFields) {
+    if (fc.display === 'image') continue; // already handled
+    shownFields.add(fc.field);
+    const val = fc.field === '_slot_id' ? slotId : extractField(fields, fc.field);
+
+    if (fc.hide_if_empty && isEmpty(val)) continue;
+
+    const label = fc.label || fc.field;
+
+    if (fc.link && val != null) {
+      const href = fc.link.replace('{value}', val);
+      addModalRowHtml(dl, label, `<a href="${href}" target="_blank" rel="noopener">${val}</a>`);
+    } else if (fc.display === 'code' && val != null) {
+      addModalRowHtml(dl, label, `<code>${val}</code>`);
+    } else if (hasDictionary(fc.field) && typeof val === 'number') {
+      addModalRow(dl, label, dictLabel(fc.field, val));
+    } else {
+      addModalRow(dl, label, formatValue(val, fc.format));
     }
   }
 
-  const dt = document.createElement('dt'); dt.textContent = 'slot_id';
-  const dd = document.createElement('dd'); dd.textContent = slotId;
-  dl.prepend(dd); dl.prepend(dt);
+  // Remaining fields not in config (alphabetical)
+  if (fields) {
+    const remaining = Object.keys(fields).filter(k => !shownFields.has(k) && !hiddenFields.has(k)).sort();
+    for (const key of remaining) {
+      let val = extractField(fields, key);
+      if (hasDictionary(key) && typeof val === 'number') val = dictLabel(key, val);
+      else if (Array.isArray(val)) val = formatValue(val, 'count');
+      addModalRow(dl, key, val);
+    }
+  }
 
   modal.classList.add('open');
 }
 
-function addModalField(dl, key, value) {
-  const dt = document.createElement('dt'); dt.textContent = key;
-  const dd = document.createElement('dd');
-  if (Array.isArray(value)) {
-    dd.textContent = value.length > 20 ? `[${value.length} items] ${value.slice(0, 20).join(', ')}...` : value.join(', ');
-  } else {
-    dd.textContent = String(value);
-  }
-  dl.appendChild(dt);
-  dl.appendChild(dd);
+function addModalRow(dl, label, value) {
+  const dt = document.createElement('dt'); dt.textContent = label;
+  const dd = document.createElement('dd'); dd.textContent = value ?? '';
+  dl.appendChild(dt); dl.appendChild(dd);
 }
 
-function closeModal() {
-  document.getElementById('modal').classList.remove('open');
+function addModalRowHtml(dl, label, html) {
+  const dt = document.createElement('dt'); dt.textContent = label;
+  const dd = document.createElement('dd'); dd.innerHTML = html;
+  dl.appendChild(dt); dl.appendChild(dd);
 }
 
-// Toggle Controls
+function closeModal() { document.getElementById('modal').classList.remove('open'); }
+
+// ── Controls ──
 function toggleFilters() {
-  const panel = document.getElementById('filter-panel');
-  const btn = document.getElementById('btn-filters');
-  const content = document.getElementById('content');
   filtersVisible = !filtersVisible;
-  panel.classList.toggle('collapsed', !filtersVisible);
-  content.classList.toggle('filters-open', filtersVisible);
-  btn.classList.toggle('active', filtersVisible);
+  document.getElementById('filter-panel').classList.toggle('collapsed', !filtersVisible);
+  document.getElementById('content').classList.toggle('filters-open', filtersVisible);
+  document.getElementById('btn-filters').classList.toggle('active', filtersVisible);
 }
 
 function toggleRaw() {
   const panel = document.getElementById('raw-panel');
-  const btn = document.getElementById('btn-raw');
   panel.classList.toggle('open');
-  btn.classList.toggle('active');
+  document.getElementById('btn-raw').classList.toggle('active');
   if (panel.classList.contains('open')) {
     document.getElementById('raw-query').value = JSON.stringify(buildQuery(null), null, 2);
   }
@@ -750,21 +879,18 @@ async function runRawQuery() {
   } catch(e) { showError('Invalid JSON: ' + e.message); }
 }
 
-// Error Toast
 function showError(msg) {
   const el = document.getElementById('error-toast');
-  el.textContent = msg;
-  el.classList.add('show');
+  el.textContent = msg; el.classList.add('show');
   setTimeout(() => el.classList.remove('show'), 5000);
 }
 
-// Live Query (debounced)
 function onFilterChange() {
   clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
+    saveUrlState();
     const query = buildQuery(null);
-    const rawPanel = document.getElementById('raw-panel');
-    if (rawPanel.classList.contains('open')) {
+    if (document.getElementById('raw-panel')?.classList.contains('open')) {
       document.getElementById('raw-query').value = JSON.stringify(query, null, 2);
     }
     isLoading = false;
@@ -772,53 +898,31 @@ function onFilterChange() {
   }, 200);
 }
 
-// Attach live-update listeners to all filter controls
 function attachListeners() {
-  const selectIds = ['f-type', 'f-baseModel', 'f-hasMeta', 'f-onSite', 'f-poi', 'f-minor', 'sort-field', 'sort-dir', 'f-timeRange'];
-  const inputIds = ['f-tagIds', 'f-userId', 'f-modelVersionIds', 'f-toolIds', 'f-techniqueIds', 'limit'];
-
-  for (const id of selectIds) {
-    document.getElementById(id).addEventListener('change', onFilterChange);
+  // All selects and inputs in filter-grid and sort-row
+  for (const el of document.querySelectorAll('#filter-grid select, #sort-row select, #filter-grid input[type="text"], #filter-grid input[type="number"]')) {
+    el.addEventListener(el.tagName === 'SELECT' ? 'change' : 'input', onFilterChange);
   }
-  for (const id of inputIds) {
-    document.getElementById(id).addEventListener('input', onFilterChange);
+  for (const el of document.querySelectorAll('#sort-row input')) {
+    el.addEventListener('input', onFilterChange);
   }
-
-  // NSFW checkboxes
-  for (const cb of document.querySelectorAll('#nsfw-group input[type="checkbox"]')) {
+  // Checkboxes
+  for (const cb of document.querySelectorAll('#filter-grid input[type="checkbox"]')) {
     cb.addEventListener('change', onFilterChange);
   }
 }
 
-// Infinite Scroll
 function setupInfiniteScroll() {
-  const observer = new IntersectionObserver((entries) => {
+  new IntersectionObserver((entries) => {
     for (const entry of entries) {
       if (entry.isIntersecting && !isLoading && hasMore && currentCursor) {
-        const query = buildQuery(currentCursor);
-        executeQuery(query, true);
+        executeQuery(buildQuery(currentCursor), true);
       }
     }
-  }, { rootMargin: '1500px' });
-
-  observer.observe(document.getElementById('scroll-sentinel'));
+  }, { rootMargin: '1500px' }).observe(document.getElementById('scroll-sentinel'));
 }
 
-// Keyboard shortcuts
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeModal();
-});
-
-// Init
-// Discover index, then fetch stats and load initial images
-(async () => {
-  await discoverIndex();
-  if (INDEX_NAME) fetchStats();
-})();
-attachListeners();
-setupInfiniteScroll();
-setTimeout(() => onFilterChange(), 100);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
 </script>
-
 </body>
 </html>

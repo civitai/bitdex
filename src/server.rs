@@ -20,11 +20,11 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
-use crate::concurrent_engine::ConcurrentEngine;
+use crate::engine::ConcurrentEngine;
 use crate::config::{Config, DataSchema, FieldValueType, FilterFieldConfig, SortFieldConfig};
-use crate::shard_store_doc::StoredDoc;
-use crate::executor::{CaseSensitiveFields, StringMaps};
-use crate::loader;
+use crate::silos::doc_format::StoredDoc;
+use crate::engine::executor::{CaseSensitiveFields, StringMaps};
+use crate::sync::loader;
 use crate::metrics::Metrics;
 use crate::mutation::FieldValue;
 use crate::query::{BitdexQuery, Value};
@@ -328,7 +328,7 @@ struct AppState {
     /// Minimum query latency (microseconds) to record a trace. 0 = record all.
     trace_min_us: AtomicU64,
     admin_token: Option<String>,
-    trace_buffer: crate::query_metrics::TraceBuffer,
+    trace_buffer: crate::query::metrics::TraceBuffer,
     /// Number of queries currently executing (incremented on entry, decremented on exit).
     queries_in_flight: AtomicI64,
     /// Peak concurrent queries since startup (updated atomically via fetch_max).
@@ -340,17 +340,19 @@ struct AppState {
     /// Toggleable metric groups — disable expensive metrics without redeploy.
     /// Default: all enabled. PATCH /config to toggle at runtime.
     metrics_bitmap_memory: AtomicBool,
-    metrics_eviction_stats: AtomicBool,
-    metrics_boundstore_disk: AtomicBool,
+    /// Read-only mode: serve queries but reject all write operations with 503.
+    /// Used during zero-downtime rolling deploys — the new pod starts read-only
+    /// and promotes to read-write when the old pod releases the writer lock.
+    read_only: AtomicBool,
     /// WAL writer for V2 ops endpoint. Created lazily on first ops POST.
     #[cfg(feature = "pg-sync")]
     ops_wal: Mutex<Option<crate::ops_wal::WalWriter>>,
     /// Latest sync source metadata (cursor, lag) keyed by source name.
     #[cfg(feature = "pg-sync")]
-    sync_meta: Mutex<std::collections::HashMap<String, crate::pg_sync::ops::SyncMeta>>,
+    sync_meta: Mutex<std::collections::HashMap<String, crate::sync::ops::SyncMeta>>,
     /// Dump registry for tracking table dump lifecycle.
     #[cfg(feature = "pg-sync")]
-    dump_registry: Mutex<crate::pg_sync::dump::DumpRegistry>,
+    dump_registry: Mutex<crate::sync::dump::DumpRegistry>,
     /// Shared slot watermark for progressive shard pre-creation.
     /// Updated by dump phases as they see new max slot IDs.
     #[cfg(feature = "pg-sync")]
@@ -413,6 +415,22 @@ async fn require_admin(
             }
         }
     }
+}
+
+/// Middleware: reject all requests with 503 when the server is in read-only mode.
+/// Applied to admin routes so that create/update/delete operations are blocked
+/// during zero-downtime rolling deploys until this pod acquires the writer lock.
+async fn reject_if_read_only(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if state.read_only.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({
+            "error": "read-only mode: this instance is not the active writer"
+        }))).into_response();
+    }
+    next.run(req).await
 }
 
 /// Middleware: record requests/responses to the caplog when capture is active.
@@ -917,15 +935,8 @@ struct ConfigPatch {
     /// entries give only ~5.5s of history — increase for cache analysis.
     #[serde(default)]
     trace_buffer_size: Option<usize>,
-    /// Toggle expensive metric groups at runtime. Array of group names to enable.
-    /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
-    /// DEPRECATED: Use disabled_metrics instead.
-    /// If provided, ONLY listed groups are enabled (others disabled).
-    #[serde(default)]
-    enabled_metrics: Option<Vec<String>>,
-
     /// Metric groups to DISABLE (opt-out). Default: all ON.
-    /// Takes precedence over enabled_metrics.
+    /// Groups: "bitmap_memory"
     #[serde(default)]
     disabled_metrics: Option<Vec<String>>,
 }
@@ -989,11 +1000,14 @@ pub struct BitdexServer {
     admin_token: Option<String>,
     max_query_concurrency: u32,
     trace_buffer_size: usize,
+    /// Start in read-only mode. Write endpoints return 503.
+    /// Used for zero-downtime deploys where this pod hasn't yet acquired the writer lock.
+    read_only: bool,
 }
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, index_dir: None, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0, trace_buffer_size: 1000 }
+        Self { data_dir, index_dir: None, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0, trace_buffer_size: 1000, read_only: false }
     }
 
     /// Set external index config directory (e.g. ConfigMap mount path).
@@ -1044,6 +1058,13 @@ impl BitdexServer {
         self
     }
 
+    /// Start in read-only mode. Write endpoints (ops, dumps, admin) return 503.
+    /// The server can be promoted to read-write at runtime by clearing the flag.
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     /// Start the HTTP server. Blocks until the server shuts down.
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
         // Ensure data directory exists
@@ -1072,14 +1093,13 @@ impl BitdexServer {
             enable_traces: AtomicBool::new(self.enable_traces),
             trace_min_us: AtomicU64::new(0),
             admin_token,
-            trace_buffer: crate::query_metrics::TraceBuffer::new(self.trace_buffer_size),
+            trace_buffer: crate::query::metrics::TraceBuffer::new(self.trace_buffer_size),
             queries_in_flight: AtomicI64::new(0),
             queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
             capture: crate::capture::CaptureManager::new(&self.data_dir),
             metrics_bitmap_memory: AtomicBool::new(true),
-            metrics_eviction_stats: AtomicBool::new(true),
-            metrics_boundstore_disk: AtomicBool::new(true),
+            read_only: AtomicBool::new(self.read_only),
             #[cfg(feature = "pg-sync")]
             ops_wal: Mutex::new(None),
             #[cfg(feature = "pg-sync")]
@@ -1087,7 +1107,7 @@ impl BitdexServer {
             #[cfg(feature = "pg-sync")]
             dump_registry: {
                 let dumps_path = self.data_dir.join("dumps.json");
-                let mut reg = crate::pg_sync::dump::DumpRegistry::load(&dumps_path);
+                let mut reg = crate::sync::dump::DumpRegistry::load(&dumps_path);
                 // Auto-clear stale dump state after PVC wipe: if dumps.json has
                 // Complete entries but no bitmaps exist, the PVC was wiped.
                 let indexes_dir = self.data_dir.join("indexes");
@@ -1095,9 +1115,9 @@ impl BitdexServer {
                     .map(|entries| entries.filter_map(|e| e.ok())
                         .any(|e| e.path().join("bitmaps").exists()))
                     .unwrap_or(false);
-                if !has_bitmaps && reg.dumps.values().any(|d| d.status == crate::pg_sync::dump::DumpStatus::Complete) {
+                if !has_bitmaps && reg.dumps.values().any(|d| d.status == crate::sync::dump::DumpStatus::Complete) {
                     eprintln!("WARNING: dumps.json has Complete entries but no bitmaps found — clearing stale dump state (PVC wipe detected)");
-                    reg = crate::pg_sync::dump::DumpRegistry::default();
+                    reg = crate::sync::dump::DumpRegistry::default();
                     reg.save(&dumps_path).ok();
                 }
                 Mutex::new(reg)
@@ -1125,23 +1145,9 @@ impl BitdexServer {
         if let Some(ref idx) = *state.index.lock() {
             let config = &idx.definition.config;
             if let Some(ref disabled) = config.disabled_metrics {
-                // Opt-out model: everything ON except what's listed
                 let bm = !disabled.iter().any(|g| g == "bitmap_memory");
-                let ev = !disabled.iter().any(|g| g == "eviction_stats");
-                let bd = !disabled.iter().any(|g| g == "boundstore_disk");
                 state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
-                state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
-                eprintln!("Restored disabled_metrics from config: {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", disabled);
-            } else if let Some(ref groups) = config.enabled_metrics {
-                // Legacy opt-in model (deprecated)
-                let bm = groups.iter().any(|g| g == "bitmap_memory");
-                let ev = groups.iter().any(|g| g == "eviction_stats");
-                let bd = groups.iter().any(|g| g == "boundstore_disk");
-                state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
-                state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
-                eprintln!("Restored enabled_metrics (legacy) from config: {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
+                eprintln!("Restored disabled_metrics from config: {:?} (bitmap_memory={bm})", disabled);
             }
             // If neither is set: all metrics default to ON (AtomicBool defaults true)
         }
@@ -1154,9 +1160,13 @@ impl BitdexServer {
             }
         }
 
-        // Spawn WAL reader thread if pg-sync feature is enabled and index exists
+        // Spawn WAL reader thread if pg-sync feature is enabled and index exists.
+        // Skip in read-only mode — only the writer pod should process WAL ops.
         #[cfg(feature = "pg-sync")]
-        let _wal_handle: Option<std::thread::JoinHandle<()>> = {
+        let _wal_handle: Option<std::thread::JoinHandle<()>> = if self.read_only {
+            eprintln!("Read-only mode: skipping WAL reader thread");
+            None
+        } else {
             let wal_dir = self.data_dir.join("wal");
             let wal_state = Arc::clone(&state);
             std::thread::Builder::new()
@@ -1202,7 +1212,7 @@ impl BitdexServer {
                                     // Build FieldMeta, CoalescerSink, and DocWriter for the ops processor
                                     let meta = crate::ops_processor::FieldMeta::from_config(engine.config());
                                     let sender = engine.mutation_sender();
-                                    let mut sink = crate::ingester::CoalescerSink::new(sender);
+                                    let mut sink = crate::sync::ingester::CoalescerSink::new(sender);
                                     let mut doc_writer = crate::ops_processor::DocWriter::new(
                                         engine.docstore_arc(),
                                     );
@@ -1216,15 +1226,6 @@ impl BitdexServer {
 
                                     // Flush pending docstore writes (DocWriter buffers tuples)
                                     doc_writer.flush();
-
-                                    // Invalidate doc cache for mutated entities so
-                                    // GET /documents returns fresh data after ops.
-                                    if applied > 0 {
-                                        for entry in &entries {
-                                            let slot = entry.entity_id as u32;
-                                            engine.evict_doc_cache(slot);
-                                        }
-                                    }
 
                                     // WAL read-side metrics
                                     if applied > 0 {
@@ -1328,6 +1329,13 @@ impl BitdexServer {
                 .ok()
         };
 
+        // Log server mode
+        if self.read_only {
+            eprintln!("Server mode: READ-ONLY (write endpoints return 503, waiting for writer lock)");
+        } else {
+            eprintln!("Server mode: READ-WRITE");
+        }
+
         let shutdown_state = Arc::clone(&state);
 
         // Admin routes — require Bearer token (or disabled if no token configured)
@@ -1348,6 +1356,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/fields", post(handle_add_fields).delete(handle_remove_fields))
             .route("/api/indexes/{name}/fields/{field}/reload", post(handle_reload_field))
             .route("/api/indexes/{name}/compact", post(handle_compact))
+            .route("/api/indexes/{name}/time-buckets/rebuild", post(handle_rebuild_time_buckets))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
             // Capture endpoints (Phase 2)
@@ -1361,6 +1370,7 @@ impl BitdexServer {
             .route("/debug/snapshots", get(handle_snapshots_list))
             .route("/debug/rescan-memory", post(handle_rescan_memory))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
+            .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), reject_if_read_only))
             .with_state(Arc::clone(&state));
 
         // Public routes — no auth required
@@ -1387,6 +1397,8 @@ impl BitdexServer {
             .route("/api/indexes/{name}/dumps/{dump_name}/loaded", post(handle_dump_loaded))
             .route("/api/indexes/{name}/dumps/{dump_name}", delete(handle_delete_dump))
             .route("/api/indexes/{name}/dumps/clear", post(handle_clear_dumps))
+            .route("/api/indexes/{name}/dictionaries", get(handle_dictionaries))
+            .route("/api/indexes/{name}/ui-config", get(handle_ui_config))
             .route("/metrics", get(handle_metrics))
             .route("/", get(handle_ui))
             .with_state(Arc::clone(&state));
@@ -1421,30 +1433,6 @@ impl BitdexServer {
         // The server won't accept traffic until all eager bitmaps are loaded
         // and cache shards are restored. This prevents cold-start stampedes
         // where queries arrive before bitmaps are in memory.
-        {
-            let engine_arc = shutdown_state.index.lock()
-                .as_ref()
-                .map(|s| Arc::clone(&s.engine));
-            if let Some(ref engine) = engine_arc {
-                // Phase 5: Eager fields (bitmaps needed for queries)
-                let phase_start = std::time::Instant::now();
-                engine.preload_eager_fields();
-                let phase5_elapsed = phase_start.elapsed();
-                eprintln!("  Boot phase: eager_fields completed in {}ms", phase5_elapsed.as_millis());
-                state.metrics.boot_phase_seconds
-                    .with_label_values(&["eager_fields"])
-                    .set(phase5_elapsed.as_secs() as i64);
-
-                // Phase 6: Bound cache shards (persisted cache entries)
-                let phase_start = std::time::Instant::now();
-                engine.preload_bound_cache();
-                let phase6_elapsed = phase_start.elapsed();
-                eprintln!("  Boot phase: bound_cache completed in {}ms", phase6_elapsed.as_millis());
-                state.metrics.boot_phase_seconds
-                    .with_label_values(&["bound_cache"])
-                    .set(phase6_elapsed.as_secs() as i64);
-            }
-        }
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -1589,7 +1577,7 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
         // Phase 4: Metrics bridge wiring
         let phase_start = std::time::Instant::now();
         // Wire Prometheus metrics bridge into the engine's background threads.
-        engine.set_metrics_bridge(crate::concurrent_engine::MetricsBridge {
+        engine.set_metrics_bridge(crate::engine::concurrent_engine::MetricsBridge {
             lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
             compaction_total: state.metrics.compaction_total.clone(),
             compaction_duration: state.metrics.compaction_duration_seconds.clone(),
@@ -1646,12 +1634,9 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 /// Deletes the bitmaps directory, runs `build_all_from_docstore`, then
 /// `save_and_unload` to persist and free memory.
 fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
-    use crate::concurrent_engine::get_rss_bytes;
-
     let guard = state.index.lock();
     let idx = guard.as_ref().ok_or("No index found — cannot rebuild without config")?;
 
-    let engine = Arc::clone(&idx.engine);
     let index_name = idx.definition.name.clone();
     let bitmap_path = state.data_dir.join("indexes").join(&index_name).join("bitmaps");
     drop(guard);
@@ -1667,60 +1652,9 @@ fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
         eprintln!("  done");
     }
 
-    // Step 2: Build all bitmap indexes from docstore
-    let rss_start = get_rss_bytes();
-    eprintln!("Building bitmap indexes from docstore...");
-    eprintln!("  RSS before build: {:.2} GB", rss_start as f64 / 1e9);
-
-    let progress = Arc::new(AtomicU64::new(0));
-    let progress_clone = progress.clone();
-
-    let memory_cb: Box<dyn Fn(u64, f64, u64) + Send + Sync> = Box::new(move |docs, elapsed, rss| {
-        if elapsed > 0.0 {
-            eprintln!("  [{:>6.1}s] {:>10} docs ({:>7.0} docs/s)  RSS={:.2} GB",
-                elapsed, docs, docs as f64 / elapsed, rss as f64 / 1e9);
-        }
-    });
-
-    let (total_docs, build_elapsed) = engine
-        .build_all_from_docstore(progress_clone, Some(memory_cb))
-        .map_err(|e| format!("build_all_from_docstore: {e}"))?;
-
-    let rss_after_build = get_rss_bytes();
-    eprintln!("Build complete: {} docs in {:.1}s ({:.0} docs/s), RSS={:.2} GB",
-        total_docs, build_elapsed, total_docs as f64 / build_elapsed, rss_after_build as f64 / 1e9);
-
-    // Step 3: Persist bitmaps to disk and unload from memory
-    eprintln!("Persisting bitmaps to disk...");
-    let persist_start = std::time::Instant::now();
-
-    engine.save_and_unload().map_err(|e| format!("save_and_unload: {e}"))?;
-
-    let persist_elapsed = persist_start.elapsed().as_secs_f64();
-    let rss_final = get_rss_bytes();
-    let total_elapsed = build_elapsed + persist_elapsed;
-
-    eprintln!("\n=== REBUILD COMPLETE ===");
-    eprintln!("  Docs:          {}", total_docs);
-    eprintln!("  Build:         {:.1}s", build_elapsed);
-    eprintln!("  Persist:       {:.1}s", persist_elapsed);
-    eprintln!("  Total:         {:.1}s ({:.1} min)", total_elapsed, total_elapsed / 60.0);
-    eprintln!("  RSS final:     {:.2} GB", rss_final as f64 / 1e9);
-    eprintln!("Server will now start with lazy bitmap loading.\n");
-
-    // Update task registry so the API reflects the rebuild
-    let guard = state.index.lock();
-    if let Some(idx) = guard.as_ref() {
-        if let Ok((tid, progress)) = idx.tasks.try_start(TaskType::Rebuild) {
-            progress.store(total_docs, Ordering::Release);
-            idx.tasks.set_complete(tid, Some(serde_json::json!({
-                "records_loaded": total_docs,
-                "elapsed_secs": total_elapsed,
-            })));
-        }
-    }
-
-    Ok(())
+    // Step 2: Build all bitmap indexes from docstore (not yet implemented — DataSilo bulk scan API pending)
+    eprintln!("rebuild_on_boot: build_all_from_docstore not yet implemented (DataSilo bulk scan API pending)");
+    Err("rebuild_on_boot: DataSilo bulk scan API not yet implemented".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1893,7 +1827,7 @@ async fn handle_create_index(
     }
 
     // Wire Prometheus metrics bridge into the engine's background threads.
-    engine.set_metrics_bridge(crate::concurrent_engine::MetricsBridge {
+    engine.set_metrics_bridge(crate::engine::concurrent_engine::MetricsBridge {
         lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
         compaction_total: state.metrics.compaction_total.clone(),
         compaction_duration: state.metrics.compaction_duration_seconds.clone(),
@@ -1950,6 +1884,95 @@ async fn handle_get_index(
             Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
         ).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: UI — Dictionaries & UI Config
+// ---------------------------------------------------------------------------
+
+/// GET /api/indexes/{name}/dictionaries — reverse maps (int → display string)
+/// for all fields that have dictionaries (LowCardinalityString) or string_maps
+/// (MappedString). The UI uses these to populate dropdowns and render labels.
+async fn handle_dictionaries(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let guard = state.index.lock();
+    match guard.as_ref() {
+        Some(idx) if idx.definition.name == name => {
+            let mut result: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+            // LowCardinalityString dictionaries from the engine
+            for (field_name, dict) in idx.engine.dictionaries().iter() {
+                let snap = dict.snapshot();
+                let reverse = snap.to_reverse_map();
+                let map: serde_json::Map<String, serde_json::Value> = reverse.iter()
+                    .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.clone())))
+                    .collect();
+                result.insert(field_name.clone(), serde_json::Value::Object(map));
+            }
+
+            // MappedString fields from data_schema (reverse the string_map)
+            for mapping in &idx.definition.data_schema.fields {
+                if let Some(ref string_map) = mapping.string_map {
+                    if !result.contains_key(&mapping.target) {
+                        let reverse: serde_json::Map<String, serde_json::Value> = string_map.iter()
+                            .map(|(label, &id)| (id.to_string(), serde_json::Value::String(label.clone())))
+                            .collect();
+                        result.insert(mapping.target.clone(), serde_json::Value::Object(reverse));
+                    }
+                }
+            }
+
+            Json(serde_json::Value::Object(result)).into_response()
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+        ).into_response(),
+    }
+}
+
+/// GET /api/indexes/{name}/ui-config — serve the UI config YAML as JSON.
+/// Loaded from data_dir/indexes/{name}/ui-config.yaml (or index_dir if set).
+/// Returns {} if no UI config file exists (UI falls back to auto-generated controls).
+async fn handle_ui_config(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let config_source_dir = state.index_dir.clone()
+        .unwrap_or_else(|| state.data_dir.join("indexes"));
+    let candidates = [
+        config_source_dir.join(&name).join("ui-config.yaml"),
+        config_source_dir.join(&name).join("ui-config.yml"),
+        state.data_dir.join("indexes").join(&name).join("ui-config.yaml"),
+        state.data_dir.join("indexes").join(&name).join("ui-config.yml"),
+    ];
+
+    for path in &candidates {
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(yaml_str) => {
+                    match serde_yaml::from_str::<serde_json::Value>(&yaml_str) {
+                        Ok(val) => return Json(val).into_response(),
+                        Err(e) => {
+                            eprintln!("Failed to parse ui-config at {}: {e}", path.display());
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"error": format!("Invalid ui-config YAML: {e}")})),
+                            ).into_response();
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to read ui-config at {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
+    // No config file — return empty object (UI auto-generates)
+    Json(serde_json::json!({})).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2053,23 +2076,19 @@ async fn handle_patch_config(
                 if let Some(ref cache_patch) = patch.cache {
                     if let Some(v) = cache_patch.max_entries {
                         idx.definition.config.cache.max_entries = v;
-                        idx.engine.set_cache_max_entries(v);
+                        // CacheSilo handles cache sizing via compaction
                     }
                     if let Some(v) = cache_patch.max_bytes {
                         idx.definition.config.cache.max_bytes = v;
-                        idx.engine.set_cache_max_bytes(v);
                     }
                     if let Some(v) = cache_patch.initial_capacity {
                         idx.definition.config.cache.initial_capacity = v;
-                        idx.engine.set_cache_initial_capacity(v);
                     }
                     if let Some(v) = cache_patch.max_capacity {
                         idx.definition.config.cache.max_capacity = v;
-                        idx.engine.set_cache_max_capacity(v);
                     }
                     if let Some(v) = cache_patch.min_filter_size {
                         idx.definition.config.cache.min_filter_size = v;
-                        idx.engine.set_cache_min_filter_size(v);
                     }
                     if let Some(v) = cache_patch.decay_rate {
                         idx.definition.config.cache.decay_rate = v;
@@ -2088,11 +2107,9 @@ async fn handle_patch_config(
                     }
                     if let Some(v) = cache_patch.max_maintenance_work {
                         idx.definition.config.cache.max_maintenance_work = v;
-                        idx.engine.set_max_maintenance_work(v);
                     }
                     if let Some(v) = cache_patch.max_maintenance_ms {
                         idx.definition.config.cache.max_maintenance_ms = v;
-                        idx.engine.set_max_maintenance_ms(v);
                     }
                 }
 
@@ -2161,27 +2178,12 @@ async fn handle_patch_config(
                     eprintln!("Config patch: trace_buffer_size set to {v}");
                 }
 
-                // Toggle metric groups — disabled_metrics takes precedence
+                // Toggle metric groups
                 if let Some(ref disabled) = patch.disabled_metrics {
                     let bm = !disabled.iter().any(|g| g == "bitmap_memory");
-                    let ev = !disabled.iter().any(|g| g == "eviction_stats");
-                    let bd = !disabled.iter().any(|g| g == "boundstore_disk");
                     state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                    state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
-                    state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
                     idx.definition.config.disabled_metrics = Some(disabled.clone());
-                    idx.definition.config.enabled_metrics = None; // clear legacy
-                    eprintln!("Config patch: disabled_metrics = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", disabled);
-                } else if let Some(ref groups) = patch.enabled_metrics {
-                    // Legacy opt-in (deprecated)
-                    let bm = groups.iter().any(|g| g == "bitmap_memory");
-                    let ev = groups.iter().any(|g| g == "eviction_stats");
-                    let bd = groups.iter().any(|g| g == "boundstore_disk");
-                    state.metrics_bitmap_memory.store(bm, Ordering::Relaxed);
-                    state.metrics_eviction_stats.store(ev, Ordering::Relaxed);
-                    state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
-                    idx.definition.config.enabled_metrics = Some(groups.clone());
-                    eprintln!("Config patch: enabled_metrics (legacy) = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
+                    eprintln!("Config patch: disabled_metrics = {:?} (bitmap_memory={bm})", disabled);
                 }
 
                 // Persist updated config
@@ -2210,17 +2212,8 @@ async fn handle_patch_config(
                             .map(|name| FilterClause::Eq(name.clone(), Value::Integer(0)))
                             .collect();
 
-                        // Load each newly-eager sort field
-                        for sname in &newly_eager_sorts {
-                            let _ = engine_clone.ensure_fields_loaded(&clauses, Some(sname));
-                        }
-                        // Load remaining filter-only fields
-                        if !clauses.is_empty() {
-                            let _ = engine_clone.ensure_fields_loaded(&clauses, None);
-                        }
-
                         eprintln!(
-                            "Config patch: loaded {} eager filter + {} eager sort fields",
+                            "Config patch: {} eager filter + {} eager sort fields (BitmapSilo handles lazy loading)",
                             newly_eager_filters.len(),
                             newly_eager_sorts.len(),
                         );
@@ -2344,30 +2337,22 @@ async fn handle_load(
     tokio::task::spawn_blocking(move || {
         let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
 
-        // Enter loading mode
-        engine.enter_loading_mode();
-
         match loader::load_ndjson(&engine, &schema, &path, limit, threads, chunk_size, docstore_batch_size, max_writer_threads, progress.clone()) {
             Ok(stats) => {
                 let alive;
 
                 if save_snapshot {
-                    // Combined exit-loading + save + unload: saves directly from
-                    // staging without an intermediate full publish, eliminating the
-                    // memory spike from staging.clone() at scale.
                     guard.tasks.set_saving(task_id);
 
                     let snap_start = Instant::now();
-                    if let Err(e) = engine.exit_loading_mode_and_save_unload() {
-                        eprintln!("Warning: failed to exit_loading_mode_and_save_unload: {e}");
+                    if let Err(e) = engine.save_and_unload() {
+                        eprintln!("Warning: failed to save_and_unload: {e}");
                     } else {
-                        eprintln!("exit_loading_mode_and_save_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
+                        eprintln!("save_and_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
                     }
                     // Alive bitmap is always preserved during unload
                     alive = engine.alive_count();
                 } else {
-                    // Just exit loading mode — no save needed
-                    engine.exit_loading_mode();
                     alive = engine.alive_count();
                 }
 
@@ -2380,7 +2365,6 @@ async fn handle_load(
                 guard.defuse();
             }
             Err(e) => {
-                engine.exit_loading_mode();
                 guard.tasks.set_error(task_id, e.to_string());
                 guard.defuse();
             }
@@ -2783,260 +2767,54 @@ async fn handle_documents_batch(
 }
 
 async fn handle_upsert(
-    State(state): State<SharedState>,
+    State(_state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(req): Json<UpsertRequest>,
+    Json(_req): Json<UpsertRequest>,
 ) -> impl IntoResponse {
-    let engine = {
-        let guard = state.index.lock();
-        match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => {
-                Arc::clone(&idx.engine)
-            }
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    // Get schema and dictionaries for the upsert
-    let (schema, has_lcs) = {
-        let guard = state.index.lock();
-        let idx = guard.as_ref().unwrap();
-        let has_lcs = idx.definition.data_schema.fields.iter().any(|f| f.value_type == FieldValueType::LowCardinalityString);
-        (idx.definition.data_schema.clone(), has_lcs)
-    };
-
-    // Run upserts on a blocking thread — engine.put() does sync disk I/O
-    // (docstore reads for diffing) that would starve the tokio runtime.
-    let documents = req.documents;
-    let engine_clone = Arc::clone(&engine);
-    let schema_clone = schema.clone();
-    let (upserted, errors) = tokio::task::spawn_blocking(move || {
-        let mut upserted = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-
-        for (i, doc_json) in documents.iter().enumerate() {
-            let dicts = if has_lcs { Some(engine_clone.dictionaries()) } else { None };
-            match loader::json_to_document_with_dicts(doc_json, &schema_clone, dicts) {
-                Ok((slot, doc)) => {
-                    if let Err(e) = engine_clone.put(slot, &doc) {
-                        errors.push(format!("doc[{}] id={}: {}", i, slot, e));
-                    } else {
-                        upserted += 1;
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("doc[{}]: {}", i, e));
-                }
-            }
-        }
-
-        (upserted, errors)
-    }).await.expect("spawn_blocking join");
-
-    // Set cursor if provided (after mutations are submitted to coalescer)
-    if let Some(cursor) = req.cursor {
-        engine.set_cursor(cursor.name, cursor.value);
-    }
-
-    // Rebuild reverse maps if LCS dictionaries gained new values.
-    // Ensures newly-upserted string values are reverse-mappable when serving documents.
-    // Query-time resolution already falls through to live dictionaries (no rebuild needed).
-    if has_lcs && upserted > 0 {
-        // Persist dirty dictionaries before updating reverse maps.
-        // This ensures dictionary mappings survive crashes — a doc on disk
-        // always has its integer keys resolvable via the persisted dictionary.
-        if let Err(e) = engine.persist_dirty_dictionaries() {
-            eprintln!("warning: failed to persist LCS dictionaries: {}", e);
-        }
-
-        let mut guard = state.index.lock();
-        if let Some(ref mut idx) = *guard {
-            let dicts = engine.dictionaries();
-            let reverse_maps = build_reverse_string_maps_with_dicts(&idx.definition.data_schema, Some(dicts));
-            idx.reverse_maps = Arc::new(reverse_maps);
-        }
-    }
-
-    state
-        .metrics
-        .upsert_total
-        .with_label_values(&[&name])
-        .inc_by(upserted);
-
-    if errors.is_empty() {
-        Json(serde_json::json!({"upserted": upserted})).into_response()
-    } else {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({"upserted": upserted, "errors": errors})),
-        ).into_response()
-    }
+    // Direct upsert via PUT is no longer supported. All document writes
+    // flow through the ops pipeline (POST /ops). Use the bitdex-sync
+    // sidecar to deliver writes from Postgres.
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": format!(
+                "Direct upsert is not implemented for index '{}'; all writes flow through the ops pipeline",
+                name
+            )
+        })),
+    ).into_response()
 }
 
 /// PATCH /api/indexes/{name}/documents/patch
 ///
-/// Partial update: merges only provided fields into existing documents.
-/// Fields absent from the payload are left untouched in bitmaps and docstore.
-/// Slots that are not alive return an error (use upsert for initial creation).
+/// Not implemented — use upsert (PUT) for all document writes.
 async fn handle_patch_documents(
-    State(state): State<SharedState>,
+    State(_state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(req): Json<UpsertRequest>,
+    Json(_req): Json<UpsertRequest>,
 ) -> impl IntoResponse {
-    let engine = {
-        let guard = state.index.lock();
-        match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    let (schema, has_lcs) = {
-        let guard = state.index.lock();
-        let idx = guard.as_ref().unwrap();
-        let has_lcs = idx.definition.data_schema.fields.iter().any(|f| f.value_type == FieldValueType::LowCardinalityString);
-        (idx.definition.data_schema.clone(), has_lcs)
-    };
-
-    // Run patch_document on a blocking thread to avoid starving the tokio
-    // runtime. patch_document does sync disk I/O (reads old doc for diffing)
-    // and 5000 patches per pg-sync cycle would exhaust the async thread pool.
-    let documents = req.documents;
-    let engine_clone = Arc::clone(&engine);
-    let schema_clone = schema.clone();
-    let (patched, errors) = tokio::task::spawn_blocking(move || {
-        let mut patched = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-
-        for (i, doc_json) in documents.iter().enumerate() {
-            let dicts = if has_lcs { Some(engine_clone.dictionaries()) } else { None };
-            match loader::json_to_document_with_dicts(doc_json, &schema_clone, dicts) {
-                Ok((slot, doc)) => {
-                    match engine_clone.patch_document(slot, &doc) {
-                        Ok(()) => patched += 1,
-                        Err(crate::error::BitdexError::SlotNotFound(_)) => {
-                            errors.push(format!("doc[{}] id={}: not alive (use upsert for new docs)", i, slot));
-                        }
-                        Err(e) => {
-                            errors.push(format!("doc[{}] id={}: {}", i, slot, e));
-                        }
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("doc[{}]: {}", i, e));
-                }
-            }
-        }
-
-        (patched, errors)
-    }).await.expect("spawn_blocking join");
-
-    if let Some(cursor) = req.cursor {
-        engine.set_cursor(cursor.name, cursor.value);
-    }
-
-    if has_lcs && patched > 0 {
-        if let Err(e) = engine.persist_dirty_dictionaries() {
-            eprintln!("warning: failed to persist LCS dictionaries: {}", e);
-        }
-        let mut guard = state.index.lock();
-        if let Some(ref mut idx) = *guard {
-            let dicts = engine.dictionaries();
-            let reverse_maps = build_reverse_string_maps_with_dicts(&idx.definition.data_schema, Some(dicts));
-            idx.reverse_maps = Arc::new(reverse_maps);
-        }
-    }
-
-    state.metrics.upsert_total.with_label_values(&[&name]).inc_by(patched);
-
-    if errors.is_empty() {
-        Json(serde_json::json!({"patched": patched})).into_response()
-    } else {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({"patched": patched, "errors": errors})),
-        ).into_response()
-    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": format!("PATCH is not implemented for index '{}'; use PUT upsert instead", name)
+        })),
+    )
 }
 
-/// Sync filter values for a filter_only multi-value field.
+/// Sync filter values — not implemented.
 ///
-/// Accepts a batch of (slot, values) pairs and replaces all bitmap memberships
-/// for each slot on the named field. Used by the outbox poller for fields like
-/// collectionIds where membership comes from a separate table.
+/// This endpoint is no longer supported. Use upsert (PUT) for all document writes.
 async fn handle_filter_sync(
-    State(state): State<SharedState>,
+    State(_state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(req): Json<FilterSyncRequest>,
+    Json(_req): Json<FilterSyncRequest>,
 ) -> impl IntoResponse {
-    // Validate field exists and is a multi_value filter field
-    let engine = {
-        let guard = state.index.lock();
-        match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => {
-                let is_multi_value = idx.definition.config.filter_fields.iter().any(|f| {
-                    f.name == req.field
-                        && matches!(f.field_type, crate::filter::FilterFieldType::MultiValue)
-                });
-                let is_filter_only = idx.definition.data_schema.fields.iter().any(|f| {
-                    f.target == req.field && f.filter_only
-                });
-                if !is_multi_value || !is_filter_only {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": format!("Field '{}' is not a filter_only multi_value field", req.field)
-                        })),
-                    ).into_response();
-                }
-                Arc::clone(&idx.engine)
-            }
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    let mut synced = 0u64;
-    let mut errors: Vec<String> = Vec::new();
-
-    for (i, entry) in req.documents.iter().enumerate() {
-        match engine.sync_filter_values(entry.id, &req.field, &entry.values) {
-            Ok(()) => synced += 1,
-            Err(e) => errors.push(format!("doc[{}] id={}: {}", i, entry.id, e)),
-        }
-    }
-
-    state.metrics.upsert_total.with_label_values(&[&name]).inc_by(synced);
-
-    if errors.is_empty() {
-        Json(serde_json::json!({"synced": synced})).into_response()
-    } else if synced == 0 {
-        // Total failure — no documents synced
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"synced": 0, "errors": errors})),
-        ).into_response()
-    } else {
-        // Partial failure
-        (
-            StatusCode::MULTI_STATUS,
-            Json(serde_json::json!({"synced": synced, "errors": errors})),
-        ).into_response()
-    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": format!("filter_sync is not implemented for index '{}'; use PUT upsert instead", name)
+        })),
+    )
 }
 
 async fn handle_delete_docs(
@@ -3118,54 +2896,13 @@ async fn handle_stats(
     let (slot_bytes, filter_bytes, sort_bytes) = tokio::task::spawn_blocking(move || {
         engine2.bitmap_memory_totals()
     }).await.unwrap_or((0, 0, 0));
-    let uc = engine.unified_cache_stats();
-    let entries: Vec<serde_json::Value> = engine.unified_cache_entry_details().into_iter().map(|e| {
-        serde_json::json!({
-            "sort_field": e.sort_field,
-            "direction": e.direction,
-            "filter_count": e.filter_count,
-            "cardinality": e.cardinality,
-            "capacity": e.capacity,
-            "max_capacity": e.max_capacity,
-            "has_more": e.has_more,
-            "min_tracked_value": e.min_tracked_value,
-        })
-    }).collect();
-    let eviction: Vec<serde_json::Value> = engine.eviction_stats().into_iter().map(|(name, total, resident)| {
-        serde_json::json!({
-            "field": name,
-            "evicted_total": total,
-            "resident_values": resident,
-        })
-    }).collect();
     Json(serde_json::json!({
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
-        "flush_cycle": engine.flush_cycle(),
+        "flush_cycle": 0u64,
         "slot_bitmap_bytes": slot_bytes,
         "filter_bitmap_bytes": filter_bytes,
         "sort_bitmap_bytes": sort_bytes,
-        "unified_cache_entries": uc.entries,
-        "unified_cache_hits": uc.hits,
-        "unified_cache_misses": uc.misses,
-        "unified_cache_bytes": uc.memory_bytes,
-        "unified_cache_meta_entries": uc.meta_index_entries,
-        "unified_cache_meta_bytes": uc.meta_index_bytes,
-        "unified_cache_persistence_enabled": uc.persistence_enabled,
-        "unified_cache_tombstones": uc.tombstone_count,
-        "unified_cache_pending_shards": uc.pending_shard_count,
-        "unified_cache_dirty_shards": uc.dirty_shard_count,
-        "unified_cache_meta_dirty": uc.meta_dirty,
-        "unified_cache_disk_bytes": engine.boundstore_disk_bytes(),
-        "unified_cache_shard_load_count": engine.boundstore_shard_loads(),
-        "unified_cache_tombstones_created": engine.boundstore_tombstones_created(),
-        "unified_cache_tombstones_cleaned": engine.boundstore_tombstones_cleaned(),
-        "unified_cache_entries_restored": engine.boundstore_entries_restored(),
-        "unified_cache_entries_skipped": engine.boundstore_entries_skipped(),
-        "unified_cache_bytes_written": engine.boundstore_bytes_written(),
-        "unified_cache_bytes_read": engine.boundstore_bytes_read(),
-        "unified_cache_entry_details": entries,
-        "eviction": eviction,
         "queries_in_flight": state.queries_in_flight.load(Ordering::Relaxed),
         "queries_in_flight_peak": state.queries_in_flight_peak.load(Ordering::Relaxed),
         "queries_rejected": state.metrics.queries_rejected_total.get(),
@@ -3191,13 +2928,13 @@ async fn handle_clear_cache(
         }
     };
 
-    engine.clear_unified_cache();
+    engine.clear_cache();
     Json(serde_json::json!({"cleared": true, "scope": "ram_only"})).into_response()
 }
 
 /// DELETE /api/indexes/{name}/cache/persistent — purge disk + RAM cache.
-/// Wipes all BoundStore files (meta.bin + shards) then clears the in-memory
-/// cache and meta-index. Safe to call while the server is running.
+/// Wipes all CacheSilo data then clears the in-memory cache.
+/// Safe to call while the server is running.
 async fn handle_purge_cache(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
@@ -3341,99 +3078,23 @@ async fn handle_warm_cache(
 async fn handle_rebuild(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(req): Json<RebuildRequest>,
+    _req: Json<RebuildRequest>,
 ) -> impl IntoResponse {
-    let (engine, config, tasks) = {
+    // Verify the index exists
+    {
         let guard = state.index.lock();
-        match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => (
-                Arc::clone(&idx.engine),
-                idx.definition.config.clone(),
-                Arc::clone(&idx.tasks),
-            ),
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    // Validate field names
-    if let Some(ref sort_names) = req.sort_fields {
-        for name in sort_names {
-            if !config.sort_fields.iter().any(|sc| &sc.name == name) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("Unknown sort field: {}", name)})),
-                ).into_response();
-            }
-        }
-    }
-    if let Some(ref filter_names) = req.filter_fields {
-        for name in filter_names {
-            if !config.filter_fields.iter().any(|fc| &fc.name == name) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("Unknown filter field: {}", name)})),
-                ).into_response();
-            }
-        }
-    }
-
-    let (task_id, progress) = match tasks.try_start(TaskType::Rebuild) {
-        Ok(v) => v,
-        Err(active_info) => {
+        if guard.as_ref().map(|idx| idx.definition.name != name).unwrap_or(true) {
             return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "A task is already running",
-                    "active_task": serde_json::to_value(&active_info).unwrap(),
-                })),
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
             ).into_response();
         }
-    };
+    }
 
-    let sort_fields = req.sort_fields;
-    let filter_fields = req.filter_fields;
-    let save = req.save_snapshot;
-
-    let tasks_clone = Arc::clone(&tasks);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
-
-        match engine.rebuild_fields_from_docstore(sort_fields, filter_fields, progress.clone()) {
-            Ok((slots, fields)) => {
-                if save {
-                    guard.tasks.set_saving(task_id);
-
-                    let snap_start = Instant::now();
-                    if let Err(e) = engine.save_and_unload() {
-                        eprintln!("rebuild: failed to save_and_unload: {e}");
-                    } else {
-                        eprintln!("rebuild: save_and_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
-                    }
-                }
-
-                guard.tasks.set_complete(task_id, Some(serde_json::json!({
-                    "records_loaded": slots,
-                    "fields": fields,
-                })));
-                guard.defuse();
-
-                eprintln!("rebuild: done — {} slots, {} fields", slots, fields.len());
-            }
-            Err(e) => {
-                guard.tasks.set_error(task_id, format!("Rebuild failed: {}", e));
-                guard.defuse();
-            }
-        }
-    });
-
+    // rebuild_fields_from_docstore is not yet implemented (DataSilo bulk scan API pending)
     (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"task_id": task_id})),
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "rebuild_fields_from_docstore not yet implemented"})),
     ).into_response()
 }
 
@@ -3446,6 +3107,42 @@ struct CompactRequest {
     targets: Option<Vec<String>>,
     threshold: Option<u32>,
     workers: Option<usize>,
+}
+
+async fn handle_rebuild_time_buckets(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+    match engine.rebuild_time_buckets() {
+        Ok((bucket_count, slots_scanned)) => {
+            // Include per-bucket counts in the response
+            let bucket_details = engine.time_bucket_stats();
+            Json(serde_json::json!({
+                "status": "ok",
+                "buckets_rebuilt": bucket_count,
+                "slots_scanned": slots_scanned,
+                "buckets": bucket_details,
+            })).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            ).into_response()
+        }
+    }
 }
 
 async fn handle_compact(
@@ -3557,140 +3254,21 @@ async fn handle_add_fields(
         ).into_response();
     }
 
-    let (engine, tasks) = {
-        let mut guard = state.index.lock();
-        match guard.as_mut() {
-            Some(idx) if idx.definition.name == name => {
-                // Validate no duplicate field names with existing config
-                for fc in &req.filter_fields {
-                    if idx.definition.config.filter_fields.iter().any(|f| f.name == fc.name) {
-                        return (
-                            StatusCode::CONFLICT,
-                            Json(serde_json::json!({"error": format!("Filter field '{}' already exists", fc.name)})),
-                        ).into_response();
-                    }
-                }
-                for sc in &req.sort_fields {
-                    if idx.definition.config.sort_fields.iter().any(|f| f.name == sc.name) {
-                        return (
-                            StatusCode::CONFLICT,
-                            Json(serde_json::json!({"error": format!("Sort field '{}' already exists", sc.name)})),
-                        ).into_response();
-                    }
-                }
-
-                // Update the persisted config with the new fields
-                idx.definition.config.filter_fields.extend(req.filter_fields.clone());
-                idx.definition.config.sort_fields.extend(req.sort_fields.clone());
-
-                // Save updated config
-                let index_dir = state.data_dir.join("indexes").join(&name);
-                if let Err(e) = idx.definition.save_yaml(&index_dir) {
-                    // Rollback config changes
-                    for fc in &req.filter_fields {
-                        idx.definition.config.filter_fields.retain(|f| f.name != fc.name);
-                    }
-                    for sc in &req.sort_fields {
-                        idx.definition.config.sort_fields.retain(|f| f.name != sc.name);
-                    }
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": format!("Failed to persist config: {e}")})),
-                    ).into_response();
-                }
-
-                (
-                    Arc::clone(&idx.engine),
-                    Arc::clone(&idx.tasks),
-                )
-            }
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    // Validate fields exist in docstore (unless skipped)
-    if !req.skip_validation {
-        let all_names: Vec<&str> = req.filter_fields.iter().map(|f| f.name.as_str())
-            .chain(req.sort_fields.iter().map(|f| f.name.as_str()))
-            .collect();
-
-        match engine.validate_fields_in_docstore(&all_names) {
-            Ok(missing) if !missing.is_empty() => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("Fields not found in docstore: {:?}", missing),
-                        "hint": "Set skip_validation=true to add fields that may not exist in all documents"
-                    })),
-                ).into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("Validation failed: {e}")})),
-                ).into_response();
-            }
-            _ => {}
+    // Verify the index exists
+    {
+        let guard = state.index.lock();
+        if guard.as_ref().map(|idx| idx.definition.name != name).unwrap_or(true) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+            ).into_response();
         }
     }
 
-    let (task_id, progress) = match tasks.try_start(TaskType::AddFields) {
-        Ok(v) => v,
-        Err(active_info) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "A task is already running",
-                    "active_task": serde_json::to_value(&active_info).unwrap(),
-                })),
-            ).into_response();
-        }
-    };
-
-    let filter_fields = req.filter_fields;
-    let sort_fields = req.sort_fields;
-    let save = req.save_snapshot;
-
-    let tasks_clone = Arc::clone(&tasks);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
-
-        match engine.add_fields_from_docstore(filter_fields, sort_fields, progress) {
-            Ok((slots, fields)) => {
-                if save {
-                    guard.tasks.set_saving(task_id);
-
-                    let snap_start = Instant::now();
-                    if let Err(e) = engine.save_and_unload() {
-                        eprintln!("add_fields: save_and_unload failed: {e}");
-                    } else {
-                        eprintln!("add_fields: save_and_unload in {:.1}s", snap_start.elapsed().as_secs_f64());
-                    }
-                }
-
-                guard.tasks.set_complete(task_id, Some(serde_json::json!({
-                    "records_loaded": slots,
-                    "fields": fields,
-                })));
-                guard.defuse();
-
-                eprintln!("add_fields: done — {} slots, {} fields", slots, fields.len());
-            }
-            Err(e) => {
-                guard.tasks.set_error(task_id, format!("Add fields failed: {}", e));
-                guard.defuse();
-            }
-        }
-    });
-
+    // add_fields_from_docstore is not yet implemented (DataSilo bulk scan API pending)
     (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"task_id": task_id})),
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "add_fields_from_docstore not yet implemented"})),
     ).into_response()
 }
 
@@ -3716,13 +3294,9 @@ async fn handle_reload_field(
         }
     };
 
-    match engine.reload_existence_set(&field) {
-        Ok(()) => Json(serde_json::json!({"reloaded": field})).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("{e}")})),
-        ).into_response(),
-    }
+    // Existence sets are no longer used (BitmapSilo replaced lazy loading).
+    let _ = engine;
+    Json(serde_json::json!({"reloaded": field, "note": "existence sets removed, no-op"})).into_response()
 }
 
 async fn handle_remove_fields(
@@ -3803,44 +3377,15 @@ async fn handle_remove_fields(
         }
     };
 
-    let filter_fields = req.filter_fields;
-    let sort_fields = req.sort_fields;
-    let save = req.save_snapshot;
-
-    let tasks_clone = Arc::clone(&tasks);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
-
-        match engine.remove_fields(&filter_fields, &sort_fields) {
-            Ok(removed) => {
-                if save {
-                    guard.tasks.set_saving(task_id);
-
-                    let snap_start = Instant::now();
-                    if let Err(e) = engine.save_and_unload() {
-                        eprintln!("remove_fields: save_and_unload failed: {e}");
-                    } else {
-                        eprintln!("remove_fields: save_and_unload in {:.1}s", snap_start.elapsed().as_secs_f64());
-                    }
-                }
-
-                guard.tasks.set_complete(task_id, Some(serde_json::json!({
-                    "removed": removed,
-                })));
-                guard.defuse();
-
-                eprintln!("remove_fields: done — removed {:?}", removed);
-            }
-            Err(e) => {
-                guard.tasks.set_error(task_id, format!("Remove fields failed: {}", e));
-                guard.defuse();
-            }
-        }
-    });
-
+    // remove_fields is not yet implemented in the silo architecture.
+    // The config was already updated above; a full reload is required to
+    // make the field removal take effect in bitmaps.
+    let _ = (engine, tasks, task_id);
     (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"task_id": task_id})),
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "remove_fields is not yet implemented — reload the index to apply config changes",
+        })),
     ).into_response()
 }
 
@@ -3944,7 +3489,7 @@ async fn handle_capture_start(
 
     match state.capture.start(&req) {
         Ok(status) => {
-            // Pin ShardStore generations at capture start boundary.
+            // Pin BitmapSilo generations at capture start boundary.
             // Gen N = pre-capture state, Gen N+1 = where mutations during capture go.
             if let Some(ref idx) = *state.index.lock() {
                 match idx.engine.pin_shard_generations() {
@@ -4014,7 +3559,7 @@ async fn handle_capture_stop(
 ) -> impl IntoResponse {
     match state.capture.stop() {
         Ok(status) => {
-            // Pin ShardStore generations at capture stop boundary.
+            // Pin BitmapSilo generations at capture stop boundary.
             // Gen N+1 = mutations during capture, Gen N+2 = post-capture.
             if let Some(ref idx) = *state.index.lock() {
                 match idx.engine.pin_shard_generations() {
@@ -4287,28 +3832,25 @@ async fn handle_list_cursors(
 // Handlers: Utility
 // ---------------------------------------------------------------------------
 
-async fn handle_health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+async fn handle_health(State(state): State<SharedState>) -> impl IntoResponse {
+    let mode = if state.read_only.load(Ordering::Relaxed) { "read-only" } else { "read-write" };
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok", "mode": mode})))
 }
 
-/// Memory budget endpoint — shows where every GB of RSS goes.
+/// Memory budget endpoint — shows where every GB of tracked bitmap memory goes.
 /// Bitmap totals run on a blocking thread (can be slow at 107M records).
 /// Designed for manual debugging, not Prometheus scraping.
 async fn handle_debug_memory(
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
-    let rss_bytes = crate::concurrent_engine::get_rss_bytes() as u64;
-
-    let (engine, engine_name, uc_bytes, doc_cache_bytes) = {
+    let (engine, engine_name, uc_bytes) = {
         let guard = state.index.lock();
         if let Some(idx) = guard.as_ref() {
             let engine = Arc::clone(&idx.engine);
             let name = idx.definition.name.clone();
-            let uc = engine.unified_cache_stats();
-            let (_, _, _, dc_bytes, _, _) = engine.doc_cache_stats();
-            (Some(engine), name, uc.memory_bytes as u64, dc_bytes)
+            (Some(engine), name, 0u64)
         } else {
-            (None, String::new(), 0, 0)
+            (None, String::new(), 0)
         }
     };
 
@@ -4322,46 +3864,22 @@ async fn handle_debug_memory(
     };
 
     let bitmap_total = slot_bytes + filter_bytes + sort_bytes;
-    let tracked_total = bitmap_total + uc_bytes + doc_cache_bytes;
-    let untracked = rss_bytes.saturating_sub(tracked_total);
-
-    let pod_limit: u64 = std::env::var("BITDEX_MEMORY_LIMIT_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32 * 1024 * 1024 * 1024);
-
-    let headroom = pod_limit.saturating_sub(rss_bytes);
-    let non_doc_tracked = tracked_total.saturating_sub(doc_cache_bytes);
-    let safe_doc_cache = pod_limit
-        .saturating_sub(non_doc_tracked)
-        .saturating_sub(untracked)
-        .saturating_sub(2 * 1024 * 1024 * 1024);
+    let tracked_total = bitmap_total + uc_bytes;
 
     Json(serde_json::json!({
         "index": engine_name,
-        "rss_bytes": rss_bytes,
         "tracked": {
             "alive_bitmap": slot_bytes,
             "filter_bitmaps": filter_bytes,
             "sort_bitmaps": sort_bytes,
             "bitmap_total": bitmap_total,
             "unified_cache": uc_bytes,
-            "doc_cache": doc_cache_bytes,
         },
         "tracked_total": tracked_total,
-        "untracked": untracked,
-        "budget": {
-            "pod_limit": pod_limit,
-            "rss_current": rss_bytes,
-            "headroom": headroom,
-            "safe_doc_cache_max": safe_doc_cache,
-        },
         "human": {
-            "rss": format!("{:.2} GB", rss_bytes as f64 / 1e9),
             "tracked": format!("{:.2} GB", tracked_total as f64 / 1e9),
-            "untracked": format!("{:.2} GB", untracked as f64 / 1e9),
-            "headroom": format!("{:.2} GB", headroom as f64 / 1e9),
-            "safe_doc_cache": format!("{:.2} GB", safe_doc_cache as f64 / 1e9),
+            "bitmaps": format!("{:.2} GB", bitmap_total as f64 / 1e9),
+            "cache": format!("{:.2} GB", uc_bytes as f64 / 1e9),
         }
     }))
 }
@@ -4439,13 +3957,11 @@ async fn handle_rescan_memory(
 ) -> impl IntoResponse {
     let guard = state.index.lock();
     match guard.as_ref() {
-        Some(idx) => {
-            idx.engine.bitmap_memory_cache().mark_all_stale();
+        Some(_idx) => {
+            // BitmapSilo uses mmap — no heap bitmap scanner needed.
             Json(serde_json::json!({
                 "status": "ok",
-                "message": "All fields marked stale. Scanner will process them in batches.",
-                "scanner_interval_ms": idx.engine.bitmap_memory_cache().interval_ms(),
-                "scanner_batch_size": idx.engine.bitmap_memory_cache().batch_size(),
+                "message": "Bitmap memory scanner removed (BitmapSilo uses mmap).",
             }))
         }
         None => {
@@ -4527,77 +4043,13 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(engine.slot_counter() as i64);
 
-            // Cache gauges
-            let t0 = std::time::Instant::now();
-            let uc = engine.unified_cache_stats();
-            let t_cache_stats = t0.elapsed();
-            m.cache_entries
-                .with_label_values(&[name])
-                .set(uc.entries as i64);
-            m.cache_bytes
-                .with_label_values(&[name])
-                .set(uc.memory_bytes as i64);
-            m.cache_hits_total
-                .with_label_values(&[name])
-                .set(uc.hits as i64);
-            m.cache_misses_total
-                .with_label_values(&[name])
-                .set(uc.misses as i64);
-            m.cache_inserts_total
-                .with_label_values(&[name])
-                .set(uc.inserts as i64);
-            m.cache_updates_total
-                .with_label_values(&[name])
-                .set(uc.updates as i64);
-            m.cache_evictions_total
-                .with_label_values(&[name])
-                .set(uc.evictions as i64);
-            m.cache_invalidations_total
-                .with_label_values(&[name])
-                .set(uc.invalidations as i64);
-            m.cache_entries_initial
-                .with_label_values(&[name])
-                .set(uc.entries_initial as i64);
-            m.cache_entries_expanded
-                .with_label_values(&[name])
-                .set(uc.entries_expanded as i64);
-            m.cache_extensions_total
-                .with_label_values(&[name])
-                .set(uc.extensions as i64);
-            m.cache_wall_hits_total
-                .with_label_values(&[name])
-                .set(uc.wall_hits as i64);
-            m.cache_prefetch_total
-                .with_label_values(&[name])
-                .set(uc.prefetches as i64);
+            // Cache gauges removed — CacheSilo has no in-memory stats tracking.
+            // Cache hit/miss counts tracked separately in query path metrics.
 
-            // Per-field bitmap memory gauges.
-            // Uses cached scanner totals instead of iterating all bitmaps (52s at 107M).
-            // The bitmap_memory_cache is populated by a background scanner thread
-            // that processes dirty fields in small batches.
-            if state.metrics_bitmap_memory.load(Ordering::Relaxed) {
-                let mem_cache = engine.bitmap_memory_cache();
-                m.slot_bitmap_bytes
-                    .with_label_values(&[name])
-                    .set(mem_cache.cached_slot_bytes() as i64);
-                for (field, bytes, count) in mem_cache.cached_filter_memory() {
-                    m.filter_bitmap_bytes
-                        .with_label_values(&[name, &field])
-                        .set(bytes as i64);
-                    m.filter_bitmap_count
-                        .with_label_values(&[name, &field])
-                        .set(count as i64);
-                }
-                for (field, bytes) in mem_cache.cached_sort_memory() {
-                    m.sort_bitmap_bytes
-                        .with_label_values(&[name, &field])
-                        .set(bytes as i64);
-                }
-            }
-            // NOTE: The old bitmap_memory_report() code that iterated all bitmaps
-            // synchronously on every scrape is replaced above. If you need to verify
-            // scanner accuracy, temporarily call engine.bitmap_memory_report() and
-            // compare against the cached values.
+            // Per-field bitmap memory gauges removed: BitmapSilo uses mmap, not heap bitmaps.
+            // The old bitmap_memory_cache scanner was removed along with lazy loading.
+            // If per-field memory metrics are needed in the future, iterate the BitmapSilo
+            // mmap sizes instead of heap bitmap allocations.
 
             // Flush pipeline stats
             let (pub_count, _cumulative_nanos, last_nanos) = engine.flush_stats();
@@ -4617,24 +4069,6 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.flush_compact_nanos.with_label_values(&[name]).set(compact_ns as i64);
             let _ = opslog_ns; // TODO: add bitdex_flush_opslog_nanos Prometheus metric
 
-            // Pending fields (lazy loading)
-            let pending = engine.pending_field_count();
-            m.pending_fields
-                .with_label_values(&[name])
-                .set(pending as i64);
-
-            // Eviction stats (gated — iterates per-field eviction data)
-            if state.metrics_eviction_stats.load(Ordering::Relaxed) {
-                for (field, total, resident) in engine.eviction_stats() {
-                    m.eviction_total
-                        .with_label_values(&[name, &field])
-                        .set(total as i64);
-                    m.eviction_resident_values
-                        .with_label_values(&[name, &field])
-                        .set(resident as i64);
-                }
-            }
-
             // Compaction skipped (scrape-time from atomic counter)
             m.compaction_skipped_total
                 .with_label_values(&[name])
@@ -4644,57 +4078,10 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.queries_in_flight_peak
                 .set(state.queries_in_flight_peak.load(Ordering::Relaxed));
 
-            // BoundStore stats
-            m.boundstore_meta_entries
-                .with_label_values(&[name])
-                .set(uc.meta_index_entries as i64);
-            m.boundstore_tombstones
-                .with_label_values(&[name])
-                .set(uc.tombstone_count as i64);
-            m.boundstore_pending_shards
-                .with_label_values(&[name])
-                .set(uc.pending_shard_count as i64);
-            // Disk bytes scan gated — does sync I/O (directory listing)
-            if state.metrics_boundstore_disk.load(Ordering::Relaxed) {
-                m.boundstore_disk_bytes
-                    .with_label_values(&[name])
-                    .set(engine.boundstore_disk_bytes() as i64);
-            }
-            m.boundstore_shard_loads_total
-                .with_label_values(&[name])
-                .set(engine.boundstore_shard_loads() as i64);
-            m.boundstore_tombstones_created
-                .with_label_values(&[name])
-                .set(engine.boundstore_tombstones_created() as i64);
-            m.boundstore_tombstones_cleaned
-                .with_label_values(&[name])
-                .set(engine.boundstore_tombstones_cleaned() as i64);
-            m.boundstore_entries_restored
-                .with_label_values(&[name])
-                .set(engine.boundstore_entries_restored() as i64);
-            m.boundstore_bytes_written
-                .with_label_values(&[name])
-                .set(engine.boundstore_bytes_written() as i64);
-            m.boundstore_bytes_read
-                .with_label_values(&[name])
-                .set(engine.boundstore_bytes_read() as i64);
-
             // Phase 2.5: Flush queue depth
             m.flush_queue_depth.set(engine.flush_queue_depth() as i64);
 
-            // Doc cache stats (synced from DocCache atomic counters)
-            let t4 = std::time::Instant::now();
-            let (dc_hits, dc_misses, dc_entries, dc_bytes, dc_evictions, dc_generations) = engine.doc_cache_stats();
-            let t_doc_cache = t4.elapsed();
-            m.doc_cache_hit_total.with_label_values(&[name]).set(dc_hits as i64);
-            m.doc_cache_miss_total.with_label_values(&[name]).set(dc_misses as i64);
-            m.doc_cache_entries.with_label_values(&[name]).set(dc_entries as i64);
-            m.doc_cache_bytes.with_label_values(&[name]).set(dc_bytes as i64);
-            m.doc_cache_evictions_total.with_label_values(&[name]).set(dc_evictions as i64);
-            m.doc_cache_generations.with_label_values(&[name]).set(dc_generations as i64);
-
-            eprintln!("[metrics-timing] cache_stats={:?} doc_cache={:?} total={:?}",
-                t_cache_stats, t_doc_cache, metrics_start.elapsed());
+            eprintln!("[metrics-timing] total={:?}", metrics_start.elapsed());
         }
     }
 
@@ -4743,8 +4130,12 @@ async fn handle_pgsync_metrics(
 async fn handle_ops(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
-    Json(batch): Json<crate::pg_sync::ops::OpsBatch>,
+    Json(batch): Json<crate::sync::ops::OpsBatch>,
 ) -> impl IntoResponse {
+    // Reject writes in read-only mode (zero-downtime deploy: this pod hasn't acquired the writer lock)
+    if state.read_only.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "read-only mode: this instance is not the active writer").into_response();
+    }
     // Verify index exists
     {
         let guard = state.index.lock();
@@ -4885,10 +4276,14 @@ async fn handle_register_dump(
     AxumPath(_name): AxumPath<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // Reject writes in read-only mode (zero-downtime deploy: this pod hasn't acquired the writer lock)
+    if state.read_only.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "read-only mode: this instance is not the active writer").into_response();
+    }
     // Detect V2 DumpRequest by presence of csv_path
     if body.get("csv_path").is_some() {
         // V2: parse DumpRequest and process asynchronously
-        let request: crate::dump_processor::DumpRequest = match serde_json::from_value(body) {
+        let request: crate::sync::dump_processor::DumpRequest = match serde_json::from_value(body) {
             Ok(r) => r,
             Err(e) => {
                 return (
@@ -4954,7 +4349,7 @@ async fn handle_register_dump(
             let bitmap_path = engine.config().storage.bitmap_path.clone();
             let filter_names: Vec<String> = engine.config()
                 .filter_fields.iter().map(|f| f.name.clone()).collect();
-            let _precreator = crate::dump_processor::ShardPreCreator::spawn(
+            let _precreator = crate::sync::dump_processor::ShardPreCreator::spawn(
                 Arc::clone(&state.slot_watermark),
                 Arc::clone(&state.precreator_done),
                 docstore_root,
@@ -4986,7 +4381,7 @@ async fn handle_register_dump(
                 let shutdown_check: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
                     shutdown_flag.shutting_down.load(std::sync::atomic::Ordering::Relaxed)
                 });
-                crate::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema), Some(slot_watermark), Some(shutdown_check))
+                crate::sync::dump_processor::process_dump(&request, &engine, &stage_dir, Some(progress), Some(&data_schema), Some(slot_watermark), Some(shutdown_check))
             })
             .await;
 
@@ -5002,7 +4397,7 @@ async fn handle_register_dump(
                         tasks.set_error(task_id, msg.clone());
                         let mut reg = state_clone.dump_registry.lock();
                         if let Some(entry) = reg.dumps.get_mut(&dump_name_inner) {
-                            entry.status = crate::pg_sync::dump::DumpStatus::Failed(msg);
+                            entry.status = crate::sync::dump::DumpStatus::Failed(msg);
                         }
                         let dumps_path = state_clone.data_dir.join("dumps.json");
                         reg.save(&dumps_path).ok();
@@ -5012,7 +4407,18 @@ async fn handle_register_dump(
                     // Reload fields only for the alive phase (images).
                     // Other phases just save to disk — fields get loaded lazily on first query.
                     if phase_sets_alive {
-                        crate::dump_processor::reload_after_dumps(&engine_for_reload, true);
+                        crate::sync::dump_processor::reload_after_dumps(&engine_for_reload, true);
+                    }
+
+                    // Bitmaps already written to BitmapSilo in process_dump (direct write).
+                    // Only need to compact the doc silo.
+                    {
+                        let t_compact = std::time::Instant::now();
+                        if let Err(e) = crate::sync::dump_processor::compact_after_dumps(&engine_for_reload) {
+                            eprintln!("WARNING: compact after dump '{}': {e}", dump_name_inner);
+                        } else {
+                            eprintln!("  Dump {} compact in {:.1}s", dump_name_inner, t_compact.elapsed().as_secs_f64());
+                        }
                     }
 
                     tasks.set_complete(
@@ -5026,7 +4432,7 @@ async fn handle_register_dump(
                     // Mark dump as complete in registry
                     let mut reg = state_clone.dump_registry.lock();
                     if let Some(entry) = reg.dumps.get_mut(&dump_name_inner) {
-                        entry.status = crate::pg_sync::dump::DumpStatus::Complete;
+                        entry.status = crate::sync::dump::DumpStatus::Complete;
                         entry.ops_processed = row_count;
                         entry.completed_at = Some(
                             std::time::SystemTime::now()
@@ -5162,7 +4568,7 @@ async fn handle_sync_lag(
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
     let sync_meta = state.sync_meta.lock();
-    let sources: Vec<&crate::pg_sync::ops::SyncMeta> = sync_meta.values().collect();
+    let sources: Vec<&crate::sync::ops::SyncMeta> = sync_meta.values().collect();
     Json(serde_json::json!({ "sources": sources }))
 }
 

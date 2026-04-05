@@ -1,0 +1,133 @@
+# BitDex UI Config — Civitai Images
+#
+# This file controls how the embedded web UI renders for this index.
+# Loaded from data_dir/indexes/{name}/ui-config.yaml and served at
+# GET /api/indexes/{name}/ui-config
+#
+# Without this file, the UI auto-generates controls from the engine config:
+#   - boolean fields → select (Any/Yes/No)
+#   - single_value with dictionary → select (populated from /dictionaries)
+#   - single_value without dictionary → number input
+#   - multi_value → comma-separated text input
+#   - sort fields → dropdown from engine config
+#   - time ranges → from config.time_buckets
+
+title: "BitDex — Civitai Images"
+
+# ── Filter Controls ──
+# Only fields that need overrides. Unlisted fields auto-generate.
+# Set control: hidden to suppress a field entirely.
+filters:
+  nsfwLevel:
+    control: checklist
+    label: "NSFW Level"
+    options:
+      - { value: 1, label: "PG" }
+      - { value: 2, label: "PG-13" }
+      - { value: 4, label: "Mature" }
+      - { value: 8, label: "X" }
+      - { value: 16, label: "XXX" }
+      - { value: 32, label: "Blocked" }
+    default: [1]
+    span: 2
+
+  tagIds: { label: "Tag IDs" }
+  modelVersionIds: { label: "Model Versions" }
+  toolIds: { label: "Tool IDs" }
+  techniqueIds: { label: "Technique IDs" }
+  userId: { label: "User ID" }
+  postId: { label: "Post ID" }
+
+  # Hide fields that exist in the engine but aren't useful as UI filters
+  isPublished: { control: hidden }
+  isRemix: { control: hidden }
+  blockedFor: { control: hidden }
+  remixOfId: { control: hidden }
+  postedToId: { control: hidden }
+  modelVersionIdsManual: { control: hidden }
+
+# ── Sort Controls ──
+sort:
+  default_field: reactionCount
+  default_direction: Desc
+  labels:
+    reactionCount: "Most Reactions"
+    sortAt: "Date"
+    commentCount: "Most Comments"
+    collectedCount: "Most Collected"
+    id: "ID"
+
+# ── Display ──
+display:
+  page_size: 100
+
+# ── Card Rendering ──
+# How result cards appear in the grid
+card:
+  image:
+    field: url
+    template: "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/{value}/width={width}/image.jpeg"
+    thumbnail_width: 400
+    full_width: 1200
+  badges:
+    - { field: baseModel, position: top-right }
+    - { fields: [width, height], position: top-left, template: "{width}×{height}" }
+  meta:
+    left: { field: reactionCount, prefix: "❤ ", format: number }
+    right: { field: _slot_id, prefix: "#" }
+
+# ── Detail Modal ──
+# What shows when you click a card. Fields render in order listed.
+# Any document fields NOT listed here appear at the bottom alphabetically.
+#
+# Display types:
+#   image      — render as <img>, supports width_field/height_field for dimensions
+#   link       — clickable <a> using link template
+#   code       — monospace font
+#   (default)  — auto-detect: dictionary fields show labels, others show raw value
+#
+# Format types:
+#   number     — locale-formatted (12345 → "12,345")
+#   timestamp  — unix epoch → human date
+#   count      — arrays: "[N items]" if large, comma list if small
+#   (default)  — raw value
+#
+# hide_if_empty: true — hide the row when the value is null, empty, or 0
+
+detail:
+  fields:
+    - field: url
+      label: "Image"
+      display: image
+      template: "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/{value}/width=800/image.jpeg"
+      width_field: width
+      height_field: height
+
+    - { field: baseModel, label: "Base Model" }
+    - { field: nsfwLevel, label: "NSFW Level" }
+    - { field: type, label: "Type" }
+    - { field: availability, label: "Availability", hide_if_empty: true }
+
+    - { field: userId, label: "User", link: "https://civitai.com/user/{value}" }
+    - { field: postId, label: "Post", link: "https://civitai.com/posts/{value}", hide_if_empty: true }
+
+    - { field: reactionCount, label: "Reactions", format: number }
+    - { field: commentCount, label: "Comments", format: number }
+    - { field: collectedCount, label: "Collected", format: number }
+
+    - { field: sortAt, label: "Sort Date", format: timestamp }
+    - { field: publishedAt, label: "Published", format: timestamp, hide_if_empty: true }
+    - { field: existedAt, label: "Created", format: timestamp, hide_if_empty: true }
+
+    - { field: tagIds, label: "Tags", format: count }
+    - { field: modelVersionIds, label: "Model Versions", format: count, hide_if_empty: true }
+    - { field: toolIds, label: "Tools", format: count, hide_if_empty: true }
+    - { field: techniqueIds, label: "Techniques", format: count, hide_if_empty: true }
+
+    - { field: hash, label: "Hash", display: code, hide_if_empty: true }
+
+    - { field: poi, label: "POI", hide_if_empty: true }
+    - { field: minor, label: "Minor", hide_if_empty: true }
+
+  # Fields to never show in the modal (even in the overflow section)
+  hidden: [width, height, index, acceptableMinor, needsReview, url]

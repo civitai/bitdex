@@ -16,16 +16,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use serde_json::Value as JsonValue;
-use crate::concurrent_engine::ConcurrentEngine;
+use crate::engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
-use crate::shard_store_doc::PackedValue;
-use crate::shard_store_doc::DocStoreV3;
-use crate::filter::{FilterFieldType, NULL_BITMAP_KEY};
-use crate::ingester::BitmapSink;
+use crate::silos::doc_format::PackedValue;
+use crate::silos::doc_silo_adapter::DocSiloAdapter;
+use crate::engine::filter::{FilterFieldType, NULL_BITMAP_KEY};
+use crate::sync::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
-use crate::pg_sync::op_dedup::dedup_ops;
-use crate::pg_sync::ops::{EntityOps, Op};
+use crate::sync::op_dedup::dedup_ops;
+use crate::sync::ops::{EntityOps, Op};
 use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 // ---------------------------------------------------------------------------
 // DocWriter — writes field values to docstore alongside bitmap mutations
@@ -38,29 +38,23 @@ use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 /// is safe because no concurrent writer can modify the same slot's doc between
 /// the read and write within a single WAL batch cycle.
 pub struct DocWriter {
-    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
+    docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
     field_dict: HashMap<String, u16>,
-    pending: Vec<(u32, u16, Vec<u8>)>,
+    /// Pending field updates grouped by slot: slot → [(field_name, FieldValue)]
+    pending: HashMap<u32, Vec<(String, crate::mutation::FieldValue)>>,
 }
 impl DocWriter {
     /// Create a DocWriter from the engine's docstore.
-    pub fn new(docstore: Arc<parking_lot::Mutex<DocStoreV3>>) -> Self {
+    pub fn new(docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>) -> Self {
         let field_dict = docstore.lock().field_dict_snapshot();
         Self {
             docstore,
             field_dict,
-            pending: Vec::new(),
+            pending: HashMap::new(),
         }
     }
     /// Write a single-value field update to the docstore.
-    /// Clamps negative integers to 0 — sort fields (reactionCount, etc.) are
-    /// unsigned in bitmaps; storing negatives in docstore would diverge from
-    /// the bitmap value and confuse shadow-mode comparisons.
     fn write_set(&mut self, slot: u32, field: &str, value: &JsonValue) {
-        let idx = match self.resolve_field(field) {
-            Some(idx) => idx,
-            None => return,
-        };
         // Clamp negative integers to 0 before docstore write
         let clamped;
         let effective = if let Some(n) = value.as_i64() {
@@ -73,62 +67,65 @@ impl DocWriter {
         } else {
             value
         };
-        if let Some(packed) = json_to_packed(effective) {
-            if let Ok(bytes) = rmp_serde::to_vec(&packed) {
-                self.pending.push((slot, idx, bytes));
-            }
+        if let Some(fv) = json_to_field_value(effective) {
+            self.pending.entry(slot).or_default().push((field.to_string(), fv));
         }
     }
     /// Write a multi-value add: read current list, append value, write back.
     fn write_add(&mut self, slot: u32, field: &str, value: &JsonValue) {
-        let idx = match self.resolve_field(field) {
-            Some(idx) => idx,
-            None => return,
-        };
         let add_val = match value.as_i64() {
             Some(v) => v,
             None => return,
         };
-        // Read current doc and get existing multi-value list
         let mut current = self.read_multi_value(slot, field);
         if !current.contains(&add_val) {
             current.push(add_val);
         }
-        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
-            self.pending.push((slot, idx, bytes));
-        }
+        let fv = crate::mutation::FieldValue::Multi(
+            current.into_iter().map(QValue::Integer).collect()
+        );
+        self.pending.entry(slot).or_default().push((field.to_string(), fv));
     }
     /// Write a multi-value remove: read current list, remove value, write back.
     fn write_remove(&mut self, slot: u32, field: &str, value: &JsonValue) {
-        let idx = match self.resolve_field(field) {
-            Some(idx) => idx,
-            None => return,
-        };
         let remove_val = match value.as_i64() {
             Some(v) => v,
             None => return,
         };
         let mut current = self.read_multi_value(slot, field);
         current.retain(|&v| v != remove_val);
-        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
-            self.pending.push((slot, idx, bytes));
-        }
+        let fv = crate::mutation::FieldValue::Multi(
+            current.into_iter().map(QValue::Integer).collect()
+        );
+        self.pending.entry(slot).or_default().push((field.to_string(), fv));
     }
-    /// Flush pending tuples to the docstore.
+    /// Flush pending updates to the docstore.
     pub fn flush(&mut self) {
         if self.pending.is_empty() {
             return;
         }
-        let tuples = std::mem::take(&mut self.pending);
-        if let Err(e) = self.docstore.lock().append_tuples_batch(tuples) {
-            tracing::warn!("DocWriter flush failed: {e}");
+        let pending = std::mem::take(&mut self.pending);
+        let mut ds = self.docstore.lock();
+        for (slot, field_updates) in pending {
+            // Read existing doc and merge
+            let mut doc = ds.get(slot).ok().flatten().unwrap_or_else(|| {
+                crate::silos::doc_format::StoredDoc {
+                    fields: HashMap::new(),
+                    schema_version: 0,
+                }
+            });
+            for (name, value) in field_updates {
+                doc.fields.insert(name, value);
+            }
+            if let Err(e) = ds.put(slot, &doc) {
+                tracing::warn!("DocWriter flush failed for slot {slot}: {e}");
+            }
         }
     }
     fn resolve_field(&mut self, field: &str) -> Option<u16> {
         if let Some(&idx) = self.field_dict.get(field) {
             return Some(idx);
         }
-        // Field not in snapshot — try to ensure it exists
         match self.docstore.lock().ensure_field_index(field) {
             Ok(idx) => {
                 self.field_dict.insert(field.to_string(), idx);
@@ -153,6 +150,34 @@ impl DocWriter {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+/// Convert a JSON value to a FieldValue.
+fn json_to_field_value(v: &JsonValue) -> Option<crate::mutation::FieldValue> {
+    match v {
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(crate::mutation::FieldValue::Single(QValue::Integer(i)))
+            } else if let Some(f) = n.as_f64() {
+                Some(crate::mutation::FieldValue::Single(QValue::Float(f)))
+            } else {
+                None
+            }
+        }
+        JsonValue::Bool(b) => Some(crate::mutation::FieldValue::Single(QValue::Bool(*b))),
+        JsonValue::String(s) => Some(crate::mutation::FieldValue::Single(QValue::String(s.clone()))),
+        JsonValue::Array(arr) => {
+            let vals: Vec<QValue> = arr.iter().filter_map(|v| {
+                match v {
+                    JsonValue::Number(n) => n.as_i64().map(QValue::Integer),
+                    JsonValue::String(s) => Some(QValue::String(s.clone())),
+                    _ => None,
+                }
+            }).collect();
+            if vals.is_empty() { None } else { Some(crate::mutation::FieldValue::Multi(vals)) }
+        }
+        _ => None,
     }
 }
 // ---------------------------------------------------------------------------
@@ -193,7 +218,7 @@ fn qvalue_to_json(v: &QValue) -> JsonValue {
 /// are treated as deletions and their old bitmap bits are cleared.
 pub fn document_to_ops(
     new_doc: &crate::mutation::Document,
-    old_doc: Option<&crate::shard_store_doc::StoredDoc>,
+    old_doc: Option<&crate::silos::doc_format::StoredDoc>,
     config: &crate::config::Config,
     is_patch: bool,
 ) -> Vec<Op> {
@@ -205,7 +230,7 @@ pub fn document_to_ops(
         let old_val = old_fields.get(field_name);
         // Check if this is a multi-value field (tagIds, toolIds, etc.)
         let is_multi_value = config.filter_fields.iter()
-            .any(|f| f.name == *field_name && f.field_type == crate::filter::FilterFieldType::MultiValue);
+            .any(|f| f.name == *field_name && f.field_type == crate::engine::filter::FilterFieldType::MultiValue);
         if is_multi_value {
             // Multi-value: compute add/remove sets
             let old_ints = extract_multi_ints(old_val);
@@ -258,7 +283,7 @@ pub fn document_to_ops(
             if !new_doc.fields.contains_key(field_name) {
                 // Field was removed
                 let is_multi_value = config.filter_fields.iter()
-                    .any(|f| f.name == *field_name && f.field_type == crate::filter::FilterFieldType::MultiValue);
+                    .any(|f| f.name == *field_name && f.field_type == crate::engine::filter::FilterFieldType::MultiValue);
                 if is_multi_value {
                     for v in extract_multi_ints(Some(old_val)) {
                         ops.push(Op::Remove {
@@ -318,25 +343,6 @@ fn json_to_packed(v: &JsonValue) -> Option<PackedValue> {
         }
         JsonValue::Object(_) => None,
     }
-}
-// ---------------------------------------------------------------------------
-// Enrichment types for dump processing
-// ---------------------------------------------------------------------------
-/// Post enrichment data, keyed by post_id.
-struct PostEnrichment {
-    published_at_secs: Option<i64>,
-    availability: String,
-    // postedToId is derived from Post.modelVersionId — not directly available
-    // We use post_id itself as postedToId (Post table's ID is the posted-to entity)
-}
-/// ModelVersion enrichment data, keyed by model_version_id.
-struct MvEnrichment {
-    base_model: Option<String>,
-    model_id: i64,
-}
-/// Model enrichment data, keyed by model_id.
-struct ModelEnrichment {
-    poi: bool,
 }
 /// Convert a serde_json::Value to a query::Value for bitmap key conversion.
 fn json_to_qvalue(v: &JsonValue) -> QValue {
@@ -404,7 +410,7 @@ pub struct FieldMeta {
     /// trigger deferred alive instead of immediate alive. ms_to_seconds indicates
     /// whether the field value is in milliseconds (needs /1000 for epoch comparison).
     deferred_alive_field: Option<(String, bool)>,
-    /// Field registry for Arc<str> interning (kept for future DocSink use)
+    /// Field registry for Arc<str> interning
     #[allow(dead_code)]
     registry: FieldRegistry,
 }
@@ -469,113 +475,6 @@ impl FieldMeta {
     fn has_computed_deps(&self, field: &str) -> bool {
         self.computed_deps.contains_key(field)
     }
-}
-// ---------------------------------------------------------------------------
-// Enrichment loading — small tables loaded into memory as HashMaps
-// ---------------------------------------------------------------------------
-/// Load posts.csv into a HashMap<post_id, PostEnrichment>.
-/// Posts: id, publishedAtSecs, availability, modelVersionId (4 columns CSV)
-fn load_posts_enrichment(csv_dir: &Path) -> HashMap<i64, PostEnrichment> {
-    use crate::pg_sync::copy_queries::parse_post_row;
-    use std::io::BufRead;
-    let path = csv_dir.join("posts.csv");
-    if !path.exists() {
-        eprintln!("  posts.csv not found, skipping post enrichment");
-        return HashMap::new();
-    }
-    let start = std::time::Instant::now();
-    let file = std::fs::File::open(&path).expect("open posts.csv");
-    let reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
-    let mut map = HashMap::new();
-    let mut count = 0u64;
-    for line in reader.split(b'\n') {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() { continue; }
-        if let Some(row) = parse_post_row(&line) {
-            map.insert(row.id, PostEnrichment {
-                published_at_secs: row.published_at_secs,
-                availability: row.availability,
-            });
-            count += 1;
-        }
-    }
-    eprintln!("  posts enrichment: {} rows in {:.1}s", count, start.elapsed().as_secs_f64());
-    map
-}
-/// Load model_versions.csv into a HashMap<mv_id, MvEnrichment>.
-/// ModelVersions: id, baseModel, modelId (3 columns CSV)
-fn load_mv_enrichment(csv_dir: &Path) -> HashMap<i64, MvEnrichment> {
-    use crate::pg_sync::copy_queries::parse_model_version_row;
-    use std::io::BufRead;
-    let path = csv_dir.join("model_versions.csv");
-    if !path.exists() {
-        eprintln!("  model_versions.csv not found, skipping MV enrichment");
-        return HashMap::new();
-    }
-    let start = std::time::Instant::now();
-    let file = std::fs::File::open(&path).expect("open model_versions.csv");
-    let reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
-    let mut map = HashMap::new();
-    let mut count = 0u64;
-    for line in reader.split(b'\n') {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() { continue; }
-        if let Some(row) = parse_model_version_row(&line) {
-            map.insert(row.id, MvEnrichment {
-                base_model: row.base_model,
-                model_id: row.model_id,
-            });
-            count += 1;
-        }
-    }
-    eprintln!("  model_versions enrichment: {} rows in {:.1}s", count, start.elapsed().as_secs_f64());
-    map
-}
-/// Load models.csv into a HashMap<model_id, ModelEnrichment>.
-/// Models: id, poi, type (3 columns CSV)
-fn load_model_enrichment(csv_dir: &Path) -> HashMap<i64, ModelEnrichment> {
-    use crate::pg_sync::copy_queries::parse_model_row;
-    use std::io::BufRead;
-    let path = csv_dir.join("models.csv");
-    if !path.exists() {
-        eprintln!("  models.csv not found, skipping model enrichment");
-        return HashMap::new();
-    }
-    let start = std::time::Instant::now();
-    let file = std::fs::File::open(&path).expect("open models.csv");
-    let reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
-    let mut map = HashMap::new();
-    let mut count = 0u64;
-    for line in reader.split(b'\n') {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() { continue; }
-        if let Some(row) = parse_model_row(&line) {
-            map.insert(row.id, ModelEnrichment {
-                poi: row.poi,
-            });
-            count += 1;
-        }
-    }
-    eprintln!("  models enrichment: {} rows in {:.1}s", count, start.elapsed().as_secs_f64());
-    map
-}
-/// Resolve a string value through the field dictionary, returning the u64 bitmap key.
-#[inline]
-fn resolve_string_dict(
-    dicts: &HashMap<String, FieldDictionary>,
-    field: &str,
-    value: &str,
-) -> Option<u64> {
-    dicts.get(field).map(|dict| dict.get_or_insert(value) as u64)
 }
 /// Set sort layers for a u32 value on a slot in a BitmapAccum.
 #[inline]
@@ -1204,74 +1103,9 @@ fn parse_query_values_array(s: &str) -> std::result::Result<Vec<QValue>, String>
     }
     Ok(values)
 }
-/// Process a batch of entity ops in dump mode using AccumSink.
-///
-/// This is the bulk-loading path that bypasses the coalescer entirely.
-/// Ops are accumulated directly into bitmaps (like the single-pass loader).
-///
-/// Returns (applied, skipped, errors).
-pub(crate) fn apply_ops_batch_dump(
-    accum: &mut crate::loader::BitmapAccum,
-    meta: &FieldMeta,
-    batch: &mut Vec<EntityOps>,
-    doc_writer: Option<&mut DocWriter>,
-) -> (usize, usize, usize) {
-    let mut sink = crate::ingester::AccumSink::new(accum);
-    apply_ops_batch(&mut sink, meta, batch, None, doc_writer)
-}
-/// Process all WAL entries in dump mode: reads WAL, accumulates bitmaps, applies to engine.
-///
-/// This is the high-level dump pipeline entry point. It:
-/// 1. Creates a BitmapAccum from the engine config
-/// 2. Reads all WAL entries, processes via AccumSink
-/// 3. Applies accumulated bitmaps directly to engine staging
-///
-/// Returns (total_applied, total_errors, elapsed_secs).
-pub fn process_wal_dump(
-    engine: &ConcurrentEngine,
-    wal_path: &Path,
-    batch_size: usize,
-) -> (u64, u64, f64) {
-    use crate::loader::BitmapAccum;
-    use crate::ops_wal::WalReader;
-    use std::time::Instant;
-    let config = engine.config();
-    let meta = FieldMeta::from_config(config);
-    let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
-    let sort_configs: Vec<(String, u8)> = config.sort_fields.iter().map(|s| (s.name.clone(), s.bits)).collect();
-    let mut accum = BitmapAccum::new(&filter_names, &sort_configs);
-    let start = Instant::now();
-    let mut reader = WalReader::from_legacy(wal_path, 0);
-    let mut total_applied = 0u64;
-    let mut total_errors = 0u64;
-    // Create DocWriter so computed sort fields (sortAt = GREATEST) are written
-    // to docstore during dump. Without this, only bitmaps get the computed value.
-    let mut doc_writer = DocWriter::new(engine.docstore_arc());
-    loop {
-        let batch = match reader.read_batch(batch_size) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("WAL read error in dump mode: {e}");
-                total_errors += 1;
-                break;
-            }
-        };
-        if batch.entries.is_empty() {
-            break;
-        }
-        let mut entries = batch.entries;
-        let (applied, _skipped, errors) = apply_ops_batch_dump(&mut accum, &meta, &mut entries, Some(&mut doc_writer));
-        total_applied += applied as u64;
-        total_errors += errors as u64;
-    }
-    // Flush any pending docstore writes
-    doc_writer.flush();
-    // Apply accumulated bitmaps to engine staging
-    engine.apply_accum(&accum);
-    (total_applied, total_errors, start.elapsed().as_secs_f64())
-}
-// V1 dump functions removed: apply_accum_to_staging, process_multi_value_csv,
-// process_csv_dump_direct. Use V2 ops pipeline (ops_poller + /ops endpoint) instead.
+// V1/V2 dump functions removed: apply_ops_batch_dump, process_wal_dump,
+// apply_accum_to_staging, process_multi_value_csv, process_csv_dump_direct.
+// Use V2 ops pipeline (ops_poller + /ops endpoint) instead.
 /// Persist cursor position to disk.
 pub fn save_cursor(path: &Path, cursor: u64) -> std::io::Result<()> {
     std::fs::write(path, cursor.to_string())
@@ -1288,8 +1122,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use crate::config::{Config, DataSchema, FieldMapping, FieldValueType, FilterFieldConfig, SortFieldConfig};
-    use crate::filter::FilterFieldType;
-    use crate::ingester::BitmapSink;
+    use crate::engine::filter::FilterFieldType;
+    use crate::sync::ingester::BitmapSink;
     /// A test sink that records all operations for verification.
     struct RecordingSink {
         filter_inserts: Vec<(String, u64, u32)>,
@@ -1747,12 +1581,12 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_doc_writer_write_set() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::silos::doc_format::PackedValue;
+        use crate::silos::doc_silo_adapter::DocSiloAdapter;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
-        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        let mut store = DocSiloAdapter::open(&docs_dir).unwrap();
         store.ensure_field_index("nsfwLevel").unwrap();
         store.ensure_field_index("userId").unwrap();
         let store = Arc::new(parking_lot::Mutex::new(store));
@@ -1773,20 +1607,19 @@ mod tests {
     }
     #[test]
     fn test_doc_writer_write_add_remove() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::silos::doc_silo_adapter::DocSiloAdapter;
 
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        let mut store = DocSiloAdapter::open_temp().unwrap();
         store.ensure_field_index("tagIds").unwrap();
         let store = Arc::new(parking_lot::Mutex::new(store));
-        // First write an initial value
+        // First write an initial doc with tagIds
         {
-            let _dw = DocWriter::new(Arc::clone(&store));
-            let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100, 200])).unwrap();
-            let idx = store.lock().field_index("tagIds").unwrap();
-            store.lock().append_tuple(5, idx, &initial).unwrap();
+            let mut fields = std::collections::HashMap::new();
+            fields.insert("tagIds".to_string(), crate::mutation::FieldValue::Multi(
+                vec![crate::query::Value::Integer(100), crate::query::Value::Integer(200)]
+            ));
+            let doc = crate::silos::doc_format::StoredDoc { fields, schema_version: 0 };
+            store.lock().put(5, &doc).unwrap();
         }
         // Add a value
         {
@@ -1828,15 +1661,13 @@ mod tests {
         }
     }
 
-    /// E2E: DocWriter writes scalar fields through DocStoreV3 and reads them back.
+    /// E2E: DocWriter writes scalar fields through DocSiloAdapter and reads them back.
     /// Validates the production ops pipeline docstore write path.
     #[test]
     fn test_docstore_v3_doc_writer_e2e_roundtrip() {
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::silos::doc_silo_adapter::DocSiloAdapter;
 
-        let dir = tempfile::tempdir().unwrap();
-        let docs_dir = dir.path().join("docs");
-        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        let mut store = DocSiloAdapter::open_temp().unwrap();
         store.ensure_field_index("sortAt").unwrap();
         store.ensure_field_index("nsfwLevel").unwrap();
 
@@ -1848,7 +1679,7 @@ mod tests {
         dw.write_set(100, "nsfwLevel", &json!(5));
         dw.flush();
 
-        // Read back via DocStoreV3 and verify
+        // Read back via DocSiloAdapter and verify
         let doc = store.lock().get(100).unwrap();
         assert!(doc.is_some(), "doc should exist after DocWriter writes");
         let doc = doc.unwrap();
@@ -2042,7 +1873,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_json_to_packed_types() {
-        use crate::shard_store_doc::PackedValue;
+        use crate::silos::doc_format::PackedValue;
 
         assert_eq!(json_to_packed(&json!(42)), Some(PackedValue::I(42)));
         assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
@@ -2081,7 +1912,7 @@ mod tests {
         // Old doc: nsfwLevel=8
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::silos::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // New doc: nsfwLevel=16
         let mut new_fields = std::collections::HashMap::new();
@@ -2101,7 +1932,7 @@ mod tests {
         let mut fields = std::collections::HashMap::new();
         fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
 
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: fields.clone(), schema_version: 0 };
+        let old_doc = crate::silos::doc_format::StoredDoc { fields: fields.clone(), schema_version: 0 };
         let new_doc = Document { fields };
         let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
         assert!(ops.is_empty(), "unchanged fields should produce no ops");
@@ -2114,7 +1945,7 @@ mod tests {
         // Old doc has nsfwLevel=8 AND reactionCount sort field
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::silos::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH only sends userId=42 (nsfwLevel absent from patch)
         let mut new_fields = std::collections::HashMap::new();
@@ -2180,7 +2011,7 @@ mod tests {
         }];
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
-            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::engine::filter::NULL_BITMAP_KEY),
             "null set on nullable field should insert NULL_BITMAP_KEY sentinel"
         );
     }
@@ -2200,11 +2031,11 @@ mod tests {
         }];
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
-            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::filter::NULL_BITMAP_KEY),
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::engine::filter::NULL_BITMAP_KEY),
             "non-null set on nullable field should insert value bitmap bit"
         );
         assert!(
-            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::engine::filter::NULL_BITMAP_KEY),
             "non-null set on nullable field should remove NULL_BITMAP_KEY sentinel"
         );
     }
@@ -2224,7 +2055,7 @@ mod tests {
         }];
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         assert!(
-            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::engine::filter::NULL_BITMAP_KEY),
             "null remove on nullable field should remove NULL_BITMAP_KEY sentinel"
         );
     }
@@ -2272,12 +2103,12 @@ mod tests {
         apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
         // Old value should be removed
         assert!(
-            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::filter::NULL_BITMAP_KEY),
+            sink.filter_removes.iter().any(|(f, v, _)| f == "blockedFor" && *v != crate::engine::filter::NULL_BITMAP_KEY),
             "old blockedFor value should be removed from bitmap"
         );
         // Null sentinel should be inserted
         assert!(
-            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::filter::NULL_BITMAP_KEY),
+            sink.filter_inserts.iter().any(|(f, v, _)| f == "blockedFor" && *v == crate::engine::filter::NULL_BITMAP_KEY),
             "null set should insert NULL_BITMAP_KEY sentinel"
         );
     }

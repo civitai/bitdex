@@ -1,14 +1,83 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use crossbeam_channel::Sender;
 use roaring::RoaringBitmap;
 use crate::config::{ComputedOp, ComputedField, Config};
-use crate::shard_store_doc::{DocStoreV3, StoredDoc};
+use crate::silos::doc_silo_adapter::DocSiloAdapter;
+use crate::silos::doc_format::StoredDoc;
 use crate::error::{BitdexError, Result};
-use crate::filter::FilterIndex;
+use crate::engine::filter::FilterIndex;
 use crate::query::Value;
-use crate::slot::SlotAllocator;
-use crate::sort::SortIndex;
-use crate::write_coalescer::MutationOp;
+use crate::engine::slot::SlotAllocator;
+use crate::engine::sort::SortIndex;
+
+/// A bitmap mutation request submitted by any thread.
+/// Field names use Arc<str> to avoid heap allocation per op.
+/// All variants carry `slots: Vec<u32>` for bulk grouping.
+#[derive(Debug, Clone)]
+pub enum MutationOp {
+    /// Set bits in a filter bitmap: field[value] |= slots
+    FilterInsert {
+        field: Arc<str>,
+        value: u64,
+        slots: Vec<u32>,
+    },
+    /// Clear bits in a filter bitmap: field[value] &= !slots
+    FilterRemove {
+        field: Arc<str>,
+        value: u64,
+        slots: Vec<u32>,
+    },
+    /// Set bits in a sort layer: field.bit_layers[bit_layer] |= slots
+    SortSet {
+        field: Arc<str>,
+        bit_layer: usize,
+        slots: Vec<u32>,
+    },
+    /// Clear bits in a sort layer: field.bit_layers[bit_layer] &= !slots
+    SortClear {
+        field: Arc<str>,
+        bit_layer: usize,
+        slots: Vec<u32>,
+    },
+    /// Set alive bits for slots
+    AliveInsert { slots: Vec<u32> },
+    /// Clear alive bits for slots
+    AliveRemove { slots: Vec<u32> },
+    /// Schedule deferred alive activation at a future unix timestamp.
+    /// The slot's filter/sort bitmaps are set immediately, but the alive bit
+    /// is deferred until `activate_at` (seconds since epoch).
+    DeferredAlive { slot: u32, activate_at: u64 },
+}
+
+/// Cloneable handle for submitting mutations from any thread.
+///
+/// Wraps a `crossbeam_channel::Sender<MutationOp>`. When the bounded channel is full,
+/// `send()` blocks, providing natural backpressure to writers.
+#[derive(Clone)]
+pub struct MutationSender {
+    pub(crate) tx: Sender<MutationOp>,
+}
+impl MutationSender {
+    /// Submit a single mutation. Blocks if the channel is full (backpressure).
+    pub fn send(&self, op: MutationOp) -> std::result::Result<(), crossbeam_channel::SendError<MutationOp>> {
+        self.tx.send(op)
+    }
+    /// Approximate number of pending ops in the channel (for metrics).
+    pub fn pending_count(&self) -> usize {
+        self.tx.len()
+    }
+    /// Submit multiple mutations. Blocks per-op if the channel is full.
+    pub fn send_batch(
+        &self,
+        ops: Vec<MutationOp>,
+    ) -> std::result::Result<(), crossbeam_channel::SendError<MutationOp>> {
+        for op in ops {
+            self.tx.send(op)?;
+        }
+        Ok(())
+    }
+}
 /// A document mutation payload for PUT operations.
 /// Contains field name -> value mappings for both filter and sort fields.
 /// Bitdex does NOT store these values; they are consumed to set bitmap bits.
@@ -520,7 +589,7 @@ pub fn value_to_bitmap_key(val: &Value) -> Option<u64> {
         Value::Integer(v) => {
             let key = *v as u64;
             // Guard: -1i64 as u64 == u64::MAX == NULL_BITMAP_KEY. Reject it.
-            if key == crate::filter::NULL_BITMAP_KEY { None } else { Some(key) }
+            if key == crate::engine::filter::NULL_BITMAP_KEY { None } else { Some(key) }
         }
         Value::Float(_) | Value::String(_) => None,
     }
@@ -645,7 +714,7 @@ pub struct MutationEngine<'a> {
     filters: &'a mut FilterIndex,
     sorts: &'a mut SortIndex,
     config: &'a Config,
-    docstore: &'a mut DocStoreV3,
+    docstore: &'a mut DocSiloAdapter,
 }
 impl<'a> MutationEngine<'a> {
     pub fn new(
@@ -653,7 +722,7 @@ impl<'a> MutationEngine<'a> {
         filters: &'a mut FilterIndex,
         sorts: &'a mut SortIndex,
         config: &'a Config,
-        docstore: &'a mut DocStoreV3,
+        docstore: &'a mut DocSiloAdapter,
     ) -> Self {
         Self {
             slots,
@@ -842,7 +911,7 @@ impl<'a> MutationEngine<'a> {
     }
     /// Clear filter bitmap bits for a field value.
     fn clear_filter_bits(
-        filter_field: &mut crate::filter::FilterField,
+        filter_field: &mut crate::engine::filter::FilterField,
         id: u32,
         val: &FieldValue,
     ) {
@@ -863,7 +932,7 @@ impl<'a> MutationEngine<'a> {
     }
     /// Set filter bitmap bits for a field value.
     fn set_filter_bits(
-        filter_field: &mut crate::filter::FilterField,
+        filter_field: &mut crate::engine::filter::FilterField,
         id: u32,
         val: &FieldValue,
     ) {
@@ -990,7 +1059,7 @@ impl<'a> MutationEngine<'a> {
 mod tests {
     use super::*;
     use crate::config::{FilterFieldConfig, SortFieldConfig};
-    use crate::filter::FilterFieldType;
+    use crate::engine::filter::FilterFieldType;
     fn test_config() -> Config {
         Config {
             filter_fields: vec![
@@ -1031,12 +1100,12 @@ mod tests {
         }
     }
 
-    fn setup() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocStoreV3) {
+    fn setup() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocSiloAdapter) {
         let config = test_config();
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let docstore = DocStoreV3::open_temp().unwrap();
+        let docstore = DocSiloAdapter::open_temp().unwrap();
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
@@ -1394,12 +1463,12 @@ mod tests {
         }
     }
 
-    fn setup_computed() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocStoreV3) {
+    fn setup_computed() -> (SlotAllocator, FilterIndex, SortIndex, Config, DocSiloAdapter) {
         let config = computed_config();
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let docstore = DocStoreV3::open_temp().unwrap();
+        let docstore = DocSiloAdapter::open_temp().unwrap();
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
@@ -1531,8 +1600,8 @@ mod tests {
     #[test]
     fn test_diff_document_partial_deferred_alive() {
         use crate::config::{DeferredAliveConfig, FilterFieldConfig, SortFieldConfig};
-        use crate::filter::FilterFieldType;
-        use crate::write_coalescer::MutationOp;
+        use crate::engine::filter::FilterFieldType;
+        use crate::mutation::MutationOp;
         let mut config = Config::default();
         config.filter_fields = vec![FilterFieldConfig {
             name: "nsfwLevel".into(),
@@ -1559,7 +1628,7 @@ mod tests {
         let mut old_fields = std::collections::HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(16)));
         old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(1000)));
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::silos::doc_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH changes publishedAt to far future (year 2050)
         let future_ts = 2524608000i64;

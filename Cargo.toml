@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "scratch"]
+members = [".", "scratch", "crates/datasilo"]
 default-members = ["."]
 
 [package]
@@ -19,10 +19,14 @@ pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "de
 simd = ["roaring/simd"]
 heap-prof = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 serde_yaml = ["dep:serde_yaml"]
+dump-timing = []
 
 [dependencies]
-# Bitmap indexes
-roaring = "0.10"
+# Bitmap indexes (frozen-mmap-support fork with FrozenRoaringBitmap)
+roaring = { path = "C:/Dev/Repos/open-source/roaring-rs/roaring" }
+
+# DataSilo — mmap'd key-value store (replaces ShardStore)
+datasilo = { path = "crates/datasilo" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +53,9 @@ tar = "0.4"
 
 # Parallel sort / iteration
 rayon = "1"
+
+# Fast hash map (AES-NI accelerated, drop-in HashMap/HashSet replacement)
+ahash = "0.8"
 
 # Allocator (handles concurrent allocation much better than Windows CRT)
 rpmalloc = "0.2"
@@ -145,6 +152,10 @@ harness = false
 
 [[bench]]
 name = "bound_store_bench"
+harness = false
+
+[[bench]]
+name = "parse_alloc_bench"
 harness = false
 
 [[bin]]

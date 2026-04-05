@@ -30,7 +30,7 @@ use rand::Rng;
 use rayon::prelude::*;
 use bitdex_v2::concurrent_engine::ConcurrentEngine;
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
-use bitdex_v2::filter::FilterFieldType;
+use bitdex_v2::engine::filter::FilterFieldType;
 use bitdex_v2::mutation::{Document, FieldValue};
 use bitdex_v2::query::{BitdexQuery, CursorPosition, FilterClause, SortClause, SortDirection, Value};
 // ---------------------------------------------------------------------------
@@ -572,7 +572,6 @@ fn load_records(path: &PathBuf, limit: usize, remap_ids: bool) -> Vec<(u32, Docu
 fn print_bitmap_memory(engine: &ConcurrentEngine) {
     let (slot_bytes, filter_bytes, sort_bytes, _cache_entries, cache_bytes, filter_details, sort_details) =
         engine.bitmap_memory_report();
-    let uc = engine.unified_cache_stats();
     let total = slot_bytes + filter_bytes + sort_bytes + cache_bytes;
     println!("--- Bitmap Memory (pure Bitdex, excludes docstore/allocator) ---");
     println!("  Slots (alive+clean):  {:>10}", format_bytes(slot_bytes as u64));
@@ -584,8 +583,7 @@ fn print_bitmap_memory(engine: &ConcurrentEngine) {
     for (name, bytes) in &sort_details {
         println!("    {:<22}              {:>10}", name, format_bytes(*bytes as u64));
     }
-    println!("  Unified cache:        {:>10}  ({} entries, {} hits, {} misses)",
-        format_bytes(uc.memory_bytes as u64), uc.entries, uc.hits, uc.misses);
+    println!("  Cache (on-disk silo):  {:>10}", format_bytes(cache_bytes as u64));
     println!("  ----------------------------------------");
     println!("  Total bitmap memory:  {:>10}", format_bytes(total as u64));
     println!();
@@ -695,356 +693,19 @@ fn main() {
             alive_count: 0,
         }],
     };
-    // -----------------------------------------------------------------------
-    // Phase 2: Insert benchmarks at varying batch sizes (ConcurrentEngine
-    //          for batched docstore writes even in single-threaded mode)
-    // -----------------------------------------------------------------------
+    // Phase 2: Insert benchmarks — removed. Direct put() on ConcurrentEngine is no longer
+    // supported; all writes flow through the ops pipeline. Use the dump processor instead.
     if should_run(&args.stages, "insert") {
-        println!("--- Phase 2: Insert Benchmarks (ConcurrentEngine, single caller) ---");
-        let batch_sizes: Vec<usize> = vec![1_000, 10_000, 100_000, 500_000, 1_000_000, total_records]
-            .into_iter()
-            .filter(|&s| s <= total_records)
-            .collect();
-        let batch_sizes: Vec<usize> = {
-            let mut v = batch_sizes;
-            v.dedup();
-            v
-        };
-        for &batch_size in &batch_sizes {
-            let label = if batch_size == total_records {
-                format!("all ({})", total_records)
-            } else {
-                format!("{}", batch_size)
-            };
-            let rss_before = rss_bytes();
-            let engine = create_concurrent_engine(civitai_config(), &bench_dir, &format!("insert_{}", batch_size), args.in_memory_docstore);
-            engine.enter_loading_mode();
-            let mut insert_time = Duration::ZERO;
-            let mut id_counter = 0u32;
-            let wall_start = Instant::now();
-            stream_records(&args.data_path, batch_size, |rec| {
-                let id = if args.remap_ids { let v = id_counter; id_counter += 1; v } else { rec.id as u32 };
-                let doc = rec.to_document();
-                let put_start = Instant::now();
-                engine.put(id, &doc).unwrap();
-                insert_time += put_start.elapsed();
-            });
-            engine.exit_loading_mode();
-            // Wait for flush thread to apply all batched mutations
-            wait_for_flush(&engine, batch_size as u64, 30_000);
-            let wall_elapsed = wall_start.elapsed();
-            let rss_after = rss_bytes();
-            let rss_delta = rss_after.saturating_sub(rss_before);
-            let insert_rate = batch_size as f64 / insert_time.as_secs_f64();
-            println!("  [{:>12}] put: {:.2}s  wall: {:.2}s  ({:.0}/s)  RSS: {} (+{})  alive: {}",
-                label,
-                insert_time.as_secs_f64(),
-                wall_elapsed.as_secs_f64(),
-                insert_rate,
-                format_bytes(rss_after),
-                format_bytes(rss_delta),
-                engine.alive_count()
-            );
-            report.insert_benchmarks.push(InsertBenchmark {
-                batch_label: label.clone(),
-                record_count: batch_size,
-                insert_ms: insert_time.as_secs_f64() * 1000.0,
-                wall_ms: wall_elapsed.as_secs_f64() * 1000.0,
-                insert_rate_per_sec: insert_rate,
-                rss_before_bytes: rss_before,
-                rss_after_bytes: rss_after,
-                rss_delta_bytes: rss_delta,
-            });
-            report.memory_snapshots.push(MemorySnapshot {
-                stage: format!("insert_{}", label),
-                rss_bytes: rss_after,
-                rss_human: format_bytes(rss_after),
-                alive_count: engine.alive_count(),
-            });
-        }
-        println!();
+        println!("--- Phase 2: Insert Benchmarks (removed — use dump processor for bulk loads) ---");
     }
+    // Phase 2b: Concurrent insert benchmark — removed (put() no longer exists).
     // -----------------------------------------------------------------------
-    // Phase 2b: Concurrent insert benchmark (ConcurrentEngine, N threads)
+    // Phase 2c: Bulk insert benchmark (removed — put_bulk_loading was deleted in Phase 6)
     // -----------------------------------------------------------------------
-    if args.threads > 1 && should_run(&args.stages, "concurrent") {
-        println!("--- Phase 2b: Concurrent Insert Benchmark ({} threads, ConcurrentEngine) ---", args.threads);
-        println!("  Loading records into memory for thread distribution...");
-        let load_start = Instant::now();
-        let records = load_records(&args.data_path, total_records, args.remap_ids);
-        let load_elapsed = load_start.elapsed();
-        println!("  Loaded {} records in {:.2}s (parse + to_document)", records.len(), load_elapsed.as_secs_f64());
-        let rss_before = rss_bytes();
-        // Use tunable config for concurrent benchmarks
-        let mut config = civitai_config();
-        // Auto-size channel capacity: ~50 ops per doc * batch_count to avoid backpressure
-        if args.channel_capacity > 0 {
-            config.channel_capacity = args.channel_capacity;
-        } else {
-            config.channel_capacity = (records.len() * 50).max(100_000).min(10_000_000);
-        }
-        config.flush_interval_us = args.flush_interval_us;
-        println!("  Channel capacity: {}, flush interval: {}us", config.channel_capacity, config.flush_interval_us);
-        let engine = Arc::new(create_concurrent_engine(config, &bench_dir, "concurrent_insert", args.in_memory_docstore));
-        engine.enter_loading_mode();
-        // Split records into chunks for each thread
-        let chunk_size = (records.len() + args.threads - 1) / args.threads;
-        let chunks: Vec<Vec<(u32, Document)>> = records
-            .chunks(chunk_size)
-            .map(|c| c.to_vec())
-            .collect();
-        let total_inserted = Arc::new(AtomicUsize::new(0));
-        println!("  Inserting with {} threads ({} records/thread avg, auto-coalesced)...", args.threads, chunk_size);
-        let wall_start = Instant::now();
-        let handles: Vec<_> = chunks
-            .into_iter()
-            .map(|chunk| {
-                let engine = Arc::clone(&engine);
-                let counter = Arc::clone(&total_inserted);
-                thread::spawn(move || {
-                    let mut count = 0usize;
-                    // Simple put() calls — docstore writes are auto-coalesced by the flush thread
-                    for (id, doc) in &chunk {
-                        engine.put(*id, doc).unwrap();
-                        count += 1;
-                    }
-                    counter.fetch_add(count, Ordering::Relaxed);
-                    count
-                })
-            })
-            .collect();
-        let mut per_thread_counts = Vec::new();
-        for h in handles {
-            per_thread_counts.push(h.join().unwrap());
-        }
-        let wall_elapsed = wall_start.elapsed();
-        let total_count = total_inserted.load(Ordering::Relaxed);
-        // Exit loading mode and wait for all mutations to flush
-        engine.exit_loading_mode();
-        println!("  Waiting for flush thread to catch up...");
-        wait_for_flush(&engine, total_count as u64, 30_000);
-        let alive = engine.alive_count();
-        let rss_after = rss_bytes();
-        let total_rate = total_count as f64 / wall_elapsed.as_secs_f64();
-        let per_thread_rate = total_rate / args.threads as f64;
-        println!("  Concurrent insert complete:");
-        println!("    Records:          {}", total_count);
-        println!("    Wall time:        {:.2}s", wall_elapsed.as_secs_f64());
-        println!("    Total throughput: {:.0} docs/s", total_rate);
-        println!("    Per-thread avg:   {:.0} docs/s", per_thread_rate);
-        println!("    Alive after:      {}", alive);
-        println!("    RSS: {} (delta: {})", format_bytes(rss_after), format_bytes(rss_after.saturating_sub(rss_before)));
-        for (i, count) in per_thread_counts.iter().enumerate() {
-            println!("    Thread {}: {} records", i, count);
-        }
-        println!();
-        report.concurrent_insert_benchmark = Some(ConcurrentInsertBenchmark {
-            threads: args.threads,
-            record_count: total_count,
-            wall_ms: wall_elapsed.as_secs_f64() * 1000.0,
-            total_docs_per_sec: total_rate,
-            per_thread_docs_per_sec: per_thread_rate,
-            alive_after: alive,
-            rss_before_bytes: rss_before,
-            rss_after_bytes: rss_after,
-        });
-        report.memory_snapshots.push(MemorySnapshot {
-            stage: format!("concurrent_insert_{}t", args.threads),
-            rss_bytes: rss_after,
-            rss_human: format_bytes(rss_after),
-            alive_count: alive,
-        });
-    }
-    // -----------------------------------------------------------------------
-    // Phase 2c: Bulk insert benchmark (put_bulk — parallel decompose + direct bitmap build)
-    // -----------------------------------------------------------------------
-    let mut bulk_engine: Option<ConcurrentEngine> = None;
+    let bulk_engine: Option<ConcurrentEngine> = None;
     if should_run(&args.stages, "bulk") {
-        println!("--- Phase 2c: Bulk Insert Benchmark (put_bulk, {} threads) ---", args.threads);
-        // Process in chunks to avoid OOM at large scales.
-        // Each chunk loads N records, calls put_bulk(), then frees the chunk.
-        let chunk_size = 5_000_000.min(total_records);
-        let rss_before = rss_bytes();
-        let engine = create_concurrent_engine(civitai_config(), &bench_dir, "bulk_insert", args.in_memory_docstore);
-        let wall_start = Instant::now();
-        let mut total_inserted: usize = 0;
-        let mut chunks_processed: usize = 0;
-        let mut id_counter: u32 = 0;
-        // Use loading mode: accumulate into a private staging InnerEngine
-        // without publishing intermediate snapshots. This avoids the
-        // Arc::make_mut deep-clone cascade that happens when the published
-        // snapshot shares Arc references with the staging copy.
-        let mut staging = engine.clone_staging();
-        // Pipelined bulk loading with parallel parsing:
-        //
-        // 1. Reader thread reads raw lines in small batches (read_batch_size)
-        //    and sends them to a channel (bounded, depth=2 for backpressure).
-        // 2. Main thread receives line batches, parallel-parses with rayon,
-        //    accumulates parsed docs into a bitmap chunk (chunk_size).
-        // 3. When bitmap chunk is full, calls put_bulk_loading.
-        //
-        // This overlaps I/O with parsing with bitmap building.
-        let remap_ids = args.remap_ids;
-        let num_threads = args.threads;
-        let read_batch_size = 500_000; // smaller read batches for better pipelining
-        // Pipelined bulk loading:
-        // 1. Reader thread reads large byte blocks (~300 MB each, ~500K lines)
-        //    and sends complete-line buffers as Vec<u8>.
-        // 2. Main thread receives byte buffers, splits lines + parses JSON in
-        //    parallel with rayon, accumulates docs into bitmap chunks.
-        // 3. When chunk is full, calls put_bulk_loading.
-        //
-        // All CPU work (newline splitting, JSON parsing, document construction)
-        // happens in rayon on the main thread, while the reader thread does
-        // pure I/O. This maximizes parallelism.
-        let data_path = args.data_path.clone();
-        let target_batch_bytes = read_batch_size * 600; // ~600 bytes/line × 500K lines ≈ 300 MB
-        let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
-        let reader_handle = thread::spawn(move || {
-            use std::io::Read;
-            let file = File::open(&data_path).expect("Failed to open data file");
-            let mut reader = BufReader::with_capacity(16 * 1024 * 1024, file);
-            let mut leftover = Vec::<u8>::new();
-            let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB read buffer
-            let mut accum = Vec::<u8>::with_capacity(target_batch_bytes + 4 * 1024 * 1024);
-            let mut blocks_sent: usize = 0;
-            loop {
-                let bytes_read = reader.read(&mut buf).unwrap_or(0);
-                if bytes_read == 0 {
-                    // EOF — flush leftover + accumulator
-                    if !leftover.is_empty() {
-                        accum.extend_from_slice(&leftover);
-                        leftover.clear();
-                    }
-                    if !accum.is_empty() {
-                        let _ = block_tx.send(accum);
-                        blocks_sent += 1;
-                    }
-                    break;
-                }
-                accum.extend_from_slice(&buf[..bytes_read]);
-                // Once we have enough data, find the last newline and split
-                if accum.len() >= target_batch_bytes {
-                    match memrchr_newline(&accum) {
-                        Some(last_nl) => {
-                            // Everything up to (including) last newline is a complete batch
-                            let remainder = accum[last_nl + 1..].to_vec();
-                            accum.truncate(last_nl + 1);
-                            // Prepend any leftover from previous split
-                            if !leftover.is_empty() {
-                                let mut combined = std::mem::take(&mut leftover);
-                                combined.append(&mut accum);
-                                accum = combined;
-                            }
-                            let batch = std::mem::replace(&mut accum, Vec::with_capacity(target_batch_bytes + 4 * 1024 * 1024));
-                            leftover = remainder;
-                            if block_tx.send(batch).is_err() { break; }
-                            blocks_sent += 1;
-                        }
-                        None => {
-                            // No newline in accumulated data — keep accumulating
-                        }
-                    }
-                }
-            }
-            blocks_sent
-        });
-        // Main thread: receive byte blocks, parallel-parse with rayon, accumulate into bitmap chunks
-        let mut doc_chunk: Vec<(u32, Document)> = Vec::with_capacity(chunk_size);
-        let mut parse_time_accum = Duration::ZERO;
-        while let Ok(raw_block) = block_rx.recv() {
-            let parse_start = Instant::now();
-            let base_id = id_counter;
-            let block_str = std::str::from_utf8(&raw_block).expect("NDJSON block is not valid UTF-8");
-            // Split into lines and parallel-parse with rayon
-            let lines: Vec<&str> = block_str.split('\n')
-                .map(|l| l.trim_end_matches('\r'))
-                .filter(|l| !l.is_empty())
-                .collect();
-            let line_count = lines.len() as u32;
-            let mut parsed: Vec<(u32, Document)> = lines.into_par_iter()
-                .enumerate()
-                .filter_map(|(i, line)| {
-                    serde_json::from_str::<NdjsonRecord>(line).ok().map(|rec| {
-                        let id = if remap_ids { base_id + i as u32 } else { rec.id as u32 };
-                        (id, rec.to_document())
-                    })
-                })
-                .collect();
-            let parse_elapsed = parse_start.elapsed();
-            parse_time_accum += parse_elapsed;
-            id_counter += line_count;
-            doc_chunk.append(&mut parsed);
-            // When we have enough docs, run bitmap building
-            if doc_chunk.len() >= chunk_size {
-                let bitmap_start = Instant::now();
-                let count = engine.put_bulk_loading(&mut staging, &doc_chunk, num_threads);
-                let bitmap_elapsed = bitmap_start.elapsed();
-                total_inserted += count;
-                chunks_processed += 1;
-                let alive = staging.slots.alive_count();
-                let rate = count as f64 / (parse_time_accum + bitmap_elapsed).as_secs_f64();
-                println!("  chunk {}: {} records  parse={:.2}s bitmap={:.2}s ({:.0}/s)  alive: {}",
-                    chunks_processed, count,
-                    parse_time_accum.as_secs_f64(), bitmap_elapsed.as_secs_f64(),
-                    rate, alive);
-                doc_chunk = Vec::with_capacity(chunk_size);
-                parse_time_accum = Duration::ZERO;
-            }
-        }
-        // Process remaining docs
-        if !doc_chunk.is_empty() {
-            let bitmap_start = Instant::now();
-            let count = engine.put_bulk_loading(&mut staging, &doc_chunk, num_threads);
-            let bitmap_elapsed = bitmap_start.elapsed();
-            total_inserted += count;
-            chunks_processed += 1;
-            let alive = staging.slots.alive_count();
-            let rate = count as f64 / (parse_time_accum + bitmap_elapsed).as_secs_f64();
-            println!("  chunk {}: {} records  parse={:.2}s bitmap={:.2}s ({:.0}/s)  alive: {}",
-                chunks_processed, count,
-                parse_time_accum.as_secs_f64(), bitmap_elapsed.as_secs_f64(),
-                rate, alive);
-        }
-        reader_handle.join().unwrap();
-        // Publish the fully-built staging as the live snapshot
-        let publish_start = Instant::now();
-        engine.publish_staging(staging);
-        let publish_elapsed = publish_start.elapsed();
-        println!("  publish: {:.2}s  alive: {}", publish_elapsed.as_secs_f64(), engine.alive_count());
-        let wall_elapsed = wall_start.elapsed();
-        let rss_after = rss_bytes();
-        let rss_delta = rss_after.saturating_sub(rss_before);
-        let bulk_rate = total_inserted as f64 / wall_elapsed.as_secs_f64();
-        println!("  [{:>12}] put_bulk total: {:.2}s  ({:.0}/s)  RSS: {} (+{})  alive: {}",
-            format!("{}", total_inserted),
-            wall_elapsed.as_secs_f64(),
-            bulk_rate,
-            format_bytes(rss_after),
-            format_bytes(rss_delta),
-            engine.alive_count()
-        );
-        // Bitmap memory breakdown
-        print_bitmap_memory(&engine);
-        report.insert_benchmarks.push(InsertBenchmark {
-            batch_label: format!("bulk_{}", total_inserted),
-            record_count: total_inserted,
-            insert_ms: wall_elapsed.as_secs_f64() * 1000.0,
-            wall_ms: wall_elapsed.as_secs_f64() * 1000.0,
-            insert_rate_per_sec: bulk_rate,
-            rss_before_bytes: rss_before,
-            rss_after_bytes: rss_after,
-            rss_delta_bytes: rss_delta,
-        });
-        report.memory_snapshots.push(MemorySnapshot {
-            stage: format!("bulk_insert_{}", total_inserted),
-            rss_bytes: rss_after,
-            rss_human: format_bytes(rss_after),
-            alive_count: engine.alive_count(),
-        });
-        println!();
-        // Keep the bulk engine for query/update phases if those stages are also requested
-        bulk_engine = Some(engine);
+        println!("--- Phase 2c: Bulk Insert Benchmark (removed — put_bulk_loading no longer exists) ---");
+        println!("  Use the loader (PUT /dumps) or put() in a loop for bulk inserts.");
     }
     // -----------------------------------------------------------------------
     // Phase 3: Build the full engine (streaming from file)
@@ -1064,21 +725,11 @@ fn main() {
         print_bitmap_memory(&be);
         be
     } else {
+        // Build engine from BitmapSilo snapshot if available, else create empty.
+        // Insert stages were removed — use the dump processor to populate data.
         println!("--- Building full engine for update/query benchmarks ---");
         let engine = create_concurrent_engine(civitai_config(), &bench_dir, "full_engine", args.in_memory_docstore);
-        engine.enter_loading_mode();
-        let build_start = Instant::now();
-        let mut build_counter = 0u32;
-        stream_records(&args.data_path, limit, |rec| {
-            let id = if args.remap_ids { let v = build_counter; build_counter += 1; v } else { rec.id as u32 };
-            let doc = rec.to_document();
-            engine.put(id, &doc).unwrap();
-        });
-        engine.exit_loading_mode();
-        wait_for_flush(&engine, total_records as u64, 60_000);
-        let build_elapsed = build_start.elapsed();
         let rss = rss_bytes();
-        println!("  Loaded {} records in {:.2}s", total_records, build_elapsed.as_secs_f64());
         println!("  Alive: {}", engine.alive_count());
         println!("  RSS: {}", format_bytes(rss));
         println!();
@@ -1088,10 +739,10 @@ fn main() {
             rss_human: format_bytes(rss),
             alive_count: engine.alive_count(),
         });
-        // Bitmap memory breakdown (excludes redb, allocator, channels — pure Bitdex)
         print_bitmap_memory(&engine);
         engine
     };
+
     // -----------------------------------------------------------------------
     // Phase: Persist — save engine bitmap snapshot to disk
     // -----------------------------------------------------------------------
@@ -1143,38 +794,9 @@ fn main() {
             print_bitmap_memory(&engine);
         }
     }
-    // -----------------------------------------------------------------------
-    // Phase 4: Update/re-insert benchmark (re-reads file from top)
-    // -----------------------------------------------------------------------
+    // Phase 4: Update/re-insert benchmark — removed (put() no longer exists).
     if should_run(&args.stages, "update") {
-        println!("--- Phase 4: Update (Increment reactionCount) Benchmark ---");
-        let update_count = total_records.min(100_000);
-        let mut update_time = Duration::ZERO;
-        let mut update_counter = 0u32;
-        let wall_start = Instant::now();
-        stream_records(&args.data_path, update_count, |rec| {
-            let id = if args.remap_ids { let v = update_counter; update_counter += 1; v } else { rec.id as u32 };
-            let mut doc = rec.to_document();
-            // Increment reactionCount by 1 to exercise sort layer XOR diff
-            if let Some(FieldValue::Single(Value::Integer(ref mut v))) = doc.fields.get_mut("reactionCount") {
-                *v += 1;
-            }
-            let put_start = Instant::now();
-            engine.put(id, &doc).unwrap();
-            update_time += put_start.elapsed();
-        });
-        wait_for_flush(&engine, total_records as u64, 30_000);
-        let wall_elapsed = wall_start.elapsed();
-        let update_rate = update_count as f64 / update_time.as_secs_f64();
-        println!("  Updated {} records in {:.2}s (wall: {:.2}s) ({:.0}/s)",
-            update_count, update_time.as_secs_f64(), wall_elapsed.as_secs_f64(), update_rate);
-        println!("  Alive after upsert: {} (should be unchanged)", engine.alive_count());
-        println!();
-        report.update_benchmark = Some(UpdateBenchmark {
-            record_count: update_count,
-            elapsed_ms: update_time.as_secs_f64() * 1000.0,
-            rate_per_sec: update_rate,
-        });
+        println!("--- Phase 4: Update Benchmark (removed — writes via ops pipeline only) ---");
     }
     // -----------------------------------------------------------------------
     // Phase 5: Query benchmarks
@@ -1455,7 +1077,7 @@ fn main() {
         // -------------------------------------------------------------------
         println!("--- Phase 5b: Unified Cache Effectiveness (cold vs warm) ---");
         println!();
-        engine.clear_unified_cache();
+        engine.clear_cache();
         struct BoundTestSpec {
             name: &'static str,
             filters: Vec<FilterClause>,
@@ -1525,12 +1147,7 @@ fn main() {
                 bt.name, cold_ms, warm_stats.p50_ms, warm_stats.p95_ms, speedup);
         }
         println!();
-        // Report unified cache stats after effectiveness test
-        {
-            let uc = engine.unified_cache_stats();
-            println!("  Unified cache after effectiveness test: {} entries, {} hits, {} misses",
-                uc.entries, uc.hits, uc.misses);
-        }
+        // Cache stats removed — CacheSilo has no in-memory stats tracking
         println!();
         // -------------------------------------------------------------------
         // Phase 5c: Deep Pagination Benchmark
@@ -1590,474 +1207,17 @@ fn main() {
             }
         }
         drop(snap);
-        // Report unified cache stats after pagination
-        {
-            let uc = engine.unified_cache_stats();
-            println!();
-            println!("  Unified cache after pagination: {} entries, {} hits, {} misses",
-                uc.entries, uc.hits, uc.misses);
-        }
+        // Cache stats removed — CacheSilo has no in-memory stats tracking
         println!();
     }
     // -----------------------------------------------------------------------
-    // Phase 6: Mixed read/write benchmark (ConcurrentEngine)
-    // Some threads insert while others query concurrently
-    // -----------------------------------------------------------------------
+    // Phase 6: Mixed read/write benchmark — removed (put() no longer exists).
     if args.threads > 1 && should_run(&args.stages, "mixed") {
-        println!("--- Phase 6: Mixed Read/Write Benchmark ({} threads, ConcurrentEngine) ---", args.threads);
-        // Use half threads for writing, half for reading (min 1 each)
-        let writer_threads = (args.threads / 2).max(1);
-        let reader_threads = (args.threads - writer_threads).max(1);
-        // Load a subset of records for writing (use 50K or total if less)
-        let mixed_record_count = total_records.min(50_000);
-        println!("  Loading {} records for mixed benchmark...", mixed_record_count);
-        let records = load_records(&args.data_path, mixed_record_count, args.remap_ids);
-        let engine = Arc::new(create_concurrent_engine(civitai_config(), &bench_dir, "mixed_rw", args.in_memory_docstore));
-        // Pre-populate with half the records so readers have data to query
-        let prepop_count = records.len() / 2;
-        for (id, doc) in &records[..prepop_count] {
-            engine.put(*id, doc).unwrap();
-        }
-        wait_for_flush(&engine, prepop_count as u64, 10_000);
-        println!("  Pre-populated {} records, alive: {}", prepop_count, engine.alive_count());
-        // The remaining records will be inserted by writers during the mixed phase
-        let write_records: Vec<(u32, Document)> = records[prepop_count..].to_vec();
-        let write_chunk_size = (write_records.len() + writer_threads - 1) / writer_threads;
-        let write_chunks: Vec<Vec<(u32, Document)>> = write_records
-            .chunks(write_chunk_size)
-            .map(|c| c.to_vec())
-            .collect();
-        let total_queries = Arc::new(AtomicUsize::new(0));
-        let total_writes = Arc::new(AtomicUsize::new(0));
-        let all_query_durations: Arc<parking_lot::Mutex<Vec<Duration>>> =
-            Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        println!("  Running mixed workload: {} writer threads, {} reader threads...", writer_threads, reader_threads);
-        let wall_start = Instant::now();
-        // Spawn writer threads
-        let mut handles = Vec::new();
-        for chunk in write_chunks {
-            let engine = Arc::clone(&engine);
-            let counter = Arc::clone(&total_writes);
-            let stop = Arc::clone(&stop_flag);
-            handles.push(thread::spawn(move || {
-                for (id, doc) in &chunk {
-                    if stop.load(Ordering::Relaxed) { break; }
-                    engine.put(*id, doc).unwrap();
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-            }));
-        }
-        // Spawn reader threads
-        for _ in 0..reader_threads {
-            let engine = Arc::clone(&engine);
-            let counter = Arc::clone(&total_queries);
-            let durations = Arc::clone(&all_query_durations);
-            let stop = Arc::clone(&stop_flag);
-            handles.push(thread::spawn(move || {
-                let query_patterns: Vec<Vec<FilterClause>> = vec![
-                    vec![FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
-                    vec![FilterClause::Eq("onSite".into(), Value::Bool(true))],
-                    vec![
-                        FilterClause::Eq("nsfwLevel".into(), Value::Integer(1)),
-                        FilterClause::Eq("onSite".into(), Value::Bool(true)),
-                    ],
-                    vec![FilterClause::Eq("hasMeta".into(), Value::Bool(true))],
-                ];
-                let sort = SortClause {
-                    field: "reactionCount".into(),
-                    direction: SortDirection::Desc,
-                };
-                let mut local_durations = Vec::new();
-                let mut idx = 0;
-                while !stop.load(Ordering::Relaxed) {
-                    let filters = &query_patterns[idx % query_patterns.len()];
-                    let start = Instant::now();
-                    let result = engine.query(filters, Some(&sort), 50);
-                    let elapsed = start.elapsed();
-                    let _ = result; // query may return partial results during concurrent writes
-                    local_durations.push(elapsed);
-                    counter.fetch_add(1, Ordering::Relaxed);
-                    idx += 1;
-                }
-                durations.lock().extend(local_durations);
-            }));
-        }
-        // Wait for writer threads to finish (they're bounded by the chunk size)
-        // Reader threads run until stop_flag is set
-        // Wait for the first N handles (writers)
-        for h in handles.drain(..writer_threads.min(handles.len())) {
-            h.join().unwrap();
-        }
-        // Signal readers to stop
-        stop_flag.store(true, Ordering::Relaxed);
-        for h in handles {
-            h.join().unwrap();
-        }
-        let wall_elapsed = wall_start.elapsed();
-        let writes = total_writes.load(Ordering::Relaxed);
-        let queries = total_queries.load(Ordering::Relaxed);
-        // Wait for flush
-        wait_for_flush(&engine, (prepop_count + writes) as u64, 10_000);
-        let insert_rate = writes as f64 / wall_elapsed.as_secs_f64();
-        let query_durations = Arc::try_unwrap(all_query_durations)
-            .unwrap_or_else(|arc| arc.lock().clone().into())
-            .into_inner();
-        println!("  Mixed workload complete:");
-        println!("    Wall time:     {:.2}s", wall_elapsed.as_secs_f64());
-        println!("    Records inserted: {} ({:.0} docs/s)", writes, insert_rate);
-        println!("    Queries executed: {}", queries);
-        println!("    Alive after:   {}", engine.alive_count());
-        if !query_durations.is_empty() {
-            let stats = compute_stats(query_durations);
-            println!("    Query latency under concurrent writes:");
-            println!("      p50: {:.3}ms  p95: {:.3}ms  p99: {:.3}ms  mean: {:.3}ms",
-                stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.mean_ms);
-            report.mixed_rw_benchmark = Some(MixedRwBenchmark {
-                writer_threads,
-                reader_threads,
-                records_inserted: writes,
-                queries_executed: queries,
-                wall_ms: wall_elapsed.as_secs_f64() * 1000.0,
-                insert_rate_per_sec: insert_rate,
-                query_stats: stats,
-            });
-        }
-        println!();
+        println!("--- Phase 6: Mixed Read/Write Benchmark (removed — writes via ops pipeline only) ---");
     }
-    // -----------------------------------------------------------------------
-    // Phase 7: Realistic contention benchmark
-    //
-    // Models production traffic: slow trickle of new docs, moderate update
-    // rate on reactionCount, and readers hammering at max rate with
-    // randomized filters/sorts so the cache doesn't just absorb everything.
-    // -----------------------------------------------------------------------
+    // Phase 7: Realistic contention benchmark — removed (put() no longer exists).
     if should_run(&args.stages, "contention") {
-        println!("--- Phase 7: Realistic Contention Benchmark ---");
-        let duration_secs = 15;
-        let insert_target_per_sec = 15.0_f64;  // slow trickle of new docs
-        let update_target_per_sec = 150.0_f64; // moderate reaction count churn
-        let reader_thread_count = 4.max(args.threads.saturating_sub(2));
-        println!("  Duration:       {}s", duration_secs);
-        println!("  Insert target:  {:.0}/s (new docs)", insert_target_per_sec);
-        println!("  Update target:  {:.0}/s (reactionCount++)", update_target_per_sec);
-        println!("  Reader threads: {}", reader_thread_count);
-        println!();
-        // Build a ConcurrentEngine loaded with the full dataset
-        println!("  Building ConcurrentEngine with full dataset...");
-        let mut conc_config = civitai_config();
-        if args.channel_capacity > 0 {
-            conc_config.channel_capacity = args.channel_capacity;
-        } else {
-            conc_config.channel_capacity = (total_records * 50).max(100_000).min(10_000_000);
-        }
-        conc_config.flush_interval_us = args.flush_interval_us;
-        let conc_engine = Arc::new(create_concurrent_engine(conc_config, &bench_dir, "contention", args.in_memory_docstore));
-        let load_start = Instant::now();
-        stream_records(&args.data_path, limit, |rec| {
-            let id = rec.id as u32;
-            let doc = rec.to_document();
-            conc_engine.put(id, &doc).unwrap();
-        });
-        // Wait for full flush before measuring
-        wait_for_flush(&conc_engine, total_records as u64, 60_000);
-        println!("  Loaded in {:.2}s, alive: {}", load_start.elapsed().as_secs_f64(), conc_engine.alive_count());
-        // Collect sample values for randomized queries
-        let mut sample_nsfw_levels: Vec<i64> = Vec::new();
-        let mut sample_user_ids: Vec<i64> = Vec::new();
-        let mut sample_tags: Vec<i64> = Vec::new();
-        let mut max_id: u32 = 0;
-        stream_records(&args.data_path, 100_000.min(total_records), |rec| {
-            if rec.id as u32 > max_id { max_id = rec.id as u32; }
-            if let Some(v) = rec.nsfw_level {
-                if sample_nsfw_levels.len() < 50 && !sample_nsfw_levels.contains(&(v as i64)) {
-                    sample_nsfw_levels.push(v as i64);
-                }
-            }
-            if let Some(v) = rec.user_id {
-                if sample_user_ids.len() < 200 {
-                    sample_user_ids.push(v as i64);
-                }
-            }
-            if let Some(ref tags) = rec.tag_ids {
-                for &t in tags {
-                    if sample_tags.len() < 500 {
-                        sample_tags.push(t as i64);
-                    }
-                }
-            }
-        });
-        if sample_nsfw_levels.is_empty() { sample_nsfw_levels.push(1); }
-        if sample_user_ids.is_empty() { sample_user_ids.push(1); }
-        if sample_tags.is_empty() { sample_tags.push(304); }
-        let sample_nsfw_levels = Arc::new(sample_nsfw_levels);
-        let sample_user_ids = Arc::new(sample_user_ids);
-        let sample_tags = Arc::new(sample_tags);
-        let sort_fields: Arc<Vec<&str>> = Arc::new(vec![
-            "reactionCount", "sortAt", "commentCount", "collectedCount", "id",
-        ]);
-        let alive_before = conc_engine.alive_count();
-        let rss_before = rss_bytes();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let insert_count = Arc::new(AtomicUsize::new(0));
-        let update_count = Arc::new(AtomicUsize::new(0));
-        let query_count = Arc::new(AtomicUsize::new(0));
-        let query_durations: Arc<parking_lot::Mutex<Vec<Duration>>> =
-            Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut handles = Vec::new();
-        // --- Insert thread: slow trickle of new documents ---
-        {
-            let engine = Arc::clone(&conc_engine);
-            let stop = Arc::clone(&stop);
-            let counter = Arc::clone(&insert_count);
-            let sleep_per_insert = Duration::from_secs_f64(1.0 / insert_target_per_sec);
-            let start_id = max_id + 1_000_000; // well beyond existing IDs
-            handles.push(thread::spawn(move || {
-                let mut rng = rand::thread_rng();
-                let mut id = start_id;
-                while !stop.load(Ordering::Relaxed) {
-                    let mut fields = HashMap::new();
-                    fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(
-                        *[1i64, 2, 4, 8, 16, 28, 32].get(rng.gen_range(0..7)).unwrap()
-                    )));
-                    fields.insert("onSite".into(), FieldValue::Single(Value::Bool(rng.gen_bool(0.7))));
-                    fields.insert("hasMeta".into(), FieldValue::Single(Value::Bool(rng.gen_bool(0.5))));
-                    fields.insert("reactionCount".into(), FieldValue::Single(Value::Integer(
-                        rng.gen_range(0..500)
-                    )));
-                    fields.insert("commentCount".into(), FieldValue::Single(Value::Integer(
-                        rng.gen_range(0..50)
-                    )));
-                    fields.insert("id".into(), FieldValue::Single(Value::Integer(id as i64)));
-                    let doc = Document { fields };
-                    let _ = engine.put(id, &doc);
-                    counter.fetch_add(1, Ordering::Relaxed);
-                    id += 1;
-                    thread::sleep(sleep_per_insert);
-                }
-            }));
-        }
-        // --- Update thread: moderate rate reactionCount increments ---
-        {
-            let engine = Arc::clone(&conc_engine);
-            let stop = Arc::clone(&stop);
-            let counter = Arc::clone(&update_count);
-            let sleep_per_update = Duration::from_secs_f64(1.0 / update_target_per_sec);
-            // Collect a set of existing IDs to update (re-read from file)
-            let mut update_ids: Vec<u32> = Vec::new();
-            stream_records(&args.data_path, 50_000.min(total_records), |rec| {
-                update_ids.push(rec.id as u32);
-            });
-            handles.push(thread::spawn(move || {
-                let mut rng = rand::thread_rng();
-                while !stop.load(Ordering::Relaxed) {
-                    let idx = rng.gen_range(0..update_ids.len());
-                    let id = update_ids[idx];
-                    // Minimal update: just bump reactionCount
-                    let mut fields = HashMap::new();
-                    fields.insert("reactionCount".into(), FieldValue::Single(Value::Integer(
-                        rng.gen_range(1..10_000)
-                    )));
-                    fields.insert("id".into(), FieldValue::Single(Value::Integer(id as i64)));
-                    let doc = Document { fields };
-                    let _ = engine.put(id, &doc);
-                    counter.fetch_add(1, Ordering::Relaxed);
-                    thread::sleep(sleep_per_update);
-                }
-            }));
-        }
-        // --- Reader threads: max rate, randomized queries ---
-        for _ in 0..reader_thread_count {
-            let engine = Arc::clone(&conc_engine);
-            let stop = Arc::clone(&stop);
-            let counter = Arc::clone(&query_count);
-            let durations = Arc::clone(&query_durations);
-            let nsfw = Arc::clone(&sample_nsfw_levels);
-            let users = Arc::clone(&sample_user_ids);
-            let tags = Arc::clone(&sample_tags);
-            let sorts = Arc::clone(&sort_fields);
-            handles.push(thread::spawn(move || {
-                let mut rng = rand::thread_rng();
-                let mut local_durations = Vec::with_capacity(100_000);
-                while !stop.load(Ordering::Relaxed) {
-                    // Build a randomized query
-                    let num_clauses = rng.gen_range(1..=3);
-                    let mut filters: Vec<FilterClause> = Vec::new();
-                    for _ in 0..num_clauses {
-                        let clause_type = rng.gen_range(0..9);
-                        let clause = match clause_type {
-                            0 => {
-                                // nsfwLevel eq
-                                let v = nsfw[rng.gen_range(0..nsfw.len())];
-                                FilterClause::Eq("nsfwLevel".into(), Value::Integer(v))
-                            }
-                            1 => {
-                                // tagId eq
-                                let v = tags[rng.gen_range(0..tags.len())];
-                                FilterClause::Eq("tagIds".into(), Value::Integer(v))
-                            }
-                            2 => {
-                                // userId eq
-                                let v = users[rng.gen_range(0..users.len())];
-                                FilterClause::Eq("userId".into(), Value::Integer(v))
-                            }
-                            3 => {
-                                // boolean filters
-                                let field = match rng.gen_range(0..3) {
-                                    0 => "onSite",
-                                    1 => "hasMeta",
-                                    _ => "minor",
-                                };
-                                FilterClause::Eq(field.into(), Value::Bool(rng.gen_bool(0.5)))
-                            }
-                            4 => {
-                                // IN on nsfwLevel (2-4 random values)
-                                let count = rng.gen_range(2..=4);
-                                let vals: Vec<Value> = (0..count)
-                                    .map(|_| Value::Integer(nsfw[rng.gen_range(0..nsfw.len())]))
-                                    .collect();
-                                FilterClause::In("nsfwLevel".into(), vals)
-                            }
-                            5 => {
-                                // NOT eq on nsfwLevel
-                                let v = nsfw[rng.gen_range(0..nsfw.len())];
-                                FilterClause::NotEq("nsfwLevel".into(), Value::Integer(v))
-                            }
-                            6 => {
-                                // Or: nsfwLevel IN or userId eq (mirrors Civitai shadow queries)
-                                let count = rng.gen_range(2..=4);
-                                let nsfw_vals: Vec<Value> = (0..count)
-                                    .map(|_| Value::Integer(nsfw[rng.gen_range(0..nsfw.len())]))
-                                    .collect();
-                                let uid = users[rng.gen_range(0..users.len())];
-                                FilterClause::Or(vec![
-                                    FilterClause::In("nsfwLevel".into(), nsfw_vals),
-                                    FilterClause::Eq("userId".into(), Value::Integer(uid)),
-                                ])
-                            }
-                            7 => {
-                                // Not(And(nsfwLevel IN, boolean)) — the pattern that was buggy
-                                let count = rng.gen_range(2..=3);
-                                let nsfw_vals: Vec<Value> = (0..count)
-                                    .map(|_| Value::Integer(nsfw[rng.gen_range(0..nsfw.len())]))
-                                    .collect();
-                                let field = match rng.gen_range(0..2) {
-                                    0 => "onSite",
-                                    _ => "hasMeta",
-                                };
-                                FilterClause::Not(Box::new(FilterClause::And(vec![
-                                    FilterClause::In("nsfwLevel".into(), nsfw_vals),
-                                    FilterClause::Eq(field.into(), Value::Bool(rng.gen_bool(0.5))),
-                                ])))
-                            }
-                            _ => {
-                                // And(boolean, boolean) — simple compound
-                                FilterClause::And(vec![
-                                    FilterClause::Eq("onSite".into(), Value::Bool(rng.gen_bool(0.7))),
-                                    FilterClause::Eq("hasMeta".into(), Value::Bool(rng.gen_bool(0.5))),
-                                ])
-                            }
-                        };
-                        filters.push(clause);
-                    }
-                    // Random sort
-                    let sort_field = sorts[rng.gen_range(0..sorts.len())];
-                    let direction = if rng.gen_bool(0.5) {
-                        SortDirection::Desc
-                    } else {
-                        SortDirection::Asc
-                    };
-                    let sort = SortClause {
-                        field: sort_field.to_string(),
-                        direction,
-                    };
-                    let limit = *[20, 50, 100].get(rng.gen_range(0..3)).unwrap();
-                    let start = Instant::now();
-                    let _ = engine.query(&filters, Some(&sort), limit);
-                    local_durations.push(start.elapsed());
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                durations.lock().extend(local_durations);
-            }));
-        }
-        // Let it run for the configured duration
-        println!("  Running for {}s...", duration_secs);
-        let bench_start = Instant::now();
-        // Print progress every 3 seconds
-        for tick in 1..=(duration_secs / 3) {
-            thread::sleep(Duration::from_secs(3));
-            let elapsed = bench_start.elapsed().as_secs();
-            println!("    [{:>2}s] inserts: {}  updates: {}  queries: {}",
-                elapsed,
-                insert_count.load(Ordering::Relaxed),
-                update_count.load(Ordering::Relaxed),
-                query_count.load(Ordering::Relaxed),
-            );
-            let _ = tick;
-        }
-        // Sleep remaining time if any
-        let remaining = Duration::from_secs(duration_secs as u64).saturating_sub(bench_start.elapsed());
-        if !remaining.is_zero() {
-            thread::sleep(remaining);
-        }
-        // Signal stop
-        stop.store(true, Ordering::Relaxed);
-        for h in handles {
-            h.join().unwrap();
-        }
-        let wall_elapsed = bench_start.elapsed();
-        let total_inserts = insert_count.load(Ordering::Relaxed);
-        let total_updates = update_count.load(Ordering::Relaxed);
-        let total_queries = query_count.load(Ordering::Relaxed);
-        // Wait for flush to settle
-        thread::sleep(Duration::from_millis(200));
-        let alive_after = conc_engine.alive_count();
-        let rss_after = rss_bytes();
-        let all_durations = Arc::try_unwrap(query_durations)
-            .unwrap_or_else(|arc| arc.lock().clone().into())
-            .into_inner();
-        println!();
-        println!("  Realistic contention results:");
-        println!("    Wall time:       {:.2}s", wall_elapsed.as_secs_f64());
-        println!("    Inserts:         {} ({:.1}/s)", total_inserts,
-            total_inserts as f64 / wall_elapsed.as_secs_f64());
-        println!("    Updates:         {} ({:.1}/s)", total_updates,
-            total_updates as f64 / wall_elapsed.as_secs_f64());
-        println!("    Queries:         {} ({:.0}/s)", total_queries,
-            total_queries as f64 / wall_elapsed.as_secs_f64());
-        println!("    Alive:           {} -> {} (+{})", alive_before, alive_after,
-            alive_after - alive_before);
-        println!("    RSS:             {} -> {} (delta: {})",
-            format_bytes(rss_before), format_bytes(rss_after),
-            format_bytes(rss_after.saturating_sub(rss_before)));
-        if !all_durations.is_empty() {
-            let stats = compute_stats(all_durations);
-            println!("    Query latency under contention:");
-            println!("      p50: {:.3}ms  p95: {:.3}ms  p99: {:.3}ms  max: {:.3}ms  mean: {:.3}ms",
-                stats.p50_ms, stats.p95_ms, stats.p99_ms, stats.max_ms, stats.mean_ms);
-            report.contention_benchmark = Some(ContentionBenchmark {
-                duration_secs: wall_elapsed.as_secs_f64(),
-                reader_threads: reader_thread_count,
-                total_queries,
-                queries_per_sec: total_queries as f64 / wall_elapsed.as_secs_f64(),
-                query_stats: stats,
-                total_inserts,
-                insert_rate_per_sec: total_inserts as f64 / wall_elapsed.as_secs_f64(),
-                total_updates,
-                update_rate_per_sec: total_updates as f64 / wall_elapsed.as_secs_f64(),
-                alive_before,
-                alive_after,
-                rss_before_bytes: rss_before,
-                rss_after_bytes: rss_after,
-            });
-        }
-        report.memory_snapshots.push(MemorySnapshot {
-            stage: "contention".into(),
-            rss_bytes: rss_after,
-            rss_human: format_bytes(rss_after),
-            alive_count: alive_after,
-        });
-        println!();
+        println!("--- Phase 7: Contention Benchmark (removed — writes via ops pipeline only) ---");
     }
     // -----------------------------------------------------------------------
     // Final memory snapshot

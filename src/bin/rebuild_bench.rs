@@ -17,7 +17,8 @@ use std::time::Instant;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
-use bitdex_v2::shard_store_doc::{DocStoreV3, PackedValue, StoredDoc};
+use bitdex_v2::silos::doc_format::{PackedValue, StoredDoc};
+use bitdex_v2::silos::doc_silo_adapter::DocSiloAdapter;
 use bitdex_v2::mutation::{value_to_bitmap_key, value_to_sort_u32};
 use bitdex_v2::query::Value;
 
@@ -117,7 +118,7 @@ fn bench_raw_io(docs_path: &Path, num_shards: u32) -> (f64, u64, u64) {
             Ok(data) => {
                 bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
                 // Decompress to measure decompression throughput
-                // ShardStore format — count bytes as decompressed (no separate compression layer)
+                // BitmapSilo format — count bytes as decompressed (no separate compression layer)
                 bytes_decompressed.fetch_add(data.len() as u64, Ordering::Relaxed);
                 shards_read.fetch_add(1, Ordering::Relaxed);
             }
@@ -145,7 +146,7 @@ fn bench_decode(docs_path: &Path, num_shards: u32) -> (f64, u64) {
     eprintln!("\n=== Stage 2: Read + Decode (→ StoredDoc) ===");
     let docs_decoded = AtomicU64::new(0);
 
-    let reader = DocStoreV3::open(docs_path).expect("open docstore");
+    let reader = DocSiloAdapter::open(docs_path).expect("open docstore");
 
     let t0 = Instant::now();
 
@@ -181,7 +182,7 @@ fn bench_full_rebuild(
     eprintln!("  Filter fields: {:?}", filter_names);
     eprintln!("  Sort fields:   {:?}", sort_names);
 
-    let reader = DocStoreV3::open(docs_path).expect("open docstore");
+    let reader = DocSiloAdapter::open(docs_path).expect("open docstore");
 
     type FilterMap = HashMap<(usize, u64), RoaringBitmap>;
     struct Accum {
@@ -311,7 +312,7 @@ fn bench_single_field_rebuild(
     eprintln!("\n=== Stage 4: Single Field Rebuild — {} ({}) ===",
         field_name, if is_sort { "sort" } else { "filter" });
 
-    let reader = DocStoreV3::open(docs_path).expect("open docstore");
+    let reader = DocSiloAdapter::open(docs_path).expect("open docstore");
     let docs_processed = AtomicU64::new(0);
 
     let chunk_size = 500u32;
@@ -454,7 +455,7 @@ fn bench_bitmap_only(
 ) -> (f64, f64, u64) {
     eprintln!("\n=== Stage 5: Split-Phase (pre-read → bitmap-only) ===");
 
-    let reader = DocStoreV3::open(docs_path).expect("open docstore");
+    let reader = DocSiloAdapter::open(docs_path).expect("open docstore");
 
     // Phase A: Read all shards into memory (decoded StoredDocs)
     let t_read = Instant::now();
@@ -576,7 +577,7 @@ fn bench_selective_decode(
     eprintln!("\n=== Stage 6: Selective Decode (skip full StoredDoc) ===");
     eprintln!("  Target fields: {:?}", target_fields);
 
-    let reader = DocStoreV3::open(docs_path).expect("open docstore");
+    let reader = DocSiloAdapter::open(docs_path).expect("open docstore");
     let field_to_idx = &reader;
 
     // We'll read raw shard bytes and decode only needed fields
@@ -633,7 +634,7 @@ fn bench_packed_rebuild(
 ) -> (f64, u64) {
     eprintln!("\n=== Stage 7: Packed Rebuild (skip StoredDoc) ===");
 
-    let reader = DocStoreV3::open(docs_path).expect("open docstore");
+    let reader = DocSiloAdapter::open(docs_path).expect("open docstore");
 
     // Build u16 index → (role, position) lookup table from field dictionary
     // role: 0 = filter, 1 = sort, 2 = both
@@ -764,208 +765,16 @@ fn bench_packed_rebuild(
     (elapsed, merged.count)
 }
 
-/// Full-scale build: creates a ConcurrentEngine, calls build_all_from_docstore,
-/// monitors memory throughout. This is the "boot in build-index mode" scenario.
-fn run_full_build(data_dir: &Path, index_name: &str) {
-    use bitdex_v2::concurrent_engine::{ConcurrentEngine, get_rss_bytes};
-
-    let index_dir = data_dir.join("indexes").join(index_name);
-    let config_path = bitdex_v2::server::find_index_config(&index_dir)
-        .unwrap_or_else(|| { eprintln!("No config found in {}", index_dir.display()); std::process::exit(1); });
-    let docs_path = index_dir.join("docs");
-
-    eprintln!("\n=== FULL BUILD: build_all_from_docstore ===");
-    eprintln!("Index: {}", index_name);
-    eprintln!("Docs:  {}", docs_path.display());
-
-    let index_def = bitdex_v2::server::IndexDefinition::from_file(&config_path)
-        .unwrap_or_else(|e| { eprintln!("Failed to parse config: {e}"); std::process::exit(1); });
-    let mut config = index_def.config;
-
-    // Set bitmap_path so save_and_unload() can persist to disk
-    let bitmap_path = index_dir.join("bitmaps");
-    config.storage.bitmap_path = Some(bitmap_path.clone());
-    eprintln!("Bitmaps: {}", bitmap_path.display());
-
-    let rss_start = get_rss_bytes();
-    eprintln!("RSS before engine: {:.2} MB", rss_start as f64 / 1e6);
-
-    // Create engine with docstore path + bitmap path for persistence
-    let engine = ConcurrentEngine::new_with_path(config, &docs_path)
-        .expect("create engine");
-
-    let rss_after_engine = get_rss_bytes();
-    eprintln!("RSS after engine init: {:.2} MB", rss_after_engine as f64 / 1e6);
-
-    let progress = std::sync::Arc::new(AtomicU64::new(0));
-
-    // Memory monitoring callback — prints every 5 seconds
-    let memory_cb: Box<dyn Fn(u64, f64, u64) + Send + Sync> = Box::new(|docs, elapsed, rss| {
-        if elapsed > 0.0 {
-            eprintln!("  [{:>6.1}s] {:>10} docs ({:>7.0} docs/s)  RSS={:.2} GB",
-                elapsed, docs, docs as f64 / elapsed, rss as f64 / 1e9);
-        }
-    });
-
-    eprintln!("Starting build...");
-    let t0 = Instant::now();
-
-    let (total_docs, elapsed) = engine.build_all_from_docstore(
-        progress.clone(),
-        Some(memory_cb),
-    ).expect("build_all_from_docstore");
-
-    let rss_after_build = get_rss_bytes();
-    let bitmap_rss = rss_after_build.saturating_sub(rss_start);
-
-    eprintln!("\n--- BUILD PHASE COMPLETE ---");
-    eprintln!("  Docs:              {}", total_docs);
-    eprintln!("  Time:              {:.1}s ({:.1} min)", elapsed, elapsed / 60.0);
-    eprintln!("  Throughput:        {:.0} docs/s", total_docs as f64 / elapsed);
-    eprintln!("  RSS after build:   {:.2} GB", rss_after_build as f64 / 1e9);
-    eprintln!("  RSS delta (bitmaps): {:.2} GB", bitmap_rss as f64 / 1e9);
-
-    // Phase 2: Persist bitmaps to disk and unload from memory
-    eprintln!("\n--- PERSIST PHASE ---");
-    eprintln!("Saving bitmaps to {} ...", bitmap_path.display());
-    let persist_t0 = Instant::now();
-
-    engine.save_and_unload()
-        .expect("save_and_unload");
-
-    let persist_elapsed = persist_t0.elapsed().as_secs_f64();
-    let rss_after_persist = get_rss_bytes();
-
-    eprintln!("  Persist time:      {:.1}s", persist_elapsed);
-    eprintln!("  RSS after unload:  {:.2} GB", rss_after_persist as f64 / 1e9);
-    eprintln!("  Memory freed:      {:.2} GB", (rss_after_build.saturating_sub(rss_after_persist)) as f64 / 1e9);
-
-    let total_time = elapsed + persist_elapsed;
-
-    eprintln!("\n========================================");
-    eprintln!("  FULL BUILD + PERSIST COMPLETE");
-    eprintln!("========================================");
-    eprintln!("  Docs:              {}", total_docs);
-    eprintln!("  Build time:        {:.1}s ({:.1} min)", elapsed, elapsed / 60.0);
-    eprintln!("  Persist time:      {:.1}s", persist_elapsed);
-    eprintln!("  Total time:        {:.1}s ({:.1} min)", total_time, total_time / 60.0);
-    eprintln!("  Throughput (e2e):  {:.0} docs/s", total_docs as f64 / total_time);
-    eprintln!("  RSS start:         {:.2} GB", rss_start as f64 / 1e9);
-    eprintln!("  RSS peak (build):  {:.2} GB", rss_after_build as f64 / 1e9);
-    eprintln!("  RSS final (unloaded): {:.2} GB", rss_after_persist as f64 / 1e9);
-    eprintln!("  Bytes/doc (build): {:.0}", bitmap_rss as f64 / total_docs as f64);
+/// Full-scale build: not yet implemented — DataSilo bulk scan API pending.
+fn run_full_build(_data_dir: &Path, _index_name: &str) {
+    eprintln!("ERROR: build_all_from_docstore is not yet implemented (DataSilo bulk scan API pending).");
+    std::process::exit(1);
 }
 
-/// --add-field mode: build a full engine from docstore, then hot-add a single field.
-/// This benchmarks the add_fields_from_docstore() path that will back the HTTP endpoint.
-///
-/// Strategy: load the config, remove the target field, build the engine without it,
-/// then add it back via add_fields_from_docstore and measure the cost.
-fn run_add_field(data_dir: &Path, index_name: &str, field_name: &str) {
-    use bitdex_v2::concurrent_engine::{ConcurrentEngine, get_rss_bytes};
-    use bitdex_v2::config::{FilterFieldConfig, SortFieldConfig};
-
-    let index_dir = data_dir.join("indexes").join(index_name);
-    let config_path = index_dir.join("config.json");
-    let docs_path = index_dir.join("docs");
-
-    eprintln!("\n=== ADD-FIELD BENCHMARK: '{}' ===", field_name);
-    eprintln!("Index: {}", index_name);
-
-    #[derive(serde::Deserialize)]
-    struct IndexDef {
-        config: bitdex_v2::config::Config,
-    }
-    let config_json = std::fs::read_to_string(&config_path).expect("read config.json");
-    let index_def: IndexDef = serde_json::from_str(&config_json).expect("parse config.json");
-    let mut config = index_def.config;
-
-    // Find and remove the target field from config (so we can add it back)
-    let removed_filter: Option<FilterFieldConfig> = {
-        let pos = config.filter_fields.iter().position(|f| f.name == field_name);
-        pos.map(|i| config.filter_fields.remove(i))
-    };
-    let removed_sort: Option<SortFieldConfig> = {
-        let pos = config.sort_fields.iter().position(|f| f.name == field_name);
-        pos.map(|i| config.sort_fields.remove(i))
-    };
-
-    if removed_filter.is_none() && removed_sort.is_none() {
-        eprintln!("ERROR: Field '{}' not found in config (neither filter nor sort)", field_name);
-        std::process::exit(1);
-    }
-
-    eprintln!("  Removed from config: filter={}, sort={}",
-        removed_filter.is_some(), removed_sort.is_some());
-    eprintln!("  Will build engine without '{}', then hot-add it", field_name);
-
-    // Build engine without the target field
-    let bitmap_path = index_dir.join("bitmaps");
-    config.storage.bitmap_path = Some(bitmap_path.clone());
-
-    let rss_before = get_rss_bytes();
-
-    let engine = ConcurrentEngine::new_with_path(config, &docs_path)
-        .expect("create engine");
-
-    // Full build without the target field
-    eprintln!("\n--- Phase 1: Full build (without '{}') ---", field_name);
-    let progress = std::sync::Arc::new(AtomicU64::new(0));
-    let t_build = Instant::now();
-    let (total_docs, build_elapsed) = engine.build_all_from_docstore(
-        progress.clone(),
-        None,
-    ).expect("build_all_from_docstore");
-
-    let rss_after_build = get_rss_bytes();
-    eprintln!("  Build: {} docs in {:.1}s ({:.0} docs/s)",
-        total_docs, build_elapsed, total_docs as f64 / build_elapsed);
-    eprintln!("  RSS after build: {:.2} GB", rss_after_build as f64 / 1e9);
-
-    // Now hot-add the field
-    eprintln!("\n--- Phase 2: Hot-add '{}' ---", field_name);
-    let rss_before_add = get_rss_bytes();
-    progress.store(0, Ordering::Relaxed);
-    let t_add = Instant::now();
-
-    let new_filters = removed_filter.map(|f| vec![f]).unwrap_or_default();
-    let new_sorts = removed_sort.map(|f| vec![f]).unwrap_or_default();
-
-    let (slots, fields) = engine.add_fields_from_docstore(
-        new_filters,
-        new_sorts,
-        progress,
-    ).expect("add_fields_from_docstore");
-
-    let add_elapsed = t_add.elapsed().as_secs_f64();
-    let rss_after_add = get_rss_bytes();
-    let rss_delta = rss_after_add.saturating_sub(rss_before_add);
-
-    eprintln!("  Slots scanned:     {}", slots);
-    eprintln!("  Fields added:      {:?}", fields);
-    eprintln!("  Time:              {:.1}s", add_elapsed);
-    eprintln!("  Throughput:        {:.0} docs/s", slots as f64 / add_elapsed);
-    eprintln!("  RSS delta:         {:.2} MB", rss_delta as f64 / 1e6);
-    eprintln!("  RSS total:         {:.2} GB", rss_after_add as f64 / 1e9);
-
-    // Optional: persist
-    eprintln!("\n--- Phase 3: Persist ---");
-    let t_persist = Instant::now();
-    engine.save_and_unload().expect("save_and_unload");
-    let persist_elapsed = t_persist.elapsed().as_secs_f64();
-    let rss_after_persist = get_rss_bytes();
-    eprintln!("  Persist time:      {:.1}s", persist_elapsed);
-    eprintln!("  RSS after unload:  {:.2} GB", rss_after_persist as f64 / 1e9);
-
-    eprintln!("\n========================================");
-    eprintln!("  ADD-FIELD BENCHMARK COMPLETE");
-    eprintln!("========================================");
-    eprintln!("  Field:             {}", field_name);
-    eprintln!("  Full build:        {:.1}s (without field)", build_elapsed);
-    eprintln!("  Hot-add:           {:.1}s ({:.0} docs/s)", add_elapsed, slots as f64 / add_elapsed);
-    eprintln!("  Persist:           {:.1}s", persist_elapsed);
-    eprintln!("  Add + persist:     {:.1}s", add_elapsed + persist_elapsed);
-    eprintln!("  Add overhead:      {:.1}% of full build", add_elapsed / build_elapsed * 100.0);
+/// --add-field mode: not yet implemented — DataSilo bulk scan API pending.
+fn run_add_field(_data_dir: &Path, _index_name: &str, _field_name: &str) {
+    eprintln!("ERROR: add_fields_from_docstore is not yet implemented (DataSilo bulk scan API pending).");
+    std::process::exit(1);
 }
 
 fn main() {

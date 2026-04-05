@@ -19,13 +19,13 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
-use bitdex_v2::pg_sync::bitdex_client::BitdexClient;
-use bitdex_v2::pg_sync::bulk_loader;
-use bitdex_v2::pg_sync::config::{IndexDefinition, PgSyncConfig};
-use bitdex_v2::pg_sync::metrics_poller;
-use bitdex_v2::pg_sync::ops_poller;
-use bitdex_v2::pg_sync::queries;
-use bitdex_v2::pg_sync::sync_config::FullSyncConfig;
+use bitdex_v2::sync::bitdex_client::BitdexClient;
+use bitdex_v2::sync::bulk_loader;
+use bitdex_v2::sync::config::{IndexDefinition, PgSyncConfig};
+use bitdex_v2::sync::metrics_poller;
+use bitdex_v2::sync::ops_poller;
+use bitdex_v2::sync::queries;
+use bitdex_v2::sync::sync_config::FullSyncConfig;
 
 #[derive(Parser)]
 #[command(name = "bitdex-sync", about = "Config-driven sync system for BitDex")]
@@ -746,7 +746,7 @@ fn run_validate(
             eprintln!("  Dump phase: {} → {}", phase.name, phase.dump_name());
         }
         for trigger in &config.triggers {
-            let name = bitdex_v2::pg_sync::trigger_gen::trigger_name(trigger);
+            let name = bitdex_v2::sync::trigger_gen::trigger_name(trigger);
             eprintln!("  Trigger: {} on {}", name, trigger.table);
         }
     } else {

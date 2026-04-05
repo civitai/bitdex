@@ -20,7 +20,7 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::pg_sync::ops::{EntityOps, Op};
+use crate::sync::ops::{EntityOps, Op};
 
 const HEADER_SIZE: usize = 4 + 8 + 1; // payload_len + entity_id + flags
 const FLAG_CREATES_SLOT: u8 = 0x01;
