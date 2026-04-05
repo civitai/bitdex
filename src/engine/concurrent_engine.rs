@@ -650,17 +650,22 @@ impl ConcurrentEngine {
         }
         Ok(dicts)
     }
-    /// Load the current snapshot (lock-free, zero refcount ops).
+    /// Route mutation ops to the BitmapSilo ops log (primary path) or the legacy
+    /// coalescer channel (fallback for tests without a silo).
     ///
-    /// Returns a Guard that derefs to Arc<InnerEngine>. Unlike `load_full()`,
-    /// Send mutation ops to BOTH the coalescer channel AND the BitmapSilo ops log.
-    /// During Phase 2→4 transition, both paths receive the ops. Phase 4 removes
-    /// the coalescer, leaving only the silo ops log.
+    /// When a BitmapSilo is present, ops go ONLY to the silo — the coalescer is
+    /// NOT also notified. Filter/sort/alive reads all go through the silo
+    /// (get_effective_bitmap, frozen_top_n, alive OnceCell), so the in-memory
+    /// coalescer/flush-thread path is no longer needed for production writes.
+    ///
+    /// The coalescer fallback is kept for tests that construct a ConcurrentEngine
+    /// without a silo. It is deprecated and will be removed once all tests are
+    /// migrated to the silo path.
     pub(crate) fn send_mutation_ops(&self, ops: Vec<MutationOp>) -> Result<()> {
         // Bump epoch counters so stale cache entries are detected on next query.
         self.bump_field_epochs(&ops);
-        // Write to BitmapSilo ops log (the V3 path)
         if let Some(ref silo_arc) = self.bitmap_silo {
+            // Silo present: write ONLY to the BitmapSilo ops log.
             let silo = silo_arc.read();
             for op in &ops {
                 match op {
@@ -685,9 +690,9 @@ impl ConcurrentEngine {
                     MutationOp::DeferredAlive { .. } => {} // handled separately
                 }
             }
-        }
-        // Also send to coalescer for tests without a silo (transitional)
-        if self.bitmap_silo.is_none() {
+        } else {
+            // No silo: fall back to the legacy coalescer channel (test path only).
+            // DEPRECATED — remove once all tests use a BitmapSilo.
             self.sender.send_batch(ops).map_err(|_| {
                 crate::error::BitdexError::CapacityExceeded("coalescer channel disconnected".to_string())
             })?;
