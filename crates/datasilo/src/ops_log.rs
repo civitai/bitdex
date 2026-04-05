@@ -21,7 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const OP_TAG_PUT: u8 = 0x01;
 const OP_TAG_DELETE: u8 = 0x02;
 
-/// 1MB thread-local regions for parallel writes.
+/// 1MB thread-local regions for parallel writes (used in tests).
+#[allow(dead_code)]
 const REGION_SIZE: u64 = 1 << 20;
 
 /// Initial ops log file size (64 MB). Grows as needed.
