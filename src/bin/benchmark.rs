@@ -28,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use rand::Rng;
 use rayon::prelude::*;
-use bitdex_v2::concurrent_engine::ConcurrentEngine;
+use bitdex_v2::engine::ConcurrentEngine;
 use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
 use bitdex_v2::engine::filter::FilterFieldType;
 use bitdex_v2::mutation::{Document, FieldValue};
@@ -1172,8 +1172,6 @@ fn main() {
         println!("  {:>6} {:>8} {:>10} {:>14}",
             "Page", "latency", "results", "cursor_value");
         println!("  {}", "-".repeat(44));
-        let snap = engine.snapshot_public();
-        let sort_field = snap.sorts.get_field("reactionCount").unwrap();
         let mut cursor: Option<CursorPosition> = None;
         for page in 1..=10 {
             let query = BitdexQuery {
@@ -1190,7 +1188,8 @@ fn main() {
             let result_count = result.ids.len();
             if let Some(&last_id) = result.ids.last() {
                 let last_slot = last_id as u32;
-                let sv = sort_field.reconstruct_value(last_slot);
+                let sv = engine.reconstruct_sort_value("reactionCount", last_slot)
+                    .unwrap_or(0);
                 println!("  {:>6} {:>7.3}ms {:>10} {:>14}",
                     page, elapsed_ms, result_count, sv);
                 cursor = Some(CursorPosition {
@@ -1206,7 +1205,6 @@ fn main() {
                 break; // Partial page = end of results
             }
         }
-        drop(snap);
         // Cache stats removed — CacheSilo has no in-memory stats tracking
         println!();
     }
