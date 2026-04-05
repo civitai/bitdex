@@ -415,6 +415,7 @@ impl ConcurrentEngine {
         let planner_ctx = planner::PlannerContext {
             string_maps: executor.string_maps(),
             dictionaries: executor.dictionaries(),
+            bitmap_silo: executor.bitmap_silo(),
         };
         let plan = planner::plan_query_with_context(effective_filters, executor.filter_index(), executor.slot_allocator(), Some(&planner_ctx));
         let filter_bitmap = Arc::new(executor.compute_filters(&plan.ordered_clauses)?);
