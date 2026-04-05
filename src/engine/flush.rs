@@ -41,6 +41,9 @@ pub struct FlushArgs {
     pub doc_rx: Receiver<(u32, StoredDoc)>,
     /// BitmapSilo for writing time bucket SET/CLEAR ops alongside in-memory updates.
     pub bitmap_silo: Option<Arc<parking_lot::RwLock<crate::silos::bitmap_silo::BitmapSilo>>>,
+    /// When true, skip applying mutations to in-memory FilterIndex/SortIndex/SlotAllocator.
+    /// Mutations go directly to BitmapSilo instead.
+    pub has_silo: bool,
 }
 
 /// Entry point for the flush thread. Runs until `args.shutdown` is set.
@@ -75,17 +78,14 @@ pub fn run_flush_thread(args: FlushArgs) {
         mutation_rx: flush_mutation_rx,
         doc_rx,
         bitmap_silo: flush_bitmap_silo,
+        has_silo,
     } = args;
 
     let min_sleep = Duration::from_micros(flush_interval_us);
     let max_sleep = Duration::from_micros(flush_interval_us * 10);
     let mut current_sleep = min_sleep;
     let mut doc_batch: Vec<(u32, StoredDoc)> = Vec::new();
-    let mut flush_cycle: u64 = 0;
     let mut batch = FlushBatch::new();
-    // Compact filter diffs every N flush cycles (~5s at 100μs interval).
-    // Keeps diff layers small so apply_diff/fused stay fast.
-    const COMPACTION_INTERVAL: u64 = 50;
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(current_sleep);
         // Phase 1: Drain channel and group/sort (no lock, pure CPU work)
@@ -97,31 +97,20 @@ pub fn run_flush_thread(args: FlushArgs) {
         } else {
             0
         };
-        let mut stale_fields: Vec<String> = Vec::new();
-        // Phase 2: Apply mutations under write locks (brief hold)
+        // Phase 2: Apply mutations under write locks (brief hold).
+        // Skipped when BitmapSilo is present — mutations go directly to the silo.
         let flush_start = Instant::now();
         if bitmap_count > 0 {
             flush_dirty_flag.store(true, Ordering::Release);
-            let t_apply = Instant::now();
-            {
-                let mut slots_w = flush_slots.write();
-                let mut filters_w = flush_filters.write();
-                let mut sorts_w = flush_sorts.write();
-                batch.apply(&mut *slots_w, &mut *filters_w, &mut *sorts_w);
-            }
-            flush_apply_ns.store(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            // Collect mutated field names for bitmap memory cache staleness tracking.
-            for fgk in batch.filter_inserts.keys() {
-                stale_fields.push(fgk.field.to_string());
-            }
-            for fgk in batch.filter_removes.keys() {
-                stale_fields.push(fgk.field.to_string());
-            }
-            for sgk in batch.sort_sets.keys() {
-                stale_fields.push(sgk.field.to_string());
-            }
-            for sgk in batch.sort_clears.keys() {
-                stale_fields.push(sgk.field.to_string());
+            if !has_silo {
+                let t_apply = Instant::now();
+                {
+                    let mut slots_w = flush_slots.write();
+                    let mut filters_w = flush_filters.write();
+                    let mut sorts_w = flush_sorts.write();
+                    batch.apply(&mut *slots_w, &mut *filters_w, &mut *sorts_w);
+                }
+                flush_apply_ns.store(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             // Yield CPU after apply to let tokio I/O threads deliver
             // pending HTTP responses. Without this, the flush thread
@@ -190,8 +179,6 @@ pub fn run_flush_thread(args: FlushArgs) {
             // Yield CPU after cache work to let tokio deliver responses.
             std::thread::yield_now();
             flush_compact_ns.store(0, Ordering::Relaxed);
-            flush_cycle += 1;
-            stale_fields.clear();
             // Record flush stats for Prometheus
             let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
             flush_apply_cnt.fetch_add(1, Ordering::Relaxed);
@@ -413,13 +400,15 @@ pub fn run_flush_thread(args: FlushArgs) {
     } else { 0 };
     if count > 0 {
         flush_dirty_flag.store(true, Ordering::Release);
-        let mut slots_w = flush_slots.write();
-        let mut filters_w = flush_filters.write();
-        let mut sorts_w = flush_sorts.write();
-        shutdown_batch.apply(&mut *slots_w, &mut *filters_w, &mut *sorts_w);
-        // Compact all remaining filter diffs before shutdown
-        for (_name, field) in filters_w.fields_mut() {
-            field.merge_dirty();
+        if !has_silo {
+            let mut slots_w = flush_slots.write();
+            let mut filters_w = flush_filters.write();
+            let mut sorts_w = flush_sorts.write();
+            shutdown_batch.apply(&mut *slots_w, &mut *filters_w, &mut *sorts_w);
+            // Compact all remaining filter diffs before shutdown
+            for (_name, field) in filters_w.fields_mut() {
+                field.merge_dirty();
+            }
         }
     }
     // Final docstore drain
