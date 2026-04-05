@@ -49,14 +49,6 @@ impl ExprValue {
         }
     }
 
-    /// Coerce to string.
-    pub fn as_str_value(&self) -> Option<&str> {
-        match self {
-            ExprValue::Str(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-
     pub fn is_null(&self) -> bool {
         matches!(self, ExprValue::Null)
     }
@@ -99,22 +91,9 @@ pub enum Expr {
     Max(Vec<String>),
 }
 
-/// Context for expression evaluation.
-pub struct EvalContext<'a> {
-    /// The current CSV row being processed.
-    pub row: &'a CsvRow<'a>,
-    /// The enrichment join key value (for `lookup_key` expressions).
-    pub lookup_key: Option<i64>,
-}
-
 /// Column name → index mapping for zero-allocation row access.
 /// Build once from CSV headers, reuse for every row in the phase.
 pub type ColumnIndex = HashMap<String, usize>;
-
-/// Build a ColumnIndex from CSV header names.
-pub fn build_column_index(headers: &[&str]) -> ColumnIndex {
-    headers.iter().enumerate().map(|(i, &name)| (name.to_string(), i)).collect()
-}
 
 /// Zero-allocation evaluation context using column indices.
 /// The row is a slice of parsed fields — no HashMap per row.
@@ -138,122 +117,6 @@ impl<'a> IndexedEvalContext<'a> {
 }
 
 impl Expr {
-    /// Evaluate the expression against a row context.
-    pub fn eval(&self, ctx: &EvalContext) -> ExprValue {
-        match self {
-            Expr::Column(name) => {
-                match ctx.row.get(name.as_str()) {
-                    Some(Some(val)) if !val.is_empty() => {
-                        // Try to parse as integer first, then keep as string
-                        if let Ok(n) = val.parse::<i64>() {
-                            ExprValue::Int(n)
-                        } else if *val == "true" || *val == "t" {
-                            ExprValue::Bool(true)
-                        } else if *val == "false" || *val == "f" {
-                            ExprValue::Bool(false)
-                        } else {
-                            ExprValue::Str(val.to_string())
-                        }
-                    }
-                    _ => ExprValue::Null,
-                }
-            }
-            Expr::IntLit(n) => ExprValue::Int(*n),
-            Expr::StrLit(s) => ExprValue::Str(s.clone()),
-            Expr::BoolLit(b) => ExprValue::Bool(*b),
-            Expr::NullLit => ExprValue::Null,
-            Expr::LookupKey => match ctx.lookup_key {
-                Some(k) => ExprValue::Int(k),
-                None => ExprValue::Null,
-            },
-
-            Expr::BitfieldExtract { expr, shift, mask } => {
-                let val = expr.eval(ctx);
-                match val.as_i64() {
-                    Some(n) => ExprValue::Int((n >> shift) & (*mask as i64)),
-                    None => ExprValue::Null,
-                }
-            }
-
-            Expr::Eq(left, right) => {
-                let l = left.eval(ctx);
-                let r = right.eval(ctx);
-                // null != null (SQL semantics for filter context)
-                if l.is_null() && r.is_null() {
-                    // Special case: `col != null` is handled by NotEq
-                    // For `col = null`, we check if left is null
-                    return ExprValue::Bool(true);
-                }
-                if l.is_null() || r.is_null() {
-                    return ExprValue::Bool(false);
-                }
-                let result = match (&l, &r) {
-                    (ExprValue::Int(a), ExprValue::Int(b)) => a == b,
-                    (ExprValue::Str(a), ExprValue::Str(b)) => a == b,
-                    (ExprValue::Bool(a), ExprValue::Bool(b)) => a == b,
-                    // Cross-type: try i64 comparison
-                    _ => l.as_i64() == r.as_i64(),
-                };
-                ExprValue::Bool(result)
-            }
-
-            Expr::NotEq(left, right) => {
-                let l = left.eval(ctx);
-                let r = right.eval(ctx);
-                // `col != null` means "col is not null"
-                if r.is_null() {
-                    return ExprValue::Bool(!l.is_null());
-                }
-                if l.is_null() {
-                    return ExprValue::Bool(true);
-                }
-                let result = match (&l, &r) {
-                    (ExprValue::Int(a), ExprValue::Int(b)) => a != b,
-                    (ExprValue::Str(a), ExprValue::Str(b)) => a != b,
-                    (ExprValue::Bool(a), ExprValue::Bool(b)) => a != b,
-                    _ => l.as_i64() != r.as_i64(),
-                };
-                ExprValue::Bool(result)
-            }
-
-            Expr::And(left, right) => {
-                let l = left.eval(ctx);
-                if !l.as_bool() {
-                    return ExprValue::Bool(false);
-                }
-                let r = right.eval(ctx);
-                ExprValue::Bool(r.as_bool())
-            }
-
-            Expr::Or(left, right) => {
-                let l = left.eval(ctx);
-                if l.as_bool() {
-                    return ExprValue::Bool(true);
-                }
-                let r = right.eval(ctx);
-                ExprValue::Bool(r.as_bool())
-            }
-
-            Expr::Max(columns) => {
-                let mut max_val: Option<i64> = None;
-                for col in columns {
-                    if let Some(Some(val)) = ctx.row.get(col.as_str()) {
-                        if let Ok(n) = val.parse::<i64>() {
-                            max_val = Some(match max_val {
-                                Some(cur) => cur.max(n),
-                                None => n,
-                            });
-                        }
-                    }
-                }
-                match max_val {
-                    Some(n) => ExprValue::Int(n),
-                    None => ExprValue::Null,
-                }
-            }
-        }
-    }
-
     /// Evaluate against an indexed row context (zero-allocation per row).
     /// This is the hot-path method for 107M+ row processing.
     pub fn eval_indexed(&self, ctx: &IndexedEvalContext) -> ExprValue {
@@ -643,12 +506,6 @@ impl FilterExpression {
         Ok(Self { expr, source: source.to_string() })
     }
 
-    /// Evaluate the filter against a row. Returns true if the row passes.
-    pub fn eval(&self, row: &CsvRow, lookup_key: Option<i64>) -> bool {
-        let ctx = EvalContext { row, lookup_key };
-        self.expr.eval(&ctx).as_bool()
-    }
-
     /// Evaluate against an indexed row (zero-allocation hot path).
     #[inline]
     pub fn eval_indexed(&self, fields: &[Option<&str>], col_idx: &ColumnIndex, lookup_key: Option<i64>) -> bool {
@@ -689,36 +546,6 @@ impl ComputedFieldDef {
     /// Returns `Some(value)` if the field should be set, `None` if it should be skipped.
     /// For conditional fields (value_column set), returns the value from that column
     /// only when the expression evaluates to true.
-    pub fn eval(&self, row: &CsvRow, lookup_key: Option<i64>) -> Option<ExprValue> {
-        let ctx = EvalContext { row, lookup_key };
-
-        if let Some(ref value_col) = self.value_column {
-            // Conditional: expression is a filter, value comes from column
-            if self.expr.eval(&ctx).as_bool() {
-                match row.get(value_col.as_str()) {
-                    Some(Some(val)) if !val.is_empty() => {
-                        if let Ok(n) = val.parse::<i64>() {
-                            Some(ExprValue::Int(n))
-                        } else {
-                            Some(ExprValue::Str(val.to_string()))
-                        }
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        } else {
-            // Standard: expression IS the value
-            let val = self.expr.eval(&ctx);
-            if val.is_null() {
-                None
-            } else {
-                Some(val)
-            }
-        }
-    }
-
     /// Evaluate against an indexed row (zero-allocation hot path).
     pub fn eval_indexed(&self, fields: &[Option<&str>], col_idx: &ColumnIndex, lookup_key: Option<i64>) -> Option<ExprValue> {
         let ctx = IndexedEvalContext { fields, col_idx, lookup_key };
@@ -841,203 +668,6 @@ mod tests {
         }
     }
 
-    // --- Evaluator tests ---
-
-    #[test]
-    fn test_eval_identity() {
-        let expr = parse_expression("id").unwrap();
-        let row = make_row(&[("id", "12345")]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Int(12345));
-    }
-
-    #[test]
-    fn test_eval_lookup_key() {
-        let expr = parse_expression("lookup_key").unwrap();
-        let row = CsvRow::new();
-        let ctx = EvalContext { row: &row, lookup_key: Some(42) };
-        assert_eq!(expr.eval(&ctx), ExprValue::Int(42));
-    }
-
-    #[test]
-    fn test_eval_null_check_present() {
-        let expr = parse_expression("publishedAtSecs != null").unwrap();
-        let row = make_row(&[("publishedAtSecs", "1700000000")]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Bool(true));
-    }
-
-    #[test]
-    fn test_eval_null_check_absent() {
-        let expr = parse_expression("publishedAtSecs != null").unwrap();
-        let row = make_row_with_nulls(&[("publishedAtSecs", None)]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Bool(false));
-    }
-
-    #[test]
-    fn test_eval_equality_string() {
-        let expr = parse_expression("type = 'Checkpoint'").unwrap();
-        let row = make_row(&[("type", "Checkpoint")]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Bool(true));
-    }
-
-    #[test]
-    fn test_eval_equality_string_mismatch() {
-        let expr = parse_expression("type = 'Checkpoint'").unwrap();
-        let row = make_row(&[("type", "LORA")]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Bool(false));
-    }
-
-    #[test]
-    fn test_eval_boolean_false() {
-        let expr = parse_expression("detected == false").unwrap();
-        let row = make_row(&[("detected", "false")]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Bool(true));
-    }
-
-    #[test]
-    fn test_eval_boolean_true() {
-        let expr = parse_expression("detected == false").unwrap();
-        let row = make_row(&[("detected", "true")]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Bool(false));
-    }
-
-    #[test]
-    fn test_eval_bitfield_set() {
-        // (flags >> 13) & 1 == 1
-        let expr = parse_expression("(flags >> 13) & 1 == 1").unwrap();
-        let flags = (1i64 << 13).to_string();
-        let row = make_row(&[("flags", &flags)]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Bool(true));
-    }
-
-    #[test]
-    fn test_eval_bitfield_unset() {
-        let expr = parse_expression("(flags >> 13) & 1 == 1").unwrap();
-        let row = make_row(&[("flags", "0")]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Bool(false));
-    }
-
-    #[test]
-    fn test_eval_compound_bitfield() {
-        // hasMeta: (flags >> 13) & 1 == 1 && (flags >> 2) & 1 == 0
-        let expr = parse_expression("(flags >> 13) & 1 == 1 && (flags >> 2) & 1 == 0").unwrap();
-        // bit 13 set, bit 2 NOT set → true
-        let flags = (1i64 << 13).to_string();
-        let row = make_row(&[("flags", &flags)]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Bool(true));
-
-        // bit 13 set, bit 2 ALSO set → false
-        let flags2 = ((1i64 << 13) | (1i64 << 2)).to_string();
-        let row2 = make_row(&[("flags", &flags2)]);
-        let ctx2 = EvalContext { row: &row2, lookup_key: None };
-        assert_eq!(expr.eval(&ctx2), ExprValue::Bool(false));
-    }
-
-    #[test]
-    fn test_eval_max() {
-        let expr = parse_expression("max(scannedAtSecs, createdAtSecs)").unwrap();
-        let row = make_row(&[("scannedAtSecs", "1000"), ("createdAtSecs", "2000")]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Int(2000));
-    }
-
-    #[test]
-    fn test_eval_max_with_null() {
-        let expr = parse_expression("max(scannedAtSecs, createdAtSecs)").unwrap();
-        let row = make_row_with_nulls(&[
-            ("scannedAtSecs", None),
-            ("createdAtSecs", Some("2000")),
-        ]);
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Int(2000));
-    }
-
-    // --- Filter expression tests ---
-
-    #[test]
-    fn test_filter_disabled_tags() {
-        // (attributes >> 10) & 1 = 0 — skip disabled tags (filter returns true to include)
-        let filter = FilterExpression::parse("(attributes >> 10) & 1 = 0").unwrap();
-
-        // Not disabled (bit 10 not set) → include
-        let row = make_row(&[("attributes", "0")]);
-        assert!(filter.eval(&row, None));
-
-        // Disabled (bit 10 set) → exclude
-        let disabled = (1i64 << 10).to_string();
-        let row2 = make_row(&[("attributes", &disabled)]);
-        assert!(!filter.eval(&row2, None));
-    }
-
-    // --- Computed field tests ---
-
-    #[test]
-    fn test_computed_has_meta() {
-        let cf = ComputedFieldDef::parse("hasMeta", "(flags >> 13) & 1 == 1 && (flags >> 2) & 1 == 0", None).unwrap();
-        let flags = (1i64 << 13).to_string();
-        let row = make_row(&[("flags", &flags)]);
-        assert_eq!(cf.eval(&row, None), Some(ExprValue::Bool(true)));
-    }
-
-    #[test]
-    fn test_computed_is_published() {
-        let cf = ComputedFieldDef::parse("isPublished", "publishedAtSecs != null", None).unwrap();
-        let row = make_row(&[("publishedAtSecs", "1700000000")]);
-        assert_eq!(cf.eval(&row, None), Some(ExprValue::Bool(true)));
-
-        let row2 = make_row_with_nulls(&[("publishedAtSecs", None)]);
-        // false is not null, so it should return Some(Bool(false))
-        assert_eq!(cf.eval(&row2, None), Some(ExprValue::Bool(false)));
-    }
-
-    #[test]
-    fn test_computed_posted_to_id() {
-        let cf = ComputedFieldDef::parse("postedToId", "lookup_key", None).unwrap();
-        let row = CsvRow::new();
-        assert_eq!(cf.eval(&row, Some(999)), Some(ExprValue::Int(999)));
-    }
-
-    #[test]
-    fn test_computed_conditional_multi_value() {
-        // modelVersionIdsManual: detected == false, value = modelVersionId
-        let cf = ComputedFieldDef::parse(
-            "modelVersionIdsManual",
-            "detected == false",
-            Some("modelVersionId"),
-        ).unwrap();
-
-        // detected=false → include with modelVersionId value
-        let row = make_row(&[("detected", "false"), ("modelVersionId", "42")]);
-        assert_eq!(cf.eval(&row, None), Some(ExprValue::Int(42)));
-
-        // detected=true → skip
-        let row2 = make_row(&[("detected", "true"), ("modelVersionId", "42")]);
-        assert_eq!(cf.eval(&row2, None), None);
-    }
-
-    #[test]
-    fn test_computed_max_sort() {
-        let cf = ComputedFieldDef::parse("existedAt", "max(scannedAtSecs, createdAtSecs)", None).unwrap();
-        let row = make_row(&[("scannedAtSecs", "100"), ("createdAtSecs", "200")]);
-        assert_eq!(cf.eval(&row, None), Some(ExprValue::Int(200)));
-    }
-
-    #[test]
-    fn test_computed_identity() {
-        let cf = ComputedFieldDef::parse("id", "id", None).unwrap();
-        let row = make_row(&[("id", "12345")]);
-        assert_eq!(cf.eval(&row, None), Some(ExprValue::Int(12345)));
-    }
-
     // --- Error handling tests ---
 
     #[test]
@@ -1053,13 +683,5 @@ mod tests {
     #[test]
     fn test_parse_unmatched_paren() {
         assert!(parse_expression("(flags >> 13").is_err());
-    }
-
-    #[test]
-    fn test_eval_missing_column() {
-        let expr = parse_expression("missing_col").unwrap();
-        let row = CsvRow::new();
-        let ctx = EvalContext { row: &row, lookup_key: None };
-        assert_eq!(expr.eval(&ctx), ExprValue::Null);
     }
 }
