@@ -1583,11 +1583,15 @@ pub fn process_dump_with_progress(
     // Prepare parallel ops writer for ALL phases (including multi-value).
     // For MV phases, the post-pass uses it to write doc ops in parallel.
     let parallel_ops_writer: Option<Arc<datasilo::ParallelOpsWriter>> = {
-        let estimated_rows = (body.len() / 100).max(1000);
+        // Estimate row count from average line length in first 4KB of the file.
+        let sample_end = body.len().min(4096);
+        let sample_lines = body[..sample_end].iter().filter(|&&b| b == b'\n').count().max(1);
+        let avg_line_len = (sample_end / sample_lines).max(1);
+        let estimated_rows = (body.len() / avg_line_len).max(1000);
         // Multi-value phases have tiny doc ops (~30 bytes: header + Mi([one_i64])).
         // Standard phases have larger ops (~300 bytes: many fields per row).
         let has_multi_value = request.fields.iter().any(|f| multi_value_fields.contains(f.target()));
-        let bytes_per_row = if has_multi_value && request.fields.len() == 1 { 40 } else { 400 };
+        let bytes_per_row: u64 = if has_multi_value && request.fields.len() == 1 { 40 } else { 400 };
         let estimated_bytes = estimated_rows as u64 * bytes_per_row;
         let ds = engine.docstore_arc();
         let ds_lock = ds.lock();
@@ -2066,7 +2070,7 @@ pub fn process_dump_with_progress(
                             { timings.doc_pack_encode += _t_enc.elapsed().as_nanos() as u64; }
                             #[cfg(feature = "dump-timing")]
                             let _t_wr = std::time::Instant::now();
-                            pw.write_put_reuse(slot as u64, &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
+                            pw.write_put_reuse(crate::silos::doc_silo_adapter::slot_to_key(slot), &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
                             #[cfg(feature = "dump-timing")]
                             { timings.doc_mmap_write += _t_wr.elapsed().as_nanos() as u64; }
                         } else {
@@ -2074,7 +2078,7 @@ pub fn process_dump_with_progress(
                             let bytes = doc_encode_buf.clone();
                             #[cfg(feature = "dump-timing")]
                             { timings.doc_pack_encode += _t_enc.elapsed().as_nanos() as u64; }
-                            doc_ops.push((slot as u64, bytes));
+                            doc_ops.push((crate::silos::doc_silo_adapter::slot_to_key(slot), bytes));
                         }
                     }
                 }
@@ -2806,7 +2810,7 @@ fn collect_doc_op(
             { pack_encode_ns = _t_enc.elapsed().as_nanos() as u64; }
             #[cfg(feature = "dump-timing")]
             let _t_wr = std::time::Instant::now();
-            writer.write_put_reuse(slot as u64, doc_buf, frame_buf, local_cursor, local_end);
+            writer.write_put_reuse(crate::silos::doc_silo_adapter::slot_to_key(slot), doc_buf, frame_buf, local_cursor, local_end);
             #[cfg(feature = "dump-timing")]
             { mmap_write_ns = _t_wr.elapsed().as_nanos() as u64; }
         } else {
@@ -2815,7 +2819,7 @@ fn collect_doc_op(
             let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
             #[cfg(feature = "dump-timing")]
             { pack_encode_ns = _t_enc.elapsed().as_nanos() as u64; }
-            doc_ops.push((slot as u64, bytes));
+            doc_ops.push((crate::silos::doc_silo_adapter::slot_to_key(slot), bytes));
         }
     }
 

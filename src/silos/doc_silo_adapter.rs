@@ -15,6 +15,17 @@ use std::path::{Path, PathBuf};
 use crate::config::DataSchema;
 use crate::silos::doc_format::{self, PackedValue, StoredDoc};
 
+/// Offset applied to slot IDs to avoid HashIndex key=0 sentinel collision.
+/// Slot 0 maps to key 1, slot 1 to key 2, etc.
+const SLOT_KEY_OFFSET: u64 = 1;
+
+/// Convert a slot ID to a DataSilo key (offset by 1 to avoid key=0 sentinel).
+/// Public so dump_processor can use it for direct parallel writes.
+#[inline]
+pub fn slot_to_key(slot: u32) -> u64 {
+    slot as u64 + SLOT_KEY_OFFSET
+}
+
 /// DataSilo-backed document store adapter.
 pub struct DocSiloAdapter {
     silo: datasilo::DataSilo,
@@ -69,7 +80,7 @@ impl DocSiloAdapter {
 
     /// Get a document by slot ID.
     pub fn get(&self, slot: u32) -> io::Result<Option<StoredDoc>> {
-        let bytes = match self.silo.get_with_ops(slot as u64) {
+        let bytes = match self.silo.get_with_ops(slot_to_key(slot)) {
             Some(b) => b,
             None => return Ok(None),
         };
@@ -85,14 +96,14 @@ impl DocSiloAdapter {
     pub fn put(&mut self, slot: u32, doc: &StoredDoc) -> io::Result<()> {
         let fields = self.encode_stored_doc_auto(doc);
         let bytes = doc_format::encode_merge_fields(slot, &fields);
-        self.silo.append_op(slot as u64, &bytes)
+        self.silo.append_op(slot_to_key(slot), &bytes)
     }
 
     /// Write a batch of documents. Auto-registers any new field names.
     pub fn put_batch(&mut self, docs: &[(u32, StoredDoc)]) -> io::Result<()> {
         let ops: Vec<(u64, Vec<u8>)> = docs.iter().map(|(slot, doc)| {
             let fields = self.encode_stored_doc_auto(doc);
-            (*slot as u64, doc_format::encode_merge_fields(*slot, &fields))
+            (slot_to_key(*slot), doc_format::encode_merge_fields(*slot, &fields))
         }).collect();
         self.silo.append_ops_batch(&ops)
     }
