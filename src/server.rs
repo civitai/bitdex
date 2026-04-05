@@ -840,24 +840,6 @@ struct AddFieldsRequest {
     skip_validation: bool,
 }
 
-/// Sync filter values for a filter_only multi-value field.
-/// Replaces all bitmap memberships for the given slots on the named field.
-#[derive(Deserialize)]
-struct FilterSyncRequest {
-    /// The filter field name (must be a multi_value field).
-    field: String,
-    /// List of (slot, values) pairs to sync.
-    documents: Vec<FilterSyncEntry>,
-}
-
-#[derive(Deserialize)]
-struct FilterSyncEntry {
-    /// The document/slot ID.
-    id: u32,
-    /// The complete set of values this slot should have for the field.
-    values: Vec<u64>,
-}
-
 #[derive(Deserialize)]
 struct RemoveFieldsRequest {
     #[serde(default)]
@@ -1308,8 +1290,6 @@ impl BitdexServer {
             .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
             .route("/api/indexes/{name}/documents/{slot_id}", get(handle_get_document))
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
-            .route("/api/indexes/{name}/documents/patch", patch(handle_patch_documents))
-            .route("/api/indexes/{name}/documents/filter-sync", post(handle_filter_sync))
             .route("/api/indexes/{name}/cache", delete(handle_clear_cache))
             .route("/api/indexes/{name}/cache/persistent", delete(handle_purge_cache))
             .route("/api/indexes/{name}/warm", post(handle_warm_cache))
@@ -2646,38 +2626,6 @@ async fn handle_upsert(
             )
         })),
     ).into_response()
-}
-
-/// PATCH /api/indexes/{name}/documents/patch
-///
-/// Not implemented — use upsert (PUT) for all document writes.
-async fn handle_patch_documents(
-    State(_state): State<SharedState>,
-    AxumPath(name): AxumPath<String>,
-    Json(_req): Json<UpsertRequest>,
-) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": format!("PATCH is not implemented for index '{}'; use PUT upsert instead", name)
-        })),
-    )
-}
-
-/// Sync filter values — not implemented.
-///
-/// This endpoint is no longer supported. Use upsert (PUT) for all document writes.
-async fn handle_filter_sync(
-    State(_state): State<SharedState>,
-    AxumPath(name): AxumPath<String>,
-    Json(_req): Json<FilterSyncRequest>,
-) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": format!("filter_sync is not implemented for index '{}'; use PUT upsert instead", name)
-        })),
-    )
 }
 
 async fn handle_delete_docs(
