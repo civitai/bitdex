@@ -780,6 +780,97 @@ impl BitmapSilo {
         }
         count
     }
+
+    // ── Time bucket storage ───────────────────────────────────────────
+
+    /// Returns the logical silo name for a time bucket.
+    /// Key format: "bucket:{field}:{bucket_name}"
+    fn bucket_name(field: &str, bucket_name: &str) -> String {
+        format!("bucket:{}:{}", field, bucket_name)
+    }
+
+    /// Store a time bucket bitmap as a snapshot op in the ops log.
+    ///
+    /// Uses standard (non-frozen) serialization prefixed with `OP_FULL_BITMAP (0x00)`
+    /// so the payload doesn't need 32-byte alignment and can be decoded directly from
+    /// the ops log by `get_bucket_with_ops`.
+    pub fn save_bucket(&self, field: &str, bucket_name: &str, bitmap: &RoaringBitmap) -> io::Result<()> {
+        let name = Self::bucket_name(field, bucket_name);
+        let key = self.ensure_key(&name);
+        // Standard (portable) serialization — alignment-independent, safe in ops log
+        let bitmap_size = bitmap.serialized_size();
+        let mut buf = vec![0u8; 1 + bitmap_size];
+        buf[0] = OP_FULL_BITMAP;
+        bitmap.serialize_into(&mut buf[1..])
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize bucket: {e}")))?;
+        self.silo.append_op(key, &buf)?;
+        self.save_manifest()
+    }
+
+    /// Read a bucket bitmap with pending SET/CLEAR ops applied.
+    ///
+    /// Scans the ops log for this bucket key. Decodes:
+    /// - `OP_FULL_BITMAP (0x00)` + standard-serialized bytes → full snapshot replacement
+    /// - `OP_SET_BIT (0x01)` + u32 slot → set the bit
+    /// - `OP_CLEAR_BIT (0x02)` + u32 slot → clear the bit
+    ///
+    /// Returns None if this bucket has never been saved.
+    pub fn get_bucket_with_ops(&self, field: &str, bucket_name: &str) -> Option<RoaringBitmap> {
+        let name = Self::bucket_name(field, bucket_name);
+        let key = *self.name_to_key.read().get(&name)?;
+
+        let mut base: Option<RoaringBitmap> = None;
+        let mut sets: Vec<u32> = Vec::new();
+        let mut clears: Vec<u32> = Vec::new();
+
+        let _ = self.silo.scan_ops_for_key(key, |value| {
+            if value.is_empty() { return; }
+            match value[0] {
+                OP_FULL_BITMAP => {
+                    // Standard-serialized bitmap snapshot
+                    if let Ok(bm) = RoaringBitmap::deserialize_from(&value[1..]) {
+                        base = Some(bm);
+                        sets.clear();
+                        clears.clear();
+                    }
+                }
+                OP_SET_BIT if value.len() >= 5 => {
+                    let slot = u32::from_le_bytes(value[1..5].try_into().unwrap());
+                    sets.push(slot);
+                }
+                OP_CLEAR_BIT if value.len() >= 5 => {
+                    let slot = u32::from_le_bytes(value[1..5].try_into().unwrap());
+                    clears.push(slot);
+                }
+                _ => {} // unknown op, skip
+            }
+        });
+
+        let mut bitmap = base?;
+        for &slot in &sets { bitmap.insert(slot); }
+        for &slot in &clears { bitmap.remove(slot); }
+        Some(bitmap)
+    }
+
+    /// Append a SET op to a bucket bitmap (slot entered the time window).
+    pub fn bucket_set(&self, field: &str, bucket_name: &str, slot: u32) -> io::Result<()> {
+        let name = Self::bucket_name(field, bucket_name);
+        let key = self.ensure_key(&name);
+        let mut buf = [0u8; 5];
+        buf[0] = OP_SET_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.silo.append_op(key, &buf)
+    }
+
+    /// Append a CLEAR op to a bucket bitmap (slot aged out or was deleted).
+    pub fn bucket_clear(&self, field: &str, bucket_name: &str, slot: u32) -> io::Result<()> {
+        let name = Self::bucket_name(field, bucket_name);
+        let key = self.ensure_key(&name);
+        let mut buf = [0u8; 5];
+        buf[0] = OP_CLEAR_BIT;
+        buf[1..5].copy_from_slice(&slot.to_le_bytes());
+        self.silo.append_op(key, &buf)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,5 +1131,96 @@ mod tests {
         let field = new_filters.get_field("nsfwLevel").unwrap();
         let vb = field.get_versioned(1).expect("should have unloaded placeholder");
         assert!(!vb.is_loaded(), "should be marked as unloaded");
+    }
+
+    /// Test save_bucket / get_bucket_with_ops round-trip.
+    #[test]
+    fn test_bucket_save_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let silo = BitmapSilo::open(dir.path()).unwrap();
+
+        let mut bm = RoaringBitmap::new();
+        bm.insert(1);
+        bm.insert(2);
+        bm.insert(3);
+
+        // Save the initial snapshot
+        silo.save_bucket("sortAt", "24h", &bm).unwrap();
+
+        // Read it back with no pending ops — should match exactly
+        let result = silo.get_bucket_with_ops("sortAt", "24h")
+            .expect("bucket should exist after save");
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(1));
+        assert!(result.contains(2));
+        assert!(result.contains(3));
+    }
+
+    /// Test that bucket_set / bucket_clear ops are applied on read.
+    #[test]
+    fn test_bucket_set_clear_ops_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let silo = BitmapSilo::open(dir.path()).unwrap();
+
+        // Save initial snapshot: slots 1, 2, 3
+        let mut bm = RoaringBitmap::new();
+        bm.insert(1);
+        bm.insert(2);
+        bm.insert(3);
+        silo.save_bucket("sortAt", "7d", &bm).unwrap();
+
+        // Append SET op for slot 10 (new slot entered window)
+        silo.bucket_set("sortAt", "7d", 10).unwrap();
+        // Append CLEAR op for slot 2 (slot aged out)
+        silo.bucket_clear("sortAt", "7d", 2).unwrap();
+
+        // Read back: should include 10, exclude 2, keep 1 and 3
+        let result = silo.get_bucket_with_ops("sortAt", "7d")
+            .expect("bucket should exist");
+        assert!(result.contains(1), "slot 1 should still be present");
+        assert!(!result.contains(2), "slot 2 should be cleared");
+        assert!(result.contains(3), "slot 3 should still be present");
+        assert!(result.contains(10), "slot 10 should be set");
+        assert_eq!(result.len(), 3);
+    }
+
+    /// Test that get_bucket_with_ops returns None for an unknown bucket.
+    #[test]
+    fn test_bucket_not_found_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let silo = BitmapSilo::open(dir.path()).unwrap();
+        assert!(silo.get_bucket_with_ops("sortAt", "24h").is_none());
+    }
+
+    /// Test multiple buckets on the same field are stored independently.
+    #[test]
+    fn test_multiple_buckets_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let silo = BitmapSilo::open(dir.path()).unwrap();
+
+        // 24h bucket: slots 1..=3
+        let mut bm24 = RoaringBitmap::new();
+        bm24.extend([1u32, 2, 3]);
+        silo.save_bucket("sortAt", "24h", &bm24).unwrap();
+
+        // 7d bucket: slots 1..=10
+        let mut bm7d = RoaringBitmap::new();
+        bm7d.extend(1u32..=10);
+        silo.save_bucket("sortAt", "7d", &bm7d).unwrap();
+
+        // Mutate only 24h
+        silo.bucket_clear("sortAt", "24h", 1).unwrap();
+
+        let r24 = silo.get_bucket_with_ops("sortAt", "24h").unwrap();
+        let r7d = silo.get_bucket_with_ops("sortAt", "7d").unwrap();
+
+        // 24h: slot 1 cleared
+        assert!(!r24.contains(1));
+        assert!(r24.contains(2));
+        assert_eq!(r24.len(), 2);
+
+        // 7d: untouched
+        assert!(r7d.contains(1), "7d should not be affected by 24h clear");
+        assert_eq!(r7d.len(), 10);
     }
 }

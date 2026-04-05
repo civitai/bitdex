@@ -205,6 +205,10 @@ pub struct BucketSnapContext<'a> {
     /// If true, queries outside tolerance snap to the nearest bucket instead of returning empty.
     /// Default: true (always snap for safety).
     pub always_snap: bool,
+    /// Optional BitmapSilo reference. When present, bucket bitmaps are read from the silo
+    /// via ops-on-read (`get_bucket_with_ops`) instead of from the in-memory TimeBucketManager.
+    /// The manager is still used for config (snap_duration, snap_nearest, bucket names/durations).
+    pub bitmap_silo: Option<&'a crate::silos::bitmap_silo::BitmapSilo>,
 }
 
 /// Pre-process filter clauses: replace range filters on bucketed timestamp fields with
@@ -239,18 +243,12 @@ fn snap_clause(clause: &FilterClause, ctx: &BucketSnapContext<'_>) -> FilterClau
                     // bucket that covers the requested duration, or the largest bucket.
                     let duration_secs = ctx.now_secs.saturating_sub(*ts as u64);
                     let bucket_name = manager.snap_nearest(duration_secs);
-                    if let Some(bucket) = manager.get_bucket(bucket_name) {
-                        FilterClause::BucketBitmap {
-                            field: field.clone(),
-                            bucket_name: bucket_name.to_string(),
-                            bitmap: Arc::clone(bucket.bitmap()),
-                        }
-                    } else {
-                        FilterClause::BucketBitmap {
-                            field: field.clone(),
-                            bucket_name: "_none".to_string(),
-                            bitmap: Arc::new(RoaringBitmap::new()),
-                        }
+                    let bitmap = resolve_bucket_bitmap(ctx.bitmap_silo, manager, field, bucket_name)
+                        .unwrap_or_else(|| Arc::new(RoaringBitmap::new()));
+                    FilterClause::BucketBitmap {
+                        field: field.clone(),
+                        bucket_name: bucket_name.to_string(),
+                        bitmap,
                     }
                 } else {
                     // Unsnapped queries allowed — return empty bitmap for out-of-range.
@@ -289,12 +287,28 @@ fn try_snap_to_bucket(
     // duration = now - ts (the window the filter requests)
     let duration_secs = ctx.now_secs.saturating_sub(ts as u64);
     let bucket_name = manager.snap_duration(duration_secs, ctx.tolerance_pct)?;
-    let bucket = manager.get_bucket(bucket_name)?;
+    let bitmap = resolve_bucket_bitmap(ctx.bitmap_silo, manager, field, bucket_name)?;
     Some(FilterClause::BucketBitmap {
         field: field.to_string(),
         bucket_name: bucket_name.to_string(),
-        bitmap: Arc::clone(bucket.bitmap()),
+        bitmap,
     })
+}
+
+/// Resolve a bucket bitmap: check silo first (ops-on-read), fall back to in-memory manager.
+fn resolve_bucket_bitmap(
+    silo: Option<&crate::silos::bitmap_silo::BitmapSilo>,
+    manager: &crate::time_buckets::TimeBucketManager,
+    field: &str,
+    bucket_name: &str,
+) -> Option<Arc<RoaringBitmap>> {
+    if let Some(silo) = silo {
+        if let Some(bm) = silo.get_bucket_with_ops(field, bucket_name) {
+            return Some(Arc::new(bm));
+        }
+    }
+    // Fall back to in-memory bucket
+    manager.get_bucket(bucket_name).map(|b| Arc::clone(b.bitmap()))
 }
 
 #[cfg(test)]
@@ -314,6 +328,7 @@ mod tests {
             now_secs,
             tolerance_pct: 0.10,
             always_snap: true,
+            bitmap_silo: None,
         }
     }
 
@@ -411,6 +426,7 @@ mod tests {
             now_secs: now,
             tolerance_pct: 0.10,
             always_snap: false,
+            bitmap_silo: None,
         };
 
         // Duration = 200000s, outside tolerance, always_snap=false → empty bitmap
@@ -487,6 +503,92 @@ mod tests {
         let clauses = vec![FilterClause::Gt("sortAt".to_string(), Value::Float(1.0))];
         let snapped = snap_range_clauses(&clauses, &ctx);
         assert!(matches!(&snapped[0], FilterClause::Gt(_, _)));
+    }
+
+    /// When a BitmapSilo is available, snap_clause should read from it instead of
+    /// the in-memory TimeBucketManager bitmap.
+    #[test]
+    fn test_snap_reads_from_silo_when_available() {
+        let now: u64 = 1_700_000_000;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Build a silo with a specific bitmap for "sortAt"/"24h"
+        let silo = crate::silos::bitmap_silo::BitmapSilo::open(dir.path()).unwrap();
+        let mut silo_bm = roaring::RoaringBitmap::new();
+        silo_bm.extend([100u32, 200, 300]); // distinct from in-memory
+        silo.save_bucket("sortAt", "24h", &silo_bm).unwrap();
+
+        // Build a TimeBucketManager with DIFFERENT in-memory bitmap (slots 1, 2, 3)
+        let mgr = make_manager_with_data(now);
+        // Verify the in-memory manager has slots 1-3 for "24h", not 100-300
+        {
+            let bm = mgr.get_bucket("24h").unwrap().bitmap();
+            assert!(bm.contains(1));
+            assert!(!bm.contains(100));
+        }
+
+        let mut managers = HashMap::new();
+        managers.insert("sortAt".to_string(), &mgr);
+
+        // Build context with silo
+        let ctx = BucketSnapContext {
+            managers: &managers,
+            now_secs: now,
+            tolerance_pct: 0.10,
+            always_snap: true,
+            bitmap_silo: Some(&silo),
+        };
+
+        // Snap to "24h" — should use silo bitmap (100, 200, 300), not in-memory (1, 2, 3)
+        let ts = (now - 86400) as i64; // exactly 24h
+        let clauses = vec![FilterClause::Gt("sortAt".to_string(), Value::Integer(ts))];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+
+        match &snapped[0] {
+            FilterClause::BucketBitmap { field, bucket_name, bitmap } => {
+                assert_eq!(field, "sortAt");
+                assert_eq!(bucket_name, "24h");
+                // Should come from silo, not in-memory manager
+                assert!(bitmap.contains(100), "should have silo slot 100");
+                assert!(bitmap.contains(200), "should have silo slot 200");
+                assert!(bitmap.contains(300), "should have silo slot 300");
+                assert!(!bitmap.contains(1), "should NOT have in-memory slot 1");
+                assert_eq!(bitmap.len(), 3);
+            }
+            other => panic!("expected BucketBitmap, got {:?}", other),
+        }
+    }
+
+    /// When silo is None, snap_clause falls back to in-memory manager bitmap.
+    #[test]
+    fn test_snap_falls_back_to_in_memory_without_silo() {
+        let now: u64 = 1_700_000_000;
+        let mgr = make_manager_with_data(now);
+        let mut managers = HashMap::new();
+        managers.insert("sortAt".to_string(), &mgr);
+
+        let ctx = BucketSnapContext {
+            managers: &managers,
+            now_secs: now,
+            tolerance_pct: 0.10,
+            always_snap: true,
+            bitmap_silo: None,
+        };
+
+        let ts = (now - 86400) as i64;
+        let clauses = vec![FilterClause::Gt("sortAt".to_string(), Value::Integer(ts))];
+        let snapped = snap_range_clauses(&clauses, &ctx);
+
+        match &snapped[0] {
+            FilterClause::BucketBitmap { bitmap, .. } => {
+                // In-memory manager has slots 1-3 in "24h"
+                assert!(bitmap.contains(1));
+                assert!(bitmap.contains(2));
+                assert!(bitmap.contains(3));
+                assert_eq!(bitmap.len(), 3);
+            }
+            other => panic!("expected BucketBitmap, got {:?}", other),
+        }
     }
 
     #[test]

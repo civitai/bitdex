@@ -39,6 +39,8 @@ pub struct FlushArgs {
     pub field_registry: FieldRegistry,
     pub mutation_rx: Receiver<MutationOp>,
     pub doc_rx: Receiver<(u32, StoredDoc)>,
+    /// BitmapSilo for writing time bucket SET/CLEAR ops alongside in-memory updates.
+    pub bitmap_silo: Option<Arc<parking_lot::RwLock<crate::silos::bitmap_silo::BitmapSilo>>>,
 }
 
 /// Entry point for the flush thread. Runs until `args.shutdown` is set.
@@ -72,6 +74,7 @@ pub fn run_flush_thread(args: FlushArgs) {
         field_registry: flush_field_registry,
         mutation_rx: flush_mutation_rx,
         doc_rx,
+        bitmap_silo: flush_bitmap_silo,
     } = args;
 
     let min_sleep = Duration::from_micros(flush_interval_us);
@@ -137,16 +140,48 @@ pub fn run_flush_thread(args: FlushArgs) {
                     let mut tb = tb_arc.lock();
                     if !batch.alive_inserts.is_empty() {
                         let sort_field_name = tb.sort_field_name().to_string();
+                        let field_name = tb.field_name().to_string();
+                        let bucket_names: Vec<String> = tb.bucket_names();
                         let sorts_r = flush_sorts.read();
                         if let Some(sort_field) = sorts_r.get_field(&sort_field_name) {
                             for &slot in &batch.alive_inserts {
                                 let ts = sort_field.reconstruct_value(slot) as u64;
+                                // Determine which buckets this slot qualifies for (same logic as insert_slot)
+                                let qualifying: Vec<String> = bucket_names.iter()
+                                    .filter(|name| {
+                                        if let Some(bucket) = tb.get_bucket(name) {
+                                            let cutoff = now_secs.saturating_sub(bucket.duration_secs);
+                                            ts >= cutoff && ts <= now_secs
+                                        } else {
+                                            false
+                                        }
+                                    })
+                                    .cloned()
+                                    .collect();
                                 tb.insert_slot(slot, ts, now_secs);
+                                // Mirror to silo
+                                if let Some(ref silo_arc) = flush_bitmap_silo {
+                                    let silo = silo_arc.read();
+                                    for bucket_name in &qualifying {
+                                        let _ = silo.bucket_set(&field_name, bucket_name, slot);
+                                    }
+                                }
                             }
                         }
                     }
-                    for &slot in &batch.alive_removes {
-                        tb.remove_slot(slot);
+                    if !batch.alive_removes.is_empty() {
+                        let field_name = tb.field_name().to_string();
+                        let bucket_names: Vec<String> = tb.bucket_names();
+                        for &slot in &batch.alive_removes {
+                            tb.remove_slot(slot);
+                            // Mirror to silo — unconditionally clear from all buckets
+                            if let Some(ref silo_arc) = flush_bitmap_silo {
+                                let silo = silo_arc.read();
+                                for bucket_name in &bucket_names {
+                                    let _ = silo.bucket_clear(&field_name, bucket_name, slot);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -296,6 +331,19 @@ pub fn run_flush_thread(args: FlushArgs) {
                                 let mut tb = tb_arc.lock();
                                 if let Some(bucket) = tb.get_bucket_mut(bucket_name) {
                                     bucket.subtract_expired(&expired, new_cutoff);
+                                }
+                            }
+                            // Mirror expired CLEARs to silo
+                            if !expired.is_empty() {
+                                let field_name = {
+                                    let tb = tb_arc.lock();
+                                    tb.field_name().to_string()
+                                };
+                                if let Some(ref silo_arc) = flush_bitmap_silo {
+                                    let silo = silo_arc.read();
+                                    for slot in expired.iter() {
+                                        let _ = silo.bucket_clear(&field_name, bucket_name, slot);
+                                    }
                                 }
                             }
                             // Store diff for lazy cache application (no cache Mutex!)
