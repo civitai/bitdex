@@ -3,6 +3,7 @@ pub mod executor;
 pub mod filter;
 pub mod flush;
 pub mod flush_batch;
+pub mod frozen_sort;
 pub mod query;
 pub mod slot;
 pub mod sort;

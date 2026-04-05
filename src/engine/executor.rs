@@ -4,6 +4,7 @@ use crate::silos::bitmap_silo::BitmapSilo;
 use crate::dictionary::FieldDictionary;
 use crate::error::{BitdexError, Result};
 use crate::engine::filter::FilterIndex;
+use crate::engine::frozen_sort;
 use crate::query::planner;
 use crate::query::{FilterClause, SortClause, SortDirection, Value};
 use crate::query::metrics::{ClauseTrace, QueryTraceCollector};
@@ -44,6 +45,11 @@ pub struct QueryExecutor<'a> {
     /// unloaded (is_loaded=false), the executor reads the frozen bitmap directly
     /// from the silo's mmap — zero heap allocation for the base data.
     bitmap_silo: Option<&'a BitmapSilo>,
+    /// Number of bit layers per sort field. Required for frozen-only sort
+    /// traversal when no in-memory SortField is present (e.g. after silo-only
+    /// restore). Maps field_name → num_bits. Typically populated from
+    /// `SortFieldConfig.bits` at engine construction time.
+    sort_bits: Option<&'a HashMap<String, usize>>,
 }
 impl<'a> QueryExecutor<'a> {
     pub fn new(
@@ -63,6 +69,7 @@ impl<'a> QueryExecutor<'a> {
             case_sensitive_fields: None,
             dictionaries: None,
             bitmap_silo: None,
+            sort_bits: None,
         }
     }
     /// Full constructor — avoids chaining 5 conditional `.with_*()` calls.
@@ -88,7 +95,19 @@ impl<'a> QueryExecutor<'a> {
             case_sensitive_fields,
             dictionaries,
             bitmap_silo,
+            sort_bits: None,
         }
+    }
+
+    /// Attach a sort-bits map so frozen-only sort traversal can be used for fields
+    /// not present in the in-memory SortIndex.
+    ///
+    /// `bits` maps sort field name → number of bit layers (from `SortFieldConfig.bits`).
+    /// When a sort query arrives for a field absent from `self.sorts` but present in
+    /// the BitmapSilo, the executor uses `frozen_sort::frozen_top_n` with this bit count.
+    pub fn with_sort_bits(mut self, bits: &'a HashMap<String, usize>) -> Self {
+        self.sort_bits = Some(bits);
+        self
     }
     /// Attach string maps for MappedString field reverse lookup.
     /// Enables querying with `Value::String("SD 1.5")` on MappedString fields.
@@ -814,6 +833,11 @@ impl<'a> QueryExecutor<'a> {
         }
     }
     /// Sort candidates using bitmap sort layer traversal.
+    ///
+    /// Prefers the in-memory SortField when available (hybrid: in-memory base +
+    /// frozen supplements for unloaded layers). Falls back to the fully-frozen
+    /// path (`frozen_sort::frozen_top_n`) when no in-memory SortField exists but
+    /// a BitmapSilo and `sort_bits` entry are present.
     fn sort_and_paginate(
         &self,
         candidates: &RoaringBitmap,
@@ -821,29 +845,48 @@ impl<'a> QueryExecutor<'a> {
         limit: usize,
         cursor: Option<&crate::query::CursorPosition>,
     ) -> Result<(Vec<i64>, Option<crate::query::CursorPosition>)> {
-        let sort_field = self
-            .sorts
-            .get_field(&sort.field)
-            .ok_or_else(|| BitdexError::FieldNotFound(sort.field.clone()))?;
         let descending = sort.direction == SortDirection::Desc;
         let cursor_param = cursor.map(|c| (c.sort_value, c.slot_id));
-        // Build frozen layers for any unloaded sort layers
-        let frozen_layers = self.build_frozen_sort_layers(&sort.field, sort_field.num_bits());
-        let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
-            Some(frozen_layers.as_slice())
-        } else {
-            None
-        };
-        let sorted_slots = sort_field.top_n_frozen(candidates, limit, descending, cursor_param, frozen_ref);
-        let ids: Vec<i64> = sorted_slots.iter().map(|&s| s as i64).collect();
-        let next_cursor = sorted_slots.last().map(|&last_slot| {
-            let sort_value = sort_field.reconstruct_value_frozen(last_slot, frozen_ref) as u64;
-            crate::query::CursorPosition {
-                sort_value,
-                slot_id: last_slot,
+
+        if let Some(sort_field) = self.sorts.get_field(&sort.field) {
+            // In-memory path: use sort field with optional frozen supplement
+            let frozen_layers = self.build_frozen_sort_layers(&sort.field, sort_field.num_bits());
+            let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
+                Some(frozen_layers.as_slice())
+            } else {
+                None
+            };
+            let sorted_slots = sort_field.top_n_frozen(candidates, limit, descending, cursor_param, frozen_ref);
+            let ids: Vec<i64> = sorted_slots.iter().map(|&s| s as i64).collect();
+            let next_cursor = sorted_slots.last().map(|&last_slot| {
+                let sort_value = sort_field.reconstruct_value_frozen(last_slot, frozen_ref) as u64;
+                crate::query::CursorPosition {
+                    sort_value,
+                    slot_id: last_slot,
+                }
+            });
+            Ok((ids, next_cursor))
+        } else if let (Some(silo), Some(num_bits)) = (
+            self.bitmap_silo,
+            self.sort_bits.and_then(|sb| sb.get(&sort.field)).copied(),
+        ) {
+            // Frozen-only path: no in-memory SortField, read all layers from silo
+            if !silo.has_sort_field(&sort.field) {
+                return Err(BitdexError::FieldNotFound(sort.field.clone()));
             }
-        });
-        Ok((ids, next_cursor))
+            let sorted_slots = frozen_sort::frozen_top_n(silo, &sort.field, num_bits, candidates, limit, descending, cursor_param);
+            let ids: Vec<i64> = sorted_slots.iter().map(|&s| s as i64).collect();
+            let next_cursor = sorted_slots.last().map(|&last_slot| {
+                let sort_value = frozen_sort::frozen_reconstruct_value(silo, &sort.field, num_bits, last_slot) as u64;
+                crate::query::CursorPosition {
+                    sort_value,
+                    slot_id: last_slot,
+                }
+            });
+            Ok((ids, next_cursor))
+        } else {
+            Err(BitdexError::FieldNotFound(sort.field.clone()))
+        }
     }
 
     /// Build frozen sort layers from BitmapSilo for unloaded sort layers.
@@ -911,7 +954,9 @@ impl<'a> QueryExecutor<'a> {
         })
     }
     /// Simple in-memory sort for small result sets.
+    ///
     /// When the planner estimates the result set is small, this avoids walking 32 bit layers.
+    /// Falls back to the frozen-only path when no in-memory SortField is present.
     fn simple_sort_and_paginate(
         &self,
         candidates: &RoaringBitmap,
@@ -919,47 +964,89 @@ impl<'a> QueryExecutor<'a> {
         limit: usize,
         cursor: Option<&crate::query::CursorPosition>,
     ) -> Result<(Vec<i64>, Option<crate::query::CursorPosition>)> {
-        let sort_field = self
-            .sorts
-            .get_field(&sort.field)
-            .ok_or_else(|| BitdexError::FieldNotFound(sort.field.clone()))?;
         let descending = sort.direction == SortDirection::Desc;
-        let frozen_layers = self.build_frozen_sort_layers(&sort.field, sort_field.num_bits());
-        let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
-            Some(frozen_layers.as_slice())
-        } else {
-            None
-        };
-        let mut entries: Vec<(u32, u32)> = candidates
-            .iter()
-            .map(|slot| (slot, sort_field.reconstruct_value_frozen(slot, frozen_ref)))
-            .collect();
-        if descending {
-            entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
-        } else {
-            entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-        }
-        if let Some(cursor) = cursor {
-            let cursor_value = cursor.sort_value as u32;
-            let cursor_slot = cursor.slot_id;
-            entries.retain(|&(slot, value)| {
-                if descending {
-                    value < cursor_value || (value == cursor_value && slot < cursor_slot)
-                } else {
-                    value > cursor_value || (value == cursor_value && slot > cursor_slot)
+
+        // Closure: reconstruct a slot's value using in-memory or frozen source
+        // Returns (entries, reconstruct_fn) — separated to avoid borrow conflicts
+        if let Some(sort_field) = self.sorts.get_field(&sort.field) {
+            // In-memory path
+            let frozen_layers = self.build_frozen_sort_layers(&sort.field, sort_field.num_bits());
+            let frozen_ref = if frozen_layers.iter().any(|f| f.is_some()) {
+                Some(frozen_layers.as_slice())
+            } else {
+                None
+            };
+            let mut entries: Vec<(u32, u32)> = candidates
+                .iter()
+                .map(|slot| (slot, sort_field.reconstruct_value_frozen(slot, frozen_ref)))
+                .collect();
+            if descending {
+                entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+            } else {
+                entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            }
+            if let Some(cursor) = cursor {
+                let cursor_value = cursor.sort_value as u32;
+                let cursor_slot = cursor.slot_id;
+                entries.retain(|&(slot, value)| {
+                    if descending {
+                        value < cursor_value || (value == cursor_value && slot < cursor_slot)
+                    } else {
+                        value > cursor_value || (value == cursor_value && slot > cursor_slot)
+                    }
+                });
+            }
+            let result_slots: Vec<u32> = entries.iter().take(limit).map(|&(slot, _)| slot).collect();
+            let ids: Vec<i64> = result_slots.iter().map(|&s| s as i64).collect();
+            let next_cursor = result_slots.last().map(|&last_slot| {
+                let sort_value = sort_field.reconstruct_value_frozen(last_slot, frozen_ref) as u64;
+                crate::query::CursorPosition {
+                    sort_value,
+                    slot_id: last_slot,
                 }
             });
-        }
-        let result_slots: Vec<u32> = entries.iter().take(limit).map(|&(slot, _)| slot).collect();
-        let ids: Vec<i64> = result_slots.iter().map(|&s| s as i64).collect();
-        let next_cursor = result_slots.last().map(|&last_slot| {
-            let sort_value = sort_field.reconstruct_value_frozen(last_slot, frozen_ref) as u64;
-            crate::query::CursorPosition {
-                sort_value,
-                slot_id: last_slot,
+            Ok((ids, next_cursor))
+        } else if let (Some(silo), Some(num_bits)) = (
+            self.bitmap_silo,
+            self.sort_bits.and_then(|sb| sb.get(&sort.field)).copied(),
+        ) {
+            // Frozen-only path: reconstruct values slot-by-slot from silo
+            if !silo.has_sort_field(&sort.field) {
+                return Err(BitdexError::FieldNotFound(sort.field.clone()));
             }
-        });
-        Ok((ids, next_cursor))
+            let mut entries: Vec<(u32, u32)> = candidates
+                .iter()
+                .map(|slot| (slot, frozen_sort::frozen_reconstruct_value(silo, &sort.field, num_bits, slot)))
+                .collect();
+            if descending {
+                entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+            } else {
+                entries.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            }
+            if let Some(cursor) = cursor {
+                let cursor_value = cursor.sort_value as u32;
+                let cursor_slot = cursor.slot_id;
+                entries.retain(|&(slot, value)| {
+                    if descending {
+                        value < cursor_value || (value == cursor_value && slot < cursor_slot)
+                    } else {
+                        value > cursor_value || (value == cursor_value && slot > cursor_slot)
+                    }
+                });
+            }
+            let result_slots: Vec<u32> = entries.iter().take(limit).map(|&(slot, _)| slot).collect();
+            let ids: Vec<i64> = result_slots.iter().map(|&s| s as i64).collect();
+            let next_cursor = result_slots.last().map(|&last_slot| {
+                let sort_value = frozen_sort::frozen_reconstruct_value(silo, &sort.field, num_bits, last_slot) as u64;
+                crate::query::CursorPosition {
+                    sort_value,
+                    slot_id: last_slot,
+                }
+            });
+            Ok((ids, next_cursor))
+        } else {
+            Err(BitdexError::FieldNotFound(sort.field.clone()))
+        }
     }
 }
 #[cfg(test)]
