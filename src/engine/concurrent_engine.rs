@@ -436,6 +436,7 @@ impl ConcurrentEngine {
             let flush_config = Arc::clone(&config);
             let flush_field_registry = field_registry.clone();
             let flush_mutation_rx = mutation_rx;
+            let flush_has_silo = bitmap_silo_arc.is_some();
             thread::spawn(move || {
                 super::flush::run_flush_thread(super::flush::FlushArgs {
                     slots: flush_slots,
@@ -461,6 +462,7 @@ impl ConcurrentEngine {
                     field_registry: flush_field_registry,
                     mutation_rx: flush_mutation_rx,
                     doc_rx,
+                    has_silo: flush_has_silo,
                 });
             })
         };
