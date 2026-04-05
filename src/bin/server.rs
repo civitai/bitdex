@@ -220,6 +220,15 @@ fn parse_config() -> Config {
         if let Some(v) = table.get("trace_buffer_size").and_then(|v| v.as_integer()) {
             trace_buffer_size = v as usize;
         }
+        // Set rayon thread pool size from config (before any rayon work starts).
+        // 24 is optimal on 16-core CPUs (avoids hyperthreading contention).
+        // 0 = use all available cores (rayon default).
+        if let Some(v) = table.get("rayon_threads").and_then(|v| v.as_integer()) {
+            let threads = v as usize;
+            if threads > 0 {
+                std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
+            }
+        }
     }
 
     // --- CLI flags override everything ---

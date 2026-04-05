@@ -109,7 +109,8 @@ impl ConcurrentEngine {
         // ── Fast path: CacheSilo hit ──
         // Check the silo BEFORE computing filters. On hit we skip the expensive
         // filter bitmap computation entirely (~2ms saved at 105M scale).
-        let use_cache = !query.skip_cache && query.sort.is_some();
+        let cache_disabled = self.config.cache.max_entries == 0 || self.config.cache.max_bytes == 0;
+        let use_cache = !cache_disabled && !query.skip_cache && query.sort.is_some();
         let cache_key_opt = if use_cache {
             if let Some(sort_clause) = query.sort.as_ref() {
                 cache::canonicalize(effective_filters).map(|clauses| {

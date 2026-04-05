@@ -37,6 +37,11 @@ data_dir = "data"
 # Useful for development and debugging; disable in production to avoid disk I/O
 # enable_traces = false
 
+# Number of rayon worker threads for parallel dump processing.
+# 24 is optimal on 16-core CPUs (avoids hyperthreading contention).
+# Default: 24. Set to 0 to use all available cores.
+rayon_threads = 24
+
 # Admin token for gating mutating endpoints (config patch, cache clear, snapshot, etc.)
 # If not set, admin endpoints return 403 Forbidden (fail-safe).
 # BITDEX_ADMIN_TOKEN env var overrides this value (recommended for deployments).
