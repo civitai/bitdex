@@ -4,8 +4,11 @@
 //! - **Sequential**: single-thread, tight packing (steady-state mutations)
 //! - **Parallel**: 1MB thread-local regions, 32M+ ops/sec (dump/bulk load)
 //!
-//! Frame format: [u8 tag][u32 key][u32 value_len][value bytes][u32 crc32]
+//! Frame format: [u8 tag][u64 key][u32 value_len][value bytes][u32 crc32]
 //! Tags: 0x01 = Put, 0x02 = Delete
+//!
+//! Key size changed from u32 (4 bytes) to u64 (8 bytes) to support the
+//! full u64 key space required by BitmapSilo's deterministic key encoding.
 //!
 //! The log is mmap'd so reads are zero-copy through the page cache.
 //! No in-memory HashMap — the mmap IS the read cache.
@@ -26,15 +29,15 @@ const INITIAL_SIZE: u64 = 64 * 1024 * 1024;
 
 /// A mutation operation.
 pub enum SiloOp {
-    Put { key: u32, value: Vec<u8> },
-    Delete { key: u32 },
+    Put { key: u64, value: Vec<u8> },
+    Delete { key: u64 },
 }
 
 /// Zero-copy op reference — points into the mmap instead of copying value bytes.
 pub enum SiloOpRef {
     /// Put with (key, byte_offset_in_mmap, value_length)
-    Put { key: u32, offset: usize, len: usize },
-    Delete { key: u32 },
+    Put { key: u64, offset: usize, len: usize },
+    Delete { key: u64 },
 }
 
 /// Mmap'd append-only ops log.
@@ -209,7 +212,7 @@ impl OpsLog {
     /// Iterate over ops without allocating a Vec. Calls `f` for each valid op.
     /// More memory-efficient than `read_all` for large logs.
     pub fn for_each<F>(&self, mut f: F) -> io::Result<u64>
-    where F: FnMut(u32, &[u8]) // (key, value_bytes)
+    where F: FnMut(u64, &[u8]) // (key, value_bytes)
     {
         let mmap = match &self.mmap {
             Some(m) => m,
@@ -234,9 +237,9 @@ impl OpsLog {
 
             match tag {
                 OP_TAG_PUT => {
-                    if pos + 8 > data.len() { break; }
-                    let key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                    pos += 4;
+                    if pos + 12 > data.len() { break; }
+                    let key = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                    pos += 8;
                     let value_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
                     pos += 4;
                     if pos + value_len + 4 > data.len() { break; }
@@ -253,9 +256,9 @@ impl OpsLog {
                     // If CRC mismatch, skip this entry (could be padding)
                 }
                 OP_TAG_DELETE => {
-                    if pos + 4 + 4 > data.len() { break; }
-                    let _key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                    pos += 4;
+                    if pos + 8 + 4 > data.len() { break; }
+                    let _key = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                    pos += 8;
                     let payload_end = pos;
                     let expected_crc = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
                     pos += 4;
@@ -301,9 +304,9 @@ impl OpsLog {
 
             match tag {
                 OP_TAG_PUT => {
-                    if pos + 8 > data.len() { break; }
-                    let key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                    pos += 4;
+                    if pos + 12 > data.len() { break; }
+                    let key = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                    pos += 8;
                     let value_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
                     pos += 4;
                     if pos + value_len + 4 > data.len() { break; }
@@ -319,9 +322,9 @@ impl OpsLog {
                     }
                 }
                 OP_TAG_DELETE => {
-                    if pos + 4 + 4 > data.len() { break; }
-                    let key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                    pos += 4;
+                    if pos + 8 + 4 > data.len() { break; }
+                    let key = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                    pos += 8;
                     let payload_end = pos;
                     let expected_crc = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
                     pos += 4;
@@ -367,9 +370,9 @@ impl OpsLog {
 
             match tag {
                 OP_TAG_PUT => {
-                    if pos + 8 > data.len() { break; }
-                    let key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                    pos += 4;
+                    if pos + 12 > data.len() { break; }
+                    let key = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                    pos += 8;
                     let value_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
                     pos += 4;
                     let value_offset = pos; // byte offset of value in mmap
@@ -385,9 +388,9 @@ impl OpsLog {
                     }
                 }
                 OP_TAG_DELETE => {
-                    if pos + 4 + 4 > data.len() { break; }
-                    let key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                    pos += 4;
+                    if pos + 8 + 4 > data.len() { break; }
+                    let key = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                    pos += 8;
                     let payload_end = pos;
                     let expected_crc = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
                     pos += 4;
@@ -439,7 +442,7 @@ impl OpsLog {
 
     // ---- Encoding ----
 
-    /// Encode an op into a framed byte buffer: [tag][key][len][value][crc32]
+    /// Encode an op into a framed byte buffer: [tag:1][key:8][len:4][value][crc32:4]
     pub fn encode_op(op: &SiloOp) -> Vec<u8> {
         let mut buf = Vec::with_capacity(128);
         match op {
@@ -461,7 +464,7 @@ impl OpsLog {
 
     /// Encode a Put op directly into a provided buffer (avoids allocation).
     #[inline]
-    pub fn encode_put_into(buf: &mut Vec<u8>, key: u32, value: &[u8]) {
+    pub fn encode_put_into(buf: &mut Vec<u8>, key: u64, value: &[u8]) {
         buf.clear();
         buf.push(OP_TAG_PUT);
         buf.extend_from_slice(&key.to_le_bytes());
@@ -484,9 +487,9 @@ impl OpsLog {
 
         match tag {
             OP_TAG_PUT => {
-                if *pos + 8 > data.len() { return None; }
-                let key = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
-                *pos += 4;
+                if *pos + 12 > data.len() { return None; }
+                let key = u64::from_le_bytes(data[*pos..*pos + 8].try_into().ok()?);
+                *pos += 8;
                 let value_len = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?) as usize;
                 *pos += 4;
                 if *pos + value_len + 4 > data.len() { return None; }
@@ -500,9 +503,9 @@ impl OpsLog {
                 Some(SiloOp::Put { key, value })
             }
             OP_TAG_DELETE => {
-                if *pos + 4 + 4 > data.len() { return None; }
-                let key = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
-                *pos += 4;
+                if *pos + 8 + 4 > data.len() { return None; }
+                let key = u64::from_le_bytes(data[*pos..*pos + 8].try_into().ok()?);
+                *pos += 8;
                 let payload_end = *pos;
                 let expected_crc = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
                 *pos += 4;
@@ -548,15 +551,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.ops");
         let mut log = OpsLog::open(&path).unwrap();
-        log.append(&SiloOp::Put { key: 1, value: b"hello".to_vec() }).unwrap();
-        log.append(&SiloOp::Put { key: 2, value: b"world".to_vec() }).unwrap();
+        log.append(&SiloOp::Put { key: 1u64, value: b"hello".to_vec() }).unwrap();
+        log.append(&SiloOp::Put { key: 2u64, value: b"world".to_vec() }).unwrap();
         log.flush().unwrap();
 
         let ops = log.read_all().unwrap();
         assert_eq!(ops.len(), 2);
         match &ops[0] {
             SiloOp::Put { key, value } => {
-                assert_eq!(*key, 1);
+                assert_eq!(*key, 1u64);
                 assert_eq!(value, b"hello");
             }
             _ => panic!("expected Put"),
@@ -569,7 +572,7 @@ mod tests {
         let path = dir.path().join("test.ops");
         {
             let mut log = OpsLog::open(&path).unwrap();
-            log.append(&SiloOp::Put { key: 42, value: b"data".to_vec() }).unwrap();
+            log.append(&SiloOp::Put { key: 42u64, value: b"data".to_vec() }).unwrap();
             log.flush().unwrap();
         }
         {
@@ -578,7 +581,7 @@ mod tests {
             assert_eq!(ops.len(), 1);
             match &ops[0] {
                 SiloOp::Put { key, value } => {
-                    assert_eq!(*key, 42);
+                    assert_eq!(*key, 42u64);
                     assert_eq!(value, b"data");
                 }
                 _ => panic!("expected Put"),
@@ -591,7 +594,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.ops");
         let mut log = OpsLog::open(&path).unwrap();
-        log.append(&SiloOp::Put { key: 1, value: b"a".to_vec() }).unwrap();
+        log.append(&SiloOp::Put { key: 1u64, value: b"a".to_vec() }).unwrap();
         log.flush().unwrap();
         log.truncate().unwrap();
         let ops = log.read_all().unwrap();
@@ -603,7 +606,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.ops");
         let mut log = OpsLog::open(&path).unwrap();
-        for i in 0..100u32 {
+        for i in 0..100u64 {
             log.append(&SiloOp::Put { key: i, value: format!("val_{}", i).into_bytes() }).unwrap();
         }
         log.flush().unwrap();
@@ -622,14 +625,14 @@ mod tests {
         let path = dir.path().join("test.ops");
         let mut log = OpsLog::open(&path).unwrap();
 
-        let num_ops = 10_000u32;
+        let num_ops = 10_000u64;
         let value = vec![0xABu8; 100];
-        let frame_size = 1 + 4 + 4 + 100 + 4; // tag + key + len + value + crc
-        let total_size = num_ops as u64 * frame_size as u64 * 2; // 2x headroom for regions
+        let frame_size = 1 + 8 + 4 + 100 + 4; // tag + key(u64) + len + value + crc
+        let total_size = num_ops * frame_size as u64 * 2; // 2x headroom for regions
         log.ensure_capacity(total_size).unwrap();
 
         // Parallel write using thread-local regions
-        let num_threads = 4;
+        let num_threads = 4u64;
         let ops_per_thread = num_ops / num_threads;
 
         std::thread::scope(|s| {
