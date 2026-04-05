@@ -1462,15 +1462,9 @@ pub fn process_dump_with_progress(
         .as_secs();
     let has_deferred_alive = config.deferred_alive.is_some() && request.sets_alive;
 
-    // Multi-value-only phases (tags, tools, techniques) skip per-row doc ops during
-    // parse — 4.5B tag rows would produce 4.5B doc ops and OOM. Instead, bitmaps are
-    // built during parse and a bitmap inversion post-pass writes ~108M doc ops (one
-    // per unique slot). Detection is config-driven via multi_value_fields.
-    let is_multi_value_only = request.fields.len() == 1
-        && !request.sets_alive
-        && request.computed_fields.is_empty()
-        && request.enrichment.is_empty()
-        && multi_value_fields.contains(request.fields[0].target());
+    // All phases use the same per-row doc op path. Multi-value fields emit Mi([value])
+    // per row; compaction concatenates arrays per slot. Doc ops are streamed directly
+    // to the DocSilo mmap via ParallelOpsWriter — no in-memory accumulation.
 
     emit_stage(&request.name, "parallel_parse", "start", &t, 0);
 
@@ -1590,7 +1584,11 @@ pub fn process_dump_with_progress(
     // For MV phases, the post-pass uses it to write doc ops in parallel.
     let parallel_ops_writer: Option<Arc<datasilo::ParallelOpsWriter>> = {
         let estimated_rows = (body.len() / 100).max(1000);
-        let estimated_bytes = estimated_rows as u64 * 400; // ~300 bytes per doc + framing
+        // Multi-value phases have tiny doc ops (~30 bytes: header + Mi([one_i64])).
+        // Standard phases have larger ops (~300 bytes: many fields per row).
+        let has_multi_value = request.fields.iter().any(|f| multi_value_fields.contains(f.target()));
+        let bytes_per_row = if has_multi_value && request.fields.len() == 1 { 40 } else { 400 };
+        let estimated_bytes = estimated_rows as u64 * bytes_per_row;
         let ds = engine.docstore_arc();
         let ds_lock = ds.lock();
         match ds_lock.silo().prepare_parallel_ops(estimated_bytes) {
@@ -1646,7 +1644,7 @@ pub fn process_dump_with_progress(
             let mut deferred: Vec<(u32, u64)> = Vec::new();
             // Doc ops collected during parse — written to DataSilo after fold/reduce.
             // Doc ops collected per-row. Multi-value-only phases skip (post-pass handles it).
-            let mut doc_ops: Vec<(u64, Vec<u8>)> = if is_multi_value_only || pw_ref.is_some() {
+            let mut doc_ops: Vec<(u64, Vec<u8>)> = if pw_ref.is_some() {
                 Vec::new() // not needed when using parallel ops writer
             } else {
                 Vec::with_capacity(4096)
@@ -1831,7 +1829,7 @@ pub fn process_dump_with_progress(
                             if pub_secs > now_unix {
                                 // Write doc op (deferred rows need their doc data stored),
                                 // but skip all bitmap operations.
-                                if !is_multi_value_only {
+                                {
                                     let pw_arg = pw_ref.as_ref().map(|pw| (pw.as_ref(), &mut ops_local_cursor, &mut ops_local_end));
                                     let scratch = if pw_arg.is_some() { Some((&mut doc_encode_buf, &mut frame_buf)) } else { None };
                                     collect_doc_op(
@@ -2047,7 +2045,7 @@ pub fn process_dump_with_progress(
                 // Write doc op — directly to mmap if parallel writer available, else collect.
                 #[cfg(feature = "dump-timing")]
                 let _t_doc = std::time::Instant::now();
-                if !is_multi_value_only {
+                {
                     #[cfg(feature = "dump-timing")]
                     let _t_fc = std::time::Instant::now();
                     let mut doc_fields: Vec<(u16, DumpFieldValue)> = Vec::with_capacity(20);
@@ -2311,56 +2309,15 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
-    // Write doc ops to DataSilo ops log.
-    // Standard phases: per-row Merge ops already written during parse.
-    // Multi-value-only phases: bitmap inversion post-pass writes one Merge per unique slot.
+    // Flush doc ops to DataSilo ops log.
+    // All phases stream per-row Merge ops directly to mmap via ParallelOpsWriter during parse.
+    // Multi-value fields emit Mi([value]) per row; compaction concatenates arrays per slot.
     {
         let t_doc = Instant::now();
         let ds = engine.docstore_arc();
         let mut ds_lock = ds.lock();
 
-        if is_multi_value_only {
-            // Bitmap inversion post-pass: invert (value → bitmap) to (slot → [values]),
-            // then write one Merge op per unique slot. ~108M ops vs 4.5B per-row ops.
-            let target = request.fields[0].target();
-            if let Some(field_idx_val) = doc_field_to_idx.get(target) {
-                let fidx = *field_idx_val;
-                let mut slot_values: HashMap<u32, Vec<i64>> = HashMap::new();
-                if let Some(value_map) = merged_filters.get(target) {
-                    for (&value_id, bitmap) in value_map {
-                        for slot in bitmap.iter() {
-                            slot_values.entry(slot).or_default().push(value_id as i64);
-                        }
-                    }
-                }
-                let mv_count = slot_values.len();
-                if mv_count > 0 {
-                    if let Some(ref pw) = parallel_ops_writer {
-                        use rayon::prelude::*;
-                        let mv_entries: Vec<(u32, Vec<i64>)> = slot_values.into_iter().collect();
-                        mv_entries.par_iter().for_each(|(slot, values)| {
-                            let fields = vec![(fidx, PackedValue::Mi(values.clone()))];
-                            let bytes = crate::silos::doc_format::encode_merge_fields(*slot, &fields);
-                            let mut c = 0usize;
-                            let mut e = 0usize;
-                            pw.write_put(*slot as u64, &bytes, &mut c, &mut e);
-                        });
-                        ds_lock.silo().flush_ops()
-                            .map_err(|e| format!("flush_ops (multi-value parallel): {e}"))?;
-                    } else {
-                        let mv_ops: Vec<(u64, Vec<u8>)> = slot_values.into_iter().map(|(slot, values)| {
-                            let fields = vec![(fidx, PackedValue::Mi(values))];
-                            let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
-                            (slot as u64, bytes)
-                        }).collect();
-                        ds_lock.silo_mut().append_ops_batch(&mv_ops)
-                            .map_err(|e| format!("append_ops_batch (multi-value): {e}"))?;
-                    }
-                }
-                eprintln!("  Dump {}: multi-value post-pass wrote {} doc ops ({:.1}s)",
-                    request.name, mv_count, t_doc.elapsed().as_secs_f64());
-            }
-        } else if let Some(ref pw) = parallel_ops_writer {
+        if let Some(ref pw) = parallel_ops_writer {
             // Doc ops were already written directly to the mmap'd ops log during parse.
             // Check for overflow (correctness: dropped ops = missing docs)
             let dropped = pw.overflow_count.load(std::sync::atomic::Ordering::Relaxed);
