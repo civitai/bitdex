@@ -1240,28 +1240,27 @@ pub fn process_dump(
 
         // Convert sort_maps from HashMap<String, Vec<RoaringBitmap>> to HashMap<String, HashMap<usize, RoaringBitmap>>
         let sort_maps_indexed: HashMap<String, HashMap<usize, RoaringBitmap>> = result.sort_maps
-            .iter()
+            .into_iter()
             .map(|(name, layers)| {
                 let indexed: HashMap<usize, RoaringBitmap> = layers
-                    .iter()
+                    .into_iter()
                     .enumerate()
                     .filter(|(_, bm)| !bm.is_empty())
-                    .map(|(i, bm)| (i, bm.clone()))
                     .collect();
-                (name.clone(), indexed)
+                (name, indexed)
             })
             .collect();
 
-        // Convert AHashMap → std::HashMap for engine API boundary
+        // Convert AHashMap → std::HashMap for engine API boundary (into_iter = move, no clone)
         let filter_maps_std: std::collections::HashMap<String, std::collections::HashMap<u64, RoaringBitmap>> =
-            result.filter_maps.iter().map(|(k, v)| (k.clone(), v.iter().map(|(k2, v2)| (*k2, v2.clone())).collect())).collect();
+            result.filter_maps.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect();
         let sort_maps_std: std::collections::HashMap<String, std::collections::HashMap<usize, RoaringBitmap>> =
             sort_maps_indexed.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect();
         ConcurrentEngine::apply_bitmap_maps(
             &mut staging,
             filter_maps_std,
             sort_maps_std,
-            result.alive.clone(),
+            result.alive,
         );
 
         // Update slot counter to max_slot + 1 via from_state
@@ -1297,7 +1296,16 @@ pub fn process_dump(
     }
 
     eprintln!("  Dump {} total process_dump in {:.1}s", request.name, t_total.elapsed().as_secs_f64());
-    Ok(result)
+    // filter_maps and alive were consumed by apply_bitmap_maps (into_iter = move, not clone).
+    // Return with empty defaults — caller only uses row_count.
+    Ok(PhaseResult {
+        row_count: result.row_count,
+        filter_maps: HashMap::new(),
+        sort_maps: HashMap::new(),
+        alive: RoaringBitmap::new(),
+        deferred_slots: result.deferred_slots,
+        max_slot: result.max_slot,
+    })
 }
 
 /// Compact the doc silo after all dump phases complete.
