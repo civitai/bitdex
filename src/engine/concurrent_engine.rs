@@ -32,13 +32,6 @@ pub struct MetricsBridge {
     pub compaction_duration: prometheus::HistogramVec,
     pub index_name: String,
 }
-/// Thread-safe engine using ArcSwap for lock-free snapshot reads.
-///
-/// Writers call `put`/`delete` which compute diffs and send
-/// MutationOps to a channel. A background flush thread applies batched
-/// mutations to a private staging copy, then atomically publishes a
-/// new snapshot via ArcSwap::store().
-///
 /// Result of a compact_all() operation.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct CompactResult {
@@ -64,6 +57,8 @@ pub struct ConcurrentEngine {
     /// Sort index: per-field bit-layer bitmaps.
     pub(crate) sorts: Arc<parking_lot::RwLock<crate::engine::sort::SortIndex>>,
     pub(crate) sender: MutationSender,
+    /// Docstore write channel — test put() sends docs here; flush thread drains to disk.
+    #[allow(dead_code)]
     pub(crate) doc_tx: Sender<(u32, StoredDoc)>,
     pub(crate) docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
     pub(crate) config: Arc<Config>,

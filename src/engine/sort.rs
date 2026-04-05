@@ -523,13 +523,6 @@ impl SortIndex {
         }
     }
 
-    /// Copy a field's Arc from another SortIndex (refcount bump only, no data copy).
-    pub fn copy_field_arc_from(&mut self, source: &SortIndex, name: &str) {
-        if let Some(arc) = source.fields.get(name) {
-            self.fields.insert(name.to_string(), Arc::clone(arc));
-        }
-    }
-
     /// Build an unloaded version of a sort field from a source SortIndex.
     /// Preserves diff layers for any in-flight mutations.
     pub fn unload_from(&mut self, source: &SortIndex, name: &str) {
