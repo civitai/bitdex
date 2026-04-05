@@ -30,7 +30,7 @@ const KEY_META: u32 = 1;
 const KEY_BITMAP_START: u32 = 2;
 
 // Ops value type tags for bitmap mutations
-const OP_FULL_BITMAP: u8 = 0x00;  // Full frozen bitmap (from save_all/compaction)
+const OP_FULL_BITMAP: u8 = 0x00;  // Full frozen bitmap (from compaction or test fixtures)
 const OP_SET_BIT: u8 = 0x01;      // Set a single bit: [0x01][u32 slot]
 const OP_CLEAR_BIT: u8 = 0x02;    // Clear a single bit: [0x02][u32 slot]
 
@@ -112,6 +112,8 @@ impl BitmapSilo {
     // ── Save ────────────────────────────────────────────────────────────
 
     /// Save all bitmaps from the engine's in-memory state to the silo.
+    /// Used by tests to create frozen silo snapshots as test fixtures.
+    #[cfg(test)]
     pub fn save_all(
         &mut self,
         filters: &FilterIndex,
@@ -668,6 +670,25 @@ impl BitmapSilo {
     /// Compact the silo — merge ops into the data file, reclaim dead space.
     pub fn compact(&mut self) -> io::Result<u64> {
         self.silo.compact()
+    }
+
+    /// Persist metadata (slot_counter, cursors) to the silo ops log.
+    ///
+    /// Called by save_snapshot when using the ops-on-read path — the slot counter
+    /// and cursors live in memory and must be flushed to the silo so they survive
+    /// restarts. No need to re-serialize all bitmaps (they're already in the ops log).
+    pub fn save_meta(
+        &self,
+        slot_counter: u32,
+        cursors: &HashMap<String, String>,
+    ) -> io::Result<()> {
+        let meta = serde_json::json!({
+            "slot_counter": slot_counter,
+            "cursors": cursors,
+        });
+        let meta_bytes = serde_json::to_vec(&meta)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.silo.append_op(KEY_META, &meta_bytes)
     }
 
     // ── Frozen accessors (zero-copy from mmap) ────────────────────────

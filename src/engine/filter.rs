@@ -318,13 +318,6 @@ impl FilterIndex {
             *field_arc = Arc::new(new_field);
         }
     }
-    /// Copy a field's Arc from another FilterIndex (refcount bump only, no data copy).
-    /// Used to preserve skipped fields during save_and_unload.
-    pub fn copy_field_arc_from(&mut self, source: &FilterIndex, name: &str) {
-        if let Some(arc) = source.fields.get(name) {
-            self.fields.insert(name.to_string(), Arc::clone(arc));
-        }
-    }
     /// Build an unloaded version of a field from a source FilterIndex.
     /// Only preserves entries with pending diffs; all clean entries are dropped.
     pub fn unload_from(&mut self, source: &FilterIndex, name: &str) {
@@ -338,10 +331,6 @@ impl FilterIndex {
             }
             self.fields.insert(name.to_string(), Arc::new(new_field));
         }
-    }
-    /// Get the total number of bitmaps across all fields.
-    pub fn total_bitmap_count(&self) -> usize {
-        self.fields.values().map(|f| f.bitmap_count()).sum()
     }
     /// Return the serialized byte size of all bitmaps across all fields.
     pub fn bitmap_bytes(&self) -> usize {

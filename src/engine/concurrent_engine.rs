@@ -32,22 +32,6 @@ pub struct MetricsBridge {
     pub compaction_duration: prometheus::HistogramVec,
     pub index_name: String,
 }
-/// Staging buffer used by bulk-load paths (apply_bitmap_maps).
-/// Callers build bitmaps into this struct offline and then call publish_staging()
-/// to atomically swap its contents into the live engine under write locks.
-#[derive(Clone)]
-pub struct InnerEngine {
-    pub slots: crate::engine::slot::SlotAllocator,
-    pub filters: crate::engine::filter::FilterIndex,
-    pub sorts: crate::engine::sort::SortIndex,
-}
-/// Thread-safe engine using ArcSwap for lock-free snapshot reads.
-///
-/// Writers call `put`/`delete` which compute diffs and send
-/// MutationOps to a channel. A background flush thread applies batched
-/// mutations to a private staging copy, then atomically publishes a
-/// new snapshot via ArcSwap::store().
-///
 /// Result of a compact_all() operation.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct CompactResult {
@@ -63,8 +47,8 @@ pub struct CompactResult {
 /// multiple readers share access lock-free while flush thread holds
 /// write locks only for the duration of batch application.
 ///
-/// Bulk-load callers use `clone_staging()` + `apply_bitmap_maps()` to build
-/// bitmaps offline and `publish_staging()` to swap them in.
+/// Bulk-load callers use `merge_bitmap_maps()` to OR-merge pre-built bitmaps
+/// directly into the live state under write locks.
 pub struct ConcurrentEngine {
     /// Slot allocator: alive bitmap + slot counter + deferred alive set.
     pub(crate) slots: Arc<parking_lot::RwLock<crate::engine::slot::SlotAllocator>>,
@@ -73,6 +57,8 @@ pub struct ConcurrentEngine {
     /// Sort index: per-field bit-layer bitmaps.
     pub(crate) sorts: Arc<parking_lot::RwLock<crate::engine::sort::SortIndex>>,
     pub(crate) sender: MutationSender,
+    /// Docstore write channel — test put() sends docs here; flush thread drains to disk.
+    #[allow(dead_code)]
     pub(crate) doc_tx: Sender<(u32, StoredDoc)>,
     pub(crate) docstore: Arc<parking_lot::Mutex<DocSiloAdapter>>,
     pub(crate) config: Arc<Config>,
@@ -83,8 +69,6 @@ pub struct ConcurrentEngine {
     /// Dirty flag: flush/write paths set true so the merge thread persists on next cycle.
     pub(crate) dirty_flag: Arc<AtomicBool>,
     pub(crate) time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
-    /// Pending bucket diffs for lazy application on cache reads.
-    pub(crate) pending_bucket_diffs: Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,
     /// Reverse string maps for MappedString field query resolution.
     pub(crate) string_maps: Option<Arc<StringMaps>>,
     /// Fields where string matching is case-sensitive (default is case-insensitive).
@@ -390,7 +374,6 @@ impl ConcurrentEngine {
                 merge_handle: None,
                 dirty_flag,
                 time_buckets,
-                pending_bucket_diffs: Arc::clone(&pending_bucket_diffs),
                 string_maps: None,
                 case_sensitive_fields: None,
                 dictionaries: Arc::new(HashMap::new()),
@@ -419,7 +402,6 @@ impl ConcurrentEngine {
             let shutdown = Arc::clone(&shutdown);
             let docstore = Arc::clone(&docstore);
             let flush_interval_us = config.flush_interval_us;
-            let flush_cache_silo = cache_silo_arc.clone();
             let flush_dirty_flag = Arc::clone(&dirty_flag);
             let flush_time_buckets = time_buckets.as_ref().map(Arc::clone);
             let flush_pending_diffs = Arc::clone(&pending_bucket_diffs);
@@ -446,7 +428,6 @@ impl ConcurrentEngine {
                     shutdown,
                     docstore,
                     flush_interval_us,
-                    cache_silo: flush_cache_silo,
                     dirty_flag: flush_dirty_flag,
                     time_buckets: flush_time_buckets,
                     pending_diffs: flush_pending_diffs,
@@ -504,7 +485,6 @@ impl ConcurrentEngine {
             merge_handle: Some(merge_handle),
             dirty_flag,
             time_buckets,
-            pending_bucket_diffs,
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
@@ -745,10 +725,6 @@ impl ConcurrentEngine {
         ops.push(MutationOp::AliveRemove { slots: vec![id] });
         self.send_mutation_ops(ops)
     }
-    /// Clone the current live state into an InnerEngine. Public API for tests and tools.
-    pub fn snapshot_public(&self) -> InnerEngine {
-        self.clone_staging()
-    }
     /// Get the number of alive documents.
     pub fn alive_count(&self) -> u64 {
         self.slots.read().alive_count()
@@ -776,6 +752,11 @@ impl ConcurrentEngine {
     /// Get the high-water mark slot counter.
     pub fn slot_counter(&self) -> u32 {
         self.slots.read().slot_counter()
+    }
+    /// Reconstruct the sort value for a given slot in the named sort field.
+    /// Returns None if the field is not found in the in-memory sort index.
+    pub fn reconstruct_sort_value(&self, field: &str, slot: u32) -> Option<u32> {
+        self.sorts.read().get_field(field).map(|f| f.reconstruct_value(slot))
     }
     // ---- Named cursors ----
     /// Set a named cursor value. The value is persisted to disk at the next
@@ -981,13 +962,37 @@ impl ConcurrentEngine {
         Ok(())
     }
     /// Save a full snapshot: bitmaps to BitmapSilo, field dict to disk.
+    ///
+    /// When a live BitmapSilo is present (ops-on-read path), all bitmap mutations have
+    /// already been written to the silo ops log via `send_mutation_ops`. This method
+    /// flushes the remaining in-memory state (slot_counter, cursors) to the silo and
+    /// compacts the ops log into a frozen snapshot, then saves the field dictionary.
+    ///
+    /// When no live silo exists (no-silo fallback for tests), this is a no-op for bitmaps.
     pub fn save_snapshot(&self) -> Result<()> {
         // Save field dictionary
         self.docstore.lock().save_field_dict()
             .map_err(|e| crate::error::BitdexError::Storage(format!("save_field_dict: {e}")))?;
 
-        // Save bitmaps to BitmapSilo (parallel: rayon serialize + lock-free ops log writes)
-        if let Some(ref bitmap_path) = self.config.storage.bitmap_path {
+        if let Some(ref silo_arc) = self.bitmap_silo {
+            // Live-silo path (ops-on-read): bitmaps already written incrementally.
+            // Only need to flush metadata (slot_counter, cursors) and compact ops log.
+            let cursors = self.cursors.lock().clone();
+            let slot_counter = self.slots.read().slot_counter();
+            {
+                let silo = silo_arc.read();
+                silo.save_meta(slot_counter, &cursors)
+                    .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_meta: {e}")))?;
+            }
+            {
+                let mut silo = silo_arc.write();
+                let count = silo.compact()
+                    .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::compact: {e}")))?;
+                eprintln!("save_snapshot: compacted {} silo entries", count);
+            }
+        } else if let Some(ref bitmap_path) = self.config.storage.bitmap_path {
+            // No live silo (e.g. engine started fresh, no prior snapshot to restore from).
+            // Fall back to serializing the full in-memory state to a new silo.
             let cursors = self.cursors.lock().clone();
             let filters_r = self.filters.read();
             let sorts_r = self.sorts.read();
@@ -996,12 +1001,16 @@ impl ConcurrentEngine {
                 .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
             let count = silo.save_all_parallel(&*filters_r, &*sorts_r, &*slots_r, &cursors)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all_parallel: {e}")))?;
-            eprintln!("save_snapshot: saved {} bitmaps to BitmapSilo (parallel)", count);
+            eprintln!("save_snapshot: wrote {} bitmaps to new silo (no prior snapshot)", count);
         }
 
         Ok(())
     }
     /// Save a full snapshot to a custom path.
+    ///
+    /// Serializes the current in-memory bitmap state to the given path. Used by
+    /// the benchmark persist/restore phase to write a snapshot of an engine that
+    /// was loaded without a bitmap_path (no live silo).
     pub fn save_snapshot_to(&self, path: &Path) -> Result<()> {
         let cursors = self.cursors.lock().clone();
         let filters_r = self.filters.read();
@@ -1009,33 +1018,20 @@ impl ConcurrentEngine {
         let slots_r = self.slots.read();
         let mut silo = crate::silos::bitmap_silo::BitmapSilo::open(path)
             .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::open: {e}")))?;
-        silo.save_all_parallel(&*filters_r, &*sorts_r, &*slots_r, &cursors)
+        let count = silo.save_all_parallel(&*filters_r, &*sorts_r, &*slots_r, &cursors)
             .map_err(|e| crate::error::BitdexError::Storage(format!("BitmapSilo::save_all_parallel: {e}")))?;
+        eprintln!("save_snapshot_to: saved {} bitmaps", count);
         Ok(())
     }
-    /// Internal: zero-copy snapshot serialization via BitmapSilo.
+    /// Save the current snapshot to disk (via BitmapSilo) and replace the in-memory
+    /// filter/sort state with empty unloaded versions to free memory.
     ///
-    /// Reads the published snapshot through Arc refs — no InnerEngine clone.
-    /// Uses `fused_cow()` to borrow base bitmaps directly (zero copy when clean)
-    /// or create temporary merged bitmaps (only when dirty). Processes one field
-    /// at a time so memory overhead is minimal (~1.7 MB for tagIds' 31K Cow refs).
-    ///
-    /// Skips fields that haven't been loaded yet (still pending lazy-load) to avoid
-    /// overwriting real persisted data with empty placeholders.
-    /// Save the current snapshot to disk, then unload all loaded fields from memory.
-    /// After this call, bitmap memory drops to near-zero — fields are marked pending
-    /// and will lazy-load from disk on the next query that touches them.
-    ///
-    /// The unload is routed through the flush thread's command channel so that
-    /// the flush thread's private staging is also replaced. This prevents the
-    /// old staging from re-inflating the snapshot on the next publish cycle.
-    ///
-    /// Safe with concurrent mutations: the flush thread drains any pending
-    /// mutations and applies them to the unloaded staging's diff layers before
-    /// publishing.
-    /// Save the current snapshot to disk (via BitmapSilo) and publish a fresh unloaded state.
-    /// With BitmapSilo, all bitmaps are in the silo mmap — no lazy reload tracking needed.
+    /// With BitmapSilo, all bitmap mutations are already in the silo ops log. This
+    /// method flushes metadata, compacts the silo, then resets the in-memory indexes
+    /// so memory drops to near-zero. Queries are served from the silo mmap after this.
     pub fn save_and_unload(&self) -> Result<()> {
+        // First, flush metadata and compact the silo so the snapshot is durable.
+        self.save_snapshot()?;
         // Build an unloaded staging buffer: keep slots (always needed), empty filter/sort fields.
         let (new_slots, new_filters, new_sorts) = {
             let slots_r = self.slots.read();
@@ -1107,55 +1103,46 @@ impl ConcurrentEngine {
         Ok(result)
     }
 
-    /// Publish a staging InnerEngine as the current live state and invalidate all caches.
-    ///
-    /// Called after bulk-load paths that build bitmaps offline. Takes write locks
-    /// on all three fields briefly to swap in the new state.
-    pub fn publish_staging(&self, staging: InnerEngine) {
-        *self.slots.write() = staging.slots;
-        *self.filters.write() = staging.filters;
-        *self.sorts.write() = staging.sorts;
-        self.dirty_flag.store(true, Ordering::Release);
-        self.invalidate_all_caches();
-    }
-    /// Clone the current live state into a staging InnerEngine for offline mutation.
-    pub fn clone_staging(&self) -> InnerEngine {
-        let slots_r = self.slots.read();
-        let filters_r = self.filters.read();
-        let sorts_r = self.sorts.read();
-        InnerEngine {
-            slots: slots_r.clone(),
-            filters: filters_r.clone(),
-            sorts: sorts_r.clone(),
-        }
-    }
     fn invalidate_all_caches(&self) {
         // CacheSilo entries become stale after bulk loads; they'll be recomputed on miss.
         // Full purge via clear_cache() is available if needed.
     }
-    /// Apply pre-built bitmap maps directly to a staging snapshot.
-    /// Used by the fused parse+bitmap loader to skip the decompose/merge/apply pipeline.
-    pub fn apply_bitmap_maps(
-        staging: &mut InnerEngine,
+    /// Merge pre-built bitmap maps directly into the live engine state.
+    ///
+    /// Used by the NDJSON loader to apply accumulated bitmaps from a parsed chunk
+    /// without the staging InnerEngine pattern. Takes write locks briefly to OR-merge
+    /// filter/sort bitmaps and alive bits into the existing live state.
+    pub fn merge_bitmap_maps(
+        &self,
         filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>>,
         sort_maps: HashMap<String, HashMap<usize, RoaringBitmap>>,
         alive: RoaringBitmap,
     ) {
-        for (field_name, value_map) in filter_maps {
-            if let Some(field) = staging.filters.get_field_mut(&field_name) {
-                for (value, bitmap) in value_map {
-                    field.or_bitmap(value, &bitmap);
+        {
+            let mut filters_w = self.filters.write();
+            for (field_name, value_map) in filter_maps {
+                if let Some(field) = filters_w.get_field_mut(&field_name) {
+                    for (value, bitmap) in value_map {
+                        field.or_bitmap(value, &bitmap);
+                    }
                 }
             }
         }
-        for (field_name, bit_map) in sort_maps {
-            if let Some(field) = staging.sorts.get_field_mut(&field_name) {
-                for (bit, bitmap) in bit_map {
-                    field.or_layer(bit, &bitmap);
+        {
+            let mut sorts_w = self.sorts.write();
+            for (field_name, bit_map) in sort_maps {
+                if let Some(field) = sorts_w.get_field_mut(&field_name) {
+                    for (bit, bitmap) in bit_map {
+                        field.or_layer(bit, &bitmap);
+                    }
                 }
             }
         }
-        staging.slots.alive_or_bitmap(&alive);
+        {
+            self.slots.write().alive_or_bitmap(&alive);
+        }
+        self.dirty_flag.store(true, Ordering::Release);
+        self.invalidate_all_caches();
     }
     /// Signal background threads to stop (non-blocking, works through Arc).
     /// Threads will exit on their next loop iteration. Use this when you can't

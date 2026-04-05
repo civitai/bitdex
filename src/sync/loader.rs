@@ -4,11 +4,12 @@
 //! Three-stage pipeline:
 //!   Stage 1 (reader thread): reads raw bytes from disk into blocks
 //!   Stage 2 (parse thread):  rayon fold+reduce → bitmap maps + full docs (fused)
-//!   Stage 3 (main thread):   apply bitmaps to staging + async docstore writes
+//!   Stage 3 (main thread):   merge bitmaps into live engine state + async docstore writes
 //!
 //! Key optimization: bitmaps are built directly from JSON during parse — no
 //! intermediate Document allocation for the bitmap path. The old decompose/merge
-//! pipeline in put_bulk_into is bypassed entirely.
+//! pipeline in put_bulk_into is bypassed entirely. Bitmaps are merged directly
+//! into the live engine via merge_bitmap_maps() — no staging InnerEngine clone needed.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -443,7 +444,6 @@ pub fn load_ndjson(
     });
 
     // ---- Stage 3: Apply bitmaps + docstore (main thread) ----
-    let mut staging = engine.clone_staging();
     let mut total_inserted: usize = 0;
     let mut total_errors: u64 = 0;
     let mut chunks_processed: usize = 0;
@@ -456,14 +456,9 @@ pub fn load_ndjson(
         total_errors += chunk.errors;
         let chunk_count = chunk.count;
 
-        // Apply pre-built bitmaps directly to staging — no decompose/merge needed
+        // Apply pre-built bitmaps directly to the live engine state — no staging InnerEngine.
         let t0 = Instant::now();
-        ConcurrentEngine::apply_bitmap_maps(
-            &mut staging,
-            chunk.filter_maps,
-            chunk.sort_maps,
-            chunk.alive,
-        );
+        engine.merge_bitmap_maps(chunk.filter_maps, chunk.sort_maps, chunk.alive);
         let apply_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         total_inserted += chunk_count;
@@ -495,9 +490,6 @@ pub fn load_ndjson(
     for h in ds_handles {
         h.join().unwrap();
     }
-
-    // Publish staging snapshot
-    engine.publish_staging(staging);
 
     let elapsed = wall_start.elapsed();
     let rate = total_inserted as f64 / elapsed.as_secs_f64();
