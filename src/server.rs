@@ -4410,16 +4410,8 @@ async fn handle_register_dump(
                         crate::sync::dump_processor::reload_after_dumps(&engine_for_reload, true);
                     }
 
-                    // Save bitmaps + compact doc silo after each phase completes.
-                    // (Moved out of process_dump to measure separately.)
-                    if engine_for_reload.config().storage.bitmap_path.is_some() {
-                        let t_save = std::time::Instant::now();
-                        if let Err(e) = engine_for_reload.save_snapshot() {
-                            eprintln!("WARNING: save_snapshot after dump '{}': {e}", dump_name_inner);
-                        } else {
-                            eprintln!("  Dump {} save_snapshot in {:.1}s", dump_name_inner, t_save.elapsed().as_secs_f64());
-                        }
-                    }
+                    // Bitmaps already written to BitmapSilo in process_dump (direct write).
+                    // Only need to compact the doc silo.
                     {
                         let t_compact = std::time::Instant::now();
                         if let Err(e) = crate::sync::dump_processor::compact_after_dumps(&engine_for_reload) {

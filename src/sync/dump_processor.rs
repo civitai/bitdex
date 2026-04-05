@@ -1232,8 +1232,8 @@ pub fn process_dump(
 
     let result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema, slot_watermark.as_ref(), shutdown.as_ref())?;
 
-    // Bitmaps applied to staging inside process_dump_with_progress (fused with merge).
-    // save_snapshot and doc compact deferred to after all phases complete.
+    // Bitmaps written directly to BitmapSilo inside process_dump_with_progress.
+    // Doc compact deferred to after all phases complete.
 
     // Persist LCS dictionaries after each phase.
     if let Some(ref bitmap_path) = engine.config().storage.bitmap_path {
@@ -1259,17 +1259,14 @@ pub fn compact_after_dumps(engine: &ConcurrentEngine) -> Result<(), String> {
 }
 
 /// Post-dump hook. Called after the last dump phase completes.
-/// With DataSilo, bitmaps are already applied to engine staging during process_dump.
-/// No disk reload needed — bitmaps are in-memory.
+/// Bitmaps are written directly to BitmapSilo during process_dump.
+/// Queries read from BitmapSilo via ops-on-read. Just clear caches.
 pub fn reload_after_dumps(engine: &ConcurrentEngine, _had_alive_phase: bool) {
-    // Bitmaps are already in the engine staging from process_dump's apply_bitmap_maps.
-    // No need to mark fields for lazy reload from disk (BitmapSilo Phase 5).
-    // Just clear the unified cache to ensure queries see fresh bitmap data.
     engine.clear_cache();
-    let snap = engine.snapshot_public();
+    let alive_count = engine.alive_count();
     eprintln!(
-        "  Dump reload: alive={}, no disk reload needed (bitmaps applied in-memory)",
-        snap.slots.alive_count()
+        "  Dump reload: alive={}, bitmaps in BitmapSilo (direct write)",
+        alive_count
     );
 }
 
@@ -2396,41 +2393,48 @@ pub fn process_dump_with_progress(
         total_count as f64 / elapsed.as_secs_f64().max(0.001)
     );
 
-    // Apply bitmaps directly to engine staging — fused with merge, no intermediate copy.
+    // Write bitmaps directly to BitmapSilo — no staging roundtrip.
     let t_apply = Instant::now();
     {
-        let mut staging = engine.clone_staging();
-
-        // Convert sort_maps to indexed format and apply directly (into_iter = move, no clone)
-        let sort_maps_indexed: std::collections::HashMap<String, std::collections::HashMap<usize, RoaringBitmap>> =
-            merged_sorts.into_iter().map(|(name, layers)| {
-                let indexed: std::collections::HashMap<usize, RoaringBitmap> = layers
-                    .into_iter().enumerate().filter(|(_, bm)| !bm.is_empty()).collect();
-                (name, indexed)
-            }).collect();
+        // Convert AHashMaps to std::collections::HashMap for BitmapSilo API
         let filter_maps_std: std::collections::HashMap<String, std::collections::HashMap<u64, RoaringBitmap>> =
             merged_filters.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect();
+        let sort_maps_std: std::collections::HashMap<String, Vec<RoaringBitmap>> =
+            merged_sorts.into_iter().collect();
 
-        ConcurrentEngine::apply_bitmap_maps(&mut staging, filter_maps_std, sort_maps_indexed, merged_alive);
+        // Compute new slot counter
+        let current_counter = engine.slot_counter();
+        let new_counter = if max_slot > 0 && max_slot + 1 > current_counter {
+            max_slot + 1
+        } else {
+            current_counter
+        };
 
-        // Update slot counter
-        if max_slot > 0 {
-            let current_counter = staging.slots.slot_counter();
-            if max_slot + 1 > current_counter {
-                staging.slots = crate::engine::slot::SlotAllocator::from_state(
-                    max_slot + 1,
-                    staging.slots.alive_bitmap().clone(),
+        // Write directly to BitmapSilo (frozen serialize + batch write)
+        if let Some(ref silo_arc) = engine.bitmap_silo {
+            let cursors = engine.get_all_cursors();
+            let mut silo = silo_arc.write();
+            silo.write_dump_maps(filter_maps_std, sort_maps_std, &merged_alive, new_counter, &cursors)
+                .map_err(|e| format!("BitmapSilo::write_dump_maps: {e}"))?;
+        }
+
+        // Update engine's in-memory slot state (alive + counter + deferred)
+        {
+            let mut slots_w = engine.slots.write();
+            slots_w.alive_or_bitmap(&merged_alive);
+            if new_counter > slots_w.slot_counter() {
+                *slots_w = crate::engine::slot::SlotAllocator::from_state(
+                    new_counter,
+                    slots_w.alive_bitmap().clone(),
                     roaring::RoaringBitmap::new(),
                 );
             }
+            if !merged_deferred.is_empty() {
+                slots_w.set_deferred(merged_deferred.clone());
+            }
         }
-        if !merged_deferred.is_empty() {
-            staging.slots.set_deferred(merged_deferred.clone());
-        }
-
-        engine.publish_staging(staging);
     }
-    eprintln!("  Dump {} apply_bitmaps in {:.1}s", request.name, t_apply.elapsed().as_secs_f64());
+    eprintln!("  Dump {} write_to_silo in {:.1}s", request.name, t_apply.elapsed().as_secs_f64());
 
     Ok(PhaseResult {
         row_count: total_count,
