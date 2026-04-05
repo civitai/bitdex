@@ -47,7 +47,7 @@ impl ConcurrentEngine {
             tb_guard.as_deref().map(|tb| (tb, now_unix)),
         );
         let (filter_arc, use_simple_sort) =
-            self.resolve_filters(&executor, filters, tb_guard.as_deref(), now_unix)?;
+            self.resolve_filters(&executor, filters, tb_guard.as_deref(), now_unix, silo_guard.as_deref())?;
         let result =
             executor.execute_from_bitmap(&filter_arc, sort, limit, None, use_simple_sort)?;
         Ok(result)
@@ -98,6 +98,7 @@ impl ConcurrentEngine {
                 now_secs: now_unix,
                 tolerance_pct: 0.10,
                 always_snap: true,
+                bitmap_silo: silo_guard.as_deref(),
             };
             snapped_filters = crate::query::snap_range_clauses(&query.filters, &ctx);
             &snapped_filters[..]
@@ -213,9 +214,9 @@ impl ConcurrentEngine {
         let filter_start = Instant::now();
         let (filter_arc, use_simple_sort) = if let Some(ref c) = collector {
             let _ = c;
-            self.resolve_filters(&executor, effective_filters, tb_guard.as_deref(), now_unix)?
+            self.resolve_filters(&executor, effective_filters, tb_guard.as_deref(), now_unix, silo_guard.as_deref())?
         } else {
-            self.resolve_filters(&executor, effective_filters, tb_guard.as_deref(), now_unix)?
+            self.resolve_filters(&executor, effective_filters, tb_guard.as_deref(), now_unix, silo_guard.as_deref())?
         };
         let filter_elapsed = filter_start.elapsed();
         let full_total_matched = filter_arc.len();
@@ -393,6 +394,7 @@ impl ConcurrentEngine {
         filters: &[FilterClause],
         time_buckets: Option<&TimeBucketManager>,
         now_unix: u64,
+        silo: Option<&crate::silos::bitmap_silo::BitmapSilo>,
     ) -> Result<(Arc<roaring::RoaringBitmap>, bool)> {
         // Snap range filters to pre-computed time bucket bitmaps (C3).
         // This must happen BEFORE canonicalization so cache keys use stable
@@ -406,6 +408,7 @@ impl ConcurrentEngine {
                 now_secs: now_unix,
                 tolerance_pct: 0.10,
                 always_snap: true,
+                bitmap_silo: silo,
             };
             snapped = crate::query::snap_range_clauses(filters, &ctx);
             &snapped[..]
