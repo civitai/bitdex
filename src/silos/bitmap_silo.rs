@@ -275,6 +275,108 @@ impl BitmapSilo {
         Ok(count)
     }
 
+    /// Write dump-produced bitmap maps directly to the silo (no staging roundtrip).
+    ///
+    /// Takes the raw HashMaps from the dump merge phase, serializes each bitmap
+    /// in frozen format via rayon, and writes them all to the data file in one
+    /// batch. This bypasses the V2 clone_staging → apply → publish → save_snapshot
+    /// pipeline entirely.
+    pub fn write_dump_maps(
+        &mut self,
+        filter_maps: std::collections::HashMap<String, std::collections::HashMap<u64, RoaringBitmap>>,
+        sort_maps: std::collections::HashMap<String, Vec<RoaringBitmap>>,
+        alive: &RoaringBitmap,
+        slot_counter: u32,
+        cursors: &std::collections::HashMap<String, String>,
+    ) -> io::Result<u64> {
+        use rayon::prelude::*;
+
+        // Alive bitmap
+        let alive_size = alive.frozen_serialized_size();
+        let mut alive_buf = vec![0u8; alive_size];
+        alive.serialize_frozen_into(&mut alive_buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("frozen serialize alive: {e:?}")))?;
+
+        // Metadata
+        let meta = serde_json::json!({
+            "slot_counter": slot_counter,
+            "cursors": cursors,
+        });
+        let meta_bytes = serde_json::to_vec(&meta)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Assign silo keys for all bitmaps
+        let name_to_key = &self.name_to_key;
+        let key_to_name = &self.key_to_name;
+        let next_key = &self.next_key;
+        let ensure = |name: &str| -> u32 {
+            if let Some(&key) = name_to_key.read().get(name) { return key; }
+            let mut map = name_to_key.write();
+            if let Some(&key) = map.get(name) { return key; }
+            let key = next_key.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            map.insert(name.to_string(), key);
+            key_to_name.write().insert(key, name.to_string());
+            key
+        };
+
+        // Collect filter bitmap (key, bitmap) pairs
+        let filter_items: Vec<(u32, RoaringBitmap)> = filter_maps.into_iter()
+            .flat_map(|(field_name, value_map)| {
+                value_map.into_iter().map(move |(value, bitmap)| {
+                    let name = format!("filter:{}:{}", field_name, value);
+                    let key = ensure(&name);
+                    (key, bitmap)
+                })
+            })
+            .collect();
+
+        // Collect sort bitmap (key, bitmap) pairs
+        let sort_items: Vec<(u32, RoaringBitmap)> = sort_maps.into_iter()
+            .flat_map(|(field_name, layers)| {
+                layers.into_iter().enumerate()
+                    .filter(|(_, bm)| !bm.is_empty())
+                    .map(move |(bit_idx, bitmap)| {
+                        let name = format!("sort:{}:{}", field_name, bit_idx);
+                        let key = ensure(&name);
+                        (key, bitmap)
+                    })
+            })
+            .collect();
+
+        // Parallel serialize to frozen bytes
+        let filter_bufs: Vec<(u32, Vec<u8>)> = filter_items.par_iter()
+            .map(|(key, bitmap)| {
+                let size = bitmap.frozen_serialized_size();
+                let mut buf = vec![0u8; size];
+                bitmap.serialize_frozen_into(&mut buf).ok();
+                (*key, buf)
+            })
+            .collect();
+
+        let sort_bufs: Vec<(u32, Vec<u8>)> = sort_items.par_iter()
+            .map(|(key, bitmap)| {
+                let size = bitmap.frozen_serialized_size();
+                let mut buf = vec![0u8; size];
+                bitmap.serialize_frozen_into(&mut buf).ok();
+                (*key, buf)
+            })
+            .collect();
+
+        // Combine and write in one batch
+        let mut all_entries: Vec<(u32, Vec<u8>)> = Vec::with_capacity(
+            2 + filter_bufs.len() + sort_bufs.len()
+        );
+        all_entries.push((KEY_ALIVE, alive_buf));
+        all_entries.push((KEY_META, meta_bytes));
+        all_entries.extend(filter_bufs);
+        all_entries.extend(sort_bufs);
+
+        let count = self.silo.write_batch_parallel(&all_entries)?;
+        self.save_manifest()?;
+
+        Ok(count)
+    }
+
     // ── Load ────────────────────────────────────────────────────────────
 
     /// Load metadata from the silo.

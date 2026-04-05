@@ -29,3 +29,16 @@ tempfile = "3"
 rmp-serde = "1"
 rmpv = "1"
 crc32fast = "1"
+ahash = "0.8"
+
+[[bin]]
+name = "frozen_merge_bench"
+path = "src/bin/frozen_merge_bench.rs"
+
+[[bin]]
+name = "filter_insert_bench"
+path = "src/bin/filter_insert_bench.rs"
+
+[[bin]]
+name = "bitmap_merge_strategies"
+path = "src/bin/bitmap_merge_strategies.rs"

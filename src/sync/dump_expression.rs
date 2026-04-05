@@ -12,7 +12,7 @@
 //!
 //! All expressions evaluate against a `CsvRow` (column name → optional string value).
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::fmt;
 
 /// A row of CSV data: column name → optional string value.

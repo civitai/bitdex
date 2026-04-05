@@ -340,6 +340,10 @@ struct AppState {
     /// Toggleable metric groups — disable expensive metrics without redeploy.
     /// Default: all enabled. PATCH /config to toggle at runtime.
     metrics_bitmap_memory: AtomicBool,
+    /// Read-only mode: serve queries but reject all write operations with 503.
+    /// Used during zero-downtime rolling deploys — the new pod starts read-only
+    /// and promotes to read-write when the old pod releases the writer lock.
+    read_only: AtomicBool,
     /// WAL writer for V2 ops endpoint. Created lazily on first ops POST.
     #[cfg(feature = "pg-sync")]
     ops_wal: Mutex<Option<crate::ops_wal::WalWriter>>,
@@ -411,6 +415,22 @@ async fn require_admin(
             }
         }
     }
+}
+
+/// Middleware: reject all requests with 503 when the server is in read-only mode.
+/// Applied to admin routes so that create/update/delete operations are blocked
+/// during zero-downtime rolling deploys until this pod acquires the writer lock.
+async fn reject_if_read_only(
+    State(state): State<SharedState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if state.read_only.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({
+            "error": "read-only mode: this instance is not the active writer"
+        }))).into_response();
+    }
+    next.run(req).await
 }
 
 /// Middleware: record requests/responses to the caplog when capture is active.
@@ -980,11 +1000,14 @@ pub struct BitdexServer {
     admin_token: Option<String>,
     max_query_concurrency: u32,
     trace_buffer_size: usize,
+    /// Start in read-only mode. Write endpoints return 503.
+    /// Used for zero-downtime deploys where this pod hasn't yet acquired the writer lock.
+    read_only: bool,
 }
 
 impl BitdexServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, index_dir: None, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0, trace_buffer_size: 1000 }
+        Self { data_dir, index_dir: None, rebuild: false, default_query_format: None, enable_traces: false, admin_token: None, max_query_concurrency: 0, trace_buffer_size: 1000, read_only: false }
     }
 
     /// Set external index config directory (e.g. ConfigMap mount path).
@@ -1035,6 +1058,13 @@ impl BitdexServer {
         self
     }
 
+    /// Start in read-only mode. Write endpoints (ops, dumps, admin) return 503.
+    /// The server can be promoted to read-write at runtime by clearing the flag.
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
     /// Start the HTTP server. Blocks until the server shuts down.
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
         // Ensure data directory exists
@@ -1069,6 +1099,7 @@ impl BitdexServer {
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
             capture: crate::capture::CaptureManager::new(&self.data_dir),
             metrics_bitmap_memory: AtomicBool::new(true),
+            read_only: AtomicBool::new(self.read_only),
             #[cfg(feature = "pg-sync")]
             ops_wal: Mutex::new(None),
             #[cfg(feature = "pg-sync")]
@@ -1129,9 +1160,13 @@ impl BitdexServer {
             }
         }
 
-        // Spawn WAL reader thread if pg-sync feature is enabled and index exists
+        // Spawn WAL reader thread if pg-sync feature is enabled and index exists.
+        // Skip in read-only mode — only the writer pod should process WAL ops.
         #[cfg(feature = "pg-sync")]
-        let _wal_handle: Option<std::thread::JoinHandle<()>> = {
+        let _wal_handle: Option<std::thread::JoinHandle<()>> = if self.read_only {
+            eprintln!("Read-only mode: skipping WAL reader thread");
+            None
+        } else {
             let wal_dir = self.data_dir.join("wal");
             let wal_state = Arc::clone(&state);
             std::thread::Builder::new()
@@ -1294,6 +1329,13 @@ impl BitdexServer {
                 .ok()
         };
 
+        // Log server mode
+        if self.read_only {
+            eprintln!("Server mode: READ-ONLY (write endpoints return 503, waiting for writer lock)");
+        } else {
+            eprintln!("Server mode: READ-WRITE");
+        }
+
         let shutdown_state = Arc::clone(&state);
 
         // Admin routes — require Bearer token (or disabled if no token configured)
@@ -1328,6 +1370,7 @@ impl BitdexServer {
             .route("/debug/snapshots", get(handle_snapshots_list))
             .route("/debug/rescan-memory", post(handle_rescan_memory))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
+            .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), reject_if_read_only))
             .with_state(Arc::clone(&state));
 
         // Public routes — no auth required
@@ -2853,19 +2896,6 @@ async fn handle_stats(
     let (slot_bytes, filter_bytes, sort_bytes) = tokio::task::spawn_blocking(move || {
         engine2.bitmap_memory_totals()
     }).await.unwrap_or((0, 0, 0));
-    let uc = engine.unified_cache_stats();
-    let entries: Vec<serde_json::Value> = engine.unified_cache_entry_details().into_iter().map(|e| {
-        serde_json::json!({
-            "sort_field": e.sort_field,
-            "direction": e.direction,
-            "filter_count": e.filter_count,
-            "cardinality": e.cardinality,
-            "capacity": e.capacity,
-            "max_capacity": e.max_capacity,
-            "has_more": e.has_more,
-            "min_tracked_value": e.min_tracked_value,
-        })
-    }).collect();
     Json(serde_json::json!({
         "alive_count": engine.alive_count(),
         "slot_count": engine.slot_counter(),
@@ -2873,18 +2903,6 @@ async fn handle_stats(
         "slot_bitmap_bytes": slot_bytes,
         "filter_bitmap_bytes": filter_bytes,
         "sort_bitmap_bytes": sort_bytes,
-        "unified_cache_entries": uc.entries,
-        "unified_cache_hits": uc.hits,
-        "unified_cache_misses": uc.misses,
-        "unified_cache_bytes": uc.memory_bytes,
-        "unified_cache_meta_entries": uc.meta_index_entries,
-        "unified_cache_meta_bytes": uc.meta_index_bytes,
-        "unified_cache_persistence_enabled": uc.persistence_enabled,
-        "unified_cache_tombstones": uc.tombstone_count,
-        "unified_cache_pending_shards": uc.pending_shard_count,
-        "unified_cache_dirty_shards": uc.dirty_shard_count,
-        "unified_cache_meta_dirty": uc.meta_dirty,
-        "unified_cache_entry_details": entries,
         "queries_in_flight": state.queries_in_flight.load(Ordering::Relaxed),
         "queries_in_flight_peak": state.queries_in_flight_peak.load(Ordering::Relaxed),
         "queries_rejected": state.metrics.queries_rejected_total.get(),
@@ -2910,7 +2928,7 @@ async fn handle_clear_cache(
         }
     };
 
-    engine.clear_unified_cache();
+    engine.clear_cache();
     Json(serde_json::json!({"cleared": true, "scope": "ram_only"})).into_response()
 }
 
@@ -3814,8 +3832,9 @@ async fn handle_list_cursors(
 // Handlers: Utility
 // ---------------------------------------------------------------------------
 
-async fn handle_health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+async fn handle_health(State(state): State<SharedState>) -> impl IntoResponse {
+    let mode = if state.read_only.load(Ordering::Relaxed) { "read-only" } else { "read-write" };
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok", "mode": mode})))
 }
 
 /// Memory budget endpoint — shows where every GB of tracked bitmap memory goes.
@@ -3829,8 +3848,7 @@ async fn handle_debug_memory(
         if let Some(idx) = guard.as_ref() {
             let engine = Arc::clone(&idx.engine);
             let name = idx.definition.name.clone();
-            let uc = engine.unified_cache_stats();
-            (Some(engine), name, uc.memory_bytes as u64)
+            (Some(engine), name, 0u64)
         } else {
             (None, String::new(), 0)
         }
@@ -4025,52 +4043,8 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(engine.slot_counter() as i64);
 
-            // Cache gauges
-            let t0 = std::time::Instant::now();
-            let uc = engine.unified_cache_stats();
-            let t_cache_stats = t0.elapsed();
-            m.cache_entries
-                .with_label_values(&[name])
-                .set(uc.entries as i64);
-            m.cache_bytes
-                .with_label_values(&[name])
-                .set(uc.memory_bytes as i64);
-            m.cache_hits_total
-                .with_label_values(&[name])
-                .set(uc.hits as i64);
-            m.cache_misses_total
-                .with_label_values(&[name])
-                .set(uc.misses as i64);
-            m.cache_inserts_total
-                .with_label_values(&[name])
-                .set(uc.inserts as i64);
-            m.cache_updates_total
-                .with_label_values(&[name])
-                .set(uc.updates as i64);
-            m.cache_evictions_total
-                .with_label_values(&[name])
-                .set(uc.evictions as i64);
-            m.cache_invalidations_total
-                .with_label_values(&[name])
-                .set(uc.invalidations as i64);
-            m.cache_entries_initial
-                .with_label_values(&[name])
-                .set(uc.entries_initial as i64);
-            m.cache_entries_expanded
-                .with_label_values(&[name])
-                .set(uc.entries_expanded as i64);
-            m.cache_extensions_total
-                .with_label_values(&[name])
-                .set(uc.extensions as i64);
-            m.cache_wall_hits_total
-                .with_label_values(&[name])
-                .set(uc.wall_hits as i64);
-            m.cache_prefetch_total
-                .with_label_values(&[name])
-                .set(uc.prefetches as i64);
-            m.cache_silo_hits_total
-                .with_label_values(&[name])
-                .set(uc.silo_hits as i64);
+            // Cache gauges removed — CacheSilo has no in-memory stats tracking.
+            // Cache hit/miss counts tracked separately in query path metrics.
 
             // Per-field bitmap memory gauges removed: BitmapSilo uses mmap, not heap bitmaps.
             // The old bitmap_memory_cache scanner was removed along with lazy loading.
@@ -4107,8 +4081,7 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             // Phase 2.5: Flush queue depth
             m.flush_queue_depth.set(engine.flush_queue_depth() as i64);
 
-            eprintln!("[metrics-timing] cache_stats={:?} total={:?}",
-                t_cache_stats, metrics_start.elapsed());
+            eprintln!("[metrics-timing] total={:?}", metrics_start.elapsed());
         }
     }
 
@@ -4159,6 +4132,10 @@ async fn handle_ops(
     AxumPath(name): AxumPath<String>,
     Json(batch): Json<crate::sync::ops::OpsBatch>,
 ) -> impl IntoResponse {
+    // Reject writes in read-only mode (zero-downtime deploy: this pod hasn't acquired the writer lock)
+    if state.read_only.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "read-only mode: this instance is not the active writer").into_response();
+    }
     // Verify index exists
     {
         let guard = state.index.lock();
@@ -4299,6 +4276,10 @@ async fn handle_register_dump(
     AxumPath(_name): AxumPath<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // Reject writes in read-only mode (zero-downtime deploy: this pod hasn't acquired the writer lock)
+    if state.read_only.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "read-only mode: this instance is not the active writer").into_response();
+    }
     // Detect V2 DumpRequest by presence of csv_path
     if body.get("csv_path").is_some() {
         // V2: parse DumpRequest and process asynchronously
@@ -4429,16 +4410,8 @@ async fn handle_register_dump(
                         crate::sync::dump_processor::reload_after_dumps(&engine_for_reload, true);
                     }
 
-                    // Save bitmaps + compact doc silo after each phase completes.
-                    // (Moved out of process_dump to measure separately.)
-                    if engine_for_reload.config().storage.bitmap_path.is_some() {
-                        let t_save = std::time::Instant::now();
-                        if let Err(e) = engine_for_reload.save_snapshot() {
-                            eprintln!("WARNING: save_snapshot after dump '{}': {e}", dump_name_inner);
-                        } else {
-                            eprintln!("  Dump {} save_snapshot in {:.1}s", dump_name_inner, t_save.elapsed().as_secs_f64());
-                        }
-                    }
+                    // Bitmaps already written to BitmapSilo in process_dump (direct write).
+                    // Only need to compact the doc silo.
                     {
                         let t_compact = std::time::Instant::now();
                         if let Err(e) = crate::sync::dump_processor::compact_after_dumps(&engine_for_reload) {

@@ -160,6 +160,55 @@ const PV_TAG_S: u8 = 0x04;
 const PV_TAG_MI: u8 = 0x05;
 const PV_TAG_MM: u8 = 0x06;
 
+// ---------------------------------------------------------------------------
+// Shared wire format primitives — single source of truth for field encoding.
+// Used by both PackedValue (general path) and DumpFieldValue (zero-copy dump path).
+// ---------------------------------------------------------------------------
+
+/// Write a Merge op header: tag + slot + field count.
+#[inline]
+pub fn write_merge_header(slot: u32, field_count: u16, buf: &mut Vec<u8>) {
+    buf.push(OP_TAG_MERGE);
+    buf.extend_from_slice(&slot.to_le_bytes());
+    buf.extend_from_slice(&field_count.to_le_bytes());
+}
+
+/// Write an i64 field value.
+#[inline]
+pub fn write_field_int(field_idx: u16, value: i64, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&field_idx.to_le_bytes());
+    buf.push(PV_TAG_I);
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Write a bool field value.
+#[inline]
+pub fn write_field_bool(field_idx: u16, value: bool, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&field_idx.to_le_bytes());
+    buf.push(PV_TAG_B);
+    buf.push(if value { 1 } else { 0 });
+}
+
+/// Write a string field value (takes &str — works for both owned and borrowed).
+#[inline]
+pub fn write_field_str(field_idx: u16, value: &str, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&field_idx.to_le_bytes());
+    buf.push(PV_TAG_S);
+    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+}
+
+/// Write a multi-int field value.
+#[inline]
+pub fn write_field_multi_int(field_idx: u16, values: &[i64], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&field_idx.to_le_bytes());
+    buf.push(PV_TAG_MI);
+    buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    for val in values {
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+}
+
 pub fn encode_packed_value(pv: &PackedValue, buf: &mut Vec<u8>) {
     match pv {
         PackedValue::I(v) => {
@@ -453,7 +502,13 @@ pub fn apply_doc_op(snapshot: &mut DocSnapshot, op: &DocOp) {
             let doc = snapshot.docs.entry(*slot).or_default();
             for (field_idx, value) in fields {
                 if let Some(entry) = doc.iter_mut().find(|(f, _)| *f == *field_idx) {
-                    entry.1 = value.clone();
+                    // Mi fields: concatenate instead of replace (enables streaming MV doc ops)
+                    match (&mut entry.1, value) {
+                        (PackedValue::Mi(existing), PackedValue::Mi(new_vals)) => {
+                            existing.extend(new_vals.iter());
+                        }
+                        _ => { entry.1 = value.clone(); }
+                    }
                 } else {
                     doc.push((*field_idx, value.clone()));
                 }
@@ -744,5 +799,27 @@ mod tests {
         let decoded = decode_doc_snapshot(&buf).unwrap();
         assert_eq!(decoded.docs.len(), 2);
         assert_eq!(decoded.docs[&1], vec![(0, PackedValue::I(42))]);
+    }
+
+    #[test]
+    fn test_merge_mi_concatenates() {
+        let mut snap = DocSnapshot::new();
+        // First merge: create slot with Mi field
+        let op1 = DocOp::Merge { slot: 1, fields: vec![(0, PackedValue::Mi(vec![10, 20]))] };
+        apply_doc_op(&mut snap, &op1);
+        assert_eq!(snap.docs[&1], vec![(0, PackedValue::Mi(vec![10, 20]))]);
+
+        // Second merge: Mi field should concatenate, not replace
+        let op2 = DocOp::Merge { slot: 1, fields: vec![(0, PackedValue::Mi(vec![30, 40]))] };
+        apply_doc_op(&mut snap, &op2);
+        assert_eq!(snap.docs[&1], vec![(0, PackedValue::Mi(vec![10, 20, 30, 40]))]);
+
+        // Non-Mi field still replaces on merge
+        let op3 = DocOp::Merge { slot: 1, fields: vec![(1, PackedValue::I(100))] };
+        apply_doc_op(&mut snap, &op3);
+        let op4 = DocOp::Merge { slot: 1, fields: vec![(1, PackedValue::I(200))] };
+        apply_doc_op(&mut snap, &op4);
+        let doc = &snap.docs[&1];
+        assert_eq!(doc.iter().find(|(f, _)| *f == 1).unwrap().1, PackedValue::I(200));
     }
 }

@@ -129,6 +129,16 @@ impl ConcurrentEngine {
         if let Some((key_hash, ref _ukey)) = cache_key_opt {
             if let Some(ref silo_arc) = self.cache_silo {
                 if let Some(entry) = silo_arc.read().get_entry(key_hash) {
+                    // Staleness check: if any clause field was mutated since this
+                    // entry was formed, treat as a miss and fall through to recompute.
+                    let cache_stale = entry.is_stale(|field| self.field_epoch(field));
+                    if cache_stale {
+                        tracing::debug!(
+                            "cache_stale: entry epoch={} has stale fields, forcing miss",
+                            entry.epoch
+                        );
+                        // Fall through to slow path below (entry will be re-seeded)
+                    } else {
                     let sort_clause = query.sort.as_ref().unwrap();
                     let has_more = entry.has_more;
                     let min_val = entry.min_tracked_value;
@@ -194,6 +204,7 @@ impl ConcurrentEngine {
                     // Cache boundary exceeded — fall through to full recompute below.
                     // has_more tells us the silo has partial coverage; we'll re-seed it.
                     let _ = has_more;
+                    } // end else (not stale)
                 }
             }
         }
@@ -244,6 +255,11 @@ impl ConcurrentEngine {
                 // Build entry bitmap
                 let mut bm = roaring::RoaringBitmap::new();
                 for &slot in &sorted_slots { bm.insert(slot); }
+                // Tag the entry with the current epoch so staleness can be detected.
+                let current_epoch = self.mutation_epoch();
+                let entry_field_epochs: Vec<(String, u64)> = ukey.filter_clauses.iter()
+                    .map(|c| (c.field.clone(), self.field_epoch(&c.field)))
+                    .collect();
                 let entry_data = crate::silos::cache_silo::CacheEntryData {
                     key: ukey.clone(),
                     bitmap: bm,
@@ -254,6 +270,8 @@ impl ConcurrentEngine {
                     total_matched: full_total_matched,
                     direction: sort_clause.direction,
                     sorted_keys: if sorted_keys.is_empty() { None } else { Some(sorted_keys.clone()) },
+                    epoch: current_epoch,
+                    field_epochs: entry_field_epochs,
                 };
                 // Save to silo outside any lock
                 if let Some(ref silo_arc) = self.cache_silo {

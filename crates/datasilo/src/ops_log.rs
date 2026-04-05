@@ -30,6 +30,13 @@ pub enum SiloOp {
     Delete { key: u32 },
 }
 
+/// Zero-copy op reference — points into the mmap instead of copying value bytes.
+pub enum SiloOpRef {
+    /// Put with (key, byte_offset_in_mmap, value_length)
+    Put { key: u32, offset: usize, len: usize },
+    Delete { key: u32 },
+}
+
 /// Mmap'd append-only ops log.
 ///
 /// Supports both sequential (single-thread) and parallel (multi-thread) writes.
@@ -331,6 +338,80 @@ impl OpsLog {
         }
 
         Ok(count)
+    }
+
+    /// Zero-copy iteration: yields (key, mmap_offset, value_len) for puts.
+    /// No heap allocation — caller gets byte offsets into the mmap for later reads.
+    pub fn for_each_ops_ref<F>(&self, mut f: F) -> io::Result<u64>
+    where F: FnMut(SiloOpRef)
+    {
+        let mmap = match &self.mmap {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+        let end = self.cursor.load(Ordering::Relaxed) as usize;
+        if end == 0 { return Ok(0); }
+
+        let data = &mmap[..end.min(mmap.len())];
+        let mut pos = 0;
+        let mut count = 0u64;
+
+        while pos < data.len() {
+            if data[pos] == 0 {
+                while pos < data.len() && data[pos] == 0 { pos += 1; }
+                continue;
+            }
+            let entry_start = pos;
+            let tag = data[pos];
+            pos += 1;
+
+            match tag {
+                OP_TAG_PUT => {
+                    if pos + 8 > data.len() { break; }
+                    let key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let value_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    let value_offset = pos; // byte offset of value in mmap
+                    if pos + value_len + 4 > data.len() { break; }
+                    pos += value_len;
+                    let payload_end = pos;
+                    let expected_crc = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let actual_crc = crc32fast::hash(&data[entry_start..payload_end]);
+                    if actual_crc == expected_crc {
+                        f(SiloOpRef::Put { key, offset: value_offset, len: value_len });
+                        count += 1;
+                    }
+                }
+                OP_TAG_DELETE => {
+                    if pos + 4 + 4 > data.len() { break; }
+                    let key = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let payload_end = pos;
+                    let expected_crc = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+                    pos += 4;
+                    let actual_crc = crc32fast::hash(&data[entry_start..payload_end]);
+                    if actual_crc == expected_crc {
+                        f(SiloOpRef::Delete { key });
+                        count += 1;
+                    }
+                }
+                _ => {
+                    while pos < data.len() && data[pos] == 0 { pos += 1; }
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Get the raw mmap slice (for zero-copy reads after for_each_ops_ref).
+    pub fn mmap_data(&self) -> Option<&[u8]> {
+        self.mmap.as_ref().map(|m| {
+            let end = self.cursor.load(Ordering::Relaxed) as usize;
+            &m[..end.min(m.len())]
+        })
     }
 
     /// Current data size (bytes written).

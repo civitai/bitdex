@@ -110,47 +110,15 @@ pub struct ConcurrentEngine {
     /// BitmapSilo for frozen bitmap reads.
     pub(crate) bitmap_silo: Option<Arc<parking_lot::RwLock<crate::silos::bitmap_silo::BitmapSilo>>>,
     pub(crate) compaction_skipped: Arc<AtomicU64>,
+    /// Monotonically increasing epoch counter. Incremented on every mutation batch.
+    /// Used by cache staleness detection to invalidate entries whose fields changed.
+    pub(crate) mutation_epoch: Arc<AtomicU64>,
+    /// Per-field mutation epoch. Maps field name → epoch at last mutation.
+    /// Query threads read this to check whether a cache entry's fields have changed.
+    pub(crate) field_epochs: Arc<parking_lot::RwLock<HashMap<String, u64>>>,
 }
 
-/// Stub cache statistics returned by unified_cache_stats().
-/// CacheSilo has no in-memory entry tracking — all persistence is on disk.
-#[derive(Debug, Default, Clone)]
-pub struct CacheStats {
-    pub entries: usize,
-    pub hits: usize,
-    pub misses: usize,
-    pub memory_bytes: usize,
-    pub meta_index_entries: usize,
-    pub meta_index_bytes: usize,
-    pub persistence_enabled: bool,
-    pub tombstone_count: usize,
-    pub pending_shard_count: usize,
-    pub dirty_shard_count: usize,
-    pub meta_dirty: bool,
-    pub inserts: usize,
-    pub updates: usize,
-    pub evictions: usize,
-    pub invalidations: usize,
-    pub entries_initial: usize,
-    pub entries_expanded: usize,
-    pub extensions: usize,
-    pub wall_hits: usize,
-    pub prefetches: usize,
-    pub silo_hits: usize,
-}
-
-/// Stub per-entry cache detail returned by unified_cache_entry_details().
-#[derive(Debug, Clone)]
-pub struct CacheEntryDetail {
-    pub sort_field: String,
-    pub direction: String,
-    pub filter_count: usize,
-    pub cardinality: usize,
-    pub capacity: usize,
-    pub max_capacity: usize,
-    pub has_more: bool,
-    pub min_tracked_value: u32,
-}
+// CacheStats and CacheEntryDetail stubs removed — CacheSilo has no in-memory entry tracking.
 
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
@@ -440,6 +408,8 @@ impl ConcurrentEngine {
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
                 bitmap_silo: bitmap_silo_arc.clone(),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
+                mutation_epoch: Arc::new(AtomicU64::new(0)),
+                field_epochs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             });
         }
         let flush_handle = {
@@ -548,6 +518,8 @@ impl ConcurrentEngine {
             metrics_bridge,
             bitmap_silo: bitmap_silo_arc.clone(),
             compaction_skipped,
+            mutation_epoch: Arc::new(AtomicU64::new(0)),
+            field_epochs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
     }
     /// Set the string maps for MappedString field query resolution.
@@ -568,6 +540,47 @@ impl ConcurrentEngine {
     /// Get the cumulative count of compaction operations skipped due to channel backpressure.
     pub fn compaction_skipped_count(&self) -> u64 {
         self.compaction_skipped.load(Ordering::Relaxed)
+    }
+    /// Return the current global mutation epoch.
+    /// Cache entries formed before this epoch may be stale.
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch.load(Ordering::Acquire)
+    }
+    /// Return the epoch at which the given field was last mutated.
+    /// Returns 0 if the field has never been mutated in this process lifetime.
+    pub fn field_epoch(&self, field: &str) -> u64 {
+        self.field_epochs.read().get(field).copied().unwrap_or(0)
+    }
+    /// Bump the global mutation epoch and record per-field epochs for any
+    /// FilterInsert / FilterRemove / SortSet / SortClear ops in the batch.
+    ///
+    /// Called by every write path before dispatching ops.
+    /// Atomic Release ordering ensures query threads see updated epochs after
+    /// their own Acquire loads.
+    fn bump_field_epochs(&self, ops: &[MutationOp]) {
+        let has_field_ops = ops.iter().any(|op| matches!(
+            op,
+            MutationOp::FilterInsert { .. }
+            | MutationOp::FilterRemove { .. }
+            | MutationOp::SortSet { .. }
+            | MutationOp::SortClear { .. }
+        ));
+        if !has_field_ops {
+            return;
+        }
+        let new_epoch = self.mutation_epoch.fetch_add(1, Ordering::Release) + 1;
+        let mut guard = self.field_epochs.write();
+        for op in ops {
+            match op {
+                MutationOp::FilterInsert { field, .. }
+                | MutationOp::FilterRemove { field, .. }
+                | MutationOp::SortSet { field, .. }
+                | MutationOp::SortClear { field, .. } => {
+                    guard.insert(field.to_string(), new_epoch);
+                }
+                _ => {}
+            }
+        }
     }
     /// Set the per-field dictionaries for LowCardinalityString fields.
     pub fn set_dictionaries(&mut self, dicts: HashMap<String, crate::dictionary::FieldDictionary>) {
@@ -644,6 +657,8 @@ impl ConcurrentEngine {
     /// During Phase 2→4 transition, both paths receive the ops. Phase 4 removes
     /// the coalescer, leaving only the silo ops log.
     pub(crate) fn send_mutation_ops(&self, ops: Vec<MutationOp>) -> Result<()> {
+        // Bump epoch counters so stale cache entries are detected on next query.
+        self.bump_field_epochs(&ops);
         // Write to BitmapSilo ops log (the V3 path)
         if let Some(ref silo_arc) = self.bitmap_silo {
             let silo = silo_arc.read();
@@ -863,14 +878,6 @@ impl ConcurrentEngine {
             .collect();
         (slot_bytes, filter_bytes, sort_bytes, cache_entries, cache_bytes, filter_details, sort_details)
     }
-    /// Return stub cache stats (CacheSilo has no in-memory entry tracking).
-    pub fn unified_cache_stats(&self) -> CacheStats {
-        CacheStats::default()
-    }
-    /// Return stub per-entry cache details (CacheSilo has no in-memory entry tracking).
-    pub fn unified_cache_entry_details(&self) -> Vec<CacheEntryDetail> {
-        Vec::new()
-    }
     /// Rebuild all time bucket bitmaps from scratch by scanning the sort field
     /// for all alive slots. Use after a bulk dump or when buckets are empty/stale.
     /// Returns (bucket_count, total_slots_scanned) or an error.
@@ -951,17 +958,16 @@ impl ConcurrentEngine {
         }
     }
     /// Clear all CacheSilo entries. Stale entries will be recomputed on next query miss.
-    pub fn clear_unified_cache(&self) {
+    pub fn clear_cache(&self) {
         if let Some(ref silo_arc) = self.cache_silo {
-            // Compact silo by truncating ops log — simplest way to drop all entries.
             if let Err(e) = silo_arc.write().compact() {
-                eprintln!("clear_unified_cache: compact error: {e}");
+                eprintln!("clear_cache: compact error: {e}");
             }
         }
     }
     /// Purge the CacheSilo: entries are recomputed on next query miss.
     pub fn purge_bounds(&self) -> crate::error::Result<()> {
-        self.clear_unified_cache();
+        self.clear_cache();
         eprintln!("purge_bounds: cleared CacheSilo");
         Ok(())
     }
@@ -1116,7 +1122,7 @@ impl ConcurrentEngine {
     }
     fn invalidate_all_caches(&self) {
         // CacheSilo entries become stale after bulk loads; they'll be recomputed on miss.
-        // Full purge via clear_unified_cache() is available if needed.
+        // Full purge via clear_cache() is available if needed.
     }
     /// Apply pre-built bitmap maps directly to a staging snapshot.
     /// Used by the fused parse+bitmap loader to skip the decompose/merge/apply pipeline.
