@@ -703,6 +703,22 @@ impl BitmapSilo {
         entries.into_iter()
     }
 
+    /// Iterate all values stored for a specific filter field.
+    ///
+    /// Much more efficient than `filter_entries()` for single-field enumeration —
+    /// only collects keys that share the field prefix rather than scanning all entries.
+    /// Used by `range_scan` in the executor to enumerate candidate values from the
+    /// silo manifest without loading any bitmap data.
+    pub fn filter_values_for_field(&self, field: &str) -> Vec<u64> {
+        let prefix = format!("filter:{}:", field);
+        self.name_to_key.read().keys()
+            .filter_map(|name| {
+                let stripped = name.strip_prefix(&prefix)?;
+                stripped.parse::<u64>().ok()
+            })
+            .collect()
+    }
+
     /// Check if a sort field has any layers stored.
     pub fn has_sort_field(&self, field: &str) -> bool {
         let prefix = format!("sort:{}:", field);
