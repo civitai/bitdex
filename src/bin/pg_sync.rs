@@ -366,15 +366,8 @@ async fn run_boot_sequence(
     if let Some(config) = full_sync_config {
         run_streaming_pipeline(pool, sync_config, bitdex_client, config, stage_dir).await;
     } else {
-        // V1 fallback: download all then process manually
-        bulk_loader::download_all_tables(pool, stage_dir)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("CSV download failed: {e}");
-                std::process::exit(1);
-            });
-        eprintln!("No sync config YAML — skipping dump pipeline.");
-        eprintln!("CSVs staged at: {}. Use /dumps endpoint manually.", stage_dir.display());
+        eprintln!("No sync config YAML — cannot run dump pipeline. Provide --sync-config.");
+        std::process::exit(1);
     }
 
     // Step 10: Seed cursor at pre_dump_cursor

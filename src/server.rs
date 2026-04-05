@@ -24,7 +24,6 @@ use crate::engine::ConcurrentEngine;
 use crate::config::{Config, DataSchema, FieldValueType, FilterFieldConfig, SortFieldConfig};
 use crate::silos::doc_format::StoredDoc;
 use crate::engine::executor::{CaseSensitiveFields, StringMaps};
-use crate::sync::loader;
 use crate::metrics::Metrics;
 use crate::mutation::FieldValue;
 use crate::query::{BitdexQuery, Value};
@@ -546,43 +545,6 @@ struct CreateIndexRequest {
     data_schema: DataSchema,
 }
 
-#[derive(Deserialize)]
-struct LoadRequest {
-    path: String,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default = "default_threads")]
-    threads: usize,
-    #[serde(default = "default_chunk_size")]
-    chunk_size: usize,
-    #[serde(default = "default_docstore_batch_size")]
-    docstore_batch_size: usize,
-    #[serde(default = "default_max_writer_threads")]
-    max_writer_threads: usize,
-    #[serde(default)]
-    save_snapshot: bool,
-}
-
-fn default_threads() -> usize {
-    // Unused by fused parse+bitmap loader (rayon manages parallelism),
-    // kept for API compat.
-    let logical = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8);
-    (logical / 2).clamp(4, 8)
-}
-
-fn default_chunk_size() -> usize {
-    500_000
-}
-
-fn default_docstore_batch_size() -> usize {
-    100_000
-}
-
-fn default_max_writer_threads() -> usize {
-    4
-}
 
 #[derive(Deserialize)]
 struct DocumentRequest {
@@ -1343,7 +1305,6 @@ impl BitdexServer {
             .route("/api/indexes", post(handle_create_index))
             .route("/api/indexes/{name}", delete(handle_delete_index))
             .route("/api/indexes/{name}/config", patch(handle_patch_config))
-            .route("/api/indexes/{name}/load", post(handle_load))
             .route("/api/indexes/{name}/documents", post(handle_documents_batch).delete(handle_delete_docs))
             .route("/api/indexes/{name}/documents/{slot_id}", get(handle_get_document))
             .route("/api/indexes/{name}/documents/upsert", post(handle_upsert))
@@ -2278,104 +2239,6 @@ async fn handle_delete_index(
     Json(serde_json::json!({"status": "deleted"})).into_response()
 }
 
-// ---------------------------------------------------------------------------
-// Handlers: Data loading
-// ---------------------------------------------------------------------------
-
-async fn handle_load(
-    State(state): State<SharedState>,
-    AxumPath(name): AxumPath<String>,
-    Json(req): Json<LoadRequest>,
-) -> impl IntoResponse {
-    let (engine, schema, tasks) = {
-        let guard = state.index.lock();
-        match guard.as_ref() {
-            Some(idx) if idx.definition.name == name => (
-                Arc::clone(&idx.engine),
-                idx.definition.data_schema.clone(),
-                Arc::clone(&idx.tasks),
-            ),
-            _ => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
-                ).into_response();
-            }
-        }
-    };
-
-    let path = PathBuf::from(&req.path);
-    if !path.exists() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("File not found: {}", req.path)})),
-        ).into_response();
-    }
-
-    let (task_id, progress) = match tasks.try_start(TaskType::Load) {
-        Ok(v) => v,
-        Err(active_info) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "A task is already running",
-                    "active_task": serde_json::to_value(&active_info).unwrap(),
-                })),
-            ).into_response();
-        }
-    };
-
-    let limit = req.limit;
-    let threads = req.threads;
-    let chunk_size = req.chunk_size;
-    let docstore_batch_size = req.docstore_batch_size;
-    let max_writer_threads = req.max_writer_threads;
-    let save_snapshot = req.save_snapshot;
-
-    // Spawn blocking loading task with TaskGuard for panic safety
-    let tasks_clone = Arc::clone(&tasks);
-    tokio::task::spawn_blocking(move || {
-        let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
-
-        match loader::load_ndjson(&engine, &schema, &path, limit, threads, chunk_size, docstore_batch_size, max_writer_threads, progress.clone()) {
-            Ok(stats) => {
-                let alive;
-
-                if save_snapshot {
-                    guard.tasks.set_saving(task_id);
-
-                    let snap_start = Instant::now();
-                    if let Err(e) = engine.save_and_unload() {
-                        eprintln!("Warning: failed to save_and_unload: {e}");
-                    } else {
-                        eprintln!("save_and_unload complete in {:.1}s", snap_start.elapsed().as_secs_f64());
-                    }
-                    // Alive bitmap is always preserved during unload
-                    alive = engine.alive_count();
-                } else {
-                    alive = engine.alive_count();
-                }
-
-                eprintln!("Load complete: {} records alive", alive);
-
-                guard.tasks.set_complete(task_id, Some(serde_json::json!({
-                    "records_loaded": stats.records_loaded,
-                    "elapsed_secs": stats.elapsed.as_secs_f64(),
-                })));
-                guard.defuse();
-            }
-            Err(e) => {
-                guard.tasks.set_error(task_id, e.to_string());
-                guard.defuse();
-            }
-        }
-    });
-
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({"task_id": task_id})),
-    ).into_response()
-}
 
 // ---------------------------------------------------------------------------
 // Handlers: Query & documents

@@ -182,9 +182,6 @@ name = "bitdex-replay"
 path = "src/bin/replay.rs"
 required-features = ["replay"]
 
-[[bin]]
-name = "rebuild_bench"
-path = "src/bin/rebuild_bench.rs"
 
 [[example]]
 name = "load_from_csv"
