@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use roaring::RoaringBitmap;
 use crate::silos::bitmap_silo::BitmapSilo;
@@ -44,6 +45,10 @@ pub struct QueryExecutor<'a> {
     /// unloaded (is_loaded=false), the executor reads the frozen bitmap directly
     /// from the silo's mmap — zero heap allocation for the base data.
     bitmap_silo: Option<&'a BitmapSilo>,
+    /// Lazily-cached alive bitmap for the duration of this query.
+    /// Populated on first call to `alive_bitmap()`. Avoids repeated ops-log scans
+    /// when `alive_bitmap()` is called multiple times per query (e.g. NotEq + Not).
+    alive_cache: OnceCell<RoaringBitmap>,
 }
 impl<'a> QueryExecutor<'a> {
     pub fn new(
@@ -63,6 +68,7 @@ impl<'a> QueryExecutor<'a> {
             case_sensitive_fields: None,
             dictionaries: None,
             bitmap_silo: None,
+            alive_cache: OnceCell::new(),
         }
     }
     /// Full constructor — avoids chaining 5 conditional `.with_*()` calls.
@@ -88,6 +94,7 @@ impl<'a> QueryExecutor<'a> {
             case_sensitive_fields,
             dictionaries,
             bitmap_silo,
+            alive_cache: OnceCell::new(),
         }
     }
     /// Attach string maps for MappedString field reverse lookup.
@@ -120,6 +127,42 @@ impl<'a> QueryExecutor<'a> {
         self.time_buckets = Some(tb);
         self.now_unix = now;
         self
+    }
+
+    /// Get the alive bitmap for this query, preferring BitmapSilo ops-on-read.
+    ///
+    /// The result is computed once and cached in `alive_cache` for the duration
+    /// of the query execution. This avoids repeated ops-log scans when
+    /// `alive_bitmap()` is called multiple times per query (e.g. NotEq + Not).
+    ///
+    /// Primary path: `BitmapSilo::get_alive_with_ops()` — frozen base + pending ops.
+    /// Fallback: in-memory `SlotAllocator::alive_bitmap()` (tests without a silo).
+    fn alive_bitmap(&self) -> &RoaringBitmap {
+        self.alive_cache.get_or_init(|| {
+            if let Some(silo) = self.bitmap_silo {
+                if let Some(alive) = silo.get_alive_with_ops() {
+                    return alive;
+                }
+            }
+            self.slots.alive_bitmap().clone()
+        })
+    }
+
+    /// Get the alive count for this query, consistent with `alive_bitmap()`.
+    ///
+    /// Uses the cached alive bitmap when it has already been computed, otherwise
+    /// falls back to `SlotAllocator::alive_count()` (fused base + diff).
+    fn alive_count(&self) -> u64 {
+        // If alive_cache is populated, use it (consistent with alive_bitmap()).
+        if let Some(cached) = self.alive_cache.get() {
+            return cached.len();
+        }
+        // No silo path — fall back to in-memory count (avoids populating cache).
+        if self.bitmap_silo.is_none() {
+            return self.slots.alive_count();
+        }
+        // Silo present: populate cache and return its length.
+        self.alive_bitmap().len()
     }
     /// Get a reference to the filter index.
     pub fn filter_index(&self) -> &'a FilterIndex {
@@ -207,7 +250,7 @@ impl<'a> QueryExecutor<'a> {
                 reason: "id must be an integer".to_string(),
             }),
         };
-        let alive = self.slots.alive_bitmap();
+        let alive = self.alive_bitmap();
         let mut bm = RoaringBitmap::new();
         if alive.contains(slot) {
             bm.insert(slot);
@@ -216,7 +259,7 @@ impl<'a> QueryExecutor<'a> {
     }
     /// Build a bitmap for id IN [N1, N2, ...] filter (intersected with alive).
     fn id_bitmap_multi(&self, values: &[Value]) -> Result<RoaringBitmap> {
-        let alive = self.slots.alive_bitmap();
+        let alive = self.alive_bitmap();
         let mut bm = RoaringBitmap::new();
         for v in values {
             if let Value::Integer(id) = v {
@@ -342,7 +385,7 @@ impl<'a> QueryExecutor<'a> {
         mut trace_collector: Option<&mut QueryTraceCollector>,
     ) -> Result<RoaringBitmap> {
         if clauses.is_empty() {
-            return Ok(self.slots.alive_bitmap().clone());
+            return Ok(self.alive_bitmap().clone());
         }
         let mut result: Option<RoaringBitmap> = None;
         for (i, clause) in clauses.iter().enumerate() {
@@ -569,7 +612,7 @@ impl<'a> QueryExecutor<'a> {
             }
             FilterClause::NotEq(field, value) => {
                 let eq_bitmap = self.evaluate_clause(&FilterClause::Eq(field.clone(), value.clone()))?;
-                let alive = self.slots.alive_bitmap();
+                let alive = self.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &eq_bitmap;
                 // Subtract null bitmap
@@ -599,7 +642,7 @@ impl<'a> QueryExecutor<'a> {
             }
             FilterClause::NotIn(field, values) => {
                 let in_bitmap = self.evaluate_clause(&FilterClause::In(field.clone(), values.clone()))?;
-                let alive = self.slots.alive_bitmap();
+                let alive = self.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &in_bitmap;
                 if let Some(null_bm) = self.get_effective_bitmap(field, crate::engine::filter::NULL_BITMAP_KEY) {
@@ -610,7 +653,7 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::Not(inner) => {
                 // NOT uses andnot: compute inner bitmap and subtract from alive
                 let inner_bitmap = self.evaluate_clause(inner)?;
-                let alive = self.slots.alive_bitmap();
+                let alive = self.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &inner_bitmap;
                 Ok(result)
@@ -620,7 +663,7 @@ impl<'a> QueryExecutor<'a> {
                 let optimized = planner::optimize_and_clause(
                     clauses,
                     self.filters,
-                    self.slots.alive_count(),
+                    self.alive_count(),
                 );
                 let mut result: Option<RoaringBitmap> = None;
                 for clause in &optimized {
@@ -700,7 +743,7 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::IsNotNull(field) => {
                 let null_bitmap = self.get_effective_bitmap(field, crate::engine::filter::NULL_BITMAP_KEY)
                     .unwrap_or_default();
-                let alive = self.slots.alive_bitmap();
+                let alive = self.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &null_bitmap;
                 Ok(result)
@@ -1539,5 +1582,151 @@ mod tests {
         assert_eq!(ids, vec![42]);
         assert!(cursor.is_some());
         assert_eq!(cursor.unwrap().slot_id, 42);
+    }
+
+    /// Verify that the executor reads the alive bitmap from BitmapSilo via ops-on-read
+    /// rather than from the in-memory SlotAllocator.
+    ///
+    /// Scenario: slots 10, 20, 30 are alive in the silo. Slot 30 is then cleared via
+    /// an alive_clear op. The executor's `Not` clause should use the silo-derived alive
+    /// bitmap (slots 10 and 20) as the universe — NOT the in-memory bitmap (which is
+    /// empty in this test to prove the silo path is taken).
+    #[test]
+    fn test_alive_bitmap_ops_on_read_via_silo() {
+        use crate::silos::bitmap_silo::BitmapSilo;
+        use crate::config::FilterFieldConfig;
+        use crate::engine::filter::FilterFieldType;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Build a silo with slots 10, 20, 30 alive plus a filter bitmap.
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "nsfwLevel".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+        });
+        // nsfwLevel=1 → slot 10
+        let field = filters.get_field_mut("nsfwLevel").unwrap();
+        let mut bm1 = RoaringBitmap::new();
+        bm1.insert(10);
+        field.or_bitmap(1, &bm1);
+
+        let sorts = SortIndex::new();
+
+        // Alive: slots 10, 20, 30
+        let alive = {
+            let mut bm = RoaringBitmap::new();
+            bm.insert(10);
+            bm.insert(20);
+            bm.insert(30);
+            bm
+        };
+        let slots_on_disk = SlotAllocator::from_state(31, alive, RoaringBitmap::new());
+        let cursors = std::collections::HashMap::new();
+
+        let mut silo = BitmapSilo::open(dir.path()).unwrap();
+        silo.save_all(&filters, &sorts, &slots_on_disk, &cursors).unwrap();
+
+        // Write a pending CLEAR op for slot 30 — simulates a delete that landed in the ops log
+        // but hasn't been compacted into the frozen base yet.
+        silo.alive_clear(30).unwrap();
+
+        // The in-memory SlotAllocator is intentionally empty (no alive bits set).
+        // This proves the executor is using the silo path, not the in-memory fallback.
+        let slots_empty = SlotAllocator::new();
+
+        let executor = QueryExecutor::new_full(
+            &slots_empty,
+            &filters,
+            &sorts,
+            100,
+            Some(&silo),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // alive_bitmap() must return {10, 20} — slot 30 cleared by pending op.
+        let alive_result = executor.alive_bitmap();
+        assert!(alive_result.contains(10), "slot 10 should be alive");
+        assert!(alive_result.contains(20), "slot 20 should be alive");
+        assert!(!alive_result.contains(30), "slot 30 should be cleared by pending op");
+        assert_eq!(alive_result.len(), 2);
+
+        // Verify the cache: calling alive_bitmap() again returns the same cached value.
+        let alive_again = executor.alive_bitmap();
+        assert_eq!(alive_again.len(), 2);
+
+        // Verify NotEq uses the silo-derived alive bitmap as universe.
+        // NOT(nsfwLevel=1) = alive - {slot 10} = {20}
+        let not_eq = executor.evaluate_clause(
+            &FilterClause::NotEq("nsfwLevel".to_string(), Value::Integer(1))
+        ).unwrap();
+        assert_eq!(not_eq.len(), 1);
+        assert!(not_eq.contains(20), "NotEq should return slot 20 (alive minus nsfwLevel=1 slots)");
+        assert!(!not_eq.contains(10), "NotEq should not include slot 10 (matches nsfwLevel=1)");
+        assert!(!not_eq.contains(30), "NotEq should not include slot 30 (cleared via op)");
+
+        // Verify Not wrapping Eq uses alive as universe too.
+        // NOT(nsfwLevel=1) via Not clause = alive - {slot 10} = {20}
+        let not_clause = executor.evaluate_clause(
+            &FilterClause::Not(Box::new(FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1))))
+        ).unwrap();
+        assert_eq!(not_clause.len(), 1);
+        assert!(not_clause.contains(20));
+    }
+
+    /// Verify that alive_count() is consistent with alive_bitmap() when the silo path is taken.
+    #[test]
+    fn test_alive_count_silo_path() {
+        use crate::silos::bitmap_silo::BitmapSilo;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Save 50 alive slots to the silo.
+        let filters_empty = FilterIndex::new();
+        let sorts = SortIndex::new();
+        let alive = {
+            let mut bm = RoaringBitmap::new();
+            bm.insert_range(0..50);
+            bm
+        };
+        let slots_on_disk = SlotAllocator::from_state(50, alive, RoaringBitmap::new());
+        let cursors = std::collections::HashMap::new();
+
+        let mut silo = BitmapSilo::open(dir.path()).unwrap();
+        silo.save_all(&filters_empty, &sorts, &slots_on_disk, &cursors).unwrap();
+
+        // In-memory slots: only 10 alive (different from silo's 50).
+        let mut slots_partial = SlotAllocator::new();
+        let partial_alive = {
+            let mut bm = RoaringBitmap::new();
+            bm.insert_range(0..10);
+            bm
+        };
+        slots_partial.alive_or_bitmap(&partial_alive);
+        slots_partial.merge_alive();
+
+        let executor = QueryExecutor::new_full(
+            &slots_partial,
+            &filters_empty,
+            &sorts,
+            100,
+            Some(&silo),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // alive_count() should return silo's 50, not in-memory 10.
+        assert_eq!(executor.alive_count(), 50);
+        // alive_bitmap() should also give 50.
+        assert_eq!(executor.alive_bitmap().len(), 50);
     }
 }
