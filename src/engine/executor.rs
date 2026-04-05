@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use roaring::RoaringBitmap;
 use crate::silos::bitmap_silo::BitmapSilo;
@@ -50,6 +51,10 @@ pub struct QueryExecutor<'a> {
     /// restore). Maps field_name → num_bits. Typically populated from
     /// `SortFieldConfig.bits` at engine construction time.
     sort_bits: Option<&'a HashMap<String, usize>>,
+    /// Cached alive bitmap for the duration of a single query.
+    /// Populated on first call to `alive_bitmap()` — ensures consistency
+    /// when the BitmapSilo provides the authoritative alive state (ops-on-read).
+    alive_cache: OnceCell<RoaringBitmap>,
 }
 impl<'a> QueryExecutor<'a> {
     pub fn new(
@@ -70,6 +75,7 @@ impl<'a> QueryExecutor<'a> {
             dictionaries: None,
             bitmap_silo: None,
             sort_bits: None,
+            alive_cache: OnceCell::new(),
         }
     }
     /// Full constructor — avoids chaining 5 conditional `.with_*()` calls.
@@ -96,6 +102,7 @@ impl<'a> QueryExecutor<'a> {
             dictionaries,
             bitmap_silo,
             sort_bits: None,
+            alive_cache: OnceCell::new(),
         }
     }
 
@@ -133,6 +140,29 @@ impl<'a> QueryExecutor<'a> {
         self.bitmap_silo = Some(silo);
         self
     }
+    /// Get the alive bitmap, preferring BitmapSilo ops-on-read over in-memory.
+    /// Cached after first call for consistency within a single query.
+    fn alive_bitmap(&self) -> &RoaringBitmap {
+        self.alive_cache.get_or_init(|| {
+            if let Some(silo) = self.bitmap_silo {
+                if let Some(alive) = silo.get_alive_with_ops() {
+                    return alive;
+                }
+            }
+            self.slots.alive_bitmap().clone()
+        })
+    }
+
+    /// Alive count consistent with `alive_bitmap()`.
+    fn alive_count(&self) -> u64 {
+        if let Some(silo) = self.bitmap_silo {
+            if let Some(alive) = silo.get_alive_with_ops() {
+                return alive.len();
+            }
+        }
+        self.slots.alive_count()
+    }
+
     /// Attach a time bucket manager for in-executor bucket snapping (C3).
     /// Range filters on the bucketed field will be snapped to pre-computed bitmaps.
     pub fn with_time_buckets(mut self, tb: &'a crate::time_buckets::TimeBucketManager, now: u64) -> Self {
@@ -226,7 +256,7 @@ impl<'a> QueryExecutor<'a> {
                 reason: "id must be an integer".to_string(),
             }),
         };
-        let alive = self.slots.alive_bitmap();
+        let alive = self.alive_bitmap();
         let mut bm = RoaringBitmap::new();
         if alive.contains(slot) {
             bm.insert(slot);
@@ -235,7 +265,7 @@ impl<'a> QueryExecutor<'a> {
     }
     /// Build a bitmap for id IN [N1, N2, ...] filter (intersected with alive).
     fn id_bitmap_multi(&self, values: &[Value]) -> Result<RoaringBitmap> {
-        let alive = self.slots.alive_bitmap();
+        let alive = self.alive_bitmap();
         let mut bm = RoaringBitmap::new();
         for v in values {
             if let Value::Integer(id) = v {
@@ -361,7 +391,7 @@ impl<'a> QueryExecutor<'a> {
         mut trace_collector: Option<&mut QueryTraceCollector>,
     ) -> Result<RoaringBitmap> {
         if clauses.is_empty() {
-            return Ok(self.slots.alive_bitmap().clone());
+            return Ok(self.alive_bitmap().clone());
         }
         let mut result: Option<RoaringBitmap> = None;
         for (i, clause) in clauses.iter().enumerate() {
@@ -588,7 +618,7 @@ impl<'a> QueryExecutor<'a> {
             }
             FilterClause::NotEq(field, value) => {
                 let eq_bitmap = self.evaluate_clause(&FilterClause::Eq(field.clone(), value.clone()))?;
-                let alive = self.slots.alive_bitmap();
+                let alive = self.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &eq_bitmap;
                 // Subtract null bitmap
@@ -618,7 +648,7 @@ impl<'a> QueryExecutor<'a> {
             }
             FilterClause::NotIn(field, values) => {
                 let in_bitmap = self.evaluate_clause(&FilterClause::In(field.clone(), values.clone()))?;
-                let alive = self.slots.alive_bitmap();
+                let alive = self.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &in_bitmap;
                 if let Some(null_bm) = self.get_effective_bitmap(field, crate::engine::filter::NULL_BITMAP_KEY) {
@@ -629,7 +659,7 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::Not(inner) => {
                 // NOT uses andnot: compute inner bitmap and subtract from alive
                 let inner_bitmap = self.evaluate_clause(inner)?;
-                let alive = self.slots.alive_bitmap();
+                let alive = self.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &inner_bitmap;
                 Ok(result)
@@ -639,7 +669,7 @@ impl<'a> QueryExecutor<'a> {
                 let optimized = planner::optimize_and_clause(
                     clauses,
                     self.filters,
-                    self.slots.alive_count(),
+                    self.alive_count(),
                 );
                 let mut result: Option<RoaringBitmap> = None;
                 for clause in &optimized {
@@ -719,7 +749,7 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::IsNotNull(field) => {
                 let null_bitmap = self.get_effective_bitmap(field, crate::engine::filter::NULL_BITMAP_KEY)
                     .unwrap_or_default();
-                let alive = self.slots.alive_bitmap();
+                let alive = self.alive_bitmap();
                 let mut result = alive.clone();
                 result -= &null_bitmap;
                 Ok(result)
@@ -1752,5 +1782,102 @@ mod tests {
             matches!(err, Err(BitdexError::FieldNotFound(_))),
             "expected FieldNotFound for unknown field, got: {err:?}",
         );
+    }
+
+    // ── alive_bitmap / alive_count ops-on-read ───────────────────────────
+
+    /// Build a BitmapSilo with alive slots {10, 20, 30} saved as a frozen snapshot,
+    /// then append a CLEAR op for slot 30. Verify that alive_bitmap() returns {10, 20}
+    /// via ops-on-read, and that the in-memory SlotAllocator (empty) is NOT used.
+    #[test]
+    fn test_alive_bitmap_prefers_silo_ops_on_read() {
+        use crate::silos::bitmap_silo::BitmapSilo;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Save a frozen snapshot with slots {10, 20, 30} alive, then append a clear op.
+        // We need a frozen base so that the clear op is applied on top of it.
+        {
+            let mut alive_bm = RoaringBitmap::new();
+            for slot in [10u32, 20, 30] { alive_bm.insert(slot); }
+            let slots = SlotAllocator::from_state(31, alive_bm, RoaringBitmap::new());
+            let mut silo = BitmapSilo::open(dir.path()).unwrap();
+            let filters = FilterIndex::new();
+            let sorts = SortIndex::new();
+            let cursors = std::collections::HashMap::new();
+            silo.save_all(&filters, &sorts, &slots, &cursors).unwrap();
+        }
+
+        // Re-open and append a CLEAR op for slot 30 (simulates a delete after snapshot)
+        let silo = BitmapSilo::open(dir.path()).unwrap();
+        silo.alive_clear(30).unwrap();
+
+        // In-memory SlotAllocator is empty — executor must prefer the silo
+        let slots = SlotAllocator::new();
+        let filters = FilterIndex::new();
+        let sorts = SortIndex::new();
+
+        let executor = QueryExecutor::new_full(
+            &slots, &filters, &sorts, 100,
+            Some(&silo), None, None, None, None,
+        );
+
+        let alive = executor.alive_bitmap();
+        assert!(alive.contains(10), "slot 10 should be alive");
+        assert!(alive.contains(20), "slot 20 should be alive");
+        assert!(!alive.contains(30), "slot 30 should have been cleared by the CLEAR op");
+        assert_eq!(alive.len(), 2, "exactly 2 alive slots expected");
+    }
+
+    /// Verify alive_count() is consistent with the silo-derived alive_bitmap().
+    #[test]
+    fn test_alive_count_derived_from_silo() {
+        use crate::silos::bitmap_silo::BitmapSilo;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Save a frozen snapshot with 5 slots alive, then clear 2 via ops.
+        {
+            let mut alive_bm = RoaringBitmap::new();
+            for slot in [1u32, 2, 3, 4, 5] { alive_bm.insert(slot); }
+            let slots = SlotAllocator::from_state(6, alive_bm, RoaringBitmap::new());
+            let mut silo = BitmapSilo::open(dir.path()).unwrap();
+            let filters = FilterIndex::new();
+            let sorts = SortIndex::new();
+            let cursors = std::collections::HashMap::new();
+            silo.save_all(&filters, &sorts, &slots, &cursors).unwrap();
+        }
+
+        let silo = BitmapSilo::open(dir.path()).unwrap();
+        silo.alive_clear(3).unwrap();
+        silo.alive_clear(5).unwrap();
+
+        let slots = SlotAllocator::new(); // empty — count would be 0 without silo
+        let filters = FilterIndex::new();
+        let sorts = SortIndex::new();
+
+        let executor = QueryExecutor::new_full(
+            &slots, &filters, &sorts, 100,
+            Some(&silo), None, None, None, None,
+        );
+
+        assert_eq!(executor.alive_count(), 3, "3 alive slots expected after 2 clears");
+    }
+
+    /// When no BitmapSilo is present, alive_bitmap() falls back to in-memory SlotAllocator.
+    #[test]
+    fn test_alive_bitmap_fallback_to_in_memory_when_no_silo() {
+        let mut alive_bm = RoaringBitmap::new();
+        alive_bm.insert(7);
+        let slots = SlotAllocator::from_state(8, alive_bm, RoaringBitmap::new());
+
+        let filters = FilterIndex::new();
+        let sorts = SortIndex::new();
+
+        // Construct executor WITHOUT a silo
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100);
+
+        let alive = executor.alive_bitmap();
+        assert!(alive.contains(7), "in-memory slot 7 should be alive via fallback");
     }
 }
