@@ -727,7 +727,11 @@ impl<'a> QueryExecutor<'a> {
         }
     }
     /// Evaluate a range filter by scanning the filter field's bitmaps.
-    /// Uses diff-aware iteration to handle dirty VersionedBitmaps.
+    ///
+    /// For V3, the BitmapSilo is the PRIMARY source for range key enumeration.
+    /// The silo's manifest index is queried for all values belonging to `field`,
+    /// and `get_filter_with_ops` provides full accuracy (frozen base + pending ops).
+    /// Falls back to in-memory FilterIndex when no silo is attached (tests / legacy).
     fn range_scan<F>(
         &self,
         field: &str,
@@ -737,18 +741,33 @@ impl<'a> QueryExecutor<'a> {
     where
         F: Fn(u64, u64) -> bool,
     {
-        let has_field = self.filters.get_field(field).is_some();
-        if !has_field && self.bitmap_silo.is_none() {
-            return Err(BitdexError::FieldNotFound(field.to_string()));
-        }
         let target = value_to_bitmap_key(value)
             .ok_or_else(|| BitdexError::InvalidValue {
                 field: field.to_string(),
                 reason: "cannot convert to bitmap key for range filter".to_string(),
             })?;
         let mut result = RoaringBitmap::new();
-        // Iterate in-memory values (may be loaded or unloaded placeholders)
-        if let Some(filter_field) = self.filters.get_field(field) {
+
+        if let Some(silo) = self.bitmap_silo {
+            // Primary path: enumerate values from the silo manifest for this field.
+            // filter_values_for_field() only scans keys with the matching prefix —
+            // much cheaper than filter_entries() which scans all manifest keys.
+            let values = silo.filter_values_for_field(field);
+            if values.is_empty() && self.filters.get_field(field).is_none() {
+                // Field unknown to both silo and in-memory index.
+                return Err(BitdexError::FieldNotFound(field.to_string()));
+            }
+            for key in values {
+                if key == crate::engine::filter::NULL_BITMAP_KEY { continue; }
+                if predicate(key, target) {
+                    // ops-on-read: frozen base + any pending set/clear ops
+                    if let Some(bm) = silo.get_filter_with_ops(field, key) {
+                        result |= &bm;
+                    }
+                }
+            }
+        } else if let Some(filter_field) = self.filters.get_field(field) {
+            // Fallback: in-memory FilterIndex (used in tests and when no silo is present).
             for (&key, _vb) in filter_field.iter_versioned() {
                 if key == crate::engine::filter::NULL_BITMAP_KEY { continue; }
                 if predicate(key, target) {
@@ -757,18 +776,10 @@ impl<'a> QueryExecutor<'a> {
                     }
                 }
             }
-        } else if let Some(silo) = self.bitmap_silo {
-            // No in-memory field — scan silo entries
-            for (f, key) in silo.filter_entries() {
-                if f != field { continue; }
-                if key == crate::engine::filter::NULL_BITMAP_KEY { continue; }
-                if predicate(key, target) {
-                    if let Some(frozen) = silo.get_frozen_filter(field, key) {
-                        result |= frozen.to_owned();
-                    }
-                }
-            }
+        } else {
+            return Err(BitdexError::FieldNotFound(field.to_string()));
         }
+
         Ok(result)
     }
     /// Paginate by descending slot order (newest-first) for no-sort queries.
@@ -1626,5 +1637,120 @@ mod tests {
         assert_eq!(ids, vec![42]);
         assert!(cursor.is_some());
         assert_eq!(cursor.unwrap().slot_id, 42);
+    }
+
+    // ── range_scan silo-primary path ─────────────────────────────────────
+
+    /// Build a BitmapSilo populated with filter data for `sortAt` values,
+    /// then verify that range_scan enumerates values from the silo manifest
+    /// rather than from in-memory FilterIndex.
+    #[test]
+    fn test_range_scan_uses_silo_primary_path() {
+        use crate::silos::bitmap_silo::BitmapSilo;
+        use crate::config::FilterFieldConfig;
+        use crate::engine::filter::FilterFieldType;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // --- Populate a BitmapSilo with three sortAt values ---
+        //   value 100 → slots {1, 2}
+        //   value 200 → slots {3, 4}
+        //   value 300 → slots {5}
+        let silo = BitmapSilo::open(dir.path()).unwrap();
+
+        // Write filter bitmaps directly via filter_set (ops-on-read path)
+        for slot in [1u32, 2] { silo.filter_set("sortAt", 100, slot).unwrap(); }
+        for slot in [3u32, 4] { silo.filter_set("sortAt", 200, slot).unwrap(); }
+        silo.filter_set("sortAt", 300, 5).unwrap();
+        // Also write a null sentinel — range_scan must skip it
+        silo.filter_set("sortAt", crate::engine::filter::NULL_BITMAP_KEY, 99).unwrap();
+
+        // --- Build a minimal engine state with no in-memory filter data ---
+        let slots = SlotAllocator::new();
+        // FilterIndex knows the `sortAt` field exists (registered from config)
+        // but has no loaded bitmaps — silo is the only data source.
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "sortAt".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+        });
+        let sorts = SortIndex::new();
+
+        let executor = QueryExecutor::new_full(
+            &slots,
+            &filters,
+            &sorts,
+            100,
+            Some(&silo),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // Gte(sortAt, 200) → should match values 200 and 300 → slots {3,4,5}
+        let result = executor.execute(
+            &[FilterClause::Gte("sortAt".to_string(), Value::Integer(200))],
+            None,
+            100,
+            None,
+        ).unwrap();
+        let mut got: Vec<i64> = result.ids.clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![3, 4, 5], "Gte(200) via silo should return slots 3,4,5");
+
+        // Lt(sortAt, 200) → should match value 100 → slots {1,2}
+        let result = executor.execute(
+            &[FilterClause::Lt("sortAt".to_string(), Value::Integer(200))],
+            None,
+            100,
+            None,
+        ).unwrap();
+        let mut got: Vec<i64> = result.ids.clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2], "Lt(200) via silo should return slots 1,2");
+
+        // Gt(sortAt, 300) → no values above 300 → empty result
+        let result = executor.execute(
+            &[FilterClause::Gt("sortAt".to_string(), Value::Integer(300))],
+            None,
+            100,
+            None,
+        ).unwrap();
+        assert!(result.ids.is_empty(), "Gt(300) via silo should return empty");
+    }
+
+    /// When the silo has no entries for a field and no in-memory state exists,
+    /// range_scan must return FieldNotFound.
+    #[test]
+    fn test_range_scan_silo_unknown_field_returns_error() {
+        use crate::silos::bitmap_silo::BitmapSilo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let silo = BitmapSilo::open(dir.path()).unwrap();
+
+        let slots = SlotAllocator::new();
+        let filters = FilterIndex::new();   // no fields registered
+        let sorts = SortIndex::new();
+
+        let executor = QueryExecutor::new_full(
+            &slots, &filters, &sorts, 100,
+            Some(&silo), None, None, None, None,
+        );
+
+        let err = executor.execute(
+            &[FilterClause::Gt("unknown".to_string(), Value::Integer(0))],
+            None,
+            100,
+            None,
+        );
+        assert!(
+            matches!(err, Err(BitdexError::FieldNotFound(_))),
+            "expected FieldNotFound for unknown field, got: {err:?}",
+        );
     }
 }
