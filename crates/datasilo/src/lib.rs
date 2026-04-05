@@ -58,8 +58,6 @@ pub struct IndexEntry {
     pub allocated: u32,
 }
 
-const INDEX_ENTRY_SIZE: usize = std::mem::size_of::<IndexEntry>(); // 16
-
 // ---------------------------------------------------------------------------
 // SiloConfig
 // ---------------------------------------------------------------------------
@@ -123,8 +121,8 @@ impl ParallelOpsWriter {
     /// Write a Put op directly to the mmap. Thread-safe, lock-free.
     /// Returns true if the write succeeded.
     #[inline]
-    pub fn write_put(&self, key: u32, value: &[u8], local_cursor: &mut usize, local_end: &mut usize) -> bool {
-        let mut frame_buf = Vec::with_capacity(value.len() + 16);
+    pub fn write_put(&self, key: u64, value: &[u8], local_cursor: &mut usize, local_end: &mut usize) -> bool {
+        let mut frame_buf = Vec::with_capacity(value.len() + 20);
         OpsLog::encode_put_into(&mut frame_buf, key, value);
         self.write_frame(&frame_buf, local_cursor, local_end)
     }
@@ -132,7 +130,7 @@ impl ParallelOpsWriter {
     /// Write a Put op reusing a caller-provided buffer. Zero allocation per call.
     /// The buffer is cleared and reused — caller keeps it across rows.
     #[inline]
-    pub fn write_put_reuse(&self, key: u32, value: &[u8], buf: &mut Vec<u8>, local_cursor: &mut usize, local_end: &mut usize) -> bool {
+    pub fn write_put_reuse(&self, key: u64, value: &[u8], buf: &mut Vec<u8>, local_cursor: &mut usize, local_end: &mut usize) -> bool {
         buf.clear();
         OpsLog::encode_put_into(buf, key, value);
         self.write_frame(buf, local_cursor, local_end)
@@ -172,8 +170,9 @@ impl ParallelOpsWriter {
 pub struct DataSilo {
     path: PathBuf,
     config: SiloConfig,
-    index_mmap: Option<memmap2::MmapMut>,
-    index_len: u32,
+    /// Hash index: maps u64 key → (offset, length, allocated) in the data file.
+    /// Replaces the former flat array index — supports the full u64 key space.
+    index: Option<HashIndex>,
     data_mmap: Option<memmap2::Mmap>,
     data_len: u64,
     /// Two ops log slots for A-B swap during compaction.
@@ -211,8 +210,7 @@ impl DataSilo {
         let mut silo = Self {
             path: path.to_path_buf(),
             config,
-            index_mmap: None,
-            index_len: 0,
+            index: None,
             data_mmap: None,
             data_len: 0,
             ops_a: parking_lot::Mutex::new(ops_a),
@@ -267,12 +265,12 @@ impl DataSilo {
     }
 
     /// Append a single op (sequential, single-thread steady-state path).
-    pub fn append_op(&self, key: u32, value: &[u8]) -> io::Result<()> {
+    pub fn append_op(&self, key: u64, value: &[u8]) -> io::Result<()> {
         self.ops_log().lock().append(&SiloOp::Put { key, value: value.to_vec() })
     }
 
     /// Append a batch of ops sequentially. Useful for small batches in steady state.
-    pub fn append_ops_batch(&self, ops: &[(u32, Vec<u8>)]) -> io::Result<()> {
+    pub fn append_ops_batch(&self, ops: &[(u64, Vec<u8>)]) -> io::Result<()> {
         let mut log = self.ops_log().lock();
         for (key, value) in ops {
             log.append(&SiloOp::Put { key: *key, value: value.clone() })?;
@@ -291,7 +289,7 @@ impl DataSilo {
 
     /// Delete an entry by key. Appends a Delete tombstone to the active ops log.
     /// The entry is removed from the data file on the next compaction.
-    pub fn delete(&self, key: u32) -> io::Result<()> {
+    pub fn delete(&self, key: u64) -> io::Result<()> {
         self.ops_log().lock().append(&SiloOp::Delete { key })
     }
 
@@ -303,7 +301,7 @@ impl DataSilo {
     ///
     /// Semantics: overwrites the entire data file + index. Existing data is dropped.
     /// The caller is responsible for ensuring no concurrent reads during this call.
-    pub fn write_batch_parallel(&mut self, entries: &[(u32, Vec<u8>)]) -> io::Result<u64> {
+    pub fn write_batch_parallel(&mut self, entries: &[(u64, Vec<u8>)]) -> io::Result<u64> {
         if entries.is_empty() { return Ok(0); }
 
         let count = entries.len() as u64;
@@ -311,18 +309,15 @@ impl DataSilo {
         let buffer_ratio = self.config.buffer_ratio;
         let min_entry_size = self.config.min_entry_size;
 
-        // Find max key for index sizing
-        let max_key = entries.iter().map(|(k, _)| *k).max().unwrap_or(0);
-
-        // Drop old mmaps before writing
-        self.index_mmap = None;
+        // Drop old index and data mmaps before writing
+        self.index = None;
         self.data_mmap = None;
 
         // Phase 1: Compute entry layouts (sequential — offset computation is inherently serial)
-        struct EntryLayout { idx: usize, key: u32, offset: u64, length: u32, allocated: u32 }
+        struct EntryLayout { idx: usize, key: u64, offset: u64, length: u32, allocated: u32 }
         let mut layouts: Vec<EntryLayout> = Vec::with_capacity(entries.len());
 
-        // Sort by key for index locality
+        // Sort by key for index locality (improves hash table insertion order)
         let mut sorted_indices: Vec<usize> = (0..entries.len()).collect();
         sorted_indices.sort_unstable_by_key(|&i| entries[i].0);
 
@@ -343,7 +338,7 @@ impl DataSilo {
         }
         let total_data_size = offset;
 
-        // Phase 2: Pre-allocate data file + index as mmap
+        // Phase 2: Pre-allocate data file as mmap
         let data_path = self.path.join("data.bin");
         let data_file = OpenOptions::new()
             .create(true).read(true).write(true).truncate(true).open(&data_path)?;
@@ -352,18 +347,9 @@ impl DataSilo {
         // Sequential hint: bulk write pass reads/writes monotonically increasing offsets.
         #[cfg(unix)] let _ = data_mmap.advise(memmap2::Advice::Sequential);
 
-        let index_count = max_key as usize + 1;
-        let index_path = self.path.join("index.bin");
-        let index_file = OpenOptions::new()
-            .create(true).read(true).write(true).open(&index_path)?;
-        index_file.set_len((index_count * INDEX_ENTRY_SIZE) as u64)?;
-        let mut index_mmap = unsafe { memmap2::MmapMut::map_mut(&index_file)? };
-
-        // Phase 3: Parallel mmap writes via rayon
+        // Phase 3: Parallel mmap writes for data
         let data_base = data_mmap.as_mut_ptr() as usize;
-        let index_base = index_mmap.as_mut_ptr() as usize;
         let data_mmap_len = data_mmap.len();
-        let index_mmap_len = index_mmap.len();
 
         layouts.par_iter().for_each(|layout| {
             let value = &entries[layout.idx].1;
@@ -377,30 +363,31 @@ impl DataSilo {
                     );
                 }
             }
-            let entry = IndexEntry {
-                offset: layout.offset,
-                length: layout.length,
-                allocated: layout.allocated,
-            };
-            let pos = layout.key as usize * INDEX_ENTRY_SIZE;
-            if pos + INDEX_ENTRY_SIZE <= index_mmap_len {
-                let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(entry) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        (index_base + pos) as *mut u8,
-                        INDEX_ENTRY_SIZE,
-                    );
-                }
-            }
         });
 
         data_mmap.flush()?;
         drop(data_mmap);
-        index_mmap.flush()?;
 
-        self.index_mmap = Some(index_mmap);
-        self.index_len = index_count as u32;
+        // Phase 4: Build hash index (sequential — linear probing requires single writer)
+        // Capacity = 2× entry count to keep load factor ≤ 50%.
+        let index_capacity = (count * 2).max(16);
+        let index_path = self.path.join("index.bin");
+        // Remove existing index file so HashIndex::new() can create fresh
+        if index_path.exists() { let _ = std::fs::remove_file(&index_path); }
+        let mut idx = HashIndex::new(&index_path, index_capacity)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::new: {e}")))?;
+
+        for layout in &layouts {
+            idx.put(layout.key, IndexEntry {
+                offset: layout.offset,
+                length: layout.length,
+                allocated: layout.allocated,
+            }).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::put key={}: {e}", layout.key)))?;
+        }
+        idx.flush()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::flush: {e}")))?;
+
+        self.index = Some(idx);
         self.load_data()?;
         self.data_len = offset;
         self.dead_bytes.store(0, Ordering::Relaxed);
@@ -409,9 +396,8 @@ impl DataSilo {
         self.ops_a.lock().truncate()?;
         self.ops_b.lock().truncate()?;
 
-        eprintln!("DataSilo: write_batch_parallel {} entries, {:.1}MB data, {:.1}MB index",
-            count, offset as f64 / 1e6,
-            (index_count * INDEX_ENTRY_SIZE) as f64 / 1e6);
+        eprintln!("DataSilo: write_batch_parallel {} entries, {:.1}MB data, hash index cap={}",
+            count, offset as f64 / 1e6, index_capacity);
         Ok(count)
     }
 
@@ -419,7 +405,7 @@ impl DataSilo {
 
     /// Read an entry by key from the data file (no ops overlay).
     /// Fast path for queries after compaction.
-    pub fn get(&self, key: u32) -> Option<&[u8]> {
+    pub fn get(&self, key: u64) -> Option<&[u8]> {
         let entry = self.index_entry(key)?;
         if entry.length == 0 { return None; }
         let mmap = self.data_mmap.as_ref()?;
@@ -432,7 +418,7 @@ impl DataSilo {
     /// Unlike `get_with_ops` (which returns only the last value), this yields every
     /// op in chronological order (A then B). Used by BitmapSilo for ops-on-read
     /// where individual set/clear mutations must all be applied.
-    pub fn scan_ops_for_key<F>(&self, key: u32, mut f: F) -> io::Result<()>
+    pub fn scan_ops_for_key<F>(&self, key: u64, mut f: F) -> io::Result<()>
     where F: FnMut(&[u8])
     {
         let log_a = self.ops_a.lock();
@@ -451,7 +437,7 @@ impl DataSilo {
     /// Scans BOTH ops logs (A and B) for the latest value of this key.
     /// Last-write-wins across both logs (frozen log has older ops, active has newer).
     /// Handles both Put (update) and Delete (tombstone) ops.
-    pub fn get_with_ops(&self, key: u32) -> Option<Vec<u8>> {
+    pub fn get_with_ops(&self, key: u64) -> Option<Vec<u8>> {
         // Scan both ops logs. We must read them while holding both locks to get a
         // consistent snapshot. Lock order is always A then B to prevent deadlock.
         let log_a = self.ops_a.lock();
@@ -493,7 +479,19 @@ impl DataSilo {
 
     // ── Metadata ────────────────────────────────────────────────────────
 
-    pub fn index_capacity(&self) -> u32 { self.index_len }
+    /// Returns the number of live (non-tombstone) entries in the hash index.
+    pub fn index_capacity(&self) -> u64 {
+        self.index.as_ref().map(|idx| idx.count()).unwrap_or(0)
+    }
+
+    /// Iterate all live (compacted) keys in the hash index.
+    /// Does NOT include keys that are only in the ops log (not yet compacted).
+    /// Use `for_each_ops` on the ops log for those.
+    pub fn iter_index_keys(&self) -> impl Iterator<Item = u64> + '_ {
+        self.index.iter()
+            .flat_map(|idx| idx.iter())
+            .map(|(key, _entry)| key)
+    }
     pub fn data_bytes(&self) -> u64 { self.data_len }
     /// Total bytes written across both ops logs.
     pub fn ops_size(&self) -> u64 {
@@ -549,7 +547,7 @@ impl DataSilo {
         // fetch_xor returns the OLD value. Old active=B means B is now frozen.
 
         // Step 2: Compact from the frozen slot.
-        let has_data = self.data_mmap.is_some() && self.index_len > 0;
+        let has_data = self.data_mmap.is_some() && self.index.as_ref().map(|i| i.count() > 0).unwrap_or(false);
         let count = if has_data {
             self.compact_hot_from(frozen_is_b)?
         } else {
@@ -574,19 +572,16 @@ impl DataSilo {
         // Zero-copy scan: collect (key → mmap_offset, value_len) instead of copying values.
         // LWW dedup: last Put wins, Delete removes.
         // Values stay in the source mmap until the write phase reads them directly.
-        let mut entries: std::collections::HashMap<u32, (usize, usize)> = std::collections::HashMap::new();
-        let mut max_key: u32 = 0;
+        let mut entries: std::collections::HashMap<u64, (usize, usize)> = std::collections::HashMap::new();
         {
             let log = if frozen_is_b { self.ops_b.lock() } else { self.ops_a.lock() };
             log.for_each_ops_ref(|op| {
                 match op {
                     SiloOpRef::Put { key, offset, len } => {
                         entries.insert(key, (offset, len));
-                        if key > max_key { max_key = key; }
                     }
                     SiloOpRef::Delete { key } => {
                         entries.remove(&key);
-                        if key > max_key { max_key = key; }
                     }
                 }
             })?;
@@ -599,11 +594,11 @@ impl DataSilo {
         let min_entry_size = self.config.min_entry_size;
 
         // Sort keys and compute per-entry layout (offsets must be sequential)
-        let mut keys: Vec<u32> = entries.keys().copied().collect();
+        let mut keys: Vec<u64> = entries.keys().copied().collect();
         keys.sort_unstable();
 
         // Phase 1: Compute entry layouts — offset, length, allocated (sequential)
-        struct EntryLayout { key: u32, offset: u64, length: u32, allocated: u32 }
+        struct EntryLayout { key: u64, offset: u64, length: u32, allocated: u32 }
         let mut layouts: Vec<EntryLayout> = Vec::with_capacity(keys.len());
         let mut data_offset: u64 = 0;
         for &key in &keys {
@@ -631,11 +626,11 @@ impl DataSilo {
             }
         };
 
-        // Drop old mmaps before writing
-        self.index_mmap = None;
+        // Drop old index and data before writing
+        self.index = None;
         self.data_mmap = None;
 
-        // Phase 2: Pre-allocate data file + index as mmap
+        // Phase 2: Pre-allocate data file as mmap
         let data_path = self.path.join("data.bin");
         let data_file = OpenOptions::new()
             .create(true).read(true).write(true).truncate(true).open(&data_path)?;
@@ -643,19 +638,10 @@ impl DataSilo {
         let mut data_mmap = unsafe { memmap2::MmapMut::map_mut(&data_file)? };
         #[cfg(unix)] let _ = data_mmap.advise(memmap2::Advice::Sequential);
 
-        let index_count = max_key as usize + 1;
-        let index_path = self.path.join("index.bin");
-        let index_file = OpenOptions::new()
-            .create(true).read(true).write(true).open(&index_path)?;
-        index_file.set_len((index_count * INDEX_ENTRY_SIZE) as u64)?;
-        let mut index_mmap = unsafe { memmap2::MmapMut::map_mut(&index_file)? };
-
-        // Phase 3: Write entries to mmap (parallel memcpy via rayon)
+        // Phase 3: Write data (parallel memcpy via rayon)
         // Zero-copy: reads value bytes directly from source ops log mmap.
         let data_base = data_mmap.as_mut_ptr() as usize;
-        let index_base = index_mmap.as_mut_ptr() as usize;
         let data_mmap_len = data_mmap.len();
-        let index_mmap_len = index_mmap.len();
 
         layouts.par_iter().for_each(|layout| {
             let (src_offset, src_len) = entries[&layout.key];
@@ -669,40 +655,36 @@ impl DataSilo {
                     );
                 }
             }
-            // Write index entry
-            let entry = IndexEntry {
-                offset: layout.offset,
-                length: layout.length,
-                allocated: layout.allocated,
-            };
-            let pos = layout.key as usize * INDEX_ENTRY_SIZE;
-            if pos + INDEX_ENTRY_SIZE <= index_mmap_len {
-                let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(entry) };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        (index_base + pos) as *mut u8,
-                        INDEX_ENTRY_SIZE,
-                    );
-                }
-            }
         });
 
         data_mmap.flush()?;
         drop(data_mmap);
-        index_mmap.flush()?;
 
-        self.index_mmap = Some(index_mmap);
-        self.index_len = index_count as u32;
+        // Phase 4: Build hash index (sequential — single writer required)
+        let index_capacity = (count * 2).max(16);
+        let index_path = self.path.join("index.bin");
+        if index_path.exists() { let _ = std::fs::remove_file(&index_path); }
+        let mut idx = HashIndex::new(&index_path, index_capacity)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::new: {e}")))?;
+        for layout in &layouts {
+            idx.put(layout.key, IndexEntry {
+                offset: layout.offset,
+                length: layout.length,
+                allocated: layout.allocated,
+            }).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::put key={}: {e}", layout.key)))?;
+        }
+        idx.flush()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::flush: {e}")))?;
+
+        self.index = Some(idx);
         self.load_data()?;
         self.data_len = total_data_size;
         self.dead_bytes.store(0, Ordering::Relaxed); // full rewrite = no dead space
 
         // NOTE: caller (compact()) truncates the frozen log after this returns.
 
-        eprintln!("DataSilo: cold compacted {} entries, {:.1}MB data, {:.1}MB index",
-            count, total_data_size as f64 / 1e6,
-            (index_count * INDEX_ENTRY_SIZE) as f64 / 1e6);
+        eprintln!("DataSilo: cold compacted {} entries, {:.1}MB data, hash index cap={}",
+            count, total_data_size as f64 / 1e6, index_capacity);
         Ok(count)
     }
 
@@ -731,19 +713,16 @@ impl DataSilo {
     /// `frozen_is_b`: true = ops_b is frozen, false = ops_a is frozen.
     fn compact_hot_from(&mut self, frozen_is_b: bool) -> io::Result<u64> {
         // ── Step 1: Collect ops ──────────────────────────────────────────
-        let mut ops: std::collections::HashMap<u32, Option<Vec<u8>>> = std::collections::HashMap::new();
-        let mut max_key: u32 = 0;
+        let mut ops: std::collections::HashMap<u64, Option<Vec<u8>>> = std::collections::HashMap::new();
         {
             let log = if frozen_is_b { self.ops_b.lock() } else { self.ops_a.lock() };
             log.for_each_ops(|op| {
                 match op {
                     SiloOp::Put { key, value } => {
                         ops.insert(key, Some(value));
-                        if key > max_key { max_key = key; }
                     }
                     SiloOp::Delete { key } => {
                         ops.insert(key, None);
-                        if key > max_key { max_key = key; }
                     }
                 }
             })?;
@@ -755,14 +734,14 @@ impl DataSilo {
         // ── Step 2: Classify ops (read-only, nothing mutated) ────────────
         // in_place: key→(old IndexEntry, new value) — fits in existing slot
         // overflows: key→new value — new key or doesn't fit, goes to end
-        // deletions: (key, old_allocated) — zero index entry, account dead space
+        // deletions: (key, old_allocated) — tombstone index entry, account dead space
         //
         // Dead space is computed here while the original index is still intact.
         struct InPlaceUpdate { old_entry: IndexEntry, new_len: u32 }
-        let mut in_place_map: std::collections::HashMap<u32, InPlaceUpdate> = std::collections::HashMap::new();
-        let mut overflows: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut in_place_map: std::collections::HashMap<u64, InPlaceUpdate> = std::collections::HashMap::new();
+        let mut overflows: Vec<(u64, Vec<u8>)> = Vec::new();
         // (key, old_allocated_bytes_now_dead)
-        let mut deletions: Vec<(u32, u64)> = Vec::new();
+        let mut deletions: Vec<(u64, u64)> = Vec::new();
         // Dead bytes from overflow-displaced entries (old slots become dead in new file)
         let mut dead_from_overflows: u64 = 0;
 
@@ -770,36 +749,28 @@ impl DataSilo {
             match value_opt {
                 None => {
                     // Delete tombstone — read old allocated bytes while index is intact
-                    let old_allocated = if key < self.index_len {
-                        self.index_entry(key)
-                            .filter(|e| e.allocated > 0)
-                            .map(|e| e.allocated as u64)
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    };
+                    let old_allocated = self.index_entry(key)
+                        .filter(|e| e.allocated > 0)
+                        .map(|e| e.allocated as u64)
+                        .unwrap_or(0);
                     deletions.push((key, old_allocated));
                 }
                 Some(value) => {
-                    if key < self.index_len {
-                        if let Some(old_entry) = self.index_entry(key) {
-                            if old_entry.allocated > 0 && value.len() as u32 <= old_entry.allocated {
-                                let start = old_entry.offset as usize;
-                                // Sanity: slot must be within current data file bounds
-                                if start + old_entry.allocated as usize <= self.data_len as usize {
-                                    in_place_map.insert(key, InPlaceUpdate {
-                                        old_entry,
-                                        new_len: value.len() as u32,
-                                    });
-                                    continue;
-                                }
+                    if let Some(old_entry) = self.index_entry(key) {
+                        if old_entry.allocated > 0 && value.len() as u32 <= old_entry.allocated {
+                            let start = old_entry.offset as usize;
+                            // Sanity: slot must be within current data file bounds
+                            if start + old_entry.allocated as usize <= self.data_len as usize {
+                                in_place_map.insert(key, InPlaceUpdate {
+                                    old_entry,
+                                    new_len: value.len() as u32,
+                                });
+                                continue;
                             }
-                            // Existing entry displaced to overflow — old slot is dead space
-                            // in the new data file (we bulk-copied old file, then appended
-                            // the new value; the old region is now unreachable).
-                            if old_entry.allocated > 0 {
-                                dead_from_overflows += old_entry.allocated as u64;
-                            }
+                        }
+                        // Existing entry displaced to overflow — old slot is dead space
+                        if old_entry.allocated > 0 {
+                            dead_from_overflows += old_entry.allocated as u64;
                         }
                     }
                     // Falls through to overflow
@@ -808,28 +779,19 @@ impl DataSilo {
             }
         }
 
-        // ── Path A: In-place only (no overflows, no new keys) ────────────
+        // ── Path A: In-place only (no overflows or new keys) ────────────
         //
-        // All ops fit within their existing allocated slots and no new keys
-        // exceed the current index capacity.  Write directly into data.bin
-        // using a writable file handle — zero copy, no temp file, no rename.
+        // All ops fit within their existing allocated slots — write directly into
+        // data.bin using a writable file handle. No index rebuild needed.
         //
         // Invariant order: ALL data writes → data flush → index writes → index flush.
-        // self.data_mmap (read mmap) is never dropped — readers are unblocked
-        // throughout.
-        if overflows.is_empty() && max_key < self.index_len {
+        // self.data_mmap (read mmap) is never dropped — readers stay unblocked.
+        if overflows.is_empty() {
             let data_path = self.path.join("data.bin");
 
             // Open data.bin as a writable file for targeted byte-range writes.
-            // We do NOT mmap it for writing because on Windows a file cannot
-            // have two simultaneous mappings (read + write).  File I/O works
-            // on all platforms and is fine for the small number of in-place
-            // writes (each a few hundred bytes at most).
             let data_file = OpenOptions::new().write(true).open(&data_path)?;
 
-            // Write each in-place value directly at its existing offset.
-            // Uses pwrite-style seeks — no shared cursor, safe to do
-            // sequentially here (this method already requires &mut self).
             use std::io::{Seek, SeekFrom, Write};
             let mut data_file = std::io::BufWriter::new(data_file);
             for (&key, update) in &in_place_map {
@@ -838,55 +800,42 @@ impl DataSilo {
                     data_file.write_all(value)?;
                 }
             }
-            // Flush data before touching the index.
             data_file.flush()?;
-            // fsync the underlying file so data is durable before index update.
             data_file.into_inner()
                 .map_err(|e| e.into_error())?
                 .sync_data()?;
 
-            // ── Index: in-place length updates + deletion zeroing ─────────
-            // No extension needed (max_key < self.index_len guaranteed above).
+            // ── Index: in-place length updates + deletion tombstones ──────
+            let idx = match self.index.as_mut() {
+                Some(i) => i,
+                None => {
+                    eprintln!("DataSilo: hot compact path A — no index, skipping index update");
+                    return Ok(count);
+                }
+            };
             for (&key, update) in &in_place_map {
                 let new_entry = IndexEntry {
                     offset: update.old_entry.offset,
                     length: update.new_len,
                     allocated: update.old_entry.allocated,
                 };
-                if let Some(ref mut index_mmap) = self.index_mmap {
-                    let pos = key as usize * INDEX_ENTRY_SIZE;
-                    if pos + INDEX_ENTRY_SIZE <= index_mmap.len() {
-                        let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(new_entry) };
-                        index_mmap[pos..pos + INDEX_ENTRY_SIZE].copy_from_slice(&bytes);
-                    }
-                }
+                let _ = idx.put(key, new_entry);
             }
 
             let mut dead_from_deletes: u64 = 0;
             for &(key, old_allocated) in &deletions {
                 dead_from_deletes += old_allocated;
-                if key < self.index_len {
-                    let zero_entry = IndexEntry { offset: 0, length: 0, allocated: 0 };
-                    if let Some(ref mut index_mmap) = self.index_mmap {
-                        let pos = key as usize * INDEX_ENTRY_SIZE;
-                        if pos + INDEX_ENTRY_SIZE <= index_mmap.len() {
-                            let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(zero_entry) };
-                            index_mmap[pos..pos + INDEX_ENTRY_SIZE].copy_from_slice(&bytes);
-                        }
-                    }
-                }
+                idx.remove(key);
             }
 
             self.dead_bytes.fetch_add(dead_from_deletes, Ordering::Relaxed);
             // dead_from_overflows is zero in Path A (verified: overflows.is_empty())
 
-            if let Some(ref index_mmap) = self.index_mmap {
-                index_mmap.flush()?;
-            }
+            idx.flush()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::flush: {e}")))?;
 
             // NOTE: caller (compact()) truncates the frozen log after this returns.
-            // self.data_mmap is intentionally NOT remapped — the same file was
-            // written in-place, so existing offsets are still valid.
+            // self.data_mmap is intentionally NOT remapped — same file, same offsets.
 
             eprintln!("DataSilo: hot compacted {} ops ({} in-place, 0 overflow, {} deletes) [path=A]",
                 count, in_place_map.len(), deletions.len());
@@ -896,10 +845,7 @@ impl DataSilo {
         // ── Path B: Has overflows — in-place updates + append overflows ──
         //
         // Some entries don't fit their existing slot or are brand-new keys.
-        // In-place updates write directly to data.bin. Overflows append to
-        // the end. Old slots from overflows become dead space. The full file
-        // rewrite only happens when dead_ratio exceeds compact_threshold
-        // (handled by a separate repack pass, not here).
+        // In-place updates write directly to data.bin. Overflows append to the end.
         let data_path = self.path.join("data.bin");
 
         let align = self.config.alignment.max(1) as u64;
@@ -923,7 +869,7 @@ impl DataSilo {
 
         // ── Step 3b: Append overflows to end of data.bin ──────────────────
         let mut new_data_len = self.data_len;
-        struct OverflowLayout { key: u32, offset: u64, length: u32, allocated: u32 }
+        struct OverflowLayout { key: u64, offset: u64, length: u32, allocated: u32 }
         let mut overflow_layouts: Vec<OverflowLayout> = Vec::with_capacity(overflows.len());
         if !overflows.is_empty() {
             let data_file = OpenOptions::new().write(true).append(true).open(&data_path)?;
@@ -932,7 +878,6 @@ impl DataSilo {
 
             for (key, value) in &overflows {
                 if align > 1 {
-                    // Pad to alignment
                     let aligned = (offset + align - 1) & !(align - 1);
                     if aligned > offset {
                         let pad = (aligned - offset) as usize;
@@ -953,7 +898,6 @@ impl DataSilo {
                 }
 
                 writer.write_all(value)?;
-                // Write padding for allocated headroom
                 if allocated > len {
                     let zeros = [0u8; 4096];
                     let mut rem = (allocated - len) as usize;
@@ -973,8 +917,6 @@ impl DataSilo {
         }
 
         // ── Step 4: Remap data mmap to pick up appended data ─────────────
-        // Remap data mmap to pick up appended data (file grew).
-        // Old mmap is still valid for existing offsets. New entries are at new offsets.
         if new_data_len > self.data_len {
             self.data_mmap = None;
             self.load_data()?;
@@ -982,80 +924,81 @@ impl DataSilo {
         }
 
         // ── Step 5: Update index ──────────────────────────────────────────
-        // Only now do we touch the index.  Data file is complete on disk.
+        // Only now do we touch the index. Data file is complete on disk.
+        //
+        // If the hash index doesn't exist (fresh start after overflow), create it.
+        // If it exists but would exceed 75% load with new entries, rebuild it.
+        let new_entry_count = (self.index.as_ref().map(|i| i.count()).unwrap_or(0)
+            + overflow_layouts.len() as u64)
+            .saturating_sub(deletions.len() as u64);
+        let need_rebuild = self.index.as_ref()
+            .map(|i| new_entry_count + 1 > i.capacity() * 3 / 4)
+            .unwrap_or(true);
 
-        // Extend index if overflows include keys beyond current capacity.
-        let new_max_key = max_key.max(
-            overflow_layouts.iter().map(|l| l.key).max().unwrap_or(0)
-        );
-        if new_max_key >= self.index_len {
-            let new_count = new_max_key as usize + 1;
+        if need_rebuild {
+            // Rebuild the entire index from scratch by iterating existing entries + new.
+            let new_capacity = (new_entry_count * 2).max(16);
             let index_path = self.path.join("index.bin");
-            self.index_mmap = None;
-            let index_file = OpenOptions::new().read(true).write(true).open(&index_path)?;
-            index_file.set_len((new_count * INDEX_ENTRY_SIZE) as u64)?;
-            let mmap = unsafe { memmap2::MmapMut::map_mut(&index_file)? };
-            self.index_mmap = Some(mmap);
-            self.index_len = new_count as u32;
-        }
+            if index_path.exists() { let _ = std::fs::remove_file(&index_path); }
+            let mut new_idx = HashIndex::new(&index_path, new_capacity)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::new: {e}")))?;
 
-        // Write index entries for in-place updates (same offset, new length)
-        for (&key, update) in &in_place_map {
-            let new_entry = IndexEntry {
-                offset: update.old_entry.offset,
-                length: update.new_len,
-                allocated: update.old_entry.allocated,
-            };
-            if let Some(ref mut index_mmap) = self.index_mmap {
-                let pos = key as usize * INDEX_ENTRY_SIZE;
-                if pos + INDEX_ENTRY_SIZE <= index_mmap.len() {
-                    let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(new_entry) };
-                    index_mmap[pos..pos + INDEX_ENTRY_SIZE].copy_from_slice(&bytes);
+            // Copy surviving entries from old index
+            let deletion_set: std::collections::HashSet<u64> = deletions.iter().map(|(k, _)| *k).collect();
+            let overflow_key_set: std::collections::HashSet<u64> = overflow_layouts.iter().map(|l| l.key).collect();
+            if let Some(ref old_idx) = self.index {
+                for (key, entry) in old_idx.iter() {
+                    if deletion_set.contains(&key) { continue; }
+                    if overflow_key_set.contains(&key) { continue; } // will be re-added below
+                    let updated = if let Some(upd) = in_place_map.get(&key) {
+                        IndexEntry { offset: entry.offset, length: upd.new_len, allocated: entry.allocated }
+                    } else {
+                        entry
+                    };
+                    let _ = new_idx.put(key, updated);
                 }
             }
-        }
 
-        // Write index entries for overflow entries (new offsets)
-        for layout in &overflow_layouts {
-            let entry = IndexEntry {
-                offset: layout.offset,
-                length: layout.length,
-                allocated: layout.allocated,
-            };
-            if let Some(ref mut index_mmap) = self.index_mmap {
-                let pos = layout.key as usize * INDEX_ENTRY_SIZE;
-                if pos + INDEX_ENTRY_SIZE <= index_mmap.len() {
-                    let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(entry) };
-                    index_mmap[pos..pos + INDEX_ENTRY_SIZE].copy_from_slice(&bytes);
-                }
+            // Add overflow entries
+            for layout in &overflow_layouts {
+                let _ = new_idx.put(layout.key, IndexEntry {
+                    offset: layout.offset,
+                    length: layout.length,
+                    allocated: layout.allocated,
+                });
             }
-        }
 
-        // Zero out index entries for deletions.
-        // dead_from_deletes was captured during Step 2 classification (before any index writes).
-        let mut dead_from_deletes: u64 = 0;
-        for &(key, old_allocated) in &deletions {
-            dead_from_deletes += old_allocated;
-            if key < self.index_len {
-                let zero_entry = IndexEntry { offset: 0, length: 0, allocated: 0 };
-                if let Some(ref mut index_mmap) = self.index_mmap {
-                    let pos = key as usize * INDEX_ENTRY_SIZE;
-                    if pos + INDEX_ENTRY_SIZE <= index_mmap.len() {
-                        let bytes: [u8; INDEX_ENTRY_SIZE] = unsafe { std::mem::transmute(zero_entry) };
-                        index_mmap[pos..pos + INDEX_ENTRY_SIZE].copy_from_slice(&bytes);
-                    }
-                }
+            new_idx.flush()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::flush: {e}")))?;
+            self.index = Some(new_idx);
+        } else {
+            // In-place index update: put overflows + in-place length changes + tombstone deletions
+            let idx = self.index.as_mut().unwrap();
+
+            for (&key, update) in &in_place_map {
+                let _ = idx.put(key, IndexEntry {
+                    offset: update.old_entry.offset,
+                    length: update.new_len,
+                    allocated: update.old_entry.allocated,
+                });
             }
+            for layout in &overflow_layouts {
+                let _ = idx.put(layout.key, IndexEntry {
+                    offset: layout.offset,
+                    length: layout.length,
+                    allocated: layout.allocated,
+                });
+            }
+            for &(key, _) in &deletions {
+                idx.remove(key);
+            }
+            idx.flush()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::flush: {e}")))?;
         }
 
-        // Account for dead space.
-        // dead_from_overflows and dead_from_deletes both captured in Step 2 before
-        // any index mutations — correct pre-compaction values.
+        // Account for dead space
+        let dead_from_deletes: u64 = deletions.iter().map(|(_, a)| *a).sum();
         self.dead_bytes.fetch_add(dead_from_deletes + dead_from_overflows, Ordering::Relaxed);
-
-        if let Some(ref index_mmap) = self.index_mmap {
-            index_mmap.flush()?;
-        }
 
         // NOTE: caller (compact()) truncates the frozen log after this returns.
 
@@ -1066,26 +1009,21 @@ impl DataSilo {
 
     // ── Internal helpers ────────────────────────────────────────────────
 
-    fn index_entry(&self, key: u32) -> Option<IndexEntry> {
-        if key >= self.index_len { return None; }
-        let mmap = self.index_mmap.as_ref()?;
-        let pos = key as usize * INDEX_ENTRY_SIZE;
-        if pos + INDEX_ENTRY_SIZE > mmap.len() { return None; }
-        let bytes: [u8; INDEX_ENTRY_SIZE] = mmap[pos..pos + INDEX_ENTRY_SIZE].try_into().ok()?;
-        Some(unsafe { std::mem::transmute(bytes) })
+    fn index_entry(&self, key: u64) -> Option<IndexEntry> {
+        self.index.as_ref()?.get(key)
     }
 
     fn load_index(&mut self) -> io::Result<()> {
         let p = self.path.join("index.bin");
         if !p.exists() { return Ok(()); }
-        let f = OpenOptions::new().read(true).write(true).open(&p)?;
-        if f.metadata()?.len() < INDEX_ENTRY_SIZE as u64 { return Ok(()); }
-        let mmap = unsafe { memmap2::MmapMut::map_mut(&f)? };
-        // Random hint: index lookups address arbitrary slots by key hash.
-        #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Random);
-        self.index_len = (mmap.len() / INDEX_ENTRY_SIZE) as u32;
-        self.index_mmap = Some(mmap);
-        Ok(())
+        match HashIndex::open(&p) {
+            Ok(idx) => {
+                self.index = Some(idx);
+                Ok(())
+            }
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("load_index: {e}")))
+        }
     }
 
     fn load_data(&mut self) -> io::Result<()> {
@@ -1450,24 +1388,24 @@ mod tests {
         let mut silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
 
         // Cold compaction to establish initial data.
-        for i in 0u32..50 {
+        for i in 0u64..50 {
             silo.append_op(i, format!("initial_{}", i).as_bytes()).unwrap();
         }
         silo.compact().unwrap();
 
         // Run 10 rounds of hot compaction, each updating half the keys and adding new ones.
-        for round in 0u32..10 {
-            for i in 0u32..25 {
+        for round in 0u64..10 {
+            for i in 0u64..25 {
                 let v = format!("round_{}_key_{}", round, i);
                 silo.append_op(i, v.as_bytes()).unwrap();
             }
-            // Add new keys each round (overflow path, since key >= index_len initially)
+            // Add new keys each round
             let new_key = 50 + round;
             silo.append_op(new_key, format!("new_{}", round).as_bytes()).unwrap();
             silo.compact().unwrap();
 
             // All previously established keys must still be readable.
-            for i in 25u32..50 {
+            for i in 25u64..50 {
                 let expected = format!("initial_{}", i);
                 assert_eq!(
                     silo.get(i).unwrap(),
@@ -1476,7 +1414,7 @@ mod tests {
                 );
             }
             // Updated keys must have new values.
-            for i in 0u32..25 {
+            for i in 0u64..25 {
                 let expected = format!("round_{}_key_{}", round, i);
                 assert_eq!(
                     silo.get(i).unwrap(),
