@@ -545,29 +545,8 @@ impl<'a> ParsedRow<'a> {
         self.get_i64(slot_field).map(|v| v as u32)
     }
 
-    /// Convert to Nate's CsvRow format for expression/enrichment evaluation.
-    pub fn to_csv_row<'b>(&'b self) -> CsvRow<'b> {
-        let mut row = CsvRow::new();
-        for (name, &idx) in self.col_index {
-            if let Some(bytes) = self.fields.get(idx) {
-                if bytes.is_empty() {
-                    row.insert(name.as_str(), None);
-                } else {
-                    let s = if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
-                        std::str::from_utf8(&bytes[1..bytes.len() - 1]).ok()
-                    } else {
-                        std::str::from_utf8(bytes).ok()
-                    };
-                    row.insert(name.as_str(), s);
-                }
-            }
-        }
-        row
-    }
-
     /// Build indexed fields for zero-allocation expression evaluation.
     /// Returns a Vec<Option<&str>> aligned to the column index positions.
-    /// Much cheaper than to_csv_row() — no HashMap allocation.
     pub fn to_indexed_fields<'b>(&'b self) -> Vec<Option<&'b str>> {
         self.fields
             .iter()
