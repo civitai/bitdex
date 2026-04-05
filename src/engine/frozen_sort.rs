@@ -78,7 +78,14 @@ pub fn frozen_reconstruct_value(
     for bit in 0..num_bits {
         let contains = silo
             .get_frozen_sort_layer(field_name, bit)
-            .map_or(false, |frozen| frozen.contains(slot));
+            .map_or_else(
+                || {
+                    // Frozen not available (data not compacted yet) — fall back to ops log
+                    silo.get_sort_layer_with_ops(field_name, bit)
+                        .map_or(false, |bm| bm.contains(slot))
+                },
+                |frozen| frozen.contains(slot),
+            );
         if contains {
             value |= 1 << bit;
         }
@@ -116,18 +123,15 @@ fn bifurcate(
             break;
         }
 
-        let frozen = match silo.get_frozen_sort_layer(field_name, bit) {
-            Some(f) => f,
-            // Layer not stored in silo — treat as all-zeros (skip this layer)
-            None => continue,
-        };
-
-        let preferred: RoaringBitmap = if descending {
-            // Prefer slots with the bit SET (higher values first)
-            &remaining & &frozen
+        // Try frozen data file first, fall back to ops log
+        let layer_bitmap: RoaringBitmap;
+        let preferred: RoaringBitmap = if let Some(frozen) = silo.get_frozen_sort_layer(field_name, bit) {
+            if descending { &remaining & &frozen } else { &remaining - &frozen }
+        } else if let Some(ops_bm) = silo.get_sort_layer_with_ops(field_name, bit) {
+            layer_bitmap = ops_bm;
+            if descending { &remaining & &layer_bitmap } else { &remaining - &layer_bitmap }
         } else {
-            // Prefer slots with the bit CLEAR (lower values first)
-            &remaining - &frozen
+            continue;
         };
 
         let preferred_count = preferred.len() as usize;
@@ -205,11 +209,16 @@ fn apply_cursor_filter(
 
         let cursor_bit_set = (cursor_value >> bit) & 1 == 1;
 
+        // Try frozen data file first, fall back to ops log
+        let ops_fallback: RoaringBitmap;
         let (equal_with_bit_set, equal_with_bit_clear) =
-            match silo.get_frozen_sort_layer(field_name, bit) {
-                Some(frozen) => (&equal & &frozen, &equal - &frozen),
-                // Layer not in silo — treat as all-zeros: all slots have bit clear
-                None => (RoaringBitmap::new(), equal.clone()),
+            if let Some(frozen) = silo.get_frozen_sort_layer(field_name, bit) {
+                (&equal & &frozen, &equal - &frozen)
+            } else if let Some(bm) = silo.get_sort_layer_with_ops(field_name, bit) {
+                ops_fallback = bm;
+                (&equal & &ops_fallback, &equal - &ops_fallback)
+            } else {
+                (RoaringBitmap::new(), equal.clone())
             };
 
         if descending {
