@@ -1232,62 +1232,8 @@ pub fn process_dump(
 
     let result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema, slot_watermark.as_ref(), shutdown.as_ref())?;
 
-    // Apply bitmaps to engine staging (in-memory).
-    // This is the core bitmap transfer: filter maps, sort maps, alive bitmap.
-    let t_apply = Instant::now();
-    {
-        let mut staging = engine.clone_staging();
-
-        // Convert sort_maps from HashMap<String, Vec<RoaringBitmap>> to HashMap<String, HashMap<usize, RoaringBitmap>>
-        let sort_maps_indexed: HashMap<String, HashMap<usize, RoaringBitmap>> = result.sort_maps
-            .into_iter()
-            .map(|(name, layers)| {
-                let indexed: HashMap<usize, RoaringBitmap> = layers
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(_, bm)| !bm.is_empty())
-                    .collect();
-                (name, indexed)
-            })
-            .collect();
-
-        // Convert AHashMap → std::HashMap for engine API boundary (into_iter = move, no clone)
-        let filter_maps_std: std::collections::HashMap<String, std::collections::HashMap<u64, RoaringBitmap>> =
-            result.filter_maps.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect();
-        let sort_maps_std: std::collections::HashMap<String, std::collections::HashMap<usize, RoaringBitmap>> =
-            sort_maps_indexed.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect();
-        ConcurrentEngine::apply_bitmap_maps(
-            &mut staging,
-            filter_maps_std,
-            sort_maps_std,
-            result.alive,
-        );
-
-        // Update slot counter to max_slot + 1 via from_state
-        if result.max_slot > 0 {
-            let current_counter = staging.slots.slot_counter();
-            if result.max_slot + 1 > current_counter {
-                // Rebuild slot allocator with updated counter
-                staging.slots = crate::engine::slot::SlotAllocator::from_state(
-                    result.max_slot + 1,
-                    staging.slots.alive_bitmap().clone(),
-                    roaring::RoaringBitmap::new(),
-                );
-            }
-        }
-
-        // Apply deferred alive slots
-        if !result.deferred_slots.is_empty() {
-            staging.slots.set_deferred(result.deferred_slots.clone());
-        }
-
-        engine.publish_staging(staging);
-    }
-    eprintln!("  Dump {} apply_bitmaps in {:.1}s", request.name, t_apply.elapsed().as_secs_f64());
-
-    // NOTE: save_snapshot and doc compact are deferred to after all phases complete.
-    // Doing them per-phase was adding 35s+ of overhead per phase (10s save + 24s compact).
-    // The caller (server dump handler) calls save_snapshot + compact once at the end.
+    // Bitmaps applied to staging inside process_dump_with_progress (fused with merge).
+    // save_snapshot and doc compact deferred to after all phases complete.
 
     // Persist LCS dictionaries after each phase.
     if let Some(ref bitmap_path) = engine.config().storage.bitmap_path {
@@ -1296,16 +1242,7 @@ pub fn process_dump(
     }
 
     eprintln!("  Dump {} total process_dump in {:.1}s", request.name, t_total.elapsed().as_secs_f64());
-    // filter_maps and alive were consumed by apply_bitmap_maps (into_iter = move, not clone).
-    // Return with empty defaults — caller only uses row_count.
-    Ok(PhaseResult {
-        row_count: result.row_count,
-        filter_maps: HashMap::new(),
-        sort_maps: HashMap::new(),
-        alive: RoaringBitmap::new(),
-        deferred_slots: result.deferred_slots,
-        max_slot: result.max_slot,
-    })
+    Ok(result)
 }
 
 /// Compact the doc silo after all dump phases complete.
@@ -2459,11 +2396,47 @@ pub fn process_dump_with_progress(
         total_count as f64 / elapsed.as_secs_f64().max(0.001)
     );
 
+    // Apply bitmaps directly to engine staging — fused with merge, no intermediate copy.
+    let t_apply = Instant::now();
+    {
+        let mut staging = engine.clone_staging();
+
+        // Convert sort_maps to indexed format and apply directly (into_iter = move, no clone)
+        let sort_maps_indexed: std::collections::HashMap<String, std::collections::HashMap<usize, RoaringBitmap>> =
+            merged_sorts.into_iter().map(|(name, layers)| {
+                let indexed: std::collections::HashMap<usize, RoaringBitmap> = layers
+                    .into_iter().enumerate().filter(|(_, bm)| !bm.is_empty()).collect();
+                (name, indexed)
+            }).collect();
+        let filter_maps_std: std::collections::HashMap<String, std::collections::HashMap<u64, RoaringBitmap>> =
+            merged_filters.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect();
+
+        ConcurrentEngine::apply_bitmap_maps(&mut staging, filter_maps_std, sort_maps_indexed, merged_alive);
+
+        // Update slot counter
+        if max_slot > 0 {
+            let current_counter = staging.slots.slot_counter();
+            if max_slot + 1 > current_counter {
+                staging.slots = crate::engine::slot::SlotAllocator::from_state(
+                    max_slot + 1,
+                    staging.slots.alive_bitmap().clone(),
+                    roaring::RoaringBitmap::new(),
+                );
+            }
+        }
+        if !merged_deferred.is_empty() {
+            staging.slots.set_deferred(merged_deferred.clone());
+        }
+
+        engine.publish_staging(staging);
+    }
+    eprintln!("  Dump {} apply_bitmaps in {:.1}s", request.name, t_apply.elapsed().as_secs_f64());
+
     Ok(PhaseResult {
         row_count: total_count,
-        filter_maps: merged_filters,
-        sort_maps: merged_sorts,
-        alive: merged_alive,
+        filter_maps: HashMap::new(),
+        sort_maps: HashMap::new(),
+        alive: RoaringBitmap::new(),
         deferred_slots: merged_deferred,
         max_slot,
     })
