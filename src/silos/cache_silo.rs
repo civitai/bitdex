@@ -272,25 +272,32 @@ impl CacheEntryData {
 // Key hashing
 // ---------------------------------------------------------------------------
 
-/// Derive a stable u32 key from a UnifiedKey.
+/// Derive a stable u64 key from a UnifiedKey.
 ///
 /// Uses DefaultHasher (std deterministic within a single process run). This is
 /// adequate for a persistent cache — collisions cause silent eviction (the key
 /// stored under the same hash slot is overwritten), not correctness errors.
 /// At typical cache sizes (<100K entries) the collision probability is negligible.
-pub fn hash_unified_key(key: &UnifiedKey) -> u32 {
+///
+/// The key must not be 0 or u64::MAX (reserved by HashIndex as sentinel values).
+/// We map those collisions to a safe nearby value.
+pub fn hash_unified_key(key: &UnifiedKey) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     let h = hasher.finish();
-    // Fold 64→32 bits: XOR the two halves to reduce collisions vs plain truncation.
-    ((h >> 32) as u32) ^ (h as u32)
+    // Avoid the two reserved sentinel values used by HashIndex.
+    match h {
+        0 => 1,
+        u64::MAX => u64::MAX - 1,
+        v => v,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // CacheSilo
 // ---------------------------------------------------------------------------
 
-/// Persistent cache store: wraps a DataSilo whose keys are u32 hashes of
+/// Persistent cache store: wraps a DataSilo whose keys are u64 hashes of
 /// UnifiedKey and whose values are binary-encoded CacheEntryData.
 pub struct CacheSilo {
     silo: datasilo::DataSilo,
@@ -311,13 +318,13 @@ impl CacheSilo {
     }
 
     /// Persist a cache entry. Called by the flush thread after cache update.
-    pub fn save_entry(&self, key_hash: u32, entry: &CacheEntryData) -> io::Result<()> {
+    pub fn save_entry(&self, key_hash: u64, entry: &CacheEntryData) -> io::Result<()> {
         let bytes = entry.encode();
         self.silo.append_op(key_hash, &bytes)
     }
 
     /// Remove a persisted cache entry. Called on eviction.
-    pub fn delete_entry(&self, key_hash: u32) -> io::Result<()> {
+    pub fn delete_entry(&self, key_hash: u64) -> io::Result<()> {
         self.silo.delete(key_hash)
     }
 
@@ -326,7 +333,7 @@ impl CacheSilo {
     /// is absent or tombstoned.
     ///
     /// Used by the query fast path to check the persistent cache.
-    pub fn get_entry(&self, key_hash: u32) -> Option<CacheEntryData> {
+    pub fn get_entry(&self, key_hash: u64) -> Option<CacheEntryData> {
         let bytes = self.silo.get_with_ops(key_hash)?;
         match CacheEntryData::decode(&bytes) {
             Ok(entry) => Some(entry),
@@ -341,12 +348,12 @@ impl CacheSilo {
     ///
     /// Iterates the ops log (LIFO — last write wins) and falls back to the data
     /// file for entries that were compacted. Skips tombstoned (deleted) keys.
-    pub fn load_all(&self) -> io::Result<Vec<(u32, CacheEntryData)>> {
+    pub fn load_all(&self) -> io::Result<Vec<(u64, CacheEntryData)>> {
         use datasilo::SiloOp;
         use std::collections::HashMap;
 
         // Collect last op per key from the ops log (last-write-wins, like DataSilo compaction).
-        let mut latest: HashMap<u32, Option<Vec<u8>>> = HashMap::new();
+        let mut latest: HashMap<u64, Option<Vec<u8>>> = HashMap::new();
         let log = self.silo.ops_log().lock();
         let _ = log.for_each_ops(|op| {
             match op {
@@ -375,10 +382,9 @@ impl CacheSilo {
             // None = tombstoned; skip.
         }
 
-        // Entries only in the data file (compacted, no ops overlay)
-        // We iterate all index slots and skip any key already handled via ops.
-        let index_cap = self.silo.index_capacity();
-        for key in 0..index_cap {
+        // Entries only in the data file (compacted, no ops overlay).
+        // Iterate the hash index directly instead of probing 0..N.
+        for key in self.silo.iter_index_keys() {
             if latest.contains_key(&key) {
                 continue; // ops overlay already processed this key
             }

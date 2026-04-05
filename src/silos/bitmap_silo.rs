@@ -21,12 +21,13 @@ use roaring::{FrozenRoaringBitmap, RoaringBitmap};
 use crate::engine::filter::FilterIndex;
 use crate::engine::sort::SortIndex;
 use crate::engine::slot::SlotAllocator;
+use crate::silos::bitmap_keys::{
+    KEY_ALIVE, KEY_META, encode_filter_key, encode_sort_key,
+};
+use crate::silos::field_registry::FieldRegistry;
 
-/// Reserved key for the alive bitmap.
-const KEY_ALIVE: u32 = 0;
-/// Reserved key for metadata (slot_counter, cursors, deferred alive).
-const KEY_META: u32 = 1;
-/// First key available for filter/sort bitmaps.
+/// First key available for legacy string-manifest bitmaps.
+/// Kept for backward-compat loading of old manifest.json files.
 const KEY_BITMAP_START: u32 = 2;
 
 // Ops value type tags for bitmap mutations
@@ -38,14 +39,17 @@ const OP_CLEAR_BIT: u8 = 0x02;    // Clear a single bit: [0x02][u32 slot]
 pub struct BitmapSilo {
     silo: datasilo::DataSilo,
     path: PathBuf,
-    /// Maps logical bitmap name → silo key.
-    /// Format: "filter:{field}:{value}" or "sort:{field}:{bit}" → u32
-    /// Protected by RwLock for concurrent mutation method access.
-    name_to_key: parking_lot::RwLock<HashMap<String, u32>>,
-    /// Reverse mapping for loading.
-    key_to_name: parking_lot::RwLock<HashMap<u32, String>>,
-    /// Next available key for new bitmaps.
-    next_key: std::sync::atomic::AtomicU32,
+    /// FieldRegistry — maps field names → stable u16 IDs for key encoding.
+    /// Used by all encode_filter_key / encode_sort_key / encode_bucket_key calls.
+    field_registry: parking_lot::Mutex<FieldRegistry>,
+    /// Deprecated: legacy string-based manifest (kept for backward-compat loading).
+    /// New writes use FieldRegistry + bitmap_keys encoding instead.
+    /// Protected by RwLock for concurrent access.
+    name_to_key: parking_lot::RwLock<HashMap<String, u64>>,
+    /// Reverse mapping for legacy loading.
+    key_to_name: parking_lot::RwLock<HashMap<u64, String>>,
+    /// Next available key for legacy string-based allocations (rarely needed now).
+    next_key: std::sync::atomic::AtomicU64,
 }
 
 impl BitmapSilo {
@@ -62,37 +66,72 @@ impl BitmapSilo {
             },
         )?;
 
-        // Load manifest if it exists
+        // Load FieldRegistry (creates fresh if no file exists).
+        let field_registry = FieldRegistry::open(path)?;
+
+        // Load legacy manifest if it exists (for backward-compat reading of old data).
         let manifest_path = path.join("bitmap_manifest.json");
         let (name_to_key, key_to_name, next_key) = if manifest_path.exists() {
             let data = std::fs::read_to_string(&manifest_path)?;
-            let map: HashMap<String, u32> = serde_json::from_str(&data)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let reverse: HashMap<u32, String> = map.iter().map(|(k, v)| (*v, k.clone())).collect();
-            let max_key = map.values().copied().max().unwrap_or(KEY_BITMAP_START);
+            // Try loading as u64 map first, then fall back to legacy u32 map.
+            let map: HashMap<String, u64> = if let Ok(m) = serde_json::from_str::<HashMap<String, u64>>(&data) {
+                m
+            } else {
+                // Legacy u32 manifest — upcast all values to u64.
+                let m: HashMap<String, u32> = serde_json::from_str(&data)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                m.into_iter().map(|(k, v)| (k, v as u64)).collect()
+            };
+            let reverse: HashMap<u64, String> = map.iter().map(|(k, v)| (*v, k.clone())).collect();
+            let max_key = map.values().copied().max().unwrap_or(KEY_BITMAP_START as u64);
             (map, reverse, max_key + 1)
         } else {
-            (HashMap::new(), HashMap::new(), KEY_BITMAP_START)
+            (HashMap::new(), HashMap::new(), KEY_BITMAP_START as u64)
         };
 
         Ok(Self {
             silo,
             path: path.to_path_buf(),
+            field_registry: parking_lot::Mutex::new(field_registry),
             name_to_key: parking_lot::RwLock::new(name_to_key),
             key_to_name: parking_lot::RwLock::new(key_to_name),
-            next_key: std::sync::atomic::AtomicU32::new(next_key),
+            next_key: std::sync::atomic::AtomicU64::new(next_key),
         })
     }
 
-    /// Save the current manifest to disk.
+    /// Save the current legacy manifest to disk.
+    /// Still used by load paths that need to enumerate all named keys.
     fn save_manifest(&self) -> io::Result<()> {
         let json = serde_json::to_string_pretty(&*self.name_to_key.read())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        std::fs::write(self.path.join("bitmap_manifest.json"), json)
+        std::fs::write(self.path.join("bitmap_manifest.json"), json)?;
+        // Also save the FieldRegistry alongside the manifest.
+        self.field_registry.lock().save()
     }
 
-    /// Get or assign a silo key for a logical bitmap name.
-    fn ensure_key(&self, name: &str) -> u32 {
+    // ── FieldRegistry helpers ────────────────────────────────────────────
+
+    /// Look up the field ID for a field name. Returns None if not yet registered.
+    fn field_id(&self, name: &str) -> Option<u16> {
+        self.field_registry.lock().get(name)
+    }
+
+    /// Get or assign a field ID for a field name. Saves the registry if new.
+    fn ensure_field_id(&self, name: &str) -> u16 {
+        let mut reg = self.field_registry.lock();
+        match reg.ensure(name) {
+            Ok(id) => id,
+            Err(e) => {
+                // Field ID overflow is extremely unlikely (~16K fields). Fallback to 0.
+                eprintln!("BitmapSilo: field ID error for '{name}': {e}");
+                0
+            }
+        }
+    }
+
+    /// Deprecated: get or assign a legacy string-based silo key.
+    /// Kept for bucket keys and any code paths that predate FieldRegistry.
+    fn ensure_key(&self, name: &str) -> u64 {
         // Fast path: read lock
         if let Some(&key) = self.name_to_key.read().get(name) {
             return key;
@@ -144,9 +183,13 @@ impl BitmapSilo {
 
         // Save filter bitmaps in CRoaring frozen format (zero-copy mmap reads)
         for (field_name, field) in filters.fields() {
+            let field_id = self.ensure_field_id(field_name);
             for (value, bitmap) in field.bitmaps_fused() {
-                let name = format!("filter:{}:{}", field_name, value);
-                let key = self.ensure_key(&name);
+                let key = encode_filter_key(field_id, value);
+                // Also register in the legacy manifest for enumeration (load_filters, mark_filters_backed, etc.)
+                let manifest_name = format!("filter:{}:{}", field_name, value);
+                self.name_to_key.write().insert(manifest_name.clone(), key);
+                self.key_to_name.write().insert(key, manifest_name);
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
                 bitmap.serialize_frozen_into(&mut buf)
@@ -158,10 +201,14 @@ impl BitmapSilo {
 
         // Save sort bit-layers
         for (field_name, field) in sorts.fields() {
+            let field_id = self.ensure_field_id(field_name);
             for (bit_idx, bitmap) in field.layers_fused().iter().enumerate() {
                 if bitmap.is_empty() { continue; }
-                let name = format!("sort:{}:{}", field_name, bit_idx);
-                let key = self.ensure_key(&name);
+                let key = encode_sort_key(field_id, bit_idx as u32);
+                // Also register in the legacy manifest for enumeration (load_sorts, mark_sorts_backed, etc.)
+                let manifest_name = format!("sort:{}:{}", field_name, bit_idx);
+                self.name_to_key.write().insert(manifest_name.clone(), key);
+                self.key_to_name.write().insert(key, manifest_name);
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
                 bitmap.serialize_frozen_into(&mut buf)
@@ -174,7 +221,7 @@ impl BitmapSilo {
         // Compact to write everything to the data file
         self.silo.compact()?;
 
-        // Save manifest
+        // Save manifest (includes newly registered filter/sort entries)
         self.save_manifest()?;
 
         Ok(count)
@@ -206,46 +253,48 @@ impl BitmapSilo {
         let meta_bytes = serde_json::to_vec(&meta)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // Step 2: Collect all bitmap (key, RoaringBitmap) pairs with key assignment
-        // Use name_to_key + next_key refs to avoid borrowing &mut self in closures
-        let name_to_key = &self.name_to_key;
-        let key_to_name = &self.key_to_name;
-        let next_key = &self.next_key;
-        let ensure = |name: &str| -> u32 {
-            if let Some(&key) = name_to_key.read().get(name) { return key; }
-            let mut map = name_to_key.write();
-            if let Some(&key) = map.get(name) { return key; }
-            let key = next_key.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            map.insert(name.to_string(), key);
-            key_to_name.write().insert(key, name.to_string());
-            key
-        };
-
-        let filter_items: Vec<(u32, RoaringBitmap)> = filters.fields()
+        // Step 2: Collect all bitmap (key, manifest_name, RoaringBitmap) pairs.
+        // Use FieldRegistry-backed encoding: ensure_field_id + encode_*_key.
+        // Also collect manifest names so we can register them for enumeration paths.
+        let filter_items: Vec<(u64, String, RoaringBitmap)> = filters.fields()
             .flat_map(|(field_name, field)| {
+                let field_id = self.ensure_field_id(field_name);
+                let field_name = field_name.to_string();
                 field.bitmaps_fused().map(move |(value, bitmap)| {
+                    let key = encode_filter_key(field_id, value);
                     let name = format!("filter:{}:{}", field_name, value);
-                    let key = ensure(&name);
-                    (key, bitmap)
+                    (key, name, bitmap)
                 })
             })
             .collect();
 
-        let sort_items: Vec<(u32, RoaringBitmap)> = sorts.fields()
+        let sort_items: Vec<(u64, String, RoaringBitmap)> = sorts.fields()
             .flat_map(|(field_name, field)| {
+                let field_id = self.ensure_field_id(field_name);
+                let field_name = field_name.to_string();
                 field.layers_fused().into_iter().enumerate()
                     .filter(|(_, bm)| !bm.is_empty())
                     .map(move |(bit_idx, bitmap)| {
+                        let key = encode_sort_key(field_id, bit_idx as u32);
                         let name = format!("sort:{}:{}", field_name, bit_idx);
-                        let key = ensure(&name);
-                        (key, bitmap)
+                        (key, name, bitmap)
                     })
             })
             .collect();
 
+        // Register all encoded keys in the legacy manifest for enumeration paths.
+        {
+            let mut n2k = self.name_to_key.write();
+            let mut k2n = self.key_to_name.write();
+            for (key, name, _) in filter_items.iter().chain(sort_items.iter()) {
+                n2k.insert(name.clone(), *key);
+                k2n.insert(*key, name.clone());
+            }
+        }
+
         // Step 3: Parallel serialize all bitmaps to frozen bytes
-        let filter_bufs: Vec<(u32, Vec<u8>)> = filter_items.par_iter()
-            .map(|(key, bitmap)| {
+        let filter_bufs: Vec<(u64, Vec<u8>)> = filter_items.par_iter()
+            .map(|(key, _name, bitmap)| {
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
                 bitmap.serialize_frozen_into(&mut buf).ok();
@@ -253,8 +302,8 @@ impl BitmapSilo {
             })
             .collect();
 
-        let sort_bufs: Vec<(u32, Vec<u8>)> = sort_items.par_iter()
-            .map(|(key, bitmap)| {
+        let sort_bufs: Vec<(u64, Vec<u8>)> = sort_items.par_iter()
+            .map(|(key, _name, bitmap)| {
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
                 bitmap.serialize_frozen_into(&mut buf).ok();
@@ -263,7 +312,7 @@ impl BitmapSilo {
             .collect();
 
         // Step 4: Combine all entries and write directly to data.bin + index.bin
-        let mut all_entries: Vec<(u32, Vec<u8>)> = Vec::with_capacity(
+        let mut all_entries: Vec<(u64, Vec<u8>)> = Vec::with_capacity(
             2 + filter_bufs.len() + sort_bufs.len()
         );
         all_entries.push((KEY_ALIVE, alive_buf));
@@ -272,6 +321,7 @@ impl BitmapSilo {
         all_entries.extend(sort_bufs);
 
         let count = self.silo.write_batch_parallel(&all_entries)?;
+        // Save manifest (includes newly registered filter/sort entries)
         self.save_manifest()?;
 
         Ok(count)
@@ -307,47 +357,46 @@ impl BitmapSilo {
         let meta_bytes = serde_json::to_vec(&meta)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // Assign silo keys for all bitmaps
-        let name_to_key = &self.name_to_key;
-        let key_to_name = &self.key_to_name;
-        let next_key = &self.next_key;
-        let ensure = |name: &str| -> u32 {
-            if let Some(&key) = name_to_key.read().get(name) { return key; }
-            let mut map = name_to_key.write();
-            if let Some(&key) = map.get(name) { return key; }
-            let key = next_key.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            map.insert(name.to_string(), key);
-            key_to_name.write().insert(key, name.to_string());
-            key
-        };
-
-        // Collect filter bitmap (key, bitmap) pairs
-        let filter_items: Vec<(u32, RoaringBitmap)> = filter_maps.into_iter()
+        // Collect filter bitmap (key, manifest_name, bitmap) pairs using FieldRegistry encoding.
+        let filter_items: Vec<(u64, String, RoaringBitmap)> = filter_maps.into_iter()
             .flat_map(|(field_name, value_map)| {
+                let field_id = self.ensure_field_id(&field_name);
                 value_map.into_iter().map(move |(value, bitmap)| {
+                    let key = encode_filter_key(field_id, value);
                     let name = format!("filter:{}:{}", field_name, value);
-                    let key = ensure(&name);
-                    (key, bitmap)
+                    (key, name, bitmap)
                 })
             })
             .collect();
 
-        // Collect sort bitmap (key, bitmap) pairs
-        let sort_items: Vec<(u32, RoaringBitmap)> = sort_maps.into_iter()
+        // Collect sort bitmap (key, manifest_name, bitmap) pairs
+        let sort_items: Vec<(u64, String, RoaringBitmap)> = sort_maps.into_iter()
             .flat_map(|(field_name, layers)| {
+                let field_id = self.ensure_field_id(&field_name);
+                let field_name = field_name.clone();
                 layers.into_iter().enumerate()
                     .filter(|(_, bm)| !bm.is_empty())
                     .map(move |(bit_idx, bitmap)| {
+                        let key = encode_sort_key(field_id, bit_idx as u32);
                         let name = format!("sort:{}:{}", field_name, bit_idx);
-                        let key = ensure(&name);
-                        (key, bitmap)
+                        (key, name, bitmap)
                     })
             })
             .collect();
 
+        // Register all encoded keys in the legacy manifest for enumeration paths.
+        {
+            let mut n2k = self.name_to_key.write();
+            let mut k2n = self.key_to_name.write();
+            for (key, name, _) in filter_items.iter().chain(sort_items.iter()) {
+                n2k.insert(name.clone(), *key);
+                k2n.insert(*key, name.clone());
+            }
+        }
+
         // Parallel serialize to frozen bytes
-        let filter_bufs: Vec<(u32, Vec<u8>)> = filter_items.par_iter()
-            .map(|(key, bitmap)| {
+        let filter_bufs: Vec<(u64, Vec<u8>)> = filter_items.par_iter()
+            .map(|(key, _name, bitmap)| {
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
                 bitmap.serialize_frozen_into(&mut buf).ok();
@@ -355,8 +404,8 @@ impl BitmapSilo {
             })
             .collect();
 
-        let sort_bufs: Vec<(u32, Vec<u8>)> = sort_items.par_iter()
-            .map(|(key, bitmap)| {
+        let sort_bufs: Vec<(u64, Vec<u8>)> = sort_items.par_iter()
+            .map(|(key, _name, bitmap)| {
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
                 bitmap.serialize_frozen_into(&mut buf).ok();
@@ -365,7 +414,7 @@ impl BitmapSilo {
             .collect();
 
         // Combine and write in one batch
-        let mut all_entries: Vec<(u32, Vec<u8>)> = Vec::with_capacity(
+        let mut all_entries: Vec<(u64, Vec<u8>)> = Vec::with_capacity(
             2 + filter_bufs.len() + sort_bufs.len()
         );
         all_entries.push((KEY_ALIVE, alive_buf));
@@ -374,6 +423,7 @@ impl BitmapSilo {
         all_entries.extend(sort_bufs);
 
         let count = self.silo.write_batch_parallel(&all_entries)?;
+        // Save manifest (includes newly registered filter/sort entries)
         self.save_manifest()?;
 
         Ok(count)
@@ -396,7 +446,7 @@ impl BitmapSilo {
     /// Load all filter bitmaps into a FilterIndex.
     pub fn load_filters(&self, filters: &mut FilterIndex) -> io::Result<u64> {
         let mut count = 0u64;
-        let entries: Vec<(String, u32)> = self.name_to_key.read()
+        let entries: Vec<(String, u64)> = self.name_to_key.read()
             .iter()
             .map(|(k, &v)| (k.clone(), v))
             .collect();
@@ -431,7 +481,7 @@ impl BitmapSilo {
         // Collect all sort layers per field
         let mut field_layers: HashMap<String, Vec<(usize, RoaringBitmap)>> = HashMap::new();
 
-        let entries: Vec<(String, u32)> = self.name_to_key.read()
+        let entries: Vec<(String, u64)> = self.name_to_key.read()
             .iter()
             .map(|(k, &v)| (k.clone(), v))
             .collect();
@@ -504,10 +554,20 @@ impl BitmapSilo {
     // ── Mutation ops (individual bit set/clear) ────────────────────────
 
     /// Set a single bit in a filter bitmap. Appends a SetBit op to the ops log.
-    /// Auto-creates the key if this is the first write for this field+value.
+    /// Auto-creates the field ID if this is the first write for this field.
+    /// Also registers the (field, value) in the legacy manifest for enumeration paths.
     pub fn filter_set(&self, field: &str, value: u64, slot: u32) -> io::Result<()> {
-        let name = format!("filter:{}:{}", field, value);
-        let key = self.ensure_key(&name);
+        let field_id = self.ensure_field_id(field);
+        let key = encode_filter_key(field_id, value);
+        // Register in manifest for enumeration paths (filter_values_for_field, etc.)
+        let manifest_name = format!("filter:{}:{}", field, value);
+        if !self.name_to_key.read().contains_key(&manifest_name) {
+            let mut n2k = self.name_to_key.write();
+            if !n2k.contains_key(&manifest_name) {
+                n2k.insert(manifest_name.clone(), key);
+                self.key_to_name.write().insert(key, manifest_name);
+            }
+        }
         let mut buf = [0u8; 5];
         buf[0] = OP_SET_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -515,10 +575,10 @@ impl BitmapSilo {
     }
 
     /// Clear a single bit in a filter bitmap. Appends a ClearBit op to the ops log.
-    /// Auto-creates the key if this is the first write for this field+value.
+    /// Auto-creates the field ID if this is the first write for this field.
     pub fn filter_clear(&self, field: &str, value: u64, slot: u32) -> io::Result<()> {
-        let name = format!("filter:{}:{}", field, value);
-        let key = self.ensure_key(&name);
+        let field_id = self.ensure_field_id(field);
+        let key = encode_filter_key(field_id, value);
         let mut buf = [0u8; 5];
         buf[0] = OP_CLEAR_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -526,10 +586,20 @@ impl BitmapSilo {
     }
 
     /// Set a single bit in a sort layer bitmap.
-    /// Auto-creates the key if this is the first write for this field+bit.
+    /// Auto-creates the field ID if this is the first write for this field.
+    /// Also registers the (field, bit) in the legacy manifest for enumeration paths.
     pub fn sort_set(&self, field: &str, bit_idx: usize, slot: u32) -> io::Result<()> {
-        let name = format!("sort:{}:{}", field, bit_idx);
-        let key = self.ensure_key(&name);
+        let field_id = self.ensure_field_id(field);
+        let key = encode_sort_key(field_id, bit_idx as u32);
+        // Register in manifest for enumeration paths (has_sort_field, mark_sorts_backed, etc.)
+        let manifest_name = format!("sort:{}:{}", field, bit_idx);
+        if !self.name_to_key.read().contains_key(&manifest_name) {
+            let mut n2k = self.name_to_key.write();
+            if !n2k.contains_key(&manifest_name) {
+                n2k.insert(manifest_name.clone(), key);
+                self.key_to_name.write().insert(key, manifest_name);
+            }
+        }
         let mut buf = [0u8; 5];
         buf[0] = OP_SET_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -537,10 +607,10 @@ impl BitmapSilo {
     }
 
     /// Clear a single bit in a sort layer bitmap.
-    /// Auto-creates the key if this is the first write for this field+bit.
+    /// Auto-creates the field ID if this is the first write for this field.
     pub fn sort_clear(&self, field: &str, bit_idx: usize, slot: u32) -> io::Result<()> {
-        let name = format!("sort:{}:{}", field, bit_idx);
-        let key = self.ensure_key(&name);
+        let field_id = self.ensure_field_id(field);
+        let key = encode_sort_key(field_id, bit_idx as u32);
         let mut buf = [0u8; 5];
         buf[0] = OP_CLEAR_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -568,7 +638,7 @@ impl BitmapSilo {
     /// Prepare a lock-free parallel writer for bulk bitmap mutations.
     /// Used by the dump pipeline — rayon threads write ops without mutex contention.
     /// Call `flush_parallel_writer()` after all writes are done.
-    pub fn prepare_parallel_writer(&self, estimated_ops: u64) -> io::Result<ParallelBitmapWriter> {
+    pub fn prepare_parallel_writer(&self, estimated_ops: u64) -> io::Result<ParallelBitmapWriter<'_>> {
         // Each op is ~25 bytes framed (4 header + 4 key + 5 value + CRC + padding)
         let estimated_bytes = estimated_ops * 25;
         let writer = self.silo.prepare_parallel_ops(estimated_bytes)?;
@@ -586,15 +656,15 @@ impl BitmapSilo {
     /// Read a filter bitmap with pending ops applied.
     /// Returns the frozen base | pending_sets - pending_clears.
     pub fn get_filter_with_ops(&self, field: &str, value: u64) -> Option<RoaringBitmap> {
-        let name = format!("filter:{}:{}", field, value);
-        let key = *self.name_to_key.read().get(&name)?;
+        let field_id = self.field_id(field)?;
+        let key = encode_filter_key(field_id, value);
         self.get_bitmap_with_ops(key)
     }
 
     /// Read a sort layer bitmap with pending ops applied.
     pub fn get_sort_layer_with_ops(&self, field: &str, bit: usize) -> Option<RoaringBitmap> {
-        let name = format!("sort:{}:{}", field, bit);
-        let key = *self.name_to_key.read().get(&name)?;
+        let field_id = self.field_id(field)?;
+        let key = encode_sort_key(field_id, bit as u32);
         self.get_bitmap_with_ops(key)
     }
 
@@ -604,7 +674,7 @@ impl BitmapSilo {
     }
 
     /// Internal: read frozen base from data file + scan ops log for pending mutations.
-    fn get_bitmap_with_ops(&self, key: u32) -> Option<RoaringBitmap> {
+    fn get_bitmap_with_ops(&self, key: u64) -> Option<RoaringBitmap> {
         // Get frozen base from data file
         let frozen_base = self.silo.get(key)
             .and_then(|bytes| if bytes.is_empty() { None } else { FrozenRoaringBitmap::view(bytes).ok() });
@@ -696,8 +766,8 @@ impl BitmapSilo {
     /// Get a frozen bitmap view for a filter field+value directly from the mmap.
     /// Returns None if the field+value isn't in the silo.
     pub fn get_frozen_filter(&self, field: &str, value: u64) -> Option<FrozenRoaringBitmap<'_>> {
-        let name = format!("filter:{}:{}", field, value);
-        let key = *self.name_to_key.read().get(&name)?;
+        let field_id = self.field_id(field)?;
+        let key = encode_filter_key(field_id, value);
         let bytes = self.silo.get(key)?;
         FrozenRoaringBitmap::view(bytes).ok()
     }
@@ -705,8 +775,8 @@ impl BitmapSilo {
     /// Get a frozen bitmap view for a sort bit-layer directly from the mmap.
     /// Returns None if the field+bit isn't in the silo.
     pub fn get_frozen_sort_layer(&self, field: &str, bit: usize) -> Option<FrozenRoaringBitmap<'_>> {
-        let name = format!("sort:{}:{}", field, bit);
-        let key = *self.name_to_key.read().get(&name)?;
+        let field_id = self.field_id(field)?;
+        let key = encode_sort_key(field_id, bit as u32);
         let bytes = self.silo.get(key)?;
         FrozenRoaringBitmap::view(bytes).ok()
     }
@@ -907,7 +977,7 @@ pub struct ParallelBitmapWriter<'a> {
 }
 
 // Safety: writer is Send+Sync (atomic cursor + disjoint mmap regions).
-// silo ref is shared read-only (ensure_key uses internal RwLock).
+// silo ref is shared read-only (ensure_field_id uses internal Mutex).
 unsafe impl Send for ParallelBitmapWriter<'_> {}
 unsafe impl Sync for ParallelBitmapWriter<'_> {}
 
@@ -916,8 +986,8 @@ impl<'a> ParallelBitmapWriter<'a> {
     /// `cursor` and `end` are thread-local state — initialize both to 0.
     #[inline]
     pub fn filter_set(&self, field: &str, value: u64, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
-        let name = format!("filter:{}:{}", field, value);
-        let key = self.silo.ensure_key(&name);
+        let field_id = self.silo.ensure_field_id(field);
+        let key = encode_filter_key(field_id, value);
         let mut buf = [0u8; 5];
         buf[0] = OP_SET_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -927,8 +997,8 @@ impl<'a> ParallelBitmapWriter<'a> {
     /// Clear a single bit in a filter bitmap. Lock-free.
     #[inline]
     pub fn filter_clear(&self, field: &str, value: u64, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
-        let name = format!("filter:{}:{}", field, value);
-        let key = self.silo.ensure_key(&name);
+        let field_id = self.silo.ensure_field_id(field);
+        let key = encode_filter_key(field_id, value);
         let mut buf = [0u8; 5];
         buf[0] = OP_CLEAR_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -938,8 +1008,8 @@ impl<'a> ParallelBitmapWriter<'a> {
     /// Set a single bit in a sort layer bitmap. Lock-free.
     #[inline]
     pub fn sort_set(&self, field: &str, bit_idx: usize, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
-        let name = format!("sort:{}:{}", field, bit_idx);
-        let key = self.silo.ensure_key(&name);
+        let field_id = self.silo.ensure_field_id(field);
+        let key = encode_sort_key(field_id, bit_idx as u32);
         let mut buf = [0u8; 5];
         buf[0] = OP_SET_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
@@ -949,8 +1019,8 @@ impl<'a> ParallelBitmapWriter<'a> {
     /// Clear a single bit in a sort layer bitmap. Lock-free.
     #[inline]
     pub fn sort_clear(&self, field: &str, bit_idx: usize, slot: u32, cursor: &mut usize, end: &mut usize) -> bool {
-        let name = format!("sort:{}:{}", field, bit_idx);
-        let key = self.silo.ensure_key(&name);
+        let field_id = self.silo.ensure_field_id(field);
+        let key = encode_sort_key(field_id, bit_idx as u32);
         let mut buf = [0u8; 5];
         buf[0] = OP_CLEAR_BIT;
         buf[1..5].copy_from_slice(&slot.to_le_bytes());
