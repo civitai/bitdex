@@ -1524,9 +1524,9 @@ pub fn process_dump_with_progress(
             filter_targets.push(def.target.clone());
         }
     }
-    // Build compact field_name → u8 index for flat Vec filter tuples
-    let filter_field_to_idx: HashMap<String, u8> = filter_targets.iter().enumerate()
-        .map(|(i, name)| (name.clone(), i as u8))
+    // Build compact field_name → u16 index for flat Vec filter tuples
+    let filter_field_to_idx: HashMap<String, u16> = filter_targets.iter().enumerate()
+        .map(|(i, name)| (name.clone(), i as u16))
         .collect();
     let filter_idx_to_name: Vec<String> = filter_targets.clone();
     // Also include computed fields that are sort fields
@@ -1623,7 +1623,7 @@ pub fn process_dump_with_progress(
 
             // Flat Vec for filter bitmap tuples — push (field_idx, value, slot) per row.
             // Bitmaps built in post-pass via sort + from_sorted_iter (5.3x faster than per-row HashMap insert).
-            let mut filter_tuples: Vec<(u8, u64, u32)> = Vec::with_capacity(
+            let mut filter_tuples: Vec<(u16, u64, u32)> = Vec::with_capacity(
                 ((range_end - range_start) / 100) * 8  // ~8 filter fields per row
             );
             // Collect sort slots into Vec<u32> per bit-layer (not RoaringBitmap).

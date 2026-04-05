@@ -297,7 +297,9 @@ impl BitmapSilo {
             .map(|(key, _name, bitmap)| {
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
-                bitmap.serialize_frozen_into(&mut buf).ok();
+                if let Err(e) = bitmap.serialize_frozen_into(&mut buf) {
+                    eprintln!("BitmapSilo: frozen serialize failed: {e:?}");
+                }
                 (*key, buf)
             })
             .collect();
@@ -306,7 +308,9 @@ impl BitmapSilo {
             .map(|(key, _name, bitmap)| {
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
-                bitmap.serialize_frozen_into(&mut buf).ok();
+                if let Err(e) = bitmap.serialize_frozen_into(&mut buf) {
+                    eprintln!("BitmapSilo: frozen serialize failed: {e:?}");
+                }
                 (*key, buf)
             })
             .collect();
@@ -399,7 +403,9 @@ impl BitmapSilo {
             .map(|(key, _name, bitmap)| {
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
-                bitmap.serialize_frozen_into(&mut buf).ok();
+                if let Err(e) = bitmap.serialize_frozen_into(&mut buf) {
+                    eprintln!("BitmapSilo: frozen serialize failed: {e:?}");
+                }
                 (*key, buf)
             })
             .collect();
@@ -408,7 +414,9 @@ impl BitmapSilo {
             .map(|(key, _name, bitmap)| {
                 let size = bitmap.frozen_serialized_size();
                 let mut buf = vec![0u8; size];
-                bitmap.serialize_frozen_into(&mut buf).ok();
+                if let Err(e) = bitmap.serialize_frozen_into(&mut buf) {
+                    eprintln!("BitmapSilo: frozen serialize failed: {e:?}");
+                }
                 (*key, buf)
             })
             .collect();
