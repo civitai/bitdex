@@ -186,6 +186,10 @@ impl<'a> QueryExecutor<'a> {
     pub fn dictionaries(&self) -> Option<&'a HashMap<String, FieldDictionary>> {
         self.dictionaries
     }
+    /// Get bitmap silo (for planner context).
+    pub fn bitmap_silo(&self) -> Option<&'a crate::silos::bitmap_silo::BitmapSilo> {
+        self.bitmap_silo
+    }
     /// Resolve a Value to a bitmap key, consulting string_maps for MappedString fields
     /// and live dictionaries for LowCardinalityString fields.
     /// Applies case-insensitive normalization (lowercase) unless the field is in case_sensitive_fields.
@@ -290,6 +294,7 @@ impl<'a> QueryExecutor<'a> {
         let ctx = planner::PlannerContext {
             string_maps: self.string_maps,
             dictionaries: self.dictionaries,
+            bitmap_silo: self.bitmap_silo,
         };
         let plan = planner::plan_query_with_context(filters, self.filters, self.slots, Some(&ctx));
         // Step 2: Compute filter bitmap using planned clause order

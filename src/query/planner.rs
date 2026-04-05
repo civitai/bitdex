@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use crate::engine::filter::FilterIndex;
 use crate::query::{FilterClause, Value};
 use crate::engine::slot::SlotAllocator;
+use crate::silos::bitmap_silo::BitmapSilo;
 /// Threshold below which we skip bitmap sort traversal and use a simple in-memory sort.
 /// For very small result sets, extracting IDs and sorting is faster than walking 32 bit layers.
 const SORT_FIRST_THRESHOLD: u64 = 1000;
@@ -11,14 +12,26 @@ pub struct PlannerContext<'a> {
     pub string_maps: Option<&'a HashMap<String, HashMap<String, i64>>>,
     /// Live dictionaries: field_name → FieldDictionary for LCS fields.
     pub dictionaries: Option<&'a HashMap<String, crate::dictionary::FieldDictionary>>,
+    /// BitmapSilo for frozen cardinality reads. When present, estimate_cardinality
+    /// reads the frozen bitmap length directly from the silo's mmap — cheaper than
+    /// applying ops, and accurate enough for best-effort planning.
+    pub bitmap_silo: Option<&'a BitmapSilo>,
 }
 /// Estimates the cardinality of a filter clause using bitmap metadata.
 /// Returns the estimated number of matching documents.
+///
+/// Priority for single-value lookups:
+///   1. BitmapSilo frozen bitmap (zero-heap, mmap read) — used when silo is present
+///   2. In-memory FilterIndex (VersionedBitmap base_len) — fallback when silo absent or key missing
+///   3. alive_count — worst-case fallback when field is unknown
 fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_count: u64, ctx: Option<&PlannerContext<'_>>) -> u64 {
     match clause {
         FilterClause::Eq(field, value) => {
-            if let Some(ff) = filters.get_field(field) {
-                if let Some(key) = resolve_value_key(field, value, ctx) {
+            if let Some(key) = resolve_value_key(field, value, ctx) {
+                if let Some(card) = silo_cardinality(ctx, field, key) {
+                    return card;
+                }
+                if let Some(ff) = filters.get_field(field) {
                     return ff.cardinality(key);
                 }
             }
@@ -26,34 +39,48 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
             alive_count
         }
         FilterClause::NotEq(field, value) => {
-            if let Some(ff) = filters.get_field(field) {
-                if let Some(key) = resolve_value_key(field, value, ctx) {
-                    return alive_count.saturating_sub(ff.cardinality(key));
+            if let Some(key) = resolve_value_key(field, value, ctx) {
+                let card = silo_cardinality(ctx, field, key)
+                    .or_else(|| filters.get_field(field).map(|ff| ff.cardinality(key)));
+                if let Some(c) = card {
+                    return alive_count.saturating_sub(c);
                 }
             }
             alive_count
         }
         FilterClause::In(field, values) => {
-            if let Some(ff) = filters.get_field(field) {
-                let mut total = 0u64;
-                for v in values {
-                    if let Some(key) = resolve_value_key(field, v, ctx) {
-                        total += ff.cardinality(key);
+            let mut total = 0u64;
+            let mut found = false;
+            for v in values {
+                if let Some(key) = resolve_value_key(field, v, ctx) {
+                    let card = silo_cardinality(ctx, field, key)
+                        .or_else(|| filters.get_field(field).map(|ff| ff.cardinality(key)));
+                    if let Some(c) = card {
+                        total += c;
+                        found = true;
                     }
                 }
+            }
+            if found {
                 // Union can't exceed alive_count; this is an upper bound (may overcount overlaps)
                 return total.min(alive_count);
             }
             alive_count
         }
         FilterClause::NotIn(field, values) => {
-            if let Some(ff) = filters.get_field(field) {
-                let mut total = 0u64;
-                for v in values {
-                    if let Some(key) = resolve_value_key(field, v, ctx) {
-                        total += ff.cardinality(key);
+            let mut total = 0u64;
+            let mut found = false;
+            for v in values {
+                if let Some(key) = resolve_value_key(field, v, ctx) {
+                    let card = silo_cardinality(ctx, field, key)
+                        .or_else(|| filters.get_field(field).map(|ff| ff.cardinality(key)));
+                    if let Some(c) = card {
+                        total += c;
+                        found = true;
                     }
                 }
+            }
+            if found {
                 return alive_count.saturating_sub(total.min(alive_count));
             }
             alive_count
@@ -87,22 +114,28 @@ fn estimate_cardinality(clause: &FilterClause, filters: &FilterIndex, alive_coun
         FilterClause::BucketBitmap { bitmap, .. } => bitmap.len(),
         // IsNull: use the null bitmap's length if it exists, else assume rare (~10% of alive).
         FilterClause::IsNull(field) => {
-            if let Some(ff) = filters.get_field(field) {
-                ff.cardinality(crate::engine::filter::NULL_BITMAP_KEY)
-            } else {
-                alive_count / 10
-            }
+            let null_key = crate::engine::filter::NULL_BITMAP_KEY;
+            silo_cardinality(ctx, field, null_key)
+                .or_else(|| filters.get_field(field).map(|ff| ff.cardinality(null_key)))
+                .unwrap_or(alive_count / 10)
         }
         // IsNotNull: alive minus the null count.
         FilterClause::IsNotNull(field) => {
-            let null_count = if let Some(ff) = filters.get_field(field) {
-                ff.cardinality(crate::engine::filter::NULL_BITMAP_KEY)
-            } else {
-                alive_count / 10
-            };
+            let null_key = crate::engine::filter::NULL_BITMAP_KEY;
+            let null_count = silo_cardinality(ctx, field, null_key)
+                .or_else(|| filters.get_field(field).map(|ff| ff.cardinality(null_key)))
+                .unwrap_or(alive_count / 10);
             alive_count.saturating_sub(null_count)
         }
     }
+}
+
+/// Read the cardinality of a (field, value) pair from the silo's frozen bitmap.
+/// Returns None if no silo is available or the key is absent in the silo.
+/// This is cheap — it reads the frozen bitmap length from the mmap without heap allocation.
+#[inline]
+fn silo_cardinality(ctx: Option<&PlannerContext<'_>>, field: &str, key: u64) -> Option<u64> {
+    ctx?.bitmap_silo?.get_frozen_filter(field, key).map(|bm| bm.len())
 }
 /// Resolve a Value to a bitmap key, using string maps/dictionaries for String values.
 fn resolve_value_key(field: &str, val: &Value, ctx: Option<&PlannerContext<'_>>) -> Option<u64> {
