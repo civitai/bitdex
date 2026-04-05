@@ -76,6 +76,12 @@ pub struct CacheEntryData {
     /// Pre-sorted packed keys `(sort_value << 32 | slot_id)` for initial-capacity entries.
     /// None when the entry has been expanded (radix takes over).
     pub sorted_keys: Option<Vec<u64>>,
+    /// Global mutation epoch at the time this entry was formed (in-process only, not persisted).
+    /// Disk-restored entries get epoch=0, which `is_stale()` treats as always-stale.
+    pub epoch: u64,
+    /// Per-field mutation epochs at the time this entry was formed (in-process only, not persisted).
+    /// Maps field name → epoch. Stale if any field's current epoch exceeds the recorded value.
+    pub field_epochs: Vec<(String, u64)>,
 }
 
 const FORMAT_VERSION: u8 = 2;
@@ -231,7 +237,34 @@ impl CacheEntryData {
             total_matched,
             direction,
             sorted_keys,
+            // Disk-restored entries have no epoch — treated as stale until re-seeded
+            // in the current process lifetime.
+            epoch: 0,
+            field_epochs: Vec::new(),
         })
+    }
+
+    /// Check whether this entry is stale given a function that returns the
+    /// current epoch for a named field.
+    ///
+    /// An entry is stale if:
+    /// - It was formed with epoch=0 and no field_epochs (disk-restored or pre-epoch entries).
+    /// - Any recorded field epoch is less than the current epoch for that field.
+    pub fn is_stale<F>(&self, current_field_epoch: F) -> bool
+    where
+        F: Fn(&str) -> u64,
+    {
+        if self.epoch == 0 && self.field_epochs.is_empty() {
+            // Disk-restored entry or pre-epoch entry — treat as stale so it gets
+            // re-seeded with proper epoch tracking on the next query.
+            return true;
+        }
+        for (field, recorded_epoch) in &self.field_epochs {
+            if current_field_epoch(field) > *recorded_epoch {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -456,6 +489,8 @@ mod tests {
             total_matched: 123_456,
             direction,
             sorted_keys,
+            epoch: 0,
+            field_epochs: Vec::new(),
         }
     }
 
