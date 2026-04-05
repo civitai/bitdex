@@ -95,12 +95,14 @@ pub enum FieldValue {
 }
 /// A partial update payload for PATCH operations.
 /// Contains only the changed fields with old and new values.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PatchPayload {
     pub fields: HashMap<String, PatchField>,
 }
 /// A single field change in a PATCH operation.
 /// Both old and new values come from the WAL event -- we never look up stored state.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PatchField {
     pub old: FieldValue,
@@ -333,6 +335,7 @@ pub fn diff_document(
 /// but ONLY processes fields present in new_doc. Missing fields are skipped
 /// entirely — they are NOT treated as deletions. This is the key difference
 /// from diff_document which treats missing fields as "change to None."
+#[cfg(test)]
 pub fn diff_document_partial(
     slot: u32,
     old_doc: Option<&StoredDoc>,
@@ -453,6 +456,7 @@ pub fn diff_document_partial(
     ops
 }
 /// Pure diff for PATCH: given old/new field values, returns MutationOps.
+#[cfg(test)]
 pub fn diff_patch(
     slot: u32,
     patch: &PatchPayload,
@@ -709,6 +713,7 @@ fn emit_sort_diff_ops(
     }
 }
 /// The core mutation engine. Applies PUT/PATCH/DELETE/DELETE WHERE to bitmaps.
+#[cfg(test)]
 pub struct MutationEngine<'a> {
     slots: &'a mut SlotAllocator,
     filters: &'a mut FilterIndex,
@@ -716,6 +721,7 @@ pub struct MutationEngine<'a> {
     config: &'a Config,
     docstore: &'a mut DocSiloAdapter,
 }
+#[cfg(test)]
 impl<'a> MutationEngine<'a> {
     pub fn new(
         slots: &'a mut SlotAllocator,
