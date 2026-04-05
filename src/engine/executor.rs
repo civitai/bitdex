@@ -91,37 +91,6 @@ impl<'a> QueryExecutor<'a> {
         }
     }
 
-    /// Attach a sort-bits map so frozen-only sort traversal can be used for fields
-    /// not present in the in-memory SortIndex.
-    ///
-    /// `bits` maps sort field name → number of bit layers (from `SortFieldConfig.bits`).
-    /// When a sort query arrives for a field absent from `self.sorts` but present in
-    /// the BitmapSilo, the executor uses `frozen_sort::frozen_top_n` with this bit count.
-    pub fn with_sort_bits(mut self, bits: &'a HashMap<String, usize>) -> Self {
-        self.sort_bits = Some(bits);
-        self
-    }
-    /// Get the alive bitmap, preferring BitmapSilo ops-on-read over in-memory.
-    /// Cached after first call for consistency within a single query.
-    fn alive_bitmap(&self) -> &RoaringBitmap {
-        self.alive_cache.get_or_init(|| {
-            if let Some(silo) = self.bitmap_silo {
-                if let Some(alive) = silo.get_alive_with_ops() {
-                    return alive;
-                }
-            }
-            self.slots.alive_bitmap().clone()
-        })
-    }
-
-    /// Alive count consistent with `alive_bitmap()`.
-    ///
-    /// Derives from the cached `alive_bitmap()` so both methods always agree
-    /// within a single query execution (avoids double-computing the silo alive set).
-    fn alive_count(&self) -> u64 {
-        self.alive_bitmap().len()
-    }
-
     /// Attach a time bucket manager for in-executor bucket snapping (C3).
     /// Range filters on the bucketed field will be snapped to pre-computed bitmaps.
     pub fn with_time_buckets(mut self, tb: &'a crate::time_buckets::TimeBucketManager, now: u64) -> Self {

@@ -154,10 +154,6 @@ harness = false
 name = "bound_store_bench"
 harness = false
 
-[[bench]]
-name = "parse_alloc_bench"
-harness = false
-
 [[bin]]
 name = "bitdex-benchmark"
 path = "src/bin/benchmark.rs"
