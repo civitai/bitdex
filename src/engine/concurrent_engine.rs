@@ -110,6 +110,12 @@ pub struct ConcurrentEngine {
     /// BitmapSilo for frozen bitmap reads.
     pub(crate) bitmap_silo: Option<Arc<parking_lot::RwLock<crate::silos::bitmap_silo::BitmapSilo>>>,
     pub(crate) compaction_skipped: Arc<AtomicU64>,
+    /// Monotonically increasing epoch counter. Incremented on every mutation batch.
+    /// Used by cache staleness detection to invalidate entries whose fields changed.
+    pub(crate) mutation_epoch: Arc<AtomicU64>,
+    /// Per-field mutation epoch. Maps field name → epoch at last mutation.
+    /// Query threads read this to check whether a cache entry's fields have changed.
+    pub(crate) field_epochs: Arc<parking_lot::RwLock<HashMap<String, u64>>>,
 }
 
 // CacheStats and CacheEntryDetail stubs removed — CacheSilo has no in-memory entry tracking.
@@ -402,6 +408,8 @@ impl ConcurrentEngine {
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
                 bitmap_silo: bitmap_silo_arc.clone(),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
+                mutation_epoch: Arc::new(AtomicU64::new(0)),
+                field_epochs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             });
         }
         let flush_handle = {
@@ -510,6 +518,8 @@ impl ConcurrentEngine {
             metrics_bridge,
             bitmap_silo: bitmap_silo_arc.clone(),
             compaction_skipped,
+            mutation_epoch: Arc::new(AtomicU64::new(0)),
+            field_epochs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         })
     }
     /// Set the string maps for MappedString field query resolution.
@@ -530,6 +540,47 @@ impl ConcurrentEngine {
     /// Get the cumulative count of compaction operations skipped due to channel backpressure.
     pub fn compaction_skipped_count(&self) -> u64 {
         self.compaction_skipped.load(Ordering::Relaxed)
+    }
+    /// Return the current global mutation epoch.
+    /// Cache entries formed before this epoch may be stale.
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch.load(Ordering::Acquire)
+    }
+    /// Return the epoch at which the given field was last mutated.
+    /// Returns 0 if the field has never been mutated in this process lifetime.
+    pub fn field_epoch(&self, field: &str) -> u64 {
+        self.field_epochs.read().get(field).copied().unwrap_or(0)
+    }
+    /// Bump the global mutation epoch and record per-field epochs for any
+    /// FilterInsert / FilterRemove / SortSet / SortClear ops in the batch.
+    ///
+    /// Called by every write path before dispatching ops.
+    /// Atomic Release ordering ensures query threads see updated epochs after
+    /// their own Acquire loads.
+    fn bump_field_epochs(&self, ops: &[MutationOp]) {
+        let has_field_ops = ops.iter().any(|op| matches!(
+            op,
+            MutationOp::FilterInsert { .. }
+            | MutationOp::FilterRemove { .. }
+            | MutationOp::SortSet { .. }
+            | MutationOp::SortClear { .. }
+        ));
+        if !has_field_ops {
+            return;
+        }
+        let new_epoch = self.mutation_epoch.fetch_add(1, Ordering::Release) + 1;
+        let mut guard = self.field_epochs.write();
+        for op in ops {
+            match op {
+                MutationOp::FilterInsert { field, .. }
+                | MutationOp::FilterRemove { field, .. }
+                | MutationOp::SortSet { field, .. }
+                | MutationOp::SortClear { field, .. } => {
+                    guard.insert(field.to_string(), new_epoch);
+                }
+                _ => {}
+            }
+        }
     }
     /// Set the per-field dictionaries for LowCardinalityString fields.
     pub fn set_dictionaries(&mut self, dicts: HashMap<String, crate::dictionary::FieldDictionary>) {
@@ -606,6 +657,8 @@ impl ConcurrentEngine {
     /// During Phase 2→4 transition, both paths receive the ops. Phase 4 removes
     /// the coalescer, leaving only the silo ops log.
     pub(crate) fn send_mutation_ops(&self, ops: Vec<MutationOp>) -> Result<()> {
+        // Bump epoch counters so stale cache entries are detected on next query.
+        self.bump_field_epochs(&ops);
         // Write to BitmapSilo ops log (the V3 path)
         if let Some(ref silo_arc) = self.bitmap_silo {
             let silo = silo_arc.read();
