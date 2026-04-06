@@ -1869,7 +1869,7 @@ pub fn process_dump_with_progress(
                                     let pw_arg = if mw_arg.is_none() {
                                         pw_ref.as_ref().map(|pw| (pw.as_ref(), &mut ops_local_cursor, &mut ops_local_end))
                                     } else { None };
-                                    let scratch = if pw_arg.is_some() { Some((&mut doc_encode_buf, &mut frame_buf)) } else { None };
+                                    let scratch = if pw_arg.is_some() || mw_arg.is_some() { Some((&mut doc_encode_buf, &mut frame_buf)) } else { None };
                                     collect_doc_op(
                                         &row,
                                         &enriched,
@@ -2925,12 +2925,20 @@ fn collect_doc_op(
         if let Some(mw) = merge_writer {
             #[cfg(feature = "dump-timing")]
             let _t_enc = std::time::Instant::now();
-            let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
+            // Reuse scratch buffer if available, otherwise allocate
+            let encode_buf: Vec<u8>;
+            let encoded = if let Some((ref mut doc_buf, _)) = scratch {
+                crate::silos::doc_format::encode_merge_fields_into(slot, &fields, doc_buf);
+                doc_buf.as_slice()
+            } else {
+                encode_buf = crate::silos::doc_format::encode_merge_fields(slot, &fields);
+                encode_buf.as_slice()
+            };
             #[cfg(feature = "dump-timing")]
             { pack_encode_ns = _t_enc.elapsed().as_nanos() as u64; }
             #[cfg(feature = "dump-timing")]
             let _t_wr = std::time::Instant::now();
-            mw.merge_put(key, &bytes, |existing, new| {
+            mw.merge_put(key, encoded, |existing, new| {
                 crate::silos::doc_format::merge_encoded_docs(existing, new)
                     .unwrap_or_else(|e| {
                         eprintln!("  WARNING: merge decode error for key {}: {e}", key);

@@ -664,11 +664,16 @@ pub fn merge_encoded_docs(existing: &[u8], new_data: &[u8]) -> io::Result<Vec<u8
         }
     }
 
-    // Extract slot from existing record header (byte 1..5 after the op tag)
-    let slot = if existing.len() >= 5 {
+    // Extract slot from existing record header (byte 1..5 after the op tag).
+    // Validate op tag to catch corrupted data early.
+    let slot = if existing.len() >= 5 && (existing[0] == OP_TAG_MERGE || existing[0] == OP_TAG_CREATE) {
         u32::from_le_bytes(existing[1..5].try_into().unwrap())
     } else {
-        0
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("merge_encoded_docs: invalid op tag 0x{:02x} or data too short ({}B)",
+                existing.first().copied().unwrap_or(0), existing.len()),
+        ));
     };
     Ok(encode_merge_fields(slot, &fields))
 }
