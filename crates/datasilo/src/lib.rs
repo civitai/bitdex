@@ -742,6 +742,17 @@ impl DataSilo {
         self.merge_fn = Some(Box::new(f));
     }
 
+    /// Temporarily remove the merge function. Returns it so it can be restored.
+    /// Used by cold compaction when no duplicates are expected (e.g., images phase).
+    pub fn take_merge_fn(&mut self) -> Option<MergeFn> {
+        self.merge_fn.take()
+    }
+
+    /// Restore a previously taken merge function.
+    pub fn restore_merge_fn(&mut self, f: Option<MergeFn>) {
+        self.merge_fn = f;
+    }
+
     /// Dead bytes in the data file (from deletes and relocating updates).
     pub fn dead_bytes(&self) -> u64 { self.dead_bytes.load(Ordering::Relaxed) }
 
@@ -811,21 +822,24 @@ impl DataSilo {
     /// Deleted keys (tombstones) are excluded from the output.
     /// `frozen_is_b`: true = ops_b is frozen, false = ops_a is frozen.
     fn compact_cold_from(&mut self, frozen_is_b: bool) -> io::Result<u64> {
-        // If merge_fn is set, use the merge-aware path (copies values for merging).
-        // Otherwise use zero-copy path (stores mmap offsets).
-        if self.merge_fn.is_some() {
-            return self.compact_cold_merge(frozen_is_b);
-        }
-
         // Zero-copy scan: collect (key → mmap_offset, value_len) instead of copying values.
         // LWW dedup: last Put wins, Delete removes.
         // Values stay in the source mmap until the write phase reads them directly.
+        //
+        // If merge_fn is set AND duplicate keys are detected, fall back to the
+        // merge-aware path (which copies values). For the common case (dump images
+        // phase: 14M+ unique keys, no duplicates), this stays on the fast zero-copy
+        // path even when merge_fn is configured.
         let mut entries: std::collections::HashMap<u64, (usize, usize)> = std::collections::HashMap::new();
+        let mut has_duplicates = false;
         {
             let log = if frozen_is_b { self.ops_b.lock() } else { self.ops_a.lock() };
             log.for_each_ops_ref(|op| {
                 match op {
                     SiloOpRef::Put { key, offset, len } => {
+                        if !has_duplicates && entries.contains_key(&key) {
+                            has_duplicates = true;
+                        }
                         entries.insert(key, (offset, len));
                     }
                     SiloOpRef::Delete { key } => {
@@ -835,6 +849,14 @@ impl DataSilo {
             })?;
         }
         if entries.is_empty() { return Ok(0); }
+
+        // Duplicate keys + merge_fn → must use the merge-aware path to avoid data loss.
+        // This re-scans the ops log (copying values), but only triggers when merging
+        // is actually needed — not for the common unique-key dump case.
+        if has_duplicates && self.merge_fn.is_some() {
+            eprintln!("DataSilo: cold compact detected duplicate keys with merge_fn, using merge path");
+            return self.compact_cold_merge(frozen_is_b);
+        }
 
         let count = entries.len() as u64;
         let align = self.config.alignment.max(1) as u64;
