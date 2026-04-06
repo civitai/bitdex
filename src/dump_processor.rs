@@ -35,6 +35,82 @@ use crate::dump_expression::ExprValue as NateExprValue;
 
 const LOG_INTERVAL: u64 = 1_000_000;
 
+// ---------------------------------------------------------------------------
+// Per-row timing instrumentation (zero overhead when dump-timing feature is off)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "dump-timing")]
+#[derive(Default, Clone)]
+struct RowTimings {
+    rows: u64,
+    csv_parse: u64,
+    slot_extract: u64,
+    indexed_fields: u64,
+    filter_expr: u64,
+    enrichment: u64,
+    config_computed_sort_early: u64,
+    config_computed_sort_late: u64,
+    filter_bitmap_insert: u64,
+    sort_bitmap_insert: u64,
+    enrichment_bitmap: u64,
+    computed_field: u64,
+    doc_encode: u64,
+    deferred_alive: u64,
+    total: u64,
+    enriched_get_calls: u64,
+}
+
+#[cfg(feature = "dump-timing")]
+impl RowTimings {
+    fn print_summary(&self, thread_id: usize) {
+        if self.rows == 0 { return; }
+        let r = self.rows as f64;
+        let fields = [
+            ("csv_parse", self.csv_parse),
+            ("slot_extract", self.slot_extract),
+            ("indexed_fields", self.indexed_fields),
+            ("filter_expr", self.filter_expr),
+            ("enrichment", self.enrichment),
+            ("config_sort_early", self.config_computed_sort_early),
+            ("config_sort_late", self.config_computed_sort_late),
+            ("filter_bm_insert", self.filter_bitmap_insert),
+            ("sort_bm_insert", self.sort_bitmap_insert),
+            ("enrichment_bm", self.enrichment_bitmap),
+            ("computed_field", self.computed_field),
+            ("doc_encode", self.doc_encode),
+            ("deferred_alive", self.deferred_alive),
+        ];
+        let total_ns = self.total;
+        eprintln!("  [dump-timing] thread {} — {} rows, {:.1} ns/row total", thread_id, self.rows, total_ns as f64 / r);
+        let mut sorted: Vec<(&str, u64)> = fields.iter().map(|&(n, v)| (n, v)).collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, ns) in &sorted {
+            let pct = if total_ns > 0 { *ns as f64 / total_ns as f64 * 100.0 } else { 0.0 };
+            eprintln!("    {:>20}: {:>8.1} ns/row  ({:>5.1}%)", name, *ns as f64 / r, pct);
+        }
+        if self.enriched_get_calls > 0 {
+            eprintln!("    enriched_get calls: {} ({:.1}/row)", self.enriched_get_calls, self.enriched_get_calls as f64 / r);
+        }
+        eprintln!("    TOP 3: {}, {}, {}", sorted[0].0, sorted[1].0, sorted[2].0);
+    }
+}
+
+/// Helper macro to time a block and accumulate into RowTimings field.
+/// No-op when dump-timing feature is off.
+#[cfg(feature = "dump-timing")]
+macro_rules! time_block {
+    ($timings:expr, $field:ident, $block:expr) => {{
+        let _t_start = std::time::Instant::now();
+        let _result = $block;
+        $timings.$field += _t_start.elapsed().as_nanos() as u64;
+        _result
+    }};
+}
+
+#[cfg(not(feature = "dump-timing"))]
+macro_rules! time_block {
+    ($timings:expr, $field:ident, $block:expr) => { $block };
+}
 
 /// Emit a structured JSON stage marker to stderr for phase monitoring.
 /// Zero overhead — only called at stage transitions, not per row.
@@ -496,7 +572,8 @@ impl<'a> ParsedRow<'a> {
 
     /// Fill a pre-allocated buffer with indexed fields (reuse across rows).
     /// Avoids Vec allocation per row — just clear and refill.
-    pub fn fill_indexed_fields<'b>(&'b self, buf: &mut Vec<Option<&'b str>>) {
+    /// Uses lifetime 'a (mmap chunk) so the Vec can live outside the row borrow.
+    pub fn fill_indexed_fields(&self, buf: &mut Vec<Option<&'a str>>) {
         buf.clear();
         for bytes in &self.fields {
             buf.push(parse_field_to_str(bytes));
@@ -1446,6 +1523,7 @@ pub fn process_dump_with_progress(
         .map_err(|e| format!("open {}: {e}", csv_path.display()))?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }
         .map_err(|e| format!("mmap {}: {e}", csv_path.display()))?;
+    #[cfg(unix)] let _ = mmap.advise(memmap2::Advice::Sequential);
     let data = &mmap[..];
     let delimiter = detect_delimiter(data, &request.format);
 
@@ -1533,6 +1611,8 @@ pub fn process_dump_with_progress(
         );
         // Drop the mmap immediately after parsing — prevents zombie processes
         // from holding 80+ GB of virtual memory if force-killed during save.
+        #[cfg(target_os = "linux")]
+        let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
         drop(mmap);
         drop(file);
         eprintln!("  Dump {}: mmap released", request.name);
@@ -1619,7 +1699,7 @@ pub fn process_dump_with_progress(
     // Source fields needed by config-computed sorts (e.g., existedAt, publishedAt for sortAt).
     // These values must be collected per-row even if the source field isn't in sort_fields,
     // so that GREATEST/LEAST can evaluate correctly.
-    let config_computed_sources: std::collections::HashSet<String> = config_computed_sorts
+    let config_computed_sources: HashSet<String> = config_computed_sorts
         .iter()
         .flat_map(|ccs| ccs.source_fields.iter().cloned())
         .collect();
@@ -1644,6 +1724,8 @@ pub fn process_dump_with_progress(
             let field_idx_cache: &HashMap<String, u16> = bulk_writer.field_to_idx();
             let col_idx_ref: &HashMap<String, usize> = col_index.as_ref();
             let mut serialize_buf: Vec<u8> = Vec::with_capacity(64);
+            let mut enriched_buf = dump_enrichment::EnrichedFields::default();
+            let mut enrichment_lookup_buf: Vec<Option<&str>> = Vec::with_capacity(16);
 
 
             let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
@@ -1671,12 +1753,15 @@ pub fn process_dump_with_progress(
                 });
             }
             let mut alive = RoaringBitmap::new();
-            let mut deferred: Vec<(u32, u64)> = Vec::new();
+            let mut deferred: Vec<(u32, u64)> = Vec::with_capacity(1024);
             let mut tuple_buf: Vec<(u16, u32, u32)> = Vec::with_capacity(20);
             let mut write_buf: Vec<u8> = Vec::with_capacity(256);
             let mut count = 0u64;
             let mut max_slot: u32 = 0;
             let mut line_start = 0;
+            let mut indexed_fields_buf: Vec<Option<&str>> = Vec::new();
+            #[cfg(feature = "dump-timing")]
+            let mut timings = RowTimings::default();
 
             for i in 0..chunk.len() {
                 if chunk[i] != b'\n' {
@@ -1709,8 +1794,8 @@ pub fn process_dump_with_progress(
                     }
                 }
 
-                // Build indexed fields (Vec<Option<&str>> — cheap compared to HashMap)
-                let indexed_fields_buf = row.to_indexed_fields();
+                // Build indexed fields — reuse buffer across rows (no allocation per row)
+                row.fill_indexed_fields(&mut indexed_fields_buf);
                 let col_idx = row.col_index_ref();
 
                 // Apply filter via indexed path (zero-allocation)
@@ -1720,38 +1805,36 @@ pub fn process_dump_with_progress(
                     }
                 }
 
-
-                // Resolve enrichment via indexed path (no CsvRow HashMap)
-                let enriched = if enrichment_mgr_ref.table_count() > 0 {
-                    Some(enrichment_mgr_ref.enrich_row_indexed(&indexed_fields_buf, col_idx))
+                // Resolve enrichment via indexed path with buffer reuse
+                if enrichment_mgr_ref.table_count() > 0 {
+                    enrichment_mgr_ref.enrich_row_indexed_into(&indexed_fields_buf, col_idx, &mut enriched_buf, &mut enrichment_lookup_buf);
                 } else {
-                    None
-                };
-
-                // Collect enriched field values (avoid HashMap — linear scan is fine for <10 fields)
-                let enriched = enriched.unwrap_or_default();
-                // Build a simple lookup closure for enriched values
+                    enriched_buf.fields.clear();
+                    enriched_buf.computed.clear();
+                }
+                let enriched = &enriched_buf;
+                // Build a flat HashMap for O(1) enriched field lookups (replaces O(n) linear scan)
+                let mut enriched_map: HashMap<&str, &str> = HashMap::with_capacity(
+                    enriched.fields.len() + enriched.computed.len()
+                );
+                for (t, v) in &enriched.fields {
+                    enriched_map.insert(t.as_str(), v.as_str());
+                }
+                for (t, v) in &enriched.computed {
+                    if let NateExprValue::Str(s) = v {
+                        enriched_map.insert(t.as_str(), s.as_str());
+                    }
+                    // Int values handled separately in sort/filter paths
+                }
                 let enriched_get = |target: &str| -> Option<&str> {
-                    for (t, v) in &enriched.fields {
-                        if t == target { return Some(v.as_str()); }
-                    }
-                    for (t, v) in &enriched.computed {
-                        if t == target {
-                            return match v {
-                                NateExprValue::Int(n) => None, // handled separately
-                                NateExprValue::Str(s) => Some(s.as_str()),
-                                _ => None,
-                            };
-                        }
-                    }
-                    None
+                    enriched_map.get(target).copied()
                 };
 
                 // Evaluate config-computed sort values (e.g., sortAt = GREATEST(existedAt, publishedAt)).
                 // Computed early so both the deferred alive path and normal path can include them
                 // in the docstore write. Without this, deferred rows get sortAt:0 in docstore.
                 let config_computed_sort_vals: Vec<(&str, i64)> = if !config_computed_sorts_ref.is_empty() {
-                    let mut row_sv: HashMap<&str, u32> = HashMap::new();
+                    let mut row_sv: HashMap<&str, u32> = HashMap::with_capacity(8);
                     for fm in request_fields {
                         let t = fm.target();
                         if sort_bits_ref.contains_key(t) || config_computed_sources_ref.contains(t) {
@@ -2008,7 +2091,7 @@ pub fn process_dump_with_progress(
                 if !config_computed_sorts_ref.is_empty() {
                     // Collect per-row sort values from direct fields, enrichment, and dump computed fields.
                     // We need the u32 values that were just set in sort_maps.
-                    let mut row_sort_vals: HashMap<&str, u32> = HashMap::new();
+                    let mut row_sort_vals: HashMap<&str, u32> = HashMap::with_capacity(8);
 
                     // Direct fields (sort fields + computed sort sources)
                     for field_mapping in request_fields {
@@ -2100,7 +2183,8 @@ pub fn process_dump_with_progress(
             total_ref.fetch_add(remainder, Ordering::Relaxed);
             if let Some(ref p) = ext_progress { p.fetch_add(remainder, Ordering::Relaxed); }
 
-            // Flush timing
+            #[cfg(feature = "dump-timing")]
+            timings.print_summary(rayon::current_thread_index().unwrap_or(0));
 
             (filter_maps, sort_maps, alive, deferred, count, max_slot)
         })
@@ -2111,6 +2195,8 @@ pub fn process_dump_with_progress(
     // Drop the mmap immediately after parsing — prevents zombie processes from
     // holding 80+ GB of virtual memory if the process is force-killed during
     // the merge/save phase. NLL ensures the borrow of `body`/`data` has ended.
+    #[cfg(target_os = "linux")]
+    let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
     drop(mmap);
     drop(file);
     eprintln!("  Dump {}: mmap released", request.name);
@@ -2863,7 +2949,7 @@ fn write_docstore_row_indexed(
     // like sortAt = GREATEST) take priority over direct/enriched/computed writes.
     // Without this, a data_schema mapping (e.g., sortAtUnix → sortAt) that fails to
     // find its source column could overwrite the correct computed value with 0.
-    let extra_skip: std::collections::HashSet<&str> = extra_i64_fields.iter().map(|&(t, _)| t).collect();
+    let extra_skip: HashSet<&str> = extra_i64_fields.iter().map(|&(t, _)| t).collect();
 
     // Collect all fields into serialize_buf, track (field_idx, offset, len) in tuple_buf
     macro_rules! collect_packed {

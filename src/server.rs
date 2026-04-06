@@ -348,7 +348,7 @@ struct AppState {
     ops_wal: Mutex<Option<crate::ops_wal::WalWriter>>,
     /// Latest sync source metadata (cursor, lag) keyed by source name.
     #[cfg(feature = "pg-sync")]
-    sync_meta: Mutex<std::collections::HashMap<String, crate::pg_sync::ops::SyncMeta>>,
+    sync_meta: Mutex<HashMap<String, crate::pg_sync::ops::SyncMeta>>,
     /// Dump registry for tracking table dump lifecycle.
     #[cfg(feature = "pg-sync")]
     dump_registry: Mutex<crate::pg_sync::dump::DumpRegistry>,
@@ -1084,7 +1084,7 @@ impl BitdexServer {
             #[cfg(feature = "pg-sync")]
             ops_wal: Mutex::new(None),
             #[cfg(feature = "pg-sync")]
-            sync_meta: Mutex::new(std::collections::HashMap::new()),
+            sync_meta: Mutex::new(HashMap::new()),
             #[cfg(feature = "pg-sync")]
             dump_registry: {
                 let dumps_path = self.data_dir.join("dumps.json");

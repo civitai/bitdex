@@ -14,6 +14,7 @@
 //! - `O: OpCodec<Snapshot = S::Snapshot>` — how to serialize/deserialize ops, tied to snapshot type
 //! - `Sh: ShardingStrategy` — how to map keys to shard file paths
 
+use ahash::AHashSet as HashSet;
 use std::fmt;
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fs::{self, File, OpenOptions};
@@ -709,7 +710,7 @@ where
     /// Compact all shards in a generation: merge all older generations into
     /// `target_gen` with zero ops.
     pub fn compact_generation(&self, target_gen: u64) -> io::Result<()> {
-        let mut all_keys = std::collections::HashSet::new();
+        let mut all_keys = HashSet::new();
         for gen in 0..=target_gen {
             let gen_dir = self.gen_dir(gen);
             if gen_dir.exists() {
@@ -788,7 +789,7 @@ where
 
     /// List all shard keys across all generations.
     pub fn list_all_shards(&self) -> io::Result<Vec<Sh::Key>> {
-        let mut all_keys = std::collections::HashSet::new();
+        let mut all_keys = HashSet::new();
         let current_gen = self.current_generation();
         for gen in 0..=current_gen {
             let gen_dir = self.gen_dir(gen);

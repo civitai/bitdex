@@ -1,4 +1,4 @@
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use roaring::RoaringBitmap;
 use crate::dictionary::FieldDictionary;
 use crate::error::{BitdexError, Result};
@@ -24,7 +24,7 @@ fn value_to_bitmap_key(val: &Value) -> Option<u64> {
 pub type StringMaps = HashMap<String, HashMap<String, i64>>;
 /// Set of field names where string matching is case-sensitive.
 /// Fields not in this set use case-insensitive matching (lowercase normalization).
-pub type CaseSensitiveFields = std::collections::HashSet<String>;
+pub type CaseSensitiveFields = HashSet<String>;
 /// Query executor: computes filter intersections and sort traversals.
 /// Uses the query planner for cardinality-based clause ordering.
 pub struct QueryExecutor<'a> {

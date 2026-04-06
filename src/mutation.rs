@@ -1556,14 +1556,14 @@ mod tests {
         });
         let registry = FieldRegistry::from_config(&config);
         // Old doc has nsfwLevel=16 and publishedAt=1000 (alive)
-        let mut old_fields = std::collections::HashMap::new();
+        let mut old_fields = HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(Value::Integer(16)));
         old_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(1000)));
         let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH changes publishedAt to far future (year 2050)
         let future_ts = 2524608000i64;
-        let mut new_fields = std::collections::HashMap::new();
+        let mut new_fields = HashMap::new();
         new_fields.insert("publishedAt".into(), FieldValue::Single(Value::Integer(future_ts)));
         let new_doc = Document { fields: new_fields };
         let ops = diff_document_partial(42, Some(&old_doc), &new_doc, &config, &registry);

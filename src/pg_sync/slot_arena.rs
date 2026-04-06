@@ -46,6 +46,7 @@
 //! 512     total
 //! ```
 
+use ahash::AHashMap as HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -575,7 +576,7 @@ impl SlotArena {
     /// Read a complete slot, merging any overflow data.
     ///
     /// Returns `None` if the slot has no present bits set (never written).
-    pub(crate) fn read_slot(&self, slot: u32, overflow_map: &std::collections::HashMap<u32, Vec<&OverflowEntry>>) -> Option<SlotData> {
+    pub(crate) fn read_slot(&self, slot: u32, overflow_map: &HashMap<u32, Vec<&OverflowEntry>>) -> Option<SlotData> {
         let base = self.slot_base(slot);
         let mask = self.read_u64(base + OFF_PRESENT);
 
@@ -679,8 +680,8 @@ impl SlotArena {
 
         // Build overflow lookup
         let overflow_entries = self.overflow.lock().unwrap();
-        let mut overflow_map: std::collections::HashMap<u32, Vec<&OverflowEntry>> =
-            std::collections::HashMap::new();
+        let mut overflow_map: HashMap<u32, Vec<&OverflowEntry>> =
+            HashMap::new();
         for entry in overflow_entries.iter() {
             overflow_map.entry(entry.slot).or_default().push(entry);
         }
@@ -897,7 +898,7 @@ mod tests {
             100, 200, 0, 0, 1700000000000,
         );
 
-        let overflow = std::collections::HashMap::new();
+        let overflow = HashMap::new();
         let slot = arena.read_slot(42, &overflow).unwrap();
 
         assert_eq!(slot.image_id, 12345);
@@ -925,7 +926,7 @@ mod tests {
         let tags: Vec<u32> = (100..110).collect();
         arena.write_tags(5, &tags);
 
-        let overflow = std::collections::HashMap::new();
+        let overflow = HashMap::new();
         let slot = arena.read_slot(5, &overflow).unwrap();
         assert_eq!(slot.tag_ids, tags);
     }
@@ -941,8 +942,8 @@ mod tests {
 
         // Build overflow map
         let overflow_entries = arena.overflow.lock().unwrap();
-        let mut overflow_map: std::collections::HashMap<u32, Vec<&OverflowEntry>> =
-            std::collections::HashMap::new();
+        let mut overflow_map: HashMap<u32, Vec<&OverflowEntry>> =
+            HashMap::new();
         for entry in overflow_entries.iter() {
             overflow_map.entry(entry.slot).or_default().push(entry);
         }
@@ -961,7 +962,7 @@ mod tests {
         arena.write_tags(2, &[100, 101, 102]);
         arena.write_tags(2, &[200, 201]);
 
-        let overflow = std::collections::HashMap::new();
+        let overflow = HashMap::new();
         let slot = arena.read_slot(2, &overflow).unwrap();
         assert_eq!(slot.tag_ids, vec![100, 101, 102, 200, 201]);
     }
@@ -1000,7 +1001,7 @@ mod tests {
         });
 
         // Verify all fields present
-        let overflow = std::collections::HashMap::new();
+        let overflow = HashMap::new();
         for slot in 0..1000u32 {
             let data = arena.read_slot(slot, &overflow).unwrap();
             assert_eq!(data.image_id, slot as u64);
@@ -1037,7 +1038,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let arena = SlotArena::new(10, &dir.path().join("slots.bin")).unwrap();
 
-        let overflow = std::collections::HashMap::new();
+        let overflow = HashMap::new();
         assert!(arena.read_slot(7, &overflow).is_none());
     }
 

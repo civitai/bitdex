@@ -1,3 +1,4 @@
+use ahash::AHashMap as HashMap;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -444,13 +445,13 @@ impl SortField {
 #[derive(Clone)]
 pub struct SortIndex {
     /// Map from field name to Arc-wrapped SortField.
-    fields: std::collections::HashMap<String, Arc<SortField>>,
+    fields: HashMap<String, Arc<SortField>>,
 }
 
 impl SortIndex {
     pub fn new() -> Self {
         Self {
-            fields: std::collections::HashMap::new(),
+            fields: HashMap::new(),
         }
     }
 

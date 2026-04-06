@@ -13,7 +13,7 @@
 //! On query: intersect meta-bitmaps for the query clauses to find matching entries.
 //! Both are O(1) vs cache count — tiny bitmap intersections on ~32-bit IDs.
 
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 
 use roaring::RoaringBitmap;
 
@@ -126,7 +126,7 @@ impl MetaIndex {
 
         let mut clause_keys = Vec::with_capacity(filter_clauses.len());
         let mut field_keys = Vec::new();
-        let mut seen_fields = std::collections::HashSet::new();
+        let mut seen_fields = HashSet::new();
 
         for clause in filter_clauses {
             let ck = ClauseKey::from_canonical(clause);
@@ -319,7 +319,7 @@ impl MetaIndex {
 
         let mut clause_keys = Vec::with_capacity(filter_clauses.len());
         let mut field_keys = Vec::new();
-        let mut seen_fields = std::collections::HashSet::new();
+        let mut seen_fields = HashSet::new();
 
         for clause in filter_clauses {
             let ck = ClauseKey::from_canonical(clause);

@@ -17,6 +17,7 @@
 //!   (placeholder until Adam lands ShardStore — currently a no-op)
 //! - **Prometheus scrape**: Metrics snapshot saved at start and stop boundaries
 
+use ahash::AHashMap as HashMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -147,7 +148,7 @@ pub struct CaptureManager {
     /// Active caplog writer (only Some when recording).
     caplog: Mutex<Option<CaplogWriter>>,
     /// Package states keyed by session_id.
-    packages: Mutex<std::collections::HashMap<String, SharedPackageState>>,
+    packages: Mutex<HashMap<String, SharedPackageState>>,
 }
 
 impl CaptureManager {
@@ -159,7 +160,7 @@ impl CaptureManager {
             requests_counter: AtomicU64::new(0),
             base_dir,
             caplog: Mutex::new(None),
-            packages: Mutex::new(std::collections::HashMap::new()),
+            packages: Mutex::new(HashMap::new()),
         }
     }
 

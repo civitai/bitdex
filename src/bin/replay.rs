@@ -1049,6 +1049,7 @@ fn chrono_run_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ahash::AHashSet as HashSet;
     use std::io::Write;
 
     /// Write CaptureEntry records to a file in caplog format:
@@ -1309,12 +1310,12 @@ mod tests {
         }
 
         // Verify traffic distribution is mixed (at least 2 methods, at least 2 paths)
-        let methods: std::collections::HashSet<&str> =
+        let methods: HashSet<&str> =
             entries_out.iter().map(|e| e.method.as_str()).collect();
         assert!(methods.contains("GET"), "expected GET requests in mix");
         assert!(methods.contains("POST"), "expected POST requests in mix");
 
-        let paths: std::collections::HashSet<&str> =
+        let paths: HashSet<&str> =
             entries_out.iter().map(|e| e.path.as_str()).collect();
         assert!(paths.len() >= 3, "expected at least 3 distinct paths, got {}", paths.len());
     }

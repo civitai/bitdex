@@ -1089,7 +1089,7 @@ mod tests {
         let entries: Vec<(u64, &RoaringBitmap)> = vec![(100, &bm1), (300, &bm2), (70000, &bm3)];
 
         // Group by bucket and write
-        let mut by_bucket: std::collections::HashMap<u8, Vec<(u64, &RoaringBitmap)>> = std::collections::HashMap::new();
+        let mut by_bucket: HashMap<u8, Vec<(u64, &RoaringBitmap)>> = HashMap::new();
         for &(val, bm) in &entries {
             let bucket = ((val >> 8) & 0xFF) as u8;
             by_bucket.entry(bucket).or_default().push((val, bm));

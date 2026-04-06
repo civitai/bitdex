@@ -1,4 +1,4 @@
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 use crate::error::{BitdexError, Result};
@@ -246,7 +246,7 @@ impl Config {
             ));
         }
         // Check for duplicate filter field names
-        let mut filter_names = std::collections::HashSet::new();
+        let mut filter_names = HashSet::new();
         for f in &self.filter_fields {
             if f.name.is_empty() {
                 return Err(BitdexError::Config(
@@ -276,7 +276,7 @@ impl Config {
             }
             if let Some(behaviors) = &f.behaviors {
                 // Validate range_buckets: unique names, non-zero durations
-                let mut bucket_names = std::collections::HashSet::new();
+                let mut bucket_names = HashSet::new();
                 for bucket in &behaviors.range_buckets {
                     if bucket.name.is_empty() {
                         return Err(BitdexError::Config(format!(
@@ -317,7 +317,7 @@ impl Config {
                     "time_buckets.sort_field must not be empty".to_string(),
                 ));
             }
-            let mut bucket_names = std::collections::HashSet::new();
+            let mut bucket_names = HashSet::new();
             for bucket in &tb.range_buckets {
                 if bucket.name.is_empty() {
                     return Err(BitdexError::Config(
@@ -353,7 +353,7 @@ impl Config {
             }
         }
         // Check for duplicate sort field names and validate bits
-        let mut sort_names = std::collections::HashSet::new();
+        let mut sort_names = HashSet::new();
         for s in &self.sort_fields {
             if s.name.is_empty() {
                 return Err(BitdexError::Config(

@@ -11,7 +11,7 @@
 //! Both paths use the same `process_entity_ops()` core that translates Op variants
 //! into BitmapSink calls using the engine Config for field awareness and
 //! `value_to_bitmap_key()` / `value_to_sort_u32()` for value conversion.
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -394,7 +394,7 @@ pub struct FieldMeta {
     /// Filter field name → (Arc<str>, FilterFieldType)
     filter_fields: HashMap<String, (Arc<str>, FilterFieldType)>,
     /// Filter fields that accept null values (null Set/Remove = no-op).
-    nullable_fields: std::collections::HashSet<String>,
+    nullable_fields: HashSet<String>,
     /// Sort field name → (Arc<str>, num_bits)
     sort_fields: HashMap<String, (Arc<str>, usize)>,
     /// Reverse map: source_field → computed sort fields that depend on it.
@@ -413,7 +413,7 @@ impl FieldMeta {
     pub fn from_config(config: &Config) -> Self {
         let registry = FieldRegistry::from_config(config);
         let mut filter_fields = HashMap::new();
-        let mut nullable_fields = std::collections::HashSet::new();
+        let mut nullable_fields = HashSet::new();
         for fc in &config.filter_fields {
             filter_fields.insert(
                 fc.name.clone(),
@@ -845,7 +845,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
                 );
             }
             // Determine which source fields changed (have either old or new value)
-            let mut changed_sources: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut changed_sources: HashSet<&str> = HashSet::new();
             for k in sort_values.keys() {
                 if meta.computed_deps.contains_key(*k) {
                     changed_sources.insert(k);
@@ -2059,7 +2059,7 @@ mod tests {
         use crate::mutation::{Document, FieldValue};
         use crate::query::Value as QValue;
         let config = test_config();
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = HashMap::new();
         fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(16)));
         let doc = Document { fields };
         let ops = document_to_ops(&doc, None, &config, false);
@@ -2079,12 +2079,12 @@ mod tests {
         use crate::query::Value as QValue;
         let config = test_config();
         // Old doc: nsfwLevel=8
-        let mut old_fields = std::collections::HashMap::new();
+        let mut old_fields = HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
         let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // New doc: nsfwLevel=16
-        let mut new_fields = std::collections::HashMap::new();
+        let mut new_fields = HashMap::new();
         new_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(16)));
         let new_doc = Document { fields: new_fields };
         let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
@@ -2098,7 +2098,7 @@ mod tests {
         use crate::mutation::{Document, FieldValue};
         use crate::query::Value as QValue;
         let config = test_config();
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = HashMap::new();
         fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
 
         let old_doc = crate::shard_store_doc::StoredDoc { fields: fields.clone(), schema_version: 0 };
@@ -2112,12 +2112,12 @@ mod tests {
         use crate::query::Value as QValue;
         let config = test_config();
         // Old doc has nsfwLevel=8 AND reactionCount sort field
-        let mut old_fields = std::collections::HashMap::new();
+        let mut old_fields = HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
         let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH only sends userId=42 (nsfwLevel absent from patch)
-        let mut new_fields = std::collections::HashMap::new();
+        let mut new_fields = HashMap::new();
         new_fields.insert("userId".into(), FieldValue::Single(QValue::Integer(42)));
         let new_doc = Document { fields: new_fields };
         // is_patch=true: absent fields should NOT generate Remove ops

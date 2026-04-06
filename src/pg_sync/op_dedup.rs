@@ -9,7 +9,7 @@
 //! - QueryOpSet dedup: by (entity_id, query string), last wins
 //! - Delete absorbs all prior ops for the same entity_id
 
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 
 use super::ops::{EntityOps, Op};
 
@@ -66,7 +66,7 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
 
     // First pass: collect all ops, tracking which fields have Set ops
     let mut all_ops: Vec<Op> = ops.drain(..).collect();
-    let mut set_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut set_fields: HashSet<String> = HashSet::new();
     for op in &all_ops {
         if let Op::Set { field, .. } = op {
             set_fields.insert(field.clone());

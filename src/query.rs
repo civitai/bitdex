@@ -1,3 +1,4 @@
+use ahash::AHashMap as HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -197,7 +198,7 @@ pub trait QueryParser: Send + Sync {
 /// pre-computed time buckets (C3).
 pub struct BucketSnapContext<'a> {
     /// Map from field name → TimeBucketManager for that field.
-    pub managers: &'a std::collections::HashMap<String, &'a crate::time_buckets::TimeBucketManager>,
+    pub managers: &'a HashMap<String, &'a crate::time_buckets::TimeBucketManager>,
     /// Current unix timestamp in seconds (used to compute `now - duration` for Gt/Gte).
     pub now_secs: u64,
     /// Snap tolerance as a fraction (e.g. 0.10 for 10%).
@@ -302,7 +303,6 @@ mod tests {
     use super::*;
     use crate::config::BucketConfig;
     use crate::time_buckets::TimeBucketManager;
-    use ahash::AHashMap as HashMap;
 
     /// Build a BucketSnapContext with a single field and two buckets (24h, 7d).
     fn make_ctx<'a>(

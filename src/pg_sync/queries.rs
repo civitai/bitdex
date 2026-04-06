@@ -1,3 +1,4 @@
+use ahash::AHashSet as HashSet;
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 
@@ -217,7 +218,7 @@ pub async fn run_setup_v2(
         })
         .collect();
 
-    let expected_names: std::collections::HashSet<&str> = expected_triggers
+    let expected_names: HashSet<&str> = expected_triggers
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();

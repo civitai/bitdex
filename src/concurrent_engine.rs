@@ -2201,7 +2201,7 @@ impl ConcurrentEngine {
                                 let next_id = uc.meta().next_id();
                                 // Snapshot tombstone + registration state for orphan filtering
                                 // (used during shard merging, avoids relocking per shard)
-                                let registered_ids: std::collections::HashSet<u32> =
+                                let registered_ids: HashSet<u32> =
                                     uc.meta().all_registered_ids().collect();
                                 let all_dirty: Vec<crate::bound_store::ShardKey> = dirty_shards
                                     .iter()
@@ -2256,7 +2256,7 @@ impl ConcurrentEngine {
                                 // Tombstones are only needed for entries that still exist in shard
                                 // files on disk (to prevent stale data from being loaded). Once an
                                 // entry is removed from meta_entries, its tombstone is no longer needed.
-                                let live_entry_ids: std::collections::HashSet<u32> = meta_entries
+                                let live_entry_ids: HashSet<u32> = meta_entries
                                     .iter()
                                     .map(|e| e.entry_id)
                                     .collect();
@@ -2268,7 +2268,7 @@ impl ConcurrentEngine {
                                 // but ARE still in shard files (we can't know for certain without
                                 // scanning shards, so keep tombstones for registered IDs that were
                                 // filtered out — they may still be in unmodified shard files)
-                                let compacted_ids: std::collections::HashSet<u32> = compacted_entries
+                                let compacted_ids: HashSet<u32> = compacted_entries
                                     .iter()
                                     .map(|e| e.entry_id)
                                     .collect();
@@ -2300,7 +2300,7 @@ impl ConcurrentEngine {
                             for (i, (sk, ram_entries)) in shard_snapshots.iter().enumerate() {
                                 let mut merged: Vec<crate::bound_store::ShardEntry> = Vec::new();
                                 if let Ok(Some(disk_entries)) = bs.load_shard(sk) {
-                                    let ram_ids: std::collections::HashSet<u32> =
+                                    let ram_ids: HashSet<u32> =
                                         ram_entries.iter().map(|(id, _, _, _)| *id).collect();
                                     for de in disk_entries {
                                         if !ram_ids.contains(&de.entry_id)
@@ -3017,8 +3017,8 @@ impl ConcurrentEngine {
                     None => Vec::new(),
                 }
             };
-            let new_set: std::collections::HashSet<u64> = new_values.iter().copied().collect();
-            let old_set: std::collections::HashSet<u64> = old_values.iter().copied().collect();
+            let new_set: HashSet<u64> = new_values.iter().copied().collect();
+            let old_set: HashSet<u64> = old_values.iter().copied().collect();
             let arc_name = self.field_registry.get(field_name);
             let mut ops = Vec::new();
             // Remove slot from bitmaps for values no longer present
@@ -3743,7 +3743,7 @@ impl ConcurrentEngine {
         // a single cache entry.
         let snapped_filters;
         let effective_filters = if let Some(ref tb) = tb_guard {
-            let mut managers = std::collections::HashMap::new();
+            let mut managers = HashMap::new();
             managers.insert(tb.field_name().to_string(), &**tb);
             let ctx = crate::query::BucketSnapContext {
                 managers: &managers,
@@ -4037,7 +4037,7 @@ impl ConcurrentEngine {
         // Snap range filters to bucket bitmaps BEFORE cache key
         let snapped_filters;
         let effective_filters = if let Some(ref tb) = tb_guard {
-            let mut managers = std::collections::HashMap::new();
+            let mut managers = HashMap::new();
             managers.insert(tb.field_name().to_string(), &**tb);
             let ctx = crate::query::BucketSnapContext {
                 managers: &managers,
@@ -4928,7 +4928,7 @@ impl ConcurrentEngine {
     ) -> Result<(Arc<roaring::RoaringBitmap>, bool)> {
         let snapped;
         let effective_filters = if let Some(tb) = time_buckets {
-            let mut managers = std::collections::HashMap::new();
+            let mut managers = HashMap::new();
             managers.insert(tb.field_name().to_string(), tb);
             let ctx = crate::query::BucketSnapContext {
                 managers: &managers,
@@ -4965,7 +4965,7 @@ impl ConcurrentEngine {
         // bucket names ("7d") instead of moving timestamps.
         let snapped;
         let effective_filters = if let Some(tb) = time_buckets {
-            let mut managers = std::collections::HashMap::new();
+            let mut managers = HashMap::new();
             managers.insert(tb.field_name().to_string(), tb);
             let ctx = crate::query::BucketSnapContext {
                 managers: &managers,
@@ -5292,8 +5292,8 @@ impl ConcurrentEngine {
     }
     /// Return the set of indexed field names (filter + sort + "id").
     /// Used by the loader to strip doc-only fields from the bitmap accumulator.
-    pub fn indexed_field_names(&self) -> std::collections::HashSet<String> {
-        let mut s = std::collections::HashSet::new();
+    pub fn indexed_field_names(&self) -> HashSet<String> {
+        let mut s = HashSet::new();
         for f in &self.config.filter_fields {
             s.insert(f.name.clone());
         }

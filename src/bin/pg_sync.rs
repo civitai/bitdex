@@ -14,6 +14,7 @@
 #[global_allocator]
 static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
 
+use ahash::AHashSet as HashSet;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -405,7 +406,7 @@ async fn run_dump_pipeline(
 ) {
     // Check existing dump status
     let existing_dumps = bitdex_client.get_dumps().await.ok();
-    let completed_set: std::collections::HashSet<String> = existing_dumps
+    let completed_set: HashSet<String> = existing_dumps
         .as_ref()
         .and_then(|d| d.get("dumps"))
         .and_then(|d| d.as_object())
@@ -526,7 +527,7 @@ async fn run_streaming_pipeline(
 
     // Check existing dump status for skip logic
     let existing_dumps = bitdex_client.get_dumps().await.ok();
-    let completed_set: std::collections::HashSet<String> = existing_dumps
+    let completed_set: HashSet<String> = existing_dumps
         .as_ref()
         .and_then(|d| d.get("dumps"))
         .and_then(|d| d.as_object())
