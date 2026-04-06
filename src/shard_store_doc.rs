@@ -157,6 +157,11 @@ pub enum DocOp {
 
     /// Create a document with a full set of fields.
     Create { slot: u32, fields: Vec<(u16, PackedValue)> },
+
+    /// Merge fields into an existing document (or create if absent).
+    /// Unlike Create which replaces the entire doc, Merge upserts each field.
+    /// Used by multi-phase dump writes where phases add fields incrementally.
+    Merge { slot: u32, fields: Vec<(u16, PackedValue)> },
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +173,7 @@ const OP_TAG_APPEND: u8 = 0x02;
 const OP_TAG_REMOVE: u8 = 0x03;
 const OP_TAG_DELETE: u8 = 0x04;
 const OP_TAG_CREATE: u8 = 0x05;
+const OP_TAG_MERGE: u8 = 0x06;
 
 // ---------------------------------------------------------------------------
 // PackedValue binary encoding (compact, no msgpack dependency)
@@ -393,8 +399,9 @@ impl OpCodec for DocOpCodec {
                 buf.push(OP_TAG_DELETE);
                 buf.extend_from_slice(&slot.to_le_bytes());
             }
-            DocOp::Create { slot, fields } => {
-                buf.push(OP_TAG_CREATE);
+            DocOp::Create { slot, fields } | DocOp::Merge { slot, fields } => {
+                let tag = if matches!(op, DocOp::Merge { .. }) { OP_TAG_MERGE } else { OP_TAG_CREATE };
+                buf.push(tag);
                 buf.extend_from_slice(&slot.to_le_bytes());
                 buf.extend_from_slice(&(fields.len() as u16).to_le_bytes());
                 for (field_idx, value) in fields {
@@ -443,13 +450,14 @@ impl OpCodec for DocOpCodec {
                 })?);
                 Ok(DocOp::Delete { slot })
             }
-            OP_TAG_CREATE => {
+            OP_TAG_CREATE | OP_TAG_MERGE => {
+                let label = if tag == OP_TAG_MERGE { "Merge" } else { "Create" };
                 let slot = u32::from_le_bytes(bytes[pos..pos + 4].try_into().map_err(|_| {
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "truncated slot in Create")
+                    io::Error::new(io::ErrorKind::UnexpectedEof, format!("truncated slot in {}", label))
                 })?);
                 pos += 4;
                 let num_fields = u16::from_le_bytes(bytes[pos..pos + 2].try_into().map_err(|_| {
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "truncated field count in Create")
+                    io::Error::new(io::ErrorKind::UnexpectedEof, format!("truncated field count in {}", label))
                 })?) as usize;
                 pos += 2;
                 let mut fields = Vec::with_capacity(num_fields);
@@ -457,7 +465,11 @@ impl OpCodec for DocOpCodec {
                     let (field_idx, value) = decode_field_pair(bytes, &mut pos)?;
                     fields.push((field_idx, value));
                 }
-                Ok(DocOp::Create { slot, fields })
+                if tag == OP_TAG_MERGE {
+                    Ok(DocOp::Merge { slot, fields })
+                } else {
+                    Ok(DocOp::Create { slot, fields })
+                }
             }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -530,6 +542,16 @@ impl OpCodec for DocOpCodec {
             }
             DocOp::Create { slot, fields } => {
                 snapshot.docs.insert(*slot, fields.clone());
+            }
+            DocOp::Merge { slot, fields } => {
+                let doc = snapshot.docs.entry(*slot).or_default();
+                for (field_idx, value) in fields {
+                    if let Some(entry) = doc.iter_mut().find(|(f, _)| *f == *field_idx) {
+                        entry.1 = value.clone();
+                    } else {
+                        doc.push((*field_idx, value.clone()));
+                    }
+                }
             }
         }
     }
@@ -1633,6 +1655,43 @@ impl StreamingDocWriter {
         shard.ops_count += 1;
     }
 
+    /// Write a doc's fields as a DocOp::Merge op to the shard file.
+    /// Unlike write_doc (Create), this merges fields into the existing document.
+    /// Used by multi-phase dumps where each phase adds fields incrementally.
+    pub fn write_merge_doc(&self, slot: u32, fields: &[(u16, PackedValue)]) {
+        let non_default: Vec<(u16, PackedValue)> = fields.iter()
+            .filter(|(idx, val)| {
+                self.field_defaults.get(idx).map_or(true, |d| d != val)
+            })
+            .cloned()
+            .collect();
+
+        if non_default.is_empty() {
+            return;
+        }
+
+        let shard_key = SlotHexShard::slot_to_shard(slot);
+        let mutex = self.shards.entry(shard_key)
+            .or_insert_with(|| {
+                Arc::new(parking_lot::Mutex::new(self.open_shard(shard_key)))
+            })
+            .clone();
+
+        let op = DocOp::Merge { slot, fields: non_default };
+        let mut payload = Vec::new();
+        DocOpCodec::encode_op(&op, &mut payload);
+
+        let len = payload.len() as u32;
+        let crc = crate::shard_store::crc32_of(&payload);
+
+        let mut shard = mutex.lock();
+        use std::io::Write;
+        let _ = shard.writer.write_all(&len.to_le_bytes());
+        let _ = shard.writer.write_all(&payload);
+        let _ = shard.writer.write_all(&crc.to_le_bytes());
+        shard.ops_count += 1;
+    }
+
     /// Write a single field value as a DocOp::Set op.
     /// Used for multi-value phases (tags, resources) that append to existing docs.
     pub fn write_field(&self, slot: u32, field_idx: u16, value: &PackedValue) {
@@ -1707,6 +1766,52 @@ impl StreamingDocWriter {
         shard.ops_count += 1;
     }
 
+    /// Write raw msgpack-encoded tuples as a DocOp::Merge.
+    /// Like append_tuples_raw but merges into existing docs instead of replacing.
+    /// Used by multi-phase dumps where each phase adds fields incrementally.
+    pub fn append_tuples_merge(&self, slot: u32, tuples: &[(u16, &[u8])], _write_buf: &mut Vec<u8>) {
+        if tuples.is_empty() {
+            return;
+        }
+
+        let mut fields = Vec::with_capacity(tuples.len());
+        for &(field_idx, value_bytes) in tuples {
+            let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if self.field_defaults.get(&field_idx).map_or(false, |d| d == &pv) {
+                continue;
+            }
+            fields.push((field_idx, pv));
+        }
+
+        if fields.is_empty() {
+            return;
+        }
+
+        let shard_key = SlotHexShard::slot_to_shard(slot);
+        let mutex = self.shards.entry(shard_key)
+            .or_insert_with(|| {
+                Arc::new(parking_lot::Mutex::new(self.open_shard(shard_key)))
+            })
+            .clone();
+
+        let op = DocOp::Merge { slot, fields };
+        let mut payload = Vec::new();
+        DocOpCodec::encode_op(&op, &mut payload);
+
+        let len = payload.len() as u32;
+        let crc = crate::shard_store::crc32_of(&payload);
+
+        let mut shard = mutex.lock();
+        use std::io::Write;
+        let _ = shard.writer.write_all(&len.to_le_bytes());
+        let _ = shard.writer.write_all(&payload);
+        let _ = shard.writer.write_all(&crc.to_le_bytes());
+        shard.ops_count += 1;
+    }
+
     /// Write a single raw msgpack tuple. API-compatible with ShardStoreBulkWriter.
     pub fn append_tuple_raw(&self, slot: u32, field_idx: u16, value_bytes: &[u8]) {
         let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
@@ -1767,10 +1872,10 @@ impl StreamingDocWriter {
                     continue;
                 }
 
-                if let Err(e) = file.sync_all() {
-                    eprintln!("StreamingDocWriter: sync shard {shard_key}: {e}");
-                    errors += 1;
-                }
+                // Note: sync_all() removed for bulk dump performance.
+                // Per-shard fsync on 200K+ files takes 20-200s. Dumps are idempotent
+                // (can be rerun on crash), so crash consistency is not required here.
+                // The bitmap save phase does its own fsync via ShardStore.
             }
         }
 
@@ -1809,7 +1914,7 @@ impl StreamingDocWriter {
                                     use std::io::Seek;
                                     let _ = f.seek(std::io::SeekFrom::End(0));
                                     return ShardFileWriter {
-                                        writer: std::io::BufWriter::with_capacity(256, f),
+                                        writer: std::io::BufWriter::with_capacity(8192, f),
                                         ops_count: header.ops_count,
                                     };
                                 }
@@ -1839,8 +1944,9 @@ impl StreamingDocWriter {
         header.encode(&mut header_bytes);
 
         let f = std::fs::File::create(&path).expect("failed to create shard file");
-        // Small buffer: 213K shards × 256 bytes = 54MB total, vs 1.7GB with default 8KB
-        let mut writer = std::io::BufWriter::with_capacity(256, f);
+        // 8KB buffer: 213K shards × 8KB = 1.7GB worst case, but most shards aren't
+        // open simultaneously. 256B was causing per-write syscalls during bulk dumps.
+        let mut writer = std::io::BufWriter::with_capacity(8192, f);
         use std::io::Write;
         writer.write_all(&header_bytes).expect("failed to write shard header");
 
@@ -2682,5 +2788,186 @@ mod proptests {
         // Visible through drain
         let drained = ds.drain_dirty_shards();
         assert_eq!(drained, vec![42]);
+    }
+
+    // ---- DocOp::Merge tests ----
+
+    #[test]
+    fn test_merge_op_roundtrip() {
+        let op = DocOp::Merge {
+            slot: 42,
+            fields: vec![
+                (0, PackedValue::I(1)),
+                (1, PackedValue::S("test".into())),
+            ],
+        };
+        let mut buf = Vec::new();
+        DocOpCodec::encode_op(&op, &mut buf);
+        let decoded = DocOpCodec::decode_op(&buf).unwrap();
+        match decoded {
+            DocOp::Merge { slot, fields } => {
+                assert_eq!(slot, 42);
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0], (0, PackedValue::I(1)));
+                assert_eq!(fields[1], (1, PackedValue::S("test".into())));
+            }
+            _ => panic!("expected Merge, got {:?}", decoded),
+        }
+    }
+
+    #[test]
+    fn test_apply_merge_combines_fields() {
+        let mut snap = DocSnapshot::new();
+        // Phase 1: Create doc with fields 0 and 1
+        DocOpCodec::apply(&mut snap, &DocOp::Create {
+            slot: 1,
+            fields: vec![(0, PackedValue::I(100)), (1, PackedValue::S("hello".into()))],
+        });
+        // Phase 2: Merge field 2 (new) and field 3 (new)
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![(2, PackedValue::I(200)), (3, PackedValue::S("world".into()))],
+        });
+        let doc = &snap.docs[&1];
+        assert_eq!(doc.len(), 4);
+        assert_eq!(doc.iter().find(|(f, _)| *f == 0).unwrap().1, PackedValue::I(100));
+        assert_eq!(doc.iter().find(|(f, _)| *f == 1).unwrap().1, PackedValue::S("hello".into()));
+        assert_eq!(doc.iter().find(|(f, _)| *f == 2).unwrap().1, PackedValue::I(200));
+        assert_eq!(doc.iter().find(|(f, _)| *f == 3).unwrap().1, PackedValue::S("world".into()));
+    }
+
+    #[test]
+    fn test_apply_merge_overwrites_existing_field() {
+        let mut snap = DocSnapshot::new();
+        DocOpCodec::apply(&mut snap, &DocOp::Create {
+            slot: 1,
+            fields: vec![(0, PackedValue::I(100))],
+        });
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![(0, PackedValue::I(999))],
+        });
+        let doc = &snap.docs[&1];
+        assert_eq!(doc.len(), 1);
+        assert_eq!(doc[0], (0, PackedValue::I(999)));
+    }
+
+    #[test]
+    fn test_apply_merge_on_empty_doc() {
+        let mut snap = DocSnapshot::new();
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 42,
+            fields: vec![(0, PackedValue::I(1)), (1, PackedValue::S("new".into()))],
+        });
+        let doc = &snap.docs[&42];
+        assert_eq!(doc.len(), 2);
+        assert_eq!(doc[0], (0, PackedValue::I(1)));
+    }
+
+    #[test]
+    fn test_merge_then_merge_accumulates() {
+        let mut snap = DocSnapshot::new();
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![(0, PackedValue::I(10))],
+        });
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![(1, PackedValue::I(20))],
+        });
+        let doc = &snap.docs[&1];
+        assert_eq!(doc.len(), 2);
+        assert_eq!(doc.iter().find(|(f, _)| *f == 0).unwrap().1, PackedValue::I(10));
+        assert_eq!(doc.iter().find(|(f, _)| *f == 1).unwrap().1, PackedValue::I(20));
+    }
+
+    #[test]
+    fn test_create_then_merge_preserves_both() {
+        let mut snap = DocSnapshot::new();
+        DocOpCodec::apply(&mut snap, &DocOp::Create {
+            slot: 1,
+            fields: vec![(0, PackedValue::I(100)), (1, PackedValue::I(200))],
+        });
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![(2, PackedValue::I(300))],
+        });
+        let doc = &snap.docs[&1];
+        assert_eq!(doc.len(), 3);
+        assert!(doc.iter().any(|(f, v)| *f == 0 && *v == PackedValue::I(100)));
+        assert!(doc.iter().any(|(f, v)| *f == 1 && *v == PackedValue::I(200)));
+        assert!(doc.iter().any(|(f, v)| *f == 2 && *v == PackedValue::I(300)));
+    }
+
+    #[test]
+    fn test_merge_then_create_replaces() {
+        let mut snap = DocSnapshot::new();
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![(0, PackedValue::I(100)), (1, PackedValue::I(200))],
+        });
+        // Create replaces everything — this is expected for ops pipeline
+        DocOpCodec::apply(&mut snap, &DocOp::Create {
+            slot: 1,
+            fields: vec![(2, PackedValue::I(300))],
+        });
+        let doc = &snap.docs[&1];
+        assert_eq!(doc.len(), 1);
+        assert_eq!(doc[0], (2, PackedValue::I(300)));
+    }
+
+    #[test]
+    fn test_delete_then_merge_resurrects() {
+        let mut snap = DocSnapshot::new();
+        DocOpCodec::apply(&mut snap, &DocOp::Create {
+            slot: 1,
+            fields: vec![(0, PackedValue::I(100))],
+        });
+        DocOpCodec::apply(&mut snap, &DocOp::Delete { slot: 1 });
+        assert!(!snap.docs.contains_key(&1));
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![(0, PackedValue::I(999))],
+        });
+        let doc = &snap.docs[&1];
+        assert_eq!(doc.len(), 1);
+        assert_eq!(doc[0], (0, PackedValue::I(999)));
+    }
+
+    #[test]
+    fn test_merge_duplicate_fields_last_wins() {
+        let mut snap = DocSnapshot::new();
+        // Merge with duplicate field indices — last occurrence should win
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![(0, PackedValue::I(1)), (0, PackedValue::I(2))],
+        });
+        let doc = &snap.docs[&1];
+        // Linear scan finds the first entry and overwrites it, then the second
+        // entry finds the same field and overwrites again → last wins
+        assert_eq!(doc.iter().filter(|(f, _)| *f == 0).count(), 1);
+        assert_eq!(doc.iter().find(|(f, _)| *f == 0).unwrap().1, PackedValue::I(2));
+    }
+
+    #[test]
+    fn test_merge_with_multi_value_field() {
+        let mut snap = DocSnapshot::new();
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![
+                (0, PackedValue::I(42)),
+                (1, PackedValue::Mi(vec![10, 20, 30])),
+            ],
+        });
+        DocOpCodec::apply(&mut snap, &DocOp::Merge {
+            slot: 1,
+            fields: vec![
+                (2, PackedValue::S("extra".into())),
+            ],
+        });
+        let doc = &snap.docs[&1];
+        assert_eq!(doc.len(), 3);
+        assert_eq!(doc.iter().find(|(f, _)| *f == 1).unwrap().1, PackedValue::Mi(vec![10, 20, 30]));
+        assert_eq!(doc.iter().find(|(f, _)| *f == 2).unwrap().1, PackedValue::S("extra".into()));
     }
 }

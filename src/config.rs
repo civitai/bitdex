@@ -103,6 +103,10 @@ pub struct Config {
     /// them to zero in the filter bitmaps.
     #[serde(default)]
     pub data_schema: DataSchema,
+    /// Number of rayon threads for parallel dump processing.
+    /// Defaults to 0, which means use rayon's default (usually num_cpus).
+    #[serde(default)]
+    pub rayon_threads: usize,
 }
 fn default_max_page_size() -> usize {
     100
@@ -176,6 +180,7 @@ impl Default for Config {
             memory_pressure_target: default_memory_pressure_target(),
             headless: false,
             data_schema: DataSchema::default(),
+            rayon_threads: 0,
         }
     }
 }

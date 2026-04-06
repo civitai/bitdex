@@ -252,6 +252,7 @@ impl FieldRegistry {
             }
             DocOp::Delete { .. } => None, // Always valid
             DocOp::Create { .. } => None, // Always valid
+            DocOp::Merge { .. } => None, // Always valid
         }
     }
 

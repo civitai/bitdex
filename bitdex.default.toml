@@ -41,3 +41,7 @@ data_dir = "data"
 # If not set, admin endpoints return 403 Forbidden (fail-safe).
 # BITDEX_ADMIN_TOKEN env var overrides this value (recommended for deployments).
 # admin_token = "your-secret-token-here"
+
+# Number of rayon threads for parallel dump processing.
+# 0 = use rayon default (usually num_cpus). Set higher for dump-heavy workloads.
+# rayon_threads = 0
