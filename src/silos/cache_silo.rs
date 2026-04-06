@@ -24,6 +24,7 @@
 //! on ConcurrentEngine so threads share safely with minimal contention.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -31,6 +32,9 @@ use std::path::{Path, PathBuf};
 use roaring::RoaringBitmap;
 
 use super::cache::CanonicalClause;
+use super::cache_meta_index::CacheMetaIndex;
+use super::cache_overlay;
+use super::field_ops_log::{FieldOp, FieldOpsLog};
 use crate::query::SortDirection;
 
 // ---------------------------------------------------------------------------
@@ -82,9 +86,18 @@ pub struct CacheEntryData {
     /// Per-field mutation epochs at the time this entry was formed (in-process only, not persisted).
     /// Maps field name → epoch. Stale if any field's current epoch exceeds the recorded value.
     pub field_epochs: Vec<(String, u64)>,
+    /// Byte offset into the active field ops log up to which this entry has
+    /// been patched. On cache read, scan from this offset to the current cursor
+    /// to discover new ops. Reset on janitor checkpoint (ops baked into bitmap).
+    pub last_applied_offset: u64,
+    /// Time bucket cutoff (unix seconds) at the time this entry was formed.
+    /// For entries with bucket clauses, slots that aged past this cutoff
+    /// are removed via PendingBucketDiffs::merged_expired AND-NOT on read.
+    /// 0 means no bucket clause or unknown — skip bucket drift correction.
+    pub bucket_cutoff_at_formation: u64,
 }
 
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 4;
 
 fn encode_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -151,6 +164,18 @@ impl CacheEntryData {
             encode_string(&mut buf, &cc.value_repr);
         }
 
+        // V3: epoch + field_epochs for staleness detection
+        buf.extend_from_slice(&self.epoch.to_le_bytes());
+        buf.extend_from_slice(&(self.field_epochs.len() as u32).to_le_bytes());
+        for (field, epoch) in &self.field_epochs {
+            encode_string(&mut buf, field);
+            buf.extend_from_slice(&epoch.to_le_bytes());
+        }
+
+        // V4: last_applied_offset for field ops overlay + bucket_cutoff_at_formation
+        buf.extend_from_slice(&self.last_applied_offset.to_le_bytes());
+        buf.extend_from_slice(&self.bucket_cutoff_at_formation.to_le_bytes());
+
         buf
     }
 
@@ -161,10 +186,11 @@ impl CacheEntryData {
 
         let mut version_buf = [0u8; 1];
         cur.read_exact(&mut version_buf)?;
-        if version_buf[0] != FORMAT_VERSION {
+        let version = version_buf[0];
+        if version < 2 || version > FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported CacheEntryData version {}", version_buf[0]),
+                format!("unsupported CacheEntryData version {}", version),
             ));
         }
 
@@ -227,6 +253,29 @@ impl CacheEntryData {
             direction,
         };
 
+        // V3: read epoch + field_epochs for staleness detection
+        let (epoch, field_epochs) = if version >= 3 {
+            let epoch = read_u64_le(&mut cur)?;
+            let fe_count = read_u32_le(&mut cur)? as usize;
+            let mut fe = Vec::with_capacity(fe_count);
+            for _ in 0..fe_count {
+                let field = decode_string(&mut cur)?;
+                let e = read_u64_le(&mut cur)?;
+                fe.push((field, e));
+            }
+            (epoch, fe)
+        } else {
+            // V2: no epoch data — will be treated as stale
+            (0, Vec::new())
+        };
+
+        // V4: last_applied_offset for field ops overlay + bucket_cutoff_at_formation
+        let (last_applied_offset, bucket_cutoff_at_formation) = if version >= 4 {
+            (read_u64_le(&mut cur)?, read_u64_le(&mut cur)?)
+        } else {
+            (0, 0) // pre-V4 entries: scan from beginning, no bucket tracking
+        };
+
         Ok(Self {
             key,
             bitmap,
@@ -237,10 +286,10 @@ impl CacheEntryData {
             total_matched,
             direction,
             sorted_keys,
-            // Disk-restored entries have no epoch — treated as stale until re-seeded
-            // in the current process lifetime.
-            epoch: 0,
-            field_epochs: Vec::new(),
+            epoch,
+            field_epochs,
+            last_applied_offset,
+            bucket_cutoff_at_formation,
         })
     }
 
@@ -299,9 +348,19 @@ pub fn hash_unified_key(key: &UnifiedKey) -> u64 {
 
 /// Persistent cache store: wraps a DataSilo whose keys are u64 hashes of
 /// UnifiedKey and whose values are binary-encoded CacheEntryData.
+///
+/// Also owns a `FieldOpsLog` for recording field-level mutation events
+/// that the cache system uses for live maintenance (Option 3 architecture).
 pub struct CacheSilo {
     silo: datasilo::DataSilo,
     path: PathBuf,
+    /// Field-level ops log for cache live maintenance.
+    /// The flush thread appends ops here; cache reads scan from their
+    /// last_applied_offset to discover pending changes.
+    field_ops: FieldOpsLog,
+    /// Meta-index: maps (field_idx, value) → cache entries for O(affected)
+    /// checkpoint routing instead of O(all_entries) scanning.
+    meta_index: CacheMetaIndex,
 }
 
 impl CacheSilo {
@@ -314,7 +373,8 @@ impl CacheSilo {
             compact_threshold: 0.20,
         };
         let silo = datasilo::DataSilo::open(path, config)?;
-        Ok(Self { silo, path: path.to_path_buf() })
+        let field_ops = FieldOpsLog::open(path)?;
+        Ok(Self { silo, path: path.to_path_buf(), field_ops, meta_index: CacheMetaIndex::new() })
     }
 
     /// Persist a cache entry. Called by the flush thread after cache update.
@@ -334,9 +394,25 @@ impl CacheSilo {
     ///
     /// Used by the query fast path to check the persistent cache.
     pub fn get_entry(&self, key_hash: u64) -> Option<CacheEntryData> {
+        #[cfg(feature = "dump-timing")]
+        let _t0 = std::time::Instant::now();
         let bytes = self.silo.get_with_ops(key_hash)?;
+        #[cfg(feature = "dump-timing")]
+        let _t_read = _t0.elapsed();
+        #[cfg(feature = "dump-timing")]
+        let _t1 = std::time::Instant::now();
         match CacheEntryData::decode(&bytes) {
-            Ok(entry) => Some(entry),
+            Ok(entry) => {
+                #[cfg(feature = "dump-timing")]
+                eprintln!(
+                    "  [cache-silo] read={:.0}μs decode={:.0}μs bytes={} bm_serialized={}",
+                    _t_read.as_micros(),
+                    _t1.elapsed().as_micros(),
+                    bytes.len(),
+                    entry.bitmap.serialized_size(),
+                );
+                Some(entry)
+            }
             Err(e) => {
                 eprintln!("CacheSilo: decode error for key {key_hash}: {e} (skipping)");
                 None
@@ -431,6 +507,233 @@ impl CacheSilo {
     pub fn has_ops(&self) -> bool {
         self.silo.has_ops()
     }
+
+    // ── Field ops log API ────────────────────────────────────────────────
+
+    /// Append a single field op to the active log.
+    /// Called by the flush thread when processing mutations.
+    pub fn append_field_op(&mut self, op: &FieldOp) -> io::Result<()> {
+        self.field_ops.append(op)
+    }
+
+    /// Append a batch of field ops to the active log.
+    /// More efficient than individual appends for flush batches.
+    pub fn append_field_ops(&mut self, ops: &[FieldOp]) -> io::Result<()> {
+        self.field_ops.append_batch(ops)
+    }
+
+    /// Current write cursor of the active field ops log.
+    /// Cache entries store this as `last_applied_offset` when formed.
+    pub fn field_ops_cursor(&self) -> u64 {
+        self.field_ops.active_cursor()
+    }
+
+    /// Scan active field ops from `from_offset`, calling `f` for each op.
+    /// Returns the new cursor position (to store as last_applied_offset).
+    pub fn scan_field_ops_from<F>(&self, from_offset: u64, f: F) -> u64
+    where
+        F: FnMut(FieldOp),
+    {
+        self.field_ops.scan_active_from(from_offset, f)
+    }
+
+    /// Freeze the active field ops log and swap to the other side.
+    /// Called by the janitor at checkpoint time.
+    pub fn swap_field_ops(&mut self) -> io::Result<()> {
+        self.field_ops.swap()
+    }
+
+    /// Scan all ops in the frozen field ops log. Used by janitor checkpoint.
+    pub fn scan_frozen_field_ops<F>(&self, f: F) -> u64
+    where
+        F: FnMut(FieldOp),
+    {
+        self.field_ops.scan_frozen(f)
+    }
+
+    /// Truncate the frozen field ops log after checkpoint processing.
+    pub fn truncate_frozen_field_ops(&mut self) -> io::Result<()> {
+        self.field_ops.truncate_frozen()
+    }
+
+    /// Whether the frozen log has data pending checkpoint.
+    pub fn has_frozen_field_ops(&self) -> bool {
+        self.field_ops.has_frozen_data()
+    }
+
+    /// Total field ops across both active and frozen logs.
+    pub fn total_field_ops(&self) -> u64 {
+        self.field_ops.total_op_count()
+    }
+
+    /// Number of field ops in the active log.
+    pub fn active_field_ops(&self) -> u64 {
+        self.field_ops.active_op_count()
+    }
+
+    // ── Meta-index API ───────────────────────────────────────────────────
+
+    /// Register a cache entry in the meta-index under an exact (field_idx, value) pair.
+    /// Call this for Eq and In clause values when a cache entry is created/loaded.
+    pub fn meta_register_exact(&mut self, key_hash: u64, field_idx: u16, value: u64) {
+        self.meta_index.register_exact(key_hash, field_idx, value);
+    }
+
+    /// Register a cache entry in the meta-index under a wildcard field_idx.
+    /// Call this for NotEq, NotIn, range clauses, and sort field dependencies.
+    pub fn meta_register_wildcard(&mut self, key_hash: u64, field_idx: u16) {
+        self.meta_index.register_wildcard(key_hash, field_idx);
+    }
+
+    /// Unregister a cache entry from the meta-index (on eviction or rebuild).
+    pub fn meta_unregister(&mut self, key_hash: u64) {
+        self.meta_index.unregister(key_hash);
+    }
+
+    /// Look up all cache entries affected by a field op at (field_idx, value).
+    pub fn meta_lookup(&self, field_idx: u16, value: u64) -> Vec<u64> {
+        self.meta_index.lookup(field_idx, value)
+    }
+
+    /// Look up cache entries affected by a sort field change.
+    pub fn meta_lookup_sort(&self, field_idx: u16) -> Vec<u64> {
+        self.meta_index.lookup_sort(field_idx)
+    }
+
+    /// Check if a specific cache entry is affected by a (field_idx, value) op.
+    pub fn meta_is_affected(&self, key_hash: u64, field_idx: u16, value: u64) -> bool {
+        self.meta_index.is_affected(key_hash, field_idx, value)
+    }
+
+    /// Number of unique cache entries in the meta-index.
+    pub fn meta_entry_count(&self) -> usize {
+        self.meta_index.entry_count()
+    }
+
+    /// Clear the meta-index (e.g., on full cache rebuild).
+    pub fn meta_clear(&mut self) {
+        self.meta_index.clear();
+    }
+
+    // ── Janitor checkpoint ───────────────────────────────────────────────
+
+    /// Run a janitor checkpoint: freeze active field ops, apply all frozen ops
+    /// to affected cache entries via the meta-index, re-save updated entries,
+    /// and truncate the frozen log.
+    ///
+    /// `field_idx_to_name` maps field registry IDs to field names for clause matching.
+    ///
+    /// Returns `(entries_updated, ops_processed)`.
+    pub fn checkpoint(&mut self, field_idx_to_name: &HashMap<u16, String>) -> io::Result<(u32, u64)> {
+        // Step 1: Swap — freeze active log, activate the other
+        self.field_ops.swap()?;
+
+        // Step 2: Collect all frozen ops
+        let mut frozen_ops: Vec<FieldOp> = Vec::new();
+        self.field_ops.scan_frozen(|op| frozen_ops.push(op));
+        let ops_processed = frozen_ops.len() as u64;
+
+        if frozen_ops.is_empty() {
+            self.field_ops.truncate_frozen()?;
+            return Ok((0, 0));
+        }
+
+        // Step 3: Use meta-index to find affected entries
+        // Group ops by affected entry for batch processing
+        let mut entry_ops: HashMap<u64, Vec<FieldOp>> = HashMap::new();
+        for op in &frozen_ops {
+            let affected = self.meta_index.lookup(op.field_idx(), op.value());
+            for key_hash in affected {
+                entry_ops.entry(key_hash).or_default().push(*op);
+            }
+            // Also check sort field dependencies for SortChange ops
+            if matches!(op, FieldOp::SortChange { .. }) {
+                let sort_affected = self.meta_index.lookup_sort(op.field_idx());
+                for key_hash in sort_affected {
+                    entry_ops.entry(key_hash).or_default().push(*op);
+                }
+            }
+        }
+
+        // Step 4: Load each affected entry, apply ops, re-save
+        let mut entries_updated = 0u32;
+        let new_cursor = self.field_ops.active_cursor();
+
+        for (key_hash, ops) in &entry_ops {
+            let entry = match self.get_entry(*key_hash) {
+                Some(e) => e,
+                None => continue, // entry evicted since meta-index registration
+            };
+
+            let mut bitmap = entry.bitmap.clone();
+            let mut sorted_keys = entry.sorted_keys.clone();
+
+            let result = cache_overlay::apply_field_ops(
+                &entry.key.filter_clauses,
+                // Find sort field idx from the name map
+                field_idx_to_name.iter()
+                    .find(|(_, name)| name.as_str() == entry.key.sort_field)
+                    .map(|(&idx, _)| idx),
+                &mut bitmap,
+                &mut sorted_keys,
+                ops,
+                field_idx_to_name,
+            );
+
+            if result.applied_count > 0 || result.sort_changed {
+                // Update total_matched based on bitmap size change
+                let new_total = if result.needs_epoch_fallback {
+                    entry.total_matched // can't accurately update for negation/range
+                } else {
+                    bitmap.len()
+                };
+
+                // Checkpoint doesn't have sort value access, so clear sorted_keys
+                // when the bitmap changed. The next query will re-sort via bitmap
+                // traversal once, then the entry gets re-seeded with fresh sorted_keys.
+                let checkpoint_sorted_keys = if !result.slots_added.is_empty()
+                    || !result.slots_removed.is_empty()
+                    || result.sort_changed
+                {
+                    None
+                } else {
+                    sorted_keys
+                };
+
+                let updated_entry = CacheEntryData {
+                    key: entry.key.clone(),
+                    bitmap,
+                    min_tracked_value: entry.min_tracked_value,
+                    capacity: entry.capacity,
+                    max_capacity: entry.max_capacity,
+                    has_more: entry.has_more,
+                    total_matched: new_total,
+                    direction: entry.direction,
+                    sorted_keys: checkpoint_sorted_keys,
+                    epoch: entry.epoch,
+                    field_epochs: entry.field_epochs.clone(),
+                    last_applied_offset: new_cursor,
+                    bucket_cutoff_at_formation: entry.bucket_cutoff_at_formation,
+                };
+
+                if let Err(e) = self.save_entry(*key_hash, &updated_entry) {
+                    eprintln!("CacheSilo checkpoint: failed to save entry {key_hash}: {e}");
+                    continue;
+                }
+                entries_updated += 1;
+            }
+        }
+
+        // Step 5: Truncate frozen log
+        self.field_ops.truncate_frozen()?;
+
+        Ok((entries_updated, ops_processed))
+    }
+
+    /// Whether a checkpoint is recommended (based on field ops count threshold).
+    pub fn needs_checkpoint(&self, threshold: u64) -> bool {
+        self.field_ops.active_op_count() >= threshold
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +800,8 @@ mod tests {
             sorted_keys,
             epoch: 0,
             field_epochs: Vec::new(),
+            last_applied_offset: 0,
+            bucket_cutoff_at_formation: 0,
         }
     }
 
@@ -710,5 +1015,109 @@ mod tests {
         let k2 = make_key("likeCount", SortDirection::Asc);
         // Not guaranteed by hash theory, but holds for these distinct keys.
         assert_ne!(hash_unified_key(&k1), hash_unified_key(&k2));
+    }
+
+    // ── checkpoint integration ───────────────────────────────────────────
+
+    #[test]
+    fn checkpoint_applies_ops_and_updates_entry() {
+        use crate::silos::field_ops_log::FieldOp;
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().expect("tempdir");
+        let silo_path = dir.path().join("cache_silo");
+        let mut silo = CacheSilo::open(&silo_path).expect("open silo");
+
+        // Create an entry: nsfwLevel=1, sort by sortAt
+        let mut bm = RoaringBitmap::new();
+        bm.insert(10);
+        bm.insert(20);
+        bm.insert(30);
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "nsfwLevel".to_string(),
+                op: "eq".to_string(),
+                value_repr: "1".to_string(),
+            }],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+        let key_hash = hash_unified_key(&key);
+        let entry = CacheEntryData {
+            key: key.clone(),
+            bitmap: bm,
+            min_tracked_value: 10,
+            capacity: 4000,
+            max_capacity: 64000,
+            has_more: true,
+            total_matched: 3,
+            direction: SortDirection::Desc,
+            sorted_keys: None,
+            epoch: 1,
+            field_epochs: vec![("nsfwLevel".to_string(), 1)],
+            last_applied_offset: 0,
+            bucket_cutoff_at_formation: 0,
+        };
+        silo.save_entry(key_hash, &entry).expect("save");
+
+        // Register entry in meta-index (exact: nsfwLevel, value=1)
+        silo.meta_register_exact(key_hash, 1, 1); // field_idx=1 for nsfwLevel
+
+        // Append field ops: add slot 40 (nsfwLevel=1), remove slot 20 (nsfwLevel=1)
+        silo.append_field_op(&FieldOp::FilterSet { field_idx: 1, value: 1, slot: 40 }).unwrap();
+        silo.append_field_op(&FieldOp::FilterClear { field_idx: 1, value: 1, slot: 20 }).unwrap();
+
+        // Build field name map
+        let mut field_map = HashMap::new();
+        field_map.insert(1u16, "nsfwLevel".to_string());
+        field_map.insert(2u16, "sortAt".to_string());
+
+        // Run checkpoint
+        let (entries_updated, ops_processed) = silo.checkpoint(&field_map).expect("checkpoint");
+        assert_eq!(entries_updated, 1);
+        assert_eq!(ops_processed, 2);
+
+        // Verify the entry was updated
+        let updated = silo.get_entry(key_hash).expect("entry should exist");
+        assert!(updated.bitmap.contains(10), "slot 10 should still be there");
+        assert!(!updated.bitmap.contains(20), "slot 20 should be removed");
+        assert!(updated.bitmap.contains(30), "slot 30 should still be there");
+        assert!(updated.bitmap.contains(40), "slot 40 should be added");
+        assert_eq!(updated.bitmap.len(), 3); // 10, 30, 40
+    }
+
+    #[test]
+    fn checkpoint_with_no_ops_is_noop() {
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().expect("tempdir");
+        let silo_path = dir.path().join("cache_silo");
+        let mut silo = CacheSilo::open(&silo_path).expect("open silo");
+
+        let field_map = HashMap::new();
+        let (entries_updated, ops_processed) = silo.checkpoint(&field_map).expect("checkpoint");
+        assert_eq!(entries_updated, 0);
+        assert_eq!(ops_processed, 0);
+    }
+
+    #[test]
+    fn checkpoint_frozen_log_is_truncated() {
+        use crate::silos::field_ops_log::FieldOp;
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().expect("tempdir");
+        let silo_path = dir.path().join("cache_silo");
+        let mut silo = CacheSilo::open(&silo_path).expect("open silo");
+
+        // Append some ops (no matching entries in meta-index)
+        silo.append_field_op(&FieldOp::FilterSet { field_idx: 1, value: 1, slot: 40 }).unwrap();
+        silo.append_field_op(&FieldOp::FilterSet { field_idx: 1, value: 1, slot: 50 }).unwrap();
+        assert_eq!(silo.total_field_ops(), 2);
+
+        let field_map = HashMap::new();
+        silo.checkpoint(&field_map).expect("checkpoint");
+
+        // Frozen log should be truncated, active is clean
+        assert!(!silo.has_frozen_field_ops());
     }
 }

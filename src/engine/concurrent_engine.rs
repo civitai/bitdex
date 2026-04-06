@@ -171,8 +171,10 @@ impl ConcurrentEngine {
                     eprintln!("BitmapSilo: restore complete in {:.1}ms", t_restore.elapsed().as_secs_f64() * 1000.0);
                     bitmap_silo_arc = Some(Arc::new(parking_lot::RwLock::new(silo)));
                 }
-                Ok(_) => {
+                Ok(silo) => {
+                    // No existing data, but keep the silo so dump processor can write to it.
                     eprintln!("BitmapSilo: no data found, starting fresh");
+                    bitmap_silo_arc = Some(Arc::new(parking_lot::RwLock::new(silo)));
                 }
                 Err(e) => {
                     eprintln!("BitmapSilo: open error (starting fresh): {e}");
@@ -184,8 +186,54 @@ impl ConcurrentEngine {
             config.storage.bitmap_path.as_ref().and_then(|bp| {
                 let silo_path = std::path::Path::new(bp).join("cache_silo");
                 match crate::silos::cache_silo::CacheSilo::open(&silo_path) {
-                    Ok(silo) => {
+                    Ok(mut silo) => {
                         eprintln!("CacheSilo: opened at {}", silo_path.display());
+                        // Rebuild meta-index from persisted entries so checkpoint can route ops
+                        let t_meta = std::time::Instant::now();
+                        let mut meta_registrations = 0u64;
+                        if let Ok(entries) = silo.load_all() {
+                            for (key_hash, entry) in &entries {
+                                if let Some(ref bsilo_arc) = bitmap_silo_arc {
+                                    let bsilo = bsilo_arc.read();
+                                    for clause in &entry.key.filter_clauses {
+                                        if let Some(field_idx) = bsilo.field_id(&clause.field) {
+                                            match clause.op.as_str() {
+                                                "eq" => {
+                                                    if let Ok(val) = clause.value_repr.parse::<u64>() {
+                                                        silo.meta_register_exact(*key_hash, field_idx, val);
+                                                        meta_registrations += 1;
+                                                    }
+                                                }
+                                                "in" => {
+                                                    for v in clause.value_repr.split(',') {
+                                                        if let Ok(val) = v.parse::<u64>() {
+                                                            silo.meta_register_exact(*key_hash, field_idx, val);
+                                                            meta_registrations += 1;
+                                                        }
+                                                    }
+                                                }
+                                                _ => {
+                                                    silo.meta_register_wildcard(*key_hash, field_idx);
+                                                    meta_registrations += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Sort field wildcard
+                                    if let Some(sort_idx) = bsilo.field_id(&entry.key.sort_field) {
+                                        silo.meta_register_wildcard(*key_hash, sort_idx);
+                                        meta_registrations += 1;
+                                    }
+                                }
+                            }
+                            if !entries.is_empty() {
+                                eprintln!(
+                                    "CacheSilo: rebuilt meta-index from {} entries ({} registrations) in {:.1}ms",
+                                    entries.len(), meta_registrations,
+                                    t_meta.elapsed().as_secs_f64() * 1000.0,
+                                );
+                            }
+                        }
                         Some(Arc::new(parking_lot::RwLock::new(silo)))
                     }
                     Err(e) => {
@@ -420,6 +468,7 @@ impl ConcurrentEngine {
             let flush_mutation_rx = mutation_rx;
             let has_silo = bitmap_silo_arc.is_some();
             let flush_bitmap_silo = bitmap_silo_arc.clone();
+            let flush_cache_silo = cache_silo_arc.clone();
             thread::spawn(move || {
                 super::flush::run_flush_thread(super::flush::FlushArgs {
                     slots: flush_slots,
@@ -446,6 +495,8 @@ impl ConcurrentEngine {
                     doc_rx,
                     bitmap_silo: flush_bitmap_silo,
                     has_silo,
+                    cache_silo: flush_cache_silo,
+                    cache_checkpoint_threshold: 1000, // checkpoint every 1K field ops
                 });
             })
         };
@@ -639,53 +690,18 @@ impl ConcurrentEngine {
         }
         Ok(dicts)
     }
-    /// Route mutation ops to the BitmapSilo ops log (primary path) or the legacy
-    /// coalescer channel (fallback for tests without a silo).
+    /// Route mutation ops through the flush thread channel.
     ///
-    /// When a BitmapSilo is present, ops go ONLY to the silo — the coalescer is
-    /// NOT also notified. Filter/sort/alive reads all go through the silo
-    /// (get_effective_bitmap, frozen_top_n, alive OnceCell), so the in-memory
-    /// coalescer/flush-thread path is no longer needed for production writes.
-    ///
-    /// The coalescer fallback is kept for tests that construct a ConcurrentEngine
-    /// without a silo. It is deprecated and will be removed once all tests are
-    /// migrated to the silo path.
+    /// All ops go through the channel → flush thread, which writes to BitmapSilo
+    /// when present (has_silo=true) or to in-memory FilterIndex/SortIndex (legacy).
+    /// This ensures strict ordering: all mutations are serialized through the flush
+    /// thread, preventing race conditions between direct silo writes and channel writes.
     pub(crate) fn send_mutation_ops(&self, ops: Vec<MutationOp>) -> Result<()> {
         // Bump epoch counters so stale cache entries are detected on next query.
         self.bump_field_epochs(&ops);
-        if let Some(ref silo_arc) = self.bitmap_silo {
-            // Silo present: write ONLY to the BitmapSilo ops log.
-            let silo = silo_arc.read();
-            for op in &ops {
-                match op {
-                    MutationOp::FilterInsert { field, value, slots } => {
-                        for &slot in slots { let _ = silo.filter_set(field, *value, slot); }
-                    }
-                    MutationOp::FilterRemove { field, value, slots } => {
-                        for &slot in slots { let _ = silo.filter_clear(field, *value, slot); }
-                    }
-                    MutationOp::SortSet { field, bit_layer, slots } => {
-                        for &slot in slots { let _ = silo.sort_set(field, *bit_layer, slot); }
-                    }
-                    MutationOp::SortClear { field, bit_layer, slots } => {
-                        for &slot in slots { let _ = silo.sort_clear(field, *bit_layer, slot); }
-                    }
-                    MutationOp::AliveInsert { slots } => {
-                        for &slot in slots { let _ = silo.alive_set(slot); }
-                    }
-                    MutationOp::AliveRemove { slots } => {
-                        for &slot in slots { let _ = silo.alive_clear(slot); }
-                    }
-                    MutationOp::DeferredAlive { .. } => {} // handled separately
-                }
-            }
-        } else {
-            // No silo: fall back to the legacy coalescer channel (test path only).
-            // DEPRECATED — remove once all tests use a BitmapSilo.
-            self.sender.send_batch(ops).map_err(|_| {
-                crate::error::BitdexError::CapacityExceeded("coalescer channel disconnected".to_string())
-            })?;
-        }
+        self.sender.send_batch(ops).map_err(|_| {
+            crate::error::BitdexError::CapacityExceeded("coalescer channel disconnected".to_string())
+        })?;
         Ok(())
     }
 
@@ -728,6 +744,8 @@ impl ConcurrentEngine {
         }
         // Clear the alive bit last
         ops.push(MutationOp::AliveRemove { slots: vec![id] });
+        #[cfg(feature = "dump-timing")]
+        eprintln!("  [delete] slot={} doc_found={} ops={}", id, old_doc.is_some(), ops.len());
         self.send_mutation_ops(ops)
     }
     /// Get the number of alive documents.
@@ -735,11 +753,10 @@ impl ConcurrentEngine {
     /// When a BitmapSilo is present, reads from the silo (includes ops-log replay)
     /// rather than from the stale in-memory SlotAllocator.
     pub fn alive_count(&self) -> u64 {
-        if let Some(ref silo_arc) = self.bitmap_silo {
-            if let Some(alive) = silo_arc.read().get_alive_with_ops() {
-                return alive.len();
-            }
-        }
+        // SlotAllocator is kept in sync by the flush thread (alive_insert_bulk
+        // / alive_remove_one) and by dump_processor (alive_or_bitmap).
+        // Using it directly avoids the O(n) ops log scan that get_alive_with_ops
+        // requires, and avoids stale count issues from accumulated ops across sessions.
         self.slots.read().alive_count()
     }
     /// Flush loop stats: (apply_count, cumulative_duration_nanos, last_duration_nanos).
@@ -1111,6 +1128,7 @@ impl ConcurrentEngine {
         _workers: usize,
         _compact_bitmaps: bool,
         compact_docs: bool,
+        compact_cache: bool,
         progress: Arc<AtomicU64>,
     ) -> Result<CompactResult> {
         let t0 = std::time::Instant::now();
@@ -1124,6 +1142,31 @@ impl ConcurrentEngine {
             }
             result.shards_scanned += 1;
             progress.fetch_add(1, Ordering::Relaxed);
+        }
+        // Compact CacheSilo (checkpoint: apply field ops, re-encode affected entries)
+        if compact_cache {
+            if let Some(ref silo_arc) = self.cache_silo {
+                if let Some(ref bsilo_arc) = self.bitmap_silo {
+                    let field_map = bsilo_arc.read().field_idx_to_name_map();
+                    let mut cs = silo_arc.write();
+                    match cs.checkpoint(&field_map) {
+                        Ok((entries_updated, ops_processed)) => {
+                            eprintln!(
+                                "CacheSilo checkpoint: {} entries updated, {} ops processed",
+                                entries_updated, ops_processed,
+                            );
+                            if entries_updated > 0 {
+                                result.shards_compacted += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("CacheSilo checkpoint error: {e}");
+                        }
+                    }
+                }
+                result.shards_scanned += 1;
+                progress.fetch_add(1, Ordering::Relaxed);
+            }
         }
         result.elapsed_secs = t0.elapsed().as_secs_f64();
         Ok(result)

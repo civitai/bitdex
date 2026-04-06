@@ -40,7 +40,16 @@ impl DocSiloAdapter {
     /// Open or create a DocSiloAdapter at the given directory.
     pub fn open(path: &Path) -> io::Result<Self> {
         let silo_path = path.join("doc_silo");
-        let mut silo = datasilo::DataSilo::open(&silo_path, datasilo::SiloConfig::default())?;
+        // Higher buffer_ratio (4x) because dump pipeline writes image fields first,
+        // then subsequent phases merge in tags, resources, tools, techniques, metrics.
+        // The final doc can be 3-5x the initial image-only size.
+        // Higher min_entry_size (1024) ensures even small docs have room for merges.
+        let config = datasilo::SiloConfig {
+            buffer_ratio: 4.0,
+            min_entry_size: 1024,
+            ..datasilo::SiloConfig::default()
+        };
+        let mut silo = datasilo::DataSilo::open(&silo_path, config)?;
 
         // Set merge function so compaction merges Mi arrays instead of LWW.
         silo.set_merge_fn(|existing, new_data| {

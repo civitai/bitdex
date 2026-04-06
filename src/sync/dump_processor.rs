@@ -1250,11 +1250,34 @@ pub fn process_dump(
 /// Call ONCE after the last dump phase, before reload_after_dumps.
 pub fn compact_after_dumps(engine: &ConcurrentEngine) -> Result<(), String> {
     let t = Instant::now();
-    let ds = engine.docstore_arc();
-    let mut ds_lock = ds.lock();
-    let count = ds_lock.silo_mut().compact()
-        .map_err(|e| format!("compact: {e}"))?;
-    eprintln!("  Dump compact: {} docs in {:.2}s", count, t.elapsed().as_secs_f64());
+
+    // Compact docstore silo (ops log → data.bin)
+    {
+        let ds = engine.docstore_arc();
+        let mut ds_lock = ds.lock();
+        let silo = ds_lock.silo_mut();
+        // For the first phase (cold compaction, no existing data.bin), temporarily
+        // remove the merge function so compact uses the zero-copy path instead of
+        // the copying merge path. The images phase has no duplicate keys, so merging
+        // is unnecessary and the zero-copy path is 10-100x faster on large ops logs.
+        let saved_merge = silo.take_merge_fn();
+        let count = silo.compact()
+            .map_err(|e| format!("doc compact: {e}"))?;
+        silo.restore_merge_fn(saved_merge);
+        eprintln!("  Dump compact: {} docs in {:.2}s", count, t.elapsed().as_secs_f64());
+    }
+
+    // Compact bitmap silo (merge ops log entries into data.bin for fast reads)
+    if let Some(ref silo_arc) = engine.bitmap_silo {
+        let t_bm = Instant::now();
+        let mut silo = silo_arc.write();
+        let count = silo.compact_silo()
+            .map_err(|e| format!("bitmap compact: {e}"))?;
+        if count > 0 {
+            eprintln!("  Dump bitmap compact: {} entries in {:.2}s", count, t_bm.elapsed().as_secs_f64());
+        }
+    }
+
     Ok(())
 }
 
@@ -2484,12 +2507,22 @@ pub fn process_dump_with_progress(
             current_counter
         };
 
-        // Write directly to BitmapSilo (frozen serialize + batch write)
+        // Write directly to BitmapSilo.
+        // First phase (sets_alive, creates data.bin): use write_dump_maps (full replace).
+        // Subsequent phases (tags, resources, etc.): use append_dump_maps (ops log)
+        // so we don't overwrite existing bitmaps from previous phases.
         if let Some(ref silo_arc) = engine.bitmap_silo {
-            let cursors = engine.get_all_cursors();
             let mut silo = silo_arc.write();
-            silo.write_dump_maps(filter_maps_std, sort_maps_std, &merged_alive, new_counter, &cursors)
-                .map_err(|e| format!("BitmapSilo::write_dump_maps: {e}"))?;
+            if silo.has_data() {
+                // Subsequent phase: append via ops log to preserve existing data
+                silo.append_dump_maps(filter_maps_std, sort_maps_std)
+                    .map_err(|e| format!("BitmapSilo::append_dump_maps: {e}"))?;
+            } else {
+                // First phase: full write (creates data.bin + index.bin)
+                let cursors = engine.get_all_cursors();
+                silo.write_dump_maps(filter_maps_std, sort_maps_std, &merged_alive, new_counter, &cursors)
+                    .map_err(|e| format!("BitmapSilo::write_dump_maps: {e}"))?;
+            }
         }
 
         // Update engine's in-memory slot state (alive + counter + deferred)
@@ -2812,7 +2845,7 @@ fn collect_doc_op(
     extra_i64_fields: &[(&str, i64)],
     doc_ops: &mut Vec<(u64, Vec<u8>)>,
     pw: Option<(&datasilo::ParallelOpsWriter, &mut usize, &mut usize)>,
-    scratch: Option<(&mut Vec<u8>, &mut Vec<u8>)>, // (doc_encode_buf, frame_buf) for zero-alloc pw path
+    mut scratch: Option<(&mut Vec<u8>, &mut Vec<u8>)>, // (doc_encode_buf, frame_buf) for zero-alloc pw path
     merge_writer: Option<&datasilo::DumpMergeWriter>,
 ) -> (u64, u64, u64) { // (field_collect_ns, pack_encode_ns, mmap_write_ns) — always 0 without dump-timing
     #[cfg(feature = "dump-timing")]

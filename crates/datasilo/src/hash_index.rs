@@ -459,6 +459,61 @@ impl HashIndex {
     fn file_size_for(capacity: u64) -> usize {
         HEADER_SIZE + capacity as usize * ENTRY_SIZE
     }
+
+    /// Bulk-build a hash index from pre-computed entries.
+    ///
+    /// Builds the entire hash table in a heap buffer (no random mmap writes),
+    /// then writes the buffer to the file in one sequential pass. This is
+    /// 10-100x faster than sequential `put()` calls at millions of entries
+    /// because it avoids per-entry mmap page faults.
+    ///
+    /// `entries` is a slice of `(key, IndexEntry)` pairs.
+    /// Capacity is automatically set to 2× the entry count.
+    pub fn build_bulk(path: &Path, entries: &[(u64, IndexEntry)]) -> Result<Self> {
+        let count = entries.len() as u64;
+        let capacity = (count * 2).max(16);
+        let file_size = Self::file_size_for(capacity);
+
+        // Build in heap buffer — zero-initialized (all keys = KEY_EMPTY = 0)
+        let mut buf = vec![0u8; file_size];
+
+        // Write header
+        buf[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        buf[8..16].copy_from_slice(&capacity.to_le_bytes());
+        buf[16..24].copy_from_slice(&count.to_le_bytes());
+        buf[24..32].copy_from_slice(&count.to_le_bytes()); // occupied = count (no tombstones)
+
+        // Insert entries via linear probing on the heap buffer
+        for &(key, ref entry) in entries {
+            if key == KEY_EMPTY || key == KEY_TOMBSTONE {
+                continue; // skip reserved keys
+            }
+            let mut slot = key % capacity;
+            loop {
+                let off = HEADER_SIZE + slot as usize * ENTRY_SIZE;
+                let slot_key = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                if slot_key == KEY_EMPTY {
+                    // Found empty slot — write entry
+                    buf[off..off + 8].copy_from_slice(&key.to_le_bytes());
+                    buf[off + 8..off + 16].copy_from_slice(&entry.offset.to_le_bytes());
+                    buf[off + 16..off + 20].copy_from_slice(&entry.length.to_le_bytes());
+                    buf[off + 20..off + 24].copy_from_slice(&entry.allocated.to_le_bytes());
+                    break;
+                }
+                slot = (slot + 1) % capacity;
+            }
+        }
+
+        // Write entire buffer to file in one shot
+        let file = OpenOptions::new()
+            .read(true).write(true).create_new(true).open(path)?;
+        file.set_len(file_size as u64)?;
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        mmap.copy_from_slice(&buf);
+        mmap.flush()?;
+
+        Ok(Self { mmap, capacity, count, occupied: count })
+    }
 }
 
 // ---------------------------------------------------------------------------

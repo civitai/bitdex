@@ -3172,16 +3172,17 @@ async fn handle_compact(
     let targets = req.targets.unwrap_or_default();
 
     for t in &targets {
-        if t != "bitmaps" && t != "docs" {
+        if t != "bitmaps" && t != "docs" && t != "cache" {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Invalid target '{}'. Valid targets: bitmaps, docs", t)})),
+                Json(serde_json::json!({"error": format!("Invalid target '{}'. Valid targets: bitmaps, docs, cache", t)})),
             ).into_response();
         }
     }
 
     let compact_bitmaps = targets.is_empty() || targets.iter().any(|t| t == "bitmaps");
     let compact_docs = targets.is_empty() || targets.iter().any(|t| t == "docs");
+    let compact_cache = targets.iter().any(|t| t == "cache");
 
     let (task_id, progress) = match tasks.try_start(TaskType::Compact) {
         Ok(v) => v,
@@ -3213,7 +3214,7 @@ async fn handle_compact(
         m_compacted.set(0);
         m_skipped.set(0);
 
-        match engine.compact_all(threshold, workers, compact_bitmaps, compact_docs, progress) {
+        match engine.compact_all(threshold, workers, compact_bitmaps, compact_docs, compact_cache, progress) {
             Ok(result) => {
                 m_scanned.set(result.shards_scanned as i64);
                 m_compacted.set(result.shards_compacted as i64);

@@ -43,6 +43,10 @@ pub struct FlushArgs {
     /// When true, skip applying mutations to in-memory FilterIndex/SortIndex/SlotAllocator.
     /// Mutations go directly to BitmapSilo instead.
     pub has_silo: bool,
+    /// CacheSilo for emitting field-level mutation ops (cache live maintenance).
+    pub cache_silo: Option<Arc<parking_lot::RwLock<crate::silos::cache_silo::CacheSilo>>>,
+    /// Threshold for triggering janitor checkpoint (number of field ops).
+    pub cache_checkpoint_threshold: u64,
 }
 
 /// Entry point for the flush thread. Runs until `args.shutdown` is set.
@@ -77,6 +81,8 @@ pub fn run_flush_thread(args: FlushArgs) {
         doc_rx,
         bitmap_silo: flush_bitmap_silo,
         has_silo,
+        cache_silo: flush_cache_silo,
+        cache_checkpoint_threshold,
     } = args;
 
     let min_sleep = Duration::from_micros(flush_interval_us);
@@ -95,12 +101,97 @@ pub fn run_flush_thread(args: FlushArgs) {
         } else {
             0
         };
-        // Phase 2: Apply mutations under write locks (brief hold).
-        // Skipped when BitmapSilo is present — mutations go directly to the silo.
+        // Phase 2: Apply mutations.
+        // When BitmapSilo is present, write ops to the silo (ops-on-read path).
+        // Otherwise apply to in-memory FilterIndex/SortIndex (legacy path).
         let flush_start = Instant::now();
         if bitmap_count > 0 {
             flush_dirty_flag.store(true, Ordering::Release);
-            if !has_silo {
+            if has_silo {
+                // Route mutations to BitmapSilo ops log.
+                let t_apply = Instant::now();
+                #[cfg(feature = "dump-timing")]
+                eprintln!(
+                    "  [flush] silo batch: {} filter_ins, {} filter_rms, {} sort_sets, {} sort_clrs, {} alive_ins, {} alive_rms",
+                    batch.filter_inserts.len(), batch.filter_removes.len(),
+                    batch.sort_sets.len(), batch.sort_clears.len(),
+                    batch.alive_inserts.len(), batch.alive_removes.len(),
+                );
+                if let Some(ref silo_arc) = flush_bitmap_silo {
+                    let silo = silo_arc.read();
+                    let mut silo_errors = 0u32;
+                    for (key, slots) in &batch.filter_inserts {
+                        for &slot in slots { if silo.filter_set(&key.field, key.value, slot).is_err() { silo_errors += 1; } }
+                    }
+                    for (key, slots) in &batch.filter_removes {
+                        for &slot in slots { if silo.filter_clear(&key.field, key.value, slot).is_err() { silo_errors += 1; } }
+                    }
+                    for (key, slots) in &batch.sort_sets {
+                        for &slot in slots { if silo.sort_set(&key.field, key.bit_layer, slot).is_err() { silo_errors += 1; } }
+                    }
+                    for (key, slots) in &batch.sort_clears {
+                        for &slot in slots { if silo.sort_clear(&key.field, key.bit_layer, slot).is_err() { silo_errors += 1; } }
+                    }
+                    for &slot in &batch.alive_inserts { if silo.alive_set(slot).is_err() { silo_errors += 1; } }
+                    for &slot in &batch.alive_removes { if silo.alive_clear(slot).is_err() { silo_errors += 1; } }
+                    if silo_errors > 0 {
+                        eprintln!("  [flush] WARNING: {} silo write errors (ops log may be full)", silo_errors);
+                    }
+
+                    // Emit field ops to CacheSilo for cache live maintenance
+                    if let Some(ref cache_arc) = flush_cache_silo {
+                        let mut field_ops: Vec<crate::silos::field_ops_log::FieldOp> = Vec::new();
+                        for (key, slots) in &batch.filter_inserts {
+                            if let Some(field_idx) = silo.field_id(&key.field) {
+                                for &slot in slots {
+                                    field_ops.push(crate::silos::field_ops_log::FieldOp::FilterSet {
+                                        field_idx, value: key.value, slot,
+                                    });
+                                }
+                            }
+                        }
+                        for (key, slots) in &batch.filter_removes {
+                            if let Some(field_idx) = silo.field_id(&key.field) {
+                                for &slot in slots {
+                                    field_ops.push(crate::silos::field_ops_log::FieldOp::FilterClear {
+                                        field_idx, value: key.value, slot,
+                                    });
+                                }
+                            }
+                        }
+                        if !field_ops.is_empty() {
+                            let mut cs = cache_arc.write();
+                            if let Err(e) = cs.append_field_ops(&field_ops) {
+                                eprintln!("  [flush] WARNING: cache field ops write error: {e}");
+                            }
+                            // Trigger checkpoint if threshold exceeded
+                            if cs.needs_checkpoint(cache_checkpoint_threshold) {
+                                let field_map = silo.field_idx_to_name_map();
+                                match cs.checkpoint(&field_map) {
+                                    Ok((entries, ops)) => {
+                                        #[cfg(feature = "dump-timing")]
+                                        eprintln!("  [flush] cache checkpoint: {} entries updated, {} ops processed", entries, ops);
+                                        let _ = (entries, ops);
+                                    }
+                                    Err(e) => eprintln!("  [flush] WARNING: cache checkpoint error: {e}"),
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also update in-memory alive bitmap (SlotAllocator) so alive_count
+                // is immediately accurate for stats/queries that check slot state.
+                if !batch.alive_inserts.is_empty() || !batch.alive_removes.is_empty() {
+                    let mut slots_w = flush_slots.write();
+                    if !batch.alive_inserts.is_empty() {
+                        slots_w.alive_insert_bulk(batch.alive_inserts.iter().copied());
+                    }
+                    for &slot in &batch.alive_removes {
+                        slots_w.alive_remove_one(slot);
+                    }
+                }
+                flush_apply_ns.store(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            } else {
                 let t_apply = Instant::now();
                 {
                     let mut slots_w = flush_slots.write();

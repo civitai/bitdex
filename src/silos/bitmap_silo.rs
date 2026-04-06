@@ -112,8 +112,15 @@ impl BitmapSilo {
     // ── FieldRegistry helpers ────────────────────────────────────────────
 
     /// Look up the field ID for a field name. Returns None if not yet registered.
-    fn field_id(&self, name: &str) -> Option<u16> {
+    pub fn field_id(&self, name: &str) -> Option<u16> {
         self.field_registry.lock().get(name)
+    }
+
+    /// Build a HashMap<u16, String> of all active field IDs → names.
+    /// Used by CacheSilo checkpoint for clause matching.
+    pub fn field_idx_to_name_map(&self) -> std::collections::HashMap<u16, String> {
+        let reg = self.field_registry.lock();
+        reg.active_fields().map(|(name, id)| (id, name.to_string())).collect()
     }
 
     /// Get or assign a field ID for a field name. Saves the registry if new.
@@ -361,6 +368,7 @@ impl BitmapSilo {
         let meta_bytes = serde_json::to_vec(&meta)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
+        let t0 = std::time::Instant::now();
         // Collect filter bitmap (key, manifest_name, bitmap) pairs using FieldRegistry encoding.
         let filter_items: Vec<(u64, String, RoaringBitmap)> = filter_maps.into_iter()
             .flat_map(|(field_name, value_map)| {
@@ -388,6 +396,9 @@ impl BitmapSilo {
             })
             .collect();
 
+        eprintln!("  write_dump_maps: collect {} filter + {} sort items in {:.1}s",
+            filter_items.len(), sort_items.len(), t0.elapsed().as_secs_f64());
+        let t1 = std::time::Instant::now();
         // Register all encoded keys in the legacy manifest for enumeration paths.
         {
             let mut n2k = self.name_to_key.write();
@@ -397,7 +408,8 @@ impl BitmapSilo {
                 k2n.insert(*key, name.clone());
             }
         }
-
+        eprintln!("  write_dump_maps: manifest register in {:.1}s", t1.elapsed().as_secs_f64());
+        let t2 = std::time::Instant::now();
         // Parallel serialize to frozen bytes
         let filter_bufs: Vec<(u64, Vec<u8>)> = filter_items.par_iter()
             .map(|(key, _name, bitmap)| {
@@ -421,6 +433,8 @@ impl BitmapSilo {
             })
             .collect();
 
+        eprintln!("  write_dump_maps: frozen serialize in {:.1}s", t2.elapsed().as_secs_f64());
+        let t3 = std::time::Instant::now();
         // Combine and write in one batch
         let mut all_entries: Vec<(u64, Vec<u8>)> = Vec::with_capacity(
             2 + filter_bufs.len() + sort_bufs.len()
@@ -430,11 +444,76 @@ impl BitmapSilo {
         all_entries.extend(filter_bufs);
         all_entries.extend(sort_bufs);
 
+        eprintln!("  write_dump_maps: combine {} entries in {:.1}s", all_entries.len(), t3.elapsed().as_secs_f64());
+        let t4 = std::time::Instant::now();
         let count = self.silo.write_batch_parallel(&all_entries)?;
+        eprintln!("  write_dump_maps: write_batch_parallel in {:.1}s", t4.elapsed().as_secs_f64());
         // Save manifest (includes newly registered filter/sort entries)
         self.save_manifest()?;
+        eprintln!("  write_dump_maps: total {:.1}s", t0.elapsed().as_secs_f64());
 
         Ok(count)
+    }
+
+    /// Append dump maps to an EXISTING bitmap silo via ops log.
+    /// Used by subsequent dump phases (tags, resources, etc.) that add new bitmaps
+    /// without replacing the existing data from the images phase.
+    ///
+    /// Uses portable serialization (not frozen) because ops log values are not
+    /// guaranteed to be 32-byte aligned, which frozen bitmaps require for view().
+    /// Compaction after all phases will re-serialize to frozen format in data.bin.
+    pub fn append_dump_maps(
+        &mut self,
+        filter_maps: std::collections::HashMap<String, std::collections::HashMap<u64, RoaringBitmap>>,
+        sort_maps: std::collections::HashMap<String, Vec<RoaringBitmap>>,
+    ) -> io::Result<u64> {
+        let t0 = std::time::Instant::now();
+        let mut total = 0u64;
+
+        // Write filter bitmaps via ops log (portable serialization)
+        for (field_name, value_map) in filter_maps {
+            let field_id = self.ensure_field_id(&field_name);
+            for (value, bitmap) in value_map {
+                let key = encode_filter_key(field_id, value);
+                let name = format!("filter:{}:{}", field_name, value);
+                self.name_to_key.write().insert(name.clone(), key);
+                self.key_to_name.write().insert(key, name);
+                // Use portable serialization (works at any alignment)
+                let mut buf = Vec::with_capacity(bitmap.serialized_size());
+                bitmap.serialize_into(&mut buf)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bitmap serialize: {e:?}")))?;
+                self.silo.append_op(key, &buf)?;
+                total += 1;
+            }
+        }
+
+        // Write sort bitmaps via ops log
+        for (field_name, layers) in sort_maps {
+            let field_id = self.ensure_field_id(&field_name);
+            for (bit_idx, bitmap) in layers.into_iter().enumerate() {
+                if bitmap.is_empty() { continue; }
+                let key = encode_sort_key(field_id, bit_idx as u32);
+                let name = format!("sort:{}:{}", field_name, bit_idx);
+                self.name_to_key.write().insert(name.clone(), key);
+                self.key_to_name.write().insert(key, name);
+                let mut buf = Vec::with_capacity(bitmap.serialized_size());
+                bitmap.serialize_into(&mut buf)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bitmap serialize: {e:?}")))?;
+                self.silo.append_op(key, &buf)?;
+                total += 1;
+            }
+        }
+
+        self.save_manifest()?;
+        eprintln!("  append_dump_maps: {} entries via ops log in {:.1}s", total, t0.elapsed().as_secs_f64());
+        Ok(total)
+    }
+
+    /// Compact the bitmap silo's ops log into data.bin.
+    /// Called after all dump phases to merge append_dump_maps entries into data.bin
+    /// for O(1) reads instead of O(n) ops log scans.
+    pub fn compact_silo(&mut self) -> io::Result<u64> {
+        self.silo.compact()
     }
 
     // ── Load ────────────────────────────────────────────────────────────
@@ -683,9 +762,21 @@ impl BitmapSilo {
 
     /// Internal: read frozen base from data file + scan ops log for pending mutations.
     fn get_bitmap_with_ops(&self, key: u64) -> Option<RoaringBitmap> {
-        // Get frozen base from data file
-        let frozen_base = self.silo.get(key)
-            .and_then(|bytes| if bytes.is_empty() { None } else { FrozenRoaringBitmap::view(bytes).ok() });
+        // Get base bitmap from data file.
+        // Try frozen format first (zero-copy, requires alignment), then portable format
+        // (for entries that were written via append_dump_maps and then compacted).
+        enum Base<'a> {
+            Frozen(FrozenRoaringBitmap<'a>),
+            Owned(RoaringBitmap),
+        }
+        let base: Option<Base> = self.silo.get(key)
+            .and_then(|bytes| if bytes.is_empty() { None } else {
+                if let Ok(f) = FrozenRoaringBitmap::view(bytes) {
+                    Some(Base::Frozen(f))
+                } else {
+                    RoaringBitmap::deserialize_from(bytes).ok().map(Base::Owned)
+                }
+            });
 
         // Collect pending set/clear ops from both ops logs
         let mut sets: Vec<u32> = Vec::new();
@@ -704,9 +795,14 @@ impl BitmapSilo {
                     clears.push(slot);
                 }
                 _ => {
-                    // Legacy or full bitmap value — replace base entirely
+                    // Full bitmap value — replace base entirely.
+                    // Try frozen format first (requires alignment), then portable format.
                     if let Ok(frozen) = FrozenRoaringBitmap::view(value) {
                         full_replace = Some(frozen.to_owned());
+                        sets.clear();
+                        clears.clear();
+                    } else if let Ok(bm) = RoaringBitmap::deserialize_from(value) {
+                        full_replace = Some(bm);
                         sets.clear();
                         clears.clear();
                     }
@@ -722,20 +818,30 @@ impl BitmapSilo {
         }
 
         if sets.is_empty() && clears.is_empty() {
-            // No ops — return frozen base as owned (or None if no base)
-            return frozen_base.map(|f| f.to_owned());
+            // No ops — return base as owned (or None if no base)
+            return match base {
+                Some(Base::Frozen(f)) => Some(f.to_owned()),
+                Some(Base::Owned(bm)) => Some(bm),
+                None => None,
+            };
         }
 
         // Container-level CoW: only copies containers touched by ops
         sets.sort_unstable();
         clears.sort_unstable();
-        match frozen_base {
-            Some(frozen) => Some(frozen.apply_ops(&sets, &clears)),
+        match base {
+            Some(Base::Frozen(frozen)) => Some(frozen.apply_ops(&sets, &clears)),
+            Some(Base::Owned(mut bm)) => {
+                for &slot in &sets { bm.insert(slot); }
+                for &slot in &clears { bm.remove(slot); }
+                Some(bm)
+            }
             None => {
                 // No base — build from ops alone
                 let mut bitmap = RoaringBitmap::new();
                 for &slot in &sets { bitmap.insert(slot); }
-                Some(bitmap)
+                for &slot in &clears { bitmap.remove(slot); }
+                if bitmap.is_empty() { None } else { Some(bitmap) }
             }
         }
     }

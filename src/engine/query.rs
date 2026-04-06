@@ -130,13 +130,125 @@ impl ConcurrentEngine {
 
         if let Some((key_hash, ref _ukey)) = cache_key_opt {
             if let Some(ref silo_arc) = self.cache_silo {
-                if let Some(entry) = silo_arc.read().get_entry(key_hash) {
-                    // Staleness check: if any clause field was mutated since this
-                    // entry was formed, treat as a miss and fall through to recompute.
-                    let cache_stale = entry.is_stale(|field| self.field_epoch(field));
+                #[cfg(feature = "dump-timing")]
+                let _t_cache_start = std::time::Instant::now();
+                let cs = silo_arc.read();
+                let entry_opt = cs.get_entry(key_hash);
+                let field_ops_cursor = cs.field_ops_cursor();
+                drop(cs);
+                #[cfg(feature = "dump-timing")]
+                let _t_cache_get = _t_cache_start.elapsed();
+                if let Some(entry) = entry_opt {
+                    // Meta-index registration is handled at startup (load_all → rebuild)
+                    // and at seed time (query path below). No lazy registration needed.
+
+                    // ── Field ops overlay: patch bitmap from pending mutations ──
+                    // Instead of epoch-based invalidation, scan the field ops log
+                    // from the entry's last_applied_offset to discover pending changes.
+                    let has_pending_ops = field_ops_cursor > entry.last_applied_offset;
+                    let mut patched_bm = entry.bitmap.clone();
+                    let mut patched_keys = entry.sorted_keys.clone();
+                    let mut overlay_applied = false;
+                    let mut cache_stale = false;
+
+                    if has_pending_ops {
+                        // Scan pending field ops
+                        let mut pending_ops: Vec<crate::silos::field_ops_log::FieldOp> = Vec::new();
+                        let cs = silo_arc.read();
+                        cs.scan_field_ops_from(entry.last_applied_offset, |op| pending_ops.push(op));
+                        drop(cs);
+
+                        if !pending_ops.is_empty() {
+                            // Build field_idx → name map for clause matching
+                            let field_map = silo_guard.as_ref()
+                                .map(|s| s.field_idx_to_name_map())
+                                .unwrap_or_default();
+                            // Find sort field idx
+                            let sort_field_idx = query.sort.as_ref().and_then(|sc| {
+                                field_map.iter()
+                                    .find(|(_, name)| name.as_str() == sc.field)
+                                    .map(|(&idx, _)| idx)
+                            });
+
+                            let overlay_result = crate::silos::cache_overlay::apply_field_ops(
+                                &entry.key.filter_clauses,
+                                sort_field_idx,
+                                &mut patched_bm,
+                                &mut patched_keys,
+                                &pending_ops,
+                                &field_map,
+                            );
+
+                            if overlay_result.needs_epoch_fallback {
+                                // Negation/range/compound clauses — fall back to epoch check
+                                cache_stale = entry.is_stale(|field| self.field_epoch(field));
+                            } else {
+                                overlay_applied = true;
+                            }
+
+                            // Surgical sorted_keys update: remove/insert slots instead of
+                            // nuking sorted_keys (which causes expensive bitmap traversal).
+                            if overlay_applied && (!overlay_result.slots_removed.is_empty() || !overlay_result.slots_added.is_empty()) {
+                                if let Some(ref mut keys) = patched_keys {
+                                    // Remove slots (scan for matching slot_id in lower 32 bits)
+                                    for &slot in &overlay_result.slots_removed {
+                                        keys.retain(|&k| (k & 0xFFFF_FFFF) as u32 != slot);
+                                    }
+                                    // Insert slots with their sort values
+                                    if !overlay_result.slots_added.is_empty() {
+                                        if let Some(sort_clause) = query.sort.as_ref() {
+                                            let direction = sort_clause.direction;
+                                            for &slot in &overlay_result.slots_added {
+                                                // Reconstruct sort value from BitmapSilo
+                                                let sort_val = if let Some(ref silo) = silo_guard {
+                                                    let num_bits = self.config.sort_fields.iter()
+                                                        .find(|s| s.name == sort_clause.field)
+                                                        .map(|s| s.bits as usize)
+                                                        .unwrap_or(32);
+                                                    crate::engine::frozen_sort::frozen_reconstruct_value(
+                                                        silo, &sort_clause.field, num_bits, slot,
+                                                    )
+                                                } else {
+                                                    sorts_r.get_field(&sort_clause.field)
+                                                        .map(|f| f.reconstruct_value(slot))
+                                                        .unwrap_or(0)
+                                                };
+                                                let packed = ((sort_val as u64) << 32) | (slot as u64);
+                                                // Binary search insert at the right position
+                                                let pos = match direction {
+                                                    crate::query::SortDirection::Desc => {
+                                                        // Desc: higher values first
+                                                        keys.partition_point(|&k| k > packed)
+                                                    }
+                                                    crate::query::SortDirection::Asc => {
+                                                        // Asc: lower values first
+                                                        keys.partition_point(|&k| k < packed)
+                                                    }
+                                                };
+                                                keys.insert(pos, packed);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            #[cfg(feature = "dump-timing")]
+                            eprintln!(
+                                "  [cache-overlay] ops={} applied={} fallback={} sort_changed={} added={} removed={}",
+                                pending_ops.len(), overlay_result.applied_count,
+                                overlay_result.needs_epoch_fallback, overlay_result.sort_changed,
+                                overlay_result.slots_added.len(), overlay_result.slots_removed.len(),
+                            );
+                        }
+                    }
+
+                    // Bucket drift is handled by the flush thread's incremental
+                    // time bucket refresh — expired slots are removed via BitmapSilo
+                    // CLEARs which produce FieldOps caught by the overlay above.
+
                     if cache_stale {
                         tracing::debug!(
-                            "cache_stale: entry epoch={} has stale fields, forcing miss",
+                            "cache_stale: entry epoch={} has stale fields (epoch fallback), forcing miss",
                             entry.epoch
                         );
                         // Fall through to slow path below (entry will be re-seeded)
@@ -144,9 +256,11 @@ impl ConcurrentEngine {
                     let sort_clause = query.sort.as_ref().unwrap();
                     let has_more = entry.has_more;
                     let min_val = entry.min_tracked_value;
+                    // Keep the original total_matched — the patched bitmap is bounded (top-K),
+                    // not the full filter result. Overlay adjustments are local to the window.
                     let total = entry.total_matched;
-                    let cached_bm = Arc::new(entry.bitmap.clone());
-                    let sorted_keys = entry.sorted_keys.clone();
+                    let cached_bm = Arc::new(patched_bm);
+                    let sorted_keys = patched_keys;
 
                     // Check if cursor is within the cached boundary
                     let needs_expansion = if let Some(cursor) = query.cursor.as_ref() {
@@ -166,10 +280,11 @@ impl ConcurrentEngine {
                     };
 
                     if !needs_expansion {
-                        // CACHE HIT: serve directly from the silo entry
-                        if let Some(ref c) = collector { let _ = c; } // collector.cache_hit = true — handled below
+                        // CACHE HIT: serve directly (with overlay patches applied)
                         let offset = if query.cursor.is_none() { query.offset.unwrap_or(0) } else { 0 };
                         let fetch_limit = query.limit.saturating_add(offset);
+                        #[cfg(feature = "dump-timing")]
+                        let _t_exec_start = std::time::Instant::now();
                         let mut result = if let Some(ref keys) = sorted_keys {
                             executor.execute_from_sorted_keys(
                                 keys, &sort_clause.field, sort_clause.direction,
@@ -182,6 +297,8 @@ impl ConcurrentEngine {
                                 query.cursor.as_ref(), use_simple,
                             )?
                         };
+                        #[cfg(feature = "dump-timing")]
+                        let _t_exec = _t_exec_start.elapsed();
                         result.total_matched = total;
                         // Apply offset
                         if offset > 0 && !result.ids.is_empty() {
@@ -201,10 +318,19 @@ impl ConcurrentEngine {
                                 }
                             }
                         }
+                        #[cfg(feature = "dump-timing")]
+                        eprintln!(
+                            "  [cache-hit] get={:.0}μs exec={:.0}μs total={:.0}μs bm_len={} keys={} overlay={}",
+                            _t_cache_get.as_micros(),
+                            _t_exec_start.elapsed().as_micros(),
+                            _t_cache_start.elapsed().as_micros(),
+                            cached_bm.len(),
+                            sorted_keys.as_ref().map(|k| k.len()).unwrap_or(0),
+                            overlay_applied,
+                        );
                         return Ok(result);
                     }
                     // Cache boundary exceeded — fall through to full recompute below.
-                    // has_more tells us the silo has partial coverage; we'll re-seed it.
                     let _ = has_more;
                     } // end else (not stale)
                 }
@@ -265,6 +391,9 @@ impl ConcurrentEngine {
                     .map(|c| (c.field.clone(), self.field_epoch(&c.field)))
                     .collect();
                 entry_field_epochs.push(("__alive__".to_string(), self.field_epoch("__alive__")));
+                // Include the sort field so sort-value mutations (reactionCount etc.)
+                // invalidate entries that depend on that sort order.
+                entry_field_epochs.push((sort_clause.field.clone(), self.field_epoch(&sort_clause.field)));
                 let entry_data = crate::silos::cache_silo::CacheEntryData {
                     key: ukey.clone(),
                     bitmap: bm,
@@ -277,12 +406,45 @@ impl ConcurrentEngine {
                     sorted_keys: if sorted_keys.is_empty() { None } else { Some(sorted_keys.clone()) },
                     epoch: current_epoch,
                     field_epochs: entry_field_epochs,
+                    last_applied_offset: self.cache_silo.as_ref()
+                        .map(|s| s.read().field_ops_cursor())
+                        .unwrap_or(0),
+                    bucket_cutoff_at_formation: 0, // Set by caller if entry uses bucket clause
                 };
-                // Save to silo outside any lock
+                // Save to silo and register in meta-index
                 if let Some(ref silo_arc) = self.cache_silo {
-                    let cs = silo_arc.read();
+                    let mut cs = silo_arc.write();
                     if let Err(e) = cs.save_entry(key_hash, &entry_data) {
                         eprintln!("CacheSilo: save_entry error: {e}");
+                    }
+                    // Register in meta-index for field ops routing
+                    if let Some(ref bsilo) = silo_guard {
+                        for clause in &ukey.filter_clauses {
+                            if let Some(field_idx) = bsilo.field_id(&clause.field) {
+                                match clause.op.as_str() {
+                                    "eq" => {
+                                        if let Ok(val) = clause.value_repr.parse::<u64>() {
+                                            cs.meta_register_exact(key_hash, field_idx, val);
+                                        }
+                                    }
+                                    "in" => {
+                                        for v in clause.value_repr.split(',') {
+                                            if let Ok(val) = v.parse::<u64>() {
+                                                cs.meta_register_exact(key_hash, field_idx, val);
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        // Negation, range, compound, bucket → wildcard
+                                        cs.meta_register_wildcard(key_hash, field_idx);
+                                    }
+                                }
+                            }
+                        }
+                        // Register sort field as wildcard dependency
+                        if let Some(sort_idx) = bsilo.field_id(&sort_clause.field) {
+                            cs.meta_register_wildcard(key_hash, sort_idx);
+                        }
                     }
                 }
                 // Serve from the freshly seeded entry

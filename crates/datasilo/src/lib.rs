@@ -600,24 +600,15 @@ impl DataSilo {
         data_mmap.flush()?;
         drop(data_mmap);
 
-        // Phase 4: Build hash index (sequential — linear probing requires single writer)
-        // Capacity = 2× entry count to keep load factor ≤ 50%.
-        let index_capacity = (count * 2).max(16);
+        // Phase 4: Build hash index — bulk build in heap then write as one sequential pass.
+        // This avoids 5M+ random mmap page faults that make sequential put() unusably slow.
         let index_path = self.path.join("index.bin");
-        // Remove existing index file so HashIndex::new() can create fresh
         if index_path.exists() { let _ = std::fs::remove_file(&index_path); }
-        let mut idx = HashIndex::new(&index_path, index_capacity)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::new: {e}")))?;
-
-        for layout in &layouts {
-            idx.put(layout.key, IndexEntry {
-                offset: layout.offset,
-                length: layout.length,
-                allocated: layout.allocated,
-            }).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::put key={}: {e}", layout.key)))?;
-        }
-        idx.flush()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::flush: {e}")))?;
+        let index_entries: Vec<(u64, IndexEntry)> = layouts.iter()
+            .map(|l| (l.key, IndexEntry { offset: l.offset, length: l.length, allocated: l.allocated }))
+            .collect();
+        let idx = HashIndex::build_bulk(&index_path, &index_entries)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::build_bulk: {e}")))?;
 
         self.index = Some(idx);
         self.load_data()?;
@@ -628,8 +619,8 @@ impl DataSilo {
         self.ops_a.lock().truncate()?;
         self.ops_b.lock().truncate()?;
 
-        eprintln!("DataSilo: write_batch_parallel {} entries, {:.1}MB data, hash index cap={}",
-            count, offset as f64 / 1e6, index_capacity);
+        eprintln!("DataSilo: write_batch_parallel {} entries, {:.1}MB data",
+            count, offset as f64 / 1e6);
         Ok(count)
     }
 
@@ -930,21 +921,14 @@ impl DataSilo {
         data_mmap.flush()?;
         drop(data_mmap);
 
-        // Phase 4: Build hash index (sequential — single writer required)
-        let index_capacity = (count * 2).max(16);
+        // Phase 4: Build hash index — bulk build in heap then write as one sequential pass.
         let index_path = self.path.join("index.bin");
         if index_path.exists() { let _ = std::fs::remove_file(&index_path); }
-        let mut idx = HashIndex::new(&index_path, index_capacity)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::new: {e}")))?;
-        for layout in &layouts {
-            idx.put(layout.key, IndexEntry {
-                offset: layout.offset,
-                length: layout.length,
-                allocated: layout.allocated,
-            }).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::put key={}: {e}", layout.key)))?;
-        }
-        idx.flush()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::flush: {e}")))?;
+        let index_entries: Vec<(u64, IndexEntry)> = layouts.iter()
+            .map(|l| (l.key, IndexEntry { offset: l.offset, length: l.length, allocated: l.allocated }))
+            .collect();
+        let idx = HashIndex::build_bulk(&index_path, &index_entries)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HashIndex::build_bulk: {e}")))?;
 
         self.index = Some(idx);
         self.load_data()?;
@@ -953,8 +937,8 @@ impl DataSilo {
 
         // NOTE: caller (compact()) truncates the frozen log after this returns.
 
-        eprintln!("DataSilo: cold compacted {} entries, {:.1}MB data, hash index cap={}",
-            count, total_data_size as f64 / 1e6, index_capacity);
+        eprintln!("DataSilo: cold compacted {} entries, {:.1}MB data",
+            count, total_data_size as f64 / 1e6);
         Ok(count)
     }
 
