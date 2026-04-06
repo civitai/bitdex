@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use crate::filter::FilterIndex;
 use crate::query::{FilterClause, Value};
 use crate::slot::SlotAllocator;

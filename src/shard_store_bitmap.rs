@@ -19,7 +19,8 @@
 //! - `SortLayerShard` — sort (legacy per-layer ops): (field, bit_position) → `sort/{field}/bit{NN}.shard`
 //! - `SingletonShard` — alive: single file → `system/alive.shard`
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -832,8 +833,8 @@ impl FilterBitmapStore {
     ///
     /// This is the existence set — used to eliminate disk I/O for queries
     /// on nonexistent values.
-    pub fn existence_set(&self, field: &str) -> io::Result<std::collections::HashSet<u64>> {
-        let mut values = std::collections::HashSet::new();
+    pub fn existence_set(&self, field: &str) -> io::Result<HashSet<u64>> {
+        let mut values = HashSet::new();
         let current_gen = self.current_generation();
 
         for gen in (0..=current_gen).rev() {

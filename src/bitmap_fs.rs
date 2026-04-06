@@ -20,7 +20,7 @@
 //!   meta/slot_counter.bin
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;

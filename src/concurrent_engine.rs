@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -5276,7 +5276,7 @@ impl ConcurrentEngine {
         snap.slots.is_alive(slot)
     }
     /// Build the schema registry for version-aware default reconstruction.
-    pub fn build_schema_registry(&self) -> std::collections::HashMap<u8, std::collections::HashMap<String, serde_json::Value>> {
+    pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {
         self.docstore.lock().build_schema_registry()
     }
 

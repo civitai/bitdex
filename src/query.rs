@@ -302,7 +302,7 @@ mod tests {
     use super::*;
     use crate::config::BucketConfig;
     use crate::time_buckets::TimeBucketManager;
-    use std::collections::HashMap;
+    use ahash::AHashMap as HashMap;
 
     /// Build a BucketSnapContext with a single field and two buckets (24h, 7d).
     fn make_ctx<'a>(

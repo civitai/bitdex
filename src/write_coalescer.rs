@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::sync::Arc;
 use crossbeam_channel::{Receiver, Sender};
 use crate::filter::FilterIndex;

@@ -8,7 +8,8 @@
 //!
 //! All use atomic write (tmp → fsync → rename) for crash safety.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use ahash::AHashMap as HashMap;
 use std::io::{self, Write};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};

@@ -9,7 +9,7 @@
 //! - QueryOpSet dedup: by (entity_id, query string), last wins
 //! - Delete absorbs all prior ops for the same entity_id
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 
 use super::ops::{EntityOps, Op};
 

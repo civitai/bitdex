@@ -8,7 +8,7 @@
 //! interprets them. Validation happens before the op hits the log, and apply
 //! happens on read (when reconstructing from ops).
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::sync::Arc;
 
 use crate::shard_store_doc::PackedValue;

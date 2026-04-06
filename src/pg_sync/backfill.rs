@@ -9,7 +9,7 @@
 //!
 //! Tracks completion via a BitDex cursor (`backfill-{field_name}`).
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 

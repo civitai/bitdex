@@ -3,7 +3,8 @@
 //! Feature-gated behind `server`. Provides `BitdexServer` which starts blank
 //! and creates indexes via API.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use ahash::AHashMap as HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};

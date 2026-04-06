@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::sync::Arc;
 use roaring::RoaringBitmap;
 use crate::config::FilterFieldConfig;

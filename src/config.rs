@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 use crate::error::{BitdexError, Result};

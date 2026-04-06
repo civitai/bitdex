@@ -10,7 +10,7 @@
 //! 4. WAL reader finishes processing, marks dump as complete
 //! 5. GET /dumps — check status per table
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 

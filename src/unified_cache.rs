@@ -8,7 +8,7 @@
 //! Live maintenance is performed by the flush thread: when documents are inserted, updated,
 //! or deleted, the meta-index identifies affected entries, and each entry's bitmap is updated
 //! via per-slot contains() checks against the engine's field bitmaps.
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

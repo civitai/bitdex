@@ -10,7 +10,7 @@
 //! intermediate Document allocation for the bitmap path. The old decompose/merge
 //! pipeline in put_bulk_into is bypassed entirely.
 
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;

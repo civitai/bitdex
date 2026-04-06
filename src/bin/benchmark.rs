@@ -18,7 +18,7 @@
 // causing parse times to degrade 5x+ as bitmap memory grows to 6+ GB.
 #[global_allocator]
 static ALLOC: rpmalloc::RpMalloc = rpmalloc::RpMalloc;
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};

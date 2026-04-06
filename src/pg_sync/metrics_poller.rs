@@ -6,7 +6,7 @@
 //! so ops are sent with `creates_slot: false` — they update existing slots
 //! without touching the alive bitmap.
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
