@@ -2096,10 +2096,15 @@ pub fn process_dump_with_progress(
                             encode_dump_merge(prev, &fields, &mut doc_encode_buf);
                             let key = crate::silos::doc_silo_adapter::slot_to_key(prev);
                             if let Some(ref mw) = mw_ref {
-                                mw.merge_put(key, &doc_encode_buf, |existing, new| {
+                                if !mw.merge_put(key, &doc_encode_buf, |existing, new| {
                                     crate::silos::doc_format::merge_encoded_docs(existing, new)
-                                        .unwrap_or_else(|_| new.to_vec())
-                                });
+                                        .unwrap_or_else(|e| {
+                                            eprintln!("  WARNING: merge decode error for key {}: {e}", key);
+                                            new.to_vec()
+                                        })
+                                }) {
+                                    // Overflow — merge result exceeded allocated buffer
+                                }
                             } else if let Some(ref pw) = pw_ref {
                                 pw.write_put_reuse(key, &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
                             } else {
@@ -2421,8 +2426,12 @@ pub fn process_dump_with_progress(
         if let Some(ref mw) = dump_merge_writer {
             let in_place = mw.in_place_count.load(std::sync::atomic::Ordering::Relaxed);
             let overflow = mw.overflow_count.load(std::sync::atomic::Ordering::Relaxed);
+            let decode_errors = mw.decode_error_count.load(std::sync::atomic::Ordering::Relaxed);
             if overflow > 0 {
                 eprintln!("  WARNING: Dump {}: {} merge writes overflowed (data > allocated buffer)!", request.name, overflow);
+            }
+            if decode_errors > 0 {
+                eprintln!("  WARNING: Dump {}: {} merge decode errors (existing data unreadable)!", request.name, decode_errors);
             }
             // Drop the merge writer's mmap before reloading
             drop(dump_merge_writer);
@@ -2923,7 +2932,10 @@ fn collect_doc_op(
             let _t_wr = std::time::Instant::now();
             mw.merge_put(key, &bytes, |existing, new| {
                 crate::silos::doc_format::merge_encoded_docs(existing, new)
-                    .unwrap_or_else(|_| new.to_vec())
+                    .unwrap_or_else(|e| {
+                        eprintln!("  WARNING: merge decode error for key {}: {e}", key);
+                        new.to_vec()
+                    })
             });
             #[cfg(feature = "dump-timing")]
             { mmap_write_ns = _t_wr.elapsed().as_nanos() as u64; }

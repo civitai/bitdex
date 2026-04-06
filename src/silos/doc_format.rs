@@ -673,34 +673,6 @@ pub fn merge_encoded_docs(existing: &[u8], new_data: &[u8]) -> io::Result<Vec<u8
     Ok(encode_merge_fields(slot, &fields))
 }
 
-/// Merge two encoded doc records into a caller-provided buffer. Zero allocation
-/// except for the field Vec decode. Used from DumpMergeWriter for maximum throughput.
-pub fn merge_encoded_docs_into(existing: &[u8], new_data: &[u8], buf: &mut Vec<u8>) -> io::Result<()> {
-    let mut fields = decode_doc_fields(existing)?;
-    let new_fields = decode_doc_fields(new_data)?;
-
-    for (field_idx, value) in new_fields {
-        if let Some(entry) = fields.iter_mut().find(|(f, _)| *f == field_idx) {
-            match (&mut entry.1, &value) {
-                (PackedValue::Mi(existing_vals), PackedValue::Mi(new_vals)) => {
-                    existing_vals.extend_from_slice(new_vals);
-                }
-                _ => { entry.1 = value; }
-            }
-        } else {
-            fields.push((field_idx, value));
-        }
-    }
-
-    let slot = if existing.len() >= 5 {
-        u32::from_le_bytes(existing[1..5].try_into().unwrap())
-    } else {
-        0
-    };
-    encode_merge_fields_into(slot, &fields, buf);
-    Ok(())
-}
-
 /// Decode a full StoredDoc from raw DataSilo bytes, using the field index→name mapping.
 /// Optionally applies field defaults for missing fields.
 pub fn decode_stored_doc(

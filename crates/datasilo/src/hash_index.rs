@@ -376,26 +376,16 @@ impl HashIndex {
                 KEY_EMPTY => return false,
                 KEY_TOMBSTONE => {}
                 k if k == key => {
-                    // Write offset, length, allocated directly to the mmap.
-                    // Key field is NOT modified — slot identity is preserved.
+                    // Write offset+length+allocated as a single 16-byte copy.
+                    // Key field (bytes 0..8) is NOT modified — slot identity preserved.
+                    // Single copy prevents torn reads from concurrent `get()` calls.
                     let off = Self::slot_offset(slot);
                     let ptr = self.mmap.as_ptr() as *mut u8;
-                    // offset at +8, length at +16, allocated at +20
-                    std::ptr::copy_nonoverlapping(
-                        value.offset.to_le_bytes().as_ptr(),
-                        ptr.add(off + 8),
-                        8,
-                    );
-                    std::ptr::copy_nonoverlapping(
-                        value.length.to_le_bytes().as_ptr(),
-                        ptr.add(off + 16),
-                        4,
-                    );
-                    std::ptr::copy_nonoverlapping(
-                        value.allocated.to_le_bytes().as_ptr(),
-                        ptr.add(off + 20),
-                        4,
-                    );
+                    let mut buf = [0u8; 16];
+                    buf[0..8].copy_from_slice(&value.offset.to_le_bytes());
+                    buf[8..12].copy_from_slice(&value.length.to_le_bytes());
+                    buf[12..16].copy_from_slice(&value.allocated.to_le_bytes());
+                    std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr.add(off + 8), 16);
                     return true;
                 }
                 _ => {}

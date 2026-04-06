@@ -182,13 +182,12 @@ const MERGE_STRIPE_COUNT: usize = 1024;
 /// but distinct keys can be written concurrently from rayon threads.
 pub struct DumpMergeWriter {
     /// Raw pointer to the writable mmap for data.bin.
+    /// Both reads and writes go through this pointer to avoid dual-mmap aliasing.
     write_ptr: *mut u8,
     /// Keeps the writable mmap alive.
-    _write_mmap: memmap2::MmapMut,
-    /// Raw pointer to the read mmap for data.bin (the DataSilo's existing mmap).
-    read_ptr: *const u8,
-    /// Length of the read mmap.
-    read_len: usize,
+    write_mmap: memmap2::MmapMut,
+    /// Length of the writable mmap (same as data file size).
+    data_len: usize,
     /// Pointer to the HashIndex for entry lookups and concurrent updates.
     index_ptr: *const HashIndex,
     /// Striped locks for key-level serialization.
@@ -197,10 +196,13 @@ pub struct DumpMergeWriter {
     pub in_place_count: AtomicU64,
     /// Count of writes that overflowed (merged data > allocated buffer).
     pub overflow_count: AtomicU64,
+    /// Count of merge decode errors (existing data was unreadable, replaced by new data).
+    pub decode_error_count: AtomicU64,
 }
 
 // SAFETY: DumpMergeWriter is Send+Sync because:
-// - write_ptr/read_ptr point to stable mmaps (not freed during writer lifetime)
+// - write_ptr points to a stable MmapMut (not freed during writer lifetime)
+// - Both reads and writes go through write_ptr (no dual-mmap aliasing)
 // - index_ptr points to DataSilo's HashIndex (stable during dump)
 // - Stripe locks ensure no two threads access the same key simultaneously
 // - Different keys occupy different hash table slots (no aliased writes)
@@ -243,14 +245,14 @@ impl DumpMergeWriter {
         let to_write = if entry.length == 0 {
             std::borrow::Cow::Borrowed(new_bytes)
         } else {
-            // Read existing data from the READ mmap
+            // Read existing data from the WRITE mmap (single mmap for both reads/writes)
             let end = start + entry.length as usize;
-            if end > self.read_len {
+            if end > self.data_len {
                 self.overflow_count.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             let existing = unsafe {
-                std::slice::from_raw_parts(self.read_ptr.add(start), entry.length as usize)
+                std::slice::from_raw_parts(self.write_ptr.add(start) as *const u8, entry.length as usize)
             };
             std::borrow::Cow::Owned(merge_fn(existing, new_bytes))
         };
@@ -328,11 +330,9 @@ impl DumpMergeWriter {
         true
     }
 
-    /// Flush the writable mmap to disk.
-    pub fn flush(&self) -> io::Result<()> {
-        // The _write_mmap field holds the MmapMut — we can't call flush through
-        // the raw pointer, but the mmap will flush on drop. For explicit flush,
-        // callers should drop the DumpMergeWriter.
+    /// Flush the writable mmap to disk, persisting all in-place writes.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.write_mmap.flush()?;
         Ok(())
     }
 }
@@ -491,22 +491,22 @@ impl DataSilo {
             Some(idx) if idx.count() > 0 => idx,
             _ => return Ok(None),
         };
-        let data_mmap = match self.data_mmap.as_ref() {
-            Some(m) if !m.is_empty() => m,
-            _ => return Ok(None),
-        };
+        if self.data_mmap.is_none() {
+            return Ok(None);
+        }
 
-        // Open a writable mmap on the same data.bin for in-place writes.
+        // Open a single writable mmap on data.bin for both reads and writes.
+        // This avoids dual-mmap aliasing — no separate read mmap needed.
         let data_path = self.path.join("data.bin");
         let data_file = OpenOptions::new()
             .read(true).write(true).open(&data_path)?;
         let mut write_mmap = unsafe { memmap2::MmapMut::map_mut(&data_file)? };
+        let data_len = write_mmap.len();
 
         Ok(Some(DumpMergeWriter {
             write_ptr: write_mmap.as_mut_ptr(),
-            _write_mmap: write_mmap,
-            read_ptr: data_mmap.as_ptr(),
-            read_len: data_mmap.len(),
+            write_mmap,
+            data_len,
             index_ptr: index as *const HashIndex,
             stripes: (0..MERGE_STRIPE_COUNT)
                 .map(|_| parking_lot::Mutex::new(()))
@@ -514,6 +514,7 @@ impl DataSilo {
                 .into_boxed_slice(),
             in_place_count: AtomicU64::new(0),
             overflow_count: AtomicU64::new(0),
+            decode_error_count: AtomicU64::new(0),
         }))
     }
 
