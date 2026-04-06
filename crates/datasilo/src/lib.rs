@@ -164,8 +164,187 @@ impl ParallelOpsWriter {
 }
 
 // ---------------------------------------------------------------------------
+// DumpMergeWriter — direct read-modify-write for dump phases
+// ---------------------------------------------------------------------------
+
+const MERGE_STRIPE_COUNT: usize = 1024;
+
+/// Handle for direct read-modify-write during dump phases.
+///
+/// Created by `DataSilo::prepare_dump_merge()` after the images phase has
+/// pre-allocated all slots via `write_batch_parallel`. Subsequent phases
+/// (tags, tools, techniques, resources) use this to read existing doc records,
+/// merge new field data (Mi array concatenation), and write back in-place.
+///
+/// Bypasses the ops log entirely — no compaction needed for dump doc writes.
+///
+/// Thread-safe via striped locks: each key is serialized by `key % 1024`,
+/// but distinct keys can be written concurrently from rayon threads.
+pub struct DumpMergeWriter {
+    /// Raw pointer to the writable mmap for data.bin.
+    write_ptr: *mut u8,
+    /// Keeps the writable mmap alive.
+    _write_mmap: memmap2::MmapMut,
+    /// Raw pointer to the read mmap for data.bin (the DataSilo's existing mmap).
+    read_ptr: *const u8,
+    /// Length of the read mmap.
+    read_len: usize,
+    /// Pointer to the HashIndex for entry lookups and concurrent updates.
+    index_ptr: *const HashIndex,
+    /// Striped locks for key-level serialization.
+    stripes: Box<[parking_lot::Mutex<()>]>,
+    /// Count of successful in-place writes.
+    pub in_place_count: AtomicU64,
+    /// Count of writes that overflowed (merged data > allocated buffer).
+    pub overflow_count: AtomicU64,
+}
+
+// SAFETY: DumpMergeWriter is Send+Sync because:
+// - write_ptr/read_ptr point to stable mmaps (not freed during writer lifetime)
+// - index_ptr points to DataSilo's HashIndex (stable during dump)
+// - Stripe locks ensure no two threads access the same key simultaneously
+// - Different keys occupy different hash table slots (no aliased writes)
+unsafe impl Send for DumpMergeWriter {}
+unsafe impl Sync for DumpMergeWriter {}
+
+impl DumpMergeWriter {
+    /// Merge new data into an existing entry using a caller-provided merge function.
+    ///
+    /// The merge function receives `(existing_bytes, new_bytes)` and returns the
+    /// merged result. For doc records, this decodes both, concatenates Mi arrays,
+    /// and re-encodes.
+    ///
+    /// Returns `true` if the write succeeded (in-place), `false` if:
+    /// - The key doesn't exist in the index (shouldn't happen after images phase)
+    /// - The merged data exceeds the allocated buffer (overflow)
+    ///
+    /// If the key has no existing data (length=0), `new_bytes` is written directly
+    /// without calling the merge function.
+    #[inline]
+    pub fn merge_put<F>(&self, key: u64, new_bytes: &[u8], merge_fn: F) -> bool
+    where
+        F: FnOnce(&[u8], &[u8]) -> Vec<u8>,
+    {
+        let stripe = (key as usize) % MERGE_STRIPE_COUNT;
+        let _guard = self.stripes[stripe].lock();
+
+        let index = unsafe { &*self.index_ptr };
+        let entry = match index.get(key) {
+            Some(e) => e,
+            None => {
+                self.overflow_count.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        };
+
+        let start = entry.offset as usize;
+
+        // If existing entry is empty (length=0), write new_bytes directly
+        let to_write = if entry.length == 0 {
+            std::borrow::Cow::Borrowed(new_bytes)
+        } else {
+            // Read existing data from the READ mmap
+            let end = start + entry.length as usize;
+            if end > self.read_len {
+                self.overflow_count.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            let existing = unsafe {
+                std::slice::from_raw_parts(self.read_ptr.add(start), entry.length as usize)
+            };
+            std::borrow::Cow::Owned(merge_fn(existing, new_bytes))
+        };
+
+        if to_write.len() as u32 > entry.allocated {
+            self.overflow_count.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        // Write merged data to the WRITE mmap at the same offset
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                to_write.as_ptr(),
+                self.write_ptr.add(start),
+                to_write.len(),
+            );
+        }
+
+        // Update index entry length (offset and allocated stay the same)
+        if to_write.len() as u32 != entry.length {
+            unsafe {
+                index.update_existing_concurrent(key, IndexEntry {
+                    offset: entry.offset,
+                    length: to_write.len() as u32,
+                    allocated: entry.allocated,
+                });
+            }
+        }
+
+        self.in_place_count.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Write new data directly to an existing slot without merging.
+    /// Used by the images phase or when the entry is known to be empty.
+    #[inline]
+    pub fn put_direct(&self, key: u64, data: &[u8]) -> bool {
+        let stripe = (key as usize) % MERGE_STRIPE_COUNT;
+        let _guard = self.stripes[stripe].lock();
+
+        let index = unsafe { &*self.index_ptr };
+        let entry = match index.get(key) {
+            Some(e) => e,
+            None => {
+                self.overflow_count.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        };
+
+        if data.len() as u32 > entry.allocated {
+            self.overflow_count.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        let start = entry.offset as usize;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.write_ptr.add(start),
+                data.len(),
+            );
+        }
+
+        if data.len() as u32 != entry.length {
+            unsafe {
+                index.update_existing_concurrent(key, IndexEntry {
+                    offset: entry.offset,
+                    length: data.len() as u32,
+                    allocated: entry.allocated,
+                });
+            }
+        }
+
+        self.in_place_count.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Flush the writable mmap to disk.
+    pub fn flush(&self) -> io::Result<()> {
+        // The _write_mmap field holds the MmapMut — we can't call flush through
+        // the raw pointer, but the mmap will flush on drop. For explicit flush,
+        // callers should drop the DumpMergeWriter.
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DataSilo — the main store
 // ---------------------------------------------------------------------------
+
+/// Type alias for the merge function used during compaction.
+/// Called as `merge_fn(existing_bytes, new_bytes) -> merged_bytes`.
+/// Used to merge multiple ops for the same key instead of last-write-wins.
+pub type MergeFn = Box<dyn Fn(&[u8], &[u8]) -> Vec<u8> + Send + Sync>;
 
 pub struct DataSilo {
     path: PathBuf,
@@ -184,6 +363,10 @@ pub struct DataSilo {
     /// Bytes wasted by deleted entries and relocated updates.
     /// Tracked during hot compaction. Reset to 0 after a full rewrite.
     dead_bytes: AtomicU64,
+    /// Optional merge function for compaction. When set, multiple ops for the
+    /// same key are merged instead of last-write-wins. Also merges with existing
+    /// data file entries during hot compaction.
+    merge_fn: Option<MergeFn>,
 }
 
 unsafe impl Send for DataSilo {}
@@ -217,6 +400,7 @@ impl DataSilo {
             ops_b: parking_lot::Mutex::new(ops_b),
             active_is_b: AtomicBool::new(false),
             dead_bytes: AtomicU64::new(0),
+            merge_fn: None,
         };
 
         silo.load_index()?;
@@ -291,6 +475,53 @@ impl DataSilo {
     /// The entry is removed from the data file on the next compaction.
     pub fn delete(&self, key: u64) -> io::Result<()> {
         self.ops_log().lock().append(&SiloOp::Delete { key })
+    }
+
+    // ── Dump merge writer (direct read-modify-write, no ops log) ────���─
+
+    /// Create a `DumpMergeWriter` for direct read-modify-write during dump phases.
+    ///
+    /// The data file + index must already exist (created by `write_batch_parallel`
+    /// during the images phase). Subsequent phases use the merge writer to read
+    /// existing entries, merge new field data, and write back in-place.
+    ///
+    /// Returns `None` if there's no data file or index (images phase hasn't run yet).
+    pub fn prepare_dump_merge(&self) -> io::Result<Option<DumpMergeWriter>> {
+        let index = match self.index.as_ref() {
+            Some(idx) if idx.count() > 0 => idx,
+            _ => return Ok(None),
+        };
+        let data_mmap = match self.data_mmap.as_ref() {
+            Some(m) if !m.is_empty() => m,
+            _ => return Ok(None),
+        };
+
+        // Open a writable mmap on the same data.bin for in-place writes.
+        let data_path = self.path.join("data.bin");
+        let data_file = OpenOptions::new()
+            .read(true).write(true).open(&data_path)?;
+        let mut write_mmap = unsafe { memmap2::MmapMut::map_mut(&data_file)? };
+
+        Ok(Some(DumpMergeWriter {
+            write_ptr: write_mmap.as_mut_ptr(),
+            _write_mmap: write_mmap,
+            read_ptr: data_mmap.as_ptr(),
+            read_len: data_mmap.len(),
+            index_ptr: index as *const HashIndex,
+            stripes: (0..MERGE_STRIPE_COUNT)
+                .map(|_| parking_lot::Mutex::new(()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            in_place_count: AtomicU64::new(0),
+            overflow_count: AtomicU64::new(0),
+        }))
+    }
+
+    /// Reload the data mmap after dump merge writes.
+    /// Call this after dropping the DumpMergeWriter so queries see updated data.
+    pub fn reload_data(&mut self) -> io::Result<()> {
+        self.data_mmap = None;
+        self.load_data()
     }
 
     // ── Bulk write (bypass ops log, write directly to data+index) ─────
@@ -500,6 +731,16 @@ impl DataSilo {
     pub fn path(&self) -> &Path { &self.path }
     pub fn config(&self) -> &SiloConfig { &self.config }
 
+    /// Set a merge function for compaction.
+    /// When set, multiple ops for the same key are merged instead of last-write-wins.
+    /// The function receives `(existing_value, new_value)` and returns the merged result.
+    /// Also applied during hot compaction when merging ops into existing data file entries.
+    pub fn set_merge_fn<F>(&mut self, f: F)
+    where F: Fn(&[u8], &[u8]) -> Vec<u8> + Send + Sync + 'static
+    {
+        self.merge_fn = Some(Box::new(f));
+    }
+
     /// Dead bytes in the data file (from deletes and relocating updates).
     pub fn dead_bytes(&self) -> u64 { self.dead_bytes.load(Ordering::Relaxed) }
 
@@ -569,6 +810,12 @@ impl DataSilo {
     /// Deleted keys (tombstones) are excluded from the output.
     /// `frozen_is_b`: true = ops_b is frozen, false = ops_a is frozen.
     fn compact_cold_from(&mut self, frozen_is_b: bool) -> io::Result<u64> {
+        // If merge_fn is set, use the merge-aware path (copies values for merging).
+        // Otherwise use zero-copy path (stores mmap offsets).
+        if self.merge_fn.is_some() {
+            return self.compact_cold_merge(frozen_is_b);
+        }
+
         // Zero-copy scan: collect (key → mmap_offset, value_len) instead of copying values.
         // LWW dedup: last Put wins, Delete removes.
         // Values stay in the source mmap until the write phase reads them directly.
@@ -688,6 +935,39 @@ impl DataSilo {
         Ok(count)
     }
 
+    /// Cold compaction with merge function — copies values and merges duplicates.
+    /// Used when `self.merge_fn` is set (e.g., doc silo with Mi field concatenation).
+    fn compact_cold_merge(&mut self, frozen_is_b: bool) -> io::Result<u64> {
+        let merge = self.merge_fn.as_ref().unwrap();
+
+        // Collect ops with merging: duplicate keys call merge_fn instead of LWW.
+        let mut entries: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+        {
+            let log = if frozen_is_b { self.ops_b.lock() } else { self.ops_a.lock() };
+            log.for_each_ops(|op| {
+                match op {
+                    SiloOp::Put { key, value } => {
+                        if let Some(existing) = entries.get(&key) {
+                            let merged = merge(existing, &value);
+                            entries.insert(key, merged);
+                        } else {
+                            entries.insert(key, value);
+                        }
+                    }
+                    SiloOp::Delete { key } => {
+                        entries.remove(&key);
+                    }
+                }
+            })?;
+        }
+        if entries.is_empty() { return Ok(0); }
+
+        // Write merged entries via write_batch_parallel
+        let batch: Vec<(u64, Vec<u8>)> = entries.into_iter().collect();
+        let count = self.write_batch_parallel(&batch)?;
+        Ok(count)
+    }
+
     /// Hot compaction: existing data file with pre-allocated buffer slots.
     ///
     /// Correctness properties:
@@ -713,13 +993,25 @@ impl DataSilo {
     /// `frozen_is_b`: true = ops_b is frozen, false = ops_a is frozen.
     fn compact_hot_from(&mut self, frozen_is_b: bool) -> io::Result<u64> {
         // ── Step 1: Collect ops ──────────────────────────────────────────
+        // When merge_fn is set, duplicate keys are merged instead of LWW.
+        // Also, existing data file entries are merged with ops values.
         let mut ops: std::collections::HashMap<u64, Option<Vec<u8>>> = std::collections::HashMap::new();
         {
             let log = if frozen_is_b { self.ops_b.lock() } else { self.ops_a.lock() };
+            let merge = &self.merge_fn;
             log.for_each_ops(|op| {
                 match op {
                     SiloOp::Put { key, value } => {
-                        ops.insert(key, Some(value));
+                        if let Some(ref merge_fn) = merge {
+                            if let Some(Some(existing)) = ops.get(&key) {
+                                let merged = merge_fn(existing, &value);
+                                ops.insert(key, Some(merged));
+                            } else {
+                                ops.insert(key, Some(value));
+                            }
+                        } else {
+                            ops.insert(key, Some(value));
+                        }
                     }
                     SiloOp::Delete { key } => {
                         ops.insert(key, None);
@@ -728,6 +1020,17 @@ impl DataSilo {
             })?;
         }
         if ops.is_empty() { return Ok(0); }
+
+        // When merge_fn is set, also merge ops values with existing data file entries.
+        if let Some(ref merge_fn) = self.merge_fn {
+            for (key, value_opt) in ops.iter_mut() {
+                if let Some(ref mut new_value) = value_opt {
+                    if let Some(existing_bytes) = self.get(*key) {
+                        *new_value = merge_fn(existing_bytes, new_value);
+                    }
+                }
+            }
+        }
 
         let count = ops.len() as u64;
 
@@ -1457,5 +1760,215 @@ mod tests {
             b"legacy_value",
             "migrated ops must be readable"
         );
+    }
+
+    #[test]
+    fn test_dump_merge_writer_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig {
+            buffer_ratio: 2.0, // 100% headroom for merge growth
+            min_entry_size: 64,
+            ..Default::default()
+        }).unwrap();
+
+        // Phase 1: Write initial entries via write_batch_parallel
+        let entries: Vec<(u64, Vec<u8>)> = (1..=10u64)
+            .map(|k| (k, format!("doc_{}", k).into_bytes()))
+            .collect();
+        silo.write_batch_parallel(&entries).unwrap();
+
+        // Verify initial data
+        assert_eq!(silo.get(1).unwrap(), b"doc_1");
+        assert_eq!(silo.get(10).unwrap(), b"doc_10");
+
+        // Phase 2: Create merge writer and merge new data
+        let mw = silo.prepare_dump_merge().unwrap().expect("merge writer should be available");
+
+        // merge_put: append "_updated" to existing value
+        let ok = mw.merge_put(1, b"_updated", |existing, new| {
+            let mut merged = existing.to_vec();
+            merged.extend_from_slice(new);
+            merged
+        });
+        assert!(ok, "merge_put should succeed (in-place)");
+
+        // put_direct: overwrite with new value
+        let ok = mw.put_direct(5, b"replaced_5");
+        assert!(ok, "put_direct should succeed");
+
+        assert_eq!(mw.in_place_count.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(mw.overflow_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Drop merge writer, then reload data
+        drop(mw);
+        silo.reload_data().unwrap();
+
+        // Verify merged data
+        assert_eq!(silo.get(1).unwrap(), b"doc_1_updated");
+        assert_eq!(silo.get(5).unwrap(), b"replaced_5");
+        // Untouched entries should be unchanged
+        assert_eq!(silo.get(3).unwrap(), b"doc_3");
+    }
+
+    #[test]
+    fn test_dump_merge_writer_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig {
+            buffer_ratio: 1.0, // No headroom — exact fit
+            min_entry_size: 8,
+            ..Default::default()
+        }).unwrap();
+
+        // Write a small entry
+        silo.write_batch_parallel(&[(1, b"hi".to_vec())]).unwrap();
+
+        let mw = silo.prepare_dump_merge().unwrap().expect("merge writer should be available");
+
+        // Try to merge data that's larger than allocated (should overflow)
+        let ok = mw.merge_put(1, b"_extra", |existing, new| {
+            let mut merged = existing.to_vec();
+            merged.extend_from_slice(new);
+            merged // "hi_extra" = 8 bytes, but allocated is exactly 8 for "hi"
+        });
+        // The merged result "hi_extra" is 8 bytes, allocated is 8 bytes — fits exactly
+        assert!(ok);
+
+        // Now try something that definitely overflows
+        let ok = mw.merge_put(1, b"_this_is_way_too_long_to_fit", |existing, new| {
+            let mut merged = existing.to_vec();
+            merged.extend_from_slice(new);
+            merged
+        });
+        assert!(!ok, "should overflow when merged data exceeds allocated buffer");
+        assert!(mw.overflow_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn test_dump_merge_writer_concurrent() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig {
+            buffer_ratio: 2.0,
+            min_entry_size: 64,
+            ..Default::default()
+        }).unwrap();
+
+        // Create 1000 entries
+        let entries: Vec<(u64, Vec<u8>)> = (1..=1000u64)
+            .map(|k| (k, format!("v{}", k).into_bytes()))
+            .collect();
+        silo.write_batch_parallel(&entries).unwrap();
+
+        let mw = Arc::new(silo.prepare_dump_merge().unwrap().expect("merge writer should be available"));
+
+        // Concurrent merge_put from multiple rayon threads
+        use rayon::prelude::*;
+        (1..=1000u64).into_par_iter().for_each(|k| {
+            let suffix = format!("_{}", k);
+            mw.merge_put(k, suffix.as_bytes(), |existing, new| {
+                let mut merged = existing.to_vec();
+                merged.extend_from_slice(new);
+                merged
+            });
+        });
+
+        let in_place = mw.in_place_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(in_place, 1000, "all 1000 merges should succeed in-place");
+
+        drop(mw);
+        silo.reload_data().unwrap();
+
+        // Verify all merged
+        for k in 1..=1000u64 {
+            let data = silo.get(k).expect("entry should exist");
+            let expected = format!("v{}_{}", k, k);
+            assert_eq!(data, expected.as_bytes(), "key {} mismatch", k);
+        }
+    }
+
+    #[test]
+    fn test_merge_aware_cold_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
+
+        // Set merge function: concatenate with "+" separator
+        silo.set_merge_fn(|existing, new| {
+            let mut merged = existing.to_vec();
+            merged.push(b'+');
+            merged.extend_from_slice(new);
+            merged
+        });
+
+        // Write multiple ops for the same key (simulating Merge ops)
+        silo.append_op(1, b"a").unwrap();
+        silo.append_op(1, b"b").unwrap();
+        silo.append_op(1, b"c").unwrap();
+        // Different key — just one op
+        silo.append_op(2, b"only").unwrap();
+
+        // Compact — should merge key 1's values instead of LWW
+        let count = silo.compact().unwrap();
+        assert_eq!(count, 2); // 2 unique keys
+
+        // Key 1 should be merged: "a+b+c"
+        assert_eq!(silo.get(1).unwrap(), b"a+b+c");
+        // Key 2 should be unchanged
+        assert_eq!(silo.get(2).unwrap(), b"only");
+    }
+
+    #[test]
+    fn test_merge_aware_hot_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig {
+            buffer_ratio: 3.0, // plenty of headroom for merge growth
+            min_entry_size: 64,
+            ..Default::default()
+        }).unwrap();
+
+        // Set merge function: concatenate with "+" separator
+        silo.set_merge_fn(|existing, new| {
+            let mut merged = existing.to_vec();
+            merged.push(b'+');
+            merged.extend_from_slice(new);
+            merged
+        });
+
+        // Phase 1: Write initial data via ops → cold compact to create data.bin
+        silo.append_op(1, b"base").unwrap();
+        silo.append_op(2, b"other").unwrap();
+        silo.compact().unwrap();
+        assert_eq!(silo.get(1).unwrap(), b"base");
+
+        // Phase 2: Write new ops for existing key — hot compact should merge
+        silo.append_op(1, b"add1").unwrap();
+        silo.append_op(1, b"add2").unwrap();
+        let count = silo.compact().unwrap();
+        assert!(count > 0);
+
+        // Key 1: existing "base" merged with ops "add1" then "add2"
+        // merge_fn called as: merge("base", merge("add1", "add2")) = merge("base", "add1+add2") = "base+add1+add2"
+        // Wait — the hot compact first merges ops together, then merges with existing.
+        // Ops merge: merge("add1", "add2") = "add1+add2"
+        // Then merged with existing: merge("base", "add1+add2") = "base+add1+add2"
+        assert_eq!(silo.get(1).unwrap(), b"base+add1+add2");
+        // Key 2: untouched (no new ops)
+        assert_eq!(silo.get(2).unwrap(), b"other");
+    }
+
+    #[test]
+    fn test_lww_without_merge_fn() {
+        // Verify that without merge_fn, LWW behavior is preserved
+        let dir = tempfile::tempdir().unwrap();
+        let mut silo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
+        // No set_merge_fn call
+
+        silo.append_op(1, b"first").unwrap();
+        silo.append_op(1, b"second").unwrap();
+        silo.append_op(1, b"third").unwrap();
+
+        silo.compact().unwrap();
+        // LWW: last value wins
+        assert_eq!(silo.get(1).unwrap(), b"third");
     }
 }

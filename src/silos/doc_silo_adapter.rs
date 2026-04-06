@@ -40,7 +40,13 @@ impl DocSiloAdapter {
     /// Open or create a DocSiloAdapter at the given directory.
     pub fn open(path: &Path) -> io::Result<Self> {
         let silo_path = path.join("doc_silo");
-        let silo = datasilo::DataSilo::open(&silo_path, datasilo::SiloConfig::default())?;
+        let mut silo = datasilo::DataSilo::open(&silo_path, datasilo::SiloConfig::default())?;
+
+        // Set merge function so compaction merges Mi arrays instead of LWW.
+        silo.set_merge_fn(|existing, new_data| {
+            doc_format::merge_encoded_docs(existing, new_data)
+                .unwrap_or_else(|_| new_data.to_vec())
+        });
 
         // Load field dictionary from disk if it exists
         let dict_path = path.join("field_dict.json");
@@ -198,6 +204,17 @@ impl DocSiloAdapter {
     /// Get the underlying DataSilo (shared reference).
     pub fn silo(&self) -> &datasilo::DataSilo {
         &self.silo
+    }
+
+    /// Create a DumpMergeWriter for direct read-modify-write during dump phases.
+    /// Returns None if the data file doesn't exist yet (images phase hasn't run).
+    pub fn prepare_dump_merge(&self) -> io::Result<Option<datasilo::DumpMergeWriter>> {
+        self.silo.prepare_dump_merge()
+    }
+
+    /// Reload the data mmap after dump merge writes complete.
+    pub fn reload_data(&mut self) -> io::Result<()> {
+        self.silo.reload_data()
     }
 
     /// Compact the silo (apply pending ops).

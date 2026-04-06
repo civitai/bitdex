@@ -1578,11 +1578,31 @@ pub fn process_dump_with_progress(
         Vec<(u64, Vec<u8>)>, // doc_ops: (slot, encoded Merge op bytes)
     );
 
-    // Prepare parallel ops writer for direct mmap writes from rayon threads.
-    // Each thread writes doc ops directly to the mmap'd ops log at 32M+ ops/s.
-    // Prepare parallel ops writer for ALL phases (including multi-value).
-    // For MV phases, the post-pass uses it to write doc ops in parallel.
-    let parallel_ops_writer: Option<Arc<datasilo::ParallelOpsWriter>> = {
+    // Doc write strategy: try DumpMergeWriter first (direct read-modify-write into data.bin),
+    // fall back to ParallelOpsWriter (ops log) if data.bin doesn't exist yet (images phase).
+    //
+    // DumpMergeWriter: subsequent phases read existing doc, merge Mi arrays, write back in-place.
+    // ParallelOpsWriter: first phase (images) writes to ops log → compact creates data.bin.
+    let dump_merge_writer: Option<Arc<datasilo::DumpMergeWriter>> = {
+        let ds = engine.docstore_arc();
+        let ds_lock = ds.lock();
+        match ds_lock.silo().prepare_dump_merge() {
+            Ok(Some(mw)) => {
+                eprintln!("  Dump {}: using DumpMergeWriter (direct read-modify-write)", request.name);
+                Some(Arc::new(mw))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("  Dump {}: DumpMergeWriter failed (falling back to ops log): {e}", request.name);
+                None
+            }
+        }
+    };
+    let mw_ref = &dump_merge_writer;
+
+    let parallel_ops_writer: Option<Arc<datasilo::ParallelOpsWriter>> = if dump_merge_writer.is_some() {
+        None // merge writer handles doc writes — no ops log needed
+    } else {
         // Estimate row count from average line length in first 4KB of the file.
         let sample_end = body.len().min(4096);
         let sample_lines = body[..sample_end].iter().filter(|&&b| b == b'\n').count().max(1);
@@ -1845,7 +1865,10 @@ pub fn process_dump_with_progress(
                                 // Write doc op (deferred rows need their doc data stored),
                                 // but skip all bitmap operations.
                                 {
-                                    let pw_arg = pw_ref.as_ref().map(|pw| (pw.as_ref(), &mut ops_local_cursor, &mut ops_local_end));
+                                    let mw_arg = mw_ref.as_ref().map(|mw| mw.as_ref());
+                                    let pw_arg = if mw_arg.is_none() {
+                                        pw_ref.as_ref().map(|pw| (pw.as_ref(), &mut ops_local_cursor, &mut ops_local_end))
+                                    } else { None };
                                     let scratch = if pw_arg.is_some() { Some((&mut doc_encode_buf, &mut frame_buf)) } else { None };
                                     collect_doc_op(
                                         &row,
@@ -1861,6 +1884,7 @@ pub fn process_dump_with_progress(
                                         &mut doc_ops,
                                         pw_arg,
                                         scratch,
+                                        mw_arg,
                                     );
                                 }
                                 deferred.push((slot, pub_secs));
@@ -2069,12 +2093,17 @@ pub fn process_dump_with_progress(
                         let prev = mi_prev_slot.unwrap();
                         if !mi_accum.is_empty() {
                             let fields = vec![(mi_field_idx, DumpFieldValue::MultiInt(std::mem::take(&mut mi_accum)))];
-                            if let Some(ref pw) = pw_ref {
-                                encode_dump_merge(prev, &fields, &mut doc_encode_buf);
-                                pw.write_put_reuse(crate::silos::doc_silo_adapter::slot_to_key(prev), &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
+                            encode_dump_merge(prev, &fields, &mut doc_encode_buf);
+                            let key = crate::silos::doc_silo_adapter::slot_to_key(prev);
+                            if let Some(ref mw) = mw_ref {
+                                mw.merge_put(key, &doc_encode_buf, |existing, new| {
+                                    crate::silos::doc_format::merge_encoded_docs(existing, new)
+                                        .unwrap_or_else(|_| new.to_vec())
+                                });
+                            } else if let Some(ref pw) = pw_ref {
+                                pw.write_put_reuse(key, &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
                             } else {
-                                encode_dump_merge(prev, &fields, &mut doc_encode_buf);
-                                doc_ops.push((crate::silos::doc_silo_adapter::slot_to_key(prev), doc_encode_buf.clone()));
+                                doc_ops.push((key, doc_encode_buf.clone()));
                             }
                         }
                     }
@@ -2110,22 +2139,24 @@ pub fn process_dump_with_progress(
                     if !doc_fields.is_empty() {
                         #[cfg(feature = "dump-timing")]
                         let _t_enc = std::time::Instant::now();
-                        if let Some(ref pw) = pw_ref {
-                            encode_dump_merge(slot, &doc_fields, &mut doc_encode_buf);
-                            #[cfg(feature = "dump-timing")]
-                            { timings.doc_pack_encode += _t_enc.elapsed().as_nanos() as u64; }
-                            #[cfg(feature = "dump-timing")]
-                            let _t_wr = std::time::Instant::now();
-                            pw.write_put_reuse(crate::silos::doc_silo_adapter::slot_to_key(slot), &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
-                            #[cfg(feature = "dump-timing")]
-                            { timings.doc_mmap_write += _t_wr.elapsed().as_nanos() as u64; }
+                        encode_dump_merge(slot, &doc_fields, &mut doc_encode_buf);
+                        #[cfg(feature = "dump-timing")]
+                        { timings.doc_pack_encode += _t_enc.elapsed().as_nanos() as u64; }
+                        #[cfg(feature = "dump-timing")]
+                        let _t_wr = std::time::Instant::now();
+                        let key = crate::silos::doc_silo_adapter::slot_to_key(slot);
+                        if let Some(ref mw) = mw_ref {
+                            mw.merge_put(key, &doc_encode_buf, |existing, new| {
+                                crate::silos::doc_format::merge_encoded_docs(existing, new)
+                                    .unwrap_or_else(|_| new.to_vec())
+                            });
+                        } else if let Some(ref pw) = pw_ref {
+                            pw.write_put_reuse(key, &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
                         } else {
-                            encode_dump_merge(slot, &doc_fields, &mut doc_encode_buf);
-                            let bytes = doc_encode_buf.clone();
-                            #[cfg(feature = "dump-timing")]
-                            { timings.doc_pack_encode += _t_enc.elapsed().as_nanos() as u64; }
-                            doc_ops.push((crate::silos::doc_silo_adapter::slot_to_key(slot), bytes));
+                            doc_ops.push((key, doc_encode_buf.clone()));
                         }
+                        #[cfg(feature = "dump-timing")]
+                        { timings.doc_mmap_write += _t_wr.elapsed().as_nanos() as u64; }
                     }
                 }
 
@@ -2158,12 +2189,17 @@ pub fn process_dump_with_progress(
             if has_multi_int && !mi_accum.is_empty() {
                 if let Some(prev) = mi_prev_slot {
                     let fields = vec![(mi_field_idx, DumpFieldValue::MultiInt(std::mem::take(&mut mi_accum)))];
-                    if let Some(ref pw) = pw_ref {
-                        encode_dump_merge(prev, &fields, &mut doc_encode_buf);
-                        pw.write_put_reuse(crate::silos::doc_silo_adapter::slot_to_key(prev), &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
+                    encode_dump_merge(prev, &fields, &mut doc_encode_buf);
+                    let key = crate::silos::doc_silo_adapter::slot_to_key(prev);
+                    if let Some(ref mw) = mw_ref {
+                        mw.merge_put(key, &doc_encode_buf, |existing, new| {
+                            crate::silos::doc_format::merge_encoded_docs(existing, new)
+                                .unwrap_or_else(|_| new.to_vec())
+                        });
+                    } else if let Some(ref pw) = pw_ref {
+                        pw.write_put_reuse(key, &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
                     } else {
-                        encode_dump_merge(prev, &fields, &mut doc_encode_buf);
-                        doc_ops.push((crate::silos::doc_silo_adapter::slot_to_key(prev), doc_encode_buf.clone()));
+                        doc_ops.push((key, doc_encode_buf.clone()));
                     }
                 }
             }
@@ -2373,17 +2409,29 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
-    // Flush doc ops to DataSilo ops log.
-    // All phases stream per-row Merge ops directly to mmap via ParallelOpsWriter during parse.
-    // Multi-value fields emit Mi([value]) per row; compaction concatenates arrays per slot.
+    // Flush doc writes.
+    // DumpMergeWriter: writes already in data.bin — just log stats and reload mmap.
+    // ParallelOpsWriter: flush ops log mmap.
+    // Batch fallback: append_ops_batch.
     {
         let t_doc = Instant::now();
         let ds = engine.docstore_arc();
         let mut ds_lock = ds.lock();
 
-        if let Some(ref pw) = parallel_ops_writer {
-            // Doc ops were already written directly to the mmap'd ops log during parse.
-            // Check for overflow (correctness: dropped ops = missing docs)
+        if let Some(ref mw) = dump_merge_writer {
+            let in_place = mw.in_place_count.load(std::sync::atomic::Ordering::Relaxed);
+            let overflow = mw.overflow_count.load(std::sync::atomic::Ordering::Relaxed);
+            if overflow > 0 {
+                eprintln!("  WARNING: Dump {}: {} merge writes overflowed (data > allocated buffer)!", request.name, overflow);
+            }
+            // Drop the merge writer's mmap before reloading
+            drop(dump_merge_writer);
+            // Reload DataSilo's read mmap so future phases and queries see merged data
+            ds_lock.silo_mut().reload_data()
+                .map_err(|e| format!("reload_data: {e}"))?;
+            eprintln!("  Dump {}: {} docs merged in-place via DumpMergeWriter ({:.1}s)",
+                request.name, in_place, t_doc.elapsed().as_secs_f64());
+        } else if let Some(ref pw) = parallel_ops_writer {
             let dropped = pw.overflow_count.load(std::sync::atomic::Ordering::Relaxed);
             if dropped > 0 {
                 eprintln!("  WARNING: Dump {}: {} doc ops dropped due to parallel writer overflow!", request.name, dropped);
@@ -2739,6 +2787,7 @@ fn execute_doc_plan<'a>(
 }
 
 /// Encode a row's fields into a Merge op.
+/// If `merge_writer` is provided, merges directly into data.bin (no ops log).
 /// If `pw` is provided, writes directly to the mmap'd ops log (32M+ ops/s).
 /// Otherwise collects into `doc_ops` Vec for batch write after parse.
 fn collect_doc_op(
@@ -2755,6 +2804,7 @@ fn collect_doc_op(
     doc_ops: &mut Vec<(u64, Vec<u8>)>,
     pw: Option<(&datasilo::ParallelOpsWriter, &mut usize, &mut usize)>,
     scratch: Option<(&mut Vec<u8>, &mut Vec<u8>)>, // (doc_encode_buf, frame_buf) for zero-alloc pw path
+    merge_writer: Option<&datasilo::DumpMergeWriter>,
 ) -> (u64, u64, u64) { // (field_collect_ns, pack_encode_ns, mmap_write_ns) — always 0 without dump-timing
     #[cfg(feature = "dump-timing")]
     let _t0 = std::time::Instant::now();
@@ -2862,7 +2912,22 @@ fn collect_doc_op(
     let mut mmap_write_ns = 0u64;
 
     if !fields.is_empty() {
-        if let (Some((writer, local_cursor, local_end)), Some((doc_buf, frame_buf))) = (pw, scratch) {
+        let key = crate::silos::doc_silo_adapter::slot_to_key(slot);
+        if let Some(mw) = merge_writer {
+            #[cfg(feature = "dump-timing")]
+            let _t_enc = std::time::Instant::now();
+            let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
+            #[cfg(feature = "dump-timing")]
+            { pack_encode_ns = _t_enc.elapsed().as_nanos() as u64; }
+            #[cfg(feature = "dump-timing")]
+            let _t_wr = std::time::Instant::now();
+            mw.merge_put(key, &bytes, |existing, new| {
+                crate::silos::doc_format::merge_encoded_docs(existing, new)
+                    .unwrap_or_else(|_| new.to_vec())
+            });
+            #[cfg(feature = "dump-timing")]
+            { mmap_write_ns = _t_wr.elapsed().as_nanos() as u64; }
+        } else if let (Some((writer, local_cursor, local_end)), Some((doc_buf, frame_buf))) = (pw, scratch) {
             #[cfg(feature = "dump-timing")]
             let _t_enc = std::time::Instant::now();
             crate::silos::doc_format::encode_merge_fields_into(slot, &fields, doc_buf);
@@ -2870,7 +2935,7 @@ fn collect_doc_op(
             { pack_encode_ns = _t_enc.elapsed().as_nanos() as u64; }
             #[cfg(feature = "dump-timing")]
             let _t_wr = std::time::Instant::now();
-            writer.write_put_reuse(crate::silos::doc_silo_adapter::slot_to_key(slot), doc_buf, frame_buf, local_cursor, local_end);
+            writer.write_put_reuse(key, doc_buf, frame_buf, local_cursor, local_end);
             #[cfg(feature = "dump-timing")]
             { mmap_write_ns = _t_wr.elapsed().as_nanos() as u64; }
         } else {
@@ -2879,7 +2944,7 @@ fn collect_doc_op(
             let bytes = crate::silos::doc_format::encode_merge_fields(slot, &fields);
             #[cfg(feature = "dump-timing")]
             { pack_encode_ns = _t_enc.elapsed().as_nanos() as u64; }
-            doc_ops.push((crate::silos::doc_silo_adapter::slot_to_key(slot), bytes));
+            doc_ops.push((key, bytes));
         }
     }
 
@@ -3419,7 +3484,7 @@ mod tests {
             &row, &enriched, &computed_defs, &indexed_fields, col_idx,
             1, &request_fields, &field_idx,
             &boolean_fields, &extra_i64,
-            &mut doc_ops, None, None,
+            &mut doc_ops, None, None, None,
         );
         // Should have produced one doc op for slot 1
         assert_eq!(doc_ops.len(), 1);
@@ -3453,7 +3518,7 @@ mod tests {
             &row, &enriched, &computed_defs, &indexed_fields, col_idx,
             1, &request_fields, &field_idx,
             &boolean_fields, &extra_i64,
-            &mut doc_ops, None, None,
+            &mut doc_ops, None, None, None,
         );
         // Should have produced one doc op for slot 1 (userId + sortAt)
         assert_eq!(doc_ops.len(), 1);

@@ -638,6 +638,69 @@ pub fn decode_doc_fields(bytes: &[u8]) -> io::Result<Vec<(u16, PackedValue)>> {
     }
 }
 
+/// Merge two encoded doc records (Merge ops stored in DataSilo).
+///
+/// Decodes both records, merges field-by-field:
+/// - `Mi` fields: concatenate arrays (multi-value accumulation)
+/// - All other fields: new value replaces existing
+///
+/// Returns the re-encoded merged record.
+/// Used by `DumpMergeWriter` during dump phases to fuse doc ops in-place.
+pub fn merge_encoded_docs(existing: &[u8], new_data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut fields = decode_doc_fields(existing)?;
+    let new_fields = decode_doc_fields(new_data)?;
+
+    for (field_idx, value) in new_fields {
+        if let Some(entry) = fields.iter_mut().find(|(f, _)| *f == field_idx) {
+            // Mi fields: concatenate instead of replace
+            match (&mut entry.1, &value) {
+                (PackedValue::Mi(existing_vals), PackedValue::Mi(new_vals)) => {
+                    existing_vals.extend_from_slice(new_vals);
+                }
+                _ => { entry.1 = value; }
+            }
+        } else {
+            fields.push((field_idx, value));
+        }
+    }
+
+    // Extract slot from existing record header (byte 1..5 after the op tag)
+    let slot = if existing.len() >= 5 {
+        u32::from_le_bytes(existing[1..5].try_into().unwrap())
+    } else {
+        0
+    };
+    Ok(encode_merge_fields(slot, &fields))
+}
+
+/// Merge two encoded doc records into a caller-provided buffer. Zero allocation
+/// except for the field Vec decode. Used from DumpMergeWriter for maximum throughput.
+pub fn merge_encoded_docs_into(existing: &[u8], new_data: &[u8], buf: &mut Vec<u8>) -> io::Result<()> {
+    let mut fields = decode_doc_fields(existing)?;
+    let new_fields = decode_doc_fields(new_data)?;
+
+    for (field_idx, value) in new_fields {
+        if let Some(entry) = fields.iter_mut().find(|(f, _)| *f == field_idx) {
+            match (&mut entry.1, &value) {
+                (PackedValue::Mi(existing_vals), PackedValue::Mi(new_vals)) => {
+                    existing_vals.extend_from_slice(new_vals);
+                }
+                _ => { entry.1 = value; }
+            }
+        } else {
+            fields.push((field_idx, value));
+        }
+    }
+
+    let slot = if existing.len() >= 5 {
+        u32::from_le_bytes(existing[1..5].try_into().unwrap())
+    } else {
+        0
+    };
+    encode_merge_fields_into(slot, &fields, buf);
+    Ok(())
+}
+
 /// Decode a full StoredDoc from raw DataSilo bytes, using the field index→name mapping.
 /// Optionally applies field defaults for missing fields.
 pub fn decode_stored_doc(
@@ -821,5 +884,50 @@ mod tests {
         apply_doc_op(&mut snap, &op4);
         let doc = &snap.docs[&1];
         assert_eq!(doc.iter().find(|(f, _)| *f == 1).unwrap().1, PackedValue::I(200));
+    }
+
+    #[test]
+    fn test_merge_encoded_docs_basic() {
+        // Create first doc: slot=1, field 0 = I(42), field 1 = Mi([10, 20])
+        let existing = encode_merge_fields(1, &[
+            (0, PackedValue::I(42)),
+            (1, PackedValue::Mi(vec![10, 20])),
+        ]);
+
+        // Create second doc: slot=1, field 1 = Mi([30, 40]), field 2 = I(99)
+        let new_data = encode_merge_fields(1, &[
+            (1, PackedValue::Mi(vec![30, 40])),
+            (2, PackedValue::I(99)),
+        ]);
+
+        let merged = merge_encoded_docs(&existing, &new_data).unwrap();
+        let fields = decode_doc_fields(&merged).unwrap();
+
+        // field 0: unchanged (I(42))
+        assert_eq!(fields.iter().find(|(f, _)| *f == 0).unwrap().1, PackedValue::I(42));
+        // field 1: Mi concatenated ([10, 20, 30, 40])
+        assert_eq!(fields.iter().find(|(f, _)| *f == 1).unwrap().1, PackedValue::Mi(vec![10, 20, 30, 40]));
+        // field 2: new field (I(99))
+        assert_eq!(fields.iter().find(|(f, _)| *f == 2).unwrap().1, PackedValue::I(99));
+    }
+
+    #[test]
+    fn test_merge_encoded_docs_non_mi_replaces() {
+        let existing = encode_merge_fields(5, &[
+            (0, PackedValue::I(100)),
+            (1, PackedValue::S("hello".to_string())),
+        ]);
+
+        let new_data = encode_merge_fields(5, &[
+            (0, PackedValue::I(200)),
+        ]);
+
+        let merged = merge_encoded_docs(&existing, &new_data).unwrap();
+        let fields = decode_doc_fields(&merged).unwrap();
+
+        // field 0: replaced (I(200))
+        assert_eq!(fields.iter().find(|(f, _)| *f == 0).unwrap().1, PackedValue::I(200));
+        // field 1: unchanged (S("hello"))
+        assert_eq!(fields.iter().find(|(f, _)| *f == 1).unwrap().1, PackedValue::S("hello".to_string()));
     }
 }

@@ -354,6 +354,57 @@ impl HashIndex {
         Ok(())
     }
 
+    /// Update an existing entry's value fields in-place (offset, length, allocated).
+    /// Does NOT change count or occupied — only use for keys already in the table.
+    ///
+    /// # Safety
+    ///
+    /// Thread-safe when called on **distinct keys** concurrently, because each key
+    /// occupies a unique slot and probing is read-only.  The caller must ensure
+    /// no two threads call this with the same key simultaneously (use stripe locks).
+    ///
+    /// Returns `true` if the key was found and updated, `false` if not present.
+    pub unsafe fn update_existing_concurrent(&self, key: u64, value: IndexEntry) -> bool {
+        if key == KEY_EMPTY || key == KEY_TOMBSTONE {
+            return false;
+        }
+
+        let mut slot = self.probe_start(key);
+        for _ in 0..self.capacity {
+            let entry = self.read_entry(slot);
+            match entry.key {
+                KEY_EMPTY => return false,
+                KEY_TOMBSTONE => {}
+                k if k == key => {
+                    // Write offset, length, allocated directly to the mmap.
+                    // Key field is NOT modified — slot identity is preserved.
+                    let off = Self::slot_offset(slot);
+                    let ptr = self.mmap.as_ptr() as *mut u8;
+                    // offset at +8, length at +16, allocated at +20
+                    std::ptr::copy_nonoverlapping(
+                        value.offset.to_le_bytes().as_ptr(),
+                        ptr.add(off + 8),
+                        8,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        value.length.to_le_bytes().as_ptr(),
+                        ptr.add(off + 16),
+                        4,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        value.allocated.to_le_bytes().as_ptr(),
+                        ptr.add(off + 20),
+                        4,
+                    );
+                    return true;
+                }
+                _ => {}
+            }
+            slot = self.next_slot(slot);
+        }
+        false
+    }
+
     /// Iterate over all live entries in the table.
     ///
     /// Order is unspecified (hash table traversal order).
