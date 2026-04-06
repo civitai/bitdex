@@ -1659,6 +1659,17 @@ pub fn process_dump_with_progress(
             // Thread-local scratch buffers for zero-alloc doc encoding + framing
             let mut doc_encode_buf: Vec<u8> = Vec::with_capacity(512);
             let mut frame_buf: Vec<u8> = Vec::with_capacity(512);
+            // Per-slot accumulation for MultiInt fields (tags, tools, etc.).
+            // When consecutive rows share the same slot, accumulate values and
+            // flush one Merge(Mi([all_values])) when the slot changes.
+            // Collapses 4.5B per-row ops → ~109M per-slot ops for tags.
+            let has_multi_int = doc_field_plan_ref.iter().any(|e| matches!(e.value_type, DocValueType::MultiInt));
+            let mut mi_prev_slot: Option<u32> = None;
+            let mut mi_accum: Vec<i64> = if has_multi_int { Vec::with_capacity(64) } else { Vec::new() };
+            let mut mi_field_idx: u16 = doc_field_plan_ref.iter()
+                .find(|e| matches!(e.value_type, DocValueType::MultiInt))
+                .map(|e| e.doc_field_idx)
+                .unwrap_or(0);
             let mut count = 0u64;
             let mut max_slot: u32 = 0;
             let mut line_start = 0;
@@ -2046,10 +2057,45 @@ pub fn process_dump_with_progress(
                 #[cfg(feature = "dump-timing")]
                 { timings.config_computed_sort_late += _t_ccs_late.elapsed().as_nanos() as u64; }
 
-                // Write doc op — directly to mmap if parallel writer available, else collect.
+                // Write doc op — with per-slot batching for MultiInt fields.
+                // Consecutive rows with the same slot accumulate MultiInt values
+                // into mi_accum. Flushed when slot changes → 4.5B → ~109M ops for tags.
                 #[cfg(feature = "dump-timing")]
                 let _t_doc = std::time::Instant::now();
-                {
+                if has_multi_int {
+                    // MultiInt accumulation path: batch values per slot
+                    if mi_prev_slot.is_some() && mi_prev_slot != Some(slot) {
+                        // Slot changed — flush accumulated values for previous slot
+                        let prev = mi_prev_slot.unwrap();
+                        if !mi_accum.is_empty() {
+                            let fields = vec![(mi_field_idx, DumpFieldValue::MultiInt(std::mem::take(&mut mi_accum)))];
+                            if let Some(ref pw) = pw_ref {
+                                encode_dump_merge(prev, &fields, &mut doc_encode_buf);
+                                pw.write_put_reuse(crate::silos::doc_silo_adapter::slot_to_key(prev), &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
+                            } else {
+                                encode_dump_merge(prev, &fields, &mut doc_encode_buf);
+                                doc_ops.push((crate::silos::doc_silo_adapter::slot_to_key(prev), doc_encode_buf.clone()));
+                            }
+                        }
+                    }
+                    mi_prev_slot = Some(slot);
+                    // Collect this row's doc fields — extract MultiInt values into accum
+                    let mut doc_fields: Vec<(u16, DumpFieldValue)> = Vec::with_capacity(20);
+                    execute_doc_plan(
+                        doc_field_plan_ref, &row, &enriched_map, &enriched,
+                        computed_defs_ref, &indexed_fields_buf, col_idx,
+                        &config_computed_sort_vals, &mut doc_fields,
+                    );
+                    for (fidx, val) in &doc_fields {
+                        if let DumpFieldValue::MultiInt(vals) = val {
+                            mi_accum.extend(vals);
+                        } else {
+                            // Non-MultiInt fields in a MultiInt phase: flush immediately
+                            // (rare — MV phases typically have only the MV field)
+                        }
+                    }
+                } else {
+                    // Standard path: one doc op per row, no accumulation needed
                     #[cfg(feature = "dump-timing")]
                     let _t_fc = std::time::Instant::now();
                     let mut doc_fields: Vec<(u16, DumpFieldValue)> = Vec::with_capacity(20);
@@ -2107,6 +2153,20 @@ pub fn process_dump_with_progress(
             let remainder = count % LOG_INTERVAL;
             total_ref.fetch_add(remainder, Ordering::Relaxed);
             if let Some(ref p) = ext_progress { p.fetch_add(remainder, Ordering::Relaxed); }
+
+            // Flush final accumulated MultiInt batch for the last slot in this thread's chunk
+            if has_multi_int && !mi_accum.is_empty() {
+                if let Some(prev) = mi_prev_slot {
+                    let fields = vec![(mi_field_idx, DumpFieldValue::MultiInt(std::mem::take(&mut mi_accum)))];
+                    if let Some(ref pw) = pw_ref {
+                        encode_dump_merge(prev, &fields, &mut doc_encode_buf);
+                        pw.write_put_reuse(crate::silos::doc_silo_adapter::slot_to_key(prev), &mut doc_encode_buf, &mut frame_buf, &mut ops_local_cursor, &mut ops_local_end);
+                    } else {
+                        encode_dump_merge(prev, &fields, &mut doc_encode_buf);
+                        doc_ops.push((crate::silos::doc_silo_adapter::slot_to_key(prev), doc_encode_buf.clone()));
+                    }
+                }
+            }
 
             #[cfg(feature = "dump-timing")]
             {
