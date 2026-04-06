@@ -5441,6 +5441,68 @@ impl ConcurrentEngine {
             false
         }
     }
+
+    /// Rebuild all time buckets from the alive bitmap and sort field.
+    /// Returns (bucket_count, slots_scanned).
+    pub fn rebuild_time_buckets(&self) -> crate::error::Result<(usize, u64)> {
+        let tb_arc = self.time_buckets.as_ref().ok_or_else(|| {
+            crate::error::BitdexError::Config("no time_buckets configured".into())
+        })?;
+        let snap = self.snapshot();
+        let sort_field_name = {
+            let tb = tb_arc.lock();
+            tb.sort_field_name().to_string()
+        };
+        let sort_field = snap.sorts.get_field(&sort_field_name).ok_or_else(|| {
+            crate::error::BitdexError::Config(format!(
+                "time bucket sort field '{}' not loaded", sort_field_name
+            ))
+        })?;
+        let alive = snap.slots.alive_bitmap();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let slot_count = alive.len();
+        let mut slot_values: Vec<(u32, u64)> = Vec::with_capacity(slot_count as usize);
+        for slot in alive.iter() {
+            let ts = sort_field.reconstruct_value(slot) as u64;
+            slot_values.push((slot, ts));
+        }
+        let mut tb = tb_arc.lock();
+        let bucket_names: Vec<String> = tb.bucket_names();
+        for name in &bucket_names {
+            tb.rebuild_bucket(name, slot_values.iter().copied(), now_secs);
+        }
+        let bucket_count = bucket_names.len();
+        self.dirty_since_snapshot.store(true, std::sync::atomic::Ordering::Release);
+        self.unified_cache.lock().clear();
+        eprintln!(
+            "rebuild_time_buckets: rebuilt {} buckets from {} alive slots in sort field '{}'",
+            bucket_count, slot_count, sort_field_name
+        );
+        Ok((bucket_count, slot_count))
+    }
+
+    /// Get per-bucket statistics (name, slot count, cutoff).
+    pub fn time_bucket_stats(&self) -> serde_json::Value {
+        if let Some(ref tb_arc) = self.time_buckets {
+            let tb = tb_arc.lock();
+            let mut buckets = serde_json::Map::new();
+            for name in tb.bucket_names() {
+                if let Some(bucket) = tb.get_bucket(&name) {
+                    buckets.insert(name, serde_json::json!({
+                        "slots": bucket.bitmap().len(),
+                        "last_cutoff": bucket.last_cutoff(),
+                    }));
+                }
+            }
+            serde_json::Value::Object(buckets)
+        } else {
+            serde_json::Value::Null
+        }
+    }
+
     /// Clear unified cache entries and reset counters (RAM only).
     pub fn clear_unified_cache(&self) {
         self.unified_cache.lock().clear();
