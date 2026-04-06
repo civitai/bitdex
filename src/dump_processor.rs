@@ -1705,6 +1705,22 @@ pub fn process_dump_with_progress(
         .collect();
     let config_computed_sources_ref = &config_computed_sources;
 
+    // Extend filter_targets with computed filter field targets so the field→idx
+    // mapping covers them too. Pre-build a compact u16 index for flat tuple Vecs.
+    for def in &computed_defs {
+        if filter_field_names.contains(&def.target) && !filter_targets.contains(&def.target) {
+            filter_targets.push(def.target.clone());
+        }
+    }
+    let filter_field_to_idx: HashMap<String, u16> = filter_targets
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i as u16))
+        .collect();
+    let filter_idx_to_name: Vec<String> = filter_targets.clone();
+    let filter_field_to_idx_ref = &filter_field_to_idx;
+    let filter_idx_to_name_ref = &filter_idx_to_name;
+
     // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
     // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
     type ThreadResult = (
@@ -1728,28 +1744,24 @@ pub fn process_dump_with_progress(
             let mut enrichment_lookup_buf: Vec<Option<&str>> = Vec::with_capacity(16);
 
 
-            let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_targets
-                .iter()
-                .map(|n| (n.clone(), HashMap::new()))
-                .collect();
-            // Also init for computed filter fields
-            for def in computed_defs_ref {
-                if filter_field_names_ref.contains(&def.target) {
-                    filter_maps.entry(def.target.clone()).or_default();
-                }
-            }
-            let mut sort_maps: HashMap<String, Vec<RoaringBitmap>> = sort_targets
+            // Flat Vec for filter bitmap tuples — push (field_idx, value, slot) per row.
+            // Bitmaps built in post-pass via sort + from_sorted_iter (5.3x faster than per-row HashMap insert).
+            let mut filter_tuples: Vec<(u16, u64, u32)> = Vec::with_capacity(
+                ((range_end - range_start) / 100).max(1024) * 8
+            );
+            // Collect sort slots into Vec<u32> per bit-layer (not RoaringBitmap).
+            // After the row loop, sort + from_sorted_iter builds bitmaps faster.
+            let mut sort_vecs: HashMap<String, Vec<Vec<u32>>> = sort_targets
                 .iter()
                 .chain(computed_sort_targets.iter())
                 .map(|(n, b)| {
-                    let layers: Vec<RoaringBitmap> = (0..*b as usize).map(|_| RoaringBitmap::new()).collect();
+                    let layers: Vec<Vec<u32>> = (0..*b as usize).map(|_| Vec::with_capacity(4096)).collect();
                     (n.clone(), layers)
                 })
                 .collect();
-            // Also init sort_maps for config-computed sort targets (e.g., sortAt)
             for ccs in config_computed_sorts_ref {
-                sort_maps.entry(ccs.target.clone()).or_insert_with(|| {
-                    (0..ccs.bits as usize).map(|_| RoaringBitmap::new()).collect()
+                sort_vecs.entry(ccs.target.clone()).or_insert_with(|| {
+                    (0..ccs.bits as usize).map(|_| Vec::with_capacity(4096)).collect()
                 });
             }
             let mut alive = RoaringBitmap::new();
@@ -1927,8 +1939,8 @@ pub fn process_dump_with_progress(
                     let target = field_mapping.target();
                     let column = field_mapping.column();
 
-                    // Filter bitmap: skip contains() check — just try get_mut directly
-                    if let Some(fm) = filter_maps.get_mut(target) {
+                    // Filter bitmap: push tuple if field is in filter index
+                    if let Some(&fidx) = filter_field_to_idx_ref.get(target) {
                         let bitmap_key: Option<u64> = if let Some(dict) = dictionaries_ref.get(target) {
                             let s = row
                                 .get_str(column)
@@ -1943,9 +1955,7 @@ pub fn process_dump_with_progress(
                         };
 
                         if let Some(key) = bitmap_key {
-                            fm.entry(key)
-                                .or_insert_with(RoaringBitmap::new)
-                                .insert(slot);
+                            filter_tuples.push((fidx, key, slot));
                         }
                     }
 
@@ -1955,10 +1965,10 @@ pub fn process_dump_with_progress(
                             enriched_get(target).and_then(|s| s.parse::<i64>().ok())
                         }) {
                             let val32 = v.max(0) as u32;
-                            if let Some(sm) = sort_maps.get_mut(target) {
+                            if let Some(sv) = sort_vecs.get_mut(target) {
                                 for bit in 0..(bits as usize) {
                                     if (val32 >> bit) & 1 == 1 {
-                                        sm[bit].insert(slot);
+                                        sv[bit].push(slot);
                                     }
                                 }
                             }
@@ -1971,26 +1981,24 @@ pub fn process_dump_with_progress(
                 for target in enrichment_targets_ref {
                     if let Some(val_str) = enriched_get(target) {
                         // Filter bitmap
-                        if let Some(fm) = filter_maps.get_mut(target.as_str()) {
+                        if let Some(&fidx) = filter_field_to_idx_ref.get(target.as_str()) {
                             let bitmap_key: Option<u64> = if let Some(dict) = dictionaries_ref.get(target.as_str()) {
                                 Some(dict.get_or_insert(val_str) as u64)
                             } else {
                                 val_str.parse::<i64>().ok().map(|v| v as u64)
                             };
                             if let Some(key) = bitmap_key {
-                                fm.entry(key)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(slot);
+                                filter_tuples.push((fidx, key, slot));
                             }
                         }
                         // Sort bitmap
                         if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
                             if let Some(v) = val_str.parse::<i64>().ok() {
                                 let val32 = v.max(0) as u32;
-                                if let Some(sm) = sort_maps.get_mut(target.as_str()) {
+                                if let Some(sv) = sort_vecs.get_mut(target.as_str()) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
-                                            sm[bit].insert(slot);
+                                            sv[bit].push(slot);
                                         }
                                     }
                                 }
@@ -2005,24 +2013,20 @@ pub fn process_dump_with_progress(
                     match value {
                         NateExprValue::Bool(b) => {
                             let key = if *b { 1u64 } else { 0u64 };
-                            if let Some(fm) = filter_maps.get_mut(target.as_str()) {
-                                fm.entry(key)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(slot);
+                            if let Some(&fidx) = filter_field_to_idx_ref.get(target.as_str()) {
+                                filter_tuples.push((fidx, key, slot));
                             }
                         }
                         NateExprValue::Int(n) => {
-                            if let Some(fm) = filter_maps.get_mut(target.as_str()) {
-                                fm.entry(*n as u64)
-                                    .or_insert_with(RoaringBitmap::new)
-                                    .insert(slot);
+                            if let Some(&fidx) = filter_field_to_idx_ref.get(target.as_str()) {
+                                filter_tuples.push((fidx, *n as u64, slot));
                             }
                             if let Some(&bits) = sort_bits_ref.get(target.as_str()) {
                                 let val32 = (*n).max(0) as u32;
-                                if let Some(sm) = sort_maps.get_mut(target.as_str()) {
+                                if let Some(sv) = sort_vecs.get_mut(target.as_str()) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
-                                            sm[bit].insert(slot);
+                                            sv[bit].push(slot);
                                         }
                                     }
                                 }
@@ -2039,19 +2043,15 @@ pub fn process_dump_with_progress(
                     match computed_val {
                         Some(NateExprValue::Int(v)) if def.value_column.is_none() => {
                             // Regular computed field — use value directly as bitmap key
-                            if let Some(fm) = filter_maps.get_mut(&def.target) {
-                                {
-                                    fm.entry(v as u64)
-                                        .or_insert_with(RoaringBitmap::new)
-                                        .insert(slot);
-                                }
+                            if let Some(&fidx) = filter_field_to_idx_ref.get(def.target.as_str()) {
+                                filter_tuples.push((fidx, v as u64, slot));
                             }
                             if let Some(&bits) = sort_bits_ref.get(&def.target) {
                                 let val32 = v.max(0) as u32;
-                                if let Some(sm) = sort_maps.get_mut(&def.target) {
+                                if let Some(sv) = sort_vecs.get_mut(&def.target) {
                                     for bit in 0..(bits as usize) {
                                         if (val32 >> bit) & 1 == 1 {
-                                            sm[bit].insert(slot);
+                                            sv[bit].push(slot);
                                         }
                                     }
                                 }
@@ -2062,10 +2062,8 @@ pub fn process_dump_with_progress(
                             let vcol = def.value_column.as_deref().unwrap();
                             if let Some(v) = row.get_i64(vcol) {
                                 if filter_field_names_ref.contains(&def.target) {
-                                    if let Some(fm) = filter_maps.get_mut(&def.target) {
-                                        fm.entry(v as u64)
-                                            .or_insert_with(RoaringBitmap::new)
-                                            .insert(slot);
+                                    if let Some(&fidx) = filter_field_to_idx_ref.get(def.target.as_str()) {
+                                        filter_tuples.push((fidx, v as u64, slot));
                                     }
                                 }
                             }
@@ -2073,12 +2071,8 @@ pub fn process_dump_with_progress(
                         Some(NateExprValue::Bool(b)) if def.value_column.is_none() => {
                             // Boolean computed field (e.g. hasMeta, isPublished)
                             let key = if b { 1u64 } else { 0u64 };
-                            if let Some(fm) = filter_maps.get_mut(&def.target) {
-                                {
-                                    fm.entry(key)
-                                        .or_insert_with(RoaringBitmap::new)
-                                        .insert(slot);
-                                }
+                            if let Some(&fidx) = filter_field_to_idx_ref.get(def.target.as_str()) {
+                                filter_tuples.push((fidx, key, slot));
                             }
                         }
                         _ => {} // Null or non-matching pattern
@@ -2141,10 +2135,10 @@ pub fn process_dump_with_progress(
                             crate::config::ComputedOp::Greatest => *values.iter().max().unwrap_or(&0),
                             crate::config::ComputedOp::Least => *values.iter().min().unwrap_or(&0),
                         };
-                        if let Some(sm) = sort_maps.get_mut(&ccs.target) {
+                        if let Some(sv) = sort_vecs.get_mut(&ccs.target) {
                             for bit in 0..(ccs.bits as usize) {
                                 if (computed_val >> bit) & 1 == 1 {
-                                    sm[bit].insert(slot);
+                                    sv[bit].push(slot);
                                 }
                             }
                         }
@@ -2185,6 +2179,60 @@ pub fn process_dump_with_progress(
 
             #[cfg(feature = "dump-timing")]
             timings.print_summary(rayon::current_thread_index().unwrap_or(0));
+
+            // Convert filter_tuples → filter_maps via sort + grouped from_sorted_iter
+            // (5.3x faster than per-row HashMap entry().or_insert_with().insert()).
+            filter_tuples.sort_unstable();
+            filter_tuples.dedup();
+            let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
+            if !filter_tuples.is_empty() {
+                let mut prev_field = filter_tuples[0].0;
+                let mut prev_value = filter_tuples[0].1;
+                let mut slots: Vec<u32> = Vec::new();
+                for &(field_idx, value, slot) in &filter_tuples {
+                    if field_idx != prev_field || value != prev_value {
+                        if !slots.is_empty() {
+                            let field_name = &filter_idx_to_name_ref[prev_field as usize];
+                            filter_maps.entry(field_name.clone()).or_default().insert(
+                                prev_value,
+                                RoaringBitmap::from_sorted_iter(slots.drain(..)).unwrap_or_default(),
+                            );
+                        }
+                        prev_field = field_idx;
+                        prev_value = value;
+                    }
+                    slots.push(slot);
+                }
+                if !slots.is_empty() {
+                    let field_name = &filter_idx_to_name_ref[prev_field as usize];
+                    filter_maps.entry(field_name.clone()).or_default().insert(
+                        prev_value,
+                        RoaringBitmap::from_sorted_iter(slots.drain(..)).unwrap_or_default(),
+                    );
+                }
+            }
+            drop(filter_tuples);
+
+            // Convert sort_vecs → sort_maps via sort + from_sorted_iter
+            let sort_maps: HashMap<String, Vec<RoaringBitmap>> = sort_vecs
+                .into_iter()
+                .map(|(field, layers)| {
+                    let bitmaps: Vec<RoaringBitmap> = layers
+                        .into_iter()
+                        .map(|mut slots| {
+                            if slots.is_empty() {
+                                RoaringBitmap::new()
+                            } else {
+                                slots.sort_unstable();
+                                slots.dedup();
+                                RoaringBitmap::from_sorted_iter(slots.into_iter())
+                                    .unwrap_or_default()
+                            }
+                        })
+                        .collect();
+                    (field, bitmaps)
+                })
+                .collect();
 
             (filter_maps, sort_maps, alive, deferred, count, max_slot)
         })
