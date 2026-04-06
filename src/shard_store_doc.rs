@@ -9,7 +9,7 @@
 //! - `SlotHexShard` — hex-bucketed shard file layout
 //! - `json_to_packed_with_dict` — JSON → PackedValue conversion with dictionary support
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

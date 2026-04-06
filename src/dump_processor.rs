@@ -14,7 +14,8 @@
 //!
 //! Processing is sequential per phase (no cross-phase parallelism in V2).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

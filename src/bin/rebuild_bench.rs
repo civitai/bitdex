@@ -9,7 +9,7 @@
 //! Usage:
 //!   cargo run --release --bin rebuild_bench -- --data-dir ./data --index civitai [--shards 1000]
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;

@@ -11,7 +11,7 @@
 //! Both paths use the same `process_entity_ops()` core that translates Op variants
 //! into BitmapSink calls using the engine Config for field awareness and
 //! `value_to_bitmap_key()` / `value_to_sort_u32()` for value conversion.
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -198,7 +198,7 @@ pub fn document_to_ops(
     is_patch: bool,
 ) -> Vec<Op> {
     let mut ops = Vec::new();
-    let empty_fields = std::collections::HashMap::new();
+    let empty_fields = HashMap::new();
     let old_fields = old_doc.map_or(&empty_fields, |d| &d.fields);
     // Process all fields in the new document
     for (field_name, new_val) in &new_doc.fields {

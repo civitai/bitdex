@@ -7,7 +7,7 @@
 //! The scanner processes stale fields in small batches, dropping the ArcSwap
 //! guard between each field to avoid pinning old snapshot memory.
 
-use std::collections::HashSet;
+use ahash::AHashSet as HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 

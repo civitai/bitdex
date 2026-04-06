@@ -949,7 +949,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use ahash::AHashMap as HashMap;
 
     // -- Test snapshot codec: simple key-value store --
 

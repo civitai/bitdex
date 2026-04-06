@@ -4,7 +4,7 @@
 //! Thread-safe via `DashMap` for concurrent ingest, with a snapshot
 //! mechanism for lock-free reads at query time.
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 

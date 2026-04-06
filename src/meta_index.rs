@@ -13,7 +13,7 @@
 //! On query: intersect meta-bitmaps for the query clauses to find matching entries.
 //! Both are O(1) vs cache count — tiny bitmap intersections on ~32-bit IDs.
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 
 use roaring::RoaringBitmap;
 

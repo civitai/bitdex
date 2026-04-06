@@ -17,6 +17,7 @@ loadtest = ["ureq"]
 replay = ["ureq"]
 pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes", "dep:serde_yaml"]
 simd = ["roaring/simd"]
+dump-timing = []
 heap-prof = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 serde_yaml = ["dep:serde_yaml"]
 
@@ -38,6 +39,7 @@ dashmap = "6"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 arc-swap = "1"
+ahash = { version = "0.8", features = ["serde"] }
 
 # CRC32 checksums (bucket diff log, shard store)
 crc32fast = "1"

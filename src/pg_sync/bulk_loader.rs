@@ -8,7 +8,7 @@
 //!   - `download_metrics_from_clickhouse`: Fetch aggregate metrics from ClickHouse
 //!   - `finalize_from_bitmaps` / `scalars_to_json`: Docstore finalization helpers (used by tests)
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::time::Instant;
 
 use roaring::RoaringBitmap;

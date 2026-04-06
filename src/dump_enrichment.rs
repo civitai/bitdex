@@ -23,7 +23,7 @@
 //! drop(table);
 //! ```
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -334,7 +334,8 @@ impl EnrichmentTable {
         let mut maps = thread_maps;
         let max_idx = maps.iter().enumerate().max_by_key(|(_, m)| m.len()).map(|(i, _)| i).unwrap_or(0);
         let mut data = maps.swap_remove(max_idx);
-        data.reserve(total_rows.saturating_sub(data.len()));
+        let additional = total_rows.saturating_sub(data.len());
+        data.reserve(additional);
         for map in maps {
             data.extend(map);
         }

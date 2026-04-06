@@ -23,7 +23,7 @@
 //! - `stepped`: Pause between requests (attach profiler, collect flamegraphs)
 //! - `window`: Replay only requests from a time window (--window 120s-150s)
 
-use std::collections::HashMap;
+use ahash::AHashMap as HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
