@@ -168,6 +168,13 @@ pub struct DumpRequest {
     /// Enrichment lookups (recursive)
     #[serde(default)]
     pub enrichment: Vec<EnrichmentConfig>,
+
+    /// Use streaming N-way merge (`MultiOps::union`) instead of per-field
+    /// parallel reduce. Better for large datasets (107M+) where per-thread
+    /// bitmaps are large and memory-bandwidth dominates. Slower for small
+    /// datasets (<20M) due to collection overhead. Default: false.
+    #[serde(default)]
+    pub streaming_merge: bool,
 }
 
 /// File format for the dump.
@@ -2265,66 +2272,131 @@ pub fn process_dump_with_progress(
     }
 
     emit_stage(&request.name, "merge", "start", &t, total.load(Ordering::Relaxed));
-    // Per-field parallel merge — 3.78x faster than fold+reduce tree reduction.
-    // Step 1: Sequential collect — group per-thread results by field name (~1ms).
-    // Step 2: Parallel reduce — dispatch each field's merge as an independent rayon task.
-    // Large fields (userId with 2M values) run in parallel with cheap fields (nsfwLevel with 5 values).
-    let mut per_field_filters: HashMap<String, Vec<HashMap<u64, RoaringBitmap>>> = HashMap::new();
-    let mut per_field_sorts: HashMap<String, Vec<Vec<RoaringBitmap>>> = HashMap::new();
-    let mut merged_alive = RoaringBitmap::new();
-    let mut merged_deferred: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-    let mut total_count: u64 = 0;
-    let mut max_slot: u32 = 0;
+    // Two merge strategies:
+    // - streaming_merge=false (default): per-field parallel reduce — 3.78x faster than
+    //   fold+reduce tree reduction. Best for typical workloads.
+    // - streaming_merge=true: collect + MultiOps::union() — faster for very large datasets
+    //   (107M+) where per-thread bitmaps are large and memory-bandwidth dominates.
+    let (merged_filters, merged_sorts, merged_alive, merged_deferred, total_count, max_slot) = if request.streaming_merge {
+        use roaring::MultiOps;
 
-    for (filter_maps, sort_maps, alive, deferred, count, thread_max) in thread_results {
-        merged_alive |= alive;
-        total_count += count;
-        if thread_max > max_slot { max_slot = thread_max; }
-        for (slot, activate_at) in deferred {
-            merged_deferred.entry(activate_at).or_default().push(slot);
-        }
-        for (field, values) in filter_maps {
-            per_field_filters.entry(field).or_default().push(values);
-        }
-        for (field, layers) in sort_maps {
-            per_field_sorts.entry(field).or_default().push(layers);
-        }
-    }
+        let mut filter_collectors: HashMap<String, HashMap<u64, Vec<RoaringBitmap>>> = HashMap::new();
+        let mut sort_collectors: HashMap<String, Vec<Vec<RoaringBitmap>>> = HashMap::new();
+        let mut all_alive: Vec<RoaringBitmap> = Vec::with_capacity(thread_results.len());
+        let mut merged_deferred: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        let mut total_count: u64 = 0;
+        let mut max_slot: u32 = 0;
 
-    // Step 2a: Parallel merge filter fields
-    let merged_filters: HashMap<String, HashMap<u64, RoaringBitmap>> = per_field_filters
-        .into_iter()
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .map(|(field, thread_maps)| {
-            let mut merged: HashMap<u64, RoaringBitmap> = HashMap::new();
-            for tm in thread_maps {
-                for (val, bm) in tm {
-                    merged.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
+        for (filter_maps, sort_maps, alive, deferred, count, thread_max) in thread_results {
+            all_alive.push(alive);
+            total_count += count;
+            if thread_max > max_slot { max_slot = thread_max; }
+            for (slot, activate_at) in deferred {
+                merged_deferred.entry(activate_at).or_default().push(slot);
+            }
+            for (field, values) in filter_maps {
+                let fc = filter_collectors.entry(field).or_default();
+                for (val, bm) in values {
+                    fc.entry(val).or_default().push(bm);
                 }
             }
-            (field, merged)
-        })
-        .collect();
-
-    // Step 2b: Parallel merge sort fields
-    let merged_sorts: HashMap<String, Vec<RoaringBitmap>> = per_field_sorts
-        .into_iter()
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .map(|(field, thread_layers)| {
-            let num_layers = thread_layers.first().map(|l| l.len()).unwrap_or(0);
-            let mut merged: Vec<RoaringBitmap> = (0..num_layers).map(|_| RoaringBitmap::new()).collect();
-            for layers in thread_layers {
+            for (field, layers) in sort_maps {
+                let sc = sort_collectors.entry(field).or_insert_with(|| {
+                    (0..layers.len()).map(|_| Vec::new()).collect()
+                });
                 for (bit, bm) in layers.into_iter().enumerate() {
-                    if bit < merged.len() {
-                        merged[bit] |= bm;
+                    if bit < sc.len() { sc[bit].push(bm); }
+                }
+            }
+        }
+
+        let merged_alive: RoaringBitmap = all_alive.iter().union();
+
+        let mut merged_filters: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
+        for (field, values) in filter_collectors {
+            let dest = merged_filters.entry(field).or_default();
+            for (val, bitmaps) in values {
+                dest.insert(val, bitmaps.iter().union());
+            }
+        }
+
+        let mut merged_sorts: HashMap<String, Vec<RoaringBitmap>> = HashMap::new();
+        for (field, layers) in sort_collectors {
+            let bitmaps: Vec<RoaringBitmap> = layers.into_iter()
+                .map(|bms| bms.iter().union())
+                .collect();
+            merged_sorts.insert(field, bitmaps);
+        }
+
+        (merged_filters, merged_sorts, merged_alive, merged_deferred, total_count, max_slot)
+    } else {
+        // Per-field parallel merge — 3.78x faster than fold+reduce tree reduction.
+        // Step 1: Sequential collect — group per-thread results by field name (~1ms).
+        // Step 2: Parallel reduce — dispatch each field's merge as an independent rayon task.
+        // Large fields (userId with 2M values) run in parallel with cheap fields (nsfwLevel with 5 values).
+        let mut per_field_filters: HashMap<String, Vec<HashMap<u64, RoaringBitmap>>> = HashMap::new();
+        let mut per_field_sorts: HashMap<String, Vec<Vec<RoaringBitmap>>> = HashMap::new();
+        let mut merged_alive = RoaringBitmap::new();
+        let mut merged_deferred: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        let mut total_count: u64 = 0;
+        let mut max_slot: u32 = 0;
+
+        for (filter_maps, sort_maps, alive, deferred, count, thread_max) in thread_results {
+            merged_alive |= alive;
+            total_count += count;
+            if thread_max > max_slot { max_slot = thread_max; }
+            for (slot, activate_at) in deferred {
+                merged_deferred.entry(activate_at).or_default().push(slot);
+            }
+            for (field, values) in filter_maps {
+                per_field_filters.entry(field).or_default().push(values);
+            }
+            for (field, layers) in sort_maps {
+                per_field_sorts.entry(field).or_default().push(layers);
+            }
+        }
+
+        // Step 2a: Parallel merge filter fields.
+        // NOTE: AHashMap doesn't impl FromParallelIterator, so we collect into
+        // Vec<(String, ...)> first and then sequentially into HashMap.
+        let filter_pairs: Vec<(String, HashMap<u64, RoaringBitmap>)> = per_field_filters
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(field, thread_maps)| {
+                let mut merged: HashMap<u64, RoaringBitmap> = HashMap::new();
+                for tm in thread_maps {
+                    for (val, bm) in tm {
+                        merged.entry(val).and_modify(|e| *e |= &bm).or_insert(bm);
                     }
                 }
-            }
-            (field, merged)
-        })
-        .collect();
+                (field, merged)
+            })
+            .collect();
+        let merged_filters: HashMap<String, HashMap<u64, RoaringBitmap>> = filter_pairs.into_iter().collect();
+
+        // Step 2b: Parallel merge sort fields.
+        let sort_pairs: Vec<(String, Vec<RoaringBitmap>)> = per_field_sorts
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(field, thread_layers)| {
+                let num_layers = thread_layers.first().map(|l| l.len()).unwrap_or(0);
+                let mut merged: Vec<RoaringBitmap> = (0..num_layers).map(|_| RoaringBitmap::new()).collect();
+                for layers in thread_layers {
+                    for (bit, bm) in layers.into_iter().enumerate() {
+                        if bit < merged.len() {
+                            merged[bit] |= bm;
+                        }
+                    }
+                }
+                (field, merged)
+            })
+            .collect();
+        let merged_sorts: HashMap<String, Vec<RoaringBitmap>> = sort_pairs.into_iter().collect();
+
+        (merged_filters, merged_sorts, merged_alive, merged_deferred, total_count, max_slot)
+    };
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
@@ -3156,6 +3228,269 @@ fn write_docstore_row(
 }
 
 // ---------------------------------------------------------------------------
+// DumpFieldValue — zero-copy field value for dump pipeline encoding
+// ---------------------------------------------------------------------------
+
+/// Dump-specific field value that borrows strings from mmap/enrichment buffers.
+/// Only used in the dump parse loop — never stored, never crosses thread boundaries.
+/// Eliminates per-row String allocation for string fields (~321M alloc savings at 107M rows).
+#[allow(dead_code)]
+pub(crate) enum DumpFieldValue<'a> {
+    Int(i64),
+    Bool(bool),
+    Str(&'a str),
+    MultiInt(Vec<i64>),
+}
+
+/// Encode a DocOp::Merge from DumpFieldValues into a buffer.
+/// Same wire format as `DocOpCodec::encode_op` for `DocOp::Merge` but writes
+/// directly from borrowed refs — no PackedValue / String allocation.
+///
+/// See `test_encode_dump_merge_matches_codec` for byte-for-byte equivalence
+/// with `DocOpCodec::encode_op` against the canonical `PackedValue` path.
+#[allow(dead_code)]
+pub(crate) fn encode_dump_merge(slot: u32, fields: &[(u16, DumpFieldValue)], buf: &mut Vec<u8>) {
+    debug_assert!(fields.len() <= u16::MAX as usize, "encode_dump_merge: too many fields");
+    buf.clear();
+    crate::shard_store_doc::write_merge_header(slot, fields.len() as u16, buf);
+    for (field_idx, value) in fields {
+        match value {
+            DumpFieldValue::Int(v) => crate::shard_store_doc::write_field_int(*field_idx, *v, buf),
+            DumpFieldValue::Bool(v) => crate::shard_store_doc::write_field_bool(*field_idx, *v, buf),
+            DumpFieldValue::Str(s) => crate::shard_store_doc::write_field_str(*field_idx, s, buf),
+            DumpFieldValue::MultiInt(v) => crate::shard_store_doc::write_field_multi_int(*field_idx, v, buf),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compiled DocFieldPlan — eliminates per-row HashMap/HashSet lookups
+// ---------------------------------------------------------------------------
+
+/// How to read a field value during doc encoding.
+#[allow(dead_code)]
+pub(crate) enum DocFieldSource {
+    /// Direct CSV field — use row.get_i64(column) / row.get_str(column).
+    Direct { column: String },
+    /// Enrichment result — look up in enriched_map.
+    Enriched { target: String },
+    /// Enrichment computed field — look up in enriched.computed Vec.
+    EnrichedComputed { target: String },
+    /// Computed field — eval_indexed on computed_defs[def_index].
+    Computed { def_index: usize },
+    /// Config-computed sort value (extra_i64) — pre-computed before doc encoding.
+    ExtraI64 { index: usize },
+}
+
+/// How to interpret the raw value.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) enum DocValueType {
+    Int,
+    Boolean,
+    String,
+    IntOrString,
+    /// Multi-value integer field — each row contributes one element to an array.
+    /// Compaction merges Mi arrays via concatenation.
+    MultiInt,
+}
+
+/// One entry in the compiled doc field plan.
+#[allow(dead_code)]
+pub(crate) struct DocFieldPlanEntry {
+    pub doc_field_idx: u16,
+    pub source: DocFieldSource,
+    pub value_type: DocValueType,
+}
+
+/// Build the compiled doc field plan at phase setup. Called once per dump phase
+/// instead of per row — pre-resolves all HashMap/HashSet lookups upfront so the
+/// row hot path is a flat loop over plan entries.
+///
+/// NOTE (faithful V3 port): this function does not currently emit
+/// `DocFieldSource::EnrichedComputed` entries — V3 also leaves this gap. The
+/// variant is defined and handled by `execute_doc_plan`, but the wiring stage
+/// (Ivy's items 8/9/13) will need to thread the enrichment computed-field list
+/// through here when activating the plan in the row loop.
+#[allow(dead_code)]
+pub(crate) fn build_doc_field_plan(
+    request_fields: &[DumpFieldMapping],
+    enrichment_targets: &[String],
+    computed_defs: &[ComputedFieldDef],
+    extra_i64_targets: &[String],
+    field_idx: &HashMap<String, u16>,
+    boolean_fields: &HashSet<String>,
+    _filter_field_names: &HashSet<String>,
+    multi_value_fields: &HashSet<String>,
+) -> Vec<DocFieldPlanEntry> {
+    let extra_skip: HashSet<&str> = extra_i64_targets.iter().map(|s| s.as_str()).collect();
+    let mut plan = Vec::new();
+
+    // Direct fields
+    for mapping in request_fields {
+        let target = mapping.target();
+        if extra_skip.contains(target) { continue; }
+        if let Some(&fidx) = field_idx.get(target) {
+            let vtype = if multi_value_fields.contains(target) {
+                DocValueType::MultiInt
+            } else if boolean_fields.contains(target) {
+                DocValueType::Boolean
+            } else {
+                DocValueType::IntOrString
+            };
+            plan.push(DocFieldPlanEntry {
+                doc_field_idx: fidx,
+                source: DocFieldSource::Direct { column: mapping.column().to_string() },
+                value_type: vtype,
+            });
+        }
+    }
+
+    // Enrichment fields
+    for target in enrichment_targets {
+        if extra_skip.contains(target.as_str()) { continue; }
+        if let Some(&fidx) = field_idx.get(target.as_str()) {
+            let vtype = if boolean_fields.contains(target.as_str()) {
+                DocValueType::Boolean
+            } else {
+                DocValueType::IntOrString
+            };
+            plan.push(DocFieldPlanEntry {
+                doc_field_idx: fidx,
+                source: DocFieldSource::Enriched { target: target.clone() },
+                value_type: vtype,
+            });
+        }
+    }
+
+    // Computed fields
+    for (i, def) in computed_defs.iter().enumerate() {
+        if extra_skip.contains(def.target.as_str()) { continue; }
+        if let Some(&fidx) = field_idx.get(def.target.as_str()) {
+            plan.push(DocFieldPlanEntry {
+                doc_field_idx: fidx,
+                source: DocFieldSource::Computed { def_index: i },
+                value_type: if boolean_fields.contains(def.target.as_str()) {
+                    DocValueType::Boolean
+                } else {
+                    DocValueType::IntOrString
+                },
+            });
+        }
+    }
+
+    // Extra i64 fields (config-computed sort values)
+    for (i, target) in extra_i64_targets.iter().enumerate() {
+        if let Some(&fidx) = field_idx.get(target.as_str()) {
+            plan.push(DocFieldPlanEntry {
+                doc_field_idx: fidx,
+                source: DocFieldSource::ExtraI64 { index: i },
+                value_type: DocValueType::Int,
+            });
+        }
+    }
+
+    plan
+}
+
+/// Execute the compiled doc field plan for a single row.
+/// Produces DumpFieldValue with borrowed strings — zero allocation for string fields.
+#[allow(dead_code)]
+pub(crate) fn execute_doc_plan<'a>(
+    plan: &[DocFieldPlanEntry],
+    row: &'a ParsedRow<'a>,
+    enriched_map: &HashMap<&str, &'a str>,
+    enriched: &'a dump_enrichment::EnrichedFields,
+    computed_defs: &[ComputedFieldDef],
+    indexed_fields: &[Option<&str>],
+    col_idx: &HashMap<String, usize>,
+    extra_i64_fields: &[(&str, i64)],
+    fields: &mut Vec<(u16, DumpFieldValue<'a>)>,
+) {
+    fields.clear();
+    for entry in plan {
+        match &entry.source {
+            DocFieldSource::Direct { column } => {
+                if let Some(v) = row.get_i64(column) {
+                    match entry.value_type {
+                        DocValueType::MultiInt => fields.push((entry.doc_field_idx, DumpFieldValue::MultiInt(vec![v]))),
+                        _ => fields.push((entry.doc_field_idx, DumpFieldValue::Int(v))),
+                    }
+                } else if let Some(s) = row.get_str(column).or_else(|| enriched_map.get(column.as_str()).copied()) {
+                    match entry.value_type {
+                        DocValueType::MultiInt => {
+                            if let Ok(v) = s.parse::<i64>() {
+                                fields.push((entry.doc_field_idx, DumpFieldValue::MultiInt(vec![v])));
+                            }
+                        }
+                        DocValueType::Boolean => {
+                            match s {
+                                "t" | "true" => fields.push((entry.doc_field_idx, DumpFieldValue::Bool(true))),
+                                "f" | "false" => fields.push((entry.doc_field_idx, DumpFieldValue::Bool(false))),
+                                _ => fields.push((entry.doc_field_idx, DumpFieldValue::Str(s))),
+                            }
+                        }
+                        _ => fields.push((entry.doc_field_idx, DumpFieldValue::Str(s))),
+                    }
+                }
+            }
+            DocFieldSource::Enriched { target } => {
+                if let Some(&val) = enriched_map.get(target.as_str()) {
+                    if let Ok(v) = val.parse::<i64>() {
+                        fields.push((entry.doc_field_idx, DumpFieldValue::Int(v)));
+                    } else {
+                        match entry.value_type {
+                            DocValueType::Boolean => {
+                                match val {
+                                    "t" | "true" => fields.push((entry.doc_field_idx, DumpFieldValue::Bool(true))),
+                                    "f" | "false" => fields.push((entry.doc_field_idx, DumpFieldValue::Bool(false))),
+                                    _ => fields.push((entry.doc_field_idx, DumpFieldValue::Str(val))),
+                                }
+                            }
+                            _ => fields.push((entry.doc_field_idx, DumpFieldValue::Str(val))),
+                        }
+                    }
+                }
+            }
+            DocFieldSource::EnrichedComputed { target } => {
+                for (t, v) in &enriched.computed {
+                    if t == target {
+                        match v {
+                            NateExprValue::Int(n) => fields.push((entry.doc_field_idx, DumpFieldValue::Int(*n))),
+                            NateExprValue::Bool(b) => fields.push((entry.doc_field_idx, DumpFieldValue::Bool(*b))),
+                            NateExprValue::Str(s) => fields.push((entry.doc_field_idx, DumpFieldValue::Str(s.as_str()))),
+                            NateExprValue::Null => {}
+                        }
+                        break;
+                    }
+                }
+            }
+            DocFieldSource::Computed { def_index } => {
+                // Computed fields produce owned NateExprValue — Int and Bool are zero-copy,
+                // Str requires allocation since eval owns the result. Skip Str (rare in practice;
+                // current computed fields are almost always Int or Bool).
+                //
+                // NOTE (faithful V3 port): V3 has the same skip. If a future computed field
+                // emits Str, the wiring stage should add an `OwnedStr(String)` variant to
+                // `DumpFieldValue` rather than silently dropping the value.
+                match computed_defs[*def_index].eval_indexed(indexed_fields, col_idx, None) {
+                    Some(NateExprValue::Int(v)) => fields.push((entry.doc_field_idx, DumpFieldValue::Int(v))),
+                    Some(NateExprValue::Bool(b)) => fields.push((entry.doc_field_idx, DumpFieldValue::Bool(b))),
+                    Some(NateExprValue::Str(_)) => {} // skip — would require allocation
+                    _ => {}
+                }
+            }
+            DocFieldSource::ExtraI64 { index } => {
+                let (_, value) = extra_i64_fields[*index];
+                if value != 0 {
+                    fields.push((entry.doc_field_idx, DumpFieldValue::Int(value)));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3430,6 +3765,7 @@ mod tests {
                 value: None,
             }],
             enrichment: vec![],
+            streaming_merge: false,
         };
         let targets = collect_target_fields(&req);
         assert!(targets.contains(&"nsfwLevel".to_string()));
@@ -3450,6 +3786,7 @@ mod tests {
             filter: None,
             computed_fields: vec![],
             enrichment: vec![],
+            streaming_merge: false,
         };
         // We can't test validate_dump_request without an engine, but we can test
         // the validation logic directly
@@ -3756,6 +4093,72 @@ mod tests {
                 assert_eq!(*v, 1711234567, "sortAt should be written via extra_i64_fields");
             }
             other => panic!("sortAt should be 1711234567, got: {:?}", other),
+        }
+    }
+
+    /// Byte-for-byte regression test: `encode_dump_merge` must produce identical
+    /// bytes to `DocOpCodec::encode_op` for an equivalent `DocOp::Merge`.
+    /// Catches any wire format drift between the zero-copy dump path and the
+    /// canonical PackedValue path.
+    #[test]
+    fn test_encode_dump_merge_matches_codec() {
+        use crate::shard_store::OpCodec;
+        use crate::shard_store_doc::{DocOp, DocOpCodec, PackedValue};
+
+        // Build the same merge two ways and compare.
+        let cases: Vec<(u32, Vec<(u16, DumpFieldValue, PackedValue)>)> = vec![
+            // Empty merge
+            (0, vec![]),
+            // Single int
+            (1, vec![(0, DumpFieldValue::Int(42), PackedValue::I(42))]),
+            // Single bool true
+            (2, vec![(1, DumpFieldValue::Bool(true), PackedValue::B(true))]),
+            // Single bool false
+            (3, vec![(2, DumpFieldValue::Bool(false), PackedValue::B(false))]),
+            // Empty string
+            (4, vec![(3, DumpFieldValue::Str(""), PackedValue::S(String::new()))]),
+            // UTF-8 string
+            (5, vec![(4, DumpFieldValue::Str("héllo wörld 🦀"), PackedValue::S("héllo wörld 🦀".to_string()))]),
+            // Empty multi-int
+            (6, vec![(5, DumpFieldValue::MultiInt(vec![]), PackedValue::Mi(vec![]))]),
+            // Multi-int with values
+            (7, vec![(6, DumpFieldValue::MultiInt(vec![10, 20, 30, -1, i64::MAX]), PackedValue::Mi(vec![10, 20, 30, -1, i64::MAX]))]),
+            // Mixed fields, ordered to test order preservation
+            (
+                u32::MAX,
+                vec![
+                    (100, DumpFieldValue::Int(-1), PackedValue::I(-1)),
+                    (50, DumpFieldValue::Bool(true), PackedValue::B(true)),
+                    (200, DumpFieldValue::Str("test"), PackedValue::S("test".to_string())),
+                    (75, DumpFieldValue::MultiInt(vec![1, 2, 3]), PackedValue::Mi(vec![1, 2, 3])),
+                ],
+            ),
+        ];
+
+        for (slot, case_fields) in cases {
+            let dump_fields: Vec<(u16, DumpFieldValue)> = case_fields.iter()
+                .map(|(idx, dv, _)| (*idx, match dv {
+                    DumpFieldValue::Int(v) => DumpFieldValue::Int(*v),
+                    DumpFieldValue::Bool(v) => DumpFieldValue::Bool(*v),
+                    DumpFieldValue::Str(s) => DumpFieldValue::Str(s),
+                    DumpFieldValue::MultiInt(v) => DumpFieldValue::MultiInt(v.clone()),
+                }))
+                .collect();
+            let pv_fields: Vec<(u16, PackedValue)> = case_fields.iter()
+                .map(|(idx, _, pv)| (*idx, pv.clone()))
+                .collect();
+
+            let mut zero_copy_buf = Vec::new();
+            encode_dump_merge(slot, &dump_fields, &mut zero_copy_buf);
+
+            let mut codec_buf = Vec::new();
+            DocOpCodec::encode_op(&DocOp::Merge { slot, fields: pv_fields }, &mut codec_buf);
+
+            assert_eq!(
+                zero_copy_buf, codec_buf,
+                "wire format mismatch for slot {} — encode_dump_merge produced different bytes than DocOpCodec::encode_op",
+                slot
+            );
         }
     }
 }

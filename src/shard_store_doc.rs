@@ -186,6 +186,53 @@ const PV_TAG_S: u8 = 0x04;
 const PV_TAG_MI: u8 = 0x05;
 const PV_TAG_MM: u8 = 0x06;
 
+// ---------------------------------------------------------------------------
+// Zero-copy wire format helpers — write Merge ops directly from borrowed data.
+// Used by the dump pipeline to avoid building PackedValue (which owns Strings).
+// Same wire format as DocOpCodec::encode_op for DocOp::Merge.
+// ---------------------------------------------------------------------------
+
+/// Write a DocOp::Merge header: [tag][slot:u32][num_fields:u16].
+/// Caller follows with one write_field_* call per field.
+pub(crate) fn write_merge_header(slot: u32, num_fields: u16, buf: &mut Vec<u8>) {
+    buf.push(OP_TAG_MERGE);
+    buf.extend_from_slice(&slot.to_le_bytes());
+    buf.extend_from_slice(&num_fields.to_le_bytes());
+}
+
+/// Write a (field_idx, i64) pair: [field:u16][PV_TAG_I][i64 LE].
+pub(crate) fn write_field_int(field: u16, value: i64, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&field.to_le_bytes());
+    buf.push(PV_TAG_I);
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Write a (field_idx, bool) pair: [field:u16][PV_TAG_B][u8].
+pub(crate) fn write_field_bool(field: u16, value: bool, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&field.to_le_bytes());
+    buf.push(PV_TAG_B);
+    buf.push(if value { 1 } else { 0 });
+}
+
+/// Write a (field_idx, &str) pair: [field:u16][PV_TAG_S][len:u32 LE][bytes].
+/// Zero-copy — borrows from caller's string slice.
+pub(crate) fn write_field_str(field: u16, value: &str, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&field.to_le_bytes());
+    buf.push(PV_TAG_S);
+    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+}
+
+/// Write a (field_idx, &[i64]) pair: [field:u16][PV_TAG_MI][len:u32 LE][i64 LE...].
+pub(crate) fn write_field_multi_int(field: u16, values: &[i64], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&field.to_le_bytes());
+    buf.push(PV_TAG_MI);
+    buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    for v in values {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
 fn encode_packed_value(pv: &PackedValue, buf: &mut Vec<u8>) {
     match pv {
         PackedValue::I(v) => {
