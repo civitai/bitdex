@@ -1410,6 +1410,10 @@ pub fn process_dump_with_progress(
     let config = engine.config();
     let filter_field_names: HashSet<String> =
         config.filter_fields.iter().map(|f| f.name.clone()).collect();
+    let multi_value_fields: HashSet<String> = config.filter_fields.iter()
+        .filter(|f| f.field_type == crate::filter::FilterFieldType::MultiValue)
+        .map(|f| f.name.clone())
+        .collect();
     let sort_bits: HashMap<String, u8> = config
         .sort_fields
         .iter()
@@ -1594,38 +1598,6 @@ pub fn process_dump_with_progress(
         .as_secs();
     let has_deferred_alive = config.deferred_alive.is_some() && request.sets_alive;
 
-    // Tags optimization: if only multi-value field with small IDs, use Vec indexing
-    let is_tags_optimization = request.fields.len() == 1
-        && !request.sets_alive
-        && request.computed_fields.is_empty()
-        && request.enrichment.is_empty()
-        && {
-            let target = request.fields[0].target();
-            target == "tagIds" || target == "toolIds" || target == "techniqueIds"
-        };
-
-    if is_tags_optimization {
-        let result = process_multi_value_phase(
-            request,
-            body,
-            delimiter,
-            &col_index,
-            &filter_expr,
-            &bulk_writer,
-            &progress_counter,
-            slot_watermark,
-            shutdown,
-        );
-        // Drop the mmap immediately after parsing — prevents zombie processes
-        // from holding 80+ GB of virtual memory if force-killed during save.
-        #[cfg(target_os = "linux")]
-        let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
-        drop(mmap);
-        drop(file);
-        eprintln!("  Dump {}: mmap released", request.name);
-        return result;
-    }
-
     emit_stage(&request.name, "parallel_parse", "start", &t, 0);
     // General phase processing with rayon parallelism
     let ranges = split_mmap_ranges(body, rayon::current_num_threads());
@@ -1728,6 +1700,30 @@ pub fn process_dump_with_progress(
     let filter_field_to_idx_ref = &filter_field_to_idx;
     let filter_idx_to_name_ref = &filter_idx_to_name;
 
+    // Build compiled doc field plan — pre-resolves all HashMap lookups and
+    // HashSet checks for the per-row doc encode path. Replaces the runtime
+    // `write_docstore_row_indexed` String-allocating path with a flat Vec walk.
+    let extra_i64_targets: Vec<String> = config_computed_sorts
+        .iter()
+        .map(|ccs| ccs.target.clone())
+        .collect();
+    let mut enrichment_computed_targets: Vec<String> = Vec::new();
+    for ec in &request.enrichment {
+        collect_enrichment_computed_targets(ec, &mut enrichment_computed_targets);
+    }
+    let doc_field_plan = build_doc_field_plan(
+        request_fields,
+        &enrichment_targets,
+        &enrichment_computed_targets,
+        &computed_defs,
+        &extra_i64_targets,
+        bulk_writer.field_to_idx(),
+        &boolean_fields,
+        &filter_field_names,
+        &multi_value_fields,
+    );
+    let doc_field_plan_ref = &doc_field_plan;
+
     // Ollie #5: Vec<RoaringBitmap> for sort bit layers instead of HashMap<usize, _>.
     // Preallocate Vec of size num_bits — eliminates per-bit hash overhead.
     type ThreadResult = (
@@ -1744,9 +1740,7 @@ pub fn process_dump_with_progress(
         .map(|&(range_start, range_end)| {
             let chunk = &body[range_start..range_end];
 
-            let field_idx_cache: &HashMap<String, u16> = bulk_writer.field_to_idx();
             let col_idx_ref: &HashMap<String, usize> = col_index.as_ref();
-            let mut serialize_buf: Vec<u8> = Vec::with_capacity(64);
             let mut enriched_buf = dump_enrichment::EnrichedFields::default();
             let mut enrichment_lookup_buf: Vec<Option<&str>> = Vec::with_capacity(16);
 
@@ -1773,8 +1767,21 @@ pub fn process_dump_with_progress(
             }
             let mut alive = RoaringBitmap::new();
             let mut deferred: Vec<(u32, u64)> = Vec::with_capacity(1024);
-            let mut tuple_buf: Vec<(u16, u32, u32)> = Vec::with_capacity(20);
-            let mut write_buf: Vec<u8> = Vec::with_capacity(256);
+            // Doc encode scratch buffers — reused across rows.
+            let mut doc_encode_buf: Vec<u8> = Vec::with_capacity(512);
+            // Per-slot MultiInt accumulator (tags/tools/techniques).
+            // Consecutive rows sharing a slot accumulate values; flushed as a single
+            // Merge(Mi([...])) when slot changes. 4.5B ops -> ~109M ops for tags.
+            let has_multi_int = doc_field_plan_ref
+                .iter()
+                .any(|e| matches!(e.value_type, DocValueType::MultiInt));
+            let mi_field_idx: u16 = doc_field_plan_ref
+                .iter()
+                .find(|e| matches!(e.value_type, DocValueType::MultiInt))
+                .map(|e| e.doc_field_idx)
+                .unwrap_or(0);
+            let mut mi_prev_slot: Option<u32> = None;
+            let mut mi_accum: Vec<i64> = if has_multi_int { Vec::with_capacity(64) } else { Vec::new() };
             let mut count = 0u64;
             let mut max_slot: u32 = 0;
             let mut line_start = 0;
@@ -1793,12 +1800,17 @@ pub fn process_dump_with_progress(
                     continue;
                 }
 
-
+                #[cfg(feature = "dump-timing")]
+                let _row_start = std::time::Instant::now();
+                #[cfg(feature = "dump-timing")]
+                let _t_csv = std::time::Instant::now();
                 let fields = parse_delimited_line(line, delimiter);
                 let row = ParsedRow {
                     fields,
                     col_index: col_idx_ref,
                 };
+                #[cfg(feature = "dump-timing")]
+                { timings.csv_parse += _t_csv.elapsed().as_nanos() as u64; }
 
                 // Get slot ID
                 let slot = match row.slot(slot_field) {
@@ -1824,6 +1836,8 @@ pub fn process_dump_with_progress(
                     }
                 }
 
+                #[cfg(feature = "dump-timing")]
+                let _t_enrich = std::time::Instant::now();
                 // Resolve enrichment via indexed path with buffer reuse
                 if enrichment_mgr_ref.table_count() > 0 {
                     enrichment_mgr_ref.enrich_row_indexed_into(&indexed_fields_buf, col_idx, &mut enriched_buf, &mut enrichment_lookup_buf);
@@ -1848,6 +1862,8 @@ pub fn process_dump_with_progress(
                 let enriched_get = |target: &str| -> Option<&str> {
                     enriched_map.get(target).copied()
                 };
+                #[cfg(feature = "dump-timing")]
+                { timings.enrichment += _t_enrich.elapsed().as_nanos() as u64; }
 
                 // Evaluate config-computed sort values (e.g., sortAt = GREATEST(existedAt, publishedAt)).
                 // Computed early so both the deferred alive path and normal path can include them
@@ -1907,24 +1923,33 @@ pub fn process_dump_with_progress(
                     if let Some(pub_str) = enriched_get("publishedAt") {
                         if let Ok(pub_secs) = pub_str.parse::<u64>() {
                             if pub_secs > now_unix {
-                                // Write docstore only, skip all bitmaps
-                                write_docstore_row_indexed(
+                                // Write docstore only, skip all bitmaps.
+                                // Deferred rows never contain MultiInt fields (the deferred
+                                // path is images-phase only), so we encode directly with no
+                                // per-slot accumulation.
+                                let mut doc_fields: Vec<(u16, DumpFieldValue)> = Vec::with_capacity(20);
+                                execute_doc_plan(
+                                    doc_field_plan_ref,
                                     &row,
+                                    &enriched_map,
                                     &enriched,
                                     computed_defs_ref,
                                     &indexed_fields_buf,
                                     col_idx,
-                                    slot,
-                                    request_fields,
-                                    &bulk_writer,
-                                    &field_idx_cache,
-                                    &boolean_fields,
                                     &config_computed_sort_vals,
-                                    &mut serialize_buf,
-                                    &mut tuple_buf,
-                                    &mut write_buf,
+                                    &mut doc_fields,
                                 );
+                                if !doc_fields.is_empty() {
+                                    encode_dump_merge(slot, &doc_fields, &mut doc_encode_buf);
+                                    bulk_writer.append_merge_payload(slot, &doc_encode_buf);
+                                }
                                 deferred.push((slot, pub_secs));
+                                #[cfg(feature = "dump-timing")]
+                                {
+                                    timings.deferred_alive += _row_start.elapsed().as_nanos() as u64;
+                                    timings.total += _row_start.elapsed().as_nanos() as u64;
+                                    timings.rows += 1;
+                                }
                                 count += 1;
                                 if count % LOG_INTERVAL == 0 {
                                     total_ref.fetch_add(LOG_INTERVAL, Ordering::Relaxed);
@@ -2152,23 +2177,74 @@ pub fn process_dump_with_progress(
                     }
                 }
 
-                // Write docstore (direct + enriched + dump computed fields)
-                write_docstore_row_indexed(
-                    &row,
-                    &enriched,
-                    computed_defs_ref,
-                    &indexed_fields_buf,
-                    col_idx,
-                    slot,
-                    request_fields,
-                    &bulk_writer,
-                    &field_idx_cache,
-                    &boolean_fields,
-                    &config_computed_sort_vals,
-                    &mut serialize_buf,
-                    &mut tuple_buf,
-                    &mut write_buf,
-                );
+                // Write docstore via compiled plan (zero-copy, borrowed strings).
+                //
+                // MultiInt path: accumulate values per-slot and flush one Merge
+                // op per slot when the slot changes. Collapses ~4.5B tagIds rows
+                // into ~109M per-slot Merge ops.
+                //
+                // Standard path: one Merge op per row.
+                #[cfg(feature = "dump-timing")]
+                let _t_doc = std::time::Instant::now();
+                if has_multi_int {
+                    // Flush previous slot if it changed.
+                    if let Some(prev) = mi_prev_slot {
+                        if prev != slot && !mi_accum.is_empty() {
+                            let fields: Vec<(u16, DumpFieldValue)> = vec![(
+                                mi_field_idx,
+                                DumpFieldValue::MultiInt(std::mem::take(&mut mi_accum)),
+                            )];
+                            encode_dump_merge(prev, &fields, &mut doc_encode_buf);
+                            bulk_writer.append_merge_payload(prev, &doc_encode_buf);
+                        }
+                    }
+                    mi_prev_slot = Some(slot);
+                    // Collect this row's doc fields — extract MultiInt values into accum.
+                    let mut doc_fields: Vec<(u16, DumpFieldValue)> = Vec::with_capacity(4);
+                    execute_doc_plan(
+                        doc_field_plan_ref,
+                        &row,
+                        &enriched_map,
+                        &enriched,
+                        computed_defs_ref,
+                        &indexed_fields_buf,
+                        col_idx,
+                        &config_computed_sort_vals,
+                        &mut doc_fields,
+                    );
+                    for (_, val) in doc_fields.drain(..) {
+                        if let DumpFieldValue::MultiInt(vals) = val {
+                            mi_accum.extend(vals);
+                        }
+                        // Non-MultiInt fields in a MultiInt phase are dropped
+                        // (in practice MV phases only carry the MV field).
+                    }
+                } else {
+                    let mut doc_fields: Vec<(u16, DumpFieldValue)> = Vec::with_capacity(20);
+                    execute_doc_plan(
+                        doc_field_plan_ref,
+                        &row,
+                        &enriched_map,
+                        &enriched,
+                        computed_defs_ref,
+                        &indexed_fields_buf,
+                        col_idx,
+                        &config_computed_sort_vals,
+                        &mut doc_fields,
+                    );
+                    if !doc_fields.is_empty() {
+                        encode_dump_merge(slot, &doc_fields, &mut doc_encode_buf);
+                        bulk_writer.append_merge_payload(slot, &doc_encode_buf);
+                    }
+                }
+                #[cfg(feature = "dump-timing")]
+                { timings.doc_encode += _t_doc.elapsed().as_nanos() as u64; }
+
+                #[cfg(feature = "dump-timing")]
+                {
+                    timings.total += _row_start.elapsed().as_nanos() as u64;
+                    timings.rows += 1;
+                }
 
                 count += 1;
                 if count % LOG_INTERVAL == 0 {
@@ -2183,6 +2259,18 @@ pub fn process_dump_with_progress(
             let remainder = count % LOG_INTERVAL;
             total_ref.fetch_add(remainder, Ordering::Relaxed);
             if let Some(ref p) = ext_progress { p.fetch_add(remainder, Ordering::Relaxed); }
+
+            // Flush final accumulated MultiInt batch for the last slot in this chunk.
+            if has_multi_int && !mi_accum.is_empty() {
+                if let Some(prev) = mi_prev_slot {
+                    let fields: Vec<(u16, DumpFieldValue)> = vec![(
+                        mi_field_idx,
+                        DumpFieldValue::MultiInt(std::mem::take(&mut mi_accum)),
+                    )];
+                    encode_dump_merge(prev, &fields, &mut doc_encode_buf);
+                    bulk_writer.append_merge_payload(prev, &doc_encode_buf);
+                }
+            }
 
             #[cfg(feature = "dump-timing")]
             timings.print_summary(rayon::current_thread_index().unwrap_or(0));
@@ -2654,12 +2742,14 @@ impl SaveHandle {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-value phase (tags, tools, techniques optimization)
+// Multi-value phase (tags, tools, techniques) — now unified into the main
+// row loop via DocFieldPlan + DocValueType::MultiInt + per-slot accumulation.
+// The legacy process_multi_value_phase has been removed.
 // ---------------------------------------------------------------------------
 
-/// Optimized processor for simple multi-value phases (two columns: value_id, slot_id).
-/// Uses Vec indexing for tags (MAX_TAG_ID=300K preallocated).
-fn process_multi_value_phase(
+#[cfg(any())]
+#[allow(clippy::all)]
+fn process_multi_value_phase_removed_placeholder(
     request: &DumpRequest,
     body: &[u8],
     delimiter: u8,
@@ -3023,12 +3113,26 @@ fn collect_enrichment_targets(config: &EnrichmentConfig, targets: &mut Vec<Strin
     }
 }
 
+/// Collect only enrichment *computed* field target names (recursive).
+/// Used by `build_doc_field_plan` to emit `DocFieldSource::EnrichedComputed`
+/// entries — these have Int/Bool/Str values stored on `enriched.computed`.
+fn collect_enrichment_computed_targets(config: &EnrichmentConfig, targets: &mut Vec<String>) {
+    for cf in &config.computed_fields {
+        targets.push(cf.target.clone());
+    }
+    for child in &config.enrichment {
+        collect_enrichment_computed_targets(child, targets);
+    }
+}
+
 /// Write a single row's data to the docstore via BulkWriter (indexed path).
 ///
-/// - `boolean_fields`: set of field names declared as Boolean in the data schema.
-///   Used to coerce PG COPY "t"/"f" strings to `PackedValue::B` instead of `PackedValue::S`.
-/// - `extra_i64_fields`: config-computed sort values (e.g., sortAt = GREATEST(existedAt, publishedAt))
-///   to write alongside direct/enriched fields in a single `append_tuples_raw` call.
+/// DEPRECATED — kept under #[cfg(test)] for the legacy regression tests at the
+/// bottom of this file. The production dump path now goes through
+/// `build_doc_field_plan` + `execute_doc_plan` + `encode_dump_merge` +
+/// `StreamingDocWriter::append_merge_payload`, which is zero-copy for borrowed
+/// strings and saves ~321M String allocations at 107M rows.
+#[cfg(test)]
 fn write_docstore_row_indexed(
     row: &ParsedRow,
     enriched: &dump_enrichment::EnrichedFields,
@@ -3163,70 +3267,6 @@ fn write_docstore_row_indexed(
     }
 }
 
-/// Write a single row's data to the docstore via BulkWriter (legacy HashMap path).
-fn write_docstore_row(
-    row: &ParsedRow,
-    enriched_values: &HashMap<String, String>,
-    computed_defs: &[ComputedFieldDef],
-    csv_row: &CsvRow,
-    slot: u32,
-    request_fields: &[DumpFieldMapping],
-    bulk_writer: &Arc<StreamingDocWriter>,
-) {
-    let field_idx = bulk_writer.field_to_idx();
-
-    // Write direct fields
-    for mapping in request_fields {
-        let target = mapping.target();
-        let column = mapping.column();
-
-        if let Some(&fidx) = field_idx.get(target) {
-            if let Some(v) = row.get_i64(column) {
-                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
-            } else if let Some(s) = row.get_str(column) {
-                let packed = rmp_serde::to_vec(&PackedValue::S(s.to_string())).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
-            }
-        }
-    }
-
-    // Write enriched fields
-    for (target, value) in enriched_values {
-        if let Some(&fidx) = field_idx.get(target.as_str()) {
-            if let Ok(v) = value.parse::<i64>() {
-                let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
-            } else {
-                let packed =
-                    rmp_serde::to_vec(&PackedValue::S(value.clone())).unwrap_or_default();
-                bulk_writer.append_tuple_raw(slot, fidx, &packed);
-            }
-        }
-    }
-
-    // Write computed fields (Nate's ComputedFieldDef API)
-    for def in computed_defs {
-        if let Some(&fidx) = field_idx.get(def.target.as_str()) {
-            match def.eval(csv_row, None) {
-                Some(NateExprValue::Int(v)) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                Some(NateExprValue::Bool(b)) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::I(if b { 1 } else { 0 })).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                Some(NateExprValue::Str(ref s)) => {
-                    let packed = rmp_serde::to_vec(&PackedValue::S(s.clone())).unwrap_or_default();
-                    bulk_writer.append_tuple_raw(slot, fidx, &packed);
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // DumpFieldValue — zero-copy field value for dump pipeline encoding
 // ---------------------------------------------------------------------------
@@ -3316,6 +3356,7 @@ pub(crate) struct DocFieldPlanEntry {
 pub(crate) fn build_doc_field_plan(
     request_fields: &[DumpFieldMapping],
     enrichment_targets: &[String],
+    enrichment_computed_targets: &[String],
     computed_defs: &[ComputedFieldDef],
     extra_i64_targets: &[String],
     field_idx: &HashMap<String, u16>,
@@ -3324,6 +3365,8 @@ pub(crate) fn build_doc_field_plan(
     multi_value_fields: &HashSet<String>,
 ) -> Vec<DocFieldPlanEntry> {
     let extra_skip: HashSet<&str> = extra_i64_targets.iter().map(|s| s.as_str()).collect();
+    let enriched_computed_skip: HashSet<&str> =
+        enrichment_computed_targets.iter().map(|s| s.as_str()).collect();
     let mut plan = Vec::new();
 
     // Direct fields
@@ -3346,9 +3389,11 @@ pub(crate) fn build_doc_field_plan(
         }
     }
 
-    // Enrichment fields
+    // Enrichment (direct) fields — skip targets that are enrichment-computed
+    // (those get an EnrichedComputed entry below which handles Int/Bool/Str).
     for target in enrichment_targets {
         if extra_skip.contains(target.as_str()) { continue; }
+        if enriched_computed_skip.contains(target.as_str()) { continue; }
         if let Some(&fidx) = field_idx.get(target.as_str()) {
             let vtype = if boolean_fields.contains(target.as_str()) {
                 DocValueType::Boolean
@@ -3358,6 +3403,23 @@ pub(crate) fn build_doc_field_plan(
             plan.push(DocFieldPlanEntry {
                 doc_field_idx: fidx,
                 source: DocFieldSource::Enriched { target: target.clone() },
+                value_type: vtype,
+            });
+        }
+    }
+
+    // Enrichment computed fields — handle Int/Bool/Str values from enriched.computed.
+    for target in enrichment_computed_targets {
+        if extra_skip.contains(target.as_str()) { continue; }
+        if let Some(&fidx) = field_idx.get(target.as_str()) {
+            let vtype = if boolean_fields.contains(target.as_str()) {
+                DocValueType::Boolean
+            } else {
+                DocValueType::IntOrString
+            };
+            plan.push(DocFieldPlanEntry {
+                doc_field_idx: fidx,
+                source: DocFieldSource::EnrichedComputed { target: target.clone() },
                 value_type: vtype,
             });
         }

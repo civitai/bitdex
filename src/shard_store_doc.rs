@@ -1859,6 +1859,35 @@ impl StreamingDocWriter {
         shard.ops_count += 1;
     }
 
+    /// Write a pre-encoded DocOp::Merge payload directly to the shard file.
+    /// The payload must be the exact wire format produced by `DocOpCodec::encode_op`
+    /// for `DocOp::Merge` (see `encode_dump_merge` in dump_processor.rs).
+    /// Frames the payload with `[len:u32][payload][crc:u32]`.
+    ///
+    /// Skips field_defaults filtering — the caller (dump pipeline) already knows
+    /// it's writing non-default values via the compiled DocFieldPlan.
+    pub fn append_merge_payload(&self, slot: u32, payload: &[u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        let shard_key = SlotHexShard::slot_to_shard(slot);
+        let mutex = self.shards.entry(shard_key)
+            .or_insert_with(|| {
+                Arc::new(parking_lot::Mutex::new(self.open_shard(shard_key)))
+            })
+            .clone();
+
+        let len = payload.len() as u32;
+        let crc = crate::shard_store::crc32_of(payload);
+
+        let mut shard = mutex.lock();
+        use std::io::Write;
+        let _ = shard.writer.write_all(&len.to_le_bytes());
+        let _ = shard.writer.write_all(payload);
+        let _ = shard.writer.write_all(&crc.to_le_bytes());
+        shard.ops_count += 1;
+    }
+
     /// Write a single raw msgpack tuple. API-compatible with ShardStoreBulkWriter.
     pub fn append_tuple_raw(&self, slot: u32, field_idx: u16, value_bytes: &[u8]) {
         let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
