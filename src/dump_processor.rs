@@ -1338,6 +1338,76 @@ impl ShardPreCreator {
     }
 }
 
+/// Drain `filter_tuples` into per-field running bitmap map, merging with OR.
+/// Matches the end-of-chunk sort + grouped `from_sorted_iter` batch logic.
+fn flush_filter_tuples(
+    filter_tuples: &mut Vec<(u16, u64, u32)>,
+    filter_idx_to_name: &[String],
+    running: &mut HashMap<String, HashMap<u64, RoaringBitmap>>,
+) {
+    if filter_tuples.is_empty() {
+        return;
+    }
+    filter_tuples.sort_unstable();
+    filter_tuples.dedup();
+    let mut prev_field = filter_tuples[0].0;
+    let mut prev_value = filter_tuples[0].1;
+    let mut slots: Vec<u32> = Vec::new();
+    for &(field_idx, value, slot) in filter_tuples.iter() {
+        if field_idx != prev_field || value != prev_value {
+            if !slots.is_empty() {
+                let field_name = &filter_idx_to_name[prev_field as usize];
+                let value_map = running.entry(field_name.clone()).or_default();
+                let bm = RoaringBitmap::from_sorted_iter(slots.drain(..)).unwrap_or_default();
+                value_map
+                    .entry(prev_value)
+                    .and_modify(|existing| *existing |= &bm)
+                    .or_insert(bm);
+            }
+            prev_field = field_idx;
+            prev_value = value;
+        }
+        slots.push(slot);
+    }
+    if !slots.is_empty() {
+        let field_name = &filter_idx_to_name[prev_field as usize];
+        let value_map = running.entry(field_name.clone()).or_default();
+        let bm = RoaringBitmap::from_sorted_iter(slots.drain(..)).unwrap_or_default();
+        value_map
+            .entry(prev_value)
+            .and_modify(|existing| *existing |= &bm)
+            .or_insert(bm);
+    }
+    filter_tuples.clear();
+}
+
+/// Drain each bit-layer Vec<u32> in `sort_vecs` into running bitmap layers, merging with OR.
+fn flush_sort_vecs(
+    sort_vecs: &mut HashMap<String, Vec<Vec<u32>>>,
+    running: &mut HashMap<String, Vec<RoaringBitmap>>,
+) {
+    for (field, layers) in sort_vecs.iter_mut() {
+        let running_layers = running.entry(field.clone()).or_insert_with(|| {
+            (0..layers.len()).map(|_| RoaringBitmap::new()).collect()
+        });
+        if running_layers.len() < layers.len() {
+            running_layers.resize_with(layers.len(), RoaringBitmap::new);
+        }
+        for (bit, slots) in layers.iter_mut().enumerate() {
+            if slots.is_empty() {
+                continue;
+            }
+            slots.sort_unstable();
+            slots.dedup();
+            let bm = RoaringBitmap::from_sorted_iter(slots.drain(..)).unwrap_or_default();
+            running_layers[bit] |= bm;
+        }
+    }
+}
+
+/// Flush threshold for filter_tuples — ~140 MB per thread (10M * 14 bytes).
+const FILTER_TUPLE_FLUSH_THRESHOLD: usize = 10_000_000;
+
 pub fn process_dump(
     request: &DumpRequest,
     engine: &ConcurrentEngine,
@@ -1770,9 +1840,14 @@ pub fn process_dump_with_progress(
 
             // Flat Vec for filter bitmap tuples — push (field_idx, value, slot) per row.
             // Bitmaps built in post-pass via sort + from_sorted_iter (5.3x faster than per-row HashMap insert).
+            // Periodically flushed into `filter_maps_running` to bound memory at production scale.
             let mut filter_tuples: Vec<(u16, u64, u32)> = Vec::with_capacity(
-                ((range_end - range_start) / 100).max(1024) * 8
+                FILTER_TUPLE_FLUSH_THRESHOLD + 1024
             );
+            // Per-thread running filter/sort bitmap maps. Incrementally merged from filter_tuples/sort_vecs
+            // whenever the flat accumulators exceed their flush threshold, keeping peak memory bounded.
+            let mut filter_maps_running: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
+            let mut sort_maps_running: HashMap<String, Vec<RoaringBitmap>> = HashMap::new();
             // Collect sort slots into Vec<u32> per bit-layer (not RoaringBitmap).
             // After the row loop, sort + from_sorted_iter builds bitmaps faster.
             let mut sort_vecs: HashMap<String, Vec<Vec<u32>>> = sort_targets
@@ -2290,6 +2365,16 @@ pub fn process_dump_with_progress(
                     if let Some(ref sf) = shutdown { if sf() { break; } }
 
                 }
+                // Bound per-thread ephemeral memory: flush flat accumulators into
+                // per-thread running bitmap maps once filter_tuples grows large.
+                if filter_tuples.len() >= FILTER_TUPLE_FLUSH_THRESHOLD {
+                    flush_filter_tuples(
+                        &mut filter_tuples,
+                        filter_idx_to_name_ref,
+                        &mut filter_maps_running,
+                    );
+                    flush_sort_vecs(&mut sort_vecs, &mut sort_maps_running);
+                }
             }
             let remainder = count % LOG_INTERVAL;
             total_ref.fetch_add(remainder, Ordering::Relaxed);
@@ -2310,59 +2395,20 @@ pub fn process_dump_with_progress(
             #[cfg(feature = "dump-timing")]
             timings.print_summary(rayon::current_thread_index().unwrap_or(0));
 
-            // Convert filter_tuples → filter_maps via sort + grouped from_sorted_iter
-            // (5.3x faster than per-row HashMap entry().or_insert_with().insert()).
-            filter_tuples.sort_unstable();
-            filter_tuples.dedup();
-            let mut filter_maps: HashMap<String, HashMap<u64, RoaringBitmap>> = HashMap::new();
-            if !filter_tuples.is_empty() {
-                let mut prev_field = filter_tuples[0].0;
-                let mut prev_value = filter_tuples[0].1;
-                let mut slots: Vec<u32> = Vec::new();
-                for &(field_idx, value, slot) in &filter_tuples {
-                    if field_idx != prev_field || value != prev_value {
-                        if !slots.is_empty() {
-                            let field_name = &filter_idx_to_name_ref[prev_field as usize];
-                            filter_maps.entry(field_name.clone()).or_default().insert(
-                                prev_value,
-                                RoaringBitmap::from_sorted_iter(slots.drain(..)).unwrap_or_default(),
-                            );
-                        }
-                        prev_field = field_idx;
-                        prev_value = value;
-                    }
-                    slots.push(slot);
-                }
-                if !slots.is_empty() {
-                    let field_name = &filter_idx_to_name_ref[prev_field as usize];
-                    filter_maps.entry(field_name.clone()).or_default().insert(
-                        prev_value,
-                        RoaringBitmap::from_sorted_iter(slots.drain(..)).unwrap_or_default(),
-                    );
-                }
-            }
+            // Final drain of flat accumulators into per-thread running maps.
+            // Incremental flushes during the row loop keep peak memory bounded —
+            // this last flush just merges whatever's left over.
+            flush_filter_tuples(
+                &mut filter_tuples,
+                filter_idx_to_name_ref,
+                &mut filter_maps_running,
+            );
+            flush_sort_vecs(&mut sort_vecs, &mut sort_maps_running);
             drop(filter_tuples);
+            drop(sort_vecs);
 
-            // Convert sort_vecs → sort_maps via sort + from_sorted_iter
-            let sort_maps: HashMap<String, Vec<RoaringBitmap>> = sort_vecs
-                .into_iter()
-                .map(|(field, layers)| {
-                    let bitmaps: Vec<RoaringBitmap> = layers
-                        .into_iter()
-                        .map(|mut slots| {
-                            if slots.is_empty() {
-                                RoaringBitmap::new()
-                            } else {
-                                slots.sort_unstable();
-                                slots.dedup();
-                                RoaringBitmap::from_sorted_iter(slots.into_iter())
-                                    .unwrap_or_default()
-                            }
-                        })
-                        .collect();
-                    (field, bitmaps)
-                })
-                .collect();
+            let filter_maps = filter_maps_running;
+            let sort_maps = sort_maps_running;
 
             (filter_maps, sort_maps, alive, deferred, count, max_slot)
         })
