@@ -205,22 +205,22 @@ impl<'a> BitmapSink for AccumSink<'a> {
 /// Provides a thin wrapper that appends field-value tuples to the docstore's
 /// V2 shard files. Thread-safe via DocStore's internal per-shard locking.
 pub struct DocSink {
-    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
+    docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
 }
 
 impl DocSink {
-    pub fn new(docstore: Arc<parking_lot::Mutex<DocStoreV3>>) -> Self {
+    pub fn new(docstore: Arc<parking_lot::RwLock<DocStoreV3>>) -> Self {
         Self { docstore }
     }
 
     /// Append a single field-value tuple to the docstore.
     pub fn append(&self, slot: u32, field_idx: u16, value: &[u8]) -> Result<()> {
-        Ok(self.docstore.lock().append_tuple(slot, field_idx, value)?)
+        Ok(self.docstore.write().append_tuple(slot, field_idx, value)?)
     }
 
     /// Batch append tuples to the docstore.
     pub fn append_batch(&self, tuples: Vec<(u32, u16, Vec<u8>)>) -> Result<()> {
-        Ok(self.docstore.lock().append_tuples_batch(tuples)?)
+        Ok(self.docstore.write().append_tuples_batch(tuples)?)
     }
 }
 
