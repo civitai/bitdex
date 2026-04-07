@@ -1368,6 +1368,19 @@ pub fn process_dump(
     let t_save = Instant::now();
     save_phase_to_disk(&mut result, &alive_s, &filter_s, &sort_s, &meta_s, &bitmap_path, &dictionaries, &request.name, request.sets_alive)?;
     eprintln!("  Dump {} save_phase_to_disk in {:.1}s", request.name, t_save.elapsed().as_secs_f64());
+    // Clear the doc cache so subsequent reads see merged fields written by this
+    // phase. Without this, any slot cached during a prior phase keeps its old
+    // field set (e.g., images-phase cache entries hide tagIds added by tags phase).
+    engine.clear_doc_cache();
+    // Mark every filter and sort field as pending lazy reload from disk so the
+    // next query path picks up the bitmaps we just wrote. Without this, the
+    // engine's in-memory bitmap state remains empty (or stale) and queries
+    // return zero results until the field is reloaded explicitly.
+    let filter_field_names: Vec<String> = engine.config()
+        .filter_fields.iter().map(|f| f.name.clone()).collect();
+    let sort_field_names: Vec<String> = engine.config()
+        .sort_fields.iter().map(|f| f.name.clone()).collect();
+    engine.mark_fields_pending_reload(&filter_field_names, &sort_field_names);
     eprintln!("  Dump {} total process_dump in {:.1}s", request.name, t_total.elapsed().as_secs_f64());
     Ok(result)
 }
@@ -1382,6 +1395,10 @@ pub fn reload_after_dumps(engine: &ConcurrentEngine, had_alive_phase: bool) {
     let t_mark = Instant::now();
     engine.mark_fields_pending_reload(&filter_names, &sort_names);
     let mark_s = t_mark.elapsed().as_secs_f64();
+    // Clear the doc cache so subsequent reads see merged fields from this phase.
+    // Without this, any slot that was cached during a prior phase keeps its old
+    // field set (e.g., images-phase cache entries hide tagIds added by tags phase).
+    engine.clear_doc_cache();
     let mut alive_s = 0.0;
     if had_alive_phase {
         let t_alive = Instant::now();
@@ -4240,5 +4257,205 @@ mod tests {
                 slot
             );
         }
+    }
+
+    /// Reproduces a production bug where multi-value field (tagIds) loaded in a
+    /// second dump phase ends up with values belonging to a different slot in
+    /// the docstore. Exercises the per-slot MultiInt accumulator in
+    /// `process_dump_with_progress` (mi_accum / mi_prev_slot path) plus the
+    /// merge into docs already written by a prior phase.
+    #[test]
+    fn test_multi_int_phase_merges_with_images() {
+        use crate::config::{Config, FilterFieldConfig, FilterFieldType, SortFieldConfig};
+        use crate::query::{BitdexQuery, FilterClause, Value};
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_path = dir.path().join("docs");
+        let bitmap_path = dir.path().join("bitmaps");
+
+        let mut config = Config {
+            filter_fields: vec![
+                FilterFieldConfig {
+                    name: "nsfwLevel".to_string(),
+                    field_type: FilterFieldType::SingleValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: true,
+                    per_value_lazy: false,
+                },
+                FilterFieldConfig {
+                    name: "userId".to_string(),
+                    field_type: FilterFieldType::SingleValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false,
+                    per_value_lazy: false,
+                },
+                FilterFieldConfig {
+                    name: "tagIds".to_string(),
+                    field_type: FilterFieldType::MultiValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false,
+                    per_value_lazy: false,
+                },
+            ],
+            sort_fields: vec![
+                SortFieldConfig {
+                    name: "id".to_string(),
+                    source_type: "uint32".to_string(),
+                    encoding: "linear".to_string(),
+                    bits: 32,
+                    eager_load: false,
+                    computed: None,
+                },
+                SortFieldConfig {
+                    name: "existedAt".to_string(),
+                    source_type: "uint32".to_string(),
+                    encoding: "linear".to_string(),
+                    bits: 32,
+                    eager_load: false,
+                    computed: None,
+                },
+            ],
+            flush_interval_us: 50,
+            merge_interval_ms: 100,
+            channel_capacity: 10_000,
+            ..Default::default()
+        };
+        config.storage.bitmap_path = Some(bitmap_path.clone());
+
+        let engine = crate::concurrent_engine::ConcurrentEngine::new_with_path(
+            config, docs_path.as_path(),
+        ).unwrap();
+
+        // --- Phase 1: images ---
+        let images_csv = dir.path().join("images.csv");
+        std::fs::write(
+            &images_csv,
+            "id,nsfwLevel,userId,scannedAtSecs,createdAtSecs\n\
+             1,1,100,1000,2000\n\
+             2,1,100,1100,2100\n\
+             3,4,200,1200,2200\n\
+             4,1,300,1300,2300\n",
+        ).unwrap();
+
+        let images_request: DumpRequest = serde_json::from_value(serde_json::json!({
+            "name": "images",
+            "csv_path": images_csv.to_str().unwrap(),
+            "format": "csv",
+            "slot_field": "id",
+            "sets_alive": true,
+            "fields": ["nsfwLevel", "userId"],
+            "computed_fields": [
+                { "target": "existedAt", "expression": "max(scannedAtSecs, createdAtSecs)" }
+            ]
+        })).unwrap();
+
+        let r1 = process_dump(&images_request, &engine, dir.path(), None, None, None, None);
+        assert!(r1.is_ok(), "images phase failed: {:?}", r1.err());
+        assert_eq!(r1.unwrap().row_count, 4);
+
+        // Sanity: slot 1 after phase 1
+        let doc1_p1 = engine.get_document(1).unwrap().expect("slot 1 should exist after phase 1");
+        match doc1_p1.fields.get("nsfwLevel") {
+            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(1))) => {}
+            other => panic!("slot 1 nsfwLevel after phase 1: {:?}", other),
+        }
+        match doc1_p1.fields.get("userId") {
+            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(100))) => {}
+            other => panic!("slot 1 userId after phase 1: {:?}", other),
+        }
+        match doc1_p1.fields.get("existedAt") {
+            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(2000))) => {}
+            other => panic!("slot 1 existedAt after phase 1: {:?}", other),
+        }
+
+        // --- Phase 2: tags (multi-value, rows ordered by imageId) ---
+        let tags_csv = dir.path().join("tags.csv");
+        std::fs::write(
+            &tags_csv,
+            "tagId,imageId\n\
+             10,1\n\
+             20,1\n\
+             30,1\n\
+             10,2\n\
+             40,2\n\
+             10,3\n\
+             50,4\n\
+             60,4\n",
+        ).unwrap();
+
+        let tags_request: DumpRequest = serde_json::from_value(serde_json::json!({
+            "name": "tags",
+            "csv_path": tags_csv.to_str().unwrap(),
+            "format": "csv",
+            "slot_field": "imageId",
+            "fields": [
+                { "column": "tagId", "target": "tagIds" }
+            ]
+        })).unwrap();
+
+        let r2 = process_dump(&tags_request, &engine, dir.path(), None, None, None, None);
+        assert!(r2.is_ok(), "tags phase failed: {:?}", r2.err());
+
+        // --- Docstore assertions ---
+        let get_tags = |slot: u32| -> Vec<i64> {
+            let doc = engine.get_document(slot).unwrap()
+                .unwrap_or_else(|| panic!("slot {} missing after phase 2", slot));
+            let f = doc.fields.get("tagIds").cloned()
+                .unwrap_or_else(|| panic!("slot {} has no tagIds, fields: {:?}", slot, doc.fields.keys().collect::<Vec<_>>()));
+            match f {
+                crate::mutation::FieldValue::Multi(vals) => vals.into_iter().map(|v| match v {
+                    crate::query::Value::Integer(i) => i,
+                    other => panic!("slot {} tag value not integer: {:?}", slot, other),
+                }).collect(),
+                other => panic!("slot {} tagIds not Multi: {:?}", slot, other),
+            }
+        };
+
+        let sort_sorted = |mut v: Vec<i64>| -> Vec<i64> { v.sort(); v };
+
+        assert_eq!(sort_sorted(get_tags(1)), vec![10, 20, 30], "slot 1 tagIds mismatch");
+        assert_eq!(sort_sorted(get_tags(2)), vec![10, 40], "slot 2 tagIds mismatch");
+        assert_eq!(sort_sorted(get_tags(3)), vec![10], "slot 3 tagIds mismatch");
+        assert_eq!(sort_sorted(get_tags(4)), vec![50, 60], "slot 4 tagIds mismatch");
+
+        // Verify phase 1 fields are still present on slot 1 (merge not clobbered)
+        let doc1 = engine.get_document(1).unwrap().unwrap();
+        match doc1.fields.get("nsfwLevel") {
+            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(1))) => {}
+            other => panic!("slot 1 nsfwLevel after phase 2 (merge clobbered?): {:?}", other),
+        }
+        match doc1.fields.get("userId") {
+            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(100))) => {}
+            other => panic!("slot 1 userId after phase 2: {:?}", other),
+        }
+        match doc1.fields.get("existedAt") {
+            Some(crate::mutation::FieldValue::Single(crate::query::Value::Integer(2000))) => {}
+            other => panic!("slot 1 existedAt after phase 2: {:?}", other),
+        }
+
+        // --- Bitmap assertions via execute_query ---
+        let query_tag = |tag: i64| -> Vec<i64> {
+            let q = BitdexQuery {
+                filters: vec![FilterClause::Eq("tagIds".to_string(), Value::Integer(tag))],
+                sort: None,
+                limit: 100,
+                cursor: None,
+                offset: None,
+                skip_cache: true,
+            };
+            let mut ids = engine.execute_query(&q).unwrap().ids;
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(query_tag(10), vec![1, 2, 3], "bitmap tagIds=10");
+        assert_eq!(query_tag(20), vec![1], "bitmap tagIds=20");
+        assert_eq!(query_tag(30), vec![1], "bitmap tagIds=30");
+        assert_eq!(query_tag(40), vec![2], "bitmap tagIds=40");
+        assert_eq!(query_tag(50), vec![4], "bitmap tagIds=50");
+        assert_eq!(query_tag(60), vec![4], "bitmap tagIds=60");
     }
 }

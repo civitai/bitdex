@@ -5320,6 +5320,14 @@ impl ConcurrentEngine {
             cache.remove(slot);
         }
     }
+    /// Clear the entire doc cache. Used after dump phases when many docs may
+    /// have been merged with new fields — any cached entries from prior phases
+    /// are stale and would mask the new merged data.
+    pub fn clear_doc_cache(&self) {
+        if let Some(ref cache) = self.doc_cache {
+            cache.clear();
+        }
+    }
     pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64, usize) {
         match &self.doc_cache {
             Some(cache) => (

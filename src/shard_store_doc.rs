@@ -594,7 +594,24 @@ impl OpCodec for DocOpCodec {
                 let doc = snapshot.docs.entry(*slot).or_default();
                 for (field_idx, value) in fields {
                     if let Some(entry) = doc.iter_mut().find(|(f, _)| *f == *field_idx) {
-                        entry.1 = value.clone();
+                        // Multi-value union semantics: when both old and new are
+                        // multi-int (Mi), union the value lists with dedup. This
+                        // is critical for bulk dumps where multiple parallel chunks
+                        // emit Merge ops for the same slot with different subsets
+                        // of values (e.g., tags phase where each chunk processes
+                        // its own range of tag rows for a given imageId).
+                        // Without this, the last Merge would overwrite all prior
+                        // values, losing tags.
+                        match (&mut entry.1, value) {
+                            (PackedValue::Mi(existing), PackedValue::Mi(incoming)) => {
+                                for v in incoming {
+                                    if !existing.contains(v) {
+                                        existing.push(*v);
+                                    }
+                                }
+                            }
+                            _ => entry.1 = value.clone(),
+                        }
                     } else {
                         doc.push((*field_idx, value.clone()));
                     }
