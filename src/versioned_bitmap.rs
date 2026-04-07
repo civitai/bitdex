@@ -234,6 +234,27 @@ impl VersionedBitmap {
         self.generation += 1;
     }
 
+    /// Diff-aware point membership query. Cheap — does NOT materialize the
+    /// fused bitmap. Used by hot lookups (sort reconstruct_value) that need
+    /// to check one slot without paying for a full base+diff fuse.
+    ///
+    /// Semantics:
+    ///   present = base.contains(slot)
+    ///   if diff.clears.contains(slot): present = false
+    ///   if diff.sets.contains(slot):   present = true
+    pub fn fused_contains(&self, slot: u32) -> bool {
+        if self.diff.is_empty() {
+            return self.base.contains(slot);
+        }
+        if self.diff.sets.contains(slot) {
+            return true;
+        }
+        if self.diff.clears.contains(slot) {
+            return false;
+        }
+        self.base.contains(slot)
+    }
+
     /// Same as `merge()` but returns (clone_us, or_us, sub_us) timings.
     /// Used by ops-trace instrumentation to attribute sort merge cost.
     /// Returns (0, 0, 0) when the diff is empty or the base is unloaded.

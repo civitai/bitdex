@@ -420,34 +420,24 @@ impl WriteBatch {
         }
         t.alive_ns = t0.elapsed().as_nanos() as u64;
 
-        // Eager merge: sort diffs MUST be empty before readers see them.
-        // Merge only sort fields that were mutated in this batch.
-        let t0 = Instant::now();
-        let mut mutated_sort_fields: HashSet<&str> = HashSet::new();
-        for key in self.sort_sets.keys() {
-            mutated_sort_fields.insert(&key.field);
-        }
-        for key in self.sort_clears.keys() {
-            mutated_sort_fields.insert(&key.field);
-        }
-        for field_name in &mutated_sort_fields {
-            let f0 = Instant::now();
-            if let Some(field) = sorts.get_field_mut(field_name) {
-                field.merge_dirty();
-            }
-            // Attribute to existing per-sort-field bucket so render_summary
-            // shows total cost (clears + sets + merge) per field.
-            let arc_name: Arc<str> = Arc::from(*field_name);
-            *t.per_sort_field_ns.entry(arc_name).or_insert(0) +=
-                f0.elapsed().as_nanos() as u64;
-        }
-        t.sort_merge_dirty_ns = t0.elapsed().as_nanos() as u64;
+        // Sort diffs are NOT merged here. The read path (SortField::top_n)
+        // fuses base + diff via fused_cow on demand at the start of each
+        // query, sharing the snapshot across bifurcate / cursor / order.
+        //
+        // The previous eager-merge pattern triggered an Arc::make_mut deep
+        // clone of the layer base on every dirty layer per cycle (~500ms
+        // for sortAt at 109M scale, dominated by the 6 MB roaring clone of
+        // a 54M-bit base just to flip 2 bits). Lazy fuse moves that cost
+        // out of the write hot path entirely. The merge thread is now the
+        // sole place that promotes dirty diffs into bases on its persist
+        // cycle (~5s).
+        //
+        // For the trace summary, we still record `sort_merge_dirty_ns = 0`
+        // so existing dashboards/log parsers don't break.
+        t.sort_merge_dirty_ns = 0;
 
-        // Filter diffs are NOT merged here — they accumulate in the diff layer
-        // and are fused at read time by the executor (apply_diff). The merge
-        // thread compacts them periodically into bases. This avoids the
-        // Arc::make_mut() clone cascade that caused the write regression.
-        // See: docs/architecture-risk-review.md issue 3/4, P5/P7.
+        // Filter diffs are also NOT merged here — same pattern, fused at
+        // read time by the executor (apply_diff_eq).
         // Merge alive bitmap
         let t0 = Instant::now();
         slots.merge_alive();

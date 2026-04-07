@@ -114,13 +114,23 @@ impl SortField {
         }
     }
 
-    /// Get a reference to a specific bit layer's base bitmap.
-    /// Requires that the layer has been merged (no pending diff).
+    /// Get a reference to a specific bit layer's BASE bitmap (no diff
+    /// fusion). For diff-aware reads, use `layer_fused` or fuse via
+    /// `bit_layers[bit].fused_cow()`.
+    ///
+    /// Kept for callers that explicitly want the base only (e.g. tests
+    /// asserting persisted state) or know the layer is clean.
     pub fn layer(&self, bit: usize) -> Option<&RoaringBitmap> {
-        self.bit_layers.get(bit).map(|vb| {
-            debug_assert!(!vb.is_dirty(), "sort layer {bit} has unmerged diff");
-            vb.base().as_ref()
-        })
+        self.bit_layers.get(bit).map(|vb| vb.base().as_ref())
+    }
+    /// Get the fused (base + diff) bitmap for a specific bit layer.
+    ///
+    /// Returns `Cow::Borrowed(&base)` when the layer is clean (zero copy)
+    /// or `Cow::Owned` materializing base | sets - clears when dirty.
+    /// Use this in any read path that does AND/OR with sort layers; the
+    /// query planner will get correct results regardless of pending diffs.
+    pub fn layer_fused(&self, bit: usize) -> Option<Cow<'_, RoaringBitmap>> {
+        self.bit_layers.get(bit).map(|vb| vb.fused_cow())
     }
 
     /// Perform top-N sort traversal on a candidate set using MSB-to-LSB bifurcation.
@@ -147,11 +157,35 @@ impl SortField {
             return Vec::new();
         }
 
+        // Pre-fuse all bit layers ONCE for this query.
+        //
+        // For clean layers (the steady-state common case after the merge
+        // thread has run) `fused_cow` returns `Cow::Borrowed(&base)` —
+        // zero-copy. For dirty layers it materializes the fused result
+        // (one ~6 MB clone per dirty layer). The fused snapshot is then
+        // shared across bifurcate / apply_cursor_filter / order_results
+        // so each layer is fused at most once per query.
+        //
+        // This replaces the prior pattern of eagerly merging dirty diffs
+        // into bases on every flush cycle (which cost ~500ms per cycle
+        // under sustained ops because every dirty layer triggered an
+        // Arc::make_mut deep clone).
+        let layers: Vec<Cow<'_, RoaringBitmap>> = self
+            .bit_layers
+            .iter()
+            .map(|vb| vb.fused_cow())
+            .collect();
+
         // Apply cursor filtering if present
         let effective_candidates;
         let candidates = if let Some((cursor_sort_value, cursor_slot_id)) = cursor {
-            effective_candidates =
-                self.apply_cursor_filter(candidates, descending, cursor_sort_value, cursor_slot_id);
+            effective_candidates = self.apply_cursor_filter_with_layers(
+                candidates,
+                descending,
+                cursor_sort_value,
+                cursor_slot_id,
+                &layers,
+            );
             &effective_candidates
         } else {
             candidates
@@ -162,7 +196,7 @@ impl SortField {
         }
 
         // MSB-to-LSB bifurcation: collect top-N slots via bitmap AND operations
-        let top_n_bitmap = self.bifurcate(candidates, limit, descending);
+        let top_n_bitmap = self.bifurcate_with_layers(candidates, limit, descending, &layers);
 
         // Reconstruct values ONLY for the final top-N slots and sort them
         self.order_results(&top_n_bitmap, descending)
@@ -172,11 +206,16 @@ impl SortField {
     ///
     /// Walks bit layers from MSB to LSB, narrowing candidates at each layer.
     /// Returns a bitmap containing exactly min(limit, candidates.len()) top slots.
-    fn bifurcate(
+    ///
+    /// Operates on pre-fused layers (Cow::Borrowed for clean, Cow::Owned for
+    /// dirty) so callers can share one fused snapshot across multiple
+    /// traversal passes.
+    fn bifurcate_with_layers(
         &self,
         candidates: &RoaringBitmap,
         limit: usize,
         descending: bool,
+        layers: &[Cow<'_, RoaringBitmap>],
     ) -> RoaringBitmap {
         let total = candidates.len() as usize;
         if total <= limit {
@@ -193,8 +232,7 @@ impl SortField {
                 break;
             }
 
-            debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in bifurcate");
-            let layer: &RoaringBitmap = self.bit_layers[bit].base();
+            let layer: &RoaringBitmap = &layers[bit];
 
             // preferred = slots that have the "better" bit value at this position
             let preferred = if descending {
@@ -265,12 +303,13 @@ impl SortField {
     /// candidates into "strictly better than cursor", "equal so far", and "strictly worse".
     /// Only "strictly better" and the portion of "equal" that passes the slot ID tiebreaker
     /// are retained.
-    fn apply_cursor_filter(
+    fn apply_cursor_filter_with_layers(
         &self,
         candidates: &RoaringBitmap,
         descending: bool,
         cursor_sort_value: u64,
         cursor_slot_id: u32,
+        layers: &[Cow<'_, RoaringBitmap>],
     ) -> RoaringBitmap {
         let cursor_value = cursor_sort_value as u32;
 
@@ -287,8 +326,7 @@ impl SortField {
             }
 
             let cursor_bit_set = (cursor_value >> bit) & 1 == 1;
-            debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in apply_cursor_filter");
-            let layer: &RoaringBitmap = self.bit_layers[bit].base();
+            let layer: &RoaringBitmap = &layers[bit];
 
             let equal_with_bit_set = &equal & layer;
             let equal_with_bit_clear = &equal - layer;
@@ -336,13 +374,16 @@ impl SortField {
         confirmed
     }
 
-    /// Reconstruct the sort value for a given slot by reading from the base bitmap.
-    /// Requires that all layers have been merged.
+    /// Reconstruct the sort value for a given slot.
+    ///
+    /// Diff-aware: uses `VersionedBitmap::fused_contains` so this works
+    /// correctly when layers have unmerged diffs (lazy fuse). Cheap point
+    /// query — does NOT materialize a fused bitmap, just checks each layer
+    /// against base + diff.
     pub fn reconstruct_value(&self, slot: u32) -> u32 {
         let mut value = 0u32;
         for bit in 0..self.num_bits {
-            debug_assert!(!self.bit_layers[bit].is_dirty(), "sort layer {bit} has unmerged diff in reconstruct_value");
-            if self.bit_layers[bit].base().contains(slot) {
+            if self.bit_layers[bit].fused_contains(slot) {
                 value |= 1 << bit;
             }
         }

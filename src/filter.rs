@@ -270,27 +270,14 @@ impl FilterField {
     }
     /// Closure-based iteration over (value, &VersionedBitmap) pairs.
     ///
-    /// Snapshots the keys under a brief read lock, then for each key
-    /// re-acquires the read lock and invokes the closure with the
-    /// corresponding `VersionedBitmap`. This **releases the read lock
-    /// between iterations** so a concurrent writer can interleave —
-    /// critical for high-cardinality fields where holding the lock
-    /// across the full iteration would block writers for seconds.
-    ///
-    /// Trade-off: ~22.5M lock acquisitions instead of 1, but each is a
-    /// few nanoseconds and writers don't wait for the full iteration.
-    /// New keys added during iteration are NOT visited; deleted keys
-    /// are skipped via the get() check inside the loop.
+    /// Holds the read lock for the duration of the iteration. For
+    /// high-cardinality fields this can be ~1-2 seconds. Earlier
+    /// per-key brief-lock variant was abandoned due to writer
+    /// starvation under concurrent reader load (see `bitmap_bytes`).
     pub fn for_each_versioned<F: FnMut(u64, &VersionedBitmap)>(&self, mut f: F) {
-        let keys: Vec<u64> = {
-            let r = self.bitmaps.read();
-            r.keys().copied().collect()
-        };
-        for k in keys {
-            let r = self.bitmaps.read();
-            if let Some(vb) = r.get(&k) {
-                f(k, vb);
-            }
+        let r = self.bitmaps.read();
+        for (k, vb) in r.iter() {
+            f(*k, vb);
         }
     }
     /// Snapshot all (value, VersionedBitmap) pairs into an owned Vec under
@@ -309,24 +296,19 @@ impl FilterField {
     }
     /// Return the serialized byte size of all bitmaps in this field.
     ///
-    /// Snapshots the keys briefly, then iterates with per-key brief read
-    /// locks so the flush thread can interleave its writes. Holding the
-    /// read lock across a 22.5M-entry sum (postId) blocks writers for
-    /// seconds; this pattern keeps each lock window at single-digit
-    /// microseconds.
+    /// Holds the read lock for the duration of the iteration. For
+    /// high-cardinality fields (postId at 22.5M entries) this can take
+    /// ~1-2 seconds. **DO NOT call this on the hot path** — it's
+    /// intended for rare metrics scrapes only. The earlier chunked
+    /// per-key-lock variant was abandoned because 22.5M brief lock
+    /// acquisitions starved concurrent writers (`load_field_complete`)
+    /// indefinitely under heavy reader load.
+    ///
+    /// TODO: cache the value with a TTL or update incrementally on
+    /// mutation rather than recomputing on every metric scrape.
     pub fn bitmap_bytes(&self) -> usize {
-        let keys: Vec<u64> = {
-            let r = self.bitmaps.read();
-            r.keys().copied().collect()
-        };
-        let mut total = 0usize;
-        for k in keys {
-            let r = self.bitmaps.read();
-            if let Some(vb) = r.get(&k) {
-                total += vb.bitmap_bytes();
-            }
-        }
-        total
+        let r = self.bitmaps.read();
+        r.values().map(|vb| vb.bitmap_bytes()).sum()
     }
     /// Drop all base bitmaps and mark every value as unloaded.
     /// The diff layers are preserved so mutations can accumulate
@@ -340,6 +322,18 @@ impl FilterField {
     /// Reload a complete field from disk, merging persisted bases into any
     /// existing diff-only placeholders. After loading, all values are marked loaded
     /// so merge_dirty() can compact their diffs normally.
+    ///
+    /// Holds the write lock for the entire operation. For postId at
+    /// 22.5M entries this is ~1-2 seconds during which concurrent reads
+    /// block. Earlier chunked variants were abandoned because they
+    /// allowed reader starvation: per-chunk releases gave the memory
+    /// scanner thread a window to grab the read lock for ~1.5s
+    /// (`bitmap_bytes` iterates the full HashMap), and the writer
+    /// would never make progress.
+    ///
+    /// The proper fix is per-value lazy writes (don't load the full
+    /// field at all on first access; load each value's bitmap from
+    /// ShardStore on demand). That's tracked separately.
     pub fn load_field_complete(&self, data: HashMap<u64, RoaringBitmap>) {
         let mut w = self.bitmaps.write();
         for (value, bitmap) in data {
@@ -347,7 +341,8 @@ impl FilterField {
                 .or_insert_with(VersionedBitmap::new_unloaded)
                 .load_base(&bitmap);
         }
-        // Mark any diff-only values (mutated while unloaded, not on disk) as loaded
+        // Mark any diff-only values (mutated while unloaded, not on
+        // disk) as loaded. Same lock window.
         for vb in w.values_mut() {
             vb.mark_loaded();
         }
