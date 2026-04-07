@@ -55,6 +55,9 @@ struct RowTimings {
     enrichment_bitmap: u64,
     computed_field: u64,
     doc_encode: u64,
+    doc_field_collect: u64,  // sub-timing: execute_doc_plan
+    doc_pack_encode: u64,    // sub-timing: encode_dump_merge
+    doc_mmap_write: u64,     // sub-timing: append_merge_payload
     deferred_alive: u64,
     total: u64,
     enriched_get_calls: u64,
@@ -78,6 +81,9 @@ impl RowTimings {
             ("enrichment_bm", self.enrichment_bitmap),
             ("computed_field", self.computed_field),
             ("doc_encode", self.doc_encode),
+            ("  doc_field_collect", self.doc_field_collect),
+            ("  doc_pack_encode", self.doc_pack_encode),
+            ("  doc_mmap_write", self.doc_mmap_write),
             ("deferred_alive", self.deferred_alive),
         ];
         let total_ns = self.total;
@@ -2221,6 +2227,8 @@ pub fn process_dump_with_progress(
                     }
                 } else {
                     let mut doc_fields: Vec<(u16, DumpFieldValue)> = Vec::with_capacity(20);
+                    #[cfg(feature = "dump-timing")]
+                    let _t_collect = std::time::Instant::now();
                     execute_doc_plan(
                         doc_field_plan_ref,
                         &row,
@@ -2232,9 +2240,19 @@ pub fn process_dump_with_progress(
                         &config_computed_sort_vals,
                         &mut doc_fields,
                     );
+                    #[cfg(feature = "dump-timing")]
+                    { timings.doc_field_collect += _t_collect.elapsed().as_nanos() as u64; }
                     if !doc_fields.is_empty() {
+                        #[cfg(feature = "dump-timing")]
+                        let _t_pack = std::time::Instant::now();
                         encode_dump_merge(slot, &doc_fields, &mut doc_encode_buf);
+                        #[cfg(feature = "dump-timing")]
+                        { timings.doc_pack_encode += _t_pack.elapsed().as_nanos() as u64; }
+                        #[cfg(feature = "dump-timing")]
+                        let _t_write = std::time::Instant::now();
                         bulk_writer.append_merge_payload(slot, &doc_encode_buf);
+                        #[cfg(feature = "dump-timing")]
+                        { timings.doc_mmap_write += _t_write.elapsed().as_nanos() as u64; }
                     }
                 }
                 #[cfg(feature = "dump-timing")]
