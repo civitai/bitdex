@@ -385,10 +385,43 @@ impl SortField {
 
     /// Merge only dirty bit layers (those with pending diffs).
     pub fn merge_dirty(&mut self) {
-        for layer in &mut self.bit_layers {
-            if layer.is_dirty() {
-                layer.merge();
+        let total_start = std::time::Instant::now();
+        let mut per_layer_us: Vec<(usize, u128, u128, u128, u64, u64, u64)> = Vec::new();
+        // (bit, clone_us, set_us, sub_us, base_card_before, sets_card, clears_card)
+        for (bit, layer) in self.bit_layers.iter_mut().enumerate() {
+            if !layer.is_dirty() {
+                continue;
             }
+            let base_card = layer.base().len();
+            let sets_card = layer.diff().sets.len();
+            let clears_card = layer.diff().clears.len();
+            let (clone_us, set_us, sub_us) = layer.merge_with_timing();
+            if clone_us + set_us + sub_us > 1_000 {
+                per_layer_us.push((bit, clone_us, set_us, sub_us, base_card, sets_card, clears_card));
+            }
+        }
+        let total_us = total_start.elapsed().as_micros();
+        if total_us > 50_000 {
+            // Log only if total >50ms — surfaces sort merge spikes.
+            // Top 5 slowest layers by total time.
+            per_layer_us.sort_by(|a, b| (b.1 + b.2 + b.3).cmp(&(a.1 + a.2 + a.3)));
+            let top: Vec<String> = per_layer_us
+                .iter()
+                .take(5)
+                .map(|(b, c, s, d, bc, sc, cc)| {
+                    format!(
+                        "L{}(base={} sets={} clears={} clone={}μs |=={}μs -=={}μs)",
+                        b, bc, sc, cc, c, s, d
+                    )
+                })
+                .collect();
+            tracing::warn!(
+                "[sort_merge_slow] field={} total={}μs dirty_layers={} top=[{}]",
+                self.config.name,
+                total_us,
+                per_layer_us.len(),
+                top.join(", ")
+            );
         }
     }
 
