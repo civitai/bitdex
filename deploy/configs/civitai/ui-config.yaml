@@ -66,7 +66,16 @@ display:
 card:
   image:
     field: url
-    template: "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/{value}/width={width}/image.jpeg"
+    # Type-aware templates: frontend reads `type_field` from the doc and picks
+    # the matching template. Falls back to `default_type` if the doc's type
+    # isn't in the map. For Civitai videos we use the CF Images transcode+anim=false
+    # variant which returns a static JPEG thumbnail — same <img> rendering,
+    # no <video> element needed.
+    type_field: type
+    default_type: image
+    templates:
+      image: "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/{value}/width={width}/image.jpeg"
+      video: "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/{value}/anim=false,transcode=true,width={width}/image.jpeg"
     thumbnail_width: 400
     full_width: 1200
   badges:
@@ -97,9 +106,15 @@ card:
 detail:
   fields:
     - field: url
-      label: "Image"
+      label: "Media"
       display: image
-      template: "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/{value}/width=800/image.jpeg"
+      # Same type-aware dispatch as the card — picks jpeg for images or the
+      # anim=false,transcode=true variant for videos.
+      type_field: type
+      default_type: image
+      templates:
+        image: "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/{value}/width=800/image.jpeg"
+        video: "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/{value}/anim=false,transcode=true,width=800/image.jpeg"
       width_field: width
       height_field: height
 

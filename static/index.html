@@ -707,12 +707,19 @@ function renderCards(slotIds, documents, append) {
     card.className = 'card';
     card.onclick = () => openModal(slotId, fields);
 
-    // Image
+    // Image (supports type-aware templates for mixed image/video indexes)
     const imgCfg = cardCfg.image;
     if (imgCfg) {
       const imgVal = extractField(fields, imgCfg.field);
       const thumbWidth = imgCfg.thumbnail_width || 400;
-      const tmpl = imgCfg.template || '{value}';
+      // Pick template by doc type if imgCfg.templates is defined, else fall
+      // back to imgCfg.template (legacy single-template config).
+      let tmpl = imgCfg.template || '{value}';
+      if (imgCfg.templates) {
+        const typeField = imgCfg.type_field || 'type';
+        const docType = extractField(fields, typeField);
+        tmpl = imgCfg.templates[docType] || imgCfg.templates[imgCfg.default_type || 'image'] || tmpl;
+      }
       const thumbUrl = imgVal ? fillTemplate(tmpl.replace('{width}', thumbWidth), fields, imgVal) : null;
       if (thumbUrl) {
         const img = document.createElement('img');
@@ -783,8 +790,16 @@ function openModal(slotId, fields) {
   const imgField = detailFields.find(f => f.display === 'image');
   if (imgField) {
     const val = extractField(fields, imgField.field);
-    if (val && imgField.template) {
-      let url = fillTemplate(imgField.template, fields, val);
+    // Type-aware template: if imgField.templates is defined, pick the template
+    // matching the doc's type field; else fall back to imgField.template.
+    let tmpl = imgField.template;
+    if (imgField.templates) {
+      const typeField = imgField.type_field || 'type';
+      const docType = extractField(fields, typeField);
+      tmpl = imgField.templates[docType] || imgField.templates[imgField.default_type || 'image'] || tmpl;
+    }
+    if (val && tmpl) {
+      let url = fillTemplate(tmpl, fields, val);
       img.src = url;
       img.style.display = '';
       // Set width/height if configured
