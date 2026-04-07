@@ -38,7 +38,7 @@ use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 /// is safe because no concurrent writer can modify the same slot's doc between
 /// the read and write within a single WAL batch cycle.
 pub struct DocWriter {
-    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
+    docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
     field_dict: HashMap<String, u16>,
     pending: Vec<(u32, u16, Vec<u8>)>,
     pending_append: Vec<(u32, u16, PackedValue)>,
@@ -46,8 +46,8 @@ pub struct DocWriter {
 }
 impl DocWriter {
     /// Create a DocWriter from the engine's docstore.
-    pub fn new(docstore: Arc<parking_lot::Mutex<DocStoreV3>>) -> Self {
-        let field_dict = docstore.lock().field_dict_snapshot();
+    pub fn new(docstore: Arc<parking_lot::RwLock<DocStoreV3>>) -> Self {
+        let field_dict = docstore.read().field_dict_snapshot();
         Self {
             docstore,
             field_dict,
@@ -114,14 +114,14 @@ impl DocWriter {
     pub fn flush(&mut self) {
         if !self.pending.is_empty() {
             let tuples = std::mem::take(&mut self.pending);
-            if let Err(e) = self.docstore.lock().append_tuples_batch(tuples) {
+            if let Err(e) = self.docstore.write().append_tuples_batch(tuples) {
                 tracing::warn!("DocWriter flush failed: {e}");
             }
         }
         if !self.pending_append.is_empty() || !self.pending_remove.is_empty() {
             let appends = std::mem::take(&mut self.pending_append);
             let removes = std::mem::take(&mut self.pending_remove);
-            if let Err(e) = self.docstore.lock().append_multi_ops_batch(appends, removes) {
+            if let Err(e) = self.docstore.write().append_multi_ops_batch(appends, removes) {
                 tracing::warn!("DocWriter multi-ops flush failed: {e}");
             }
         }
@@ -131,7 +131,7 @@ impl DocWriter {
             return Some(idx);
         }
         // Field not in snapshot — try to ensure it exists
-        match self.docstore.lock().ensure_field_index(field) {
+        match self.docstore.write().ensure_field_index(field) {
             Ok(idx) => {
                 self.field_dict.insert(field.to_string(), idx);
                 Some(idx)

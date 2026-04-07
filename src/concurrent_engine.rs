@@ -195,7 +195,7 @@ pub struct ConcurrentEngine {
     inner: Arc<ArcSwap<InnerEngine>>,
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
-    docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
+    docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
     /// Docstore root path, cached to avoid locking docstore just to read the path.
     docstore_root: Arc<PathBuf>,
     config: Arc<Config>,
@@ -835,7 +835,7 @@ impl ConcurrentEngine {
         let (compact_tx, compact_handle): (Option<Sender<(u32, Vec<u8>)>>, Option<JoinHandle<()>>) = (None, None);
 
         let docstore_root = Arc::new(docstore.path().to_path_buf());
-        let docstore = Arc::new(parking_lot::Mutex::new(docstore));
+        let docstore = Arc::new(parking_lot::RwLock::new(docstore));
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
         let dirty_flag = Arc::new(AtomicBool::new(false));
@@ -1451,7 +1451,7 @@ impl ConcurrentEngine {
                             // then apply in bulk (same path as normal mutations).
                             let mut activation_batch = crate::write_coalescer::WriteBatch::new();
                             {
-                                let ds = docstore.lock();
+                                let ds = docstore.read();
                                 for &slot in &activated {
                                     match ds.get(slot) {
                                         Ok(Some(stored_doc)) => {
@@ -1509,8 +1509,13 @@ impl ConcurrentEngine {
                     // new mutations arrived — not whether old diffs were compacted.
                     let has_lazy_dirty = !is_loading && {
                         let lvf = flush_lazy_value_fields.lock();
+                        // Only idle-compact entries whose base is actually loaded.
+                        // merge() short-circuits on !is_loaded, so flagging unloaded-
+                        // dirty fields here causes a 33 tick/s no-op compaction loop
+                        // for high-cardinality unloaded fields (tagIds, modelVersionIds,
+                        // postId, etc.) that steady-state ops keep dirtying.
                         !lvf.is_empty() && staging.filters.fields()
-                            .any(|(name, field)| lvf.contains(name.as_str()) && field.has_dirty())
+                            .any(|(name, field)| lvf.contains(name.as_str()) && field.has_loaded_dirty())
                     };
                     if bitmap_count == 0 && has_lazy_dirty {
                         // Use a slower interval since there's no active write pressure.
@@ -1520,7 +1525,7 @@ impl ConcurrentEngine {
                         let tick = IDLE_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
                         if tick % COMPACTION_INTERVAL == 0 {
                             let dirty_fields: Vec<String> = staging.filters.fields()
-                                .filter(|(_, field)| field.has_dirty())
+                                .filter(|(_, field)| field.has_loaded_dirty())
                                 .map(|(name, _)| name.clone())
                                 .collect();
                             if !dirty_fields.is_empty() {
@@ -1977,7 +1982,7 @@ impl ConcurrentEngine {
                         if let Some(ref cache) = flush_doc_cache {
                             cache.update_batch_if_cached(&doc_batch);
                         }
-                        if let Err(e) = docstore.lock().put_batch(&doc_batch) {
+                        if let Err(e) = docstore.write().put_batch(&doc_batch) {
                             eprintln!("WARNING: docstore batch write failed (skipping {} docs): {e}", doc_batch.len());
                         }
                     }
@@ -2008,7 +2013,7 @@ impl ConcurrentEngine {
                     doc_batch.push(item);
                 }
                 if !doc_batch.is_empty() {
-                    if let Err(e) = docstore.lock().put_batch(&doc_batch) {
+                    if let Err(e) = docstore.write().put_batch(&doc_batch) {
                         panic!("docstore final batch write failed: {e}");
                     }
                 }
@@ -2034,8 +2039,8 @@ impl ConcurrentEngine {
             let merge_cursors = Arc::clone(&cursors);
             let merge_bound_store = bound_store.clone();
             let merge_unified_cache = Arc::clone(&unified_cache);
-            let merge_doc_shard_store = docstore.lock().shard_store_arc();
-            let merge_dirty_shards = docstore.lock().dirty_shards_arc();
+            let merge_doc_shard_store = docstore.read().shard_store_arc();
+            let merge_dirty_shards = docstore.read().dirty_shards_arc();
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
@@ -2769,7 +2774,7 @@ impl ConcurrentEngine {
         let is_alive = self.is_slot_alive(id);
         // Read old doc for upsert diffing
         let old_doc = if is_alive {
-            self.docstore.lock().get(id)?
+            self.docstore.read().get(id)?
         } else {
             None
         };
@@ -2794,7 +2799,7 @@ impl ConcurrentEngine {
             return self.put_via_wal(id, doc, wal);
         }
         // Read old doc for diffing
-        let old_doc = self.docstore.lock().get(id)?;
+        let old_doc = self.docstore.read().get(id)?;
         // For PATCH, only emit ops for fields present in the new doc
         let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config, true);
         if ops.is_empty() {
@@ -2826,7 +2831,7 @@ impl ConcurrentEngine {
         };
         // Read old doc from docstore if needed
         let old_doc = if is_upsert || was_allocated {
-            self.docstore.lock().get(id)?
+            self.docstore.read().get(id)?
         } else {
             None
         };
@@ -2895,7 +2900,7 @@ impl ConcurrentEngine {
                 return self.put_inner(id, doc);
             }
             // Read old doc for diffing
-            let old_doc = self.docstore.lock().get(id)?;
+            let old_doc = self.docstore.read().get(id)?;
             // Compute partial diff — only fields present in doc are processed
             let ops = crate::mutation::diff_document_partial(
                 id, old_doc.as_ref(), doc, &self.config, &self.field_registry,
@@ -2938,7 +2943,7 @@ impl ConcurrentEngine {
         self.in_flight.mark_in_flight(id);
         let result = (|| -> Result<()> {
             // Read the doc to know which bitmaps to clear
-            let old_doc = self.docstore.lock().get(id)?;
+            let old_doc = self.docstore.read().get(id)?;
             let mut ops = Vec::new();
             // Generate filter/sort cleanup ops from the stored doc
             if let Some(doc) = &old_doc {
@@ -5239,7 +5244,7 @@ impl ConcurrentEngine {
             }
         }
         // Slow path: disk read + cache populate
-        let doc = self.docstore.lock().get(slot_id)?;
+        let doc = self.docstore.read().get(slot_id)?;
         if let (Some(ref cache), Some(ref doc)) = (&self.doc_cache, &doc) {
             cache.insert(slot_id, doc.clone());
             // Eviction handled by dedicated eviction thread — no inline check
@@ -5248,20 +5253,20 @@ impl ConcurrentEngine {
     }
     /// Compact the docstore, reclaiming space from old write transactions.
     pub fn compact_docstore(&self) -> Result<bool> {
-        Ok(self.docstore.lock().compact()?)
+        Ok(self.docstore.read().compact()?)
     }
     /// Configure docstore field defaults from a DataSchema.
     /// Must be called before `prepare_bulk_writer()` so the BulkWriter inherits the defaults.
     pub fn set_docstore_defaults(&self, schema: &crate::config::DataSchema) {
-        self.docstore.lock().set_field_defaults(schema);
+        self.docstore.write().set_field_defaults(schema);
     }
     /// Get the current schema version from the docstore.
     pub fn docstore_schema_version(&self) -> u8 {
-        self.docstore.lock().schema_version()
+        self.docstore.read().schema_version()
     }
 
     /// Get a clone of the Arc<Mutex<DocStoreV3>> for external writers (e.g., DocWriter).
-    pub fn docstore_arc(&self) -> Arc<parking_lot::Mutex<DocStoreV3>> {
+    pub fn docstore_arc(&self) -> Arc<parking_lot::RwLock<DocStoreV3>> {
         Arc::clone(&self.docstore)
     }
     /// Set the WAL writer for the V2 write path. When set, put() and patch_document()
@@ -5277,18 +5282,18 @@ impl ConcurrentEngine {
     }
     /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {
-        self.docstore.lock().build_schema_registry()
+        self.docstore.read().build_schema_registry()
     }
 
     /// Prepare a ShardStoreBulkWriter for lock-free parallel docstore writes during bulk loading.
     /// The writer holds a snapshot of the field dictionary and can encode/write
     /// docs without acquiring the DocStoreV3 Mutex.
     pub fn prepare_bulk_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::ShardStoreBulkWriter> {
-        Ok(self.docstore.lock().prepare_bulk_load(field_names)?)
+        Ok(self.docstore.write().prepare_bulk_load(field_names)?)
     }
     /// Prepare a StreamingDocWriter for write-through docstore writes during dump processing.
     pub fn prepare_streaming_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::StreamingDocWriter> {
-        Ok(self.docstore.lock().prepare_streaming_writer(field_names)?)
+        Ok(self.docstore.write().prepare_streaming_writer(field_names)?)
     }
     /// Return the set of indexed field names (filter + sort + "id").
     /// Used by the loader to strip doc-only fields from the bitmap accumulator.
@@ -6007,7 +6012,7 @@ impl ConcurrentEngine {
             .map_err(|e| crate::error::BitdexError::Storage(format!("pin filter gen: {e}")))?;
         let gen_sort = sort_s.pin_generation()
             .map_err(|e| crate::error::BitdexError::Storage(format!("pin sort gen: {e}")))?;
-        let gen_doc = self.docstore.lock().pin_generation()
+        let gen_doc = self.docstore.read().pin_generation()
             .map_err(|e| crate::error::BitdexError::Storage(format!("pin doc gen: {e}")))?;
         eprintln!("Pinned shard generations: alive={gen_alive}, filter={gen_filter}, sort={gen_sort}, doc={gen_doc}");
         Ok(Some(gen_alive))
@@ -6134,7 +6139,7 @@ impl ConcurrentEngine {
         }
 
         if compact_docs && self.slot_counter() > 0 {
-            let doc_store_arc = self.docstore.lock().shard_store_arc();
+            let doc_store_arc = self.docstore.read().shard_store_arc();
             let slot_counter = self.slot_counter();
             let max_shard = if slot_counter > 0 {
                 (slot_counter - 1) >> crate::shard_store_doc::SHARD_SHIFT_PUB
@@ -6180,7 +6185,7 @@ impl ConcurrentEngine {
                 }
             }
             if compact_docs {
-                let doc_store_arc = self.docstore.lock().shard_store_arc();
+                let doc_store_arc = self.docstore.read().shard_store_arc();
                 for gen in 0..frozen_gen {
                     if let Err(e) = doc_store_arc.delete_generation(gen) { eprintln!("compact_all: delete doc gen {gen}: {e}"); }
                 }
@@ -6235,7 +6240,7 @@ impl ConcurrentEngine {
                 .iter()
                 .map(|&(id, is_upsert, was_allocated)| {
                     if is_upsert || was_allocated {
-                        self.docstore.lock().get(id).ok().flatten()
+                        self.docstore.read().get(id).ok().flatten()
                     } else {
                         None
                     }
@@ -6349,14 +6354,14 @@ impl ConcurrentEngine {
             for (slot, doc) in docs {
                 batch.push((slot, StoredDoc { fields: doc.fields, schema_version: 0 }));
                 if batch.len() >= batch_size {
-                    if let Err(e) = docstore.lock().put_batch(&batch) {
+                    if let Err(e) = docstore.write().put_batch(&batch) {
                         eprintln!("put_bulk: docstore batch write failed: {e}");
                     }
                     batch.clear();
                 }
             }
             if !batch.is_empty() {
-                if let Err(e) = docstore.lock().put_batch(&batch) {
+                if let Err(e) = docstore.write().put_batch(&batch) {
                     eprintln!("put_bulk: docstore batch write failed: {e}");
                 }
             }
@@ -6371,14 +6376,14 @@ impl ConcurrentEngine {
         for (slot, doc) in docs {
             batch.push((*slot, StoredDoc { fields: doc.fields.clone(), schema_version: 0 }));
             if batch.len() >= batch_size {
-                if let Err(e) = self.docstore.lock().put_batch(&batch) {
+                if let Err(e) = self.docstore.write().put_batch(&batch) {
                     eprintln!("write_docs_to_docstore: batch write failed: {e}");
                 }
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            if let Err(e) = self.docstore.lock().put_batch(&batch) {
+            if let Err(e) = self.docstore.write().put_batch(&batch) {
                 eprintln!("write_docs_to_docstore: batch write failed: {e}");
             }
         }
@@ -9410,7 +9415,7 @@ mod tests {
         // Write 10 Set ops to the same (slot=0, field=0) — 9 of 10 are stale after compaction.
         let field_idx: u16 = 0;
         {
-            let mut ds = engine.docstore.lock();
+            let mut ds = engine.docstore.write();
             for v in 0..10i64 {
                 let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
                 ds.append_tuple(0, field_idx, &packed).unwrap();
@@ -9420,27 +9425,27 @@ mod tests {
         // Verify the shard has ops before compaction
         let shard_key = SlotHexShard::slot_to_shard(0);
         let ops_before = {
-            let ds = engine.docstore.lock();
+            let ds = engine.docstore.read();
             ds.shard_store().ops_count(&shard_key).unwrap().unwrap_or(0)
         };
         assert_eq!(ops_before, 10, "should have 10 ops before compaction");
 
         // Trigger compaction directly on the shard (bypasses threshold check)
         {
-            let ds = engine.docstore.lock();
+            let ds = engine.docstore.read();
             ds.shard_store().compact_current(&shard_key).unwrap();
         }
 
         // After compaction, ops should be folded into a snapshot (0 ops remaining)
         let ops_after = {
-            let ds = engine.docstore.lock();
+            let ds = engine.docstore.read();
             ds.shard_store().ops_count(&shard_key).unwrap().unwrap_or(0)
         };
         assert_eq!(ops_after, 0, "ops should be 0 after compaction");
 
         // Verify the data is still correct — the last Set (value=9) wins
         {
-            let ds = engine.docstore.lock();
+            let ds = engine.docstore.read();
             let snap = ds.shard_store().read(&shard_key).unwrap().unwrap();
             let fields = snap.docs.get(&0).unwrap();
             assert_eq!(fields[0], (0, PackedValue::I(9)));
@@ -10126,7 +10131,7 @@ mod tests {
         wait_for_flush(&engine, 1, 500);
 
         // Read the doc back from DocStoreV3
-        let doc = engine.docstore.lock().get(1).unwrap();
+        let doc = engine.docstore.read().get(1).unwrap();
         assert!(doc.is_some(), "doc should be readable after put + flush");
         let doc = doc.unwrap();
         assert_eq!(
@@ -10184,7 +10189,7 @@ mod tests {
         assert_eq!(result.ids, vec![1], "nsfwLevel=3 should match after upsert");
 
         // Verify the stored doc has the new values
-        let doc = engine.docstore.lock().get(1).unwrap().unwrap();
+        let doc = engine.docstore.read().get(1).unwrap().unwrap();
         assert_eq!(
             doc.fields.get("nsfwLevel"),
             Some(&FieldValue::Single(Value::Integer(3))),
@@ -10205,7 +10210,7 @@ mod tests {
         wait_for_flush(&engine, 1, 500);
 
         // Doc should exist
-        assert!(engine.docstore.lock().get(1).unwrap().is_some());
+        assert!(engine.docstore.read().get(1).unwrap().is_some());
 
         // Delete — this reads old doc from DocStoreV3 to clear filter/sort bits
         engine.delete(1).unwrap();
@@ -10251,7 +10256,7 @@ mod tests {
 
         // Read docs back via DocStoreV3
         for slot in 0..10u32 {
-            let doc = engine.docstore.lock().get(slot).unwrap();
+            let doc = engine.docstore.read().get(slot).unwrap();
             assert!(doc.is_some(), "slot {} should have a doc after bulk write", slot);
             let doc = doc.unwrap();
             let nsfw = doc.fields.get("nsfwLevel");
