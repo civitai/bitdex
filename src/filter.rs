@@ -113,10 +113,23 @@ impl FilterField {
     /// Bulk-insert multiple slots into the bitmap for the given value.
     /// Slots should be sorted for maximum roaring-rs `extend()` performance.
     pub fn insert_bulk(&self, value: u64, slots: impl IntoIterator<Item = u32>) {
+        let t_lock = std::time::Instant::now();
         let mut w = self.bitmaps.write();
-        w.entry(value)
-            .or_insert_with(VersionedBitmap::new_empty)
-            .insert_bulk(slots);
+        let lock_us = t_lock.elapsed().as_micros();
+        let t_entry = std::time::Instant::now();
+        let entry = w.entry(value).or_insert_with(VersionedBitmap::new_empty);
+        let entry_us = t_entry.elapsed().as_micros();
+        let t_insert = std::time::Instant::now();
+        entry.insert_bulk(slots);
+        let insert_us = t_insert.elapsed().as_micros();
+        // Only log unusually slow calls (>5ms total) so we don't drown the logs.
+        let total_us = lock_us + entry_us + insert_us;
+        if total_us > 5_000 {
+            tracing::warn!(
+                "[insert_bulk_slow] field={} value={} lock={}μs entry={}μs insert={}μs",
+                self.config.name, value, lock_us, entry_us, insert_us
+            );
+        }
     }
     /// OR a RoaringBitmap directly into the base for the given value.
     /// Bypasses the diff layer for maximum bulk-load throughput.
@@ -255,16 +268,29 @@ impl FilterField {
         }
         Some(result)
     }
-    /// Closure-based iteration over (value, &VersionedBitmap) pairs while
-    /// holding the read lock. Use this for read-only scans that need
-    /// diff-aware access without paying the clone cost.
+    /// Closure-based iteration over (value, &VersionedBitmap) pairs.
     ///
-    /// **Holds the read lock for the duration of the closure.** Keep it
-    /// short — for long work, snapshot via `iter_versioned()` first.
+    /// Snapshots the keys under a brief read lock, then for each key
+    /// re-acquires the read lock and invokes the closure with the
+    /// corresponding `VersionedBitmap`. This **releases the read lock
+    /// between iterations** so a concurrent writer can interleave —
+    /// critical for high-cardinality fields where holding the lock
+    /// across the full iteration would block writers for seconds.
+    ///
+    /// Trade-off: ~22.5M lock acquisitions instead of 1, but each is a
+    /// few nanoseconds and writers don't wait for the full iteration.
+    /// New keys added during iteration are NOT visited; deleted keys
+    /// are skipped via the get() check inside the loop.
     pub fn for_each_versioned<F: FnMut(u64, &VersionedBitmap)>(&self, mut f: F) {
-        let r = self.bitmaps.read();
-        for (k, vb) in r.iter() {
-            f(*k, vb);
+        let keys: Vec<u64> = {
+            let r = self.bitmaps.read();
+            r.keys().copied().collect()
+        };
+        for k in keys {
+            let r = self.bitmaps.read();
+            if let Some(vb) = r.get(&k) {
+                f(k, vb);
+            }
         }
     }
     /// Snapshot all (value, VersionedBitmap) pairs into an owned Vec under
@@ -282,8 +308,25 @@ impl FilterField {
         self.bitmaps.read().len()
     }
     /// Return the serialized byte size of all bitmaps in this field.
+    ///
+    /// Snapshots the keys briefly, then iterates with per-key brief read
+    /// locks so the flush thread can interleave its writes. Holding the
+    /// read lock across a 22.5M-entry sum (postId) blocks writers for
+    /// seconds; this pattern keeps each lock window at single-digit
+    /// microseconds.
     pub fn bitmap_bytes(&self) -> usize {
-        self.bitmaps.read().values().map(|vb| vb.bitmap_bytes()).sum()
+        let keys: Vec<u64> = {
+            let r = self.bitmaps.read();
+            r.keys().copied().collect()
+        };
+        let mut total = 0usize;
+        for k in keys {
+            let r = self.bitmaps.read();
+            if let Some(vb) = r.get(&k) {
+                total += vb.bitmap_bytes();
+            }
+        }
+        total
     }
     /// Drop all base bitmaps and mark every value as unloaded.
     /// The diff layers are preserved so mutations can accumulate

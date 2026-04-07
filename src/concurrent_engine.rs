@@ -5822,15 +5822,32 @@ impl ConcurrentEngine {
             let t0 = std::time::Instant::now();
             let num_values = field.bitmap_count();
             // Group in-memory entries by bucket (256 buckets max).
-            // iter_versioned() snapshots the field under read lock and
-            // returns owned VB clones (cheap — Arc refcount bumps).
-            // We then call fused() on each to get an owned merged bitmap
-            // for serialization. The lock is held only during the snapshot.
-            let mut by_bucket: HashMap<u8, Vec<(u64, RoaringBitmap)>> = HashMap::new();
-            for (value, vb) in field.iter_versioned() {
+            //
+            // For clean VBs (overwhelming majority — postId has 22.5M entries
+            // and at any moment only a handful are dirty) we just clone the
+            // inner `Arc<RoaringBitmap>` from the VB's base — pointer bump,
+            // zero data copy. For dirty VBs we materialize the fused result.
+            //
+            // This iterates inside `for_each_versioned` which holds the read
+            // lock for the duration but performs only Arc::clones in the body
+            // (no per-VB heap allocation), so the lock window is microseconds
+            // per entry instead of milliseconds. Writers can resume promptly
+            // after the merge cycle.
+            let mut by_bucket: HashMap<u8, Vec<(u64, Arc<RoaringBitmap>)>> = HashMap::new();
+            field.for_each_versioned(|value, vb| {
                 let bucket = (value >> 8) as u8;
-                by_bucket.entry(bucket).or_default().push((value, vb.fused()));
-            }
+                if vb.is_dirty() {
+                    by_bucket
+                        .entry(bucket)
+                        .or_default()
+                        .push((value, Arc::new(vb.fused())));
+                } else {
+                    by_bucket
+                        .entry(bucket)
+                        .or_default()
+                        .push((value, Arc::clone(vb.base())));
+                }
+            });
             let num_buckets = by_bucket.len();
             if is_lazy {
                 // Merge-on-save: for each bucket with in-memory entries, read the
@@ -5844,7 +5861,7 @@ impl ConcurrentEngine {
                     let mut merged: HashMap<u64, RoaringBitmap> = disk_entries.into_iter().collect();
                     for (value, mem_bm) in &mem_entries {
                         let entry = merged.entry(*value).or_insert_with(RoaringBitmap::new);
-                        *entry |= mem_bm;
+                        *entry |= mem_bm.as_ref();
                     }
                     // Write merged result
                     let refs: Vec<(u64, &RoaringBitmap)> = merged.iter()
@@ -5858,7 +5875,7 @@ impl ConcurrentEngine {
                 for (bucket, entries) in by_bucket {
                     let refs: Vec<(u64, &RoaringBitmap)> = entries
                         .iter()
-                        .map(|(v, bm)| (*v, bm))
+                        .map(|(v, bm)| (*v, bm.as_ref()))
                         .collect();
                     filter_store.write_filter_bucket(name, bucket, &refs)
                         .map_err(|e| crate::error::BitdexError::Storage(format!("write filter {name}/{bucket:02x}: {e}")))?;
