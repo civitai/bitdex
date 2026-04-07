@@ -258,6 +258,13 @@ impl FilterField {
     pub fn has_dirty(&self) -> bool {
         self.bitmaps.values().any(|vb| vb.is_dirty())
     }
+    /// Returns true only if a *loaded* bitmap has an unmerged diff.
+    /// Unloaded-but-dirty entries can't be compacted (merge() short-circuits on
+    /// !is_loaded), so idle compaction must ignore them to avoid a hot loop
+    /// where has_dirty stays true and merge is a no-op.
+    pub fn has_loaded_dirty(&self) -> bool {
+        self.bitmaps.values().any(|vb| vb.is_loaded() && vb.is_dirty())
+    }
     pub fn merge_dirty(&mut self) {
         for vb in self.bitmaps.values_mut() {
             if vb.is_dirty() {
