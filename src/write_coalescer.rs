@@ -351,7 +351,7 @@ impl WriteBatch {
         let t0 = Instant::now();
         for (key, slot_ids) in &self.filter_removes {
             let f0 = Instant::now();
-            if let Some(field) = filters.get_field_mut(&key.field) {
+            if let Some(field) = filters.get_field(&key.field) {
                 field.remove_bulk(key.value, slot_ids);
             }
             *t.per_filter_field_ns
@@ -364,7 +364,7 @@ impl WriteBatch {
         let t0 = Instant::now();
         for (key, slot_ids) in &self.filter_inserts {
             let f0 = Instant::now();
-            if let Some(field) = filters.get_field_mut(&key.field) {
+            if let Some(field) = filters.get_field(&key.field) {
                 field.insert_bulk(key.value, slot_ids.iter().copied());
             }
             *t.per_filter_field_ns
@@ -840,10 +840,10 @@ mod tests {
         let mut filters = setup_filter_index();
         let mut sorts = setup_sort_index();
         // Pre-populate and merge so base has {10, 20, 30}
-        filters.get_field_mut("status").unwrap().insert(1, 10);
-        filters.get_field_mut("status").unwrap().insert(1, 20);
-        filters.get_field_mut("status").unwrap().insert(1, 30);
-        filters.get_field_mut("status").unwrap().merge_dirty();
+        filters.get_field("status").unwrap().insert(1, 10);
+        filters.get_field("status").unwrap().insert(1, 20);
+        filters.get_field("status").unwrap().insert(1, 30);
+        filters.get_field("status").unwrap().merge_dirty();
         let mut batch = WriteBatch::new();
         batch.ops.push(MutationOp::FilterRemove {
             field: Arc::from("status"),

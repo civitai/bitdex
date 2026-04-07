@@ -90,7 +90,7 @@ impl Engine {
             field.merge_dirty();
         }
         // Eager merge: filter diffs must be compacted before readers see them
-        for (_name, field) in self.filters.fields_mut() {
+        for (_name, field) in self.filters.fields() {
             field.merge_dirty();
         }
         self.slots.merge_alive();
@@ -118,7 +118,7 @@ impl Engine {
             field.merge_dirty();
         }
         // Eager merge: filter diffs must be compacted before readers see them
-        for (_name, field) in self.filters.fields_mut() {
+        for (_name, field) in self.filters.fields() {
             field.merge_dirty();
         }
         self.slots.merge_alive();
@@ -141,7 +141,7 @@ impl Engine {
             engine.delete(id)
         };
         // Eager merge: filter/sort diffs and alive must be compacted before readers see them
-        for (_name, field) in self.filters.fields_mut() {
+        for (_name, field) in self.filters.fields() {
             field.merge_dirty();
         }
         for (_name, field) in self.sorts.fields_mut() {
@@ -183,7 +183,7 @@ impl Engine {
             engine.delete_where(&matching)
         };
         // Eager merge: filter/sort diffs and alive must be compacted before readers see them
-        for (_name, field) in self.filters.fields_mut() {
+        for (_name, field) in self.filters.fields() {
             field.merge_dirty();
         }
         for (_name, field) in self.sorts.fields_mut() {
@@ -597,7 +597,7 @@ mod tests {
         engine.in_flight.mark_in_flight(2);
         // 2. Mutate the filter bitmaps directly (simulating the write in progress)
         //    Move slot 2 from nsfwLevel=1 bitmap to nsfwLevel=2 bitmap
-        let filter_field = engine.filters.get_field_mut("nsfwLevel").unwrap();
+        let filter_field = engine.filters.get_field("nsfwLevel").unwrap();
         filter_field.remove(1, 2);  // remove from old value
         filter_field.insert(2, 2);  // add to new value
         filter_field.merge_dirty();

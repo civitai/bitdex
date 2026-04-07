@@ -326,7 +326,7 @@ mod tests {
             for (_name, field) in self.sorts.fields_mut() {
                 field.merge_dirty();
             }
-            for (_name, field) in self.filters.fields_mut() {
+            for (_name, field) in self.filters.fields() {
                 field.merge_dirty();
             }
             self.slots.merge_alive();

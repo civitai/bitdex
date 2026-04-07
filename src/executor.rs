@@ -711,10 +711,12 @@ impl<'a> QueryExecutor<'a> {
                 field: field.to_string(),
                 reason: "cannot convert to bitmap key for range filter".to_string(),
             })?;
+        // Range scan: hold the read lock for the duration via for_each_versioned
+        // to avoid the per-VB clone cost on potentially-millions of entries.
         let mut result = RoaringBitmap::new();
-        for (&key, vb) in filter_field.iter_versioned() {
+        filter_field.for_each_versioned(|key, vb| {
             // Skip the null sentinel key — null is not a real value for range comparisons
-            if key == crate::filter::NULL_BITMAP_KEY { continue; }
+            if key == crate::filter::NULL_BITMAP_KEY { return; }
             if predicate(key, target) {
                 if vb.is_dirty() {
                     result |= vb.fused();
@@ -722,7 +724,7 @@ impl<'a> QueryExecutor<'a> {
                     result |= vb.base().as_ref();
                 }
             }
-        }
+        });
         Ok(result)
     }
     /// Paginate by descending slot order (newest-first) for no-sort queries.
@@ -1078,7 +1080,7 @@ mod tests {
             for (_name, field) in self.sorts.fields_mut() {
                 field.merge_dirty();
             }
-            for (_name, field) in self.filters.fields_mut() {
+            for (_name, field) in self.filters.fields() {
                 field.merge_dirty();
             }
             self.slots.merge_alive();

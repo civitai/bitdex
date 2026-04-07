@@ -1,6 +1,7 @@
 use ahash::AHashMap as HashMap;
 use std::sync::Arc;
 use roaring::RoaringBitmap;
+use parking_lot::RwLock;
 use crate::config::FilterFieldConfig;
 use crate::versioned_bitmap::VersionedBitmap;
 
@@ -19,26 +20,66 @@ pub const NULL_BITMAP_KEY: u64 = u64::MAX;
 /// - boolean: two bitmaps (true/false), stored as values 0 and 1
 ///
 /// Bitmaps use VersionedBitmap for deferred diff compaction and cheap snapshot cloning.
-#[derive(Clone)]
+///
+/// # Concurrency model
+///
+/// `bitmaps` is wrapped in a `parking_lot::RwLock` so mutations only need
+/// a `&FilterField` reference — never `&mut FilterField`. This eliminates
+/// the `Arc::make_mut` cascade that previously deep-cloned the entire
+/// 22.5M-entry HashMap on every flush cycle for high-cardinality fields
+/// like `postId`. With interior mutability, mutating one bitmap touches
+/// only that one bitmap's diff layer (~microseconds), regardless of
+/// how many distinct values the field has.
+///
+/// **Snapshot semantics relaxation:** Because mutations go through a
+/// shared lock, the published ArcSwap snapshot's filter bitmaps are no
+/// longer frozen for the duration of a query. Readers see eventually-
+/// consistent state — individual bitmap reads return a coherent
+/// `Arc<RoaringBitmap>` (since `VersionedBitmap` already uses
+/// per-bitmap CoW), but two consecutive reads of the same field may
+/// observe a value bitmap that's grown between them. This is correct
+/// for BitDex's existing query semantics.
+///
+/// **Reader pattern:** acquire read lock, clone the
+/// `VersionedBitmap` (cheap — internal Arcs), drop the lock, then
+/// perform query work. Never hold the read lock across bitmap
+/// intersection or doc fetch.
 pub struct FilterField {
     /// One bitmap per distinct value. Key is the u64 bitmap key.
-    bitmaps: HashMap<u64, VersionedBitmap>,
+    /// Wrapped in RwLock for interior mutability — see struct doc.
+    bitmaps: RwLock<HashMap<u64, VersionedBitmap>>,
     /// Field configuration.
     config: FilterFieldConfig,
+}
+
+// Manual Clone impl: takes the read lock and deep-clones the inner HashMap.
+// **WARNING:** This is intentionally SLOW for high-cardinality fields
+// (cloning 22.5M entries is ~1.6 GB memcpy). It exists for non-hot paths
+// (tests, restoration, ad-hoc snapshots) and must NEVER be called from
+// the flush thread or query path.
+impl Clone for FilterField {
+    fn clone(&self) -> Self {
+        let r = self.bitmaps.read();
+        Self {
+            bitmaps: RwLock::new(r.clone()),
+            config: self.config.clone(),
+        }
+    }
 }
 impl FilterField {
     pub fn new(config: FilterFieldConfig) -> Self {
         Self {
-            bitmaps: HashMap::new(),
+            bitmaps: RwLock::new(HashMap::new()),
             config,
         }
     }
     /// Bulk-load bitmaps from a map of (value -> bitmap).
     /// Used during startup to restore Tier 1 filter state from redb.
     /// Each bitmap becomes a VersionedBitmap base (no dirty diff).
-    pub fn load_from(&mut self, data: HashMap<u64, RoaringBitmap>) {
+    pub fn load_from(&self, data: HashMap<u64, RoaringBitmap>) {
+        let mut w = self.bitmaps.write();
         for (value, bitmap) in data {
-            self.bitmaps.insert(value, VersionedBitmap::new(bitmap));
+            w.insert(value, VersionedBitmap::new(bitmap));
         }
     }
     /// Get the field configuration.
@@ -54,35 +95,35 @@ impl FilterField {
         &self.config.field_type
     }
     /// Set a slot's bit in the bitmap for the given value.
-    pub fn insert(&mut self, value: u64, slot: u32) {
-        self.bitmaps
-            .entry(value)
+    pub fn insert(&self, value: u64, slot: u32) {
+        let mut w = self.bitmaps.write();
+        w.entry(value)
             .or_insert_with(VersionedBitmap::new_empty)
             .insert(slot);
     }
     /// Clear a slot's bit from the bitmap for the given value.
     /// Always records the diff, even if the value is unloaded — creates a diff-only
     /// placeholder so the remove is preserved until the base is reloaded from disk.
-    pub fn remove(&mut self, value: u64, slot: u32) {
-        self.bitmaps
-            .entry(value)
+    pub fn remove(&self, value: u64, slot: u32) {
+        let mut w = self.bitmaps.write();
+        w.entry(value)
             .or_insert_with(VersionedBitmap::new_unloaded)
             .remove(slot);
     }
     /// Bulk-insert multiple slots into the bitmap for the given value.
     /// Slots should be sorted for maximum roaring-rs `extend()` performance.
-    pub fn insert_bulk(&mut self, value: u64, slots: impl IntoIterator<Item = u32>) {
-        self.bitmaps
-            .entry(value)
+    pub fn insert_bulk(&self, value: u64, slots: impl IntoIterator<Item = u32>) {
+        let mut w = self.bitmaps.write();
+        w.entry(value)
             .or_insert_with(VersionedBitmap::new_empty)
             .insert_bulk(slots);
     }
     /// OR a RoaringBitmap directly into the base for the given value.
     /// Bypasses the diff layer for maximum bulk-load throughput.
     /// Creates the VersionedBitmap if it doesn't exist.
-    pub fn or_bitmap(&mut self, value: u64, bitmap: &RoaringBitmap) {
-        self.bitmaps
-            .entry(value)
+    pub fn or_bitmap(&self, value: u64, bitmap: &RoaringBitmap) {
+        let mut w = self.bitmaps.write();
+        w.entry(value)
             .or_insert_with(VersionedBitmap::new_empty)
             .or_into_base(bitmap);
     }
@@ -90,8 +131,9 @@ impl FilterField {
     /// If the value isn't in memory (lazy-loaded field), creates an unloaded
     /// entry with pending removes in the diff layer. The removes will be
     /// applied when the base is loaded during compaction or lazy-load.
-    pub fn remove_bulk(&mut self, value: u64, slots: &[u32]) {
-        let vb = self.bitmaps.entry(value)
+    pub fn remove_bulk(&self, value: u64, slots: &[u32]) {
+        let mut w = self.bitmaps.write();
+        let vb = w.entry(value)
             .or_insert_with(VersionedBitmap::new_unloaded);
         for &slot in slots {
             vb.remove(slot);
@@ -99,40 +141,61 @@ impl FilterField {
     }
     /// Clear a slot's bit from ALL bitmaps in this field.
     /// Used by autovac to clean dead slots from filter bitmaps.
-    pub fn remove_from_all(&mut self, slot: u32) {
-        for vb in self.bitmaps.values_mut() {
+    pub fn remove_from_all(&self, slot: u32) {
+        let mut w = self.bitmaps.write();
+        for vb in w.values_mut() {
             vb.remove(slot);
         }
     }
-    /// Get the base bitmap for a specific value.
-    /// Returns the base only (ignoring any pending diff). Use `get_versioned()`
-    /// for diff-aware reads, or `apply_diff_eq()` for fused reads.
-    pub fn get(&self, value: u64) -> Option<&RoaringBitmap> {
-        self.bitmaps.get(&value).map(|vb| vb.base().as_ref())
+    /// Get the base bitmap for a specific value as an owned `Arc` clone.
+    ///
+    /// Previously returned `&RoaringBitmap`. With interior mutability the
+    /// outer reference can't escape the lock, so this returns an `Arc`
+    /// clone of the inner base — refcount bump only, no data copy. The
+    /// returned bitmap is a coherent point-in-time snapshot.
+    pub fn get(&self, value: u64) -> Option<Arc<RoaringBitmap>> {
+        let r = self.bitmaps.read();
+        r.get(&value).map(|vb| Arc::clone(vb.base()))
     }
-    /// Get the raw VersionedBitmap for a specific value, including its diff layer.
-    /// Use this when you need to fuse diffs at read time.
-    pub fn get_versioned(&self, value: u64) -> Option<&VersionedBitmap> {
-        self.bitmaps.get(&value)
+    /// Get a cloned `VersionedBitmap` for a specific value.
+    ///
+    /// Previously returned `&VersionedBitmap`. With interior mutability
+    /// we return a cloned VB instead — `VersionedBitmap::clone()` is
+    /// cheap (Arc refcount bumps on `base` and `diff`, no data copy).
+    pub fn get_versioned(&self, value: u64) -> Option<VersionedBitmap> {
+        let r = self.bitmaps.read();
+        r.get(&value).cloned()
     }
-    /// Iterator over all value keys in this field's bitmap HashMap.
-    pub fn bitmap_keys(&self) -> impl Iterator<Item = &u64> {
-        self.bitmaps.keys()
+    /// Closure-based access to a `VersionedBitmap` while holding the read
+    /// lock. Avoids the VB clone if the closure only needs to peek.
+    /// **Holds the read lock for the duration of the closure** — keep
+    /// it short.
+    pub fn with_versioned<R>(&self, value: u64, f: impl FnOnce(Option<&VersionedBitmap>) -> R) -> R {
+        let r = self.bitmaps.read();
+        f(r.get(&value))
+    }
+    /// Snapshot all value keys currently in this field's bitmap HashMap.
+    /// Acquires the read lock briefly and returns owned keys.
+    pub fn bitmap_keys(&self) -> Vec<u64> {
+        let r = self.bitmaps.read();
+        r.keys().copied().collect()
     }
     /// Remove a value's bitmap from the field (used by idle eviction).
     /// The bitmap can be re-loaded from disk on the next query.
-    pub fn remove_value(&mut self, value: u64) {
-        self.bitmaps.remove(&value);
+    pub fn remove_value(&self, value: u64) {
+        let mut w = self.bitmaps.write();
+        w.remove(&value);
     }
     /// Number of distinct values currently loaded in memory.
     pub fn loaded_value_count(&self) -> usize {
-        self.bitmaps.len()
+        self.bitmaps.read().len()
     }
     /// Get the fused bitmap for a single value against a candidate set.
     /// Applies the diff (sets/clears) to the intersection of base and candidates.
     /// This is the primary diff-aware read path for Eq/NotEq queries.
     pub fn apply_diff_eq(&self, value: u64, candidates: &RoaringBitmap) -> Option<RoaringBitmap> {
-        self.bitmaps.get(&value).map(|vb| {
+        let r = self.bitmaps.read();
+        r.get(&value).map(|vb| {
             if vb.is_dirty() {
                 vb.apply_diff(candidates)
             } else {
@@ -144,9 +207,10 @@ impl FilterField {
     /// For each value, fuses diffs against candidates, then unions results.
     /// This is the diff-aware read path for In/Or queries.
     pub fn union_with_diff(&self, values: &[u64], candidates: &RoaringBitmap) -> RoaringBitmap {
+        let r = self.bitmaps.read();
         let mut result = RoaringBitmap::new();
         for value in values {
-            if let Some(vb) = self.bitmaps.get(value) {
+            if let Some(vb) = r.get(value) {
                 if vb.is_dirty() {
                     result |= vb.apply_diff(candidates);
                 } else {
@@ -158,17 +222,19 @@ impl FilterField {
     }
     /// Get the cardinality (number of set bits) for a specific value.
     pub fn cardinality(&self, value: u64) -> u64 {
-        self.bitmaps.get(&value).map_or(0, |vb| vb.base_len())
+        let r = self.bitmaps.read();
+        r.get(&value).map_or(0, |vb| vb.base_len())
     }
     /// Get the number of distinct values tracked.
     pub fn distinct_count(&self) -> usize {
-        self.bitmaps.len()
+        self.bitmaps.read().len()
     }
     /// Compute the union of bitmaps for multiple values (OR).
     pub fn union(&self, values: &[u64]) -> RoaringBitmap {
+        let r = self.bitmaps.read();
         let mut result = RoaringBitmap::new();
         for value in values {
-            if let Some(vb) = self.bitmaps.get(value) {
+            if let Some(vb) = r.get(value) {
                 result |= vb.base().as_ref();
             }
         }
@@ -177,108 +243,131 @@ impl FilterField {
     /// Compute the intersection of bitmaps for multiple values (AND).
     /// Returns None if any value has no bitmap.
     pub fn intersection(&self, values: &[u64]) -> Option<RoaringBitmap> {
+        let r = self.bitmaps.read();
         let mut iter = values.iter();
         let first = iter.next()?;
-        let mut result: RoaringBitmap = self.bitmaps.get(first)?.base().as_ref().clone();
+        let mut result: RoaringBitmap = r.get(first)?.base().as_ref().clone();
         for value in iter {
-            match self.bitmaps.get(value) {
+            match r.get(value) {
                 Some(vb) => result &= vb.base().as_ref(),
                 None => return Some(RoaringBitmap::new()), // Empty intersection
             }
         }
         Some(result)
     }
-    /// Iterate over all (value, bitmap) pairs (base only, no diff fusion).
-    pub fn iter(&self) -> impl Iterator<Item = (&u64, &RoaringBitmap)> {
-        self.bitmaps.iter().map(|(k, vb)| (k, vb.base().as_ref()))
+    /// Closure-based iteration over (value, &VersionedBitmap) pairs while
+    /// holding the read lock. Use this for read-only scans that need
+    /// diff-aware access without paying the clone cost.
+    ///
+    /// **Holds the read lock for the duration of the closure.** Keep it
+    /// short — for long work, snapshot via `iter_versioned()` first.
+    pub fn for_each_versioned<F: FnMut(u64, &VersionedBitmap)>(&self, mut f: F) {
+        let r = self.bitmaps.read();
+        for (k, vb) in r.iter() {
+            f(*k, vb);
+        }
     }
-    /// Iterate over all (value, VersionedBitmap) pairs for diff-aware access.
-    /// Used by range scans that need to fuse diffs.
-    pub fn iter_versioned(&self) -> impl Iterator<Item = (&u64, &VersionedBitmap)> {
-        self.bitmaps.iter()
+    /// Snapshot all (value, VersionedBitmap) pairs into an owned Vec under
+    /// the read lock. The cloned VBs share inner `Arc<RoaringBitmap>`
+    /// data with the originals (refcount bumps only) — cheap.
+    ///
+    /// Replaces the old reference-returning iter_versioned. Callers
+    /// pattern-match on `(value, &vb)` from the returned Vec.
+    pub fn iter_versioned(&self) -> Vec<(u64, VersionedBitmap)> {
+        let r = self.bitmaps.read();
+        r.iter().map(|(k, vb)| (*k, vb.clone())).collect()
     }
     /// Get the total number of bitmaps.
     pub fn bitmap_count(&self) -> usize {
-        self.bitmaps.len()
+        self.bitmaps.read().len()
     }
     /// Return the serialized byte size of all bitmaps in this field.
     pub fn bitmap_bytes(&self) -> usize {
-        self.bitmaps.values().map(|vb| vb.bitmap_bytes()).sum()
+        self.bitmaps.read().values().map(|vb| vb.bitmap_bytes()).sum()
     }
     /// Drop all base bitmaps and mark every value as unloaded.
     /// The diff layers are preserved so mutations can accumulate
     /// while the field is not in memory.
-    pub fn clear_bases_and_unload(&mut self) {
-        for vb in self.bitmaps.values_mut() {
+    pub fn clear_bases_and_unload(&self) {
+        let mut w = self.bitmaps.write();
+        for vb in w.values_mut() {
             vb.clear_base_and_unload();
         }
     }
     /// Reload a complete field from disk, merging persisted bases into any
     /// existing diff-only placeholders. After loading, all values are marked loaded
     /// so merge_dirty() can compact their diffs normally.
-    pub fn load_field_complete(&mut self, data: HashMap<u64, RoaringBitmap>) {
+    pub fn load_field_complete(&self, data: HashMap<u64, RoaringBitmap>) {
+        let mut w = self.bitmaps.write();
         for (value, bitmap) in data {
-            self.bitmaps
-                .entry(value)
+            w.entry(value)
                 .or_insert_with(VersionedBitmap::new_unloaded)
                 .load_base(&bitmap);
         }
         // Mark any diff-only values (mutated while unloaded, not on disk) as loaded
-        for vb in self.bitmaps.values_mut() {
+        for vb in w.values_mut() {
             vb.mark_loaded();
         }
     }
     /// Reload specific values from disk (for per-value lazy loading of high-cardinality fields).
     /// Only the requested values are marked as loaded; others remain unloaded.
-    pub fn load_values(&mut self, data: HashMap<u64, RoaringBitmap>, requested: &[u64]) {
+    pub fn load_values(&self, data: HashMap<u64, RoaringBitmap>, requested: &[u64]) {
+        let mut w = self.bitmaps.write();
         for &value in requested {
             if let Some(bitmap) = data.get(&value) {
-                self.bitmaps
-                    .entry(value)
+                w.entry(value)
                     .or_insert_with(VersionedBitmap::new_unloaded)
                     .load_base(bitmap);
             } else {
                 // Value wasn't on disk — it's a new value created since last save.
                 // Mark it as loaded so its diffs can be compacted.
-                self.bitmaps
-                    .entry(value)
+                w.entry(value)
                     .or_insert_with(VersionedBitmap::new_empty)
                     .mark_loaded();
             }
         }
     }
     /// Merge all dirty VersionedBitmaps in this field.
-    pub fn merge_all(&mut self) {
-        for vb in self.bitmaps.values_mut() {
+    pub fn merge_all(&self) {
+        let mut w = self.bitmaps.write();
+        for vb in w.values_mut() {
             vb.merge();
         }
     }
     /// Merge only dirty VersionedBitmaps.
     /// Returns true if any bitmap in this field has unmerged diffs.
     pub fn has_dirty(&self) -> bool {
-        self.bitmaps.values().any(|vb| vb.is_dirty())
+        self.bitmaps.read().values().any(|vb| vb.is_dirty())
     }
     /// Returns true only if a *loaded* bitmap has an unmerged diff.
     /// Unloaded-but-dirty entries can't be compacted (merge() short-circuits on
     /// !is_loaded), so idle compaction must ignore them to avoid a hot loop
     /// where has_dirty stays true and merge is a no-op.
     pub fn has_loaded_dirty(&self) -> bool {
-        self.bitmaps.values().any(|vb| vb.is_loaded() && vb.is_dirty())
+        self.bitmaps.read().values().any(|vb| vb.is_loaded() && vb.is_dirty())
     }
-    pub fn merge_dirty(&mut self) {
-        for vb in self.bitmaps.values_mut() {
+    pub fn merge_dirty(&self) {
+        let mut w = self.bitmaps.write();
+        for vb in w.values_mut() {
             if vb.is_dirty() {
                 vb.merge();
             }
         }
     }
     /// Merge a specific value's VersionedBitmap if it exists and is dirty.
-    pub fn merge_field(&mut self, value: u64) {
-        if let Some(vb) = self.bitmaps.get_mut(&value) {
+    pub fn merge_field(&self, value: u64) {
+        let mut w = self.bitmaps.write();
+        if let Some(vb) = w.get_mut(&value) {
             if vb.is_dirty() {
                 vb.merge();
             }
         }
+    }
+    /// Insert a single (value, VersionedBitmap) pair directly into the map.
+    /// Used by FilterIndex internal helpers (`unload_field`, `unload_from`)
+    /// that build new fields from diff-only clones. Acquires the write lock.
+    pub(crate) fn insert_versioned(&self, value: u64, vb: VersionedBitmap) {
+        self.bitmaps.write().insert(value, vb);
     }
 }
 /// The type of a filter field, determining how values map to bitmaps.
@@ -320,37 +409,33 @@ impl FilterIndex {
         self.fields.remove(name).is_some()
     }
     /// Get a reference to a filter field by name.
+    ///
+    /// Mutating methods on `FilterField` use interior mutability via
+    /// `parking_lot::RwLock`, so this immutable reference is sufficient
+    /// for both reads and writes. There is no `get_field_mut` because
+    /// `Arc::make_mut` on `Arc<FilterField>` would deep-clone the entire
+    /// HashMap (the bug we're fixing).
     pub fn get_field(&self, name: &str) -> Option<&FilterField> {
         self.fields.get(name).map(|f| f.as_ref())
-    }
-    /// Get a mutable reference to a filter field by name.
-    /// Uses Arc::make_mut for clone-on-write: only clones the field's data
-    /// when shared with a published snapshot (refcount > 1).
-    pub fn get_field_mut(&mut self, name: &str) -> Option<&mut FilterField> {
-        self.fields.get_mut(name).map(|f| Arc::make_mut(f))
     }
     /// Iterate over all fields.
     pub fn fields(&self) -> impl Iterator<Item = (&String, &FilterField)> {
         self.fields.iter().map(|(k, v)| (k, v.as_ref()))
     }
-    /// Iterate mutably over all fields.
-    pub fn fields_mut(&mut self) -> impl Iterator<Item = (&String, &mut FilterField)> {
-        self.fields.iter_mut().map(|(k, v)| (k, Arc::make_mut(v)))
-    }
     /// Unload a field: replace its Arc with a new empty field, preserving only
     /// entries that have pending diffs (mutations received while loading/unloaded).
-    /// This avoids Arc::make_mut deep-cloning the HashMap and drops all clean entries
-    /// entirely — critical for high-cardinality fields like postId (13M entries).
+    /// Drops all clean entries entirely — critical for high-cardinality fields
+    /// like postId (22.5M entries).
     pub fn unload_field(&mut self, name: &str) {
         if let Some(field_arc) = self.fields.get_mut(name) {
             let old = field_arc.as_ref();
-            let mut new_field = FilterField::new(old.config.clone());
+            let new_field = FilterField::new(old.config.clone());
             // Preserve only entries with pending diffs
-            for (&value, vb) in old.iter_versioned() {
+            old.for_each_versioned(|value, vb| {
                 if vb.is_dirty() {
-                    new_field.bitmaps.insert(value, vb.clone_diff_only());
+                    new_field.insert_versioned(value, vb.clone_diff_only());
                 }
-            }
+            });
             *field_arc = Arc::new(new_field);
         }
     }
@@ -366,12 +451,12 @@ impl FilterIndex {
     pub fn unload_from(&mut self, source: &FilterIndex, name: &str) {
         if let Some(source_field) = source.fields.get(name) {
             let config = source_field.config.clone();
-            let mut new_field = FilterField::new(config);
-            for (&value, vb) in source_field.iter_versioned() {
+            let new_field = FilterField::new(config);
+            source_field.for_each_versioned(|value, vb| {
                 if vb.is_dirty() {
-                    new_field.bitmaps.insert(value, vb.clone_diff_only());
+                    new_field.insert_versioned(value, vb.clone_diff_only());
                 }
-            }
+            });
             self.fields.insert(name.to_string(), Arc::new(new_field));
         }
     }

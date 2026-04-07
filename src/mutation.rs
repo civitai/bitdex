@@ -724,7 +724,7 @@ impl<'a> MutationEngine<'a> {
             if Self::field_values_equal(old_val, new_val) {
                 continue;
             }
-            if let Some(filter_field) = self.filters.get_field_mut(field_name) {
+            if let Some(filter_field) = self.filters.get_field(field_name) {
                 // Clear old bitmap bits
                 if let Some(old) = old_val {
                     Self::clear_filter_bits(filter_field, id, old);
@@ -778,7 +778,7 @@ impl<'a> MutationEngine<'a> {
     fn clear_old_bitmaps(&mut self, id: u32, old_doc: &StoredDoc) {
         for filter_config in &self.config.filter_fields {
             if let Some(old_val) = old_doc.fields.get(&filter_config.name) {
-                if let Some(filter_field) = self.filters.get_field_mut(&filter_config.name) {
+                if let Some(filter_field) = self.filters.get_field(&filter_config.name) {
                     Self::clear_filter_bits(filter_field, id, old_val);
                 }
             }
@@ -799,7 +799,7 @@ impl<'a> MutationEngine<'a> {
     fn set_all_bitmaps(&mut self, id: u32, doc: &Document) {
         for filter_config in &self.config.filter_fields {
             if let Some(field_value) = doc.fields.get(&filter_config.name) {
-                if let Some(filter_field) = self.filters.get_field_mut(&filter_config.name) {
+                if let Some(filter_field) = self.filters.get_field(&filter_config.name) {
                     Self::set_filter_bits(filter_field, id, field_value);
                 }
             }
@@ -842,7 +842,7 @@ impl<'a> MutationEngine<'a> {
     }
     /// Clear filter bitmap bits for a field value.
     fn clear_filter_bits(
-        filter_field: &mut crate::filter::FilterField,
+        filter_field: &crate::filter::FilterField,
         id: u32,
         val: &FieldValue,
     ) {
@@ -863,7 +863,7 @@ impl<'a> MutationEngine<'a> {
     }
     /// Set filter bitmap bits for a field value.
     fn set_filter_bits(
-        filter_field: &mut crate::filter::FilterField,
+        filter_field: &crate::filter::FilterField,
         id: u32,
         val: &FieldValue,
     ) {
@@ -893,7 +893,7 @@ impl<'a> MutationEngine<'a> {
         }
         for (field_name, change) in &patch.fields {
             // Update filter bitmaps
-            if let Some(filter_field) = self.filters.get_field_mut(field_name) {
+            if let Some(filter_field) = self.filters.get_field(field_name) {
                 // Clear old values
                 match &change.old {
                     FieldValue::Single(val) => {
@@ -1072,7 +1072,7 @@ mod tests {
         assert!(slots.is_alive(100));
         assert_eq!(slots.alive_count(), 1);
         // Merge filter diffs before reading (Engine::put does this; MutationEngine does not)
-        for (_name, field) in filters.fields_mut() {
+        for (_name, field) in filters.fields() {
             field.merge_dirty();
         }
         assert!(filters
@@ -1123,7 +1123,7 @@ mod tests {
         ]);
         engine.put(100, &doc2).unwrap();
         // Merge filter diffs before reading
-        for (_name, field) in filters.fields_mut() {
+        for (_name, field) in filters.fields() {
             field.merge_dirty();
         }
         // Old filter value gone
@@ -1172,7 +1172,7 @@ mod tests {
         };
         engine.patch(100, &patch).unwrap();
         // Merge filter diffs before reading
-        for (_name, field) in filters.fields_mut() {
+        for (_name, field) in filters.fields() {
             field.merge_dirty();
         }
         assert!(filters.get_field("nsfwLevel").unwrap().get(1).is_none()
@@ -1241,7 +1241,7 @@ mod tests {
         };
         engine.patch(10, &patch).unwrap();
         // Merge filter diffs before reading
-        for (_name, field) in filters.fields_mut() {
+        for (_name, field) in filters.fields() {
             field.merge_dirty();
         }
         assert!(filters.get_field("tagIds").unwrap().get(100).is_none()
@@ -1277,7 +1277,7 @@ mod tests {
         engine.delete(100).unwrap();
         assert!(!slots.is_alive(100));
         // Merge filter diffs before reading
-        for (_name, field) in filters.fields_mut() {
+        for (_name, field) in filters.fields() {
             field.merge_dirty();
         }
         // Filter bitmap is clean — stale bit removed on delete
@@ -1332,7 +1332,7 @@ mod tests {
             }
         }
         // Merge filter diffs before reading
-        for (_name, field) in filters.fields_mut() {
+        for (_name, field) in filters.fields() {
             field.merge_dirty();
         }
         // Get matching bitmap, then delete

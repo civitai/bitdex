@@ -499,7 +499,7 @@ impl ConcurrentEngine {
                         }
                     });
                     for (name, bitmaps) in eager_filter_results.into_inner().unwrap() {
-                        if let Some(field) = filters.get_field_mut(&name) {
+                        if let Some(field) = filters.get_field(&name) {
                             field.load_field_complete(bitmaps);
                         }
                         pending_filter_loads.remove(&name);
@@ -522,7 +522,7 @@ impl ConcurrentEngine {
                                         "Eager-loaded filter '{}': {} values in {:.1}ms",
                                         name, count, ft0.elapsed().as_secs_f64() * 1000.0
                                     );
-                                    if let Some(field) = filters.get_field_mut(name) {
+                                    if let Some(field) = filters.get_field(name) {
                                         field.load_field_complete(bitmaps);
                                     }
                                     pending_filter_loads.remove(name);
@@ -1086,13 +1086,13 @@ impl ConcurrentEngine {
                     while let Ok(load) = lazy_rx.try_recv() {
                         match load {
                             LazyLoad::FilterField { name, bitmaps } => {
-                                if let Some(field) = staging.filters.get_field_mut(&name) {
+                                if let Some(field) = staging.filters.get_field(&name) {
                                     field.load_field_complete(bitmaps);
                                 }
                                 stale_fields.push(name);
                             }
                             LazyLoad::FilterValues { field, values } => {
-                                if let Some(f) = staging.filters.get_field_mut(&field) {
+                                if let Some(f) = staging.filters.get_field(&field) {
                                     // For per-value loads, we use load_from since only
                                     // specific requested values are sent. The values in
                                     // the map are all that were requested.
@@ -1347,7 +1347,7 @@ impl ConcurrentEngine {
                                 // merged when the field is eventually loaded by a query.
                                 // Only make_mut + merge on fields that actually have dirty diffs
                                 for name in &dirty_fields {
-                                    if let Some(field) = staging.filters.get_field_mut(name) {
+                                    if let Some(field) = staging.filters.get_field(name) {
                                         field.merge_dirty();
                                     }
                                 }
@@ -1544,7 +1544,7 @@ impl ConcurrentEngine {
                                 // NOTE: Auto-loading bases disabled (same as regular compaction).
                                 // Dirty diffs persist via ShardStore, merge on query load.
                                 for name in &dirty_fields {
-                                    if let Some(field) = staging.filters.get_field_mut(name) {
+                                    if let Some(field) = staging.filters.get_field(name) {
                                         field.merge_dirty();
                                     }
                                 }
@@ -1562,7 +1562,7 @@ impl ConcurrentEngine {
                     // Loading mode exit: force-publish if staging has unpublished mutations
                     if was_loading && !is_loading && staging_dirty {
                         // Compact all filter diffs accumulated during loading
-                        for (_name, field) in staging.filters.fields_mut() {
+                        for (_name, field) in staging.filters.fields() {
                             field.merge_dirty();
                         }
                         // Invalidate unified cache — may be stale from the loading period
@@ -1584,12 +1584,12 @@ impl ConcurrentEngine {
                                 while let Ok(load) = lazy_rx.try_recv() {
                                     match load {
                                         LazyLoad::FilterField { name, bitmaps } => {
-                                            if let Some(field) = staging.filters.get_field_mut(&name) {
+                                            if let Some(field) = staging.filters.get_field(&name) {
                                                 field.load_field_complete(bitmaps);
                                             }
                                         }
                                         LazyLoad::FilterValues { field, values } => {
-                                            if let Some(f) = staging.filters.get_field_mut(&field) {
+                                            if let Some(f) = staging.filters.get_field(&field) {
                                                 let requested: Vec<u64> = values.keys().copied().collect();
                                                 f.load_values(values, &requested);
                                             }
@@ -1626,7 +1626,7 @@ impl ConcurrentEngine {
                                 // touches every Arc<FilterField>.
                                 let t_merge = std::time::Instant::now();
                                 if extra > 0 {
-                                    for (_name, field) in staging.filters.fields_mut() {
+                                    for (_name, field) in staging.filters.fields() {
                                         field.merge_dirty();
                                     }
                                 }
@@ -1805,25 +1805,25 @@ impl ConcurrentEngine {
                             };
                             let field_name_arc: Arc<str> = Arc::from(field_name.as_str());
                             let to_evict: Vec<u64> = field.bitmap_keys()
+                                .into_iter()
                                 .filter(|&value| {
                                     // Skip dirty bitmaps (unpersisted mutations)
-                                    if let Some(vb) = field.get_versioned(*value) {
+                                    if let Some(vb) = field.get_versioned(value) {
                                         if vb.is_dirty() {
                                             return false;
                                         }
                                     }
                                     // Check stamp (wall-clock millis)
-                                    let key = (field_name_arc.clone(), *value);
+                                    let key = (field_name_arc.clone(), value);
                                     flush_eviction_stamps
                                         .get(&key)
                                         .map(|entry| entry.value().load(Ordering::Relaxed) < cutoff_ms)
                                         .unwrap_or(true) // no stamp = never touched = evict
                                 })
-                                .copied()
                                 .collect();
                             if !to_evict.is_empty() {
                                 let count = to_evict.len();
-                                if let Some(field_mut) = staging.filters.get_field_mut(field_name) {
+                                if let Some(field_mut) = staging.filters.get_field(field_name) {
                                     for value in &to_evict {
                                         field_mut.remove_value(*value);
                                         flush_eviction_stamps.remove(
@@ -2013,7 +2013,7 @@ impl ConcurrentEngine {
                         &mut staging.sorts,
                     );
                     // Compact all remaining filter diffs before final publish
-                    for (_name, field) in staging.filters.fields_mut() {
+                    for (_name, field) in staging.filters.fields() {
                         field.merge_dirty();
                     }
                     inner.store(Arc::new(staging.clone()));
@@ -3025,10 +3025,10 @@ impl ConcurrentEngine {
                 match snap.filters.get_field(field_name) {
                     Some(field) => field
                         .bitmap_keys()
-                        .filter(|&&v| {
+                        .into_iter()
+                        .filter(|&v| {
                             field.get(v).map_or(false, |bm| bm.contains(slot))
                         })
-                        .copied()
                         .collect(),
                     None => Vec::new(),
                 }
@@ -3467,12 +3467,12 @@ impl ConcurrentEngine {
                 let current = self.inner.load_full();
                 let mut updated = (*current).clone();
                 for (name, bitmaps) in &loaded_filters {
-                    if let Some(field) = updated.filters.get_field_mut(name) {
+                    if let Some(field) = updated.filters.get_field(name) {
                         field.load_field_complete(bitmaps.clone());
                     }
                 }
                 for (field_name, loaded_vals, requested_keys) in &loaded_values {
-                    if let Some(field) = updated.filters.get_field_mut(field_name) {
+                    if let Some(field) = updated.filters.get_field(field_name) {
                         field.load_values(loaded_vals.clone(), requested_keys);
                     }
                 }
@@ -5821,11 +5821,15 @@ impl ConcurrentEngine {
             }
             let t0 = std::time::Instant::now();
             let num_values = field.bitmap_count();
-            // Group in-memory entries by bucket (256 buckets max)
-            let mut by_bucket: HashMap<u8, Vec<(u64, Cow<'_, RoaringBitmap>)>> = HashMap::new();
-            for (&value, vb) in field.iter_versioned() {
+            // Group in-memory entries by bucket (256 buckets max).
+            // iter_versioned() snapshots the field under read lock and
+            // returns owned VB clones (cheap — Arc refcount bumps).
+            // We then call fused() on each to get an owned merged bitmap
+            // for serialization. The lock is held only during the snapshot.
+            let mut by_bucket: HashMap<u8, Vec<(u64, RoaringBitmap)>> = HashMap::new();
+            for (value, vb) in field.iter_versioned() {
                 let bucket = (value >> 8) as u8;
-                by_bucket.entry(bucket).or_default().push((value, vb.fused_cow()));
+                by_bucket.entry(bucket).or_default().push((value, vb.fused()));
             }
             let num_buckets = by_bucket.len();
             if is_lazy {
@@ -5838,9 +5842,9 @@ impl ConcurrentEngine {
                         .unwrap_or_default();
                     // Build merged map: start with disk, overlay memory
                     let mut merged: HashMap<u64, RoaringBitmap> = disk_entries.into_iter().collect();
-                    for (value, cow_bm) in &mem_entries {
+                    for (value, mem_bm) in &mem_entries {
                         let entry = merged.entry(*value).or_insert_with(RoaringBitmap::new);
-                        *entry |= cow_bm.as_ref();
+                        *entry |= mem_bm;
                     }
                     // Write merged result
                     let refs: Vec<(u64, &RoaringBitmap)> = merged.iter()
@@ -5854,7 +5858,7 @@ impl ConcurrentEngine {
                 for (bucket, entries) in by_bucket {
                     let refs: Vec<(u64, &RoaringBitmap)> = entries
                         .iter()
-                        .map(|(v, c)| (*v, c.as_ref()))
+                        .map(|(v, bm)| (*v, bm))
                         .collect();
                     filter_store.write_filter_bucket(name, bucket, &refs)
                         .map_err(|e| crate::error::BitdexError::Storage(format!("write filter {name}/{bucket:02x}: {e}")))?;
@@ -6408,7 +6412,7 @@ impl ConcurrentEngine {
         alive: RoaringBitmap,
     ) {
         for (field_name, value_map) in filter_maps {
-            if let Some(field) = staging.filters.get_field_mut(&field_name) {
+            if let Some(field) = staging.filters.get_field(&field_name) {
                 for (value, bitmap) in value_map {
                     field.or_bitmap(value, &bitmap);
                 }
@@ -6544,7 +6548,7 @@ impl ConcurrentEngine {
         let t2 = t0.elapsed();
         // Phase 3: Apply to staging — OR directly into base (bypasses diff layer)
         for ((field_name, value), bitmap) in merged_filters {
-            if let Some(field) = staging.filters.get_field_mut(&field_name) {
+            if let Some(field) = staging.filters.get_field(&field_name) {
                 field.or_bitmap(value, &bitmap);
             }
         }
@@ -6581,7 +6585,7 @@ impl ConcurrentEngine {
         drop(snap);
         // Apply filter bitmaps
         for (field_name, value_map) in &accum.filter_maps {
-            if let Some(field) = staging.filters.get_field_mut(field_name) {
+            if let Some(field) = staging.filters.get_field(field_name) {
                 for (&value, bitmap) in value_map {
                     field.or_bitmap(value, bitmap);
                 }
@@ -6725,7 +6729,7 @@ impl ConcurrentEngine {
                 // Merge filter bitmaps directly into staging fields
                 for ((fi, value), bitmap) in chunk.filter_map {
                     let fname = &filter_configs_clone[fi].name;
-                    if let Some(field) = staging.filters.get_field_mut(fname) {
+                    if let Some(field) = staging.filters.get_field(fname) {
                         field.or_bitmap(value, &bitmap);
                     }
                 }
@@ -7023,7 +7027,7 @@ impl ConcurrentEngine {
         // Apply rebuilt filter bitmaps (keyed by field index)
         for ((fi, value), bitmap) in merged.filter_map {
             let fname = &filter_configs[fi].name;
-            if let Some(field) = staging.filters.get_field_mut(fname) {
+            if let Some(field) = staging.filters.get_field(fname) {
                 field.or_bitmap(value, &bitmap);
             }
         }
@@ -7227,7 +7231,7 @@ impl ConcurrentEngine {
         // Apply rebuilt filter bitmaps
         for ((fi, value), bitmap) in merged.filter_map {
             let fname = &new_filters[fi].name;
-            if let Some(field) = staging.filters.get_field_mut(fname) {
+            if let Some(field) = staging.filters.get_field(fname) {
                 field.or_bitmap(value, &bitmap);
             }
         }
@@ -8915,7 +8919,7 @@ mod tests {
         {
             let mut staging = engine.clone_staging();
             // Simulate a mutation: add nsfwLevel=1 for slot 10
-            if let Some(field) = staging.filters.get_field_mut("nsfwLevel") {
+            if let Some(field) = staging.filters.get_field("nsfwLevel") {
                 field.insert(1, 10);
             }
             engine.publish_staging(staging);
