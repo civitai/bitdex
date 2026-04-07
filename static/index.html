@@ -302,7 +302,7 @@ function dictLabel(fieldName, intValue) {
 }
 
 function extractField(fields, name) {
-  if (!fields || !fields[name]) return null;
+  if (!fields || fields[name] == null) return null;
   const v = fields[name];
   if (v.Single) {
     if (v.Single.Integer !== undefined) return v.Single.Integer;
