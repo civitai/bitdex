@@ -41,6 +41,8 @@ pub struct DocWriter {
     docstore: Arc<parking_lot::Mutex<DocStoreV3>>,
     field_dict: HashMap<String, u16>,
     pending: Vec<(u32, u16, Vec<u8>)>,
+    pending_append: Vec<(u32, u16, PackedValue)>,
+    pending_remove: Vec<(u32, u16, PackedValue)>,
 }
 impl DocWriter {
     /// Create a DocWriter from the engine's docstore.
@@ -50,6 +52,8 @@ impl DocWriter {
             docstore,
             field_dict,
             pending: Vec::new(),
+            pending_append: Vec::new(),
+            pending_remove: Vec::new(),
         }
     }
     /// Write a single-value field update to the docstore.
@@ -79,7 +83,10 @@ impl DocWriter {
             }
         }
     }
-    /// Write a multi-value add: read current list, append value, write back.
+    /// Write a multi-value add by emitting DocOp::Append. The apply path
+    /// unions with existing Mi values and dedups, so no read-modify-write
+    /// is needed — eliminates the batch race where two adds for the same
+    /// slot in one batch would each emit a Set and clobber each other.
     fn write_add(&mut self, slot: u32, field: &str, value: &JsonValue) {
         let idx = match self.resolve_field(field) {
             Some(idx) => idx,
@@ -89,16 +96,9 @@ impl DocWriter {
             Some(v) => v,
             None => return,
         };
-        // Read current doc and get existing multi-value list
-        let mut current = self.read_multi_value(slot, field);
-        if !current.contains(&add_val) {
-            current.push(add_val);
-        }
-        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
-            self.pending.push((slot, idx, bytes));
-        }
+        self.pending_append.push((slot, idx, PackedValue::I(add_val)));
     }
-    /// Write a multi-value remove: read current list, remove value, write back.
+    /// Write a multi-value remove by emitting DocOp::Remove.
     fn write_remove(&mut self, slot: u32, field: &str, value: &JsonValue) {
         let idx = match self.resolve_field(field) {
             Some(idx) => idx,
@@ -108,20 +108,22 @@ impl DocWriter {
             Some(v) => v,
             None => return,
         };
-        let mut current = self.read_multi_value(slot, field);
-        current.retain(|&v| v != remove_val);
-        if let Ok(bytes) = rmp_serde::to_vec(&PackedValue::Mi(current)) {
-            self.pending.push((slot, idx, bytes));
-        }
+        self.pending_remove.push((slot, idx, PackedValue::I(remove_val)));
     }
     /// Flush pending tuples to the docstore.
     pub fn flush(&mut self) {
-        if self.pending.is_empty() {
-            return;
+        if !self.pending.is_empty() {
+            let tuples = std::mem::take(&mut self.pending);
+            if let Err(e) = self.docstore.lock().append_tuples_batch(tuples) {
+                tracing::warn!("DocWriter flush failed: {e}");
+            }
         }
-        let tuples = std::mem::take(&mut self.pending);
-        if let Err(e) = self.docstore.lock().append_tuples_batch(tuples) {
-            tracing::warn!("DocWriter flush failed: {e}");
+        if !self.pending_append.is_empty() || !self.pending_remove.is_empty() {
+            let appends = std::mem::take(&mut self.pending_append);
+            let removes = std::mem::take(&mut self.pending_remove);
+            if let Err(e) = self.docstore.lock().append_multi_ops_batch(appends, removes) {
+                tracing::warn!("DocWriter multi-ops flush failed: {e}");
+            }
         }
     }
     fn resolve_field(&mut self, field: &str) -> Option<u16> {
@@ -138,20 +140,6 @@ impl DocWriter {
                 tracing::warn!("DocWriter: failed to ensure field '{field}': {e}");
                 None
             }
-        }
-    }
-    fn read_multi_value(&self, slot: u32, field: &str) -> Vec<i64> {
-        let doc = match self.docstore.lock().get(slot) {
-            Ok(Some(doc)) => doc,
-            _ => return Vec::new(),
-        };
-        match doc.fields.get(field) {
-            Some(crate::mutation::FieldValue::Multi(vals)) => {
-                vals.iter().filter_map(|v| {
-                    if let QValue::Integer(i) = v { Some(*i) } else { None }
-                }).collect()
-            }
-            _ => Vec::new(),
         }
     }
 }
@@ -1823,6 +1811,81 @@ mod tests {
                 assert!(ints.contains(&100));
                 assert!(!ints.contains(&200), "200 should have been removed");
                 assert!(ints.contains(&300));
+            }
+            other => panic!("expected multi-value tagIds, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_doc_writer_batch_add_race() {
+        use crate::shard_store_doc::PackedValue;
+        use crate::shard_store_doc::DocStoreV3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        store.ensure_field_index("tagIds").unwrap();
+        let store = Arc::new(parking_lot::Mutex::new(store));
+
+        // Initial value
+        {
+            let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100, 200])).unwrap();
+            let idx = store.lock().field_index("tagIds").unwrap();
+            store.lock().append_tuple(5, idx, &initial).unwrap();
+        }
+
+        // Two adds for the same slot in ONE DocWriter batch (the race scenario).
+        let mut dw = DocWriter::new(Arc::clone(&store));
+        dw.write_add(5, "tagIds", &json!(300));
+        dw.write_add(5, "tagIds", &json!(400));
+        dw.flush();
+
+        let doc = store.lock().get(5).unwrap().unwrap();
+        match &doc.fields["tagIds"] {
+            crate::mutation::FieldValue::Multi(vals) => {
+                let ints: Vec<i64> = vals.iter().filter_map(|v| {
+                    if let crate::query::Value::Integer(i) = v { Some(*i) } else { None }
+                }).collect();
+                assert!(ints.contains(&100), "100 missing: {:?}", ints);
+                assert!(ints.contains(&200), "200 missing: {:?}", ints);
+                assert!(ints.contains(&300), "300 missing (batch race): {:?}", ints);
+                assert!(ints.contains(&400), "400 missing (batch race): {:?}", ints);
+            }
+            other => panic!("expected multi-value tagIds, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_doc_writer_batch_add_dedup() {
+        use crate::shard_store_doc::PackedValue;
+        use crate::shard_store_doc::DocStoreV3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let docs_dir = dir.path().join("docs");
+        let mut store = DocStoreV3::open(&docs_dir).unwrap();
+        store.ensure_field_index("tagIds").unwrap();
+        let store = Arc::new(parking_lot::Mutex::new(store));
+
+        {
+            let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100])).unwrap();
+            let idx = store.lock().field_index("tagIds").unwrap();
+            store.lock().append_tuple(5, idx, &initial).unwrap();
+        }
+
+        let mut dw = DocWriter::new(Arc::clone(&store));
+        dw.write_add(5, "tagIds", &json!(100)); // re-add existing
+        dw.write_add(5, "tagIds", &json!(200)); // add new
+        dw.flush();
+
+        let doc = store.lock().get(5).unwrap().unwrap();
+        match &doc.fields["tagIds"] {
+            crate::mutation::FieldValue::Multi(vals) => {
+                let ints: Vec<i64> = vals.iter().filter_map(|v| {
+                    if let crate::query::Value::Integer(i) = v { Some(*i) } else { None }
+                }).collect();
+                let mut sorted = ints.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec![100, 200], "expected exactly [100, 200], got: {:?}", ints);
             }
             other => panic!("expected multi-value tagIds, got: {:?}", other),
         }

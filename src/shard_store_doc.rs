@@ -543,11 +543,15 @@ impl OpCodec for DocOpCodec {
                     match &mut entry.1 {
                         PackedValue::Mi(v) => {
                             if let PackedValue::I(i) = value {
-                                v.push(*i);
+                                if !v.contains(i) {
+                                    v.push(*i);
+                                }
                             }
                         }
                         PackedValue::Mm(v) => {
-                            v.push(value.clone());
+                            if !v.iter().any(|x| packed_value_eq(x, value)) {
+                                v.push(value.clone());
+                            }
                         }
                         _ => {
                             // Convert scalar to multi by wrapping
@@ -1105,6 +1109,30 @@ impl DocStoreV3 {
             });
         }
 
+        for (shard_key, ops) in by_shard {
+            self.store.append_ops(&shard_key, &ops)?;
+            self.dirty_shards.insert(shard_key);
+        }
+        Ok(())
+    }
+
+    /// Append a batch of multi-value DocOp::Append and DocOp::Remove ops.
+    /// Used by DocWriter for tag additions/removals — the apply path handles
+    /// union/remove with dedup so no read-modify-write is needed.
+    pub fn append_multi_ops_batch(
+        &mut self,
+        appends: Vec<(u32, u16, PackedValue)>,
+        removes: Vec<(u32, u16, PackedValue)>,
+    ) -> io::Result<()> {
+        let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
+        for (slot, field, value) in appends {
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            by_shard.entry(shard_key).or_default().push(DocOp::Append { slot, field, value });
+        }
+        for (slot, field, value) in removes {
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            by_shard.entry(shard_key).or_default().push(DocOp::Remove { slot, field, value });
+        }
         for (shard_key, ops) in by_shard {
             self.store.append_ops(&shard_key, &ops)?;
             self.dirty_shards.insert(shard_key);
