@@ -1,9 +1,86 @@
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender};
 use crate::filter::FilterIndex;
 use crate::slot::SlotAllocator;
 use crate::sort::SortIndex;
+
+/// Per-cycle timing breakdown for `WriteBatch::apply`.
+///
+/// Used to identify which sub-phase or which specific field is dominating
+/// the apply duration. The flush thread logs this if total apply time
+/// exceeds a threshold (default 100ms).
+#[derive(Debug, Default, Clone)]
+pub struct BatchApplyTimings {
+    pub filter_removes_ns: u64,
+    pub filter_inserts_ns: u64,
+    pub sort_clears_ns: u64,
+    pub sort_sets_ns: u64,
+    pub alive_ns: u64,
+    pub sort_merge_dirty_ns: u64,
+    pub alive_merge_ns: u64,
+    /// Per-field nanoseconds for filter inserts+removes combined.
+    /// Identifies whether a single high-cardinality field (e.g. postId)
+    /// is dominating the cycle. Sorted descending in render.
+    pub per_filter_field_ns: HashMap<Arc<str>, u64>,
+    /// Per-field nanoseconds for sort sets+clears+merge_dirty combined.
+    pub per_sort_field_ns: HashMap<Arc<str>, u64>,
+    /// Number of (field, value) groups processed across inserts+removes.
+    pub filter_groups: usize,
+    pub sort_groups: usize,
+}
+
+impl BatchApplyTimings {
+    pub fn total_ns(&self) -> u64 {
+        self.filter_removes_ns
+            + self.filter_inserts_ns
+            + self.sort_clears_ns
+            + self.sort_sets_ns
+            + self.alive_ns
+            + self.sort_merge_dirty_ns
+            + self.alive_merge_ns
+    }
+    /// Render a single-line summary of the timings, with the top 3 hot fields
+    /// called out by name. Used by the flush thread for ops-trace logging.
+    pub fn render_summary(&self) -> String {
+        let mut top_filter: Vec<(&Arc<str>, &u64)> =
+            self.per_filter_field_ns.iter().collect();
+        top_filter.sort_by(|a, b| b.1.cmp(a.1));
+        let top_filter_str = top_filter
+            .iter()
+            .take(3)
+            .map(|(f, ns)| format!("{}={}ms", f, *ns / 1_000_000))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut top_sort: Vec<(&Arc<str>, &u64)> =
+            self.per_sort_field_ns.iter().collect();
+        top_sort.sort_by(|a, b| b.1.cmp(a.1));
+        let top_sort_str = top_sort
+            .iter()
+            .take(3)
+            .map(|(f, ns)| format!("{}={}ms", f, *ns / 1_000_000))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "total={}ms (fr={}ms fi={}ms sc={}ms ss={}ms alive={}ms sortmerge={}ms aliveerge={}ms) f_groups={} s_groups={} top_filter=[{}] top_sort=[{}]",
+            self.total_ns() / 1_000_000,
+            self.filter_removes_ns / 1_000_000,
+            self.filter_inserts_ns / 1_000_000,
+            self.sort_clears_ns / 1_000_000,
+            self.sort_sets_ns / 1_000_000,
+            self.alive_ns / 1_000_000,
+            self.sort_merge_dirty_ns / 1_000_000,
+            self.alive_merge_ns / 1_000_000,
+            self.filter_groups,
+            self.sort_groups,
+            top_filter_str,
+            top_sort_str,
+        )
+    }
+}
 /// A bitmap mutation request submitted by any thread.
 /// Field names use Arc<str> to avoid heap allocation per op.
 /// All variants carry `slots: Vec<u32>` for bulk grouping.
@@ -248,6 +325,22 @@ impl WriteBatch {
         filters: &mut FilterIndex,
         sorts: &mut SortIndex,
     ) {
+        // Discard timings — call apply_traced if you want them.
+        let _ = self.apply_traced(slots, filters, sorts);
+    }
+
+    /// Apply all grouped mutations to the bitmap state, returning a per-sub-phase
+    /// and per-field timing breakdown for ops-path tracing.
+    pub fn apply_traced(
+        &self,
+        slots: &mut SlotAllocator,
+        filters: &mut FilterIndex,
+        sorts: &mut SortIndex,
+    ) -> BatchApplyTimings {
+        let mut t = BatchApplyTimings::default();
+        t.filter_groups = self.filter_inserts.len() + self.filter_removes.len();
+        t.sort_groups = self.sort_sets.len() + self.sort_clears.len();
+
         // Apply filter removes BEFORE inserts.
         // On upsert, diff_document emits remove-old + insert-new for changed
         // multi_value fields.  When a value is kept across the upsert (e.g.
@@ -255,17 +348,31 @@ impl WriteBatch {
         // applying inserts first makes the insert a no-op and the subsequent
         // remove deletes the slot — losing the value.  Removes-first is safe:
         // the remove clears the bit, then the insert re-sets it.
+        let t0 = Instant::now();
         for (key, slot_ids) in &self.filter_removes {
+            let f0 = Instant::now();
             if let Some(field) = filters.get_field_mut(&key.field) {
                 field.remove_bulk(key.value, slot_ids);
             }
+            *t.per_filter_field_ns
+                .entry(Arc::clone(&key.field))
+                .or_insert(0) += f0.elapsed().as_nanos() as u64;
         }
+        t.filter_removes_ns = t0.elapsed().as_nanos() as u64;
+
         // Apply filter inserts in bulk
+        let t0 = Instant::now();
         for (key, slot_ids) in &self.filter_inserts {
+            let f0 = Instant::now();
             if let Some(field) = filters.get_field_mut(&key.field) {
                 field.insert_bulk(key.value, slot_ids.iter().copied());
             }
+            *t.per_filter_field_ns
+                .entry(Arc::clone(&key.field))
+                .or_insert(0) += f0.elapsed().as_nanos() as u64;
         }
+        t.filter_inserts_ns = t0.elapsed().as_nanos() as u64;
+
         // Apply sort layer clears BEFORE sets.
         // On slot recycling (delete → reinsert), diff_document emits SortClear
         // for old value bits and SortSet for new value bits.  For bits that are 1
@@ -273,18 +380,33 @@ impl WriteBatch {
         // and sort_sets.  Sets-first makes the set a no-op, then clear deletes
         // the bit — losing the value.  Clears-first is safe: clear removes the
         // old bit, then set re-establishes it.
+        let t0 = Instant::now();
         for (key, slot_ids) in &self.sort_clears {
+            let f0 = Instant::now();
             if let Some(field) = sorts.get_field_mut(&key.field) {
                 field.clear_layer_bulk(key.bit_layer, slot_ids);
             }
+            *t.per_sort_field_ns
+                .entry(Arc::clone(&key.field))
+                .or_insert(0) += f0.elapsed().as_nanos() as u64;
         }
+        t.sort_clears_ns = t0.elapsed().as_nanos() as u64;
+
         // Apply sort layer sets in bulk
+        let t0 = Instant::now();
         for (key, slot_ids) in &self.sort_sets {
+            let f0 = Instant::now();
             if let Some(field) = sorts.get_field_mut(&key.field) {
                 field.set_layer_bulk(key.bit_layer, slot_ids.iter().copied());
             }
+            *t.per_sort_field_ns
+                .entry(Arc::clone(&key.field))
+                .or_insert(0) += f0.elapsed().as_nanos() as u64;
         }
+        t.sort_sets_ns = t0.elapsed().as_nanos() as u64;
+
         // Apply alive inserts in bulk (writes to diff layer)
+        let t0 = Instant::now();
         if !self.alive_inserts.is_empty() {
             slots.alive_insert_bulk(self.alive_inserts.iter().copied());
         }
@@ -296,8 +418,11 @@ impl WriteBatch {
         for &(slot, activate_at) in &self.deferred_alive {
             slots.schedule_alive(slot, activate_at);
         }
+        t.alive_ns = t0.elapsed().as_nanos() as u64;
+
         // Eager merge: sort diffs MUST be empty before readers see them.
         // Merge only sort fields that were mutated in this batch.
+        let t0 = Instant::now();
         let mut mutated_sort_fields: HashSet<&str> = HashSet::new();
         for key in self.sort_sets.keys() {
             mutated_sort_fields.insert(&key.field);
@@ -306,17 +431,29 @@ impl WriteBatch {
             mutated_sort_fields.insert(&key.field);
         }
         for field_name in &mutated_sort_fields {
+            let f0 = Instant::now();
             if let Some(field) = sorts.get_field_mut(field_name) {
                 field.merge_dirty();
             }
+            // Attribute to existing per-sort-field bucket so render_summary
+            // shows total cost (clears + sets + merge) per field.
+            let arc_name: Arc<str> = Arc::from(*field_name);
+            *t.per_sort_field_ns.entry(arc_name).or_insert(0) +=
+                f0.elapsed().as_nanos() as u64;
         }
+        t.sort_merge_dirty_ns = t0.elapsed().as_nanos() as u64;
+
         // Filter diffs are NOT merged here — they accumulate in the diff layer
         // and are fused at read time by the executor (apply_diff). The merge
         // thread compacts them periodically into bases. This avoids the
         // Arc::make_mut() clone cascade that caused the write regression.
         // See: docs/architecture-risk-review.md issue 3/4, P5/P7.
         // Merge alive bitmap
+        let t0 = Instant::now();
         slots.merge_alive();
+        t.alive_merge_ns = t0.elapsed().as_nanos() as u64;
+
+        t
     }
 }
 impl Default for WriteBatch {
@@ -421,6 +558,17 @@ impl WriteCoalescer {
         sorts: &mut SortIndex,
     ) {
         self.batch.apply(slots, filters, sorts);
+    }
+    /// Phase 2 with timing breakdown. Returns per-sub-phase + per-field
+    /// nanosecond costs so the flush thread can emit ops trace logs and
+    /// surface hot-field cascades (e.g. postId at 22.5M entries).
+    pub fn apply_prepared_traced(
+        &self,
+        slots: &mut SlotAllocator,
+        filters: &mut FilterIndex,
+        sorts: &mut SortIndex,
+    ) -> BatchApplyTimings {
+        self.batch.apply_traced(slots, filters, sorts)
     }
     /// Extract Tier 2 filter mutations from the prepared batch.
     /// Must be called after `prepare()` and before `apply_prepared()`.

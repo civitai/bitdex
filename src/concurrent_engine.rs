@@ -1128,12 +1128,23 @@ impl ConcurrentEngine {
                         staging_dirty = true;
                         flush_dirty_flag.store(true, Ordering::Release);
                         let t_apply = Instant::now();
-                        coalescer.apply_prepared(
+                        let apply_timings = coalescer.apply_prepared_traced(
                             &mut staging.slots,
                             &mut staging.filters,
                             &mut staging.sorts,
                         );
-                        flush_apply_ns.store(t_apply.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        let apply_elapsed_ns = t_apply.elapsed().as_nanos() as u64;
+                        flush_apply_ns.store(apply_elapsed_ns, Ordering::Relaxed);
+                        // Emit ops trace log when a single cycle is unusually slow.
+                        // Threshold: 100ms apply. Surfaces per-field hot spots
+                        // (e.g. postId Arc::make_mut cascade on 22.5M-entry HashMap).
+                        if apply_elapsed_ns > 100_000_000 {
+                            tracing::warn!(
+                                "[ops-trace] apply ops={} {}",
+                                bitmap_count,
+                                apply_timings.render_summary(),
+                            );
+                        }
                         // Collect mutated field names for bitmap memory cache staleness tracking.
                         for fgk in coalescer.filter_insert_entries().keys() {
                             stale_fields.push(fgk.field.to_string());
