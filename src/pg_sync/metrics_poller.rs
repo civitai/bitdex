@@ -35,6 +35,33 @@ struct MetricInfo {
 /// V2 pipeline: fetches aggregate counts from ClickHouse, converts them to
 /// `Op::Set` ops for sort fields, and POSTs via the `/ops` endpoint.
 /// No PG round-trip needed — metrics are self-contained sort-field updates.
+/// Cursor name used to persist the metrics poller's high-water-mark on the
+/// BitDex side via the `/cursors` API. The value is the unix-epoch upper
+/// bound of the most recently *fully successful* poll cycle.
+const METRICS_CURSOR_NAME: &str = "metrics-poller-civitai";
+
+/// Optional env-var override read once at startup, ONLY honored on cold start
+/// (no persisted cursor exists). If set to a unix-epoch integer, the poller
+/// seeds the cold-start cursor from this value. Restarts after the first
+/// successful cycle ignore the env var entirely — the persisted cursor wins,
+/// so a leftover env var can't trigger a redundant backfill on every reboot.
+///
+/// Operational note: to *force* a manual backfill on a system with an existing
+/// cursor, PUT a smaller timestamp directly via the BitDex `/cursors/<name>`
+/// API. The env var is intentionally narrow.
+const METRICS_SINCE_ENV: &str = "BITDEX_METRICS_SINCE";
+
+/// Safety lag (seconds) subtracted from `now()` when computing the upper
+/// bound of each poll window. Absorbs ClickHouse ingestion latency: events
+/// generated at wall-clock T might not be visible in `entityMetricEvents`
+/// until T+lag. Without this, an event generated immediately before
+/// `cycle_upper_ts = now()` would be missed and never picked up by a future
+/// cycle (because future cycles use `createdAt > upper_ts`).
+///
+/// 60s is conservative for our CH ingestion path. Tune via observation if
+/// the gap proves too large or too small.
+const INGESTION_SAFETY_LAG_SECS: i64 = 60;
+
 pub async fn run_metrics_poller(
     ch_config: &ClickHouseConfig,
     bitdex_client: &BitdexClient,
@@ -42,11 +69,20 @@ pub async fn run_metrics_poller(
 ) -> Result<(), String> {
     let mut ticker = interval(Duration::from_secs(poll_interval_secs));
     let http = Client::new();
-    let mut last_poll_ts = current_epoch_secs() - poll_interval_secs as i64;
+
+    // Resolve starting `since_ts` from persisted cursor (with optional env
+    // override on cold start). Fails CLOSED on transient API errors so a
+    // restart during a BitDex outage doesn't silently skip the backlog.
+    let mut last_poll_ts = match resolve_initial_since(bitdex_client, poll_interval_secs).await {
+        Ok(ts) => ts,
+        Err(e) => return Err(format!("Metrics: refusing to start: {e}")),
+    };
+
     let mut bitdex_was_down = false;
 
     eprintln!(
-        "Metrics poller started (ClickHouse={}, interval={poll_interval_secs}s)",
+        "Metrics poller started (ClickHouse={}, interval={poll_interval_secs}s, \
+         since_ts={last_poll_ts}, ingestion_lag={INGESTION_SAFETY_LAG_SECS}s)",
         ch_config.url
     );
 
@@ -66,19 +102,123 @@ pub async fn run_metrics_poller(
             bitdex_was_down = false;
         }
 
-        let now = current_epoch_secs();
+        // Pin the upper bound of this cycle's window AT THE START minus a
+        // safety lag for CH ingestion delay. The query uses a half-open
+        // interval (since_ts, cycle_upper_ts], guaranteeing no gap and no
+        // overlap between consecutive cycles. Events landing in CH after
+        // `cycle_upper_ts` are the next cycle's responsibility.
+        let cycle_upper_ts = current_epoch_secs() - INGESTION_SAFETY_LAG_SECS;
 
-        match poll_metrics_and_push(&http, ch_config, bitdex_client, last_poll_ts).await {
+        // Monotonic guard: never process a cycle whose upper bound is at or
+        // below the current cursor. Protects against system clock regressions
+        // (NTP corrections, container clock skew) which would otherwise cause
+        // the cursor to walk backwards and trigger huge replay churn.
+        if cycle_upper_ts <= last_poll_ts {
+            eprintln!(
+                "Metrics: skipping cycle — upper_ts={cycle_upper_ts} is not ahead of \
+                 last_poll_ts={last_poll_ts} (clock skew or interval shorter than lag?)"
+            );
+            continue;
+        }
+
+        match poll_metrics_and_push(
+            &http,
+            ch_config,
+            bitdex_client,
+            last_poll_ts,
+            cycle_upper_ts,
+        )
+        .await
+        {
             Ok(count) => {
                 if count > 0 {
-                    eprintln!("Metrics: pushed {count} ops batches");
+                    eprintln!(
+                        "Metrics: pushed {count} ops batches (window {}..{}]",
+                        last_poll_ts, cycle_upper_ts
+                    );
                 }
-                last_poll_ts = now;
+                // Persist BEFORE advancing in-memory state. If persist fails
+                // we keep the old `last_poll_ts` and re-poll the same window
+                // next cycle (Set ops are idempotent — no double-counting).
+                if let Err(e) = bitdex_client
+                    .set_cursor(METRICS_CURSOR_NAME, &cycle_upper_ts.to_string())
+                    .await
+                {
+                    eprintln!("Metrics: cursor persist failed ({e}); will retry same window next cycle");
+                    continue;
+                }
+                last_poll_ts = cycle_upper_ts;
             }
             Err(e) => {
                 eprintln!("Metrics poll error: {e}");
-                // Don't advance last_poll_ts — retry same window
+                // Don't advance — retry same window next cycle.
             }
+        }
+    }
+}
+
+/// Resolve the starting `since_ts` for the poller loop.
+///
+/// Behavior:
+/// - If a persisted cursor exists and parses, use it. Always.
+/// - If no cursor exists (true cold start) and `BITDEX_METRICS_SINCE` is set,
+///   use the env value. (Lets operators bootstrap with a custom backfill
+///   horizon without an extra `/cursors` PUT.)
+/// - If no cursor and no env, fall back to `now - poll_interval`.
+/// - On any *transient* API error fetching the cursor, returns Err so the
+///   caller can fail closed instead of silently skipping the backlog.
+/// - On *unparseable* persisted cursor, returns Err for the same reason —
+///   silent fallback would convert state corruption into permanent data loss.
+async fn resolve_initial_since(
+    bitdex_client: &BitdexClient,
+    poll_interval_secs: u64,
+) -> Result<i64, String> {
+    // Try persisted cursor first (must distinguish 404 → None from transient error → Err).
+    match bitdex_client.get_cursor(METRICS_CURSOR_NAME).await? {
+        Some(s) => match s.trim().parse::<i64>() {
+            Ok(ts) if ts > 0 => {
+                eprintln!("Metrics: resumed from persisted cursor (since_ts={ts})");
+                Ok(ts)
+            }
+            _ => Err(format!(
+                "persisted cursor {METRICS_CURSOR_NAME}={s:?} is unparseable. \
+                 Recovery: PUT a valid unix-epoch integer to /cursors/{METRICS_CURSOR_NAME} \
+                 (or DELETE it to force a cold start). Refusing to silently restart \
+                 from now-interval — that would discard the backlog."
+            )),
+        },
+        None => {
+            // Cold start — env var override is honored only here.
+            if let Ok(s) = std::env::var(METRICS_SINCE_ENV) {
+                // Hard-fail on a malformed env var: the operator clearly meant
+                // to override, and silently falling back to "now - interval"
+                // would discard the backlog they were trying to recover.
+                let ts: i64 = s.trim().parse().map_err(|e| {
+                    format!(
+                        "{METRICS_SINCE_ENV}={s:?} is not a valid unix-epoch integer ({e}). \
+                         Either fix or unset the env var."
+                    )
+                })?;
+                if ts <= 0 {
+                    return Err(format!(
+                        "{METRICS_SINCE_ENV}={ts} must be > 0. Either fix or unset the env var."
+                    ));
+                }
+                eprintln!("Metrics: cold start, {METRICS_SINCE_ENV}={ts} override active");
+                return Ok(ts);
+            }
+            // Cold start fallback: subtract BOTH the poll interval AND the
+            // ingestion safety lag so the first cycle's `cycle_upper_ts`
+            // (which is `now - lag`) is strictly greater than `last_poll_ts`,
+            // and the first window covers any events in the lag tail. Without
+            // this, when `lag > poll_interval` the monotonic guard would
+            // skip cycles until `last_poll_ts` was overtaken — and the first
+            // real window would silently exclude lag-delayed events.
+            let ts = current_epoch_secs()
+                - poll_interval_secs as i64
+                - INGESTION_SAFETY_LAG_SECS;
+            eprintln!("Metrics: cold start, no env override (since_ts={ts})");
+            Ok(ts)
         }
     }
 }
@@ -95,14 +235,19 @@ fn current_epoch_secs() -> i64 {
 const OPS_BATCH_SIZE: usize = 5_000;
 
 /// Single poll + push cycle. Fetches CH metrics, converts to V2 ops, POSTs to BitDex.
+///
+/// Uses a half-open window `(since_ts, upper_ts]` so consecutive cycles cover
+/// the time line exactly once each. The upper bound is fixed at the start of
+/// the cycle by the caller — events landing in CH after that timestamp are
+/// the next cycle's responsibility.
 async fn poll_metrics_and_push(
     http: &Client,
     ch_config: &ClickHouseConfig,
     bitdex_client: &BitdexClient,
     since_ts: i64,
+    upper_ts: i64,
 ) -> Result<usize, String> {
-    // Query ClickHouse for image IDs with recent metric events
-    let metrics = fetch_metrics_from_clickhouse(http, ch_config, since_ts).await?;
+    let metrics = fetch_metrics_from_clickhouse(http, ch_config, since_ts, upper_ts).await?;
 
     if metrics.is_empty() {
         return Ok(0);
@@ -143,9 +288,15 @@ async fn fetch_metrics_from_clickhouse(
     http: &Client,
     ch_config: &ClickHouseConfig,
     since_ts: i64,
+    upper_ts: i64,
 ) -> Result<HashMap<i64, MetricInfo>, String> {
-    // Phase 1: discover IDs with recent metric events
-    // Phase 2: get their all-time totals from the daily aggregate table
+    // Phase 1: discover IDs with metric events in the closed window
+    //          (since_ts, upper_ts] — half-open lower, inclusive upper.
+    // Phase 2: get their all-time totals from the daily aggregate table.
+    //
+    // The bounded upper interval is the key correctness property: any event
+    // landing in entityMetricEvents AFTER upper_ts is left for the next cycle,
+    // whose `since_ts` will equal this cycle's `upper_ts`. No gap, no overlap.
     let query = format!(
         r#"SELECT
             entityId as id,
@@ -159,7 +310,8 @@ async fn fetch_metrics_from_clickhouse(
             FROM entityMetricEvents
             WHERE entityType = 'Image'
               AND entityId IS NOT NULL
-              AND createdAt > fromUnixTimestamp({since_ts})
+              AND createdAt >  fromUnixTimestamp({since_ts})
+              AND createdAt <= fromUnixTimestamp({upper_ts})
           )
         GROUP BY entityId
         FORMAT JSONEachRow"#,

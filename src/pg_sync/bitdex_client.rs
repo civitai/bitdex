@@ -476,4 +476,25 @@ impl BitdexClient {
             .map_err(|e| format!("get_cursor parse failed: {e}"))?;
         Ok(Some(cursor.value))
     }
+
+    /// Set a named cursor on the BitDex server. Persisted to disk on the
+    /// server side via snapshot save, so the value survives server restarts.
+    /// Used by the metrics poller to track its closed-window high-water-mark.
+    pub async fn set_cursor(&self, cursor_name: &str, value: &str) -> Result<(), String> {
+        let url = format!("{}/cursors/{}", self.base_url, cursor_name);
+        let body = serde_json::json!({ "value": value });
+        let resp = self.client
+            .put(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("set_cursor request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("set_cursor returned {status}: {body}"));
+        }
+        Ok(())
+    }
 }
