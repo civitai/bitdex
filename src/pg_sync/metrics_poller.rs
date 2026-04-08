@@ -194,12 +194,21 @@ async fn fetch_metrics_from_clickhouse(
         let row: serde_json::Value =
             serde_json::from_str(line).map_err(|e| format!("parse CH row: {e}"))?;
 
+        // ClickHouse JSONEachRow quotes Int64 values as strings by default
+        // (output_format_json_quote_64bit_integers=1), so as_i64() alone returns
+        // None and silently zeroes every metric. Parse string form too.
+        fn read_count(v: &serde_json::Value) -> i64 {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0)
+        }
         let id = row["id"]
             .as_i64()
+            .or_else(|| row["id"].as_str().and_then(|s| s.parse().ok()))
             .ok_or_else(|| "missing id in CH response".to_string())?;
-        let reaction_count = row["reactionCount"].as_i64().unwrap_or(0);
-        let comment_count = row["commentCount"].as_i64().unwrap_or(0);
-        let collected_count = row["collectedCount"].as_i64().unwrap_or(0);
+        let reaction_count = read_count(&row["reactionCount"]);
+        let comment_count = read_count(&row["commentCount"]);
+        let collected_count = read_count(&row["collectedCount"]);
 
         metrics.insert(
             id,
