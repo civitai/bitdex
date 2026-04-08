@@ -234,6 +234,48 @@ impl VersionedBitmap {
         self.generation += 1;
     }
 
+    /// Diff-aware point membership query. Cheap — does NOT materialize the
+    /// fused bitmap. Used by hot lookups (sort reconstruct_value) that need
+    /// to check one slot without paying for a full base+diff fuse.
+    ///
+    /// Semantics:
+    ///   present = base.contains(slot)
+    ///   if diff.clears.contains(slot): present = false
+    ///   if diff.sets.contains(slot):   present = true
+    pub fn fused_contains(&self, slot: u32) -> bool {
+        if self.diff.is_empty() {
+            return self.base.contains(slot);
+        }
+        if self.diff.sets.contains(slot) {
+            return true;
+        }
+        if self.diff.clears.contains(slot) {
+            return false;
+        }
+        self.base.contains(slot)
+    }
+
+    /// Same as `merge()` but returns (clone_us, or_us, sub_us) timings.
+    /// Used by ops-trace instrumentation to attribute sort merge cost.
+    /// Returns (0, 0, 0) when the diff is empty or the base is unloaded.
+    pub fn merge_with_timing(&mut self) -> (u128, u128, u128) {
+        if self.diff.is_empty() || !self.is_loaded {
+            return (0, 0, 0);
+        }
+        let t_clone = std::time::Instant::now();
+        let base = Arc::make_mut(&mut self.base);
+        let clone_us = t_clone.elapsed().as_micros();
+        let t_or = std::time::Instant::now();
+        *base |= &self.diff.sets;
+        let or_us = t_or.elapsed().as_micros();
+        let t_sub = std::time::Instant::now();
+        *base -= &self.diff.clears;
+        let sub_us = t_sub.elapsed().as_micros();
+        self.diff = Arc::new(BitmapDiff::new());
+        self.generation += 1;
+        (clone_us, or_us, sub_us)
+    }
+
     /// Total serialized byte size of base + diff bitmaps.
     pub fn bitmap_bytes(&self) -> usize {
         self.base.serialized_size() + self.diff.serialized_size()

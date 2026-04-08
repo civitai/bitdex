@@ -1074,16 +1074,67 @@ impl ConcurrentEngine {
                 // Compact filter diffs every N flush cycles (~5s at 100μs interval).
                 // Keeps diff layers small so apply_diff/fused stay fast.
                 const COMPACTION_INTERVAL: u64 = 50;
+                // Periodically promote dirty sort layer diffs into bases.
+                // Lazy fuse means reads work correctly with dirty diffs (via
+                // VB::fused_cow), but per-query fuse cost grows linearly with
+                // diff size. Periodic promotion keeps diffs small. The promote
+                // does pay the Arc::make_mut clone cost (since published readers
+                // hold base refs), but at 5s interval that's ~10% CPU vs the
+                // ~10000% it was when we did it every cycle.
+                let mut last_sort_promote = std::time::Instant::now();
+                let sort_promote_interval = Duration::from_secs(5);
+                let mut heartbeat_counter: u64 = 0;
+                let mut max_bitmap_count_seen: usize = 0;
+                let mut nonzero_iters: u64 = 0;
+                let mut last_heartbeat_log = std::time::Instant::now();
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(current_sleep);
                     let is_loading = flush_loading_mode.load(Ordering::Relaxed);
                     // Phase 1: Drain channel and group/sort (no lock, pure CPU work)
                     let bitmap_count = coalescer.prepare();
+                    if bitmap_count > 0 {
+                        nonzero_iters += 1;
+                        if bitmap_count > max_bitmap_count_seen {
+                            max_bitmap_count_seen = bitmap_count;
+                        }
+                    }
+                    // Heartbeat: emit every 5 seconds so we can verify the flush
+                    // thread is alive and tell us what bitmap_count it's seeing.
+                    heartbeat_counter += 1;
+                    if last_heartbeat_log.elapsed() >= Duration::from_secs(5) {
+                        let coalescer_pending = coalescer.pending_count();
+                        tracing::warn!(
+                            "[flush-heartbeat] iter={} bitmap_count={} coalescer_pending={} nonzero_iters={} max_seen={} is_loading={} sleep_us={}",
+                            heartbeat_counter,
+                            bitmap_count,
+                            coalescer_pending,
+                            nonzero_iters,
+                            max_bitmap_count_seen,
+                            is_loading,
+                            current_sleep.as_micros(),
+                        );
+                        last_heartbeat_log = std::time::Instant::now();
+                    }
                     // Phase 1b: Drain lazy load channel — apply loaded fields to staging.
                     // This keeps staging in sync with snapshots published by ensure_loaded().
+                    //
+                    // **Bounded drain:** processing one LazyLoad::FilterField for a
+                    // high-cardinality field (postId at 22.5M values) takes 1-2s of
+                    // chunked HashMap inserts. If queries keep triggering new lazy
+                    // loads while we're processing, the unbounded `while try_recv`
+                    // loop runs forever and phase 2 (apply mutations) never gets a
+                    // chance — channel fills up, ops back up, queries time out.
+                    // Cap at LAZY_DRAIN_MAX per cycle so phase 2 always runs.
+                    const LAZY_DRAIN_MAX: usize = 1;
                     let mut lazy_loaded = false;
                     let mut stale_fields: Vec<String> = Vec::new();
-                    while let Ok(load) = lazy_rx.try_recv() {
+                    let mut lazy_drained: usize = 0;
+                    while lazy_drained < LAZY_DRAIN_MAX {
+                        let load = match lazy_rx.try_recv() {
+                            Ok(load) => load,
+                            Err(_) => break,
+                        };
+                        lazy_drained += 1;
                         match load {
                             LazyLoad::FilterField { name, bitmaps } => {
                                 if let Some(field) = staging.filters.get_field(&name) {
@@ -1144,6 +1195,43 @@ impl ConcurrentEngine {
                                 bitmap_count,
                                 apply_timings.render_summary(),
                             );
+                        }
+                        // Periodic sort layer promote: bound the per-query lazy
+                        // fuse cost by clearing dirty diffs every sort_promote_interval.
+                        // Triggered inside the apply branch because that's where
+                        // we have a recent mutation context — but rate-limited so
+                        // it only runs at the configured cadence.
+                        if last_sort_promote.elapsed() >= sort_promote_interval {
+                            let t_promote = std::time::Instant::now();
+                            // Collect dirty field names (immutable borrow ends
+                            // before we mutate via get_field_mut).
+                            let all_field_dirty: Vec<(String, bool)> = staging
+                                .sorts
+                                .fields()
+                                .map(|(name, sf)| (name.clone(), sf.has_dirty()))
+                                .collect();
+                            let dirty_field_names: Vec<String> = all_field_dirty
+                                .iter()
+                                .filter(|(_, d)| *d)
+                                .map(|(n, _)| n.clone())
+                                .collect();
+                            for name in &dirty_field_names {
+                                if let Some(sf) = staging.sorts.get_field_mut(name) {
+                                    sf.merge_dirty();
+                                }
+                            }
+                            let promote_elapsed_ms =
+                                t_promote.elapsed().as_secs_f64() * 1000.0;
+                            tracing::warn!(
+                                "[sort-promote] tick interval={}ms total_fields={} dirty={} elapsed={:.1}ms dirty_names={:?} all_status={:?}",
+                                sort_promote_interval.as_millis(),
+                                all_field_dirty.len(),
+                                dirty_field_names.len(),
+                                promote_elapsed_ms,
+                                dirty_field_names,
+                                all_field_dirty
+                            );
+                            last_sort_promote = std::time::Instant::now();
                         }
                         // Collect mutated field names for bitmap memory cache staleness tracking.
                         for fgk in coalescer.filter_insert_entries().keys() {
