@@ -10,6 +10,11 @@ pub struct BitdexClient {
     base_url: String,
     /// Server root URL (e.g. "http://localhost:3000") for health checks.
     server_root: String,
+    /// Optional admin token (read from BITDEX_ADMIN_TOKEN env at construction).
+    /// Sent as `Authorization: Bearer <token>` on admin-gated routes such as
+    /// `PUT /cursors/{name}`. The PG ops poller's `/upsert` and `/ops` paths
+    /// are public and don't need it.
+    admin_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -51,10 +56,12 @@ impl BitdexClient {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
+        let admin_token = std::env::var("BITDEX_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
         Self {
             client,
             base_url,
             server_root,
+            admin_token,
         }
     }
 
@@ -480,11 +487,19 @@ impl BitdexClient {
     /// Set a named cursor on the BitDex server. Persisted to disk on the
     /// server side via snapshot save, so the value survives server restarts.
     /// Used by the metrics poller to track its closed-window high-water-mark.
+    ///
+    /// `PUT /cursors/{name}` is admin-gated, so this requires
+    /// `BITDEX_ADMIN_TOKEN` to be set in the environment when the client was
+    /// constructed. Returns a clear error if the token is missing.
     pub async fn set_cursor(&self, cursor_name: &str, value: &str) -> Result<(), String> {
+        let token = self.admin_token.as_deref().ok_or_else(|| {
+            "set_cursor requires BITDEX_ADMIN_TOKEN env var (PUT /cursors is admin-gated)".to_string()
+        })?;
         let url = format!("{}/cursors/{}", self.base_url, cursor_name);
         let body = serde_json::json!({ "value": value });
         let resp = self.client
             .put(&url)
+            .bearer_auth(token)
             .json(&body)
             .send()
             .await
