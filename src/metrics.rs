@@ -76,6 +76,10 @@ pub struct Metrics {
     pub cache_maint_sort_work_items_max: IntGaugeVec,
     pub docstore_put_batch_fast_path_total: IntGaugeVec,
     pub docstore_put_batch_slow_path_total: IntGaugeVec,
+    pub docstore_append_tuples_fast_path_total: IntGaugeVec,
+    pub docstore_append_tuples_slow_path_total: IntGaugeVec,
+    pub docstore_append_multi_ops_fast_path_total: IntGaugeVec,
+    pub docstore_append_multi_ops_slow_path_total: IntGaugeVec,
 
     // -- Tier 2: Lazy loading --
     pub lazy_load_duration_seconds: HistogramVec,
@@ -490,6 +494,38 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let docstore_append_tuples_fast_path_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_docstore_append_tuples_fast_path_total",
+                "Cumulative count of DocStoreV3::append_tuples_batch_concurrent invocations — the steady-state hot path for Set ops from the metrics poller and PG ops sync. Expected to dominate put_batch counters in prod.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let docstore_append_tuples_slow_path_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_docstore_append_tuples_slow_path_total",
+                "Cumulative count of the legacy `append_tuples_batch(&mut self)` write-lock path. Expected ~zero in steady state once all callers migrate to the concurrent variant.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let docstore_append_multi_ops_fast_path_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_docstore_append_multi_ops_fast_path_total",
+                "Cumulative count of DocStoreV3::append_multi_ops_batch_concurrent invocations — used for Append/Remove ops on multi-value fields (tag adds/removes etc).",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let docstore_append_multi_ops_slow_path_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_docstore_append_multi_ops_slow_path_total",
+                "Cumulative count of the legacy `append_multi_ops_batch(&mut self)` write-lock path.",
+            ),
+            &["index"],
+        )
+        .unwrap();
 
         let lazy_load_buckets = vec![0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0];
         let lazy_load_duration_seconds = HistogramVec::new(
@@ -857,6 +893,10 @@ impl Metrics {
         registry.register(Box::new(cache_maint_sort_work_items_max.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_fast_path_total.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_slow_path_total.clone())).unwrap();
+        registry.register(Box::new(docstore_append_tuples_fast_path_total.clone())).unwrap();
+        registry.register(Box::new(docstore_append_tuples_slow_path_total.clone())).unwrap();
+        registry.register(Box::new(docstore_append_multi_ops_fast_path_total.clone())).unwrap();
+        registry.register(Box::new(docstore_append_multi_ops_slow_path_total.clone())).unwrap();
         registry
             .register(Box::new(lazy_load_duration_seconds.clone()))
             .unwrap();
@@ -972,6 +1012,10 @@ impl Metrics {
             cache_maint_sort_work_items_max,
             docstore_put_batch_fast_path_total,
             docstore_put_batch_slow_path_total,
+            docstore_append_tuples_fast_path_total,
+            docstore_append_tuples_slow_path_total,
+            docstore_append_multi_ops_fast_path_total,
+            docstore_append_multi_ops_slow_path_total,
             lazy_load_duration_seconds,
             pending_fields,
             eviction_total,
