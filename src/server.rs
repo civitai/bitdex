@@ -4746,6 +4746,14 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.flush_compact_nanos.with_label_values(&[name]).set(compact_ns as i64);
             m.flush_opslog_nanos.with_label_values(&[name]).set(opslog_ns as i64);
             m.flush_sort_promote_nanos.with_label_values(&[name]).set(sort_promote_ns as i64);
+            // Iter 4a — cache maintenance shape stats
+            let (unique_shapes, sort_work_items) = engine.cache_maint_shape_stats();
+            m.cache_maint_unique_filter_shapes
+                .with_label_values(&[name])
+                .set(unique_shapes as i64);
+            m.cache_maint_sort_work_items
+                .with_label_values(&[name])
+                .set(sort_work_items as i64);
 
             // Pending fields (lazy loading)
             let pending = engine.pending_field_count();
