@@ -4746,14 +4746,29 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.flush_compact_nanos.with_label_values(&[name]).set(compact_ns as i64);
             m.flush_opslog_nanos.with_label_values(&[name]).set(opslog_ns as i64);
             m.flush_sort_promote_nanos.with_label_values(&[name]).set(sort_promote_ns as i64);
-            // Iter 4a — cache maintenance shape stats
-            let (unique_shapes, sort_work_items) = engine.cache_maint_shape_stats();
+            // Iter 4a — cache maintenance shape stats + iter 6 max-seen
+            let (unique_shapes, sort_work_items, unique_shapes_max, sort_work_items_max) =
+                engine.cache_maint_shape_stats();
             m.cache_maint_unique_filter_shapes
                 .with_label_values(&[name])
                 .set(unique_shapes as i64);
             m.cache_maint_sort_work_items
                 .with_label_values(&[name])
                 .set(sort_work_items as i64);
+            m.cache_maint_unique_filter_shapes_max
+                .with_label_values(&[name])
+                .set(unique_shapes_max as i64);
+            m.cache_maint_sort_work_items_max
+                .with_label_values(&[name])
+                .set(sort_work_items_max as i64);
+            // Iter 6 — put_batch fast/slow path counters
+            let (fast_path, slow_path) = engine.docstore_put_batch_path_stats();
+            m.docstore_put_batch_fast_path_total
+                .with_label_values(&[name])
+                .set(fast_path as i64);
+            m.docstore_put_batch_slow_path_total
+                .with_label_values(&[name])
+                .set(slow_path as i64);
 
             // Pending fields (lazy loading)
             let pending = engine.pending_field_count();
