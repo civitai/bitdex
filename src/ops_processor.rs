@@ -111,17 +111,24 @@ impl DocWriter {
         self.pending_remove.push((slot, idx, PackedValue::I(remove_val)));
     }
     /// Flush pending tuples to the docstore.
+    ///
+    /// Uses the concurrent-read fast paths
+    /// (`append_tuples_batch_concurrent` / `append_multi_ops_batch_concurrent`)
+    /// so doc fetches proceed in parallel with the apply. This is the
+    /// steady-state hot path for the metrics poller (~5K Set ops every few
+    /// seconds) — switching it off the docstore write lock is the main win
+    /// in iter 7.
     pub fn flush(&mut self) {
         if !self.pending.is_empty() {
             let tuples = std::mem::take(&mut self.pending);
-            if let Err(e) = self.docstore.write().append_tuples_batch(tuples) {
+            if let Err(e) = self.docstore.read().append_tuples_batch_concurrent(tuples) {
                 tracing::warn!("DocWriter flush failed: {e}");
             }
         }
         if !self.pending_append.is_empty() || !self.pending_remove.is_empty() {
             let appends = std::mem::take(&mut self.pending_append);
             let removes = std::mem::take(&mut self.pending_remove);
-            if let Err(e) = self.docstore.write().append_multi_ops_batch(appends, removes) {
+            if let Err(e) = self.docstore.read().append_multi_ops_batch_concurrent(appends, removes) {
                 tracing::warn!("DocWriter multi-ops flush failed: {e}");
             }
         }

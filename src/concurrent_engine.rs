@@ -5415,6 +5415,14 @@ impl ConcurrentEngine {
     pub fn docstore_put_batch_path_stats(&self) -> (u64, u64) {
         self.docstore.read().put_batch_path_stats()
     }
+    /// Iter 7 — DocStoreV3 append_tuples_batch fast/slow path counters.
+    pub fn docstore_append_tuples_path_stats(&self) -> (u64, u64) {
+        self.docstore.read().append_tuples_path_stats()
+    }
+    /// Iter 7 — DocStoreV3 append_multi_ops_batch fast/slow path counters.
+    pub fn docstore_append_multi_ops_path_stats(&self) -> (u64, u64) {
+        self.docstore.read().append_multi_ops_path_stats()
+    }
     /// Iter 4a instrumentation — cache-maintenance shape stats:
     /// `(unique_filter_shapes, sort_work_items, unique_shapes_max, sort_work_items_max)`.
     ///

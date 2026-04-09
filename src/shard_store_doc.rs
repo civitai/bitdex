@@ -740,6 +740,21 @@ pub struct DocStoreV3 {
     /// by any direct `put_batch(&mut self)` call. Exposed as
     /// `bitdex_docstore_put_batch_slow_path_total`.
     put_batch_slow_path_total: Arc<std::sync::atomic::AtomicU64>,
+    /// Fast-path append_tuples_batch counter. Incremented by
+    /// `append_tuples_batch_concurrent(&self, ..)` — the steady-state hot
+    /// path for Set ops from the metrics poller and PG ops sync.
+    append_tuples_fast_path_total: Arc<std::sync::atomic::AtomicU64>,
+    /// Slow-path append_tuples_batch counter. Incremented by the legacy
+    /// `&mut self` method. Expected zero in steady state once all callers
+    /// migrate to the concurrent variant.
+    append_tuples_slow_path_total: Arc<std::sync::atomic::AtomicU64>,
+    /// Fast-path append_multi_ops_batch counter. Incremented by
+    /// `append_multi_ops_batch_concurrent(&self, ..)` — used for Append /
+    /// Remove ops on multi-value fields (tag adds/removes etc).
+    append_multi_ops_fast_path_total: Arc<std::sync::atomic::AtomicU64>,
+    /// Slow-path append_multi_ops_batch counter. Incremented by the legacy
+    /// `&mut self` method.
+    append_multi_ops_slow_path_total: Arc<std::sync::atomic::AtomicU64>,
     /// Serializes concurrent fast-path writers (see `put_batch_known_fields`).
     ///
     /// `ShardStore::append_ops` is not thread-safe for concurrent writers on
@@ -784,6 +799,10 @@ impl DocStoreV3 {
             dirty_shards: Arc::new(DashSet::new()),
             put_batch_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             put_batch_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            append_tuples_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            append_tuples_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            append_multi_ops_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            append_multi_ops_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_path_writer_lock: Arc::new(parking_lot::Mutex::new(())),
         })
     }
@@ -811,6 +830,10 @@ impl DocStoreV3 {
             dirty_shards: Arc::new(DashSet::new()),
             put_batch_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             put_batch_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            append_tuples_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            append_tuples_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            append_multi_ops_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            append_multi_ops_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_path_writer_lock: Arc::new(parking_lot::Mutex::new(())),
         })
     }
@@ -1155,6 +1178,18 @@ impl DocStoreV3 {
         if docs.is_empty() {
             return Ok(());
         }
+        // Defense-in-depth: take the fast_path_writer_lock even though the
+        // outer `&mut self` + `RwLock<DocStoreV3>::write()` already serializes
+        // against fast-path read guards. This ensures the single-writer-per-
+        // shard invariant holds at the method boundary, not just by caller
+        // discipline — if a future refactor ever calls this method without
+        // the outer write guard, the inner mutex still prevents corruption.
+        //
+        // We `Arc::clone` the lock first so the guard borrows the clone
+        // instead of `self`, freeing `&mut self` for the field-dict update
+        // path below.
+        let writer_lock = Arc::clone(&self.fast_path_writer_lock);
+        let _writer_guard = writer_lock.lock();
 
         // Ensure field dictionary is up to date
         let mut dict_changed = false;
@@ -1192,6 +1227,12 @@ impl DocStoreV3 {
 
     /// Append tuples for a single slot (used by DocWriter in ops_processor).
     pub fn append_tuples_batch(&mut self, tuples: Vec<(u32, u16, Vec<u8>)>) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.append_tuples_slow_path_total.fetch_add(1, Ordering::Relaxed);
+        // Defense-in-depth: take the fast_path_writer_lock. See `put_batch`
+        // comment for rationale.
+        let writer_lock = Arc::clone(&self.fast_path_writer_lock);
+        let _writer_guard = writer_lock.lock();
         // Group tuples by shard
         let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
         for (slot, field_idx, value_bytes) in tuples {
@@ -1212,6 +1253,60 @@ impl DocStoreV3 {
         }
         Ok(())
     }
+    /// Concurrent-friendly variant of `append_tuples_batch`. Takes `&self`
+    /// so callers can hold only a `docstore.read()` lock, which means
+    /// doc fetches proceed concurrently with the apply.
+    ///
+    /// Unlike `put_batch_known_fields`, there's NO field-dictionary
+    /// precondition to check — `append_tuples_batch` takes `field_idx: u16`
+    /// tuples that are ALREADY resolved by the caller. This method is
+    /// always safe to call; there's no slow-path fallback.
+    ///
+    /// This is the hot path for steady-state Set ops from the metrics
+    /// poller (reactionCount/commentCount/collectedCount) and PG ops sync.
+    /// In v1.0.155 prod data, `put_batch` was never called but
+    /// `append_tuples_batch` processed ~2.5M ops over 77 minutes — that's
+    /// why the PR #155 put_batch fast-path counters stayed at zero.
+    ///
+    /// Safety:
+    /// - `field_to_idx` / `idx_to_field` are not touched (field resolution
+    ///   happened upstream in `DocWriter`).
+    /// - `self.store.append_ops(&shard_key, ..)` already takes `&self`.
+    /// - `self.dirty_shards` is `Arc<DashSet>`, lockless.
+    /// - `fast_path_writer_lock` serializes concurrent fast-path writers
+    ///   against each other to preserve the single-writer-per-shard invariant
+    ///   that `ShardStore::append_ops` relies on (non-atomic seek+write).
+    pub fn append_tuples_batch_concurrent(
+        &self,
+        tuples: Vec<(u32, u16, Vec<u8>)>,
+    ) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if tuples.is_empty() {
+            self.append_tuples_fast_path_total.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        // Group tuples by shard (immutable computation)
+        let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
+        for (slot, field_idx, value_bytes) in tuples {
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            let pv: PackedValue = rmp_serde::from_slice(&value_bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode packed: {e}")))?;
+            by_shard.entry(shard_key).or_default().push(DocOp::Set {
+                slot,
+                field: field_idx,
+                value: pv,
+            });
+        }
+        // Serialize concurrent fast-path writers on the same inner mutex
+        // as put_batch_known_fields. Doc fetches don't touch this mutex.
+        let _writer_guard = self.fast_path_writer_lock.lock();
+        for (shard_key, ops) in by_shard {
+            self.store.append_ops(&shard_key, &ops)?;
+            self.dirty_shards.insert(shard_key);
+        }
+        self.append_tuples_fast_path_total.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 
     /// Append a batch of multi-value DocOp::Append and DocOp::Remove ops.
     /// Used by DocWriter for tag additions/removals — the apply path handles
@@ -1221,6 +1316,12 @@ impl DocStoreV3 {
         appends: Vec<(u32, u16, PackedValue)>,
         removes: Vec<(u32, u16, PackedValue)>,
     ) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.append_multi_ops_slow_path_total.fetch_add(1, Ordering::Relaxed);
+        // Defense-in-depth: take the fast_path_writer_lock. See `put_batch`
+        // comment for rationale.
+        let writer_lock = Arc::clone(&self.fast_path_writer_lock);
+        let _writer_guard = writer_lock.lock();
         let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
         for (slot, field, value) in appends {
             let shard_key = SlotHexShard::slot_to_shard(slot);
@@ -1236,12 +1337,54 @@ impl DocStoreV3 {
         }
         Ok(())
     }
+    /// Concurrent-friendly variant of `append_multi_ops_batch`. Takes `&self`
+    /// so callers can hold only a `docstore.read()` lock.
+    ///
+    /// Used by `DocWriter` for multi-value field mutations (tag adds/removes,
+    /// modelVersionIds, etc). Like `append_tuples_batch_concurrent`, there's
+    /// no field-dict precondition to check.
+    ///
+    /// Safety: same story as `append_tuples_batch_concurrent`. Serializes
+    /// concurrent same-shard writers via `fast_path_writer_lock`. Readers
+    /// proceed without contention.
+    pub fn append_multi_ops_batch_concurrent(
+        &self,
+        appends: Vec<(u32, u16, PackedValue)>,
+        removes: Vec<(u32, u16, PackedValue)>,
+    ) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if appends.is_empty() && removes.is_empty() {
+            self.append_multi_ops_fast_path_total.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
+        for (slot, field, value) in appends {
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            by_shard.entry(shard_key).or_default().push(DocOp::Append { slot, field, value });
+        }
+        for (slot, field, value) in removes {
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            by_shard.entry(shard_key).or_default().push(DocOp::Remove { slot, field, value });
+        }
+        let _writer_guard = self.fast_path_writer_lock.lock();
+        for (shard_key, ops) in by_shard {
+            self.store.append_ops(&shard_key, &ops)?;
+            self.dirty_shards.insert(shard_key);
+        }
+        self.append_multi_ops_fast_path_total.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 
     /// Append a single tuple (used by ingester).
     pub fn append_tuple(&mut self, slot: u32, field_idx: u16, value_bytes: &[u8]) -> io::Result<()> {
         let shard_key = SlotHexShard::slot_to_shard(slot);
         let pv: PackedValue = rmp_serde::from_slice(value_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode packed: {e}")))?;
+        // Defense-in-depth: take the fast_path_writer_lock to enforce
+        // single-writer-per-shard at the method boundary. See `put_batch`
+        // comment.
+        let writer_lock = Arc::clone(&self.fast_path_writer_lock);
+        let _writer_guard = writer_lock.lock();
         self.store.append_op(&shard_key, &DocOp::Set {
             slot,
             field: field_idx,
@@ -1359,6 +1502,22 @@ impl DocStoreV3 {
         (
             self.put_batch_fast_path_total.load(Ordering::Relaxed),
             self.put_batch_slow_path_total.load(Ordering::Relaxed),
+        )
+    }
+    /// Fast/slow path invocation counts for `append_tuples_batch`.
+    pub fn append_tuples_path_stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.append_tuples_fast_path_total.load(Ordering::Relaxed),
+            self.append_tuples_slow_path_total.load(Ordering::Relaxed),
+        )
+    }
+    /// Fast/slow path invocation counts for `append_multi_ops_batch`.
+    pub fn append_multi_ops_path_stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.append_multi_ops_fast_path_total.load(Ordering::Relaxed),
+            self.append_multi_ops_slow_path_total.load(Ordering::Relaxed),
         )
     }
 

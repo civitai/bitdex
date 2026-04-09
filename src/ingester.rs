@@ -219,8 +219,12 @@ impl DocSink {
     }
 
     /// Batch append tuples to the docstore.
+    ///
+    /// Uses the concurrent-read fast path so doc fetches proceed in parallel
+    /// with the apply. `append_tuples_batch_concurrent` takes `&self` on
+    /// `DocStoreV3`, so we only need a `docstore.read()` guard here.
     pub fn append_batch(&self, tuples: Vec<(u32, u16, Vec<u8>)>) -> Result<()> {
-        Ok(self.docstore.write().append_tuples_batch(tuples)?)
+        Ok(self.docstore.read().append_tuples_batch_concurrent(tuples)?)
     }
 }
 

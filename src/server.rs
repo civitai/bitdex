@@ -4769,6 +4769,21 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.docstore_put_batch_slow_path_total
                 .with_label_values(&[name])
                 .set(slow_path as i64);
+            // Iter 7 — append_tuples_batch / append_multi_ops_batch fast/slow path counters
+            let (at_fast, at_slow) = engine.docstore_append_tuples_path_stats();
+            m.docstore_append_tuples_fast_path_total
+                .with_label_values(&[name])
+                .set(at_fast as i64);
+            m.docstore_append_tuples_slow_path_total
+                .with_label_values(&[name])
+                .set(at_slow as i64);
+            let (am_fast, am_slow) = engine.docstore_append_multi_ops_path_stats();
+            m.docstore_append_multi_ops_fast_path_total
+                .with_label_values(&[name])
+                .set(am_fast as i64);
+            m.docstore_append_multi_ops_slow_path_total
+                .with_label_values(&[name])
+                .set(am_slow as i64);
 
             // Pending fields (lazy loading)
             let pending = engine.pending_field_count();
