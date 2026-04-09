@@ -1082,12 +1082,16 @@ impl ConcurrentEngine {
                 // Keeps diff layers small so apply_diff/fused stay fast.
                 const COMPACTION_INTERVAL: u64 = 50;
                 // Periodically promote dirty sort layer diffs into bases.
-                // Lazy fuse means reads work correctly with dirty diffs (via
-                // VB::fused_cow), but per-query fuse cost grows linearly with
-                // diff size. Periodic promotion keeps diffs small. The promote
-                // does pay the Arc::make_mut clone cost (since published readers
-                // hold base refs), but at 5s interval that's ~10% CPU vs the
-                // ~10000% it was when we did it every cycle.
+                //
+                // The query path uses `VersionedBitmap::apply_diff` /
+                // `apply_diff_inverse` against the working candidate set, so
+                // dirty layers no longer force per-query base-bitmap clones.
+                // But promote still serves to bound per-layer diff size
+                // (which affects apply_diff cost proportionally). Prod
+                // v1.0.151 showed sort-promote at ~49ms total per run which
+                // is not the current bottleneck, so we're leaving the
+                // 5-second interval unchanged until we have evidence to
+                // tune it. Bumping the interval is a pending follow-up.
                 let mut last_sort_promote = std::time::Instant::now();
                 let sort_promote_interval = Duration::from_secs(5);
                 let mut heartbeat_counter: u64 = 0;

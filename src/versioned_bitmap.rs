@@ -143,15 +143,48 @@ impl VersionedBitmap {
 
     /// Apply the diff to a candidate set. This is the hot path for queries.
     ///
-    /// Fuses the diff into an intersection with candidates without touching the
-    /// full base bitmap:
+    /// Computes `candidates & (base | diff.sets - diff.clears)` — i.e. the
+    /// intersection of `candidates` with the logically-fused bitmap — WITHOUT
+    /// cloning the full base. Cost is O(candidates), not O(base).
+    ///
     /// 1. Start with candidates AND base
     /// 2. OR in candidates AND diff.sets (newly added bits that are in candidates)
     /// 3. Subtract diff.clears (removed bits)
     pub fn apply_diff(&self, candidates: &RoaringBitmap) -> RoaringBitmap {
+        // Fast path for clean layers (the steady-state common case once the
+        // flush thread has merged diffs). Avoids two no-op bitmap ops against
+        // empty diff collections, matching the allocation profile of the
+        // pre-fuse code this method replaces in the sort hot path.
+        if self.diff.is_empty() {
+            return candidates & self.base.as_ref();
+        }
         let mut result = candidates & self.base.as_ref();
         result |= candidates & &self.diff.sets;
         result -= &self.diff.clears;
+        result
+    }
+    /// Inverse of `apply_diff`: computes `candidates - (base | sets - clears)`
+    /// — the set of candidate slots that are NOT in the fused bitmap — without
+    /// cloning the base. Used by descending-sort bifurcation when the preferred
+    /// direction is "bit clear" (i.e. ascending sort, or subtracting a set).
+    ///
+    /// Set-algebra derivation:
+    /// ```text
+    ///   candidates - ((base | sets) - clears)
+    ///     = (candidates - (base | sets)) ∪ (candidates ∩ clears)
+    ///     = (candidates - base - sets) ∪ (candidates ∩ clears)
+    /// ```
+    ///
+    /// Cost is O(candidates), not O(base).
+    pub fn apply_diff_inverse(&self, candidates: &RoaringBitmap) -> RoaringBitmap {
+        // Fast path for clean layers (the steady-state common case). See
+        // `apply_diff` for the rationale.
+        if self.diff.is_empty() {
+            return candidates - self.base.as_ref();
+        }
+        let mut result = candidates - self.base.as_ref();
+        result -= &self.diff.sets;
+        result |= candidates & &self.diff.clears;
         result
     }
 
