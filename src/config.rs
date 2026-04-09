@@ -509,17 +509,36 @@ impl Default for StorageConfig {
     }
 }
 fn default_doc_cache_max_bytes() -> u64 {
-    // 1 GiB. Reverted from 4 GiB (iter 5 / PR #156) after v1.0.156 OOMed
-    // twice in production. Root cause: `estimate_doc_size` in
-    // `src/doc_cache.rs` undercounts real in-memory per-entry cost by
-    // ~4x (missing HashMap backing-array overhead, CacheEntry wrapper,
-    // DashMap shard overhead, String allocator padding, and transient
-    // multi-generation duplication during promote). At a 4 GiB tracked
-    // budget the cache was holding ~16 GiB of real heap, blowing past
-    // the 32 GB pod limit in ~80 minutes. Reverting the budget caps
-    // real memory at ~4 GiB until the accounting is fixed honestly
-    // against measured per-entry cost.
-    1_073_741_824
+    // 3 GiB (honest). v1.0.158 combines two changes that make this
+    // safe:
+    //
+    //   (1) honest per-entry accounting in `src/doc_cache.rs` — real
+    //       memory ≈ tracked bytes instead of ~3x the tracked value,
+    //   (2) the jemalloc global allocator with `dirty_decay_ms:0` —
+    //       freed pages return to the kernel promptly instead of
+    //       sitting in per-thread glibc arenas.
+    //
+    // v1.0.158 measured steady state: 8.17 GB RSS with a 1 GiB honest
+    // doc_cache budget (188K entries) and ~550 evictions/sec churn.
+    // Lowering churn to restore hit rate without blowing the pod limit
+    // is exactly what this bump exists to do.
+    //
+    // Projection for 3 GiB honest:
+    //   doc_cache tracked:   ~3.0 GB  (was 0.9 GB at 1 GiB budget)
+    //   jemalloc overhead:  +~0.3 GB  (10% of tracked, measured)
+    //   entry count:       ~564K     (matches the old dishonest 548K
+    //                                  target from iter 5)
+    //   eviction rate:     ~180/sec  (down from 555/sec)
+    //   projected RSS:    ~10.4 GB   (8.17 + 2.2)
+    //   pod headroom:      ~21 GB    (32 GB limit)
+    //
+    // We deliberately do NOT return to the iter 5 value of 4 GiB.
+    // 3 GiB leaves a clean doubling of headroom vs projection, which
+    // protects against workload bursts, lazy-load cascades, and any
+    // residual second-order allocation drift. If post-bump metrics
+    // show stable RSS < 12 GB after a few hours, a further bump to
+    // 4 GiB is safe at that point and can be made separately.
+    3 * 1_073_741_824
 }
 fn default_doc_cache_generation_interval() -> u64 {
     60
@@ -869,7 +888,7 @@ mod tests {
         assert_eq!(config.cache.max_capacity, 64_000);
         assert_eq!(config.cache.min_filter_size, 0);
         assert_eq!(config.cache.decay_rate, 0.95);
-        assert_eq!(config.doc_cache.max_bytes, 1_073_741_824);
+        assert_eq!(config.doc_cache.max_bytes, 3 * 1_073_741_824);
         assert_eq!(config.autovac_interval_secs, 3600);
         assert_eq!(config.merge_interval_ms, 5000);
         assert_eq!(config.prometheus_port, 9090);
