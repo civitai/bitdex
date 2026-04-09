@@ -2522,6 +2522,36 @@ impl Drop for QueryInflightGuard<'_> {
     }
 }
 
+/// RAII guard that decrements `docstore_concurrent_reads` on drop.
+///
+/// The previous code wrapped the doc-fetch `spawn_blocking` with
+/// `gauge.inc()` + `.await.unwrap()` + `gauge.dec()`. The `dec()` line
+/// was unreachable whenever the `.await` was cancelled — which happens
+/// on HTTP client disconnect, even though the `spawn_blocking` task
+/// itself keeps running until it finishes. That leaked `inc()`s into
+/// the gauge permanently.
+///
+/// Production pod observed at 19,541 concurrent reads under an admission
+/// cap of 200 — clearly impossible. With this guard on the async stack
+/// frame, `Drop` runs whether the future completes, panics, or is
+/// cancelled, so the gauge stays honest.
+struct ConcurrentReadGuard<'a> {
+    gauge: &'a prometheus::IntGauge,
+}
+
+impl<'a> ConcurrentReadGuard<'a> {
+    fn new(gauge: &'a prometheus::IntGauge) -> Self {
+        gauge.inc();
+        Self { gauge }
+    }
+}
+
+impl Drop for ConcurrentReadGuard<'_> {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
 async fn handle_query(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
@@ -2644,7 +2674,10 @@ async fn handle_query(
                 let docstore_hist = m.docstore_read_seconds.clone();
                 let name_docs = name.clone();
 
-                m.docstore_concurrent_reads.inc();
+                // RAII guard replaces the old inc()/dec() bookend that
+                // leaked on `.await` cancellation (HTTP client disconnect).
+                // Dropped unconditionally when the async stack frame unwinds.
+                let _read_guard = ConcurrentReadGuard::new(&m.docstore_concurrent_reads);
                 let docs = tokio::task::spawn_blocking(move || {
                     let mut docs = Vec::with_capacity(ids.len());
                     for &id in &ids {
@@ -2668,7 +2701,6 @@ async fn handle_query(
                     }
                     docs
                 }).await.unwrap();
-                m.docstore_concurrent_reads.dec();
                 Some(docs)
             } else {
                 None
