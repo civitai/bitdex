@@ -1313,11 +1313,20 @@ impl ConcurrentEngine {
                             //   Phase B: NO lock — evaluate slots against staging
                             //   Phase C: brief lock — apply results
                             let t_cache = Instant::now();
+                            let t_phase_a = Instant::now();
+                            let mut ct_uc_entries: usize = 0;
+                            let mut ct_alive_removes: usize = 0;
+                            let mut ct_filter_work_items: usize = 0;
+                            let mut ct_filter_over_budget: usize = 0;
+                            let mut ct_sort_work_items: usize = 0;
+                            let mut ct_sort_over_budget: usize = 0;
                             // Phase A: Brief lock — collect work items and do cheap ops
                             let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
                                 let mut uc = flush_unified_cache.lock();
+                                ct_uc_entries = uc.len();
                                 // Targeted alive removal (fast: O(1) per entry per remove)
                                 if !uc.is_empty() {
+                                    ct_alive_removes = coalescer.alive_removes().len();
                                     for &slot in coalescer.alive_removes() {
                                         uc.remove_slot_from_all(slot);
                                     }
@@ -1331,6 +1340,8 @@ impl ConcurrentEngine {
                                 } else {
                                     (Vec::new(), Vec::new())
                                 };
+                                ct_filter_work_items = fw.len();
+                                ct_filter_over_budget = fob.len();
                                 // Collect sort maintenance work
                                 let sort_mutations = coalescer.mutated_sort_slots();
                                 let (sw, sob) = if !sort_mutations.is_empty() {
@@ -1338,6 +1349,8 @@ impl ConcurrentEngine {
                                 } else {
                                     (Vec::new(), Vec::new())
                                 };
+                                ct_sort_work_items = sw.len();
+                                ct_sort_over_budget = sob.len();
                                 // Tombstone unloaded entries (fast meta-index ops).
                                 // Runs even when cache is empty — meta-index may be
                                 // populated from meta.bin after restart (§3.2).
@@ -1375,9 +1388,11 @@ impl ConcurrentEngine {
                                 }
                                 (fw, fob, sw, sob)
                             }; // Phase A lock released
+                            let phase_a_ns = t_phase_a.elapsed().as_nanos() as u64;
                             // Phase B: NO lock — evaluate slots against staging data.
                             // This is the expensive part (slot_matches_filter, reconstruct_value)
                             // that previously held the Mutex for ~469ms.
+                            let t_phase_b = Instant::now();
                             let deadline = if flush_config.cache.max_maintenance_ms > 0 {
                                 Some(Instant::now() + Duration::from_millis(flush_config.cache.max_maintenance_ms))
                             } else {
@@ -1393,7 +1408,13 @@ impl ConcurrentEngine {
                             } else {
                                 (Vec::new(), Vec::new())
                             };
+                            let phase_b_ns = t_phase_b.elapsed().as_nanos() as u64;
+                            let ct_filter_results = filter_results.len();
+                            let ct_sort_results = sort_results.len();
+                            let ct_filter_timed_out = filter_timed_out.len();
+                            let ct_sort_timed_out = sort_timed_out.len();
                             // Phase C: Brief lock — apply results
+                            let t_phase_c = Instant::now();
                             if !filter_results.is_empty() || !sort_results.is_empty()
                                 || !filter_over_budget.is_empty() || !sort_over_budget.is_empty()
                                 || !filter_timed_out.is_empty() || !sort_timed_out.is_empty()
@@ -1407,7 +1428,29 @@ impl ConcurrentEngine {
                                 uc.mark_for_rebuild_batch(&sort_timed_out);
                                 uc.reconcile_bytes();
                             }
+                            let phase_c_ns = t_phase_c.elapsed().as_nanos() as u64;
                             flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            // [cache-trace]: warn when any locked phase exceeds ~10ms.
+                            // Phase B is lock-free so its cost doesn't block queries, but
+                            // Phase A + Phase C are held under the UnifiedCache Mutex and
+                            // directly contribute to query starvation when flush is slow.
+                            let locked_ns = phase_a_ns + phase_c_ns;
+                            if locked_ns > 10_000_000 || phase_b_ns > 100_000_000 {
+                                tracing::warn!(
+                                    target: "cache-trace",
+                                    "cache maintenance slow: phase_a={:.2}ms phase_b={:.2}ms phase_c={:.2}ms  \
+                                     uc_entries={} alive_removes={} \
+                                     filter[work={} over_budget={} results={} timed_out={}] \
+                                     sort[work={} over_budget={} results={} timed_out={}]",
+                                    phase_a_ns as f64 / 1_000_000.0,
+                                    phase_b_ns as f64 / 1_000_000.0,
+                                    phase_c_ns as f64 / 1_000_000.0,
+                                    ct_uc_entries,
+                                    ct_alive_removes,
+                                    ct_filter_work_items, ct_filter_over_budget, ct_filter_results, ct_filter_timed_out,
+                                    ct_sort_work_items, ct_sort_over_budget, ct_sort_results, ct_sort_timed_out,
+                                );
+                            }
                             // Yield CPU after cache maintenance to let tokio deliver responses.
                             std::thread::yield_now();
                             // Periodic filter diff compaction: merge dirty diffs into
