@@ -4,7 +4,7 @@ default-members = ["."]
 
 [package]
 name = "bitdex-v2"
-version = "1.0.158"
+version = "1.0.159"
 edition = "2021"
 license = "MIT"
 description = "Purpose-built in-memory bitmap index engine"
