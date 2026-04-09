@@ -258,6 +258,16 @@ pub struct ConcurrentEngine {
     /// sort fields) duration in nanoseconds. Runs every ~5s inside the flush
     /// thread and can dominate the flush cycle when many sort fields are dirty.
     flush_sort_promote_nanos: Arc<AtomicU64>,
+    /// Iter 4a instrumentation: number of unique canonical filter-clause
+    /// vectors across sort-maintenance work items in the most recent flush
+    /// cycle that did cache maintenance. Low values mean entries cluster into
+    /// shared filter shapes (filter-shape grouping would pay off); high
+    /// values mean entries have diverse filters (grouping would be marginal).
+    flush_cache_unique_filter_shapes: Arc<AtomicU64>,
+    /// Iter 4a instrumentation: number of sort-maintenance work items in the
+    /// most recent cycle that did cache maintenance. Denominator for the
+    /// unique-shapes-vs-total ratio (collapse factor).
+    flush_cache_sort_work_items: Arc<AtomicU64>,
     /// Named cursors: opaque key-value pairs persisted at checkpoint time.
     /// Callers (e.g. pg-sync sidecars) use these to track replication progress.
     cursors: Arc<parking_lot::Mutex<HashMap<String, String>>>,
@@ -947,6 +957,8 @@ impl ConcurrentEngine {
         let flush_compact_nanos = Arc::new(AtomicU64::new(0));
         let flush_opslog_nanos = Arc::new(AtomicU64::new(0));
         let flush_sort_promote_nanos = Arc::new(AtomicU64::new(0));
+        let flush_cache_unique_filter_shapes = Arc::new(AtomicU64::new(0));
+        let flush_cache_sort_work_items = Arc::new(AtomicU64::new(0));
         // BoundStore operational counters (defined before flush/merge threads)
         let boundstore_shard_loads = Arc::new(AtomicU64::new(0));
         let boundstore_tombstones_created = Arc::new(AtomicU64::new(0));
@@ -1001,6 +1013,8 @@ impl ConcurrentEngine {
                 flush_compact_nanos,
                 flush_opslog_nanos,
                 flush_sort_promote_nanos,
+                flush_cache_unique_filter_shapes,
+                flush_cache_sort_work_items,
                 cursors,
                 existing_keys,
                 eviction_stamps,
@@ -1049,6 +1063,10 @@ impl ConcurrentEngine {
             let flush_compact_ns = Arc::clone(&flush_compact_nanos);
             let flush_opslog_ns = Arc::clone(&flush_opslog_nanos);
             let flush_sort_promote_ns = Arc::clone(&flush_sort_promote_nanos);
+            let flush_cache_unique_shapes =
+                Arc::clone(&flush_cache_unique_filter_shapes);
+            let flush_cache_sort_work_items_gauge =
+                Arc::clone(&flush_cache_sort_work_items);
             let flush_existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> =
                 existing_keys.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
             let flush_eviction_stamps = Arc::clone(&eviction_stamps);
@@ -1400,6 +1418,51 @@ impl ConcurrentEngine {
                                 (fw, fob, sw, sob)
                             }; // Phase A lock released
                             let phase_a_ns = t_phase_a.elapsed().as_nanos() as u64;
+                            // Iter 4a observability: count unique canonical
+                            // filter-clause vectors across sort-work items.
+                            // Tells us whether filter-shape grouping in Phase B
+                            // would pay off (low unique/total ratio = entries
+                            // cluster into shared shapes = big win from
+                            // grouping; high ratio = filters diverse =
+                            // marginal gain).
+                            //
+                            // UnifiedKey.filter_clauses is already canonical
+                            // (see src/cache.rs::canonicalize — clauses are
+                            // sorted before the cache key is built), so hash
+                            // order is stable across entries.
+                            //
+                            // Approximation: dedup via 64-bit hash. Hash
+                            // collisions are possible but negligible at
+                            // observed cardinalities (< 100k). If exact is
+                            // required later, swap HashSet<u64> for
+                            // HashSet<Vec<CanonicalClause>>.
+                            //
+                            // Implementation uses Vec + sort_unstable + dedup
+                            // instead of HashSet<u64>: one allocation, better
+                            // cache locality, 2-4x faster at 50k items
+                            // (per Gemini review).
+                            if sort_work.is_empty() {
+                                // Reset gauges to 0 on skipped cycles so
+                                // dashboards don't flatline at stale values.
+                                flush_cache_unique_shapes.store(0, Ordering::Relaxed);
+                                flush_cache_sort_work_items_gauge
+                                    .store(0, Ordering::Relaxed);
+                            } else {
+                                use std::hash::{Hash, Hasher};
+                                let mut hashes: Vec<u64> =
+                                    Vec::with_capacity(sort_work.len());
+                                for item in &sort_work {
+                                    let mut hasher = ahash::AHasher::default();
+                                    item.key.filter_clauses.hash(&mut hasher);
+                                    hashes.push(hasher.finish());
+                                }
+                                hashes.sort_unstable();
+                                hashes.dedup();
+                                flush_cache_unique_shapes
+                                    .store(hashes.len() as u64, Ordering::Relaxed);
+                                flush_cache_sort_work_items_gauge
+                                    .store(sort_work.len() as u64, Ordering::Relaxed);
+                            }
                             // Phase B: NO lock — evaluate slots against staging data.
                             // This is the expensive part (slot_matches_filter, reconstruct_value)
                             // that previously held the Mutex for ~469ms.
@@ -2758,6 +2821,8 @@ impl ConcurrentEngine {
             flush_compact_nanos,
             flush_opslog_nanos,
             flush_sort_promote_nanos,
+            flush_cache_unique_filter_shapes,
+            flush_cache_sort_work_items,
             cursors,
             existing_keys,
             eviction_stamps,
@@ -5271,6 +5336,19 @@ impl ConcurrentEngine {
             self.flush_compact_nanos.load(Ordering::Relaxed),
             self.flush_opslog_nanos.load(Ordering::Relaxed),
             self.flush_sort_promote_nanos.load(Ordering::Relaxed),
+        )
+    }
+    /// Iter 4a instrumentation — cache-maintenance shape stats:
+    /// `(unique_filter_shapes, sort_work_items)`.
+    ///
+    /// Use the ratio `unique_filter_shapes / sort_work_items` in PromQL to
+    /// see the filter-shape collapse factor. Low ratio = many entries
+    /// share filters (filter-shape grouping in Phase B would pay off).
+    /// High ratio = diverse filters, grouping is marginal.
+    pub fn cache_maint_shape_stats(&self) -> (u64, u64) {
+        (
+            self.flush_cache_unique_filter_shapes.load(Ordering::Relaxed),
+            self.flush_cache_sort_work_items.load(Ordering::Relaxed),
         )
     }
     /// Number of filter + sort fields still pending lazy load.
