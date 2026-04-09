@@ -382,6 +382,24 @@ where
     _phantom_o: std::marker::PhantomData<O>,
 }
 
+/// Per-call timing breakdown returned by `ShardStore::read_with_stats`.
+///
+/// Used to split the cost of a shard read into its two dominant phases
+/// so diagnostics can tell file-I/O-bound work from decode-bound work
+/// without guessing. Callers typically observe these into Prometheus
+/// histograms.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ShardReadStats {
+    /// Total nanoseconds spent in `read_shard_file_raw` across every
+    /// generation walked, including unsuccessful reads that fell
+    /// through to an older generation.
+    pub file_read_nanos: u64,
+    /// Total nanoseconds spent in `S::decode` plus post-decode op
+    /// application (`O::apply`). Also includes `read_op_entries`
+    /// deserialization for generations that only contributed ops.
+    pub decode_nanos: u64,
+}
+
 impl<S, O, Sh> ShardStore<S, O, Sh>
 where
     S: SnapshotCodec,
@@ -450,6 +468,20 @@ where
         self.read_up_to_generation(key, self.current_generation())
     }
 
+    /// Read a snapshot for a key and return detailed timing stats.
+    ///
+    /// Same semantics as `read()` plus a `ShardReadStats` capturing the
+    /// raw file-read duration and the decode + op-apply duration. Callers
+    /// that want to observe these into Prometheus histograms (e.g. the
+    /// doc-fetch batch path) should use this method; callers that don't
+    /// care about the split should keep using `read()`.
+    pub fn read_with_stats(
+        &self,
+        key: &Sh::Key,
+    ) -> io::Result<(Option<S::Snapshot>, ShardReadStats)> {
+        self.read_up_to_generation_with_stats(key, self.current_generation())
+    }
+
     /// Read a shard's state bounded to generations 0..=max_gen.
     ///
     /// Like `read()` but stops at `max_gen` instead of `current_generation()`.
@@ -457,7 +489,35 @@ where
     /// while new writes flow to gen N+1.
     ///
     /// Tolerates NotFound errors (concurrent gen deletion) by skipping missing files.
-    pub fn read_up_to_generation(&self, key: &Sh::Key, max_gen: u64) -> io::Result<Option<S::Snapshot>> {
+    pub fn read_up_to_generation(
+        &self,
+        key: &Sh::Key,
+        max_gen: u64,
+    ) -> io::Result<Option<S::Snapshot>> {
+        self.read_up_to_generation_with_stats(key, max_gen)
+            .map(|(snap, _stats)| snap)
+    }
+
+    /// Stats-returning variant of `read_up_to_generation`.
+    ///
+    /// Tracks two phases separately:
+    ///   - `file_read_nanos`: total time in `read_shard_file_raw` across
+    ///     every generation walked (disk + kernel + file open/close).
+    ///   - `decode_nanos`: total time in `S::decode` and subsequent op
+    ///     application (msgpack decode + any per-op mutation work).
+    ///
+    /// The split is important diagnostically: on NVMe-backed storage,
+    /// file-read should dominate if we're genuinely disk-bound, and
+    /// decode should dominate if the hot path is CPU-bound on
+    /// serialization. Observed prod P50 of 37 ms per read is ~300x an
+    /// NVMe baseline, and this split lets us tell which phase is
+    /// responsible without guessing.
+    pub fn read_up_to_generation_with_stats(
+        &self,
+        key: &Sh::Key,
+        max_gen: u64,
+    ) -> io::Result<(Option<S::Snapshot>, ShardReadStats)> {
+        let mut stats = ShardReadStats::default();
         let mut pending_ops: Vec<Vec<O::Op>> = Vec::new();
         let mut found_any = false;
 
@@ -469,43 +529,55 @@ where
                 continue;
             }
 
-            let (header, snapshot_bytes, ops_bytes) = match read_shard_file_raw(&shard_path) {
+            let read_start = std::time::Instant::now();
+            let raw = match read_shard_file_raw(&shard_path) {
                 Ok(result) => result,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    stats.file_read_nanos += read_start.elapsed().as_nanos() as u64;
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
+            stats.file_read_nanos += read_start.elapsed().as_nanos() as u64;
+            let (header, snapshot_bytes, ops_bytes) = raw;
             found_any = true;
 
             if header.ops_count > 0 {
+                let decode_start = std::time::Instant::now();
                 pending_ops.push(read_op_entries::<O>(&ops_bytes));
+                stats.decode_nanos += decode_start.elapsed().as_nanos() as u64;
             }
 
             if header.snapshot_len > 0 {
+                let decode_start = std::time::Instant::now();
                 let mut snapshot = S::decode(&snapshot_bytes)?;
                 for ops in pending_ops.iter().rev() {
                     for op in ops {
                         O::apply(&mut snapshot, op);
                     }
                 }
-                return Ok(Some(snapshot));
+                stats.decode_nanos += decode_start.elapsed().as_nanos() as u64;
+                return Ok((Some(snapshot), stats));
             }
         }
 
         if found_any && !pending_ops.is_empty() {
+            let decode_start = std::time::Instant::now();
             let mut snapshot = S::empty();
             for ops in pending_ops.iter().rev() {
                 for op in ops {
                     O::apply(&mut snapshot, op);
                 }
             }
-            return Ok(Some(snapshot));
+            stats.decode_nanos += decode_start.elapsed().as_nanos() as u64;
+            return Ok((Some(snapshot), stats));
         }
 
         if found_any {
-            return Ok(Some(S::empty()));
+            return Ok((Some(S::empty()), stats));
         }
 
-        Ok(None)
+        Ok((None, stats))
     }
 
     /// Read the raw ops count for a key in the current generation.

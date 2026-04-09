@@ -125,6 +125,10 @@ pub struct Metrics {
     // -- Phase 2.5: DocStore I/O observability --
     pub docstore_read_seconds: HistogramVec,
     pub docstore_concurrent_reads: IntGauge,
+    // -- Phase 1 (2026-04-09 batch doc fetch): shard read cost split --
+    pub docstore_shard_file_read_seconds: HistogramVec,
+    pub docstore_shard_decode_seconds: HistogramVec,
+    pub docstore_batch_unique_shards: HistogramVec,
     pub save_snapshot_seconds: HistogramVec,
     pub flush_queue_depth: IntGauge,
 
@@ -678,6 +682,44 @@ impl Metrics {
             "Number of concurrent docstore reads in progress",
         )
         .unwrap();
+
+        // Phase 1 (2026-04-09): split the per-shard read cost into its
+        // two dominant phases so we can tell disk-bound from decode-bound
+        // work without guessing. Same bucket shape as docstore_read_seconds.
+        let shard_read_buckets = vec![
+            0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
+        ];
+        let docstore_shard_file_read_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_docstore_shard_file_read_seconds",
+                "Raw shard file read time (disk + kernel, excludes decode)",
+            )
+            .buckets(shard_read_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let docstore_shard_decode_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_docstore_shard_decode_seconds",
+                "Shard snapshot decode + op-apply time (CPU, excludes disk)",
+            )
+            .buckets(shard_read_buckets),
+            &["index"],
+        )
+        .unwrap();
+        // How many unique shards a single batch doc fetch has to read.
+        // Low values mean shards are clustering (good for batch effect),
+        // high values mean random access (batch effect is weaker).
+        let docstore_batch_unique_shards = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_docstore_batch_unique_shards",
+                "Unique shards touched per batch doc fetch call",
+            )
+            .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]),
+            &["index"],
+        )
+        .unwrap();
+
         let save_snapshot_buckets = vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0];
         let save_snapshot_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -934,6 +976,9 @@ impl Metrics {
         // Phase 2.5
         registry.register(Box::new(docstore_read_seconds.clone())).unwrap();
         registry.register(Box::new(docstore_concurrent_reads.clone())).unwrap();
+        registry.register(Box::new(docstore_shard_file_read_seconds.clone())).unwrap();
+        registry.register(Box::new(docstore_shard_decode_seconds.clone())).unwrap();
+        registry.register(Box::new(docstore_batch_unique_shards.clone())).unwrap();
         registry.register(Box::new(save_snapshot_seconds.clone())).unwrap();
         registry.register(Box::new(flush_queue_depth.clone())).unwrap();
         registry.register(Box::new(doc_cache_hit_total.clone())).unwrap();
@@ -1045,6 +1090,9 @@ impl Metrics {
             // Phase 2.5
             docstore_read_seconds,
             docstore_concurrent_reads,
+            docstore_shard_file_read_seconds,
+            docstore_shard_decode_seconds,
+            docstore_batch_unique_shards,
             save_snapshot_seconds,
             flush_queue_depth,
             doc_cache_hit_total,

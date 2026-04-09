@@ -5577,6 +5577,119 @@ impl ConcurrentEngine {
         }
         Ok(doc)
     }
+
+    /// Batch-retrieve multiple stored documents, reading each unique
+    /// shard at most once from disk on cache miss.
+    ///
+    /// Replaces the old serial `for id in ids { get_document(id) }`
+    /// pattern in the doc-fetch hot path (`server.rs` query handler).
+    /// The previous approach paid the full `ShardStore::read` cost
+    /// (file open + decode of ~10 KB of snapshot bytes + op apply) for
+    /// every cache miss, which at 42% miss rate and 100 ids per query
+    /// translates to ~42 full-shard decodes per request. For sortAt-
+    /// adjacent results this is catastrophically wasteful — consecutive
+    /// slot ids cluster within the same shard, so the same decode work
+    /// happens dozens of times per request.
+    ///
+    /// # Algorithm
+    ///
+    ///   1. Probe the doc cache for every requested id. Record hits.
+    ///   2. Collect any ids that missed the cache, preserving their
+    ///      original positions in the result vector.
+    ///   3. Hand the missing ids to `DocStoreV3::get_many`, which
+    ///      groups by shard, reads each unique shard at most once,
+    ///      and returns docs in the same order as it was given.
+    ///   4. Populate the doc cache with the decoded docs. Only cache
+    ///      the IDs the caller explicitly asked for — NOT all ~512
+    ///      other docs that happened to live in the same shard. The
+    ///      "cache the whole shard" strategy was considered and
+    ///      rejected because at typical QPS it would write ~2.5 GB/s
+    ///      into the cache and thrash the LRU into uselessness.
+    ///   5. Observe the aggregate `ShardReadStats` (file-read and
+    ///      decode nanos) into the per-phase histograms, plus the
+    ///      unique-shard count into its own histogram for tracking
+    ///      clustering behavior over time.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    ///   - `Vec<Option<StoredDoc>>` in the same order as `ids`. Each
+    ///     position is `None` if the slot had no stored document or if
+    ///     it wasn't in the doc cache AND couldn't be read from disk.
+    ///   - Aggregate `ShardReadStats` covering only the disk-miss
+    ///     portion of the batch (cache hits contribute zero). Caller
+    ///     observes these nanos into the
+    ///     `bitdex_docstore_shard_file_read_seconds` and
+    ///     `bitdex_docstore_shard_decode_seconds` histograms.
+    ///   - `usize` count of unique shards actually read from disk on
+    ///     this batch. Caller observes into
+    ///     `bitdex_docstore_batch_unique_shards`.
+    ///
+    /// The engine deliberately does not observe histograms directly
+    /// because the prometheus crate is feature-gated behind `server`,
+    /// and `concurrent_engine.rs` is compiled in the base library. The
+    /// server handler at `src/server.rs` owns the metrics handles and
+    /// does the `.observe()` calls from the returned stats.
+    pub fn get_documents_batch(
+        &self,
+        ids: &[u32],
+    ) -> Result<(Vec<Option<StoredDoc>>, crate::shard_store::ShardReadStats, usize)> {
+        use crate::shard_store::ShardReadStats;
+
+        if ids.is_empty() {
+            return Ok((Vec::new(), ShardReadStats::default(), 0));
+        }
+
+        let mut results: Vec<Option<StoredDoc>> = vec![None; ids.len()];
+
+        // Phase 1: cache probe. Collect indices + ids of cache misses,
+        // preserving original positions so we can scatter disk results
+        // back into the right slots.
+        let mut miss_indices: Vec<usize> = Vec::new();
+        let mut miss_ids: Vec<u32> = Vec::new();
+        if let Some(ref cache) = self.doc_cache {
+            for (i, &id) in ids.iter().enumerate() {
+                if let Some(doc) = cache.get(id) {
+                    results[i] = Some(doc);
+                } else {
+                    miss_indices.push(i);
+                    miss_ids.push(id);
+                }
+            }
+        } else {
+            // No cache configured — every id is a miss
+            miss_indices.extend(0..ids.len());
+            miss_ids.extend_from_slice(ids);
+        }
+
+        if miss_ids.is_empty() {
+            return Ok((results, ShardReadStats::default(), 0));
+        }
+
+        // Phase 2: batch disk read. One `get_many` call reads each
+        // unique shard at most once and returns docs in the order of
+        // `miss_ids`. Scoped to drop the RwLock read guard before we
+        // start touching the cache (the cache has its own locking).
+        let (mut disk_results, stats, unique_shards) = {
+            let guard = self.docstore.read();
+            guard.get_many(&miss_ids)?
+        };
+
+        // Phase 3: scatter disk results into the output and populate
+        // the doc cache. Only the explicitly requested IDs are cached —
+        // see the doc comment above for why we don't pre-populate the
+        // whole shard's 512 docs.
+        for (disk_idx, &result_idx) in miss_indices.iter().enumerate() {
+            if let Some(doc) = disk_results[disk_idx].take() {
+                if let Some(ref cache) = self.doc_cache {
+                    cache.insert(miss_ids[disk_idx], doc.clone());
+                }
+                results[result_idx] = Some(doc);
+            }
+        }
+
+        Ok((results, stats, unique_shards))
+    }
     /// Compact the docstore, reclaiming space from old write transactions.
     pub fn compact_docstore(&self) -> Result<bool> {
         Ok(self.docstore.read().compact()?)

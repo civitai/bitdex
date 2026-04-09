@@ -1079,6 +1079,82 @@ impl DocStoreV3 {
         Ok(snap.docs.get(&id).map(|fields| self.fields_to_stored_doc(fields)))
     }
 
+    /// Batch-fetch multiple documents, reading each unique shard at
+    /// most once instead of re-reading the shard file per id.
+    ///
+    /// Replaces the old `for id in ids { get(id) }` pattern in the
+    /// doc-fetch hot path. The previous serial approach paid the full
+    /// `ShardStore::read` cost (file open + raw read + `S::decode` on
+    /// ~10 KB of snapshot bytes + op apply) for every id, even when
+    /// multiple ids lived in the same shard. At 512 slots per shard,
+    /// any query returning sortAt-adjacent results would touch the
+    /// same shard repeatedly and pay for the decode once per slot.
+    ///
+    /// # Return value
+    ///
+    /// A tuple of:
+    ///
+    ///   - `Vec<Option<StoredDoc>>` in the same order as `ids`. Each
+    ///     slot-not-found returns `None` at its position (matching the
+    ///     semantics of `get(id)`).
+    ///   - Aggregate `ShardReadStats` summed across every unique shard
+    ///     touched. Caller observes into Prometheus histograms.
+    ///   - `usize` count of unique shards actually read. Caller
+    ///     observes into the `docstore_batch_unique_shards` histogram
+    ///     to track clustering behavior over time.
+    ///
+    /// # Shard grouping
+    ///
+    /// Uses `SlotHexShard::slot_to_shard(id)` (= `id >> 9`) to compute
+    /// the shard key for each id. Ids sharing a shard key are read
+    /// together. Worst case (random ids, no clustering): ~`ids.len()`
+    /// unique shards. Best case (sortAt-adjacent ids, high clustering):
+    /// `ids.len() / 512` unique shards.
+    pub fn get_many(
+        &self,
+        ids: &[u32],
+    ) -> io::Result<(Vec<Option<StoredDoc>>, crate::shard_store::ShardReadStats, usize)> {
+        use crate::shard_store::ShardReadStats;
+
+        if ids.is_empty() {
+            return Ok((Vec::new(), ShardReadStats::default(), 0));
+        }
+
+        // Group requested ids by their shard_key. Preserve the first
+        // (and any) position each id was seen at so we can scatter the
+        // decoded docs back into a result vector that matches the
+        // caller's order.
+        let mut by_shard: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
+        for (i, &id) in ids.iter().enumerate() {
+            let shard_key = SlotHexShard::slot_to_shard(id);
+            by_shard.entry(shard_key).or_default().push((i, id));
+        }
+        let unique_shards = by_shard.len();
+
+        let mut results: Vec<Option<StoredDoc>> = vec![None; ids.len()];
+        let mut agg_stats = ShardReadStats::default();
+
+        for (shard_key, slot_positions) in by_shard {
+            let (snap_opt, stats) = self.store.read_with_stats(&shard_key)?;
+            agg_stats.file_read_nanos += stats.file_read_nanos;
+            agg_stats.decode_nanos += stats.decode_nanos;
+
+            let snap = match snap_opt {
+                Some(s) => s,
+                None => continue, // all slots in this shard stay None
+            };
+
+            for (result_idx, id) in slot_positions {
+                if let Some(fields) = snap.docs.get(&id) {
+                    results[result_idx] = Some(self.fields_to_stored_doc(fields));
+                }
+                // id not in the snapshot → leave None at results[result_idx]
+            }
+        }
+
+        Ok((results, agg_stats, unique_shards))
+    }
+
     /// Read all documents from a single shard, decoded.
     pub fn get_shard(&self, shard_id: u32) -> io::Result<Vec<(u32, StoredDoc)>> {
         let snap = match self.store.read(&shard_id)? {
@@ -1097,6 +1173,25 @@ impl DocStoreV3 {
             None => return Ok(Vec::new()),
         };
         Ok(snap.docs.into_iter().collect())
+    }
+
+    /// Stats-returning variant of `get_shard_packed` used by the batch
+    /// doc-fetch hot path in `ConcurrentEngine::get_documents_batch`.
+    ///
+    /// Returns the raw shard contents plus a `ShardReadStats` with the
+    /// file-read / decode split so the engine layer can observe those
+    /// phases into Prometheus histograms. Passes stats straight through
+    /// from `ShardStore::read_with_stats` without interpretation.
+    pub fn get_shard_packed_with_stats(
+        &self,
+        shard_id: u32,
+    ) -> io::Result<(Vec<(u32, Vec<(u16, PackedValue)>)>, crate::shard_store::ShardReadStats)> {
+        let (snap_opt, stats) = self.store.read_with_stats(&shard_id)?;
+        let docs = match snap_opt {
+            Some(s) => s.docs.into_iter().collect(),
+            None => Vec::new(),
+        };
+        Ok((docs, stats))
     }
 
     /// Store a single document.
