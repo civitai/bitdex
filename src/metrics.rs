@@ -72,6 +72,10 @@ pub struct Metrics {
     pub flush_sort_promote_nanos: IntGaugeVec,
     pub cache_maint_unique_filter_shapes: IntGaugeVec,
     pub cache_maint_sort_work_items: IntGaugeVec,
+    pub cache_maint_unique_filter_shapes_max: IntGaugeVec,
+    pub cache_maint_sort_work_items_max: IntGaugeVec,
+    pub docstore_put_batch_fast_path_total: IntGaugeVec,
+    pub docstore_put_batch_slow_path_total: IntGaugeVec,
 
     // -- Tier 2: Lazy loading --
     pub lazy_load_duration_seconds: HistogramVec,
@@ -454,6 +458,38 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let cache_maint_unique_filter_shapes_max = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_maint_unique_filter_shapes_max",
+                "Maximum observed unique canonical filter-clause vectors in a single cache-maintenance cycle since boot. Captures burst-time peaks that the last-cycle gauge can miss on quiet samples.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_maint_sort_work_items_max = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_maint_sort_work_items_max",
+                "Maximum observed sort-maintenance work item count in a single cache-maintenance cycle since boot. Denominator for the burst-time filter-shape collapse ratio.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let docstore_put_batch_fast_path_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_docstore_put_batch_fast_path_total",
+                "Cumulative count of DocStoreV3::put_batch_known_fields invocations that took the concurrent-read fast path (field dict already contained all batch fields). Ratio with slow_path tells us how often we avoid the outer RwLock write guard.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let docstore_put_batch_slow_path_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_docstore_put_batch_slow_path_total",
+                "Cumulative count of DocStoreV3::put_batch calls (write-lock path), either from dict-update fallback or direct calls that bypass the fast path.",
+            ),
+            &["index"],
+        )
+        .unwrap();
 
         let lazy_load_buckets = vec![0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0];
         let lazy_load_duration_seconds = HistogramVec::new(
@@ -817,6 +853,10 @@ impl Metrics {
         registry.register(Box::new(flush_sort_promote_nanos.clone())).unwrap();
         registry.register(Box::new(cache_maint_unique_filter_shapes.clone())).unwrap();
         registry.register(Box::new(cache_maint_sort_work_items.clone())).unwrap();
+        registry.register(Box::new(cache_maint_unique_filter_shapes_max.clone())).unwrap();
+        registry.register(Box::new(cache_maint_sort_work_items_max.clone())).unwrap();
+        registry.register(Box::new(docstore_put_batch_fast_path_total.clone())).unwrap();
+        registry.register(Box::new(docstore_put_batch_slow_path_total.clone())).unwrap();
         registry
             .register(Box::new(lazy_load_duration_seconds.clone()))
             .unwrap();
@@ -928,6 +968,10 @@ impl Metrics {
             flush_sort_promote_nanos,
             cache_maint_unique_filter_shapes,
             cache_maint_sort_work_items,
+            cache_maint_unique_filter_shapes_max,
+            cache_maint_sort_work_items_max,
+            docstore_put_batch_fast_path_total,
+            docstore_put_batch_slow_path_total,
             lazy_load_duration_seconds,
             pending_fields,
             eviction_total,
