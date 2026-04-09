@@ -731,6 +731,15 @@ pub struct DocStoreV3 {
     /// Shard IDs that received writes since last drain.
     /// Used by merge thread for targeted compaction (avoids scanning all 209K shards).
     dirty_shards: Arc<DashSet<u32>>,
+    /// Fast-path put_batch invocation counter (monotonic). Incremented by
+    /// `put_batch_known_fields` on Ok(true). Exposed as
+    /// `bitdex_docstore_put_batch_fast_path_total`.
+    put_batch_fast_path_total: Arc<std::sync::atomic::AtomicU64>,
+    /// Slow-path put_batch invocation counter (monotonic). Incremented by
+    /// `put_batch_known_fields` returning Ok(false) (caller falls back) AND
+    /// by any direct `put_batch(&mut self)` call. Exposed as
+    /// `bitdex_docstore_put_batch_slow_path_total`.
+    put_batch_slow_path_total: Arc<std::sync::atomic::AtomicU64>,
     /// Serializes concurrent fast-path writers (see `put_batch_known_fields`).
     ///
     /// `ShardStore::append_ops` is not thread-safe for concurrent writers on
@@ -773,6 +782,8 @@ impl DocStoreV3 {
             historical_defaults,
             compact_threshold: 1000,
             dirty_shards: Arc::new(DashSet::new()),
+            put_batch_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            put_batch_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_path_writer_lock: Arc::new(parking_lot::Mutex::new(())),
         })
     }
@@ -798,6 +809,8 @@ impl DocStoreV3 {
             historical_defaults: HashMap::new(),
             compact_threshold: 1000,
             dirty_shards: Arc::new(DashSet::new()),
+            put_batch_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            put_batch_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_path_writer_lock: Arc::new(parking_lot::Mutex::new(())),
         })
     }
@@ -1093,7 +1106,9 @@ impl DocStoreV3 {
     /// of already-known sort fields like `reactionCount`, `commentCount`,
     /// `collectedCount`) hits this path and never takes the write lock.
     pub fn put_batch_known_fields(&self, docs: &[(u32, StoredDoc)]) -> io::Result<bool> {
+        use std::sync::atomic::Ordering;
         if docs.is_empty() {
+            self.put_batch_fast_path_total.fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
         // Bail if any field is not in the dict — caller must fall back to
@@ -1101,6 +1116,7 @@ impl DocStoreV3 {
         for (_, doc) in docs {
             for name in doc.fields.keys() {
                 if !self.field_to_idx.contains_key(name) {
+                    self.put_batch_slow_path_total.fetch_add(1, Ordering::Relaxed);
                     return Ok(false);
                 }
             }
@@ -1129,10 +1145,13 @@ impl DocStoreV3 {
             self.store.append_ops(&shard_key, &ops)?;
             self.dirty_shards.insert(shard_key);
         }
+        self.put_batch_fast_path_total.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
     /// Store multiple documents. Converts to ShardStore Create ops.
     pub fn put_batch(&mut self, docs: &[(u32, StoredDoc)]) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.put_batch_slow_path_total.fetch_add(1, Ordering::Relaxed);
         if docs.is_empty() {
             return Ok(());
         }
@@ -1332,6 +1351,15 @@ impl DocStoreV3 {
     /// Get an Arc clone of the dirty shards set (for passing to merge thread).
     pub fn dirty_shards_arc(&self) -> Arc<DashSet<u32>> {
         Arc::clone(&self.dirty_shards)
+    }
+    /// Fast/slow path invocation counts for `put_batch` observability.
+    /// Returns `(fast_path_total, slow_path_total)` monotonic counters.
+    pub fn put_batch_path_stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.put_batch_fast_path_total.load(Ordering::Relaxed),
+            self.put_batch_slow_path_total.load(Ordering::Relaxed),
+        )
     }
 
     /// Pin the current generation for crash-consistent snapshots.
