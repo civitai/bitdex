@@ -157,34 +157,29 @@ impl SortField {
             return Vec::new();
         }
 
-        // Pre-fuse all bit layers ONCE for this query.
+        // NOTE: earlier revisions of this function pre-fused all 32 bit layers
+        // via `fused_cow()` to amortize across bifurcate / cursor / order. On
+        // dirty layers, fused_cow deep-clones the entire base bitmap (~12 MB
+        // per layer at 109M slots × 32 layers = ~400 MB of per-query
+        // allocation). That cost was invisible because it showed up on the
+        // query thread, not the flush thread, and forced us to run sort-promote
+        // every 5 s just to keep layers clean.
         //
-        // For clean layers (the steady-state common case after the merge
-        // thread has run) `fused_cow` returns `Cow::Borrowed(&base)` —
-        // zero-copy. For dirty layers it materializes the fused result
-        // (one ~6 MB clone per dirty layer). The fused snapshot is then
-        // shared across bifurcate / apply_cursor_filter / order_results
-        // so each layer is fused at most once per query.
-        //
-        // This replaces the prior pattern of eagerly merging dirty diffs
-        // into bases on every flush cycle (which cost ~500ms per cycle
-        // under sustained ops because every dirty layer triggered an
-        // Arc::make_mut deep clone).
-        let layers: Vec<Cow<'_, RoaringBitmap>> = self
-            .bit_layers
-            .iter()
-            .map(|vb| vb.fused_cow())
-            .collect();
+        // Instead, we now use `apply_diff` / `apply_diff_inverse` against the
+        // working `candidates` set directly. Both operations compute
+        // `candidates & fused` or `candidates - fused` without touching the
+        // full base: cost is O(candidates), not O(base). The cursor and
+        // bifurcation paths each bit-layer-walk lazily, so unvisited layers
+        // pay nothing.
 
         // Apply cursor filtering if present
         let effective_candidates;
         let candidates = if let Some((cursor_sort_value, cursor_slot_id)) = cursor {
-            effective_candidates = self.apply_cursor_filter_with_layers(
+            effective_candidates = self.apply_cursor_filter(
                 candidates,
                 descending,
                 cursor_sort_value,
                 cursor_slot_id,
-                &layers,
             );
             &effective_candidates
         } else {
@@ -196,7 +191,7 @@ impl SortField {
         }
 
         // MSB-to-LSB bifurcation: collect top-N slots via bitmap AND operations
-        let top_n_bitmap = self.bifurcate_with_layers(candidates, limit, descending, &layers);
+        let top_n_bitmap = self.bifurcate(candidates, limit, descending);
 
         // Reconstruct values ONLY for the final top-N slots and sort them
         self.order_results(&top_n_bitmap, descending)
@@ -207,15 +202,14 @@ impl SortField {
     /// Walks bit layers from MSB to LSB, narrowing candidates at each layer.
     /// Returns a bitmap containing exactly min(limit, candidates.len()) top slots.
     ///
-    /// Operates on pre-fused layers (Cow::Borrowed for clean, Cow::Owned for
-    /// dirty) so callers can share one fused snapshot across multiple
-    /// traversal passes.
-    fn bifurcate_with_layers(
+    /// Uses `apply_diff` / `apply_diff_inverse` against the shrinking
+    /// `remaining` set so we never clone a full base bitmap, even when layers
+    /// are dirty.
+    fn bifurcate(
         &self,
         candidates: &RoaringBitmap,
         limit: usize,
         descending: bool,
-        layers: &[Cow<'_, RoaringBitmap>],
     ) -> RoaringBitmap {
         let total = candidates.len() as usize;
         if total <= limit {
@@ -232,15 +226,17 @@ impl SortField {
                 break;
             }
 
-            let layer: &RoaringBitmap = &layers[bit];
+            let layer = &self.bit_layers[bit];
 
-            // preferred = slots that have the "better" bit value at this position
+            // preferred = slots that have the "better" bit value at this position.
+            // apply_diff(remaining)          = remaining & fused_layer
+            // apply_diff_inverse(remaining)  = remaining - fused_layer
             let preferred = if descending {
                 // Descending: prefer bit SET (higher values)
-                &remaining & layer
+                layer.apply_diff(&remaining)
             } else {
                 // Ascending: prefer bit CLEAR (lower values)
-                &remaining - layer
+                layer.apply_diff_inverse(&remaining)
             };
 
             let preferred_count = preferred.len() as usize;
@@ -303,13 +299,15 @@ impl SortField {
     /// candidates into "strictly better than cursor", "equal so far", and "strictly worse".
     /// Only "strictly better" and the portion of "equal" that passes the slot ID tiebreaker
     /// are retained.
-    fn apply_cursor_filter_with_layers(
+    ///
+    /// Uses `apply_diff` against the shrinking `equal` set so dirty layers
+    /// don't trigger a full base-bitmap clone.
+    fn apply_cursor_filter(
         &self,
         candidates: &RoaringBitmap,
         descending: bool,
         cursor_sort_value: u64,
         cursor_slot_id: u32,
-        layers: &[Cow<'_, RoaringBitmap>],
     ) -> RoaringBitmap {
         let cursor_value = cursor_sort_value as u32;
 
@@ -326,10 +324,12 @@ impl SortField {
             }
 
             let cursor_bit_set = (cursor_value >> bit) & 1 == 1;
-            let layer: &RoaringBitmap = &layers[bit];
+            let layer = &self.bit_layers[bit];
 
-            let equal_with_bit_set = &equal & layer;
-            let equal_with_bit_clear = &equal - layer;
+            // Compute the bit-set partition via apply_diff (O(equal), not
+            // O(base)). Bit-clear partition is equal minus the bit-set.
+            let equal_with_bit_set = layer.apply_diff(&equal);
+            let equal_with_bit_clear = &equal - &equal_with_bit_set;
 
             if descending {
                 // Descending: we want slots with value LESS than cursor (they come after cursor)
