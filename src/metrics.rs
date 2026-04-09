@@ -237,7 +237,28 @@ impl Metrics {
         )
         .unwrap();
 
-        let phase_buckets = vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
+        // Phase histograms (`query_filter_seconds`, `query_sort_seconds`,
+        // `query_docs_seconds`). The top bucket used to be 5.0 seconds,
+        // which saturated the query_docs_seconds P95/P99 for the entire
+        // Apr 9 2026 "OOM + P95 regression" crisis — we spent hours
+        // chasing a "pinned 5 s tail" that turned out to be histogram
+        // ceiling saturation, not a real regression. The real tail was
+        // under 500 ms the whole time.
+        //
+        // Top bucket is now 60 s so even a pathological backlog event
+        // (disk wedge, GC pause, runaway query) is still measurable.
+        // Added 2.5 between 1 and 5 for resolution in the "tail but
+        // still reasonable" range where most production alerting lives.
+        //
+        // Note: changing histogram buckets mid-flight is Prometheus-safe.
+        // Existing dashboards that compute `histogram_quantile(0.95, ...)`
+        // over the bucket series continue to work (cumulative bucket
+        // counts are unchanged for existing boundaries). The new buckets
+        // appear as additional time series with zero backfill.
+        let phase_buckets = vec![
+            0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
+            1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+        ];
         let query_filter_seconds = HistogramVec::new(
             HistogramOpts::new("bitdex_query_filter_seconds", "Bitmap filter evaluation time")
                 .buckets(phase_buckets.clone()),
