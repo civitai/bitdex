@@ -2678,28 +2678,76 @@ async fn handle_query(
                 // leaked on `.await` cancellation (HTTP client disconnect).
                 // Dropped unconditionally when the async stack frame unwinds.
                 let _read_guard = ConcurrentReadGuard::new(&m.docstore_concurrent_reads);
+
+                // Phase 1 batch doc fetch: one call reads each unique
+                // shard at most once instead of re-reading the shard
+                // file per id. See `ConcurrentEngine::get_documents_batch`
+                // for the full doc comment. The blocking task now runs
+                // a single call that internally groups by shard_key,
+                // reads each shard once, decodes, caches the requested
+                // IDs, and returns in-order results.
+                let file_hist = m.docstore_shard_file_read_seconds.clone();
+                let decode_hist = m.docstore_shard_decode_seconds.clone();
+                let shards_hist = m.docstore_batch_unique_shards.clone();
+                let docstore_hist_clone = docstore_hist.clone();
+                let name_docs_clone = name_docs.clone();
                 let docs = tokio::task::spawn_blocking(move || {
-                    let mut docs = Vec::with_capacity(ids.len());
-                    for &id in &ids {
-                        let read_start = Instant::now();
-                        let doc = engine_docs.get_document(id as u32);
-                        docstore_hist
-                            .with_label_values(&[&name_docs])
-                            .observe(read_start.elapsed().as_secs_f64());
-                        docs.push(match doc {
-                            Ok(Some(stored)) => {
-                                format_document(&stored, &schema_docs, &reverse_maps_docs, &include_docs_docs, &schema_registry_docs)
+                    let slot_ids: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+                    let batch_start = Instant::now();
+                    let batch_result = engine_docs.get_documents_batch(&slot_ids);
+                    let batch_elapsed = batch_start.elapsed().as_secs_f64();
+
+                    match batch_result {
+                        Ok((stored_opts, stats, unique_shards)) => {
+                            // Observe the phase split. Cache hits don't
+                            // contribute to stats (both nanos are zero
+                            // for hit-only batches), so the histograms
+                            // track real disk-path cost.
+                            file_hist
+                                .with_label_values(&[&name_docs_clone])
+                                .observe(stats.file_read_nanos as f64 / 1_000_000_000.0);
+                            decode_hist
+                                .with_label_values(&[&name_docs_clone])
+                                .observe(stats.decode_nanos as f64 / 1_000_000_000.0);
+                            shards_hist
+                                .with_label_values(&[&name_docs_clone])
+                                .observe(unique_shards as f64);
+
+                            // Back-compat: keep feeding the legacy per-read
+                            // histogram so existing dashboards still work.
+                            // Report the amortized per-id cost of the batch.
+                            let per_read = batch_elapsed / (ids.len().max(1) as f64);
+                            for _ in 0..ids.len() {
+                                docstore_hist_clone
+                                    .with_label_values(&[&name_docs_clone])
+                                    .observe(per_read);
                             }
-                            Ok(None) => {
-                                serde_json::json!({ "id": id })
+
+                            let mut docs = Vec::with_capacity(ids.len());
+                            for (i, opt) in stored_opts.into_iter().enumerate() {
+                                let id = ids[i];
+                                docs.push(match opt {
+                                    Some(stored) => format_document(
+                                        &stored,
+                                        &schema_docs,
+                                        &reverse_maps_docs,
+                                        &include_docs_docs,
+                                        &schema_registry_docs,
+                                    ),
+                                    None => serde_json::json!({ "id": id }),
+                                });
                             }
-                            Err(e) => {
-                                tracing::warn!("doc read error for slot {}: {e}", id);
-                                serde_json::json!({ "id": id })
-                            }
-                        });
+                            docs
+                        }
+                        Err(e) => {
+                            tracing::warn!("batch doc read error: {e}");
+                            // Fall back to one json-stub per id so the
+                            // response shape stays consistent.
+                            ids.iter()
+                                .map(|&id| serde_json::json!({ "id": id }))
+                                .collect()
+                        }
                     }
-                    docs
                 }).await.unwrap();
                 Some(docs)
             } else {
