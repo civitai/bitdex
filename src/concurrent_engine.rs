@@ -254,6 +254,10 @@ pub struct ConcurrentEngine {
     flush_timebucket_nanos: Arc<AtomicU64>,
     /// Flush phase timing: last diff compaction duration in nanoseconds.
     flush_compact_nanos: Arc<AtomicU64>,
+    /// Flush phase timing: last sort-layer promote (merge_dirty across dirty
+    /// sort fields) duration in nanoseconds. Runs every ~5s inside the flush
+    /// thread and can dominate the flush cycle when many sort fields are dirty.
+    flush_sort_promote_nanos: Arc<AtomicU64>,
     /// Named cursors: opaque key-value pairs persisted at checkpoint time.
     /// Callers (e.g. pg-sync sidecars) use these to track replication progress.
     cursors: Arc<parking_lot::Mutex<HashMap<String, String>>>,
@@ -942,6 +946,7 @@ impl ConcurrentEngine {
         let flush_timebucket_nanos = Arc::new(AtomicU64::new(0));
         let flush_compact_nanos = Arc::new(AtomicU64::new(0));
         let flush_opslog_nanos = Arc::new(AtomicU64::new(0));
+        let flush_sort_promote_nanos = Arc::new(AtomicU64::new(0));
         // BoundStore operational counters (defined before flush/merge threads)
         let boundstore_shard_loads = Arc::new(AtomicU64::new(0));
         let boundstore_tombstones_created = Arc::new(AtomicU64::new(0));
@@ -995,6 +1000,7 @@ impl ConcurrentEngine {
                 flush_timebucket_nanos,
                 flush_compact_nanos,
                 flush_opslog_nanos,
+                flush_sort_promote_nanos,
                 cursors,
                 existing_keys,
                 eviction_stamps,
@@ -1042,6 +1048,7 @@ impl ConcurrentEngine {
             let flush_timebucket_ns = Arc::clone(&flush_timebucket_nanos);
             let flush_compact_ns = Arc::clone(&flush_compact_nanos);
             let flush_opslog_ns = Arc::clone(&flush_opslog_nanos);
+            let flush_sort_promote_ns = Arc::clone(&flush_sort_promote_nanos);
             let flush_existing_keys: HashMap<String, Arc<ArcSwap<HashSet<u64>>>> =
                 existing_keys.iter().map(|(k, v)| (k.clone(), Arc::clone(v))).collect();
             let flush_eviction_stamps = Arc::clone(&eviction_stamps);
@@ -1220,14 +1227,14 @@ impl ConcurrentEngine {
                                     sf.merge_dirty();
                                 }
                             }
-                            let promote_elapsed_ms =
-                                t_promote.elapsed().as_secs_f64() * 1000.0;
+                            let promote_elapsed_ns = t_promote.elapsed().as_nanos() as u64;
+                            flush_sort_promote_ns.store(promote_elapsed_ns, Ordering::Relaxed);
                             tracing::warn!(
                                 "[sort-promote] tick interval={}ms total_fields={} dirty={} elapsed={:.1}ms dirty_names={:?} all_status={:?}",
                                 sort_promote_interval.as_millis(),
                                 all_field_dirty.len(),
                                 dirty_field_names.len(),
-                                promote_elapsed_ms,
+                                promote_elapsed_ns as f64 / 1_000_000.0,
                                 dirty_field_names,
                                 all_field_dirty
                             );
@@ -2746,6 +2753,7 @@ impl ConcurrentEngine {
             flush_timebucket_nanos,
             flush_compact_nanos,
             flush_opslog_nanos,
+            flush_sort_promote_nanos,
             cursors,
             existing_keys,
             eviction_stamps,
@@ -5248,8 +5256,9 @@ impl ConcurrentEngine {
             self.flush_last_duration_nanos.load(Ordering::Relaxed),
         )
     }
-    /// Per-phase flush timing in nanoseconds: (apply, cache, publish, timebucket, compact, opslog).
-    pub fn flush_phase_stats(&self) -> (u64, u64, u64, u64, u64, u64) {
+    /// Per-phase flush timing in nanoseconds:
+    /// `(apply, cache, publish, timebucket, compact, opslog, sort_promote)`.
+    pub fn flush_phase_stats(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
         (
             self.flush_apply_nanos.load(Ordering::Relaxed),
             self.flush_cache_nanos.load(Ordering::Relaxed),
@@ -5257,6 +5266,7 @@ impl ConcurrentEngine {
             self.flush_timebucket_nanos.load(Ordering::Relaxed),
             self.flush_compact_nanos.load(Ordering::Relaxed),
             self.flush_opslog_nanos.load(Ordering::Relaxed),
+            self.flush_sort_promote_nanos.load(Ordering::Relaxed),
         )
     }
     /// Number of filter + sort fields still pending lazy load.

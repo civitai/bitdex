@@ -68,6 +68,8 @@ pub struct Metrics {
     pub flush_publish_nanos: IntGaugeVec,
     pub flush_timebucket_nanos: IntGaugeVec,
     pub flush_compact_nanos: IntGaugeVec,
+    pub flush_opslog_nanos: IntGaugeVec,
+    pub flush_sort_promote_nanos: IntGaugeVec,
 
     // -- Tier 2: Lazy loading --
     pub lazy_load_duration_seconds: HistogramVec,
@@ -415,6 +417,22 @@ impl Metrics {
         .unwrap();
         let flush_compact_nanos = IntGaugeVec::new(
             Opts::new("bitdex_flush_compact_nanos", "Last flush diff compaction duration in nanoseconds"),
+            &["index"],
+        )
+        .unwrap();
+        let flush_opslog_nanos = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_flush_opslog_nanos",
+                "Last flush ops-log append duration in nanoseconds (runs after publish, not included in flush_last_duration_nanos)",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let flush_sort_promote_nanos = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_flush_sort_promote_nanos",
+                "Duration of the most recent sort-layer promote pass (merge_dirty across dirty sort fields) in nanoseconds. Sort-promote runs inside the flush thread but only fires every ~5s, so this gauge updates on promote cycles, NOT on every flush. A value of 0 means no promote has run since boot. Contributes to flush_last_duration_nanos on the cycle it fires.",
+            ),
             &["index"],
         )
         .unwrap();
@@ -777,6 +795,8 @@ impl Metrics {
         registry.register(Box::new(flush_publish_nanos.clone())).unwrap();
         registry.register(Box::new(flush_timebucket_nanos.clone())).unwrap();
         registry.register(Box::new(flush_compact_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_opslog_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_sort_promote_nanos.clone())).unwrap();
         registry
             .register(Box::new(lazy_load_duration_seconds.clone()))
             .unwrap();
@@ -884,6 +904,8 @@ impl Metrics {
             flush_publish_nanos,
             flush_timebucket_nanos,
             flush_compact_nanos,
+            flush_opslog_nanos,
+            flush_sort_promote_nanos,
             lazy_load_duration_seconds,
             pending_fields,
             eviction_total,
