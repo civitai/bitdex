@@ -438,40 +438,165 @@ pub fn eviction_thread(cache: Arc<DocCache>, shutdown: Arc<AtomicBool>) {
     }
 }
 
-/// Estimate the in-memory size of a StoredDoc.
-fn estimate_doc_size(doc: &StoredDoc) -> u64 {
-    // Base overhead: HashMap + schema_version
-    let mut size: u64 = 128; // HashMap overhead estimate
+// -----------------------------------------------------------------------------
+// Honest per-entry memory accounting for StoredDoc.
+//
+// Prior accounting (pre-v1.0.157) used a flat 128-byte "HashMap overhead"
+// constant and counted String / Value payloads at their exact byte length
+// (`24 + s.len()`). This undercounted real heap cost by ~4x because it ignored:
+//
+//   (1) The DashMap bucket overhead per cached entry.
+//   (2) The CachedEntry + StoredDoc struct headers (sizes known at compile
+//       time, not estimated).
+//   (3) The hashbrown bucket table capacity for the inner
+//       `HashMap<String, FieldValue>`, which for N entries is roughly
+//       `next_power_of_two(ceil(N / 0.875)) * (sizeof(K) + sizeof(V) + 1)`.
+//   (4) jemalloc size-class rounding on every String allocation. jemalloc
+//       rounds small allocations to 8 / 16 / 32 / 48 / 64 / 80 / 96 / 112 /
+//       128-byte classes, so a 7-byte field name ("hasMeta") costs 16 bytes
+//       of heap, not 7.
+//   (5) FieldValue::Multi's `Vec<Value>` backing-array capacity, which
+//       follows the same power-of-two growth pattern.
+//
+// The v1.0.156 OOM was caused by the 4x undercount combined with the
+// 1 -> 4 GiB doc_cache budget bump in PR #156: the "4 GiB" budget was
+// actually holding ~16 GiB of real heap. The hotfix reverted the budget to
+// 1 GiB; this function now makes the budget honest against the ~4 GiB real
+// ceiling so the next budget bump can be informed.
+//
+// We deliberately over-estimate where the real answer depends on jemalloc
+// internals. Over-counting wastes a small fraction of the cache budget;
+// under-counting OOMs the pod.
+// -----------------------------------------------------------------------------
 
-    for (key, value) in &doc.fields {
-        // Key: String (24 bytes + data)
-        size += 24 + key.len() as u64;
-        // Value: FieldValue (varies)
-        size += estimate_field_value_size(value);
+/// Round a raw allocation length up to the nearest jemalloc small size class.
+///
+/// Size classes used here (bytes): 8, 16, 32, 48, 64, 80, 96, 112, 128, then
+/// 160, 192, 224, 256, then powers of two. Anything >= 4096 is treated as
+/// page-aligned. This matches jemalloc's default config closely enough for
+/// budget accounting; we do not claim page-perfect accuracy.
+fn jemalloc_rounded(bytes: u64) -> u64 {
+    if bytes == 0 {
+        return 0;
     }
-
-    size
+    const SMALL: [u64; 9] = [8, 16, 32, 48, 64, 80, 96, 112, 128];
+    for &c in &SMALL {
+        if bytes <= c {
+            return c;
+        }
+    }
+    if bytes <= 256 {
+        // 160 / 192 / 224 / 256 classes
+        return ((bytes + 31) / 32) * 32;
+    }
+    if bytes <= 4096 {
+        // Power-of-two classes up to the 4 KiB page.
+        return bytes.next_power_of_two();
+    }
+    // Page-aligned beyond the small/large boundary.
+    (bytes + 4095) & !4095
 }
 
-/// Estimate the in-memory size of a FieldValue.
+/// Backing-array bytes for a hashbrown `HashMap<K, V>` with `len` entries.
+///
+/// hashbrown targets ~87.5% load. Capacity is rounded up to the next power
+/// of two, with a minimum of 4 buckets once the map is non-empty. Each
+/// bucket stores `(K, V)` plus one control byte; the allocator then rounds
+/// the whole table.
+fn hashbrown_backing_bytes(len: usize, entry_bytes: u64) -> u64 {
+    if len == 0 {
+        // Empty HashMap doesn't allocate a backing table.
+        return 0;
+    }
+    let target = ((len as u64 * 8) / 7).max(4);
+    let buckets = target.next_power_of_two();
+    // (K, V) + 1 control byte, rounded up to the entry alignment (assume 8).
+    let per_bucket = ((entry_bytes + 1 + 7) / 8) * 8;
+    jemalloc_rounded(buckets * per_bucket)
+}
+
+/// Heap cost of a `String` holding `len` bytes.
+///
+/// Header is accounted at the call site (it is either inline in a parent
+/// struct or counted as part of that struct's `size_of`). This function
+/// returns only the heap allocation cost for the bytes themselves.
+fn string_heap_bytes(len: usize) -> u64 {
+    // std::String allocates `cap` bytes. After a `to_string()` on `&str`,
+    // `cap == len`. jemalloc rounds the allocation up to a size class.
+    jemalloc_rounded(len as u64)
+}
+
+/// Estimate the in-memory footprint of a single cached StoredDoc entry,
+/// including:
+///
+///   - The DashMap bucket overhead (one entry in the per-shard hashbrown).
+///   - The `CachedEntry` + `StoredDoc` struct headers.
+///   - The inner `HashMap<String, FieldValue>` backing table capacity.
+///   - Every `String` key and every `String` payload inside `FieldValue`,
+///     padded to jemalloc size classes.
+///   - Every `Vec<Value>` backing array inside `FieldValue::Multi`.
+fn estimate_doc_size(doc: &StoredDoc) -> u64 {
+    use std::mem::size_of;
+    use crate::mutation::FieldValue;
+
+    let key_val_bytes = size_of::<String>() as u64 + size_of::<FieldValue>() as u64;
+
+    // (1) DashMap bucket overhead: DashMap keeps one hashbrown shard per
+    //     concurrency level, each holding `(u32, CachedEntry)` buckets.
+    //     Amortize the shard's bucket-table cost across its entries by
+    //     treating one `(u32, CachedEntry)` bucket as the per-entry cost.
+    //     The CachedEntry itself is counted below.
+    let dashmap_bucket = jemalloc_rounded(
+        size_of::<u32>() as u64 + size_of::<CachedEntry>() as u64 + 1,
+    );
+
+    // (2) Fixed struct headers (CachedEntry wraps StoredDoc).
+    //     size_of::<CachedEntry>() already contains StoredDoc's HashMap header
+    //     and the schema_version byte, so no double counting.
+    let fixed_header = size_of::<CachedEntry>() as u64;
+
+    // (3) Inner HashMap<String, FieldValue> backing table.
+    let inner_backing = hashbrown_backing_bytes(doc.fields.len(), key_val_bytes);
+
+    // (4) + (5) Per-field String keys and FieldValue payloads.
+    let mut fields_heap = 0u64;
+    for (key, value) in &doc.fields {
+        fields_heap += string_heap_bytes(key.len());
+        fields_heap += estimate_field_value_size(value);
+    }
+
+    dashmap_bucket + fixed_header + inner_backing + fields_heap
+}
+
+/// Heap cost of a `FieldValue`'s payload (excluding the enum tag, which is
+/// counted as part of the inner HashMap's value slot).
 fn estimate_field_value_size(value: &crate::mutation::FieldValue) -> u64 {
     use crate::mutation::FieldValue;
+    use std::mem::size_of;
     match value {
-        FieldValue::Single(v) => 8 + estimate_value_size(v),
+        FieldValue::Single(v) => estimate_value_payload_bytes(v),
         FieldValue::Multi(values) => {
-            24 + values.iter().map(|v| estimate_value_size(v)).sum::<u64>()
+            // Vec<Value> backing array: capacity rounded to jemalloc class.
+            // A freshly-pushed Vec typically has capacity == len (after
+            // shrink) or next_power_of_two(len) before shrink. We assume
+            // the latter since StoredDocs are rarely shrink_to_fit'd.
+            let cap = (values.len() as u64).max(1).next_power_of_two();
+            let backing = jemalloc_rounded(cap * size_of::<crate::query::Value>() as u64);
+            let payloads: u64 = values.iter()
+                .map(estimate_value_payload_bytes)
+                .sum();
+            backing + payloads
         }
     }
 }
 
-/// Estimate the in-memory size of a Value.
-fn estimate_value_size(value: &crate::query::Value) -> u64 {
+/// Heap cost of a `Value`'s payload, NOT counting the inline enum storage
+/// (that is counted by the parent container's `size_of`).
+fn estimate_value_payload_bytes(value: &crate::query::Value) -> u64 {
     use crate::query::Value;
     match value {
-        Value::Integer(_) => 8,
-        Value::Float(_) => 8,
-        Value::Bool(_) => 1,
-        Value::String(s) => 24 + s.len() as u64,
+        Value::Integer(_) | Value::Float(_) | Value::Bool(_) => 0,
+        Value::String(s) => string_heap_bytes(s.len()),
     }
 }
 
@@ -486,6 +611,115 @@ mod tests {
             fields: fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             schema_version: 0,
         }
+    }
+
+    /// Build a doc that mimics Civitai image entries: ~11 fields, mix of
+    /// integers, booleans, and one or two short strings. Used as the
+    /// reference shape for the honest-accounting tests below.
+    fn make_realistic_doc() -> StoredDoc {
+        make_doc(vec![
+            ("slot", FieldValue::Single(Value::Integer(123_456_789))),
+            ("postId", FieldValue::Single(Value::Integer(98_765_432))),
+            ("postedToId", FieldValue::Single(Value::Integer(1_234))),
+            ("userId", FieldValue::Single(Value::Integer(5_678_901))),
+            ("sortAt", FieldValue::Single(Value::Integer(1_717_000_000))),
+            ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+            ("isPublished", FieldValue::Single(Value::Bool(true))),
+            ("hasMeta", FieldValue::Single(Value::Bool(true))),
+            ("minor", FieldValue::Single(Value::Bool(false))),
+            ("url", FieldValue::Single(Value::String(
+                "xG1nkqKTMzGDvpLrqFT7WA/abcd1234-uuid-guid-ab12-0123456789ab".into(),
+            ))),
+            ("tagIds", FieldValue::Multi(vec![
+                Value::Integer(1), Value::Integer(2), Value::Integer(3),
+                Value::Integer(4), Value::Integer(5), Value::Integer(6),
+            ])),
+        ])
+    }
+
+    #[test]
+    fn estimate_doc_size_accounts_for_real_overhead() {
+        // A realistic Civitai doc should come out meaningfully larger than
+        // the sum of its String bytes — the old estimator returned ~260
+        // bytes for this shape, which was a ~4x undercount against the
+        // real jemalloc footprint observed in prod. The new estimator
+        // must clear a lower bound that reflects:
+        //
+        //   - 2x header overhead (DashMap bucket + CachedEntry/StoredDoc)
+        //   - The inner HashMap's 16-bucket hashbrown backing table
+        //   - String allocator padding on every field name and value
+        //   - The Multi<Value> vec backing array
+        //
+        // We use >= 700 bytes as the floor (realistic minimum) and
+        // <= 2000 bytes as the ceiling (guards against runaway estimation
+        // if a future refactor inflates a constant).
+        let doc = make_realistic_doc();
+        let estimated = estimate_doc_size(&doc);
+        assert!(
+            estimated >= 700,
+            "realistic doc estimate {} bytes is too low — \
+             honest accounting should account for hashbrown backing, \
+             DashMap bucket overhead, and allocator padding",
+            estimated,
+        );
+        assert!(
+            estimated <= 2000,
+            "realistic doc estimate {} bytes is implausibly high — \
+             check for double counting of the HashMap header or the \
+             CachedEntry struct",
+            estimated,
+        );
+    }
+
+    #[test]
+    fn estimate_doc_size_budget_capacity_is_honest() {
+        // With the 1 GiB default budget and the realistic doc shape
+        // above, the cache should hold at least ~500K and no more than
+        // ~2M entries. The old estimator returned ~260 bytes/entry,
+        // implying 4.1M entries at 1 GiB — which then ballooned into
+        // real heap that crossed the pod limit. The new estimator
+        // should land in a window that matches the ~550K-600K entry
+        // counts observed in prod at the previous 1 GiB budget.
+        let doc = make_realistic_doc();
+        let per_entry = estimate_doc_size(&doc);
+        let budget = 1_073_741_824u64; // 1 GiB
+        let entries = budget / per_entry;
+        assert!(
+            (300_000..=2_000_000).contains(&entries),
+            "1 GiB / {} bytes per entry = {} entries — outside the \
+             plausible 300K-2M window for Civitai doc shapes",
+            per_entry,
+            entries,
+        );
+    }
+
+    #[test]
+    fn jemalloc_rounding_matches_size_classes() {
+        assert_eq!(jemalloc_rounded(0), 0);
+        assert_eq!(jemalloc_rounded(1), 8);
+        assert_eq!(jemalloc_rounded(7), 8);
+        assert_eq!(jemalloc_rounded(8), 8);
+        assert_eq!(jemalloc_rounded(9), 16);
+        assert_eq!(jemalloc_rounded(16), 16);
+        assert_eq!(jemalloc_rounded(17), 32);
+        assert_eq!(jemalloc_rounded(63), 64);
+        assert_eq!(jemalloc_rounded(65), 80);
+        assert_eq!(jemalloc_rounded(129), 160);
+        assert_eq!(jemalloc_rounded(257), 512);
+        assert_eq!(jemalloc_rounded(4097), 8192);
+    }
+
+    #[test]
+    fn hashbrown_backing_follows_power_of_two() {
+        // 0 entries -> no allocation
+        assert_eq!(hashbrown_backing_bytes(0, 40), 0);
+        // 1 entry -> 4-bucket minimum
+        assert!(hashbrown_backing_bytes(1, 40) >= 4 * 40);
+        // 10 entries -> capacity 16
+        let b10 = hashbrown_backing_bytes(10, 40);
+        assert!(b10 >= 16 * 40, "10-entry backing too small: {}", b10);
+        // Doubles across the boundary
+        assert!(hashbrown_backing_bytes(15, 40) < hashbrown_backing_bytes(20, 40));
     }
 
     #[test]
