@@ -731,6 +731,19 @@ pub struct DocStoreV3 {
     /// Shard IDs that received writes since last drain.
     /// Used by merge thread for targeted compaction (avoids scanning all 209K shards).
     dirty_shards: Arc<DashSet<u32>>,
+    /// Serializes concurrent fast-path writers (see `put_batch_known_fields`).
+    ///
+    /// `ShardStore::append_ops` is not thread-safe for concurrent writers on
+    /// the same shard (non-atomic seek+write). The fast path exposes
+    /// `put_batch_known_fields` as `&self` so the caller can hold only a
+    /// read guard on the outer `RwLock<DocStoreV3>`, but multiple concurrent
+    /// read-guard callers could still race on the same shard. This mutex
+    /// serializes all fast-path append loops against each other.
+    ///
+    /// It is NOT taken by slow-path `put_batch` because the slow path
+    /// holds the outer write lock, which is already mutually exclusive
+    /// with fast-path read guards.
+    fast_path_writer_lock: Arc<parking_lot::Mutex<()>>,
 }
 
 impl DocStoreV3 {
@@ -760,6 +773,7 @@ impl DocStoreV3 {
             historical_defaults,
             compact_threshold: 1000,
             dirty_shards: Arc::new(DashSet::new()),
+            fast_path_writer_lock: Arc::new(parking_lot::Mutex::new(())),
         })
     }
 
@@ -784,6 +798,7 @@ impl DocStoreV3 {
             historical_defaults: HashMap::new(),
             compact_threshold: 1000,
             dirty_shards: Arc::new(DashSet::new()),
+            fast_path_writer_lock: Arc::new(parking_lot::Mutex::new(())),
         })
     }
 
@@ -1053,6 +1068,69 @@ impl DocStoreV3 {
         self.put_batch(&[(id, doc.clone())])
     }
 
+    /// Concurrent-friendly fast path for `put_batch` when all field names are
+    /// already in the field dictionary.
+    ///
+    /// Takes `&self` so the caller can hold only a `docstore.read()` lock,
+    /// letting doc fetches run concurrently with the apply. This eliminates
+    /// the parking_lot::RwLock writer-priority stall that was the dominant
+    /// source of `query_docs_seconds` p95 spikes (see iteration 4b analysis).
+    ///
+    /// Returns `Ok(true)` on success, `Ok(false)` if any field is missing
+    /// from the dictionary (caller must retry with the `&mut self` slow
+    /// path to add the field). Returns `Err` only on disk write failure.
+    ///
+    /// Why this is safe:
+    /// - `self.field_to_idx` is read-only under the read lock (the outer
+    ///   `RwLock<DocStoreV3>` ensures no concurrent writer is mutating it)
+    /// - `self.store.append_ops(&shard_key, ...)` already takes `&self` —
+    ///   the underlying `ShardStore::append_ops` is designed for concurrent
+    ///   per-shard writes
+    /// - `self.dirty_shards` is `Arc<DashSet<u32>>` — lockless
+    /// - `self.stored_doc_to_fields(&self, ..)` takes `&self` — pure
+    ///
+    /// The 99% common-case workload (metrics poller updating a small set
+    /// of already-known sort fields like `reactionCount`, `commentCount`,
+    /// `collectedCount`) hits this path and never takes the write lock.
+    pub fn put_batch_known_fields(&self, docs: &[(u32, StoredDoc)]) -> io::Result<bool> {
+        if docs.is_empty() {
+            return Ok(true);
+        }
+        // Bail if any field is not in the dict — caller must fall back to
+        // the slow path which updates the dictionary.
+        for (_, doc) in docs {
+            for name in doc.fields.keys() {
+                if !self.field_to_idx.contains_key(name) {
+                    return Ok(false);
+                }
+            }
+        }
+        // Group by shard (immutable read of field_to_idx / idx_to_field).
+        // Done BEFORE taking the serialization lock so the grouping itself
+        // doesn't contend with other fast-path writers.
+        let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
+        for (id, doc) in docs {
+            let shard_key = SlotHexShard::slot_to_shard(*id);
+            let fields = self.stored_doc_to_fields(doc);
+            by_shard.entry(shard_key).or_default().push(DocOp::Create {
+                slot: *id,
+                fields,
+            });
+        }
+        // Serialize concurrent fast-path writers against each other. The
+        // underlying `ShardStore::append_ops` is not safe for concurrent
+        // same-shard writers (non-atomic seek+write), so even though we
+        // only hold the outer read guard on DocStoreV3, we need a dedicated
+        // writer mutex to ensure at most one fast-path writer is active at
+        // a time. Readers holding `docstore.read().get(slot)` don't touch
+        // this mutex and proceed concurrently.
+        let _writer_guard = self.fast_path_writer_lock.lock();
+        for (shard_key, ops) in by_shard {
+            self.store.append_ops(&shard_key, &ops)?;
+            self.dirty_shards.insert(shard_key);
+        }
+        Ok(true)
+    }
     /// Store multiple documents. Converts to ShardStore Create ops.
     pub fn put_batch(&mut self, docs: &[(u32, StoredDoc)]) -> io::Result<()> {
         if docs.is_empty() {

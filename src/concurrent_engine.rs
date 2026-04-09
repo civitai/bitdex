@@ -2198,8 +2198,38 @@ impl ConcurrentEngine {
                         if let Some(ref cache) = flush_doc_cache {
                             cache.update_batch_if_cached(&doc_batch);
                         }
-                        if let Err(e) = docstore.write().put_batch(&doc_batch) {
-                            eprintln!("WARNING: docstore batch write failed (skipping {} docs): {e}", doc_batch.len());
+                        // Fast path: if all fields are already in the dict,
+                        // append under a READ lock so concurrent doc fetches
+                        // aren't blocked by writer priority. The parking_lot
+                        // RwLock's writer-priority semantics meant every
+                        // flush cycle's ~28 ms write lock queued hundreds of
+                        // readers, which was the dominant source of
+                        // `query_docs_seconds` p95 spikes.
+                        //
+                        // Slow path runs only when the batch introduces a
+                        // new field name — rare in steady state since the
+                        // metrics poller only touches already-known fields
+                        // (reactionCount / commentCount / collectedCount).
+                        let fast_handled = match docstore
+                            .read()
+                            .put_batch_known_fields(&doc_batch)
+                        {
+                            Ok(handled) => handled,
+                            Err(e) => {
+                                eprintln!(
+                                    "WARNING: docstore fast-path write failed ({} docs): {e}",
+                                    doc_batch.len()
+                                );
+                                true // logged; don't retry on slow path
+                            }
+                        };
+                        if !fast_handled {
+                            if let Err(e) = docstore.write().put_batch(&doc_batch) {
+                                eprintln!(
+                                    "WARNING: docstore slow-path write failed ({} docs): {e}",
+                                    doc_batch.len()
+                                );
+                            }
                         }
                     }
                     if bitmap_count > 0 || doc_count > 0 || lazy_loaded {
