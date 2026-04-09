@@ -70,6 +70,8 @@ pub struct Metrics {
     pub flush_compact_nanos: IntGaugeVec,
     pub flush_opslog_nanos: IntGaugeVec,
     pub flush_sort_promote_nanos: IntGaugeVec,
+    pub cache_maint_unique_filter_shapes: IntGaugeVec,
+    pub cache_maint_sort_work_items: IntGaugeVec,
 
     // -- Tier 2: Lazy loading --
     pub lazy_load_duration_seconds: HistogramVec,
@@ -436,6 +438,22 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let cache_maint_unique_filter_shapes = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_maint_unique_filter_shapes",
+                "Number of unique canonical filter-clause vectors across sort-maintenance work items in the most recent cache-maintenance cycle. Compare to cache_maint_sort_work_items to get the collapse factor (shapes/items). Low collapse = many entries share filters, filter-shape grouping in Phase B would pay off. High collapse = filters are diverse.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_maint_sort_work_items = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_maint_sort_work_items",
+                "Number of sort-maintenance work items collected in the most recent cache-maintenance cycle. Denominator for the filter-shape collapse ratio (see cache_maint_unique_filter_shapes).",
+            ),
+            &["index"],
+        )
+        .unwrap();
 
         let lazy_load_buckets = vec![0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0];
         let lazy_load_duration_seconds = HistogramVec::new(
@@ -797,6 +815,8 @@ impl Metrics {
         registry.register(Box::new(flush_compact_nanos.clone())).unwrap();
         registry.register(Box::new(flush_opslog_nanos.clone())).unwrap();
         registry.register(Box::new(flush_sort_promote_nanos.clone())).unwrap();
+        registry.register(Box::new(cache_maint_unique_filter_shapes.clone())).unwrap();
+        registry.register(Box::new(cache_maint_sort_work_items.clone())).unwrap();
         registry
             .register(Box::new(lazy_load_duration_seconds.clone()))
             .unwrap();
@@ -906,6 +926,8 @@ impl Metrics {
             flush_compact_nanos,
             flush_opslog_nanos,
             flush_sort_promote_nanos,
+            cache_maint_unique_filter_shapes,
+            cache_maint_sort_work_items,
             lazy_load_duration_seconds,
             pending_fields,
             eviction_total,
