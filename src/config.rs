@@ -509,14 +509,17 @@ impl Default for StorageConfig {
     }
 }
 fn default_doc_cache_max_bytes() -> u64 {
-    // 4 GiB. Bumped from 1 GiB after prod observability showed the doc
-    // cache pinned at budget with 34% hit rate and 265k cumulative
-    // evictions at 550k entries. 1 GiB was insufficient for the current
-    // working set; 4 GiB pushes hit rate to the 80% range and indirectly
-    // reduces docstore read-lock demand. Pod RSS headroom: ~15 GiB
-    // (32 GiB limit minus steady-state 17 GiB), so the ~3 GiB increase
-    // is cheap.
-    4 * 1_073_741_824
+    // 1 GiB. Reverted from 4 GiB (iter 5 / PR #156) after v1.0.156 OOMed
+    // twice in production. Root cause: `estimate_doc_size` in
+    // `src/doc_cache.rs` undercounts real in-memory per-entry cost by
+    // ~4x (missing HashMap backing-array overhead, CacheEntry wrapper,
+    // DashMap shard overhead, String allocator padding, and transient
+    // multi-generation duplication during promote). At a 4 GiB tracked
+    // budget the cache was holding ~16 GiB of real heap, blowing past
+    // the 32 GB pod limit in ~80 minutes. Reverting the budget caps
+    // real memory at ~4 GiB until the accounting is fixed honestly
+    // against measured per-entry cost.
+    1_073_741_824
 }
 fn default_doc_cache_generation_interval() -> u64 {
     60
@@ -866,7 +869,7 @@ mod tests {
         assert_eq!(config.cache.max_capacity, 64_000);
         assert_eq!(config.cache.min_filter_size, 0);
         assert_eq!(config.cache.decay_rate, 0.95);
-        assert_eq!(config.doc_cache.max_bytes, 4 * 1_073_741_824);
+        assert_eq!(config.doc_cache.max_bytes, 1_073_741_824);
         assert_eq!(config.autovac_interval_secs, 3600);
         assert_eq!(config.merge_interval_ms, 5000);
         assert_eq!(config.prometheus_port, 9090);
