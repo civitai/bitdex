@@ -5999,6 +5999,12 @@ impl ConcurrentEngine {
             cache.clear();
         }
     }
+    /// Return a reference to the doc cache (if configured).
+    /// Used by the query handler's inline fast path to probe cache
+    /// without going through spawn_blocking.
+    pub fn doc_cache_ref(&self) -> Option<&crate::doc_cache::DocCache> {
+        self.doc_cache.as_deref()
+    }
     pub fn doc_cache_stats(&self) -> (u64, u64, usize, u64, u64, usize) {
         match &self.doc_cache {
             Some(cache) => (

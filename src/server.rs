@@ -2691,13 +2691,60 @@ async fn handle_query(
                 // Dropped unconditionally when the async stack frame unwinds.
                 let _read_guard = ConcurrentReadGuard::new(&m.docstore_concurrent_reads);
 
-                // Phase 1 batch doc fetch: one call reads each unique
-                // shard at most once instead of re-reading the shard
-                // file per id. See `ConcurrentEngine::get_documents_batch`
-                // for the full doc comment. The blocking task now runs
-                // a single call that internally groups by shard_key,
-                // reads each shard once, decodes, caches the requested
-                // IDs, and returns in-order results.
+                // Fast path: if ALL docs are in the cache, format inline
+                // on the async thread — no spawn_blocking, no .await delay.
+                // At 200 concurrent queries, the .await return path adds
+                // ~571ms average per query due to reactor saturation. Skipping
+                // spawn_blocking for full-cache-hit batches eliminates this.
+                let slot_ids: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
+                let inline_docs = if !slot_ids.is_empty() {
+                    let mut cached: Vec<Option<crate::shard_store_doc::StoredDoc>> = Vec::with_capacity(slot_ids.len());
+                    let mut all_hit = true;
+                    if let Some(cache) = engine_docs.doc_cache_ref() {
+                        for &id in &slot_ids {
+                            if let Some(doc) = cache.get(id) {
+                                cached.push(Some(doc));
+                            } else {
+                                all_hit = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        all_hit = false;
+                    }
+                    if all_hit && cached.len() == slot_ids.len() {
+                        // All cache hits — format inline, skip spawn_blocking.
+                        let format_start = Instant::now();
+                        let docs: Vec<serde_json::Value> = cached.into_iter().enumerate().map(|(i, opt)| {
+                            match opt {
+                                Some(stored) => format_document(
+                                    &stored,
+                                    &schema_docs,
+                                    &reverse_maps_docs,
+                                    &include_docs_docs,
+                                    &schema_registry_docs,
+                                ),
+                                None => serde_json::json!({ "id": result.ids[i] }),
+                            }
+                        }).collect();
+                        m.query_doc_format_seconds
+                            .with_label_values(&[&name_docs])
+                            .observe(format_start.elapsed().as_secs_f64());
+                        m.query_doc_cache_probe_seconds
+                            .with_label_values(&[&name_docs])
+                            .observe(0.0); // cache probe included in the get() calls above
+                        Some(docs)
+                    } else {
+                        None // has misses, fall through to spawn_blocking
+                    }
+                } else {
+                    Some(Vec::new()) // empty batch
+                };
+
+                let docs = if let Some(inline) = inline_docs {
+                    inline
+                } else {
+                // Slow path: cache misses present, use spawn_blocking for disk I/O.
                 let file_hist = m.docstore_shard_file_read_seconds.clone();
                 let decode_hist = m.docstore_shard_decode_seconds.clone();
                 let shards_hist = m.docstore_batch_unique_shards.clone();
@@ -2707,10 +2754,15 @@ async fn handle_query(
                 let format_hist = m.query_doc_format_seconds.clone();
                 let docstore_hist_clone = docstore_hist.clone();
                 let name_docs_clone = name_docs.clone();
+                let ids = result.ids.clone();
+                let schema_docs = schema_docs.clone();
+                let reverse_maps_docs = Arc::clone(&reverse_maps_docs);
+                let include_docs_docs = include_docs_docs.clone();
+                let schema_registry_docs = Arc::clone(&schema_registry_docs);
                 // C1 isolation: capture wall time immediately before the
                 // spawn_blocking call so we can measure dispatch gap.
                 let dispatch_start = Instant::now();
-                let docs = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     // First line inside the closure: close the dispatch
                     // gap window. Delta is pure tokio pool handoff cost.
                     let dispatch_elapsed = dispatch_start.elapsed().as_secs_f64();
@@ -2803,7 +2855,8 @@ async fn handle_query(
                                 .collect()
                         }
                     }
-                }).await.unwrap();
+                }).await.unwrap()
+                }; // end if let Some(inline) / else spawn_blocking
                 Some(docs)
             } else {
                 None
