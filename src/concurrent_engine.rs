@@ -5693,18 +5693,21 @@ impl ConcurrentEngine {
     pub fn get_documents_batch(
         &self,
         ids: &[u32],
-    ) -> Result<(Vec<Option<StoredDoc>>, crate::shard_store::ShardReadStats, usize)> {
+    ) -> Result<(Vec<Option<StoredDoc>>, crate::shard_store::ShardReadStats, usize, u64, u64)> {
         use crate::shard_store::ShardReadStats;
+        use std::time::Instant;
 
         if ids.is_empty() {
-            return Ok((Vec::new(), ShardReadStats::default(), 0));
+            return Ok((Vec::new(), ShardReadStats::default(), 0, 0, 0));
         }
 
         let mut results: Vec<Option<StoredDoc>> = vec![None; ids.len()];
 
         // Phase 1: cache probe. Collect indices + ids of cache misses,
         // preserving original positions so we can scatter disk results
-        // back into the right slots.
+        // back into the right slots. Timing this phase isolates the cost
+        // of DocCache hits including the StoredDoc::clone() per hit.
+        let probe_start = Instant::now();
         let mut miss_indices: Vec<usize> = Vec::new();
         let mut miss_ids: Vec<u32> = Vec::new();
         if let Some(ref cache) = self.doc_cache {
@@ -5721,15 +5724,20 @@ impl ConcurrentEngine {
             miss_indices.extend(0..ids.len());
             miss_ids.extend_from_slice(ids);
         }
+        let cache_probe_nanos = probe_start.elapsed().as_nanos() as u64;
 
         if miss_ids.is_empty() {
-            return Ok((results, ShardReadStats::default(), 0));
+            return Ok((results, ShardReadStats::default(), 0, cache_probe_nanos, 0));
         }
 
         // Phase 2: batch disk read. One `get_many` call reads each
         // unique shard at most once and returns docs in the order of
         // `miss_ids`. Scoped to drop the RwLock read guard before we
         // start touching the cache (the cache has its own locking).
+        // The wall-clock timing here includes the by_shard HashMap
+        // build + scatter loop in DocStoreV3::get_many, which is NOT
+        // covered by the inner `stats` split (file_read vs decode).
+        let disk_start = Instant::now();
         let (mut disk_results, stats, unique_shards) = {
             let guard = self.docstore.read();
             guard.get_many(&miss_ids)?
@@ -5747,8 +5755,9 @@ impl ConcurrentEngine {
                 results[result_idx] = Some(doc);
             }
         }
+        let disk_fetch_nanos = disk_start.elapsed().as_nanos() as u64;
 
-        Ok((results, stats, unique_shards))
+        Ok((results, stats, unique_shards, cache_probe_nanos, disk_fetch_nanos))
     }
     /// Compact the docstore, reclaiming space from old write transactions.
     pub fn compact_docstore(&self) -> Result<bool> {

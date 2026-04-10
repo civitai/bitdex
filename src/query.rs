@@ -154,7 +154,15 @@ pub struct SortClause {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SortDirection {
+    // Aliases let the bitdex-native serde path accept the lowercase forms
+    // that prod-captured caplogs + the meilisearch/compact parsers emit.
+    // Previously the default format rejected `"direction":"desc"` with
+    // `unknown variant "desc", expected "Asc" or "Desc"`, which made every
+    // replayed prod query fail with HTTP 400. Captured April 10 2026 while
+    // setting up the local replay loop for the P50 regression hunt.
+    #[serde(alias = "asc", alias = "ASC")]
     Asc,
+    #[serde(alias = "desc", alias = "DESC")]
     Desc,
 }
 
