@@ -141,6 +141,16 @@ pub struct Metrics {
     pub docstore_shard_file_read_seconds: HistogramVec,
     pub docstore_shard_decode_seconds: HistogramVec,
     pub docstore_batch_unique_shards: HistogramVec,
+    // -- Apr 10 2026 doc fetch path per-stage split (Ivy+Aidan catalog) --
+    // Isolates C1 spawn_blocking dispatch, C4 StoredDoc::clone on cache
+    // hits, C2 format_document loop, and C10 json!(docs) response wrap.
+    // Together with existing filter/sort/docs histograms, covers the
+    // entire path from request parse to response build.
+    pub query_spawn_blocking_dispatch_seconds: HistogramVec,
+    pub query_doc_cache_probe_seconds: HistogramVec,
+    pub query_doc_disk_fetch_seconds: HistogramVec,
+    pub query_doc_format_seconds: HistogramVec,
+    pub query_response_build_seconds: HistogramVec,
     pub save_snapshot_seconds: HistogramVec,
     pub flush_queue_depth: IntGauge,
 
@@ -777,6 +787,59 @@ impl Metrics {
         )
         .unwrap();
 
+        // Apr 10 2026: doc fetch path per-stage split. Uses phase_buckets
+        // (same as query_filter/sort/docs) so dashboards comparing phases
+        // share axes. See comment on the struct fields for the rationale.
+        let doc_phase_buckets = vec![
+            0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5,
+            1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+        ];
+        let query_spawn_blocking_dispatch_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_spawn_blocking_dispatch_seconds",
+                "tokio::spawn_blocking dispatch gap: time between spawn call and closure first line",
+            )
+            .buckets(doc_phase_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let query_doc_cache_probe_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_doc_cache_probe_seconds",
+                "Phase 1 of get_documents_batch: DocCache probe loop (includes StoredDoc::clone on hits)",
+            )
+            .buckets(doc_phase_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let query_doc_disk_fetch_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_doc_disk_fetch_seconds",
+                "Phase 2 of get_documents_batch: wrapping get_many call (shard read + by_shard build + scatter)",
+            )
+            .buckets(doc_phase_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let query_doc_format_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_doc_format_seconds",
+                "format_document loop inside spawn_blocking: StoredDoc → serde_json::Value per doc",
+            )
+            .buckets(doc_phase_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let query_response_build_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_response_build_seconds",
+                "Response build window: json!(docs) wrap + final Json(response) serialize (currently unattributed 9ms gap)",
+            )
+            .buckets(doc_phase_buckets),
+            &["index"],
+        )
+        .unwrap();
+
         let save_snapshot_buckets = vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0];
         let save_snapshot_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -1039,6 +1102,11 @@ impl Metrics {
         registry.register(Box::new(docstore_shard_file_read_seconds.clone())).unwrap();
         registry.register(Box::new(docstore_shard_decode_seconds.clone())).unwrap();
         registry.register(Box::new(docstore_batch_unique_shards.clone())).unwrap();
+        registry.register(Box::new(query_spawn_blocking_dispatch_seconds.clone())).unwrap();
+        registry.register(Box::new(query_doc_cache_probe_seconds.clone())).unwrap();
+        registry.register(Box::new(query_doc_disk_fetch_seconds.clone())).unwrap();
+        registry.register(Box::new(query_doc_format_seconds.clone())).unwrap();
+        registry.register(Box::new(query_response_build_seconds.clone())).unwrap();
         registry.register(Box::new(save_snapshot_seconds.clone())).unwrap();
         registry.register(Box::new(flush_queue_depth.clone())).unwrap();
         registry.register(Box::new(doc_cache_hit_total.clone())).unwrap();
@@ -1156,6 +1224,11 @@ impl Metrics {
             docstore_shard_file_read_seconds,
             docstore_shard_decode_seconds,
             docstore_batch_unique_shards,
+            query_spawn_blocking_dispatch_seconds,
+            query_doc_cache_probe_seconds,
+            query_doc_disk_fetch_seconds,
+            query_doc_format_seconds,
+            query_response_build_seconds,
             save_snapshot_seconds,
             flush_queue_depth,
             doc_cache_hit_total,

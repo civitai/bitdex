@@ -2689,16 +2689,50 @@ async fn handle_query(
                 let file_hist = m.docstore_shard_file_read_seconds.clone();
                 let decode_hist = m.docstore_shard_decode_seconds.clone();
                 let shards_hist = m.docstore_batch_unique_shards.clone();
+                let dispatch_hist = m.query_spawn_blocking_dispatch_seconds.clone();
+                let cache_probe_hist = m.query_doc_cache_probe_seconds.clone();
+                let disk_fetch_hist = m.query_doc_disk_fetch_seconds.clone();
+                let format_hist = m.query_doc_format_seconds.clone();
                 let docstore_hist_clone = docstore_hist.clone();
                 let name_docs_clone = name_docs.clone();
+                // C1 isolation: capture wall time immediately before the
+                // spawn_blocking call so we can measure dispatch gap.
+                let dispatch_start = Instant::now();
                 let docs = tokio::task::spawn_blocking(move || {
+                    // First line inside the closure: close the dispatch
+                    // gap window. Delta is pure tokio pool handoff cost.
+                    let dispatch_elapsed = dispatch_start.elapsed().as_secs_f64();
+                    dispatch_hist
+                        .with_label_values(&[&name_docs_clone])
+                        .observe(dispatch_elapsed);
+
                     let slot_ids: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
                     let batch_start = Instant::now();
                     let batch_result = engine_docs.get_documents_batch(&slot_ids);
                     let batch_elapsed = batch_start.elapsed().as_secs_f64();
 
                     match batch_result {
-                        Ok((stored_opts, stats, unique_shards)) => {
+                        Ok((stored_opts, stats, unique_shards, cache_probe_ns, disk_fetch_ns)) => {
+                            // Split Phase 1 (cache probe) vs Phase 2
+                            // (disk fetch) from inside get_documents_batch.
+                            // Observes even when values are zero (full
+                            // cache hit: disk_fetch_ns == 0) so dashboards
+                            // can compute phase-occupancy fractions.
+                            cache_probe_hist
+                                .with_label_values(&[&name_docs_clone])
+                                .observe(cache_probe_ns as f64 / 1_000_000_000.0);
+                            // Only observe disk fetch when the path was
+                            // actually taken. Full-cache-hit batches
+                            // skip the disk path via the miss_ids empty
+                            // early return, so emitting zero here would
+                            // drag the histogram toward 0 and hide the
+                            // real cost on the batches that DO hit disk.
+                            // unique_shards > 0 ≡ disk path was taken.
+                            if unique_shards > 0 {
+                                disk_fetch_hist
+                                    .with_label_values(&[&name_docs_clone])
+                                    .observe(disk_fetch_ns as f64 / 1_000_000_000.0);
+                            }
                             // Observe the phase split. Cache hits don't
                             // contribute to stats (both nanos are zero
                             // for hit-only batches), so the histograms
@@ -2723,6 +2757,10 @@ async fn handle_query(
                                     .observe(per_read);
                             }
 
+                            // C2/C4 isolation: wrap the format_document
+                            // loop to measure StoredDoc → serde_json::Value
+                            // conversion cost in isolation.
+                            let format_start = Instant::now();
                             let mut docs = Vec::with_capacity(ids.len());
                             for (i, opt) in stored_opts.into_iter().enumerate() {
                                 let id = ids[i];
@@ -2737,6 +2775,9 @@ async fn handle_query(
                                     None => serde_json::json!({ "id": id }),
                                 });
                             }
+                            format_hist
+                                .with_label_values(&[&name_docs_clone])
+                                .observe(format_start.elapsed().as_secs_f64());
                             docs
                         }
                         Err(e) => {
@@ -2788,6 +2829,12 @@ async fn handle_query(
                 }
             }
 
+            // C10 + final serialize isolation: window from start of
+            // response Value build to just before into_response(). This
+            // captures the `json!(docs)` deep clone and the axum Json
+            // serializer's pass over the full response body — the
+            // ~9 ms P50 gap that currently has no attribution.
+            let response_build_start = Instant::now();
             let mut response = serde_json::json!({
                 "ids": result.ids,
                 "cursor": cursor,
@@ -2803,6 +2850,9 @@ async fn handle_query(
                 "X-BitDex-Duration-Us",
                 axum::http::HeaderValue::from_str(&elapsed_us.to_string()).unwrap(),
             );
+            m.query_response_build_seconds
+                .with_label_values(&[&name])
+                .observe(response_build_start.elapsed().as_secs_f64());
             resp
         }
         Err(e) => {
