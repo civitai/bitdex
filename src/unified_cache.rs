@@ -1557,6 +1557,42 @@ impl UnifiedCache {
             entry.remove_slot_blind(slot);
         }
     }
+
+    /// Batch-remove multiple slots from all cache entries. Each entry's
+    /// bitmap is cloned via Arc::make_mut ONCE for the entire batch
+    /// instead of once per slot. At N removes × M entries, this reduces
+    /// Arc::make_mut calls from N×M to M — typically 50x fewer bitmap
+    /// clones when queries hold Arc refs to the same bitmaps.
+    pub fn remove_slots_from_all_batch(&mut self, slots: &[u32]) {
+        if slots.is_empty() {
+            return;
+        }
+        // Build a roaring bitmap of slots to remove for efficient bitmap
+        // subtraction + is_disjoint skip check.
+        let remove_bm: roaring::RoaringBitmap = slots.iter().copied().collect();
+        for (_, entry) in self.entries.iter_mut() {
+            // Skip entries that don't contain ANY of the removed slots.
+            // is_disjoint is O(min(n,m)) on roaring and avoids the
+            // Arc::make_mut clone entirely for unaffected entries.
+            // (GPT + Gemini review recommendation)
+            if entry.bitmap.is_disjoint(&remove_bm) {
+                continue;
+            }
+            // Single Arc::make_mut — one clone per entry, not N.
+            let bm = Arc::make_mut(&mut entry.bitmap);
+            *bm -= &remove_bm;
+            entry.sorted_keys = None;
+            entry.persist_dirty = true;
+            if let Some(ref mut radix) = entry.radix {
+                let r = Arc::make_mut(radix);
+                // Iterate the deduped bitmap, not raw slots — avoids
+                // duplicate work if alive_removes() has repeats.
+                for slot in remove_bm.iter() {
+                    r.remove_blind(slot);
+                }
+            }
+        }
+    }
     // ── Two-Phase Maintenance (Lock-Free Evaluation) ────────────────────
     //
     // These methods split cache maintenance into three brief-lock phases:

@@ -1397,12 +1397,14 @@ impl ConcurrentEngine {
                             let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
                                 let mut uc = flush_unified_cache.lock();
                                 ct_uc_entries = uc.len();
-                                // Targeted alive removal (fast: O(1) per entry per remove)
+                                // Batched alive removal: one Arc::make_mut per
+                                // entry for the entire remove set, instead of
+                                // one per entry per slot. At N removes × M
+                                // entries, reduces bitmap clones from N×M to M.
                                 if !uc.is_empty() {
-                                    ct_alive_removes = coalescer.alive_removes().len();
-                                    for &slot in coalescer.alive_removes() {
-                                        uc.remove_slot_from_all(slot);
-                                    }
+                                    let removes: Vec<u32> = coalescer.alive_removes().to_vec();
+                                    ct_alive_removes = removes.len();
+                                    uc.remove_slots_from_all_batch(&removes);
                                 }
                                 // Collect filter maintenance work
                                 let (fw, fob) = if !coalescer.mutated_filter_fields().is_empty() {
