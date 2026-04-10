@@ -5844,6 +5844,12 @@ impl ConcurrentEngine {
     /// Returns zeros if doc_cache is not configured.
     /// Evict a slot from the doc cache so the next read fetches from disk.
     /// Used by WAL reader after DocWriter updates a document via ops.
+    /// Set the doc cache max_bytes at runtime. Pass 0 to revert to config default.
+    pub fn set_doc_cache_max_bytes(&self, new_max: u64) {
+        if let Some(ref cache) = self.doc_cache {
+            cache.set_max_bytes(new_max);
+        }
+    }
     pub fn evict_doc_cache(&self, slot: u32) {
         if let Some(ref cache) = self.doc_cache {
             cache.remove(slot);

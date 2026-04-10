@@ -918,6 +918,12 @@ struct ConfigPatch {
     /// entries give only ~5.5s of history — increase for cache analysis.
     #[serde(default)]
     trace_buffer_size: Option<usize>,
+    /// Update the doc cache max_bytes at runtime. Previously required a
+    /// config change + restart because DocCacheConfig is construction-time
+    /// only. This field sets the runtime override via DocCache::set_max_bytes.
+    /// Pass 0 to revert to the config default.
+    #[serde(default)]
+    doc_cache_max_bytes: Option<u64>,
     /// Toggle expensive metric groups at runtime. Array of group names to enable.
     /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
     /// DEPRECATED: Use disabled_metrics instead.
@@ -2275,6 +2281,12 @@ async fn handle_patch_config(
                     state.metrics_boundstore_disk.store(bd, Ordering::Relaxed);
                     idx.definition.config.enabled_metrics = Some(groups.clone());
                     eprintln!("Config patch: enabled_metrics (legacy) = {:?} (bitmap_memory={bm}, eviction_stats={ev}, boundstore_disk={bd})", groups);
+                }
+
+                // Apply doc cache max_bytes runtime override
+                if let Some(v) = patch.doc_cache_max_bytes {
+                    idx.engine.set_doc_cache_max_bytes(v);
+                    eprintln!("Config patch: doc_cache_max_bytes set to {v} (0 = revert to config default)");
                 }
 
                 // Persist updated config
