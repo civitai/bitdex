@@ -157,6 +157,9 @@ pub struct Metrics {
     // holds locks during Phase A/C (unified_cache Mutex) or put_batch
     // (docstore RwLock write).
     pub query_cache_lock_wait_seconds: HistogramVec,
+    pub query_cache_hold_seconds: HistogramVec,
+    pub query_lazy_load_seconds: HistogramVec,
+    pub query_overhead_seconds: HistogramVec,
     pub query_docstore_lock_wait_seconds: HistogramVec,
     pub save_snapshot_seconds: HistogramVec,
     pub flush_queue_depth: IntGauge,
@@ -862,6 +865,33 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let query_cache_hold_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_cache_hold_seconds",
+                "Time spent HOLDING unified_cache Mutex during lookup (work done under lock, not wait time)",
+            )
+            .buckets(lock_wait_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let query_lazy_load_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_lazy_load_seconds",
+                "Time ensure_fields_loaded takes per query (lazy bitmap loading from disk)",
+            )
+            .buckets(lock_wait_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let query_overhead_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_overhead_seconds",
+                "Unexplained residual: query_duration - filter - sort - lazy_load - cache_lock_wait (cuts through histogram P50 artifacts)",
+            )
+            .buckets(lock_wait_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
         let query_docstore_lock_wait_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "bitdex_query_docstore_lock_wait_seconds",
@@ -1140,6 +1170,9 @@ impl Metrics {
         registry.register(Box::new(query_doc_format_seconds.clone())).unwrap();
         registry.register(Box::new(query_response_build_seconds.clone())).unwrap();
         registry.register(Box::new(query_cache_lock_wait_seconds.clone())).unwrap();
+        registry.register(Box::new(query_cache_hold_seconds.clone())).unwrap();
+        registry.register(Box::new(query_lazy_load_seconds.clone())).unwrap();
+        registry.register(Box::new(query_overhead_seconds.clone())).unwrap();
         registry.register(Box::new(query_docstore_lock_wait_seconds.clone())).unwrap();
         registry.register(Box::new(save_snapshot_seconds.clone())).unwrap();
         registry.register(Box::new(flush_queue_depth.clone())).unwrap();
@@ -1264,6 +1297,9 @@ impl Metrics {
             query_doc_format_seconds,
             query_response_build_seconds,
             query_cache_lock_wait_seconds,
+            query_cache_hold_seconds,
+            query_lazy_load_seconds,
+            query_overhead_seconds,
             query_docstore_lock_wait_seconds,
             save_snapshot_seconds,
             flush_queue_depth,

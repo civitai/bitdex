@@ -2815,6 +2815,25 @@ async fn handle_query(
             m.query_cache_lock_wait_seconds
                 .with_label_values(&[&name])
                 .observe(trace.cache_lock_wait_us as f64 / 1_000_000.0);
+            m.query_cache_hold_seconds
+                .with_label_values(&[&name])
+                .observe(trace.cache_hold_us as f64 / 1_000_000.0);
+            m.query_lazy_load_seconds
+                .with_label_values(&[&name])
+                .observe(trace.lazy_load_us as f64 / 1_000_000.0);
+            // Computed residual: total - all known stages. Cuts through
+            // histogram P50 interpolation artifacts from bimodal distributions.
+            // If this is near-zero at P50, the "26ms gap" is a quantile
+            // estimation problem, not a real per-query cost.
+            let overhead_us = elapsed_us
+                .saturating_sub(trace.filter_us)
+                .saturating_sub(trace.sort_us)
+                .saturating_sub(trace.lazy_load_us)
+                .saturating_sub(trace.cache_lock_wait_us)
+                .saturating_sub(trace.cache_hold_us);
+            m.query_overhead_seconds
+                .with_label_values(&[&name])
+                .observe(overhead_us as f64 / 1_000_000.0);
 
             let cache_tag = if trace.cache_hit { " cache" } else { "" };
             let docs_tag = if docs_count > 0 { format!("  docs={}μs({})", docs_us, docs_count) } else { String::new() };
