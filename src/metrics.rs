@@ -65,6 +65,18 @@ pub struct Metrics {
     // -- Flush phase timing --
     pub flush_apply_nanos: IntGaugeVec,
     pub flush_cache_nanos: IntGaugeVec,
+    /// Phase A (collect work, LOCK HELD) duration of the most recent
+    /// cache maintenance cycle. Combined with `flush_phase_c_nanos` it
+    /// gives the actual mutex hold time queries pay against.
+    pub flush_phase_a_nanos: IntGaugeVec,
+    /// Phase C (apply results, LOCK HELD) duration of the most recent
+    /// cache maintenance cycle.
+    pub flush_phase_c_nanos: IntGaugeVec,
+    /// Cumulative count of cache-maintenance cycles run by the flush
+    /// thread. Paired with the phase nanos gauges via PromQL `rate()`
+    /// to compute lock_held_per_second:
+    ///   sum(flush_phase_a_nanos + flush_phase_c_nanos) * rate(flush_cache_cycles_total[1m]) / 1e9
+    pub flush_cache_cycles_total: IntGaugeVec,
     pub flush_publish_nanos: IntGaugeVec,
     pub flush_timebucket_nanos: IntGaugeVec,
     pub flush_compact_nanos: IntGaugeVec,
@@ -436,7 +448,31 @@ impl Metrics {
         )
         .unwrap();
         let flush_cache_nanos = IntGaugeVec::new(
-            Opts::new("bitdex_flush_cache_nanos", "Last flush cache maintenance duration in nanoseconds"),
+            Opts::new("bitdex_flush_cache_nanos", "Last flush cache maintenance duration in nanoseconds (Phase A + Phase B + Phase C)"),
+            &["index"],
+        )
+        .unwrap();
+        let flush_phase_a_nanos = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_flush_phase_a_nanos",
+                "Last cache-maintenance Phase A duration (collect work, LOCK HELD on unified_cache mutex)",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let flush_phase_c_nanos = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_flush_phase_c_nanos",
+                "Last cache-maintenance Phase C duration (apply results, LOCK HELD on unified_cache mutex)",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let flush_cache_cycles_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_flush_cache_cycles_total",
+                "Cumulative count of cache-maintenance cycles run by the flush thread (use rate() to derive cycles/sec)",
+            ),
             &["index"],
         )
         .unwrap();
@@ -945,6 +981,9 @@ impl Metrics {
         registry.register(Box::new(startup_duration_seconds.clone())).unwrap();
         registry.register(Box::new(flush_apply_nanos.clone())).unwrap();
         registry.register(Box::new(flush_cache_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_phase_a_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_phase_c_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_cache_cycles_total.clone())).unwrap();
         registry.register(Box::new(flush_publish_nanos.clone())).unwrap();
         registry.register(Box::new(flush_timebucket_nanos.clone())).unwrap();
         registry.register(Box::new(flush_compact_nanos.clone())).unwrap();
@@ -1067,6 +1106,9 @@ impl Metrics {
             startup_duration_seconds,
             flush_apply_nanos,
             flush_cache_nanos,
+            flush_phase_a_nanos,
+            flush_phase_c_nanos,
+            flush_cache_cycles_total,
             flush_publish_nanos,
             flush_timebucket_nanos,
             flush_compact_nanos,

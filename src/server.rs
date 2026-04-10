@@ -4828,6 +4828,15 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.flush_compact_nanos.with_label_values(&[name]).set(compact_ns as i64);
             m.flush_opslog_nanos.with_label_values(&[name]).set(opslog_ns as i64);
             m.flush_sort_promote_nanos.with_label_values(&[name]).set(sort_promote_ns as i64);
+            // Cache maintenance phase split (the lock-held part of flush_cache_nanos).
+            // phase_a + phase_c is the actual mutex hold time queries pay against.
+            // cycles_total combined with rate() gives cycles/sec, which combined
+            // with the per-cycle phase nanos yields total wall-clock lock saturation.
+            let (phase_a_ns, phase_c_ns, cache_cycles) =
+                engine.flush_cache_phase_stats();
+            m.flush_phase_a_nanos.with_label_values(&[name]).set(phase_a_ns as i64);
+            m.flush_phase_c_nanos.with_label_values(&[name]).set(phase_c_ns as i64);
+            m.flush_cache_cycles_total.with_label_values(&[name]).set(cache_cycles as i64);
             // Iter 4a — cache maintenance shape stats + iter 6 max-seen
             let (unique_shapes, sort_work_items, unique_shapes_max, sort_work_items_max) =
                 engine.cache_maint_shape_stats();
