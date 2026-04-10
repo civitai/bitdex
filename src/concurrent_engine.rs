@@ -1666,7 +1666,22 @@ impl ConcurrentEngine {
                             // Precompute not-null bitmaps for nullable fields.
                             // alive - null per field, cached so IsNotNull queries
                             // avoid the 13MB alive.clone() + bitmap subtraction.
-                            staging.not_null_bitmaps = staging.compute_not_null_bitmaps();
+                            //
+                            // Compute from the PUBLISHED snapshot first (which has
+                            // lazily-loaded per_value_lazy fields like postId), then
+                            // overlay with staging's own computation. This ensures
+                            // fields that were lazy-loaded by query threads (into the
+                            // published snapshot but NOT staging) still get their
+                            // not-null bitmap computed. Staging's computation handles
+                            // fields that were loaded via bulk/ops path.
+                            let published = inner.load();
+                            let mut not_null = published.compute_not_null_bitmaps();
+                            // Overlay with staging's own (which has fresher alive bitmap
+                            // and any null bitmaps from ops mutations)
+                            for (name, bm) in staging.compute_not_null_bitmaps() {
+                                not_null.insert(name, bm);
+                            }
+                            staging.not_null_bitmaps = not_null;
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
                             let t_publish = Instant::now();
                             inner.store(Arc::new(staging.clone()));
