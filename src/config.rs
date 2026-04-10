@@ -78,7 +78,10 @@ pub struct Config {
     /// requested IDs). Pre-populates the cache with ~512 neighboring docs
     /// so subsequent queries hitting the same shard get free cache hits.
     /// Requires sufficient doc_cache.max_bytes headroom (~2.4MB per shard).
-    #[serde(default = "default_true")]
+    /// Default FALSE — at 30% miss rate × 56 QPS the fill rate (~40MB/s)
+    /// overwhelms eviction during cold start, causing OOM (v1.0.170).
+    /// Enable via PATCH only after cache is warm and eviction is stable.
+    #[serde(default)]
     pub doc_cache_prepopulate_shard: bool,
     /// Bitmap memory scanner settings. Replaces the expensive per-scrape
     /// bitmap_memory_report() with incremental background scanning.
@@ -177,7 +180,7 @@ impl Default for Config {
             eviction_sweep_interval: default_eviction_sweep_interval(),
             compact_threshold_pct: default_compact_threshold_pct(),
             doc_cache: DocCacheConfigEntry::default(),
-            doc_cache_prepopulate_shard: true,
+            doc_cache_prepopulate_shard: false,
             memory_scanner: MemoryScannerConfig::default(),
             enabled_metrics: None,
             disabled_metrics: None,
