@@ -172,7 +172,33 @@ pub struct InnerEngine {
     pub slots: crate::slot::SlotAllocator,
     pub filters: crate::filter::FilterIndex,
     pub sorts: crate::sort::SortIndex,
+    /// Precomputed not-null bitmaps: `alive - null` per nullable field.
+    /// Maintained by the flush thread at snapshot publish time.
+    /// Eliminates the 10-17ms `alive.clone() - null_bitmap` computation
+    /// from the IsNotNull hot path (every query with a nullable filter).
+    pub not_null_bitmaps: HashMap<Arc<str>, Arc<RoaringBitmap>>,
 }
+
+impl InnerEngine {
+    /// Compute `alive - null` for every field that has a NULL_BITMAP_KEY entry.
+    /// Returns a map from field name to precomputed not-null bitmap.
+    /// Called by the flush thread before snapshot publish.
+    fn compute_not_null_bitmaps(&self) -> HashMap<Arc<str>, Arc<RoaringBitmap>> {
+        let alive = self.slots.alive_bitmap();
+        let mut result = HashMap::new();
+        for (name, field) in self.filters.fields() {
+            if let Some(null_vb) = field.get_versioned(crate::filter::NULL_BITMAP_KEY) {
+                let null_bm = null_vb.fused();
+                if !null_bm.is_empty() {
+                    let not_null = alive - &null_bm;
+                    result.insert(Arc::from(name.as_str()), Arc::new(not_null));
+                }
+            }
+        }
+        result
+    }
+}
+
 /// Thread-safe engine using ArcSwap for lock-free snapshot reads.
 ///
 /// Writers call `put`/`patch`/`delete` which compute diffs and send
@@ -843,6 +869,7 @@ impl ConcurrentEngine {
             slots,
             filters,
             sorts,
+            not_null_bitmaps: HashMap::new(),
         };
         // Flush thread owns a staging clone; readers see published snapshots
         let mut staging = inner_engine.clone();
@@ -1634,6 +1661,10 @@ impl ConcurrentEngine {
                             flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             flush_cycle += 1;
                             flush_cycle_clone.store(flush_cycle, Ordering::Relaxed);
+                            // Precompute not-null bitmaps for nullable fields.
+                            // alive - null per field, cached so IsNotNull queries
+                            // avoid the 13MB alive.clone() + bitmap subtraction.
+                            staging.not_null_bitmaps = staging.compute_not_null_bitmaps();
                             // Publish new snapshot atomically (Arc-per-bitmap CoW clone)
                             let t_publish = Instant::now();
                             inner.store(Arc::new(staging.clone()));
@@ -2052,6 +2083,7 @@ impl ConcurrentEngine {
                                     slots,
                                     filters: new_filters,
                                     sorts: new_sorts,
+                                    not_null_bitmaps: HashMap::new(),
                                 };
                                 flush_unified_cache.lock().clear();
                                 inner.store(Arc::new(staging.clone()));
@@ -2762,7 +2794,7 @@ impl ConcurrentEngine {
                             &snap.filters,
                             &snap.sorts,
                             pf_config.max_page_size,
-                        );
+                        ).with_not_null_bitmaps(&snap.not_null_bitmaps);
                         // Convert canonical clauses back to FilterClauses
                         let filter_clauses: Vec<FilterClause> = ukey.filter_clauses.iter()
                             .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
@@ -3425,7 +3457,7 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            );
+            ).with_not_null_bitmaps(&snap.not_null_bitmaps);
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -4054,7 +4086,7 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            );
+            ).with_not_null_bitmaps(&snap.not_null_bitmaps);
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -4352,7 +4384,7 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            );
+            ).with_not_null_bitmaps(&snap.not_null_bitmaps);
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -5765,9 +5797,7 @@ impl ConcurrentEngine {
         };
 
         // Phase 3: scatter disk results into the output and populate
-        // the doc cache. Only the explicitly requested IDs are cached —
-        // see the doc comment above for why we don't pre-populate the
-        // whole shard's 512 docs.
+        // the doc cache with requested IDs.
         for (disk_idx, &result_idx) in miss_indices.iter().enumerate() {
             if let Some(doc) = disk_results[disk_idx].take() {
                 if let Some(ref cache) = self.doc_cache {
@@ -5776,6 +5806,41 @@ impl ConcurrentEngine {
                 results[result_idx] = Some(doc);
             }
         }
+
+        // Phase 3b: shard pre-populate. When enabled, read each unique
+        // shard again (OS page cache hit, no disk I/O) and cache ALL
+        // docs from the shard — not just the requested ones. This means
+        // subsequent queries hitting nearby IDs in the same shard get
+        // free cache hits. At 512 docs/shard × ~4.7KB/doc = ~2.4MB per
+        // shard. With 10GB cache headroom this is safe; watch eviction
+        // velocity if memory is tight.
+        //
+        // The shard files were just decoded by get_many, so the OS page
+        // cache has them hot. The cost is CPU for decode + cache insert,
+        // not disk I/O.
+        if self.config.doc_cache_prepopulate_shard {
+            if let Some(ref cache) = self.doc_cache {
+                // Collect unique shard keys from miss IDs
+                let mut shard_keys: Vec<u32> = miss_ids.iter()
+                    .map(|&id| crate::shard_store_doc::SlotHexShard::slot_to_shard(id))
+                    .collect();
+                shard_keys.sort_unstable();
+                shard_keys.dedup();
+                let guard = self.docstore.read();
+                for shard_key in shard_keys {
+                    if let Ok(shard_docs) = guard.get_shard(shard_key) {
+                        for (slot_id, doc) in shard_docs {
+                            // Only insert if not already cached (don't
+                            // overwrite fresher entries from write-through)
+                            if cache.get(slot_id).is_none() {
+                                cache.insert(slot_id, doc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let disk_fetch_nanos = disk_start.elapsed().as_nanos() as u64;
 
         Ok((results, stats, unique_shards, cache_probe_nanos, disk_fetch_nanos))
@@ -6494,6 +6559,7 @@ impl ConcurrentEngine {
             slots,
             filters: new_filters,
             sorts: new_sorts,
+            not_null_bitmaps: HashMap::new(),
         };
         // Phase 3: Route through flush thread — replaces both staging and
         // published snapshot atomically. Flush thread drains any pending
