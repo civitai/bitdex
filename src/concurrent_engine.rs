@@ -3941,8 +3941,16 @@ impl ConcurrentEngine {
                 }
             }
             FilterClause::BucketBitmap { .. } => {}
-            // IsNull/IsNotNull: no specific value to eager-load; skip.
-            FilterClause::IsNull(_) | FilterClause::IsNotNull(_) => {}
+            // IsNull/IsNotNull: load the null sentinel bitmap for the field.
+            // Without this, per_value_lazy fields like postId never have their
+            // NULL_BITMAP_KEY loaded from disk, causing IsNotNull to return
+            // all alive docs (correctness bug) and the precomputed not-null
+            // bitmap to be empty (performance bug — 13ms alive.clone()).
+            FilterClause::IsNull(f) | FilterClause::IsNotNull(f) => {
+                if lazy_fields.contains(f) {
+                    out.entry(f.clone()).or_default().push(crate::filter::NULL_BITMAP_KEY);
+                }
+            }
         }
     }
     /// Execute a parsed BitdexQuery.
