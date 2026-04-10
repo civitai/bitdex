@@ -183,15 +183,39 @@ impl InnerEngine {
     /// Compute `alive - null` for every field that has a NULL_BITMAP_KEY entry.
     /// Returns a map from field name to precomputed not-null bitmap.
     /// Called by the flush thread before snapshot publish.
-    fn compute_not_null_bitmaps(&self) -> HashMap<Arc<str>, Arc<RoaringBitmap>> {
+    ///
+    /// If `filter_store` is provided, falls back to reading the null bitmap
+    /// from disk for per_value_lazy fields where the null bitmap isn't in
+    /// the in-memory FilterField (it gets loaded per-query but evicted
+    /// between flush cycles).
+    fn compute_not_null_bitmaps(
+        &self,
+        filter_store: Option<&crate::shard_store_bitmap::FilterBitmapStore>,
+    ) -> HashMap<Arc<str>, Arc<RoaringBitmap>> {
         let alive = self.slots.alive_bitmap();
         let mut result = HashMap::new();
         for (name, field) in self.filters.fields() {
+            // Try in-memory first
             if let Some(null_vb) = field.get_versioned(crate::filter::NULL_BITMAP_KEY) {
                 let null_bm = null_vb.fused();
                 if !null_bm.is_empty() {
                     let not_null = alive - &null_bm;
                     result.insert(Arc::from(name.as_str()), Arc::new(not_null));
+                    continue;
+                }
+            }
+            // Fallback: read null bitmap from disk (per_value_lazy fields).
+            // NULL_BITMAP_KEY = u64::MAX → bucket 255.
+            if let Some(store) = filter_store {
+                let bucket = ((crate::filter::NULL_BITMAP_KEY >> 8) & 0xFF) as u8;
+                if let Ok(entries) = store.read_filter_bucket(name, bucket) {
+                    for (value, bm) in entries {
+                        if value == crate::filter::NULL_BITMAP_KEY && !bm.is_empty() {
+                            let not_null = alive - &bm;
+                            result.insert(Arc::from(name.as_str()), Arc::new(not_null));
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1675,10 +1699,11 @@ impl ConcurrentEngine {
                             // not-null bitmap computed. Staging's computation handles
                             // fields that were loaded via bulk/ops path.
                             let published = inner.load();
-                            let mut not_null = published.compute_not_null_bitmaps();
+                            let fs = flush_filter_store.as_ref().map(|s| s.as_ref());
+                            let mut not_null = published.compute_not_null_bitmaps(fs);
                             // Overlay with staging's own (which has fresher alive bitmap
                             // and any null bitmaps from ops mutations)
-                            for (name, bm) in staging.compute_not_null_bitmaps() {
+                            for (name, bm) in staging.compute_not_null_bitmaps(fs) {
                                 not_null.insert(name, bm);
                             }
                             staging.not_null_bitmaps = not_null;
