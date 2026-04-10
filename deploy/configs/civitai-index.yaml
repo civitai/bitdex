@@ -39,6 +39,9 @@ config:
 
   max_page_size: 200
 
+  doc_cache:
+    max_bytes: 10737418240  # 10 GB (was default 3 GB — cache thrashing at 675K entries / 110M docs)
+
   deferred_alive:
     source_field: publishedAt
 
