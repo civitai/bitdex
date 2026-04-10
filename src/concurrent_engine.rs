@@ -2794,7 +2794,7 @@ impl ConcurrentEngine {
                             &snap.filters,
                             &snap.sorts,
                             pf_config.max_page_size,
-                        );
+                        ).with_not_null_bitmaps(&snap.not_null_bitmaps);
                         // Convert canonical clauses back to FilterClauses
                         let filter_clauses: Vec<FilterClause> = ukey.filter_clauses.iter()
                             .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
@@ -3457,7 +3457,7 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            );
+            ).with_not_null_bitmaps(&snap.not_null_bitmaps);
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -4086,7 +4086,7 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            );
+            ).with_not_null_bitmaps(&snap.not_null_bitmaps);
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }
@@ -4384,7 +4384,7 @@ impl ConcurrentEngine {
                 &snap.filters,
                 &snap.sorts,
                 self.config.max_page_size,
-            );
+            ).with_not_null_bitmaps(&snap.not_null_bitmaps);
             if let Some(ref maps) = self.string_maps {
                 base = base.with_string_maps(maps);
             }

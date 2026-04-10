@@ -1,5 +1,6 @@
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use roaring::RoaringBitmap;
+use std::sync::Arc;
 use crate::dictionary::FieldDictionary;
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
@@ -39,6 +40,9 @@ pub struct QueryExecutor<'a> {
     /// Live dictionaries for LowCardinalityString fields — used as fallback
     /// when string_maps snapshot doesn't have a recently-added value.
     dictionaries: Option<&'a HashMap<String, FieldDictionary>>,
+    /// Precomputed not-null bitmaps from the snapshot, keyed by field name.
+    /// When present, IsNotNull skips the expensive alive.clone() - null computation.
+    not_null_bitmaps: Option<&'a HashMap<Arc<str>, Arc<RoaringBitmap>>>,
 }
 impl<'a> QueryExecutor<'a> {
     pub fn new(
@@ -57,6 +61,7 @@ impl<'a> QueryExecutor<'a> {
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: None,
+            not_null_bitmaps: None,
         }
     }
     /// Attach string maps for MappedString field reverse lookup.
@@ -74,6 +79,13 @@ impl<'a> QueryExecutor<'a> {
     /// Used as fallback when the string_maps snapshot doesn't have a recently-added value.
     pub fn with_dictionaries(mut self, dicts: &'a HashMap<String, FieldDictionary>) -> Self {
         self.dictionaries = Some(dicts);
+        self
+    }
+    /// Attach precomputed not-null bitmaps from the snapshot.
+    /// When set, IsNotNull evaluations use the cached bitmap instead of
+    /// computing `alive.clone() - null` per query (10-17ms at 110M scale).
+    pub fn with_not_null_bitmaps(mut self, bitmaps: &'a HashMap<Arc<str>, Arc<RoaringBitmap>>) -> Self {
+        self.not_null_bitmaps = Some(bitmaps);
         self
     }
     /// Attach a time bucket manager for in-executor bucket snapping (C3).
@@ -676,8 +688,16 @@ impl<'a> QueryExecutor<'a> {
                     .map(|vb| vb.fused())
                     .unwrap_or_default())
             }
-            // IsNotNull: alive minus the null bitmap.
+            // IsNotNull: use precomputed not-null bitmap if available,
+            // otherwise fall back to alive - null (10-17ms at 110M).
             FilterClause::IsNotNull(field) => {
+                // Fast path: precomputed by flush thread
+                if let Some(ref cache) = self.not_null_bitmaps {
+                    if let Some(bm) = cache.get(field.as_str()) {
+                        return Ok((**bm).clone());
+                    }
+                }
+                // Fallback: compute inline (before first flush publishes)
                 let filter_field = self.filters.get_field(field)
                     .ok_or_else(|| BitdexError::FieldNotFound(field.to_string()))?;
                 let null_bitmap = filter_field
