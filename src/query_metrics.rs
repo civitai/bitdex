@@ -33,6 +33,8 @@ pub struct QueryTrace {
     /// Time (µs) the query thread spent blocked waiting for unified_cache
     /// Mutex, contended by the flush thread's Phase A/C lock-held work.
     pub cache_lock_wait_us: u64,
+    /// Time (µs) spent holding the Mutex doing cache lookup work.
+    pub cache_hold_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -72,6 +74,7 @@ pub struct QueryTraceCollector {
     pub sort_us: u64,
     pub cache_hit: bool,
     pub cache_lock_wait_us: u64,
+    pub cache_hold_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -86,6 +89,7 @@ impl QueryTraceCollector {
             sort_us: 0,
             cache_hit: false,
             cache_lock_wait_us: 0,
+            cache_hold_us: 0,
             clauses: Vec::new(),
             sort: None,
         }
@@ -115,6 +119,7 @@ impl QueryTraceCollector {
             docs_us: 0,
             docs_count: 0,
             cache_lock_wait_us: self.cache_lock_wait_us,
+            cache_hold_us: self.cache_hold_us,
             clauses: self.clauses,
             sort: self.sort,
         }

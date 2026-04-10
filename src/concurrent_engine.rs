@@ -4401,9 +4401,10 @@ impl ConcurrentEngine {
                     // thread to release the unified_cache Mutex (Phase A/C).
                     let lock_start = std::time::Instant::now();
                     let mut uc = self.unified_cache.lock();
+                    let lock_acquired = std::time::Instant::now();
                     collector.cache_lock_wait_us += lock_start.elapsed().as_micros() as u64;
                     let pending = self.pending_bucket_diffs.load();
-                    uc.lookup(&ukey).map(|entry| {
+                    let cache_lookup_result = uc.lookup(&ukey).map(|entry| {
                         // Apply pending bucket diffs lazily before reading
                         if pending.current_cutoff() > 0
                             && entry.uses_bucket()
@@ -4424,7 +4425,12 @@ impl ConcurrentEngine {
                         let direction = entry.direction();
                         let sorted_keys = entry.sorted_keys().map(Arc::clone);
                         (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
-                    })
+                    });
+                    // Record hold time before MutexGuard (uc) drops.
+                    // Must capture before the block closes.
+                    collector.cache_hold_us += lock_acquired.elapsed().as_micros() as u64;
+                    drop(uc);
+                    cache_lookup_result
                 };
                 if let Some((unified_bm, has_more, min_val, capacity, cached_total, cached_radix, _cached_direction, cached_sorted_keys)) = cache_data {
                     let needs_expansion = if let Some(cursor) = query.cursor.as_ref() {
