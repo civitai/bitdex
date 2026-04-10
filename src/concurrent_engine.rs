@@ -4397,7 +4397,11 @@ impl ConcurrentEngine {
                     direction: sort_clause.direction,
                 };
                 let cache_data = {
+                    // Measure lock-wait: time blocked waiting for the flush
+                    // thread to release the unified_cache Mutex (Phase A/C).
+                    let lock_start = std::time::Instant::now();
                     let mut uc = self.unified_cache.lock();
+                    collector.cache_lock_wait_us += lock_start.elapsed().as_micros() as u64;
                     let pending = self.pending_bucket_diffs.load();
                     uc.lookup(&ukey).map(|entry| {
                         // Apply pending bucket diffs lazily before reading
