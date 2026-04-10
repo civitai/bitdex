@@ -2520,6 +2520,90 @@ impl ConcurrentEngine {
                             }
                         }
 
+                        // Cross-generation compaction: when generation count exceeds
+                        // threshold, compact all stores down to a single generation.
+                        // This prevents the "15 stale gens" problem where each shard
+                        // read must open N files (one per gen), causing disk_fetch
+                        // P95 to scale with gen count.
+                        //
+                        // Threshold default: 3 (current gen + 2 old = reasonable).
+                        // Only runs when the normal per-shard compaction is also
+                        // running (needs_write was true), so it piggybacks on the
+                        // existing merge cycle timing.
+                        {
+                            let max_gen = [
+                                as_.current_generation(),
+                                fs_.current_generation(),
+                                ss_.current_generation(),
+                                merge_doc_shard_store.current_generation(),
+                            ].into_iter().max().unwrap_or(0);
+                            let gen_threshold = merge_config.compact_gen_threshold.unwrap_or(3);
+                            if max_gen >= gen_threshold {
+                                eprintln!(
+                                    "merge: cross-gen compaction triggered (max_gen={max_gen}, threshold={gen_threshold})"
+                                );
+                                let t_crossgen = std::time::Instant::now();
+
+                                // Pin all stores — freezes current gen, new writes go to N+1
+                                let frozen_gen = as_.pin_generation().unwrap_or(max_gen);
+                                let _ = fs_.pin_generation();
+                                let _ = ss_.pin_generation();
+                                let _ = merge_doc_shard_store.pin_generation();
+
+                                // Compact alive (single shard)
+                                if let Err(e) = as_.compact_shard_bounded(
+                                    &AliveShardKey, frozen_gen, frozen_gen,
+                                ) {
+                                    eprintln!("merge cross-gen: alive compact failed: {e}");
+                                }
+
+                                // Compact filter shards
+                                if let Ok(keys) = fs_.list_all_shards() {
+                                    for key in &keys {
+                                        if let Err(e) = fs_.compact_shard_bounded(key, frozen_gen, frozen_gen) {
+                                            eprintln!("merge cross-gen: filter compact {}: {e}", key.field);
+                                        }
+                                    }
+                                }
+
+                                // Compact sort shards
+                                if let Ok(keys) = ss_.list_all_shards() {
+                                    for key in &keys {
+                                        if let Err(e) = ss_.compact_shard_bounded(key, frozen_gen, frozen_gen) {
+                                            eprintln!("merge cross-gen: sort compact {}/{}: {e}", key.field, key.bit_position);
+                                        }
+                                    }
+                                }
+
+                                // Compact doc shards
+                                let slot_counter = merge_inner.load().slots.slot_counter();
+                                if slot_counter > 0 {
+                                    let max_shard = (slot_counter - 1) >> crate::shard_store_doc::SHARD_SHIFT_PUB;
+                                    for shard_id in 0..=max_shard {
+                                        if let Err(e) = merge_doc_shard_store.compact_shard_bounded(
+                                            &shard_id, frozen_gen, frozen_gen,
+                                        ) {
+                                            eprintln!("merge cross-gen: doc shard {shard_id}: {e}");
+                                        }
+                                    }
+                                }
+
+                                // Grace period then delete old generations
+                                std::thread::sleep(Duration::from_secs(2));
+                                for gen in 0..frozen_gen {
+                                    let _ = as_.delete_generation(gen);
+                                    let _ = fs_.delete_generation(gen);
+                                    let _ = ss_.delete_generation(gen);
+                                    let _ = merge_doc_shard_store.delete_generation(gen);
+                                }
+
+                                eprintln!(
+                                    "merge: cross-gen compaction done in {:.1}s (frozen_gen={frozen_gen})",
+                                    t_crossgen.elapsed().as_secs_f64()
+                                );
+                            }
+                        }
+
                         // Persist slot counter + deferred alive (critical metadata)
                         {
                             let snap = merge_inner.load();

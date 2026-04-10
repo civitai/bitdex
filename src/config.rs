@@ -50,6 +50,12 @@ pub struct Config {
     /// compaction entirely (no worker thread, no staleness tracking on reads).
     #[serde(default = "default_compact_threshold_pct")]
     pub compact_threshold_pct: u64,
+    /// Generation count threshold for automatic cross-gen compaction in the
+    /// merge thread. When the max generation across all stores exceeds this,
+    /// the merge thread compacts everything down to a single generation.
+    /// Default 3. Set to 0 to disable automatic cross-gen compaction.
+    #[serde(default)]
+    pub compact_gen_threshold: Option<u64>,
     /// Eviction sweep interval: check for idle values every N flush cycles.
     /// Default 1000 (~0.1s at 100μs flush). Lower values make eviction more
     /// responsive (useful for testing).
@@ -179,6 +185,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             eviction_sweep_interval: default_eviction_sweep_interval(),
             compact_threshold_pct: default_compact_threshold_pct(),
+            compact_gen_threshold: None,
             doc_cache: DocCacheConfigEntry::default(),
             doc_cache_prepopulate_shard: false,
             memory_scanner: MemoryScannerConfig::default(),
