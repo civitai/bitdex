@@ -246,6 +246,13 @@ pub struct ConcurrentEngine {
     flush_apply_nanos: Arc<AtomicU64>,
     /// Flush phase timing: last cache maintenance duration in nanoseconds.
     flush_cache_nanos: Arc<AtomicU64>,
+    /// Flush phase timing: last Phase A duration (collect work, lock-held).
+    flush_phase_a_nanos: Arc<AtomicU64>,
+    /// Flush phase timing: last Phase C duration (apply results, lock-held).
+    flush_phase_c_nanos: Arc<AtomicU64>,
+    /// Cumulative count of cache-maintenance cycles. Used with the phase
+    /// duration gauges to compute cycles/sec and total wall-time lock hold.
+    flush_cache_cycles_total: Arc<AtomicU64>,
     /// Flush phase timing: last staging.clone() + ArcSwap publish duration in nanoseconds.
     flush_publish_nanos: Arc<AtomicU64>,
     /// Flush phase timing: last ops-log append duration in nanoseconds (after publish).
@@ -961,6 +968,17 @@ impl ConcurrentEngine {
         let flush_last_duration_nanos = Arc::new(AtomicU64::new(0));
         let flush_apply_nanos = Arc::new(AtomicU64::new(0));
         let flush_cache_nanos = Arc::new(AtomicU64::new(0));
+        // Phase A + Phase C of cache maintenance hold the unified_cache
+        // Mutex; Phase B is lock-free. flush_cache_nanos covers all three.
+        // Splitting them out lets us see the actual lock-hold time directly
+        // instead of inferring it from `flush_cache_nanos - max_maintenance_ms`.
+        let flush_phase_a_nanos = Arc::new(AtomicU64::new(0));
+        let flush_phase_c_nanos = Arc::new(AtomicU64::new(0));
+        // Cumulative count of cache-maintenance cycles. Combined with the
+        // duration gauges this gives us cycles/sec, which is the missing
+        // factor in the lock-saturation calculation:
+        //   lock_held_per_sec = (phase_a + phase_c) * cycles_per_sec
+        let flush_cache_cycles_total = Arc::new(AtomicU64::new(0));
         let flush_publish_nanos = Arc::new(AtomicU64::new(0));
         let flush_timebucket_nanos = Arc::new(AtomicU64::new(0));
         let flush_compact_nanos = Arc::new(AtomicU64::new(0));
@@ -1019,6 +1037,9 @@ impl ConcurrentEngine {
                 flush_last_duration_nanos,
                 flush_apply_nanos,
                 flush_cache_nanos,
+                flush_phase_a_nanos,
+                flush_phase_c_nanos,
+                flush_cache_cycles_total,
                 flush_publish_nanos,
                 flush_timebucket_nanos,
                 flush_compact_nanos,
@@ -1071,6 +1092,9 @@ impl ConcurrentEngine {
             let flush_last_dur_nanos = Arc::clone(&flush_last_duration_nanos);
             let flush_apply_ns = Arc::clone(&flush_apply_nanos);
             let flush_cache_ns = Arc::clone(&flush_cache_nanos);
+            let flush_phase_a_ns = Arc::clone(&flush_phase_a_nanos);
+            let flush_phase_c_ns = Arc::clone(&flush_phase_c_nanos);
+            let flush_cache_cycles = Arc::clone(&flush_cache_cycles_total);
             let flush_publish_ns = Arc::clone(&flush_publish_nanos);
             let flush_timebucket_ns = Arc::clone(&flush_timebucket_nanos);
             let flush_compact_ns = Arc::clone(&flush_compact_nanos);
@@ -1544,6 +1568,13 @@ impl ConcurrentEngine {
                             }
                             let phase_c_ns = t_phase_c.elapsed().as_nanos() as u64;
                             flush_cache_ns.store(t_cache.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            // Phase A + C are the lock-held phases. Their gauges
+                            // expose the actual blocking cost queries face on the
+                            // unified_cache mutex; the cycles counter lets the
+                            // scrape compute lock_held_per_sec without inference.
+                            flush_phase_a_ns.store(phase_a_ns, Ordering::Relaxed);
+                            flush_phase_c_ns.store(phase_c_ns, Ordering::Relaxed);
+                            flush_cache_cycles.fetch_add(1, Ordering::Relaxed);
                             // [cache-trace]: warn when any locked phase exceeds ~10ms.
                             // Phase B is lock-free so its cost doesn't block queries, but
                             // Phase A + Phase C are held under the UnifiedCache Mutex and
@@ -2886,6 +2917,9 @@ impl ConcurrentEngine {
             flush_last_duration_nanos,
             flush_apply_nanos,
             flush_cache_nanos,
+            flush_phase_a_nanos,
+            flush_phase_c_nanos,
+            flush_cache_cycles_total,
             flush_publish_nanos,
             flush_timebucket_nanos,
             flush_compact_nanos,
@@ -5408,6 +5442,32 @@ impl ConcurrentEngine {
             self.flush_compact_nanos.load(Ordering::Relaxed),
             self.flush_opslog_nanos.load(Ordering::Relaxed),
             self.flush_sort_promote_nanos.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Cache-maintenance phase split:
+    /// `(phase_a_nanos, phase_c_nanos, total_cycles)`.
+    ///
+    /// `phase_a_nanos` and `phase_c_nanos` are the most-recent-cycle
+    /// durations of the two LOCK-HELD halves of the cache maintenance
+    /// loop. Phase B is lock-free and bounded by `max_maintenance_ms`,
+    /// so Phase A + Phase C is the actual cost queries pay waiting on
+    /// the unified_cache mutex.
+    ///
+    /// `total_cycles` is monotonically incrementing — paired with
+    /// scrape-time deltas it gives cycles/sec, which combined with the
+    /// per-cycle phase durations yields total wall-time lock hold:
+    ///
+    ///     lock_held_per_sec = (phase_a + phase_c) * cycles_per_sec
+    ///
+    /// At ~42% lock saturation, this number is the structural cost of
+    /// the cache maintenance design and is the target of the upcoming
+    /// dirty-set Phase A redesign.
+    pub fn flush_cache_phase_stats(&self) -> (u64, u64, u64) {
+        (
+            self.flush_phase_a_nanos.load(Ordering::Relaxed),
+            self.flush_phase_c_nanos.load(Ordering::Relaxed),
+            self.flush_cache_cycles_total.load(Ordering::Relaxed),
         )
     }
     /// Iter 6 — DocStoreV3 put_batch fast/slow path counters.
