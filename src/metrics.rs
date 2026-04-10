@@ -151,6 +151,13 @@ pub struct Metrics {
     pub query_doc_disk_fetch_seconds: HistogramVec,
     pub query_doc_format_seconds: HistogramVec,
     pub query_response_build_seconds: HistogramVec,
+    // -- Apr 10 2026 lock-wait instrumentation (Justin's flush-blocks-reads hypothesis) --
+    // Measures how long query threads BLOCK waiting for locks held by the
+    // flush thread. Zero under no contention; spikes when flush thread
+    // holds locks during Phase A/C (unified_cache Mutex) or put_batch
+    // (docstore RwLock write).
+    pub query_cache_lock_wait_seconds: HistogramVec,
+    pub query_docstore_lock_wait_seconds: HistogramVec,
     pub save_snapshot_seconds: HistogramVec,
     pub flush_queue_depth: IntGauge,
 
@@ -840,6 +847,31 @@ impl Metrics {
         )
         .unwrap();
 
+        // Lock-wait histograms: measure time query threads spend BLOCKED
+        // waiting for locks held by the flush thread. Fine-grained buckets
+        // in the 10µs–500ms range where contention shows up.
+        let lock_wait_buckets = vec![
+            0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5,
+        ];
+        let query_cache_lock_wait_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_cache_lock_wait_seconds",
+                "Time query thread blocks waiting for unified_cache Mutex (contended by flush Phase A/C)",
+            )
+            .buckets(lock_wait_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let query_docstore_lock_wait_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_docstore_lock_wait_seconds",
+                "Time query thread blocks waiting for docstore RwLock read (contended by flush put_batch write)",
+            )
+            .buckets(lock_wait_buckets),
+            &["index"],
+        )
+        .unwrap();
+
         let save_snapshot_buckets = vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0];
         let save_snapshot_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -1107,6 +1139,8 @@ impl Metrics {
         registry.register(Box::new(query_doc_disk_fetch_seconds.clone())).unwrap();
         registry.register(Box::new(query_doc_format_seconds.clone())).unwrap();
         registry.register(Box::new(query_response_build_seconds.clone())).unwrap();
+        registry.register(Box::new(query_cache_lock_wait_seconds.clone())).unwrap();
+        registry.register(Box::new(query_docstore_lock_wait_seconds.clone())).unwrap();
         registry.register(Box::new(save_snapshot_seconds.clone())).unwrap();
         registry.register(Box::new(flush_queue_depth.clone())).unwrap();
         registry.register(Box::new(doc_cache_hit_total.clone())).unwrap();
@@ -1229,6 +1263,8 @@ impl Metrics {
             query_doc_disk_fetch_seconds,
             query_doc_format_seconds,
             query_response_build_seconds,
+            query_cache_lock_wait_seconds,
+            query_docstore_lock_wait_seconds,
             save_snapshot_seconds,
             flush_queue_depth,
             doc_cache_hit_total,

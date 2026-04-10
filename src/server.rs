@@ -2812,6 +2812,9 @@ async fn handle_query(
             m.query_docs_seconds
                 .with_label_values(&[&name])
                 .observe(docs_us as f64 / 1_000_000.0);
+            m.query_cache_lock_wait_seconds
+                .with_label_values(&[&name])
+                .observe(trace.cache_lock_wait_us as f64 / 1_000_000.0);
 
             let cache_tag = if trace.cache_hit { " cache" } else { "" };
             let docs_tag = if docs_count > 0 { format!("  docs={}μs({})", docs_us, docs_count) } else { String::new() };
