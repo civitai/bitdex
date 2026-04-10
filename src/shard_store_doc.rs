@@ -1131,24 +1131,71 @@ impl DocStoreV3 {
         }
         let unique_shards = by_shard.len();
 
+        // For ≤4 unique shards, serial reads are cheaper than rayon
+        // dispatch overhead. At >4 shards, parallel reads cut the
+        // disk path from N×500µs to N/cores×500µs. The threshold of 4
+        // was chosen conservatively: rayon's per-task overhead is ~1-5µs,
+        // and a single shard read is ~500µs on NVMe. At 4 shards the
+        // serial cost is ~2ms vs parallel ~500µs+overhead — marginal.
+        // At 30 shards (typical prod cache miss) the win is 7x.
+        if unique_shards <= 4 {
+            let mut results: Vec<Option<StoredDoc>> = vec![None; ids.len()];
+            let mut agg_stats = ShardReadStats::default();
+
+            for (shard_key, slot_positions) in by_shard {
+                let (snap_opt, stats) = self.store.read_with_stats(&shard_key)?;
+                agg_stats.file_read_nanos += stats.file_read_nanos;
+                agg_stats.decode_nanos += stats.decode_nanos;
+
+                let snap = match snap_opt {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                for (result_idx, id) in slot_positions {
+                    if let Some(fields) = snap.docs.get(&id) {
+                        results[result_idx] = Some(self.fields_to_stored_doc(fields));
+                    }
+                }
+            }
+
+            return Ok((results, agg_stats, unique_shards));
+        }
+
+        // Parallel path: read each shard on a rayon thread, then scatter
+        // results back into caller order. Each rayon task returns its
+        // (result_index, StoredDoc) pairs + per-shard stats. The scatter
+        // is single-threaded (cheap — just Vec assignments).
+        use rayon::prelude::*;
+
+        // Collect into a Vec for rayon — AHashMap doesn't impl
+        // IntoParallelIterator directly.
+        let shards: Vec<(u32, Vec<(usize, u32)>)> = by_shard.into_iter().collect();
+        let shard_results: Vec<io::Result<(Vec<(usize, StoredDoc)>, ShardReadStats)>> =
+            shards
+                .into_par_iter()
+                .map(|(shard_key, slot_positions)| {
+                    let (snap_opt, stats) = self.store.read_with_stats(&shard_key)?;
+                    let mut docs = Vec::new();
+                    if let Some(snap) = snap_opt {
+                        for (result_idx, id) in slot_positions {
+                            if let Some(fields) = snap.docs.get(&id) {
+                                docs.push((result_idx, self.fields_to_stored_doc(fields)));
+                            }
+                        }
+                    }
+                    Ok((docs, stats))
+                })
+                .collect();
+
         let mut results: Vec<Option<StoredDoc>> = vec![None; ids.len()];
         let mut agg_stats = ShardReadStats::default();
-
-        for (shard_key, slot_positions) in by_shard {
-            let (snap_opt, stats) = self.store.read_with_stats(&shard_key)?;
+        for result in shard_results {
+            let (docs, stats) = result?;
             agg_stats.file_read_nanos += stats.file_read_nanos;
             agg_stats.decode_nanos += stats.decode_nanos;
-
-            let snap = match snap_opt {
-                Some(s) => s,
-                None => continue, // all slots in this shard stay None
-            };
-
-            for (result_idx, id) in slot_positions {
-                if let Some(fields) = snap.docs.get(&id) {
-                    results[result_idx] = Some(self.fields_to_stored_doc(fields));
-                }
-                // id not in the snapshot → leave None at results[result_idx]
+            for (idx, doc) in docs {
+                results[idx] = Some(doc);
             }
         }
 
