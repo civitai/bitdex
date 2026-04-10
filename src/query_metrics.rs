@@ -35,6 +35,8 @@ pub struct QueryTrace {
     pub cache_lock_wait_us: u64,
     /// Time (µs) spent holding the Mutex doing cache lookup work.
     pub cache_hold_us: u64,
+    /// Time from function entry to just before cache lookup.
+    pub pre_cache_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -67,7 +69,7 @@ pub struct SortTrace {
 // ---------------------------------------------------------------------------
 
 pub struct QueryTraceCollector {
-    start: Instant,
+    pub start: Instant,
     pub plan_us: u64,
     pub lazy_load_us: u64,
     pub filter_us: u64,
@@ -75,6 +77,7 @@ pub struct QueryTraceCollector {
     pub cache_hit: bool,
     pub cache_lock_wait_us: u64,
     pub cache_hold_us: u64,
+    pub pre_cache_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -90,6 +93,7 @@ impl QueryTraceCollector {
             cache_hit: false,
             cache_lock_wait_us: 0,
             cache_hold_us: 0,
+            pre_cache_us: 0,
             clauses: Vec::new(),
             sort: None,
         }
@@ -120,6 +124,7 @@ impl QueryTraceCollector {
             docs_count: 0,
             cache_lock_wait_us: self.cache_lock_wait_us,
             cache_hold_us: self.cache_hold_us,
+            pre_cache_us: self.pre_cache_us,
             clauses: self.clauses,
             sort: self.sort,
         }

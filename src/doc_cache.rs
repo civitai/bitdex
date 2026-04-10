@@ -92,6 +92,10 @@ pub struct DocCache {
     /// Generation list: [0] = current (newest), [N] = oldest.
     generations: ArcSwap<Vec<Arc<Generation>>>,
     config: DocCacheConfig,
+    /// Runtime override for max_bytes. When non-zero, takes precedence
+    /// over `config.max_bytes`. Set via `set_max_bytes()` from the
+    /// PATCH /config handler. Default 0 = use config value.
+    max_bytes_override: AtomicU64,
     /// Cumulative cache hits.
     hits: AtomicU64,
     /// Cumulative cache misses.
@@ -107,6 +111,7 @@ impl DocCache {
         DocCache {
             generations: ArcSwap::from_pointee(vec![initial_gen]),
             config,
+            max_bytes_override: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
@@ -363,14 +368,15 @@ impl DocCache {
     /// Check if eviction is needed. Provided for API compatibility but
     /// the eviction thread handles this — callers should not evict inline.
     pub fn needs_eviction(&self) -> bool {
-        self.total_bytes() > self.config.max_bytes
+        self.total_bytes() > self.effective_max_bytes()
     }
 
     /// Legacy eviction method — triggers drop of oldest generations until under budget.
     /// Prefer using the dedicated eviction thread instead.
     pub fn evict(&self) -> u64 {
+        let max = self.effective_max_bytes();
         let mut total_evicted = 0u64;
-        while self.total_bytes() > self.config.max_bytes {
+        while self.total_bytes() > max {
             if self.generation_count() <= 1 {
                 break;
             }
@@ -385,9 +391,22 @@ impl DocCache {
         self.generations.store(Arc::new(vec![new_gen]));
     }
 
-    /// Get the max_bytes config value.
+    /// Effective max_bytes: runtime override if set, otherwise config default.
+    pub fn effective_max_bytes(&self) -> u64 {
+        let ovr = self.max_bytes_override.load(Ordering::Relaxed);
+        if ovr > 0 { ovr } else { self.config.max_bytes }
+    }
+
+    /// Get the max_bytes config value (ignores runtime override).
     pub fn max_bytes(&self) -> u64 {
         self.config.max_bytes
+    }
+
+    /// Set max_bytes at runtime. Takes effect immediately — the eviction
+    /// thread will stop evicting once total_bytes drops below the new limit.
+    /// Pass 0 to revert to the config default.
+    pub fn set_max_bytes(&self, new_max: u64) {
+        self.max_bytes_override.store(new_max, Ordering::Relaxed);
     }
 
     /// Get the generation interval in seconds.
@@ -424,7 +443,7 @@ pub fn eviction_thread(cache: Arc<DocCache>, shutdown: Arc<AtomicBool>) {
         }
 
         // Evict: drop oldest generations until under budget
-        while cache.total_bytes() > cache.config.max_bytes {
+        while cache.total_bytes() > cache.effective_max_bytes() {
             if cache.generation_count() <= 1 {
                 break;
             }
