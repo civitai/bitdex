@@ -1753,6 +1753,7 @@ impl UnifiedCache {
         (work, Vec::new())
     }
     /// Phase C: Apply computed maintenance results under brief lock.
+    /// Batched: one Arc::make_mut per entry instead of per-slot.
     pub fn apply_maintenance_results(&mut self, results: &[CacheMaintenanceResult]) {
         for result in results {
             let Some(entry) = self.entries.get_mut(&result.key) else {
@@ -1761,11 +1762,33 @@ impl UnifiedCache {
             if entry.needs_rebuild {
                 continue;
             }
-            for &(slot, sort_value) in &result.adds {
-                entry.add_slot(slot, sort_value);
+            if result.adds.is_empty() && result.removes.is_empty() {
+                continue;
             }
-            for &(slot, sort_value) in &result.removes {
-                entry.remove_slot(slot, sort_value);
+            // Single Arc::make_mut for the bitmap — one clone per entry
+            let bm = Arc::make_mut(&mut entry.bitmap);
+            for &(slot, _sort_value) in &result.adds {
+                bm.insert(slot);
+            }
+            for &(slot, _sort_value) in &result.removes {
+                bm.remove(slot);
+            }
+            entry.persist_dirty = true;
+            entry.sorted_keys = None;
+            // Bloat check (same as add_slot)
+            let bloat_threshold = entry.capacity * 2;
+            if bm.len() as usize > bloat_threshold {
+                entry.needs_rebuild = true;
+            }
+            // Single Arc::make_mut for radix — one clone per entry
+            if let Some(ref mut radix) = entry.radix {
+                let r = Arc::make_mut(radix);
+                for &(slot, sort_value) in &result.adds {
+                    r.insert(slot, sort_value);
+                }
+                for &(slot, sort_value) in &result.removes {
+                    r.remove(slot, sort_value);
+                }
             }
         }
     }
@@ -2015,18 +2038,9 @@ pub fn evaluate_filter_work(
     // 10M reconstruct_value calls (316ns each) into ~200 calls, saving
     // ~3 seconds of redundant CPU per flush cycle.
     let reconstructed = precompute_sort_values(work, sorts);
-    let mut results = Vec::with_capacity(work.len());
-    let mut timed_out = Vec::new();
-    for (i, item) in work.iter().enumerate() {
-        // Check deadline every 64 items
-        if let Some(deadline) = deadline {
-            if i > 0 && i % 64 == 0 && Instant::now() > deadline {
-                for remaining in &work[i..] {
-                    timed_out.push(remaining.key.clone());
-                }
-                break;
-            }
-        }
+
+    // Helper: evaluate a single filter work item
+    let evaluate_item = |item: &CacheMaintenanceItem| -> Option<CacheMaintenanceResult> {
         let mut adds = Vec::new();
         let mut removes = Vec::new();
         for &slot in &item.slots {
@@ -2047,12 +2061,41 @@ pub fn evaluate_filter_work(
                 removes.push((slot, sort_value));
             }
         }
-        if !adds.is_empty() || !removes.is_empty() {
-            results.push(CacheMaintenanceResult {
+        if adds.is_empty() && removes.is_empty() {
+            None
+        } else {
+            Some(CacheMaintenanceResult {
                 key: item.key.clone(),
                 adds,
                 removes,
-            });
+            })
+        }
+    };
+
+    // Parallel path: >64 items, rayon splits across cores
+    if work.len() > 64 {
+        use rayon::prelude::*;
+        let results: Vec<CacheMaintenanceResult> = work
+            .par_iter()
+            .filter_map(evaluate_item)
+            .collect();
+        return (results, Vec::new());
+    }
+
+    // Serial path for small work sets — preserves deadline
+    let mut results = Vec::with_capacity(work.len());
+    let mut timed_out = Vec::new();
+    for (i, item) in work.iter().enumerate() {
+        if let Some(deadline) = deadline {
+            if i > 0 && i % 64 == 0 && Instant::now() > deadline {
+                for remaining in &work[i..] {
+                    timed_out.push(remaining.key.clone());
+                }
+                break;
+            }
+        }
+        if let Some(result) = evaluate_item(item) {
+            results.push(result);
         }
     }
     (results, timed_out)
@@ -2087,6 +2130,62 @@ pub fn evaluate_sort_work(
     // cycle — skip it entirely without touching slots.
     let max_per_field = compute_max_per_field(&reconstructed);
     let min_per_field = compute_min_per_field(&reconstructed);
+    // Helper closure: evaluate a single work item (used by both paths)
+    let evaluate_item = |item: &CacheMaintenanceItem| -> Option<CacheMaintenanceResult> {
+        let field_name = item.key.sort_field.as_str();
+        let can_possibly_qualify = match item.direction {
+            SortDirection::Desc => {
+                max_per_field.get(field_name).copied().unwrap_or(0) > item.min_tracked_value
+            }
+            SortDirection::Asc => {
+                min_per_field.get(field_name).copied().unwrap_or(0) < item.min_tracked_value
+            }
+        };
+        if !can_possibly_qualify {
+            return None;
+        }
+        let mut adds = Vec::new();
+        for &slot in &item.slots {
+            let sort_value = reconstructed
+                .get(&(field_name, slot))
+                .copied()
+                .unwrap_or(0);
+            let qualifies = match item.direction {
+                SortDirection::Desc => sort_value > item.min_tracked_value,
+                SortDirection::Asc => sort_value < item.min_tracked_value,
+            };
+            if !qualifies {
+                continue;
+            }
+            if slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts) {
+                adds.push((slot, sort_value));
+            }
+        }
+        if adds.is_empty() {
+            None
+        } else {
+            Some(CacheMaintenanceResult {
+                key: item.key.clone(),
+                adds,
+                removes: Vec::new(),
+            })
+        }
+    };
+
+    // Parallel path: >64 work items, rayon splits across cores.
+    // Each item is independent (reads shared immutable precomputed maps).
+    // Phase B is lock-free so parallelism is safe. At 839 entries / 4
+    // cores, wall-clock drops from ~200ms to ~50ms.
+    if work.len() > 64 {
+        use rayon::prelude::*;
+        let results: Vec<CacheMaintenanceResult> = work
+            .par_iter()
+            .filter_map(evaluate_item)
+            .collect();
+        return (results, Vec::new());
+    }
+
+    // Serial path for small work sets (≤64 items) — preserves deadline
     let mut results = Vec::with_capacity(work.len());
     let mut timed_out = Vec::new();
     for (i, item) in work.iter().enumerate() {
@@ -2098,56 +2197,8 @@ pub fn evaluate_sort_work(
                 break;
             }
         }
-        // Fast reject: if no mutated value can possibly cross the bound in
-        // the entry's direction, skip the entry entirely. This is the main
-        // structural win: O(entries) integer compares instead of
-        // O(entries × slots × reconstruct_value).
-        //
-        // Missing-field handling: if the sort field isn't in the precompute
-        // map (SortIndex returned None), we fall back to 0 to stay
-        // consistent with the per-slot `unwrap_or(0)` in the main loop. This
-        // preserves the old code's semantics: Desc entries with missing
-        // fields never qualify (since 0 can't exceed u32 `min_tracked`),
-        // while Asc entries with a positive `min_tracked_value` still can.
-        let field_name = item.key.sort_field.as_str();
-        let can_possibly_qualify = match item.direction {
-            SortDirection::Desc => {
-                max_per_field.get(field_name).copied().unwrap_or(0) > item.min_tracked_value
-            }
-            SortDirection::Asc => {
-                min_per_field.get(field_name).copied().unwrap_or(0) < item.min_tracked_value
-            }
-        };
-        if !can_possibly_qualify {
-            continue;
-        }
-        let mut adds = Vec::new();
-        for &slot in &item.slots {
-            let sort_value = reconstructed
-                .get(&(field_name, slot))
-                .copied()
-                .unwrap_or(0);
-            // Check sort qualification first (cheap integer compare)
-            let qualifies = match item.direction {
-                SortDirection::Desc => sort_value > item.min_tracked_value,
-                SortDirection::Asc => sort_value < item.min_tracked_value,
-            };
-            if !qualifies {
-                continue;
-            }
-            // Sort qualifies — only now pay filter match cost. Preserves the
-            // full slot_matches_filter semantics (Eq, NotEq, In, Gt, Lt,
-            // bucket, compound) — no signature-based shortcut.
-            if slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts) {
-                adds.push((slot, sort_value));
-            }
-        }
-        if !adds.is_empty() {
-            results.push(CacheMaintenanceResult {
-                key: item.key.clone(),
-                adds,
-                removes: Vec::new(), // Sort maintenance never removes
-            });
+        if let Some(result) = evaluate_item(item) {
+            results.push(result);
         }
     }
     (results, timed_out)
