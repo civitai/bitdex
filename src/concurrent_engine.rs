@@ -4389,6 +4389,12 @@ impl ConcurrentEngine {
             );
         }
         // ── Fast path: unified cache hit without expansion ──
+        // Record pre-cache phase: everything from function entry through
+        // ensure_fields_loaded, ensure_cache_shard_loaded, snapshot,
+        // time_buckets.lock(), executor build, and snap_range_clauses.
+        // If this is 60ms, the ghost cost is in the pre-cache section.
+        collector.pre_cache_us = collector.start.elapsed().as_micros() as u64
+            - collector.lazy_load_us;  // subtract already-accounted lazy load
         if let Some(sort_clause) = query.sort.as_ref() {
             if let Some(clauses) = cache::canonicalize(effective_filters) {
                 let ukey = UnifiedKey {
