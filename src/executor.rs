@@ -457,6 +457,17 @@ impl<'a> QueryExecutor<'a> {
                 }
                 None
             }
+            // IsNotNull: AND with precomputed not-null bitmap by reference.
+            // Avoids the 13MB deep clone that evaluate_clause would do.
+            FilterClause::IsNotNull(field) => {
+                if let Some(ref cache) = self.not_null_bitmaps {
+                    if let Some(bm) = cache.get(field.as_str()) {
+                        *acc &= bm.as_ref();
+                        return Some(Ok(()));
+                    }
+                }
+                None // fall through to evaluate_clause (inline compute)
+            }
             _ => None, // Can't fast-path range clauses
         }
     }
