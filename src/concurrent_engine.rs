@@ -889,11 +889,27 @@ impl ConcurrentEngine {
             }
             Arc::new(ArcSwap::new(Arc::new(pending)))
         };
+        // Eagerly compute not-null bitmaps at boot. Reads null sentinel bitmaps
+        // from disk for per_value_lazy fields (like postId) that aren't in memory.
+        // One-time cost (~100ms for ~15MB of disk reads). Eliminates the 13ms
+        // alive.clone() - null on every IsNotNull query.
+        let boot_not_null = {
+            let mut engine = InnerEngine {
+                slots: slots.clone(),
+                filters: filters.clone(),
+                sorts: sorts.clone(),
+                not_null_bitmaps: HashMap::new(),
+            };
+            engine.not_null_bitmaps = engine.compute_not_null_bitmaps(
+                filter_store.as_ref().map(|s| s.as_ref()),
+            );
+            engine.not_null_bitmaps
+        };
         let inner_engine = InnerEngine {
             slots,
             filters,
             sorts,
-            not_null_bitmaps: HashMap::new(),
+            not_null_bitmaps: boot_not_null,
         };
         // Flush thread owns a staging clone; readers see published snapshots
         let mut staging = inner_engine.clone();
