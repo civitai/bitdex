@@ -212,7 +212,7 @@ pub struct ConcurrentEngine {
     meta_store: Option<Arc<crate::shard_store_meta::MetaStore>>,
     loading_mode: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
-    time_buckets: Option<Arc<parking_lot::Mutex<TimeBucketManager>>>,
+    time_buckets: Option<Arc<ArcSwap<TimeBucketManager>>>,
     /// Pending bucket diffs for lazy application on cache reads.
     /// Flush thread stores new snapshots; query threads load for diff application.
     pending_bucket_diffs: Arc<ArcSwap<crate::bucket_diff_log::PendingBucketDiffs>>,
@@ -724,7 +724,7 @@ impl ConcurrentEngine {
                     Err(e) => eprintln!("Warning: failed to load time buckets: {e}"),
                 }
             }
-            Arc::new(parking_lot::Mutex::new(tb))
+            Arc::new(ArcSwap::new(Arc::new(tb)))
         });
         // Initialize pending bucket diffs (load from append-only log on disk + compute boot diff)
         let pending_bucket_diffs = {
@@ -758,11 +758,11 @@ impl ConcurrentEngine {
                     .unwrap_or_default()
                     .as_secs();
                 if let Some(ref tb_arc) = time_buckets {
-                    let tb = tb_arc.lock();
+                    let tb = tb_arc.load();
                     let sort_field_name = tb.sort_field_name().to_string();
                     drop(tb);
                     if let Some(sort_field) = sorts.get_field(&sort_field_name) {
-                        let tb = tb_arc.lock();
+                        let tb = tb_arc.load();
                         for bucket_config in &tb_config.range_buckets {
                             let bucket_name = &bucket_config.name;
                             if let Some(bucket) = tb.get_bucket(bucket_name) {
@@ -829,7 +829,7 @@ impl ConcurrentEngine {
                         drop(tb);
                         // Also apply boot diffs to the bucket bitmaps themselves
                         if pending.current_cutoff() > 0 {
-                            let mut tb = tb_arc.lock();
+                            let mut tb = (*tb_arc.load_full()).clone();
                             for bucket_config in &tb_config.range_buckets {
                                 if let Some(bucket) = tb.get_bucket_mut(&bucket_config.name) {
                                     let new_cutoff = crate::bucket_diff_log::snap_cutoff(
@@ -843,6 +843,7 @@ impl ConcurrentEngine {
                                     }
                                 }
                             }
+                            tb_arc.store(Arc::new(tb));
                         }
                     }
                 }
@@ -1269,9 +1270,10 @@ impl ConcurrentEngine {
                                     // next periodic check (don't rebuild inline — iterating 100M+
                                     // slots while holding the lock would block queries).
                                     if let Some(ref tb_arc) = flush_time_buckets {
-                                        let mut tb = tb_arc.lock();
+                                        let mut tb = (*tb_arc.load_full()).clone();
                                         if tb.sort_field_name() == name {
                                             tb.force_refresh_due();
+                                            tb_arc.store(Arc::new(tb));
                                         }
                                     }
                                 }
@@ -1364,7 +1366,7 @@ impl ConcurrentEngine {
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs();
-                                    let mut tb = tb_arc.lock();
+                                    let mut tb = (*tb_arc.load_full()).clone();
                                     if !alive_inserts.is_empty() {
                                         let sort_field_name = tb.sort_field_name().to_string();
                                         if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
@@ -1377,6 +1379,7 @@ impl ConcurrentEngine {
                                     for &slot in alive_removes {
                                         tb.remove_slot(slot);
                                     }
+                                    tb_arc.store(Arc::new(tb));
                                 }
                             }
                             flush_timebucket_ns.store(t_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2325,7 +2328,7 @@ impl ConcurrentEngine {
                                 .as_secs();
                             // Brief lock: check which buckets need refresh and get their config
                             let refresh_info: Vec<(String, u64, u64, u64)> = {
-                                let tb = tb_arc.lock();
+                                let tb = tb_arc.load();
                                 let due = tb.refresh_due(now_secs);
                                 if due.is_empty() {
                                     Vec::new()
@@ -2343,9 +2346,7 @@ impl ConcurrentEngine {
                                 }
                             }; // lock released
                             if !refresh_info.is_empty() {
-                                let tb_lock = tb_arc.lock();
-                                let sort_field_name = tb_lock.sort_field_name().to_string();
-                                drop(tb_lock);
+                                let sort_field_name = tb_arc.load().sort_field_name().to_string();
                                 if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
                                     let start = std::time::Instant::now();
                                     for (bucket_name, duration_secs, refresh_interval, old_cutoff) in &refresh_info {
@@ -2356,16 +2357,17 @@ impl ConcurrentEngine {
                                         if new_cutoff <= *old_cutoff {
                                             // No new expired slots since last cutoff
                                             // Still mark as refreshed so needs_refresh returns false
-                                            let mut tb = tb_arc.lock();
+                                            let mut tb = (*tb_arc.load_full()).clone();
                                             if let Some(bucket) = tb.get_bucket_mut(bucket_name) {
                                                 bucket.subtract_expired(&RoaringBitmap::new(), new_cutoff);
                                             }
+                                            tb_arc.store(Arc::new(tb));
                                             continue;
                                         }
                                         // Find expired slots: those in the bucket bitmap with
                                         // sort value in [old_cutoff, new_cutoff)
                                         let bucket_bm = {
-                                            let tb = tb_arc.lock();
+                                            let tb = tb_arc.load();
                                             tb.get_bucket(bucket_name)
                                                 .map(|b| RoaringBitmap::clone(b.bitmap()))
                                                 .unwrap_or_default()
@@ -2380,12 +2382,13 @@ impl ConcurrentEngine {
                                             }
                                         }
                                         let expired_count = expired.len();
-                                        // Brief lock: subtract expired from bucket bitmap
+                                        // Clone-mutate-store: subtract expired from bucket bitmap
                                         {
-                                            let mut tb = tb_arc.lock();
+                                            let mut tb = (*tb_arc.load_full()).clone();
                                             if let Some(bucket) = tb.get_bucket_mut(bucket_name) {
                                                 bucket.subtract_expired(&expired, new_cutoff);
                                             }
+                                            tb_arc.store(Arc::new(tb));
                                         }
                                         // Store diff for lazy cache application (no cache Mutex!)
                                         let diff = crate::bucket_diff_log::BucketDiff {
@@ -2589,7 +2592,7 @@ impl ConcurrentEngine {
                         }
                         // Persist time bucket bitmaps + cutoffs (MetaStore)
                         if let Some(ref tb_arc) = merge_time_buckets {
-                            let tb = tb_arc.lock();
+                            let tb = tb_arc.load();
                             for (name, bitmap) in tb.all_buckets() {
                                 if !bitmap.is_empty() {
                                     if let Err(e) = ms_.write_time_bucket(name, bitmap) {
@@ -3828,7 +3831,7 @@ impl ConcurrentEngine {
         // Lazy-load any fields not yet loaded from disk
         self.ensure_fields_loaded(filters, sort.map(|s| s.field.as_str()))?;
         let snap = self.snapshot(); // lock-free
-        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
+        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.load_full());
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -4457,7 +4460,7 @@ impl ConcurrentEngine {
             self.ensure_cache_shard_loaded(&sort_clause.field, sort_clause.direction);
         }
         let snap = self.snapshot(); // lock-free
-        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
+        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.load_full());
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -4490,8 +4493,9 @@ impl ConcurrentEngine {
         // a single cache entry.
         let snapped_filters;
         let effective_filters = if let Some(ref tb) = tb_guard {
-            let mut managers = HashMap::new();
-            managers.insert(tb.field_name().to_string(), &**tb);
+            let tb_ref: &TimeBucketManager = &**tb;
+            let mut managers: HashMap<String, &TimeBucketManager> = HashMap::new();
+            managers.insert(tb_ref.field_name().to_string(), tb_ref);
             let ctx = crate::query::BucketSnapContext {
                 managers: &managers,
                 now_secs: now_unix,
@@ -4754,7 +4758,7 @@ impl ConcurrentEngine {
             self.ensure_cache_shard_loaded(&sort_clause.field, sort_clause.direction);
         }
         let snap = self.snapshot();
-        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.lock());
+        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.load_full());
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -4784,8 +4788,9 @@ impl ConcurrentEngine {
         // Snap range filters to bucket bitmaps BEFORE cache key
         let snapped_filters;
         let effective_filters = if let Some(ref tb) = tb_guard {
-            let mut managers = HashMap::new();
-            managers.insert(tb.field_name().to_string(), &**tb);
+            let tb_ref: &TimeBucketManager = &**tb;
+            let mut managers: HashMap<String, &TimeBucketManager> = HashMap::new();
+            managers.insert(tb_ref.field_name().to_string(), tb_ref);
             let ctx = crate::query::BucketSnapContext {
                 managers: &managers,
                 now_secs: now_unix,
@@ -6436,7 +6441,10 @@ impl ConcurrentEngine {
     /// manager exists or the bucket name was not found.
     pub fn set_time_bucket_refresh_interval(&self, bucket_name: &str, interval_secs: u64) -> bool {
         if let Some(ref tb_arc) = self.time_buckets {
-            tb_arc.lock().set_refresh_interval(bucket_name, interval_secs)
+            let mut tb = (*tb_arc.load_full()).clone();
+            let result = tb.set_refresh_interval(bucket_name, interval_secs);
+            tb_arc.store(Arc::new(tb));
+            result
         } else {
             false
         }
@@ -6449,10 +6457,7 @@ impl ConcurrentEngine {
             crate::error::BitdexError::Config("no time_buckets configured".into())
         })?;
         let snap = self.snapshot();
-        let sort_field_name = {
-            let tb = tb_arc.lock();
-            tb.sort_field_name().to_string()
-        };
+        let sort_field_name = tb_arc.load().sort_field_name().to_string();
         let sort_field = snap.sorts.get_field(&sort_field_name).ok_or_else(|| {
             crate::error::BitdexError::Config(format!(
                 "time bucket sort field '{}' not loaded", sort_field_name
@@ -6469,12 +6474,13 @@ impl ConcurrentEngine {
             let ts = sort_field.reconstruct_value(slot) as u64;
             slot_values.push((slot, ts));
         }
-        let mut tb = tb_arc.lock();
+        let mut tb = (*tb_arc.load_full()).clone();
         let bucket_names: Vec<String> = tb.bucket_names();
         for name in &bucket_names {
             tb.rebuild_bucket(name, slot_values.iter().copied(), now_secs);
         }
         let bucket_count = bucket_names.len();
+        tb_arc.store(Arc::new(tb));
         self.dirty_since_snapshot.store(true, std::sync::atomic::Ordering::Release);
         self.unified_cache.lock().clear();
         eprintln!(
@@ -6487,12 +6493,13 @@ impl ConcurrentEngine {
     /// Get per-bucket statistics (name, slot count, cutoff).
     pub fn time_bucket_stats(&self) -> serde_json::Value {
         if let Some(ref tb_arc) = self.time_buckets {
-            let tb = tb_arc.lock();
+            let tb = tb_arc.load();
             let mut buckets = serde_json::Map::new();
             for name in tb.bucket_names() {
                 if let Some(bucket) = tb.get_bucket(&name) {
+                    let slot_count: u64 = bucket.bitmap().len();
                     buckets.insert(name, serde_json::json!({
-                        "slots": bucket.bitmap().len(),
+                        "slots": slot_count,
                         "last_cutoff": bucket.last_cutoff(),
                     }));
                 }
