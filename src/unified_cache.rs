@@ -2072,17 +2072,13 @@ pub fn evaluate_filter_work(
         }
     };
 
-    // Parallel path: >64 items, rayon splits across cores
-    if work.len() > 64 {
-        use rayon::prelude::*;
-        let results: Vec<CacheMaintenanceResult> = work
-            .par_iter()
-            .filter_map(evaluate_item)
-            .collect();
-        return (results, Vec::new());
-    }
-
-    // Serial path for small work sets — preserves deadline
+    // Serial path — always use deadline-aware evaluation.
+    // The rayon parallel path was removed because it bypassed the
+    // max_maintenance_ms deadline, causing Phase B to take 10+ seconds
+    // at 97K cache entries. The serial deadline caps at ~5ms and marks
+    // excess entries for rebuild. Proper fix: make maintenance O(mutations)
+    // not O(entries × mutations) — see sort-only skip or filter-shape
+    // grouping proposals.
     let mut results = Vec::with_capacity(work.len());
     let mut timed_out = Vec::new();
     for (i, item) in work.iter().enumerate() {
@@ -2172,20 +2168,7 @@ pub fn evaluate_sort_work(
         }
     };
 
-    // Parallel path: >64 work items, rayon splits across cores.
-    // Each item is independent (reads shared immutable precomputed maps).
-    // Phase B is lock-free so parallelism is safe. At 839 entries / 4
-    // cores, wall-clock drops from ~200ms to ~50ms.
-    if work.len() > 64 {
-        use rayon::prelude::*;
-        let results: Vec<CacheMaintenanceResult> = work
-            .par_iter()
-            .filter_map(evaluate_item)
-            .collect();
-        return (results, Vec::new());
-    }
-
-    // Serial path for small work sets (≤64 items) — preserves deadline
+    // Serial path — always use deadline-aware evaluation (see evaluate_filter_work).
     let mut results = Vec::with_capacity(work.len());
     let mut timed_out = Vec::new();
     for (i, item) in work.iter().enumerate() {
