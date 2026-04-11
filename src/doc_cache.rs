@@ -14,7 +14,7 @@
 //!   when over budget. O(1) eviction vs O(n log n) LRU scan.
 //! - **Promotion on read**: Entries accessed in older generations are moved to current
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,13 +96,52 @@ pub struct DocCache {
     /// over `config.max_bytes`. Set via `set_max_bytes()` from the
     /// PATCH /config handler. Default 0 = use config value.
     max_bytes_override: AtomicU64,
+    /// Runtime override for max_generations. When non-zero, takes
+    /// precedence over `config.max_generations`. Default 0 = use config.
+    max_generations_override: AtomicUsize,
     /// Cumulative cache hits.
     hits: AtomicU64,
     /// Cumulative cache misses.
     misses: AtomicU64,
     /// Cumulative evictions (entries dropped via generation eviction).
     evictions: AtomicU64,
+
+    // --- Apr 11 2026: miss-path diagnostic counters (IntGaugeVec-synced) ---
+    /// Highest slot_id ever inserted/promoted. Used to classify misses
+    /// as "never_seen" (slot_id > max_seen = hot insert region) vs
+    /// "below_water" (slot_id <= max_seen = evicted or never queried).
+    max_seen_slot: AtomicU32,
+    /// Hit count by which generation the entry was found in.
+    /// Buckets match `gen_bucket_index`: 0, 1, 2-5, 6-15, 16-29.
+    hits_by_gen_bucket: [AtomicU64; 5],
+    /// Miss classified as "above_high_water": slot_id > max_seen_slot.
+    misses_above_high_water: AtomicU64,
+    /// Miss classified as "at_or_below_high_water": slot_id <= max_seen_slot
+    /// but absent from every generation. Does NOT prove eviction — may
+    /// also be a never-queried slot or persistent null doc.
+    misses_at_or_below_high_water: AtomicU64,
+    /// Write-through outcomes from the flush thread.
+    writethrough_updated: AtomicU64,
+    writethrough_skipped: AtomicU64,
 }
+
+/// Map a generation index (0 = newest) to its bucket label index.
+/// Buckets: 0 -> "0", 1 -> "1", 2-5 -> "2-5", 6-15 -> "6-15", 16+ -> "16+".
+/// The last bucket is open-ended so the labels stay valid even when
+/// `max_generations` is bumped at runtime (e.g. 30 → 120 experiment).
+#[inline]
+fn gen_bucket_index(gen_idx: usize) -> usize {
+    match gen_idx {
+        0 => 0,
+        1 => 1,
+        2..=5 => 2,
+        6..=15 => 3,
+        _ => 4,
+    }
+}
+
+/// Human-readable labels aligned with `gen_bucket_index` output positions.
+pub const GEN_BUCKET_LABELS: [&str; 5] = ["0", "1", "2-5", "6-15", "16+"];
 
 impl DocCache {
     /// Create a new generational document cache with one empty generation.
@@ -112,9 +151,22 @@ impl DocCache {
             generations: ArcSwap::from_pointee(vec![initial_gen]),
             config,
             max_bytes_override: AtomicU64::new(0),
+            max_generations_override: AtomicUsize::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            max_seen_slot: AtomicU32::new(0),
+            hits_by_gen_bucket: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            misses_above_high_water: AtomicU64::new(0),
+            misses_at_or_below_high_water: AtomicU64::new(0),
+            writethrough_updated: AtomicU64::new(0),
+            writethrough_skipped: AtomicU64::new(0),
         }
     }
 
@@ -126,6 +178,11 @@ impl DocCache {
         for (i, gen) in gens.iter().enumerate() {
             if let Some(entry) = gen.entries.get(&slot_id) {
                 let doc = entry.doc.clone();
+                // Record hit bucket BEFORE any promotion so instrumentation
+                // reflects where the entry actually was, not where it landed.
+                let bucket = gen_bucket_index(i);
+                self.hits_by_gen_bucket[bucket].fetch_add(1, Ordering::Relaxed);
+
                 if i == 0 {
                     // Already in current generation — fast path
                     self.hits.fetch_add(1, Ordering::Relaxed);
@@ -140,7 +197,24 @@ impl DocCache {
             }
         }
 
+        // Miss: classify by slot_id vs max-seen high water mark.
+        // This is NOT a proof of the miss cause; it's a structural split:
+        //   above_high_water — slot_id is higher than any slot the cache
+        //     has ever held (via insert/promote). Strong signal that
+        //     it's a recent insert that queries are already hunting for.
+        //   at_or_below_high_water — slot_id is within the range the
+        //     cache has observed. Could be evicted, could be a slot
+        //     that was never queried (cache-on-read skipped it), could
+        //     be a slot with a persistent null doc. Requires cross-
+        //     referencing with writethrough + hit_generation to
+        //     interpret.
         self.misses.fetch_add(1, Ordering::Relaxed);
+        let high_water = self.max_seen_slot.load(Ordering::Relaxed);
+        if slot_id > high_water {
+            self.misses_above_high_water.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses_at_or_below_high_water.fetch_add(1, Ordering::Relaxed);
+        }
         None
     }
 
@@ -173,6 +247,18 @@ impl DocCache {
             current.entries.insert(slot_id, CachedEntry { doc, size_bytes: size });
             current.size_bytes.fetch_add(size, Ordering::Relaxed);
         }
+
+        // Bump high water mark used by miss-reason classification.
+        self.bump_max_seen(slot_id);
+    }
+
+    /// Update max_seen_slot atomically. Only grows — never decreases.
+    /// Called from insert paths so miss-reason classification knows
+    /// which slot ids have ever lived in the cache. Uses `fetch_max`
+    /// (stable since Rust 1.45) instead of a manual CAS loop.
+    #[inline]
+    fn bump_max_seen(&self, slot_id: u32) {
+        self.max_seen_slot.fetch_max(slot_id, Ordering::Relaxed);
     }
 
     /// Insert a batch of documents into the cache.
@@ -191,10 +277,14 @@ impl DocCache {
     pub fn update_batch_if_cached(&self, docs: &[(u32, StoredDoc)]) {
         let gens = self.generations.load();
 
+        let mut updated: u64 = 0;
+        let mut skipped: u64 = 0;
+
         for (slot_id, doc) in docs {
             let new_size = estimate_doc_size(doc);
 
             // Find in any generation and update in-place (don't promote — writes aren't reads)
+            let mut found = false;
             for gen in gens.iter() {
                 if let Some(mut existing) = gen.entries.get_mut(slot_id) {
                     let old_size = existing.size_bytes;
@@ -205,10 +295,23 @@ impl DocCache {
                     } else {
                         gen.size_bytes.fetch_sub(old_size - new_size, Ordering::Relaxed);
                     }
+                    found = true;
                     break;
                 }
             }
-            // Not in cache — skip. Doc goes to disk only.
+            if found {
+                updated += 1;
+            } else {
+                skipped += 1;
+            }
+            // Not found = skip. Doc goes to disk only.
+        }
+
+        if updated > 0 {
+            self.writethrough_updated.fetch_add(updated, Ordering::Relaxed);
+        }
+        if skipped > 0 {
+            self.writethrough_skipped.fetch_add(skipped, Ordering::Relaxed);
         }
     }
 
@@ -237,9 +340,18 @@ impl DocCache {
             new_gens.push(Arc::clone(gen));
         }
 
-        // If over cap, merge the two oldest into one
-        if new_gens.len() > self.config.max_generations {
+        // If over cap, merge the two oldest into one. Loops so that
+        // shrinking via runtime PATCH (e.g. 120 → 30) converges in a
+        // single rotation instead of taking 90 rotations (~90 min) to
+        // merge one pair per cycle. Gemini's catch.
+        while new_gens.len() > self.effective_max_generations() {
+            let before = new_gens.len();
             self.merge_oldest(&mut new_gens);
+            if new_gens.len() >= before {
+                // merge_oldest is a no-op if len < 2 — break to avoid
+                // infinite loops in edge cases.
+                break;
+            }
         }
 
         self.generations.store(Arc::new(new_gens));
@@ -414,9 +526,62 @@ impl DocCache {
         self.config.generation_interval_secs
     }
 
-    /// Get the max generations count.
-    pub fn max_generations(&self) -> usize {
+    /// Get the configured max generations count (ignores runtime override).
+    /// Use `effective_max_generations()` for the value currently in force.
+    pub fn configured_max_generations(&self) -> usize {
         self.config.max_generations
+    }
+
+    /// Effective max_generations: runtime override if set, otherwise config.
+    pub fn effective_max_generations(&self) -> usize {
+        let ovr = self.max_generations_override.load(Ordering::Relaxed);
+        if ovr > 0 { ovr } else { self.config.max_generations }
+    }
+
+    /// Set max_generations at runtime. Takes effect on the next generation
+    /// rotation in the eviction thread. Pass 0 to revert to the config default.
+    /// Expands retention window without restart — the experiment lever for
+    /// testing whether the floor is retention-bound.
+    pub fn set_max_generations(&self, new_max: usize) {
+        self.max_generations_override.store(new_max, Ordering::Relaxed);
+    }
+
+    // --- Apr 11 2026 diagnostic accessors (synced into IntGaugeVecs) ---
+
+    /// Cumulative hits bucketed by which generation held the entry.
+    /// Indexes align with `GEN_BUCKET_LABELS`.
+    pub fn hits_by_gen(&self) -> [u64; 5] {
+        [
+            self.hits_by_gen_bucket[0].load(Ordering::Relaxed),
+            self.hits_by_gen_bucket[1].load(Ordering::Relaxed),
+            self.hits_by_gen_bucket[2].load(Ordering::Relaxed),
+            self.hits_by_gen_bucket[3].load(Ordering::Relaxed),
+            self.hits_by_gen_bucket[4].load(Ordering::Relaxed),
+        ]
+    }
+
+    /// Cumulative misses where slot_id > max_seen_slot (hot insert region).
+    pub fn misses_above_high_water(&self) -> u64 {
+        self.misses_above_high_water.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative misses where slot_id <= max_seen_slot (in range but
+    /// not present: evicted, never queried, or persistent null doc).
+    pub fn misses_at_or_below_high_water(&self) -> u64 {
+        self.misses_at_or_below_high_water.load(Ordering::Relaxed)
+    }
+
+    /// Write-through outcomes: (updated, skipped).
+    pub fn writethrough_counts(&self) -> (u64, u64) {
+        (
+            self.writethrough_updated.load(Ordering::Relaxed),
+            self.writethrough_skipped.load(Ordering::Relaxed),
+        )
+    }
+
+    /// High water mark for max slot_id ever observed by insert/promote.
+    pub fn max_seen_slot(&self) -> u32 {
+        self.max_seen_slot.load(Ordering::Relaxed)
     }
 }
 
