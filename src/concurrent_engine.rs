@@ -6207,86 +6207,103 @@ impl ConcurrentEngine {
     ///
     /// Returns `(docs_copied, data_bytes)` on success.
     pub fn copy_docstore_to_silo(&self) -> Result<(u64, u64)> {
-        const FETCH_CHUNK: usize = 200_000;
+        use crate::doc_silo::{encode_slot_bytes, slot_to_key};
+        use crate::shard_store_doc::SlotHexShard;
 
         let silo = self
             .doc_silo
             .as_ref()
             .ok_or_else(|| crate::error::BitdexError::Storage("DocSilo not initialized".into()))?;
 
+        // Iterate DocStoreV3 shards in order via get_shard_packed, which
+        // returns Vec<(u32, Vec<(u16, PackedValue)>)> — the same shape as
+        // SlotSnapshot, skipping the StoredDoc HashMap detour that blew up
+        // memory at 107M (~1.4KB/doc → ~200B/doc after this rewrite).
+        //
+        // Encode each doc to bytes inline and accumulate into a single
+        // Vec<(u64 silo_key, Vec<u8> encoded_bytes)>. Then call
+        // `DocSilo::bulk_load_encoded` which skips the re-encode step.
+
+        // Snapshot field-dict translation up front under a brief write lock.
+        // DocStoreV3 and DocSilo have independent field indices — we build
+        // a translation table so the encoded bytes use silo indices.
+        let (docstore_idx_to_name, max_docstore_idx) = {
+            let ds = self.docstore.read();
+            let names: Vec<String> = ds.idx_to_field().iter().cloned().collect();
+            let max = names.len();
+            (names, max)
+        };
+        let mut silo_idx_for: Vec<u16> = Vec::with_capacity(max_docstore_idx);
+        {
+            let mut guard = silo.write();
+            for name in &docstore_idx_to_name {
+                silo_idx_for.push(guard.ensure_field_index(name));
+            }
+        }
+
+        // How many shards does DocStoreV3 span?
         let snap = self.snapshot();
-        let alive_bitmap = snap.slots.alive_bitmap().clone();
+        let total_alive = snap.slots.alive_bitmap().len() as u64;
+        let max_slot = snap.slots.slot_counter();
         drop(snap);
-        let total_alive = alive_bitmap.len() as u64;
+        let num_shards = SlotHexShard::slot_to_shard(max_slot.saturating_sub(1)) + 1;
         eprintln!(
-            "copy_docstore_to_silo: {} alive slots, fetch_chunk={} (single bulk_load mode)",
-            total_alive, FETCH_CHUNK
+            "copy_docstore_to_silo: {} alive slots across {} shards (packed encode path)",
+            total_alive, num_shards
         );
 
         let overall_start = std::time::Instant::now();
-        // Accumulate every (slot, StoredDoc) into one Vec. At 14M this is ~3 GB.
-        // At 107M this is ~22 GB, tight on 32 GB RAM — relies on Windows paging
-        // to absorb overflow. Streaming via ops log + compact hits quadratic
-        // per-compact sync cost (see docs/_in/datasilo-port-14m-findings.md),
-        // so single-pass bulk_load remains the best option for now.
-        let mut all_docs: Vec<(u32, StoredDoc)> = Vec::with_capacity(total_alive as usize);
-        let mut batch_slots: Vec<u32> = Vec::with_capacity(FETCH_CHUNK);
-
-        let mut drain_batch = |batch: &mut Vec<u32>,
-                               out: &mut Vec<(u32, StoredDoc)>,
-                               docstore: &parking_lot::RwLock<DocStoreV3>|
-         -> Result<()> {
-            if batch.is_empty() {
-                return Ok(());
-            }
-            let (docs, _, _) = {
-                let guard = docstore.read();
-                guard.get_many(batch)?
-            };
-            for (slot_id, maybe_doc) in batch.iter().zip(docs.into_iter()) {
-                if let Some(doc) = maybe_doc {
-                    out.push((*slot_id, doc));
-                }
-            }
-            batch.clear();
-            Ok(())
-        };
-
+        let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(total_alive as usize);
         let mut last_progress_pct = -1i64;
-        for slot in alive_bitmap.iter() {
-            batch_slots.push(slot);
-            if batch_slots.len() >= FETCH_CHUNK {
-                drain_batch(&mut batch_slots, &mut all_docs, self.docstore.as_ref())?;
-                let pct = (100.0 * all_docs.len() as f64 / total_alive.max(1) as f64) as i64;
-                if pct / 5 > last_progress_pct / 5 {
-                    eprintln!(
-                        "  fetched {} / {} ({}%), elapsed {:.1}s",
-                        all_docs.len(),
-                        total_alive,
-                        pct,
-                        overall_start.elapsed().as_secs_f64()
-                    );
-                    last_progress_pct = pct;
+        let mut encode_buf = Vec::with_capacity(256);
+
+        // Hold the docstore read lock for the whole scan loop. Re-acquiring
+        // it per shard was ~100x slower (245K lock ops with flush-thread
+        // contention). The loop is read-only.
+        let ds = self.docstore.read();
+        for shard_id in 0..num_shards {
+            let shard = ds.get_shard_packed(shard_id).unwrap_or_default();
+            for (slot_id, mut pairs) in shard {
+                // Remap field indices from docstore space → silo space.
+                for (idx, _) in pairs.iter_mut() {
+                    let ds_idx = *idx as usize;
+                    if ds_idx < silo_idx_for.len() {
+                        *idx = silo_idx_for[ds_idx];
+                    }
                 }
+                encode_slot_bytes(true, &pairs, &mut encode_buf);
+                encoded.push((slot_to_key(slot_id), encode_buf.clone()));
+            }
+
+            let pct = (100.0 * encoded.len() as f64 / total_alive.max(1) as f64) as i64;
+            if pct / 5 > last_progress_pct / 5 {
+                eprintln!(
+                    "  encoded {} / {} ({}%), shards {}/{}, elapsed {:.1}s",
+                    encoded.len(),
+                    total_alive,
+                    pct,
+                    shard_id + 1,
+                    num_shards,
+                    overall_start.elapsed().as_secs_f64()
+                );
+                last_progress_pct = pct;
             }
         }
-        drain_batch(&mut batch_slots, &mut all_docs, self.docstore.as_ref())?;
+        drop(ds);
 
-        let fetched_docs = all_docs.len() as u64;
+        let fetched_docs = encoded.len() as u64;
         eprintln!(
-            "copy_docstore_to_silo: fetched {} docs in {:.1}s, calling bulk_load",
+            "copy_docstore_to_silo: encoded {} docs in {:.1}s, bulk-loading silo",
             fetched_docs,
             overall_start.elapsed().as_secs_f64()
         );
 
         let loaded = {
             let mut guard = silo.write();
-            guard.bulk_load(&all_docs).map_err(|e| {
-                crate::error::BitdexError::Storage(format!("silo bulk_load: {e}"))
+            guard.bulk_load_encoded(encoded).map_err(|e| {
+                crate::error::BitdexError::Storage(format!("silo bulk_load_encoded: {e}"))
             })?
         };
-        // Drop the Vec immediately so bulk_load's encode buffer has headroom.
-        drop(all_docs);
 
         let data_bytes = {
             let guard = silo.read();

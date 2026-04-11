@@ -362,7 +362,37 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
             return Ok(0);
         }
 
-        let count = entries.len() as u64;
+        // Phase 1: encode each snapshot once. Delegate the rest to
+        // `bulk_load_encoded` so the two paths share the same layout +
+        // index build logic.
+        let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
+        for (k, snap) in entries {
+            let mut buf = Vec::with_capacity(256);
+            S::encode(snap, &mut buf);
+            encoded.push((*k, buf));
+        }
+        self.bulk_load_encoded(encoded)
+    }
+
+    /// Replace the data file and index with a fresh bulk snapshot given
+    /// **pre-encoded** entries. This skips the `SnapshotCodec::encode`
+    /// step — the caller is responsible for producing bytes in whatever
+    /// format `SnapshotCodec::decode` expects.
+    ///
+    /// Used by streaming populate paths where encoding happens inline
+    /// during fetch so the intermediate `S::Snapshot` value never
+    /// accumulates in memory. Avoids double-buffering at bulk-load
+    /// scale — important when the full dataset exceeds RAM.
+    ///
+    /// Takes `Vec<(u64, Vec<u8>)>` by value so the caller's buffer is
+    /// consumed and reclaimed after layout.
+    ///
+    /// Destructive: truncates both ops logs.
+    pub fn bulk_load_encoded(&mut self, encoded: Vec<(u64, Vec<u8>)>) -> io::Result<u64> {
+        if encoded.is_empty() {
+            return Ok(0);
+        }
+        let count = encoded.len() as u64;
         let align = self.config.alignment.max(1) as u64;
         let buffer_ratio = self.config.buffer_ratio;
         let min_entry_size = self.config.min_entry_size;
@@ -370,13 +400,7 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
         self.index = None;
         self.data_mmap = None;
 
-        // Phase 1: encode each snapshot once; lay out offsets sequentially.
-        let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(entries.len());
-        for (k, snap) in entries {
-            let mut buf = Vec::with_capacity(256);
-            S::encode(snap, &mut buf);
-            encoded.push((*k, buf));
-        }
+        let mut encoded = encoded;
         // Sort by key for insertion locality.
         encoded.sort_unstable_by_key(|(k, _)| *k);
 

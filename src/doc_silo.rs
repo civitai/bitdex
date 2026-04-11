@@ -532,6 +532,19 @@ impl OpCodec for SlotDocOpCodec {
 // FieldValue ↔ PackedValue conversions
 // ---------------------------------------------------------------------------
 
+/// Encode a slot's packed field list directly to `SlotSnapshotCodec`'s
+/// wire format without constructing a `SlotSnapshot` intermediate. Used
+/// by populate paths that read `Vec<(u16, PackedValue)>` straight from
+/// DocStoreV3 shards and want to avoid allocating StoredDoc HashMaps.
+pub fn encode_slot_bytes(alive: bool, fields: &[(u16, PackedValue)], out: &mut Vec<u8>) {
+    out.clear();
+    out.push(if alive { 1 } else { 0 });
+    out.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+    for (field, value) in fields {
+        encode_field_pair(*field, value, out);
+    }
+}
+
 pub fn field_value_to_packed(fv: &FieldValue) -> PackedValue {
     match fv {
         FieldValue::Single(v) => value_to_packed(v),
@@ -746,6 +759,15 @@ impl DocSilo {
             out.push((idx, field_value_to_packed(value)));
         }
         out
+    }
+
+    /// Bulk load pre-encoded entries. Each `Vec<u8>` must be a `SlotSnapshotCodec`-
+    /// compatible byte sequence `[alive:u8][num_fields:u16][field_pair...]`.
+    /// Use `encode_slot_bytes()` to produce these. Skips the `StoredDoc` +
+    /// `SlotSnapshot` intermediates — the path populate uses at 107M scale
+    /// to keep per-doc memory to ~200 bytes instead of ~1.4 KB.
+    pub fn bulk_load_encoded(&mut self, encoded: Vec<(u64, Vec<u8>)>) -> io::Result<u64> {
+        self.silo.bulk_load_encoded(encoded)
     }
 
     /// Bulk load: replace the data file + index with a fresh snapshot.
