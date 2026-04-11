@@ -461,7 +461,7 @@ impl FieldMeta {
         }
     }
     /// Check if a sort field is a source for any computed field.
-    fn has_computed_deps(&self, field: &str) -> bool {
+    pub fn has_computed_deps(&self, field: &str) -> bool {
         self.computed_deps.contains_key(field)
     }
 }

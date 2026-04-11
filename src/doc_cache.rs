@@ -143,6 +143,49 @@ fn gen_bucket_index(gen_idx: usize) -> usize {
 /// Human-readable labels aligned with `gen_bucket_index` output positions.
 pub const GEN_BUCKET_LABELS: [&str; 5] = ["0", "1", "2-5", "6-15", "16+"];
 
+/// Outcome of `DocCache::apply_ops_in_place`. Used by the WAL reader
+/// to tally per-entity accounting and route entries that need disk
+/// reload through the fallback `doc_cache_refresh_slots` path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// All ops applied cleanly; cached doc is now current.
+    Applied,
+    /// Ops included `Delete`; cache entry removed.
+    Deleted,
+    /// Slot is not in cache — no action taken. Preserves
+    /// cache-on-read semantics: cold slots stay cold until a query
+    /// promotes them.
+    NotCached,
+    /// Ops included a shape we can't handle in-place (QueryOpSet,
+    /// unparseable value, or a type-mismatched Add on a Single field).
+    /// Caller should fall back to disk reload for this slot.
+    NeedsFallback,
+}
+
+/// Convert a `serde_json::Value` (as carried by pg-sync Ops) to the
+/// `query::Value` variant used by `FieldValue::Single` / `Multi`.
+/// Returns `None` for shapes the cache can't represent (null, arrays,
+/// nested objects). The caller routes those slots to the disk refresh
+/// path so nothing silently diverges.
+#[cfg(feature = "pg-sync")]
+fn json_value_to_query_value(
+    raw: &serde_json::Value,
+) -> Option<crate::query::Value> {
+    use crate::query::Value;
+    match raw {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(Value::Integer(i))
+            } else {
+                n.as_f64().map(Value::Float)
+            }
+        }
+        serde_json::Value::Bool(b) => Some(Value::Bool(*b)),
+        serde_json::Value::String(s) => Some(Value::String(s.clone())),
+        _ => None,
+    }
+}
+
 impl DocCache {
     /// Create a new generational document cache with one empty generation.
     pub fn new(config: DocCacheConfig) -> Self {
@@ -348,6 +391,195 @@ impl DocCache {
             }
         }
         false
+    }
+
+    /// Apr 11 2026: Apply pg-sync ops directly to a cached StoredDoc,
+    /// avoiding the disk read in `doc_cache_refresh_slots`.
+    ///
+    /// This is the hot path for the WAL reader on steady-state sync.
+    /// The previous `refresh_slots` implementation re-read every
+    /// touched cached slot from disk via `DocStoreV3::get_many`, which
+    /// dispatches to the global rayon pool and steals worker threads
+    /// from query handlers. Under high cache saturation that contention
+    /// dominated the latency tail (see `tokio_return_delay` spike at
+    /// T+30 on v1.0.185). Applying ops in-place keeps the hot cache
+    /// state coherent with zero disk I/O.
+    ///
+    /// The caller decides which ops are safe to apply in-place. This
+    /// method assumes:
+    /// - Set/Remove/Add on non-computed-source fields are safe
+    /// - Fields that feed computed deps (e.g. `scannedAt` feeding
+    ///   `sortAt`) need disk reload for the computed value to refresh
+    /// - QueryOpSet needs query resolution first (not handled here)
+    ///
+    /// Returns `ApplyOutcome::NotCached` if the slot isn't in the
+    /// cache at all — no-op, preserves cache-on-read semantics.
+    #[cfg(feature = "pg-sync")]
+    pub fn apply_ops_in_place(
+        &self,
+        slot_id: u32,
+        ops: &[crate::pg_sync::ops::Op],
+    ) -> ApplyOutcome {
+        use crate::pg_sync::ops::Op;
+        use crate::mutation::FieldValue;
+
+        if ops.is_empty() {
+            return ApplyOutcome::NotCached;
+        }
+
+        let gens = self.generations.load();
+
+        // Find the slot's entry via DashMap get_mut. Holding the shard
+        // lock across op application is fine — no disk I/O, no allocs
+        // outside the entry's own HashMap. Single-threaded WAL reader
+        // means no concurrent writer contention on the same entry.
+        //
+        // GPT review H1 — Apr 11 2026: apply ops to a *clone* of the
+        // stored doc, then atomically swap it back only if every op
+        // succeeded. The previous version mutated `entry.doc` in place
+        // and early-returned `NeedsFallback` from inside the loop,
+        // which left the cached doc in a half-applied state on bail.
+        // While `doc_cache_apply_ops_batch`'s fallback path eventually
+        // overwrote the entry from disk, the transient window had
+        // divergent state and `size_bytes` was never updated for the
+        // partial mutation. Clone-then-swap gives all-or-nothing
+        // semantics: either every op lands or the entry is untouched
+        // and the caller routes to the disk-refresh fallback. The
+        // clone cost is ~1 doc per WAL batch (hundreds per second
+        // in prod) — cheaper than one `get_many` disk read, which
+        // is what we're replacing.
+        for gen in gens.iter() {
+            if let Some(mut entry) = gen.entries.get_mut(&slot_id) {
+                let old_size = entry.size_bytes;
+
+                // Apply to a clone. Delete short-circuits before the
+                // swap because it drops the slot entirely — no swap
+                // needed, just remove.
+                let mut working = entry.doc.clone();
+                let mut deleted = false;
+
+                for i in 0..ops.len() {
+                    let op = &ops[i];
+                    match op {
+                        Op::Set { field, value } => {
+                            match json_value_to_query_value(value) {
+                                Some(v) => {
+                                    working.fields.insert(
+                                        field.clone(),
+                                        FieldValue::Single(v),
+                                    );
+                                }
+                                None => return ApplyOutcome::NeedsFallback,
+                            }
+                        }
+                        Op::Remove { field, value } => {
+                            match working.fields.get_mut(field) {
+                                Some(FieldValue::Multi(vec)) => {
+                                    if let Some(target) = json_value_to_query_value(value) {
+                                        vec.retain(|v| v != &target);
+                                    }
+                                }
+                                Some(FieldValue::Single(_)) => {
+                                    // Scalar remove is the "old value"
+                                    // half of a remove/set pair in
+                                    // pg-sync's ops protocol. Common
+                                    // case, but nothing in the wire
+                                    // format guarantees a paired Set
+                                    // exists (SET NULL, trigger bugs,
+                                    // future op shapes). Bail unless
+                                    // a matching Set follows in the
+                                    // same ops list so disk refresh
+                                    // reloads authoritative state.
+                                    // Gemini review H1 — Apr 11 2026.
+                                    let has_paired_set = ops[i + 1..].iter().any(|later| {
+                                        matches!(
+                                            later,
+                                            Op::Set { field: f, .. } if f == field
+                                        )
+                                    });
+                                    if has_paired_set {
+                                        working.fields.remove(field);
+                                    } else {
+                                        return ApplyOutcome::NeedsFallback;
+                                    }
+                                }
+                                None => {
+                                    // No current value — no-op.
+                                }
+                            }
+                        }
+                        Op::Add { field, value } => {
+                            let target = match json_value_to_query_value(value) {
+                                Some(v) => v,
+                                None => return ApplyOutcome::NeedsFallback,
+                            };
+                            match working.fields.get_mut(field) {
+                                Some(FieldValue::Multi(vec)) => {
+                                    if !vec.iter().any(|v| v == &target) {
+                                        vec.push(target);
+                                    }
+                                }
+                                Some(FieldValue::Single(_)) => {
+                                    // Type mismatch on a single-value
+                                    // field. The upfront check in
+                                    // `doc_cache_apply_ops_batch` only
+                                    // knows about computed deps, not
+                                    // type shape, so this is the
+                                    // correct place to bail.
+                                    return ApplyOutcome::NeedsFallback;
+                                }
+                                None => {
+                                    working.fields.insert(
+                                        field.clone(),
+                                        FieldValue::Multi(vec![target]),
+                                    );
+                                }
+                            }
+                        }
+                        Op::Delete => {
+                            deleted = true;
+                            break;
+                        }
+                        Op::Alive => {
+                            // Creates-slot signal affects the alive
+                            // bitmap only. StoredDoc already exists
+                            // (that's why we found it in the cache).
+                        }
+                        Op::QueryOpSet { .. } => {
+                            // Fan-out ops need query resolution; the
+                            // caller routes these to the refresh path.
+                            return ApplyOutcome::NeedsFallback;
+                        }
+                    }
+                }
+
+                if deleted {
+                    // Drop the DashMap ref before calling remove() —
+                    // remove() re-acquires the shard lock and would
+                    // deadlock if we still held get_mut.
+                    let freed = entry.size_bytes;
+                    drop(entry);
+                    gen.entries.remove(&slot_id);
+                    gen.size_bytes.fetch_sub(freed, Ordering::Relaxed);
+                    return ApplyOutcome::Deleted;
+                }
+
+                // Commit: swap the working clone into the entry and
+                // update size accounting.
+                let new_size = estimate_doc_size(&working);
+                entry.doc = working;
+                entry.size_bytes = new_size;
+                drop(entry);
+                if new_size >= old_size {
+                    gen.size_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
+                } else {
+                    gen.size_bytes.fetch_sub(old_size - new_size, Ordering::Relaxed);
+                }
+                return ApplyOutcome::Applied;
+            }
+        }
+
+        ApplyOutcome::NotCached
     }
 
     /// Push a new empty generation to the front (current position).
@@ -1225,4 +1457,9 @@ mod tests {
         // Should have rotated at least once
         assert!(cache.generation_count() >= 2, "should have rotated generations");
     }
+
+    // In-place op-apply tests live at tests/doc_cache_apply_ops.rs — the
+    // lib test target has pre-existing unrelated compile rot that blocks
+    // per-file test runs; integration tests build against the public API.
 }
+
