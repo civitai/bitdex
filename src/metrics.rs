@@ -186,6 +186,21 @@ pub struct Metrics {
     pub doc_cache_generations: IntGaugeVec,
     pub doc_cache_backlog: IntGaugeVec,
 
+    // -- Apr 11 2026: Doc-cache miss-path diagnostic instrumentation.
+    //
+    // Hit rate in prod sits ~48%. These metrics expose the structural
+    // reasons so we can stop guessing: is the write stream bypassing
+    // write-through? Are hits all in gen 0 (healthy) or spread into old
+    // gens (promotion falling behind)? Are batches dominated by 0-1
+    // misses ("all or nothing" amplification) or 10+ misses (working
+    // set too big)? Do concurrent queries re-open the same shard inside
+    // a small window (read coalescing opportunity)?
+    pub doc_cache_writethrough_total: IntGaugeVec, // labels: result=updated|skipped
+    pub doc_cache_hit_generation_total: IntGaugeVec, // labels: gen_bucket=0|1|2-5|6-15|16+
+    pub doc_cache_miss_reason_total: IntGaugeVec,  // labels: reason=above_high_water|at_or_below_high_water
+    pub docstore_shard_concurrent_read_total: IntGaugeVec, // labels: context=first|concurrent_duplicate
+    pub query_docs_batch_miss_count: HistogramVec, // buckets: 0,1,2,3,5,10,25,100,500+
+
     // -- Phase 2.5: ShardStore ops (stub — wired when Phase 1 lands) --
     pub shardstore_ops_count: IntGaugeVec,
 
@@ -996,6 +1011,53 @@ impl Metrics {
         )
         .unwrap();
 
+        // Apr 11 2026: Doc-cache miss-path diagnostics
+        let doc_cache_writethrough_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_doc_cache_writethrough_total",
+                "Write-through outcomes from flush thread: updated (doc already cached) vs skipped (doc not in cache, stays on disk only)",
+            ),
+            &["index", "result"],
+        )
+        .unwrap();
+        let doc_cache_hit_generation_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_doc_cache_hit_generation_total",
+                "Cumulative cache hits bucketed by which generation held the entry (0 = current/healthy, older = promotion falling behind)",
+            ),
+            &["index", "gen_bucket"],
+        )
+        .unwrap();
+        let doc_cache_miss_reason_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_doc_cache_miss_reason_total",
+                "Cumulative cache misses classified by slot relationship to high water mark. above_high_water: slot_id > max-ever-cached (hot insert region). at_or_below_high_water: slot_id ≤ max-ever-cached but absent — could be evicted, never queried, or persistent null doc (interpretation requires cross-ref with writethrough + hit_generation)",
+            ),
+            &["index", "reason"],
+        )
+        .unwrap();
+        let docstore_shard_concurrent_read_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_docstore_shard_concurrent_read_total",
+                "Shard opens classified by recency heuristic: first (not opened in last 20ms by any get_many) vs concurrent_duplicate (another get_many opened this shard within the last 20ms). NOT a proof of simultaneous in-flight duplication — a high duplicate rate is a signal that a read coalescer would be worth building, not a measurement of it.",
+            ),
+            &["index", "context"],
+        )
+        .unwrap();
+        // Batch miss count buckets: explicit to catch "all or nothing" shape.
+        // 0 = full hit, 1 = one miss forces whole batch to spawn_blocking,
+        // 100+ = large working-set miss.
+        let batch_miss_buckets = vec![0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 25.0, 100.0, 500.0];
+        let query_docs_batch_miss_count = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_docs_batch_miss_count",
+                "Distribution of cache misses per doc-fetch batch (measures 'all or nothing' amplification — one miss kicks the whole batch to spawn_blocking)",
+            )
+            .buckets(batch_miss_buckets),
+            &["index"],
+        )
+        .unwrap();
+
         // Phase 2.5: ShardStore ops stub (wired when Phase 1 lands)
         let shardstore_ops_count = IntGaugeVec::new(
             Opts::new("bitdex_shardstore_ops_count", "Pending ops per shard store"),
@@ -1227,6 +1289,11 @@ impl Metrics {
         registry.register(Box::new(doc_cache_evictions_total.clone())).unwrap();
         registry.register(Box::new(doc_cache_generations.clone())).unwrap();
         registry.register(Box::new(doc_cache_backlog.clone())).unwrap();
+        registry.register(Box::new(doc_cache_writethrough_total.clone())).unwrap();
+        registry.register(Box::new(doc_cache_hit_generation_total.clone())).unwrap();
+        registry.register(Box::new(doc_cache_miss_reason_total.clone())).unwrap();
+        registry.register(Box::new(docstore_shard_concurrent_read_total.clone())).unwrap();
+        registry.register(Box::new(query_docs_batch_miss_count.clone())).unwrap();
         registry.register(Box::new(shardstore_ops_count.clone())).unwrap();
         registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
         registry.register(Box::new(pgsync_rows_fetched_total.clone())).unwrap();
@@ -1357,6 +1424,11 @@ impl Metrics {
             doc_cache_evictions_total,
             doc_cache_generations,
             doc_cache_backlog,
+            doc_cache_writethrough_total,
+            doc_cache_hit_generation_total,
+            doc_cache_miss_reason_total,
+            docstore_shard_concurrent_read_total,
+            query_docs_batch_miss_count,
             shardstore_ops_count,
             pgsync_cycle_seconds,
             pgsync_rows_fetched_total,

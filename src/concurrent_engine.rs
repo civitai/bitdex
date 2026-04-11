@@ -373,6 +373,18 @@ pub struct ConcurrentEngine {
     bitmap_memory_cache: Arc<crate::bitmap_memory_cache::BitmapMemoryCache>,
     /// In-memory document cache (DashMap, cache-on-read, write-through, LRU eviction).
     doc_cache: Option<Arc<crate::doc_cache::DocCache>>,
+    /// Apr 11 2026 miss-path diagnostic: map of shard_id → last-open Instant.
+    /// Used to classify each shard read in `get_documents_batch` as "first"
+    /// (not opened within the window) or "concurrent_duplicate" (another
+    /// in-flight read opened this shard <= window ms ago). Answers the
+    /// question of whether concurrent queries are competing for the same
+    /// shard files — the signal for whether a read coalescer is worth
+    /// building.
+    shard_recent_opens: Arc<DashMap<u32, Instant>>,
+    /// Counter for "first" context shard reads.
+    shard_read_first: Arc<AtomicU64>,
+    /// Counter for "concurrent_duplicate" context shard reads.
+    shard_read_duplicate: Arc<AtomicU64>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
     compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
@@ -1134,6 +1146,9 @@ impl ConcurrentEngine {
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
                 bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
                 doc_cache: doc_cache.clone(),
+                shard_recent_opens: Arc::new(DashMap::new()),
+                shard_read_first: Arc::new(AtomicU64::new(0)),
+                shard_read_duplicate: Arc::new(AtomicU64::new(0)),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
@@ -3154,6 +3169,9 @@ impl ConcurrentEngine {
             metrics_bridge,
             bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
             doc_cache: doc_cache.clone(),
+            shard_recent_opens: Arc::new(DashMap::new()),
+            shard_read_first: Arc::new(AtomicU64::new(0)),
+            shard_read_duplicate: Arc::new(AtomicU64::new(0)),
             compaction_skipped,
             compact_tx,
             compact_handle,
@@ -5928,12 +5946,12 @@ impl ConcurrentEngine {
     pub fn get_documents_batch(
         &self,
         ids: &[u32],
-    ) -> Result<(Vec<Option<StoredDoc>>, crate::shard_store::ShardReadStats, usize, u64, u64)> {
+    ) -> Result<(Vec<Option<StoredDoc>>, crate::shard_store::ShardReadStats, usize, u64, u64, usize)> {
         use crate::shard_store::ShardReadStats;
         use std::time::Instant;
 
         if ids.is_empty() {
-            return Ok((Vec::new(), ShardReadStats::default(), 0, 0, 0));
+            return Ok((Vec::new(), ShardReadStats::default(), 0, 0, 0, 0));
         }
 
         let mut results: Vec<Option<StoredDoc>> = vec![None; ids.len()];
@@ -5960,9 +5978,67 @@ impl ConcurrentEngine {
             miss_ids.extend_from_slice(ids);
         }
         let cache_probe_nanos = probe_start.elapsed().as_nanos() as u64;
+        let miss_count = miss_ids.len();
 
         if miss_ids.is_empty() {
-            return Ok((results, ShardReadStats::default(), 0, cache_probe_nanos, 0));
+            return Ok((results, ShardReadStats::default(), 0, cache_probe_nanos, 0, 0));
+        }
+
+        // Apr 11 2026: classify unique shard opens by recency.
+        // A shard opened <= 20ms ago by another recently-completed
+        // get_many call is a "concurrent_duplicate" — an approximation
+        // for "within the same concurrency window". This is NOT a
+        // proof of simultaneous in-flight duplicate opens; it's a
+        // recency-based heuristic. If the metric shows a high duplicate
+        // rate, we can design a proper in-flight detector.
+        //
+        // Uses DashMap's entry() API so the read-then-write on a single
+        // shard_key is atomic within the bucket lock, eliminating the
+        // most common race where two threads both see "no entry" and
+        // both classify as "first". Threads racing across different
+        // shard_keys remain independent.
+        //
+        // `now` is sampled here but another thread may have sampled a
+        // later instant before we acquire the entry lock, so use
+        // `saturating_duration_since` — `Instant::duration_since` would
+        // PANIC if prev > now. Gemini caught this.
+        {
+            use dashmap::mapref::entry::Entry;
+            let window = Duration::from_millis(20);
+            let now = Instant::now();
+            // Build unique shard set from miss_ids. Small — typically
+            // <100 shards per batch — so Vec+sort+dedup is fine.
+            let mut shard_keys: Vec<u32> = miss_ids
+                .iter()
+                .map(|&id| crate::shard_store_doc::SlotHexShard::slot_to_shard(id))
+                .collect();
+            shard_keys.sort_unstable();
+            shard_keys.dedup();
+            for shard_key in &shard_keys {
+                let is_duplicate = match self.shard_recent_opens.entry(*shard_key) {
+                    Entry::Occupied(mut entry) => {
+                        let prev = *entry.get();
+                        let dup = now.saturating_duration_since(prev) < window;
+                        *entry.get_mut() = now;
+                        dup
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(now);
+                        false
+                    }
+                };
+                if is_duplicate {
+                    self.shard_read_duplicate.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.shard_read_first.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            // Drop bounded pruning. DashMap::len() is O(N) and
+            // write-locks every shard; calling it on each miss path is
+            // a performance trap. Shard-space is bounded (~42K entries
+            // max × 24 bytes ≈ 1 MB), so unbounded growth is
+            // acceptable. Gemini's catch.
         }
 
         // Phase 2: batch disk read. One `get_many` call reads each
@@ -6025,7 +6101,7 @@ impl ConcurrentEngine {
 
         let disk_fetch_nanos = disk_start.elapsed().as_nanos() as u64;
 
-        Ok((results, stats, unique_shards, cache_probe_nanos, disk_fetch_nanos))
+        Ok((results, stats, unique_shards, cache_probe_nanos, disk_fetch_nanos, miss_count))
     }
     /// Compact the docstore, reclaiming space from old write transactions.
     pub fn compact_docstore(&self) -> Result<bool> {
@@ -6132,6 +6208,41 @@ impl ConcurrentEngine {
                 cache.generation_count(),
             ),
             None => (0, 0, 0, 0, 0, 0),
+        }
+    }
+
+    /// Apr 11 2026: miss-path diagnostic stats pulled from DocCache atomics.
+    /// Returns (hits_by_gen[5], miss_above_high_water, miss_at_or_below_high_water, writethrough_updated, writethrough_skipped).
+    pub fn doc_cache_diagnostic_stats(&self) -> ([u64; 5], u64, u64, u64, u64) {
+        match &self.doc_cache {
+            Some(cache) => {
+                let (wt_upd, wt_skip) = cache.writethrough_counts();
+                (
+                    cache.hits_by_gen(),
+                    cache.misses_above_high_water(),
+                    cache.misses_at_or_below_high_water(),
+                    wt_upd,
+                    wt_skip,
+                )
+            }
+            None => ([0; 5], 0, 0, 0, 0),
+        }
+    }
+
+    /// Apr 11 2026: shard concurrent-read diagnostic counts. Returns
+    /// (first, concurrent_duplicate).
+    pub fn shard_concurrent_read_counts(&self) -> (u64, u64) {
+        (
+            self.shard_read_first.load(Ordering::Relaxed),
+            self.shard_read_duplicate.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Apr 11 2026: runtime override for `DocCacheConfig::max_generations`.
+    /// Pass 0 to revert to config default.
+    pub fn set_doc_cache_max_generations(&self, new_max: usize) {
+        if let Some(ref cache) = self.doc_cache {
+            cache.set_max_generations(new_max);
         }
     }
     /// Report bitmap memory usage broken down by component (lock-free snapshot).

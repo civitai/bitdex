@@ -924,6 +924,14 @@ struct ConfigPatch {
     /// Pass 0 to revert to the config default.
     #[serde(default)]
     doc_cache_max_bytes: Option<u64>,
+    /// Apr 11 2026: Update the doc cache max_generations cap at runtime.
+    /// Default config is 30 generations × 60s rotation = ~30 min retention
+    /// for inactive slots. Bumping this to e.g. 120 gives ~2 hours, which
+    /// is the experiment lever for testing whether the 48% hit rate floor
+    /// is retention-bound or structural. Pass 0 to revert to config default.
+    /// Takes effect on the next generation rotation.
+    #[serde(default)]
+    doc_cache_max_generations: Option<usize>,
     /// Toggle expensive metric groups at runtime. Array of group names to enable.
     /// Groups: "bitmap_memory", "eviction_stats", "boundstore_disk"
     /// DEPRECATED: Use disabled_metrics instead.
@@ -2289,6 +2297,18 @@ async fn handle_patch_config(
                     eprintln!("Config patch: doc_cache_max_bytes set to {v} (0 = revert to config default)");
                 }
 
+                // Apr 11 2026: doc cache max_generations runtime override.
+                // Takes effect on the next generation rotation in the
+                // eviction thread. Intentionally NOT persisted to YAML —
+                // this is a temporary experiment lever (matches the
+                // existing doc_cache_max_bytes runtime-only behavior).
+                // Reverts across restart unless the config default is
+                // also changed.
+                if let Some(v) = patch.doc_cache_max_generations {
+                    idx.engine.set_doc_cache_max_generations(v);
+                    eprintln!("Config patch: doc_cache_max_generations set to {v} (0 = revert to config default, not persisted)");
+                }
+
                 // Persist updated config
                 let index_dir = state.data_dir.join("indexes").join(&name);
                 if let Err(e) = idx.definition.save_yaml(&index_dir) {
@@ -2733,6 +2753,12 @@ async fn handle_query(
                         m.query_doc_cache_probe_seconds
                             .with_label_values(&[&name_docs])
                             .observe(0.0); // cache probe included in the get() calls above
+                        // Inline fast path = 0 misses by definition.
+                        // Observe so the histogram covers the full
+                        // distribution (inline + spawn_blocking).
+                        m.query_docs_batch_miss_count
+                            .with_label_values(&[&name_docs])
+                            .observe(0.0);
                         // Count the inline fast-path hit. Lets ops compare
                         // inline vs spawn_blocking rates and confirm the
                         // optimization is firing as expected.
@@ -2759,6 +2785,7 @@ async fn handle_query(
                 let disk_fetch_hist = m.query_doc_disk_fetch_seconds.clone();
                 let format_hist = m.query_doc_format_seconds.clone();
                 let read_path_total = m.docstore_read_path_total.clone();
+                let batch_miss_hist = m.query_docs_batch_miss_count.clone();
                 let docstore_hist_clone = docstore_hist.clone();
                 let name_docs_clone = name_docs.clone();
                 let ids = result.ids.clone();
@@ -2787,7 +2814,14 @@ async fn handle_query(
                     let batch_elapsed = batch_start.elapsed().as_secs_f64();
 
                     let docs: Vec<serde_json::Value> = match batch_result {
-                        Ok((stored_opts, stats, unique_shards, cache_probe_ns, disk_fetch_ns)) => {
+                        Ok((stored_opts, stats, unique_shards, cache_probe_ns, disk_fetch_ns, miss_count)) => {
+                            // Apr 11 2026: observe per-batch miss count
+                            // distribution. Measures "all or nothing"
+                            // amplification — one miss forces the whole
+                            // batch through spawn_blocking.
+                            batch_miss_hist
+                                .with_label_values(&[&name_docs_clone])
+                                .observe(miss_count as f64);
                             // Split Phase 1 (cache probe) vs Phase 2
                             // (disk fetch) from inside get_documents_batch.
                             // Observes even when values are zero (full
@@ -5123,6 +5157,35 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.doc_cache_bytes.with_label_values(&[name]).set(dc_bytes as i64);
             m.doc_cache_evictions_total.with_label_values(&[name]).set(dc_evictions as i64);
             m.doc_cache_generations.with_label_values(&[name]).set(dc_generations as i64);
+
+            // Apr 11 2026 miss-path diagnostics
+            let (hits_by_gen, miss_above, miss_at_or_below, wt_updated, wt_skipped) =
+                engine.doc_cache_diagnostic_stats();
+            for (bucket_idx, label) in crate::doc_cache::GEN_BUCKET_LABELS.iter().enumerate() {
+                m.doc_cache_hit_generation_total
+                    .with_label_values(&[name, label])
+                    .set(hits_by_gen[bucket_idx] as i64);
+            }
+            m.doc_cache_miss_reason_total
+                .with_label_values(&[name, "above_high_water"])
+                .set(miss_above as i64);
+            m.doc_cache_miss_reason_total
+                .with_label_values(&[name, "at_or_below_high_water"])
+                .set(miss_at_or_below as i64);
+            m.doc_cache_writethrough_total
+                .with_label_values(&[name, "updated"])
+                .set(wt_updated as i64);
+            m.doc_cache_writethrough_total
+                .with_label_values(&[name, "skipped"])
+                .set(wt_skipped as i64);
+
+            let (shard_first, shard_dup) = engine.shard_concurrent_read_counts();
+            m.docstore_shard_concurrent_read_total
+                .with_label_values(&[name, "first"])
+                .set(shard_first as i64);
+            m.docstore_shard_concurrent_read_total
+                .with_label_values(&[name, "concurrent_duplicate"])
+                .set(shard_dup as i64);
 
             eprintln!("[metrics-timing] cache_stats={:?} doc_cache={:?} total={:?}",
                 t_cache_stats, t_doc_cache, metrics_start.elapsed());
