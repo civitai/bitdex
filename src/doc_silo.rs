@@ -876,6 +876,46 @@ struct BulkState {
     layouts: Vec<(u64, u64, u32)>,
 }
 
+/// Per-rayon-thread scratch state. Each rayon worker owns exactly one of
+/// these — indexed by `rayon::current_thread_index()` — so access is
+/// single-threaded and needs no synchronization. The cursor-lease pattern
+/// batches global `fetch_add` calls, trading a few KB of trailing slack
+/// per thread for ~8000x fewer atomic ops.
+#[repr(align(64))] // cache-line pad to avoid false sharing between workers
+struct ThreadSlot {
+    /// Next free byte within the current lease region.
+    lease_cur: u64,
+    /// End of the current lease region (exclusive).
+    lease_end: u64,
+    /// Layouts accumulated by this thread; drained at finalize.
+    layouts: Vec<(u64, u64, u32)>,
+}
+
+impl ThreadSlot {
+    fn new() -> Self {
+        Self {
+            lease_cur: 0,
+            lease_end: 0,
+            layouts: Vec::with_capacity(16 * 1024),
+        }
+    }
+}
+
+/// Bytes each thread reserves from the global cursor in one atomic bump.
+/// At ~85 bytes/doc average, 1 MB holds ~12K docs before the next fetch_add.
+const CURSOR_LEASE_BYTES: u64 = 1024 * 1024;
+
+/// Wrapper for a `Vec<UnsafeCell<ThreadSlot>>` that is safe to share
+/// across rayon workers: each thread only ever touches its own slot
+/// (indexed by `current_thread_index`), so there is no aliasing.
+struct ThreadSlots {
+    slots: Vec<std::cell::UnsafeCell<ThreadSlot>>,
+    /// Fallback slot for non-rayon threads (tests, ad-hoc callers).
+    fallback: parking_lot::Mutex<ThreadSlot>,
+}
+
+unsafe impl Sync for ThreadSlots {}
+
 pub struct DocSiloBulkWriter {
     silo_root: PathBuf,
     field_to_idx: ahash::AHashMap<String, u16>,
@@ -891,16 +931,15 @@ pub struct DocSiloBulkWriter {
     mmap_ptr: std::sync::atomic::AtomicPtr<u8>,
     /// Total bytes available in the pre-allocated mmap region.
     mmap_capacity: std::sync::atomic::AtomicU64,
-    /// Atomic byte cursor into the mmap. Each append bumps this by the
-    /// doc's byte length to claim a write region.
+    /// Atomic byte cursor into the mmap. Each thread leases
+    /// `CURSOR_LEASE_BYTES` at a time and carves per-doc offsets locally.
     write_cursor: std::sync::atomic::AtomicU64,
     /// Count of successful appends (atomic so we can report without locks).
     appended_count: std::sync::atomic::AtomicU64,
     /// Count of appends that were dropped because the mmap overflowed.
     overflow_count: std::sync::atomic::AtomicU64,
-    /// Per-thread layout slabs. Each thread accumulates its own Vec to
-    /// avoid contention on a shared one; drained at finalize.
-    thread_layouts: dashmap::DashMap<std::thread::ThreadId, parking_lot::Mutex<Vec<(u64, u64, u32)>>>,
+    /// Per-rayon-worker scratch state. Hot path does NO synchronization.
+    thread_slots: ThreadSlots,
 }
 
 impl DocSiloBulkWriter {
@@ -981,7 +1020,12 @@ impl DocSiloBulkWriter {
             write_cursor: std::sync::atomic::AtomicU64::new(0),
             appended_count: std::sync::atomic::AtomicU64::new(0),
             overflow_count: std::sync::atomic::AtomicU64::new(0),
-            thread_layouts: dashmap::DashMap::new(),
+            thread_slots: ThreadSlots {
+                slots: (0..rayon::current_num_threads())
+                    .map(|_| std::cell::UnsafeCell::new(ThreadSlot::new()))
+                    .collect(),
+                fallback: parking_lot::Mutex::new(ThreadSlot::new()),
+            },
         })
     }
 
@@ -1020,30 +1064,24 @@ impl DocSiloBulkWriter {
         let fields_bytes = &payload[5..];
         let key = slot_to_key(slot);
         let length = (1 + fields_bytes.len()) as u32;
-
-        // Lock-free atomic cursor bump + direct mmap write. See the
-        // struct-level comment on `DocSiloBulkWriter` for the design.
-        use std::sync::atomic::Ordering;
         let length_u64 = length as u64;
-        let offset = self.write_cursor.fetch_add(length_u64, Ordering::Relaxed);
-        let capacity = self.mmap_capacity.load(Ordering::Relaxed);
-        if offset + length_u64 > capacity {
-            self.overflow_count.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        unsafe {
-            let base = self.mmap_ptr.load(Ordering::Relaxed);
-            let dst = base.add(offset as usize);
-            *dst = 1u8;
-            std::ptr::copy_nonoverlapping(fields_bytes.as_ptr(), dst.add(1), fields_bytes.len());
-        }
-        let tid = std::thread::current().id();
-        let slab_cell = self
-            .thread_layouts
-            .entry(tid)
-            .or_insert_with(|| parking_lot::Mutex::new(Vec::with_capacity(8192)));
-        slab_cell.lock().push((key, offset, length));
-        self.appended_count.fetch_add(1, Ordering::Relaxed);
+
+        self.with_thread_slot(|ts| {
+            let Some(offset) = self.reserve(ts, length_u64) else { return };
+            unsafe {
+                let base = self.mmap_ptr.load(std::sync::atomic::Ordering::Relaxed);
+                let dst = base.add(offset as usize);
+                *dst = 1u8;
+                std::ptr::copy_nonoverlapping(
+                    fields_bytes.as_ptr(),
+                    dst.add(1),
+                    fields_bytes.len(),
+                );
+            }
+            ts.layouts.push((key, offset, length));
+        });
+        self.appended_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Encode a slot's packed tuples as a DocOp::Merge and append.
@@ -1084,26 +1122,63 @@ impl DocSiloBulkWriter {
 
         let key = slot_to_key(slot);
         let length = write_buf.len() as u32;
-        use std::sync::atomic::Ordering;
         let length_u64 = length as u64;
-        let offset = self.write_cursor.fetch_add(length_u64, Ordering::Relaxed);
-        let capacity = self.mmap_capacity.load(Ordering::Relaxed);
-        if offset + length_u64 > capacity {
-            self.overflow_count.fetch_add(1, Ordering::Relaxed);
-            return;
+
+        self.with_thread_slot(|ts| {
+            let Some(offset) = self.reserve(ts, length_u64) else { return };
+            unsafe {
+                let base = self.mmap_ptr.load(std::sync::atomic::Ordering::Relaxed);
+                let dst = base.add(offset as usize);
+                std::ptr::copy_nonoverlapping(write_buf.as_ptr(), dst, write_buf.len());
+            }
+            ts.layouts.push((key, offset, length));
+        });
+        self.appended_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Dispatch to the current thread's slot. Rayon workers hit a wait-free
+    /// path (plain `UnsafeCell` access indexed by `current_thread_index`);
+    /// non-rayon threads fall back to a shared mutex slot.
+    #[inline]
+    fn with_thread_slot<R>(&self, f: impl FnOnce(&mut ThreadSlot) -> R) -> R {
+        match rayon::current_thread_index() {
+            Some(i) if i < self.thread_slots.slots.len() => {
+                let cell = &self.thread_slots.slots[i];
+                // SAFETY: `rayon::current_thread_index()` returns a unique
+                // stable index per worker, so this &mut is the only live
+                // reference to this slot for the duration of the closure.
+                unsafe { f(&mut *cell.get()) }
+            }
+            _ => {
+                let mut guard = self.thread_slots.fallback.lock();
+                f(&mut *guard)
+            }
         }
-        unsafe {
-            let base = self.mmap_ptr.load(Ordering::Relaxed);
-            let dst = base.add(offset as usize);
-            std::ptr::copy_nonoverlapping(write_buf.as_ptr(), dst, write_buf.len());
+    }
+
+    /// Reserve `length` contiguous bytes in the mmap for the calling
+    /// thread. Amortizes global cursor bumps via per-thread leases of
+    /// `CURSOR_LEASE_BYTES`. Returns `None` and bumps the overflow counter
+    /// if the mmap is exhausted.
+    #[inline]
+    fn reserve(&self, ts: &mut ThreadSlot, length: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        if ts.lease_cur + length > ts.lease_end {
+            // Need a fresh lease. Grab at least enough for this doc.
+            let grab = CURSOR_LEASE_BYTES.max(length);
+            let base = self.write_cursor.fetch_add(grab, Ordering::Relaxed);
+            let capacity = self.mmap_capacity.load(Ordering::Relaxed);
+            if base + grab > capacity {
+                self.overflow_count.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            ts.lease_cur = base;
+            ts.lease_end = base + grab;
         }
-        let tid = std::thread::current().id();
-        let slab_cell = self
-            .thread_layouts
-            .entry(tid)
-            .or_insert_with(|| parking_lot::Mutex::new(Vec::with_capacity(8192)));
-        slab_cell.lock().push((key, offset, length));
-        self.appended_count.fetch_add(1, Ordering::Relaxed);
+        let offset = ts.lease_cur;
+        ts.lease_cur += length;
+        Some(offset)
     }
 
     /// Flush data.bin, build the hash index, and persist the field dict.
@@ -1127,15 +1202,18 @@ impl DocSiloBulkWriter {
             ));
         }
 
-        // Drain every thread-local layouts slab into one combined Vec.
+        // Drain every per-rayon-worker layouts slab into one combined Vec.
+        // Safety: finalize is only called after all rayon workers have
+        // completed their appends, so we hold the only live reference to
+        // each slot.
         let mut layouts: Vec<(u64, u64, u32)> = Vec::with_capacity(appended as usize);
-        let tids: Vec<std::thread::ThreadId> =
-            self.thread_layouts.iter().map(|e| *e.key()).collect();
-        for tid in tids {
-            if let Some(entry) = self.thread_layouts.get(&tid) {
-                let mut slab = entry.lock();
-                layouts.extend(slab.drain(..));
-            }
+        for cell in &self.thread_slots.slots {
+            let slab = unsafe { &mut *cell.get() };
+            layouts.append(&mut slab.layouts);
+        }
+        {
+            let mut fallback = self.thread_slots.fallback.lock();
+            layouts.append(&mut fallback.layouts);
         }
 
         // Flush the mmap, then release it before touching the file.
@@ -1166,11 +1244,15 @@ impl DocSiloBulkWriter {
             }
         }
 
-        // Build the hash index from layouts via HashIndex::build_bulk_with_capacity.
+        // Build the hash index from layouts. Sort by key first so the
+        // HashIndex probe writes hit the heap buffer in linear offset order;
+        // a random insertion order touches ~14M pages non-sequentially on
+        // Windows and turns a fast build into a minutes-long page-fault
+        // storm.
         let silo_subdir = self.silo_root.join("silo");
         let index_path = silo_subdir.join("index.bin");
         let _ = std::fs::remove_file(&index_path);
-        let entries: Vec<(u64, datasilo::IndexEntry)> = layouts
+        let mut entries: Vec<(u64, datasilo::IndexEntry)> = layouts
             .into_iter()
             .map(|(k, o, l)| {
                 (
@@ -1183,6 +1265,7 @@ impl DocSiloBulkWriter {
                 )
             })
             .collect();
+        entries.sort_unstable_by_key(|(k, _)| *k);
         datasilo::HashIndex::build_bulk(&index_path, &entries)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build_bulk: {e}")))?;
 

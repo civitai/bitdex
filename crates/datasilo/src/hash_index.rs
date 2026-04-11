@@ -492,26 +492,32 @@ impl HashIndex {
         }
         let file_size = Self::file_size_for(capacity);
 
-        // Build in heap buffer — zero-initialized (all keys = KEY_EMPTY = 0)
+        // Build the whole hash table in a heap buffer, then write it to disk
+        // with a single `write_all` call. Writing directly to an mmap'd file
+        // triggers per-page disk allocation on NTFS and turns the hot loop
+        // into a page-fault storm; a plain heap Vec is backed by the Windows
+        // pagefile (cheap commits) and serialised via one large file write.
+        //
+        // Callers building tables with dense keys should pre-sort by key to
+        // keep probe writes sequential across the buffer's pages.
         let mut buf = vec![0u8; file_size];
 
-        // Write header
+        // Write header into the heap buffer.
         buf[0..8].copy_from_slice(&MAGIC.to_le_bytes());
         buf[8..16].copy_from_slice(&capacity.to_le_bytes());
         buf[16..24].copy_from_slice(&count.to_le_bytes());
-        buf[24..32].copy_from_slice(&count.to_le_bytes()); // occupied = count (no tombstones)
+        buf[24..32].copy_from_slice(&count.to_le_bytes()); // occupied = count
 
-        // Insert entries via linear probing on the heap buffer
+        // Insert entries via linear probing.
         for &(key, ref entry) in entries {
             if key == KEY_EMPTY || key == KEY_TOMBSTONE {
-                continue; // skip reserved keys
+                continue;
             }
             let mut slot = key % capacity;
             loop {
                 let off = HEADER_SIZE + slot as usize * ENTRY_SIZE;
                 let slot_key = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
                 if slot_key == KEY_EMPTY {
-                    // Found empty slot — write entry
                     buf[off..off + 8].copy_from_slice(&key.to_le_bytes());
                     buf[off + 8..off + 16].copy_from_slice(&entry.offset.to_le_bytes());
                     buf[off + 16..off + 20].copy_from_slice(&entry.length.to_le_bytes());
@@ -522,17 +528,18 @@ impl HashIndex {
             }
         }
 
-        // Write entire buffer to file in one shot. Truncate-and-overwrite
-        // so callers can use this as an in-place rebuild for grow.
         if path.exists() {
             std::fs::remove_file(path)?;
         }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true).write(true).create_new(true).open(path)?;
-        file.set_len(file_size as u64)?;
-        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        mmap.copy_from_slice(&buf);
-        mmap.flush()?;
+        use std::io::Write;
+        file.write_all(&buf)?;
+        file.sync_data()?;
+        drop(buf);
+
+        // Re-mmap the completed file for the returned HashIndex.
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
 
         Ok(Self { mmap, capacity, count, occupied: count })
     }
