@@ -6207,8 +6207,7 @@ impl ConcurrentEngine {
     ///
     /// Returns `(docs_copied, data_bytes)` on success.
     pub fn copy_docstore_to_silo(&self) -> Result<(u64, u64)> {
-        use crate::doc_silo::{field_value_to_packed, DocOp};
-        const FETCH_CHUNK: usize = 500_000;
+        const FETCH_CHUNK: usize = 200_000;
 
         let silo = self
             .doc_silo
@@ -6220,130 +6219,74 @@ impl ConcurrentEngine {
         drop(snap);
         let total_alive = alive_bitmap.len() as u64;
         eprintln!(
-            "copy_docstore_to_silo: {} alive slots, fetch_chunk={}",
+            "copy_docstore_to_silo: {} alive slots, fetch_chunk={} (single bulk_load mode)",
             total_alive, FETCH_CHUNK
         );
 
         let overall_start = std::time::Instant::now();
+        // Accumulate every (slot, StoredDoc) into one Vec. At 14M this is ~3 GB.
+        // At 107M this is ~22 GB, tight on 32 GB RAM — relies on Windows paging
+        // to absorb overflow. Streaming via ops log + compact hits quadratic
+        // per-compact sync cost (see docs/_in/datasilo-port-14m-findings.md),
+        // so single-pass bulk_load remains the best option for now.
+        let mut all_docs: Vec<(u32, StoredDoc)> = Vec::with_capacity(total_alive as usize);
         let mut batch_slots: Vec<u32> = Vec::with_capacity(FETCH_CHUNK);
-        let mut total_copied: u64 = 0;
 
-        let process_chunk = |slots: &mut Vec<u32>,
-                             silo: &parking_lot::RwLock<crate::doc_silo::DocSilo>,
-                             docstore: &parking_lot::RwLock<DocStoreV3>|
-         -> Result<u64> {
-            if slots.is_empty() {
-                return Ok(0);
+        let mut drain_batch = |batch: &mut Vec<u32>,
+                               out: &mut Vec<(u32, StoredDoc)>,
+                               docstore: &parking_lot::RwLock<DocStoreV3>|
+         -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
             }
-            let t_fetch = std::time::Instant::now();
             let (docs, _, _) = {
                 let guard = docstore.read();
-                guard.get_many(slots)?
+                guard.get_many(batch)?
             };
-            let fetch_s = t_fetch.elapsed().as_secs_f64();
-
-            // Register any new field names under a brief write lock.
-            let fields_to_add: Vec<String> = {
-                let guard = silo.read();
-                let f2i = guard.field_to_idx();
-                let mut names: Vec<String> = Vec::new();
-                for maybe_doc in &docs {
-                    if let Some(doc) = maybe_doc {
-                        for name in doc.fields.keys() {
-                            if !f2i.contains_key(name) && !names.contains(name) {
-                                names.push(name.clone());
-                            }
-                        }
-                    }
-                }
-                names
-            };
-            if !fields_to_add.is_empty() {
-                let mut guard = silo.write();
-                for name in fields_to_add {
-                    guard.ensure_field_index(&name);
+            for (slot_id, maybe_doc) in batch.iter().zip(docs.into_iter()) {
+                if let Some(doc) = maybe_doc {
+                    out.push((*slot_id, doc));
                 }
             }
-
-            let t_encode = std::time::Instant::now();
-            let mut ops: Vec<DocOp> = Vec::with_capacity(slots.len());
-            let mut present: u64 = 0;
-            {
-                let guard = silo.read();
-                let f2i = guard.field_to_idx();
-                for (slot_id, maybe_doc) in slots.iter().zip(docs.iter()) {
-                    if let Some(doc) = maybe_doc {
-                        let mut fields: Vec<(u16, crate::shard_store_doc::PackedValue)> =
-                            Vec::with_capacity(doc.fields.len());
-                        for (name, value) in &doc.fields {
-                            if let Some(&idx) = f2i.get(name) {
-                                fields.push((idx, field_value_to_packed(value)));
-                            }
-                        }
-                        ops.push(DocOp::Create { slot: *slot_id, fields });
-                        present += 1;
-                    }
-                }
-            }
-            let encode_s = t_encode.elapsed().as_secs_f64();
-
-            let t_append = std::time::Instant::now();
-            {
-                let guard = silo.read();
-                guard.apply_ops_batch(&ops).map_err(|e| {
-                    crate::error::BitdexError::Storage(format!("silo apply_ops_batch: {e}"))
-                })?;
-            }
-            let append_s = t_append.elapsed().as_secs_f64();
-
-            let t_compact = std::time::Instant::now();
-            let compacted = {
-                let mut guard = silo.write();
-                guard.compact().map_err(|e| {
-                    crate::error::BitdexError::Storage(format!("silo compact: {e}"))
-                })?
-            };
-            let compact_s = t_compact.elapsed().as_secs_f64();
-
-            eprintln!(
-                "  chunk: {} slots → {} present, fetch {:.1}s, encode {:.1}s, append {:.1}s, compact {:.1}s ({} ops)",
-                slots.len(), present, fetch_s, encode_s, append_s, compact_s, compacted
-            );
-            slots.clear();
-            Ok(present)
+            batch.clear();
+            Ok(())
         };
 
+        let mut last_progress_pct = -1i64;
         for slot in alive_bitmap.iter() {
             batch_slots.push(slot);
             if batch_slots.len() >= FETCH_CHUNK {
-                total_copied +=
-                    process_chunk(&mut batch_slots, silo.as_ref(), self.docstore.as_ref())?;
-                eprintln!(
-                    "  progress: {} / {} ({:.1}%), elapsed {:.1}s",
-                    total_copied,
-                    total_alive,
-                    100.0 * total_copied as f64 / total_alive.max(1) as f64,
-                    overall_start.elapsed().as_secs_f64()
-                );
+                drain_batch(&mut batch_slots, &mut all_docs, self.docstore.as_ref())?;
+                let pct = (100.0 * all_docs.len() as f64 / total_alive.max(1) as f64) as i64;
+                if pct / 5 > last_progress_pct / 5 {
+                    eprintln!(
+                        "  fetched {} / {} ({}%), elapsed {:.1}s",
+                        all_docs.len(),
+                        total_alive,
+                        pct,
+                        overall_start.elapsed().as_secs_f64()
+                    );
+                    last_progress_pct = pct;
+                }
             }
         }
-        total_copied +=
-            process_chunk(&mut batch_slots, silo.as_ref(), self.docstore.as_ref())?;
+        drain_batch(&mut batch_slots, &mut all_docs, self.docstore.as_ref())?;
 
-        // Single end-of-batch sync commits the data + index mmaps to disk.
+        let fetched_docs = all_docs.len() as u64;
         eprintln!(
-            "copy_docstore_to_silo: streamed {} docs in {:.1}s, syncing...",
-            total_copied,
+            "copy_docstore_to_silo: fetched {} docs in {:.1}s, calling bulk_load",
+            fetched_docs,
             overall_start.elapsed().as_secs_f64()
         );
-        let t_sync = std::time::Instant::now();
-        {
-            let guard = silo.read();
-            guard.sync().map_err(|e| {
-                crate::error::BitdexError::Storage(format!("silo sync: {e}"))
-            })?;
-        }
-        let sync_s = t_sync.elapsed().as_secs_f64();
+
+        let loaded = {
+            let mut guard = silo.write();
+            guard.bulk_load(&all_docs).map_err(|e| {
+                crate::error::BitdexError::Storage(format!("silo bulk_load: {e}"))
+            })?
+        };
+        // Drop the Vec immediately so bulk_load's encode buffer has headroom.
+        drop(all_docs);
 
         let data_bytes = {
             let guard = silo.read();
@@ -6357,12 +6300,12 @@ impl ConcurrentEngine {
         }
 
         eprintln!(
-            "copy_docstore_to_silo: done in {:.1}s total (sync {:.1}s), data.bin = {:.1} MB",
+            "copy_docstore_to_silo: loaded {} docs in {:.1}s, data.bin = {:.1} MB",
+            loaded,
             overall_start.elapsed().as_secs_f64(),
-            sync_s,
             data_bytes as f64 / 1e6
         );
-        Ok((total_copied, data_bytes))
+        Ok((loaded, data_bytes))
     }
 
     /// Set the WAL writer for the V2 write path. When set, put() and patch_document()

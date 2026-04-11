@@ -171,6 +171,29 @@ That removes the 27 GB docstore from the working set and cuts ingest
 memory to ~100 MB per rayon thread. Out of scope for this session — it's
 `dump_processor.rs` surgery plus a new write adapter on the silo side.
 
+### Attempt 3: single bulk_load at 107M
+
+After validating the streaming path couldn't scale, I reverted `copy_docstore_to_silo` to the proven single-pass `bulk_load` and started the server on the already-dumped 107M docstore state (no redump needed — docstore was still on disk from the 7.3-minute dump). The populate printed "fetched 5,600,000 / 109,106,021 (5%) elapsed 16.8s" and then stalled for 3+ minutes with no further progress messages.
+
+Checked the server process memory:
+
+```
+WorkingSetSize  : 34,914,537,472  (32.5 GB in RAM)
+PrivatePageCount: 43,303,743,488  (40.3 GB committed total)
+```
+
+Process was 40 GB committed against 32 GB physical RAM — ~8 GB in the page file. Every docstore read hit a paged-out region and had to swap in. The all_docs Vec accumulating ~20 GB was evicting docstore page cache; docstore reads then re-paged in the docstore pages, evicting Vec regions. Classic thrashing cycle.
+
+Confirmed: **both streaming and single-pass populate paths are memory-bound at 107M on a 32 GB box** because the populate process needs simultaneous access to (1) the 27 GB DocStoreV3 mmap, (2) a growing DocSilo data.bin (~30 GB expected), (3) the Rust working set. Even perfect scheduling can't fit all three in 32 GB.
+
+### Port status summary
+
+- **Code**: production-quality and committed. Seven commits on `ivy/datasilo-port-doc-layer`. 18 crate tests + 9 integration tests all green. Engine integration plumbs DocSilo through the hot read path with automatic fallback to DocStoreV3 when the silo is empty.
+- **14M**: validated end-to-end three times, numbers reproducible. Dump 35s, populate 160s (single-pass) or 775s (streaming), query_docs P99 < 5ms max < 10ms.
+- **107M dump**: works (440s / 7.3 min, 109.1M alive docs, 27 GB on disk).
+- **107M populate via DocStoreV3 intermediary**: architecturally unreachable on a 32 GB machine. Confirmed by two distinct failure modes (streaming flush thrash + single-bulk paging thrash).
+- **107M end-to-end**: requires direct CSV → DocSilo dump path. Tractable but not in this session's scope.
+
 ## 107M Stretch Goal — Blocked
 
 Two independent blockers tripped the 107M attempt this session:
