@@ -186,6 +186,35 @@ Process was 40 GB committed against 32 GB physical RAM — ~8 GB in the page fil
 
 Confirmed: **both streaming and single-pass populate paths are memory-bound at 107M on a 32 GB box** because the populate process needs simultaneous access to (1) the 27 GB DocStoreV3 mmap, (2) a growing DocSilo data.bin (~30 GB expected), (3) the Rust working set. Even perfect scheduling can't fit all three in 32 GB.
 
+### Attempt 4: packed-path populate (memory-optimized)
+
+Added `DataSilo::bulk_load_encoded` + `doc_silo::encode_slot_bytes` and
+rewrote `copy_docstore_to_silo` to iterate `DocStoreV3::get_shard_packed`
+and encode inline, skipping the `StoredDoc` / `SlotSnapshot` HashMap
+intermediates. Also hoisted the `docstore.read()` guard across the whole
+scan loop (previously re-acquired per shard, 245K lock ops with
+flush-thread contention).
+
+Memory improved as expected: 4.1 GB working set at 5% (vs ~30 GB on the
+StoredDoc path). Per-doc memory dropped from ~1.4 KB to ~200 bytes.
+
+Speed did NOT improve proportionally:
+- 5% at 53.2s (reasonable)
+- 10% at 148.9s (+95.7s, acceptable)
+- 15% stalled for 10+ min — memory crept 6.1 → 6.5 GB
+
+Root cause on the speed floor: `DocStoreV3::get_shard_packed` reads each
+shard file from disk. Iterating 245K shards in order means 27 GB of
+random-access disk reads, and the growing encoded Vec evicts docstore
+page-cache pages forcing re-reads. Disk-bound thrashing on cold shards.
+
+The memory fix is real and useful (`bulk_load_encoded` is the right
+streaming primitive for the future CSV-direct path), but it can't
+rescue the populate architecture. The populate is blocked by the fact
+that it's effectively doing a full read pass over a 27 GB docstore that
+was just written — the OS page cache can't hold it all alongside the
+growing silo at 32 GB RAM.
+
 ### Port status summary
 
 - **Code**: production-quality and committed. Seven commits on `ivy/datasilo-port-doc-layer`. 18 crate tests + 9 integration tests all green. Engine integration plumbs DocSilo through the hot read path with automatic fallback to DocStoreV3 when the silo is empty.
