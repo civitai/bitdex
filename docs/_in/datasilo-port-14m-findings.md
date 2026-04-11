@@ -142,6 +142,35 @@ writer (v3's datasilo crate ships a `ParallelOpsWriter` primitive I
 ported but don't use from the engine yet). That's a follow-up
 session's worth of work, not an incremental patch. Tracked below.
 
+## 107M attempt: dump worked, populate thrashed
+
+Dumped the full 107M `images.csv` via the existing `dump-images-full.json`
+endpoint — completed in **440s (7.3 min)** with 109,106,029 alive docs
+and `docs/` dir at 27 GB. This proves the DocStoreV3 write path still
+works at full scale.
+
+Streaming populate (alive-bitmap → `get_many` chunks of 500K →
+`apply_ops_batch` → `compact()` with per-compact `sync_data`) completed
+the **first chunk** in 9.8s (fetch 0.8s, encode 1.3s, append 0.3s,
+compact 4.0s). The second chunk hung for 5+ minutes before I aborted.
+
+Root cause: **reading a 27 GB DocStoreV3 while simultaneously writing
+to a growing DocSilo blows the 32 GB RAM limit.** OS page cache for
+the docstore shards plus the silo's own data.bin mmap plus Rust process
+RSS all compete. Windows starts thrashing to the page file, and the
+`get_many` fetch rate falls off a cliff.
+
+The second-chunk ops_b.log only reached 129 MB in 5 minutes — a clear
+I/O stall, not compute. data.bin stayed at the first-chunk size (978 MB)
+because compact couldn't start until fetch+encode+append finished.
+
+**The correct fix is skipping DocStoreV3 entirely**: a dedicated CSV →
+DocSilo dump path that parses rows directly into the silo via the
+`ParallelOpsWriter` primitive already exposed by the datasilo crate.
+That removes the 27 GB docstore from the working set and cuts ingest
+memory to ~100 MB per rayon thread. Out of scope for this session — it's
+`dump_processor.rs` surgery plus a new write adapter on the silo side.
+
 ## 107M Stretch Goal — Blocked
 
 Two independent blockers tripped the 107M attempt this session:
