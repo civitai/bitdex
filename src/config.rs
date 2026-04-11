@@ -446,6 +446,16 @@ pub struct CacheConfig {
     /// 0 = use count-based `max_maintenance_work` instead. Default: 10ms.
     #[serde(default = "default_max_maintenance_ms")]
     pub max_maintenance_ms: u64,
+    /// Use shape-grouping for filter maintenance.
+    ///
+    /// When true, cache entries are grouped by shape_hash (hash of canonical
+    /// filter_clauses). slot_matches_filter is called once per shape per slot
+    /// instead of once per entry per slot. At ~470 entries per shape (prod),
+    /// this reduces slot_matches_filter calls by ~470x.
+    ///
+    /// Default: false. Enable to A/B test before making permanent.
+    #[serde(default)]
+    pub cache_maintenance_by_shape: bool,
 }
 fn default_cache_max_entries() -> usize {
     100_000
@@ -502,6 +512,7 @@ impl Default for CacheConfig {
             preload_bounds: default_preload_bounds(),
             max_maintenance_work: default_max_maintenance_work(),
             max_maintenance_ms: default_max_maintenance_ms(),
+            cache_maintenance_by_shape: false,
         }
     }
 }
