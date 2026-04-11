@@ -26,6 +26,7 @@ use crate::types::QueryResult;
 use crate::unified_cache::{
     UnifiedCache, UnifiedCacheConfig, UnifiedEntry, UnifiedKey,
     evaluate_filter_work, evaluate_sort_work,
+    evaluate_by_shape, flatten_shape_results,
 };
 use crate::shard_store_bitmap::{
     AliveShardKey, BitmapOp, FilterBucketKey, FilterOp, SortLayerShardKey,
@@ -1461,7 +1462,8 @@ impl ConcurrentEngine {
                             let mut ct_sort_work_items: usize = 0;
                             let mut ct_sort_over_budget: usize = 0;
                             // Phase A: Brief lock — collect work items and do cheap ops
-                            let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
+                            let use_shape_path = flush_config.cache.cache_maintenance_by_shape;
+                            let (filter_work, shape_work, filter_over_budget, sort_work, sort_over_budget) = {
                                 let mut uc = flush_unified_cache.lock();
                                 ct_uc_entries = uc.len();
                                 // Batched alive removal: one Arc::make_mut per
@@ -1473,16 +1475,25 @@ impl ConcurrentEngine {
                                     ct_alive_removes = removes.len();
                                     uc.remove_slots_from_all_batch(&removes);
                                 }
-                                // Collect filter maintenance work
-                                let (fw, fob) = if !coalescer.mutated_filter_fields().is_empty() {
-                                    uc.collect_filter_work(
-                                        coalescer.filter_insert_entries(),
-                                        coalescer.filter_remove_entries(),
-                                    )
+                                // Collect filter maintenance work (legacy or shape path)
+                                let (fw, sw_shape, fob) = if !coalescer.mutated_filter_fields().is_empty() {
+                                    if use_shape_path {
+                                        let (sw, sob) = uc.collect_by_shape(
+                                            coalescer.filter_insert_entries(),
+                                            coalescer.filter_remove_entries(),
+                                        );
+                                        (Vec::new(), sw, sob)
+                                    } else {
+                                        let (fw, fob) = uc.collect_filter_work(
+                                            coalescer.filter_insert_entries(),
+                                            coalescer.filter_remove_entries(),
+                                        );
+                                        (fw, Vec::new(), fob)
+                                    }
                                 } else {
-                                    (Vec::new(), Vec::new())
+                                    (Vec::new(), Vec::new(), Vec::new())
                                 };
-                                ct_filter_work_items = fw.len();
+                                ct_filter_work_items = fw.len() + sw_shape.len();
                                 ct_filter_over_budget = fob.len();
                                 // Collect sort maintenance work
                                 let sort_mutations = coalescer.mutated_sort_slots();
@@ -1528,7 +1539,7 @@ impl ConcurrentEngine {
                                         }
                                     }
                                 }
-                                (fw, fob, sw, sob)
+                                (fw, sw_shape, fob, sw, sob)
                             }; // Phase A lock released
                             let phase_a_ns = t_phase_a.elapsed().as_nanos() as u64;
                             // Iter 4a observability: count unique canonical
@@ -1608,7 +1619,10 @@ impl ConcurrentEngine {
                             } else {
                                 None
                             };
-                            let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
+                            let (filter_results, filter_timed_out) = if use_shape_path && !shape_work.is_empty() {
+                                let (shape_results, timed_out) = evaluate_by_shape(&shape_work, &staging.filters, &staging.sorts, deadline);
+                                (flatten_shape_results(shape_results), timed_out)
+                            } else if !filter_work.is_empty() {
                                 evaluate_filter_work(&filter_work, &staging.filters, &staging.sorts, deadline)
                             } else {
                                 (Vec::new(), Vec::new())

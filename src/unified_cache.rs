@@ -47,6 +47,33 @@ pub struct CacheMaintenanceResult {
     /// Slots to remove: (slot_id, sort_value)
     pub removes: Vec<(u32, u32)>,
 }
+// ── Shape Grouping Types ─────────────────────────────────────────────────
+/// Per-entry data needed to compute shape-grouped maintenance results.
+pub struct ShapeEntryRef {
+    pub key: UnifiedKey,
+    pub min_tracked_value: u32,
+    pub direction: SortDirection,
+    /// Bitmap snapshot for the sort-only fast path: when a slot had no filter
+    /// changes, bitmap.contains(slot) proves filter membership without calling
+    /// slot_matches_filter.
+    pub bitmap: Option<Arc<RoaringBitmap>>,
+}
+/// Work item for one shape group: all entries sharing the same filter clauses.
+pub struct ShapeWorkItem {
+    /// 64-bit hash of filter_clauses — used for fast grouping.
+    pub shape_hash: u64,
+    /// The actual filter clause vector (one clone per shape, not per entry).
+    pub filter_clauses: Vec<CanonicalClause>,
+    /// Union of changed slots across all entries in this shape.
+    pub slots: Vec<u32>,
+    /// All entries under this shape.
+    pub entries: Vec<ShapeEntryRef>,
+}
+/// Result of evaluating one shape group.
+pub struct ShapeResult {
+    /// Per-entry add/remove lists.
+    pub entry_results: Vec<CacheMaintenanceResult>,
+}
 /// Configuration for the unified cache.
 #[derive(Debug, Clone)]
 pub struct UnifiedCacheConfig {
@@ -646,6 +673,22 @@ pub struct UnifiedCache {
     /// Reverse index: ShardKey → set of UnifiedKeys in that shard.
     /// Avoids O(all_entries) scan in entries_for_shard() and clear_shard_entry_dirty().
     shard_to_keys: HashMap<ShardKey, HashSet<UnifiedKey>>,
+    // ── Shape Grouping Indexes ─────────────────────────────────────────
+    /// Maps canonical filter_clauses vector → set of UnifiedKeys sharing that shape.
+    ///
+    /// Keyed by the actual Vec<CanonicalClause> (not a hash) to avoid collision
+    /// bugs where two distinct clause vectors collide on the 64-bit hash. The
+    /// ahash HashMap already provides fast hashing internally.
+    ///
+    /// shape_hash() is kept as a fast observability metric but NOT used as
+    /// the grouping key here.
+    shape_to_keys: HashMap<Vec<CanonicalClause>, HashSet<UnifiedKey>>,
+    /// Maps filter field name → set of canonical filter_clauses vectors that
+    /// reference that field.
+    ///
+    /// Used to narrow affected shapes to only those touching a mutated filter
+    /// field, avoiding a full scan of shape_to_keys on each flush cycle.
+    field_to_shapes: HashMap<String, HashSet<Vec<CanonicalClause>>>,
 }
 impl UnifiedCache {
     pub fn new(config: UnifiedCacheConfig) -> Self {
@@ -673,6 +716,8 @@ impl UnifiedCache {
             prefetches: 0,
             restoring: false,
             shard_to_keys: HashMap::new(),
+            shape_to_keys: HashMap::new(),
+            field_to_shapes: HashMap::new(),
         }
     }
     /// Store persisted has_more flags from meta.bin, keyed by entry ID.
@@ -715,6 +760,50 @@ impl UnifiedCache {
     pub fn get(&self, key: &UnifiedKey) -> Option<&UnifiedEntry> {
         self.entries.get(key)
     }
+    // ── Shape Index Helpers ────────────────────────────────────────────────
+    //
+    // These helpers keep shape_to_keys and field_to_shapes consistent with
+    // `entries`. Call `register_entry_in_indexes` on every insert,
+    // `remove_entry_from_indexes` on every remove. Never call `entries.remove`
+    // without also calling `remove_entry_from_indexes`.
+    /// Register a cache key in the shape indexes.
+    ///
+    /// Called after inserting a key into `self.entries`. Maintains both
+    /// `shape_to_keys` and `field_to_shapes`. Uses `Vec<CanonicalClause>` as
+    /// the shape key (not a hash) to avoid collision bugs.
+    fn register_entry_in_indexes(&mut self, key: &UnifiedKey) {
+        self.shape_to_keys
+            .entry(key.filter_clauses.clone())
+            .or_default()
+            .insert(key.clone());
+        for clause in &key.filter_clauses {
+            self.field_to_shapes
+                .entry(clause.field.clone())
+                .or_default()
+                .insert(key.filter_clauses.clone());
+        }
+    }
+    /// Deregister a cache key from the shape indexes.
+    ///
+    /// Called before removing a key from `self.entries`. Cleans up
+    /// empty shape and field entries to avoid unbounded index growth.
+    fn remove_entry_from_indexes(&mut self, key: &UnifiedKey) {
+        if let Some(keys) = self.shape_to_keys.get_mut(&key.filter_clauses) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.shape_to_keys.remove(&key.filter_clauses);
+                // Clean up field_to_shapes entries that now have no shapes
+                for clause in &key.filter_clauses {
+                    if let Some(shapes) = self.field_to_shapes.get_mut(&clause.field) {
+                        shapes.remove(&key.filter_clauses);
+                        if shapes.is_empty() {
+                            self.field_to_shapes.remove(&clause.field);
+                        }
+                    }
+                }
+            }
+        }
+    }
     /// Store a new entry, evicting LRU if over budget. Returns the meta_id assigned.
     ///
     /// Uses batch eviction: when over budget, evicts ~10% of entries in one O(n)
@@ -733,6 +822,8 @@ impl UnifiedCache {
             if let Some(set) = self.shard_to_keys.get_mut(&old_sk) {
                 set.remove(&key);
             }
+            // Remove from shape indexes
+            self.remove_entry_from_indexes(&key);
         }
         // Batch eviction: when over budget, evict ~10% of entries at once.
         // One O(n) pass handles many evictions, creating headroom so subsequent
@@ -755,6 +846,8 @@ impl UnifiedCache {
         // Maintain shard→keys index
         let sk = ShardKey::new(key.sort_field.clone(), key.direction);
         self.shard_to_keys.entry(sk).or_default().insert(key.clone());
+        // Register in shape indexes
+        self.register_entry_in_indexes(&key);
         self.entries.insert(key, entry);
         self.inserts += 1;
         meta_id
@@ -838,6 +931,8 @@ impl UnifiedCache {
             if let Some(set) = self.shard_to_keys.get_mut(&sk) {
                 set.remove(&lru_key);
             }
+            // Remove from shape indexes
+            self.remove_entry_from_indexes(&lru_key);
             self.evictions += 1;
             if !self.persistence_enabled {
                 // Without persistence, deregister fully (original behavior)
@@ -891,6 +986,8 @@ impl UnifiedCache {
                 if let Some(set) = self.shard_to_keys.get_mut(&sk) {
                     set.remove(&key);
                 }
+                // Remove from shape indexes
+                self.remove_entry_from_indexes(&key);
                 self.evictions += 1;
                 if !self.persistence_enabled {
                     self.meta.deregister(entry.meta_id);
@@ -936,6 +1033,9 @@ impl UnifiedCache {
         self.entries.clear();
         self.meta_id_to_key.clear();
         self.shard_to_keys.clear();
+        // Clear shape indexes — all entries gone, no need to call remove_entry_from_indexes per key
+        self.shape_to_keys.clear();
+        self.field_to_shapes.clear();
         self.meta = MetaIndex::new();
         self.hits = 0;
         self.misses = 0;
@@ -1101,6 +1201,8 @@ impl UnifiedCache {
         // Maintain shard→keys index
         let sk = ShardKey::new(key.sort_field.clone(), key.direction);
         self.shard_to_keys.entry(sk).or_default().insert(key.clone());
+        // Register in shape indexes
+        self.register_entry_in_indexes(&key);
         self.entries.insert(key, entry);
     }
     /// Begin restore mode: skip per-insert eviction during shard restore.
@@ -1152,6 +1254,8 @@ impl UnifiedCache {
                 if let Some(set) = self.shard_to_keys.get_mut(&sk) {
                     set.remove(key);
                 }
+                // Remove from shape indexes
+                self.remove_entry_from_indexes(key);
                 self.evictions += 1;
                 if !self.persistence_enabled {
                     self.meta.deregister(entry.meta_id);
@@ -1707,6 +1811,119 @@ impl UnifiedCache {
             .collect();
         (work, Vec::new())
     }
+    /// Phase A (shape path): Collect filter work items grouped by shape.
+    ///
+    /// Instead of one work item per entry, produces one work item per unique
+    /// filter clause vector ("shape"). Returns (shape_items, over_budget_keys).
+    ///
+    /// Shape items share a single `filter_clauses` clone and a deduplicated
+    /// slot list. Phase B evaluates `slot_matches_filter` once per shape per
+    /// slot instead of once per entry per slot.
+    pub fn collect_by_shape(
+        &self,
+        filter_inserts: &HashMap<FilterGroupKey, Vec<u32>>,
+        filter_removes: &HashMap<FilterGroupKey, Vec<u32>>,
+    ) -> (Vec<ShapeWorkItem>, Vec<UnifiedKey>) {
+        if self.entries.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        // Collect changed slots per field name
+        let mut changed_slots_per_field: HashMap<&str, HashSet<u32>> = HashMap::new();
+        for (key, slots) in filter_inserts {
+            changed_slots_per_field
+                .entry(&key.field)
+                .or_default()
+                .extend(slots.iter().copied());
+        }
+        for (key, slots) in filter_removes {
+            changed_slots_per_field
+                .entry(&key.field)
+                .or_default()
+                .extend(slots.iter().copied());
+        }
+        if changed_slots_per_field.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        // Find affected shapes via field_to_shapes index (exact Vec<CanonicalClause> keys)
+        let mut affected_shapes: HashSet<Vec<CanonicalClause>> = HashSet::new();
+        for field in changed_slots_per_field.keys() {
+            if let Some(shapes) = self.field_to_shapes.get(*field) {
+                affected_shapes.extend(shapes.iter().cloned());
+            }
+        }
+        if affected_shapes.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        // Budget check (count-based, same logic as collect_filter_work)
+        // Estimate affected entries by summing shape sizes
+        let total_changed_slots: usize = changed_slots_per_field.values().map(|s| s.len()).sum();
+        let affected_entry_count: usize = affected_shapes
+            .iter()
+            .filter_map(|clauses| self.shape_to_keys.get(clauses))
+            .map(|keys| keys.len())
+            .sum();
+        let estimated_work = affected_entry_count * total_changed_slots;
+        if self.config.max_maintenance_ms == 0 && estimated_work > self.config.max_maintenance_work {
+            // Over count-based budget: collect all keys for rebuild
+            let over_budget: Vec<UnifiedKey> = affected_shapes
+                .iter()
+                .filter_map(|clauses| self.shape_to_keys.get(clauses))
+                .flatten()
+                .filter(|key| {
+                    self.entries.get(*key).map_or(false, |e| !e.needs_rebuild)
+                })
+                .cloned()
+                .collect();
+            return (Vec::new(), over_budget);
+        }
+        // Build shape work items: one per affected shape (exact clauses, no collision risk)
+        let mut items = Vec::with_capacity(affected_shapes.len());
+        for filter_clauses in affected_shapes {
+            let Some(keys) = self.shape_to_keys.get(&filter_clauses) else {
+                continue;
+            };
+            // Collect live entries for this shape
+            let mut entry_refs: Vec<ShapeEntryRef> = Vec::new();
+            for key in keys {
+                let Some(entry) = self.entries.get(key) else {
+                    continue;
+                };
+                if entry.needs_rebuild {
+                    continue;
+                }
+                entry_refs.push(ShapeEntryRef {
+                    key: key.clone(),
+                    min_tracked_value: entry.min_tracked_value,
+                    direction: entry.direction,
+                    bitmap: None, // filter path doesn't use bitmap fast-path
+                });
+            }
+            if entry_refs.is_empty() {
+                continue;
+            }
+            // Build the union of changed slots relevant to this shape's fields
+            let mut slots: Vec<u32> = Vec::new();
+            for clause in &filter_clauses {
+                if let Some(field_slots) = changed_slots_per_field.get(clause.field.as_str()) {
+                    slots.extend(field_slots.iter().copied());
+                }
+            }
+            slots.sort_unstable();
+            slots.dedup();
+            if slots.is_empty() {
+                continue;
+            }
+            // shape_hash is computed for observability/future use but NOT used for grouping
+            let hash = shape_hash(&filter_clauses);
+            items.push(ShapeWorkItem {
+                shape_hash: hash,
+                filter_clauses,
+                slots,
+                entries: entry_refs,
+            });
+        }
+        (items, Vec::new())
+    }
     /// Phase A: Collect sort maintenance work items under brief lock.
     ///
     /// Returns (work_items, over_budget_keys).
@@ -1899,6 +2116,22 @@ impl UnifiedCache {
             }
         }
     }
+}
+// ── Shape Hash ────────────────────────────────────────────────────────────
+/// Compute a 64-bit hash of a canonical filter clause vector.
+///
+/// Two entries with identical `filter_clauses` produce the same hash.
+/// `CanonicalClause` is already sorted by `canonicalize()` in `cache.rs`,
+/// so the hash is order-independent (stable regardless of original clause order).
+///
+/// Hash collisions are negligible at <1K unique shapes. A collision only
+/// inflates work (the shape work item contains the actual clauses, not just
+/// the hash), so correctness is preserved even under collision.
+pub(crate) fn shape_hash(clauses: &[CanonicalClause]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = ahash::AHasher::default();
+    clauses.hash(&mut h);
+    h.finish()
 }
 // ── Filter Evaluation ──────────────────────────────────────────────────────
 /// Evaluate whether a slot matches ALL clauses in a filter predicate.
@@ -2287,6 +2520,122 @@ fn compute_min_per_field<'a>(
         }
     }
     out
+}
+// ── Phase B: Shape-Grouped Evaluation ────────────────────────────────────
+/// Phase B (shape path): Evaluate shape work items outside the cache lock.
+///
+/// For each `ShapeWorkItem`:
+///   1. Calls `slot_matches_filter` ONCE per slot (not per entry per slot).
+///   2. Broadcasts the result to every `ShapeEntryRef`: matching slots are
+///      added if they also qualify on sort value; non-matching slots are
+///      removed from any entry that currently contains them.
+///
+/// Returns (shape_results, timed_out_keys). The caller converts `shape_results`
+/// to `Vec<CacheMaintenanceResult>` and passes them to `apply_maintenance_results`.
+pub fn evaluate_by_shape(
+    items: &[ShapeWorkItem],
+    filters: &FilterIndex,
+    sorts: &SortIndex,
+    deadline: Option<Instant>,
+) -> (Vec<ShapeResult>, Vec<UnifiedKey>) {
+    // Precompute sort values for all unique (sort_field, slot) pairs.
+    // We need a CacheMaintenanceItem-compatible view for precompute_sort_values.
+    // Build a temporary vec of items using ShapeEntryRef.key.sort_field for
+    // the per-entry sort field.
+    //
+    // Strategy: gather all (sort_field, slot) pairs across all items/entries,
+    // deduplicate, call reconstruct_value once per unique pair.
+    let mut slots_by_field: HashMap<&str, Vec<u32>> = HashMap::new();
+    for item in items {
+        for entry_ref in &item.entries {
+            slots_by_field
+                .entry(entry_ref.key.sort_field.as_str())
+                .or_default()
+                .extend_from_slice(&item.slots);
+        }
+    }
+    let mut reconstructed: HashMap<(&str, u32), u32> = HashMap::new();
+    for (field_name, mut slots) in slots_by_field {
+        let Some(field) = sorts.get_field(field_name) else {
+            continue;
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        for slot in slots {
+            let value = field.reconstruct_value(slot);
+            reconstructed.insert((field_name, slot), value);
+        }
+    }
+    let mut shape_results = Vec::with_capacity(items.len());
+    let mut timed_out = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        // Deadline check every 64 shape items
+        if let Some(deadline) = deadline {
+            if i > 0 && i % 64 == 0 && Instant::now() > deadline {
+                for remaining in &items[i..] {
+                    for entry_ref in &remaining.entries {
+                        timed_out.push(entry_ref.key.clone());
+                    }
+                }
+                break;
+            }
+        }
+        // Evaluate each slot against the shape's filter clauses ONCE
+        // For each slot: (matches_filter, []) — removes are per-entry below
+        let mut slot_matches: Vec<(u32, bool)> = Vec::with_capacity(item.slots.len());
+        for &slot in &item.slots {
+            let matches = slot_matches_filter(slot, &item.filter_clauses, filters, sorts);
+            slot_matches.push((slot, matches));
+        }
+        // Build per-entry results by broadcasting the shape-level match result
+        let mut entry_results: Vec<CacheMaintenanceResult> = Vec::new();
+        for entry_ref in &item.entries {
+            let sort_field = entry_ref.key.sort_field.as_str();
+            let mut adds = Vec::new();
+            let mut removes = Vec::new();
+            for &(slot, matches) in &slot_matches {
+                let sort_value = reconstructed
+                    .get(&(sort_field, slot))
+                    .copied()
+                    .unwrap_or(0);
+                if matches {
+                    // Slot matches the shape's filter — add if sort qualifies
+                    let qualifies = match entry_ref.direction {
+                        SortDirection::Desc => sort_value > entry_ref.min_tracked_value,
+                        SortDirection::Asc => sort_value < entry_ref.min_tracked_value,
+                    };
+                    if qualifies {
+                        adds.push((slot, sort_value));
+                    }
+                } else {
+                    // Slot no longer matches — remove it from this entry's bitmap.
+                    // We can't check bitmap.contains here (no bitmap in filter path)
+                    // but apply_maintenance_results handles spurious removes safely
+                    // (roaring bitmap remove is a no-op if the slot isn't present).
+                    removes.push((slot, sort_value));
+                }
+            }
+            if !adds.is_empty() || !removes.is_empty() {
+                entry_results.push(CacheMaintenanceResult {
+                    key: entry_ref.key.clone(),
+                    adds,
+                    removes,
+                });
+            }
+        }
+        if !entry_results.is_empty() {
+            shape_results.push(ShapeResult { entry_results });
+        }
+    }
+    (shape_results, timed_out)
+}
+/// Flatten shape results into a flat `Vec<CacheMaintenanceResult>` for
+/// `apply_maintenance_results`. Avoids modifying Phase C.
+pub fn flatten_shape_results(shape_results: Vec<ShapeResult>) -> Vec<CacheMaintenanceResult> {
+    shape_results
+        .into_iter()
+        .flat_map(|sr| sr.entry_results)
+        .collect()
 }
 #[cfg(test)]
 mod tests {
@@ -3645,5 +3994,419 @@ mod tests {
         let total_ns: u128 = samples.iter().map(|(e, _, _)| e.as_nanos()).sum();
         let avg_ms = (total_ns as f64 / iters as f64) / 1_000_000.0;
         println!("[bench] avg collect_sort_work: {:.3}ms over {} iters", avg_ms, iters);
+    }
+
+    // ── Shape Index Tests ─────────────────────────────────────────────────
+    //
+    // Required by spec: test_shape_registration_on_insert,
+    // test_shape_deregistration_on_evict, test_shape_grouping_parity,
+    // test_shape_grouping_multi_shape_disjoint_fields.
+
+    #[test]
+    fn test_shape_registration_on_insert() {
+        // Insert 3 entries with the same filter clauses but different sort fields.
+        // shape_to_keys should have exactly 1 shape key with 3 entries.
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 100,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 50,
+            max_capacity: 200,
+            min_filter_size: 0,
+            ..Default::default()
+        });
+        let clauses: Vec<(&str, &str, &str)> = vec![("nsfwLevel", "eq", "1")];
+        let slots: Vec<u32> = (0..10).collect();
+        for sort in &["reactionCount", "sortAt", "commentCount"] {
+            let key = make_key(&clauses, sort, SortDirection::Desc);
+            cache.form_and_store(key, &slots, false, 100, |s| 100 - s);
+        }
+        // All three share the same filter clauses, so one shape key covers all
+        let shape_key_1 = vec![CanonicalClause {
+            field: "nsfwLevel".into(),
+            op: "eq".into(),
+            value_repr: "1".into(),
+        }];
+        let keys_in_shape = cache.shape_to_keys.get(&shape_key_1).unwrap();
+        assert_eq!(
+            keys_in_shape.len(), 3,
+            "Expected 3 entries under the same shape key"
+        );
+        // field_to_shapes should map "nsfwLevel" → {shape_key_1}
+        let shapes_for_field = cache.field_to_shapes.get("nsfwLevel").unwrap();
+        assert!(
+            shapes_for_field.contains(&shape_key_1),
+            "field_to_shapes should contain the shape key"
+        );
+        // Inserting a 4th entry with different filter clauses should NOT appear in the same shape
+        let key2 = make_key(&[("nsfwLevel", "eq", "2")], "sortAt", SortDirection::Asc);
+        cache.form_and_store(key2, &slots, false, 100, |s| s);
+        let shape_key_2 = vec![CanonicalClause {
+            field: "nsfwLevel".into(),
+            op: "eq".into(),
+            value_repr: "2".into(),
+        }];
+        assert_ne!(&shape_key_1, &shape_key_2, "Different filter clauses are different keys");
+        assert_eq!(
+            cache.shape_to_keys.get(&shape_key_1).unwrap().len(), 3,
+            "Original shape still has 3 entries"
+        );
+        assert_eq!(
+            cache.shape_to_keys.get(&shape_key_2).unwrap().len(), 1,
+            "New shape has 1 entry"
+        );
+    }
+
+    #[test]
+    fn test_shape_deregistration_on_evict_lru() {
+        // Insert 2 entries sharing a shape, evict one via evict_lru, verify indexes updated.
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 100,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 50,
+            max_capacity: 200,
+            min_filter_size: 0,
+            ..Default::default()
+        });
+        let clauses: Vec<(&str, &str, &str)> = vec![("nsfwLevel", "eq", "1")];
+        let slots: Vec<u32> = (0..10).collect();
+        let key1 = make_key(&clauses, "reactionCount", SortDirection::Desc);
+        let key2 = make_key(&clauses, "sortAt", SortDirection::Desc);
+        cache.form_and_store(key1.clone(), &slots, false, 100, |s| 100 - s);
+        cache.form_and_store(key2.clone(), &slots, false, 100, |s| 100 - s);
+        let shape_key = vec![CanonicalClause {
+            field: "nsfwLevel".into(),
+            op: "eq".into(),
+            value_repr: "1".into(),
+        }];
+        assert_eq!(cache.shape_to_keys.get(&shape_key).unwrap().len(), 2);
+        // Evict one entry
+        cache.evict_lru();
+        // Shape should still exist with 1 entry
+        assert_eq!(
+            cache.shape_to_keys.get(&shape_key).unwrap().len(), 1,
+            "After evicting one of two entries, shape should have 1 entry left"
+        );
+        assert!(
+            cache.field_to_shapes.get("nsfwLevel").unwrap().contains(&shape_key),
+            "field_to_shapes should still contain the shape (1 entry remains)"
+        );
+    }
+
+    #[test]
+    fn test_shape_deregistration_on_evict_all_removed() {
+        // When the last entry under a shape is evicted, the shape and field entries should be cleaned up.
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 100,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 50,
+            max_capacity: 200,
+            min_filter_size: 0,
+            ..Default::default()
+        });
+        let clauses: Vec<(&str, &str, &str)> = vec![("nsfwLevel", "eq", "99")];
+        let slots: Vec<u32> = (0..5).collect();
+        let key1 = make_key(&clauses, "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key1.clone(), &slots, false, 100, |s| 100 - s);
+        let shape_key = vec![CanonicalClause {
+            field: "nsfwLevel".into(),
+            op: "eq".into(),
+            value_repr: "99".into(),
+        }];
+        assert!(cache.shape_to_keys.contains_key(&shape_key));
+        // Evict the single entry
+        cache.evict_lru();
+        // Shape and field entries must be fully cleaned up
+        assert!(
+            !cache.shape_to_keys.contains_key(&shape_key),
+            "shape_to_keys should not have the shape key after last entry evicted"
+        );
+        assert!(
+            cache.field_to_shapes.get("nsfwLevel").map_or(true, |s| !s.contains(&shape_key)),
+            "field_to_shapes should not reference the removed shape"
+        );
+    }
+
+    #[test]
+    fn test_shape_deregistration_on_clear() {
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 100,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 50,
+            max_capacity: 200,
+            min_filter_size: 0,
+            ..Default::default()
+        });
+        let slots: Vec<u32> = (0..5).collect();
+        for i in 0..5u64 {
+            let key = make_key(&[("type", "eq", &i.to_string())], "sortAt", SortDirection::Desc);
+            cache.form_and_store(key, &slots, false, 100, |s| s);
+        }
+        assert!(!cache.shape_to_keys.is_empty());
+        assert!(!cache.field_to_shapes.is_empty());
+        cache.clear();
+        assert!(cache.shape_to_keys.is_empty(), "shape_to_keys must be empty after clear()");
+        assert!(cache.field_to_shapes.is_empty(), "field_to_shapes must be empty after clear()");
+    }
+
+    #[test]
+    fn test_shape_deregistration_on_store_replace() {
+        // store() on an already-present key: old entry deregistered, new registered.
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 100,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 50,
+            max_capacity: 200,
+            min_filter_size: 0,
+            ..Default::default()
+        });
+        let clauses: Vec<(&str, &str, &str)> = vec![("nsfwLevel", "eq", "5")];
+        let slots: Vec<u32> = (0..5).collect();
+        let key = make_key(&clauses, "sortAt", SortDirection::Desc);
+        cache.form_and_store(key.clone(), &slots, false, 100, |s| s);
+        let shape_key = vec![CanonicalClause {
+            field: "nsfwLevel".into(),
+            op: "eq".into(),
+            value_repr: "5".into(),
+        }];
+        assert_eq!(cache.shape_to_keys.get(&shape_key).unwrap().len(), 1);
+        // Re-inserting the same key should replace (not duplicate) in shape index
+        // (HashSet insert is idempotent for the same key)
+        cache.form_and_store(key.clone(), &slots, false, 200, |s| s);
+        assert_eq!(
+            cache.shape_to_keys.get(&shape_key).unwrap().len(), 1,
+            "Re-inserting same key must not create a duplicate in shape_to_keys"
+        );
+    }
+
+    #[test]
+    fn test_shape_deregistration_on_finish_restore() {
+        // Entries evicted by finish_restore must be removed from shape indexes.
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 2, // very small
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 50,
+            max_capacity: 200,
+            min_filter_size: 0,
+            ..Default::default()
+        });
+        let slots: Vec<u32> = (0..5).collect();
+        // Insert 5 entries during restore (bypasses per-insert eviction)
+        cache.begin_restore();
+        for i in 0..5u64 {
+            let key = make_key(&[("type", "eq", &i.to_string())], "sortAt", SortDirection::Desc);
+            let meta_id = cache.meta.register(
+                &key.filter_clauses,
+                Some(&key.sort_field),
+                Some(key.direction),
+            );
+            let entry = UnifiedEntry::new(
+                &slots,
+                50,
+                200,
+                false,
+                100,
+                meta_id,
+                SortDirection::Desc,
+                |s| s,
+            );
+            cache.insert_restored_entry(key, entry);
+        }
+        assert_eq!(cache.len(), 5);
+        // finish_restore should evict down to max_entries=2
+        cache.finish_restore();
+        assert!(cache.len() <= 2, "Entries should be evicted to max_entries");
+        // shape_to_keys should have exactly the number of remaining entries
+        let total_shape_entries: usize = cache.shape_to_keys.values().map(|v| v.len()).sum();
+        assert_eq!(
+            total_shape_entries, cache.len(),
+            "shape_to_keys total count should match surviving entries"
+        );
+    }
+
+    #[test]
+    fn test_shape_grouping_parity() {
+        // Enable shape path. Run a sequence of filter mutations. Compare to legacy path.
+        // Both should produce the same final cache state.
+        let make_test_cache = || UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 100,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 50,
+            max_capacity: 200,
+            min_filter_size: 0,
+            max_maintenance_ms: 1000,
+            ..Default::default()
+        });
+        // Build filters + sorts
+        let all_slots: Vec<u32> = (0..20).collect();
+        let filter_data: &[(&str, &[(u64, &[u32])])] = &[
+            ("nsfwLevel", &[(1, &[0, 1, 2, 3, 10, 11])]),
+        ];
+        let sort_data: &[(&str, &[(u32, u32)])] = &[
+            ("reactionCount", &{
+                let mut v: Vec<(u32, u32)> = Vec::new();
+                for s in 0u32..25 {
+                    v.push((s, 1000 - s));
+                }
+                v
+            }),
+        ];
+        let filters = make_filter_index(filter_data);
+        let sorts = make_sort_index(sort_data);
+        // Set up two caches with identical entries
+        let mut cache_legacy = make_test_cache();
+        let mut cache_shape = make_test_cache();
+        let keys: Vec<UnifiedKey> = vec![
+            make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc),
+            make_key(&[("nsfwLevel", "eq", "1")], "sortAt", SortDirection::Desc),
+            make_key(&[("nsfwLevel", "eq", "1")], "commentCount", SortDirection::Asc),
+        ];
+        let initial_slots: Vec<u32> = (0..6).collect();
+        for key in &keys {
+            cache_legacy.form_and_store(key.clone(), &initial_slots, false, 100, |s| 1000 - s);
+            cache_shape.form_and_store(key.clone(), &initial_slots, false, 100, |s| 1000 - s);
+        }
+        // Perform maintenance: insert slots 10 and 11 into nsfwLevel=1
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![10, 11],
+        );
+        // Legacy path
+        cache_legacy.maintain_filter_changes(&inserts, &HashMap::new(), &filters, &sorts);
+        // Shape path (Phase A + B + C)
+        let (shape_items, over_budget) = cache_shape.collect_by_shape(&inserts, &HashMap::new());
+        assert!(over_budget.is_empty(), "Should not be over budget in this test");
+        let (shape_results, timed_out) = evaluate_by_shape(&shape_items, &filters, &sorts, None);
+        assert!(timed_out.is_empty(), "Should not time out in this test");
+        let flat = flatten_shape_results(shape_results);
+        cache_shape.apply_maintenance_results(&flat);
+        // Compare: both caches should have the same bitmap contents for each key
+        for key in &keys {
+            let entry_legacy = cache_legacy.get(key).expect("legacy entry missing");
+            let entry_shape = cache_shape.get(key).expect("shape entry missing");
+            let bm_legacy = entry_legacy.bitmap().clone();
+            let bm_shape = entry_shape.bitmap().clone();
+            assert_eq!(
+                bm_legacy, bm_shape,
+                "Shape path and legacy path disagree on cache entry for sort_field={}",
+                key.sort_field
+            );
+        }
+    }
+
+    #[test]
+    fn test_shape_grouping_multi_shape_disjoint_fields() {
+        // Two shapes with different filter fields. Mutation only touches one field's shape.
+        // The other shape must not be affected.
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 100,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 50,
+            max_capacity: 200,
+            min_filter_size: 0,
+            max_maintenance_ms: 1000,
+            ..Default::default()
+        });
+        let slots: Vec<u32> = (0..10).collect();
+        // Shape A: filter on nsfwLevel
+        let key_a1 = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let key_a2 = make_key(&[("nsfwLevel", "eq", "1")], "sortAt", SortDirection::Desc);
+        // Shape B: filter on type
+        let key_b = make_key(&[("type", "eq", "2")], "reactionCount", SortDirection::Desc);
+        cache.form_and_store(key_a1.clone(), &slots, false, 100, |s| 100 - s);
+        cache.form_and_store(key_a2.clone(), &slots, false, 100, |s| 100 - s);
+        cache.form_and_store(key_b.clone(), &slots, false, 100, |s| 100 - s);
+        let initial_card_b = cache.get(&key_b).unwrap().cardinality();
+        // Mutation: only nsfwLevel changes
+        let filters = make_filter_index(&[
+            ("nsfwLevel", &[(1, &(0..12u32).collect::<Vec<_>>())]),
+            ("type", &[(2, &slots)]),
+        ]);
+        let sorts = make_sort_index(&[
+            ("reactionCount", &{
+                let mut v: Vec<(u32, u32)> = Vec::new();
+                for s in 0u32..15 {
+                    v.push((s, 200 - s));
+                }
+                v
+            }),
+            ("sortAt", &{
+                let mut v: Vec<(u32, u32)> = Vec::new();
+                for s in 0u32..15 {
+                    v.push((s, 200 - s));
+                }
+                v
+            }),
+        ]);
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![10, 11],
+        );
+        let (shape_items, _) = cache.collect_by_shape(&inserts, &HashMap::new());
+        // Only nsfwLevel shapes should appear
+        for item in &shape_items {
+            let all_nswf = item.filter_clauses.iter().all(|c| c.field == "nsfwLevel");
+            assert!(all_nswf, "Only nsfwLevel shapes should be in work items");
+        }
+        let (shape_results, _) = evaluate_by_shape(&shape_items, &filters, &sorts, None);
+        let flat = flatten_shape_results(shape_results);
+        cache.apply_maintenance_results(&flat);
+        // key_b (type=2) must be unchanged
+        assert_eq!(
+            cache.get(&key_b).unwrap().cardinality(),
+            initial_card_b,
+            "type=2 entry must be unaffected by nsfwLevel mutation"
+        );
+        // key_a1 and key_a2 may have changed — just verify the cache is consistent
+        assert!(
+            cache.get(&key_a1).is_some(),
+            "nsfwLevel=1 reactionCount entry should still exist"
+        );
+    }
+
+    #[test]
+    fn test_sort_only_fast_path_unaffected_by_shape_flag() {
+        // With flag OFF (legacy path), sort-only maintenance (PR #182) still works.
+        // This is a correctness regression test for the sort-only path.
+        let config = UnifiedCacheConfig {
+            max_entries: 100,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 50,
+            max_capacity: 200,
+            min_filter_size: 0,
+            max_maintenance_ms: 1000,
+            ..Default::default()
+        };
+        let mut cache = UnifiedCache::new(config);
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &(0..10u32).collect::<Vec<_>>())])]);
+        let sorts = make_sort_index(&[("reactionCount", &{
+            let mut v: Vec<(u32, u32)> = Vec::new();
+            for s in 0u32..20 {
+                v.push((s, 500 - s));
+            }
+            v
+        })]);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 100, |s| 500 - s);
+        // Sort-only mutation: slot 10 gets a high reactionCount (no filter change)
+        let mut sort_mutations = HashMap::new();
+        let mut sort_slots = HashSet::new();
+        sort_slots.insert(10u32);
+        sort_mutations.insert("reactionCount", sort_slots);
+        let (sort_work, _) = cache.collect_sort_work(&sort_mutations);
+        // Build empty filter_changed_slots (no filter changes)
+        let filter_changed_slots = RoaringBitmap::new();
+        let (sort_results, timed_out) = evaluate_sort_work(
+            &sort_work, &filters, &sorts, None, Some(&filter_changed_slots),
+        );
+        assert!(timed_out.is_empty());
+        cache.apply_maintenance_results(&sort_results);
+        // Slot 10 should be added (sort qualifies, filter passes via full eval)
+        assert!(
+            cache.get(&key).unwrap().bitmap().contains(10),
+            "Sort-only slot 10 should be added after sort mutation"
+        );
     }
 }
