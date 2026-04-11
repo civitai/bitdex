@@ -336,16 +336,6 @@ struct AppState {
     queries_in_flight_peak: AtomicI64,
     /// Concurrency limit for queries. 0 = unlimited (no backpressure).
     max_query_concurrency: AtomicU32,
-    /// Apr 11 2026: count of in-flight inline-1-miss fast-path reads.
-    /// The inline-1-miss path performs a synchronous disk read on the
-    /// async worker thread, bypassing spawn_blocking and its ~2s
-    /// reactor wake delay. Bounded to prevent saturating the tokio
-    /// worker pool under traffic bursts — if this counter hits
-    /// `max_inline_miss_concurrency`, the batch falls through to
-    /// spawn_blocking instead.
-    inline_miss_in_flight: AtomicU32,
-    /// Max concurrent inline-1-miss reads. Default 16. Runtime PATCHable.
-    max_inline_miss_concurrency: AtomicU32,
     /// Snapshot capture session manager (Phase 2).
     capture: crate::capture::CaptureManager,
     /// Toggleable metric groups — disable expensive metrics without redeploy.
@@ -918,15 +908,6 @@ struct ConfigPatch {
     /// Update the query concurrency limit. 0 = unlimited (no backpressure).
     #[serde(default)]
     max_query_concurrency: Option<u32>,
-    /// Apr 11 2026: Update the inline-1-miss concurrency cap at runtime.
-    /// Inline 1-miss reads block a tokio worker thread for one disk
-    /// shard read (typical ~80ms, P99 ~400ms). Too many concurrent
-    /// inline-miss reads can saturate the worker pool and starve the
-    /// async runtime. Default cap is 16; 0 means the path is disabled
-    /// entirely (all >0-miss batches fall through to spawn_blocking).
-    /// Runtime-only — not persisted.
-    #[serde(default)]
-    max_inline_miss_concurrency: Option<u32>,
     /// Toggle query trace collection on/off without restart.
     #[serde(default)]
     enable_traces: Option<bool>,
@@ -1110,8 +1091,6 @@ impl BitdexServer {
             queries_in_flight: AtomicI64::new(0),
             queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
-            inline_miss_in_flight: AtomicU32::new(0),
-            max_inline_miss_concurrency: AtomicU32::new(16),
             capture: crate::capture::CaptureManager::new(&self.data_dir),
             metrics_bitmap_memory: AtomicBool::new(true),
             metrics_eviction_stats: AtomicBool::new(true),
@@ -2276,12 +2255,6 @@ async fn handle_patch_config(
                     eprintln!("Config patch: max_query_concurrency set to {v}");
                 }
 
-                // Apr 11 2026: inline-1-miss concurrency cap
-                if let Some(v) = patch.max_inline_miss_concurrency {
-                    state.max_inline_miss_concurrency.store(v, Ordering::Relaxed);
-                    eprintln!("Config patch: max_inline_miss_concurrency set to {v} (0 = disable inline-1-miss path, not persisted)");
-                }
-
                 // Toggle trace collection (server-wide, not persisted with index config)
                 if let Some(v) = patch.enable_traces {
                     state.enable_traces.store(v, Ordering::Relaxed);
@@ -2752,129 +2725,24 @@ async fn handle_query(
                 // At 200 concurrent queries, the .await return path adds
                 // ~571ms average per query due to reactor saturation. Skipping
                 // spawn_blocking for full-cache-hit batches eliminates this.
-                //
-                // Apr 11 2026: extended to tolerate exactly 1 cache miss.
-                // Rather than kicking the whole batch to spawn_blocking and
-                // paying the 2.1s P95 reactor wake delay, we do one
-                // synchronous shard read on the current tokio worker.
-                // Bounded via `inline_miss_in_flight` so a traffic burst
-                // can't saturate the worker pool (16 permits default).
-                // At prod's batch_miss_count distribution (48.6% of
-                // batches have ≤1 miss), this moves ~16% of batches off
-                // the slow path — Aidan's T+30 analysis.
                 let slot_ids: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
-                let inline_docs: Option<Vec<serde_json::Value>> = if slot_ids.is_empty() {
-                    Some(Vec::new())
-                } else if engine_docs.doc_cache_ref().is_none() {
-                    // Without a cache, the inline path has nothing to
-                    // hit on and fetch_and_cache_one has nothing to
-                    // populate. Fall straight to spawn_blocking and
-                    // skip the probe loop entirely — also avoids the
-                    // "miss_count == 1 + no cache + no first_miss_idx"
-                    // panic Gemini caught.
-                    None
-                } else {
-                    // Probe the cache for every slot (no early break) so we
-                    // know the exact miss count for routing and metrics.
-                    // This is microseconds even at ~100 slots/batch.
-                    let cache = engine_docs.doc_cache_ref().unwrap();
+                let inline_docs = if !slot_ids.is_empty() {
                     let mut cached: Vec<Option<crate::shard_store_doc::StoredDoc>> = Vec::with_capacity(slot_ids.len());
-                    let mut miss_count: usize = 0;
-                    let mut first_miss_idx: Option<usize> = None;
-                    for (i, &id) in slot_ids.iter().enumerate() {
-                        match cache.get(id) {
-                            Some(doc) => cached.push(Some(doc)),
-                            None => {
-                                cached.push(None);
-                                if miss_count == 0 {
-                                    first_miss_idx = Some(i);
-                                }
-                                miss_count += 1;
-                            }
-                        }
-                    }
-
-                    // Try to serve inline if possible (miss_count == 0 or == 1).
-                    let served_inline = match miss_count {
-                        0 => true,
-                        1 => {
-                            // Attempt the inline-1-miss fast path. Bounded
-                            // concurrency: if we're already at the limit OR
-                            // the cap is 0 (path disabled), fall through to
-                            // spawn_blocking. Gemini caught the original
-                            // `cap > 0 && prev >= cap` logic inverting the
-                            // cap==0 case — fixed below.
-                            let cap = state.max_inline_miss_concurrency.load(Ordering::Relaxed);
-                            let prev = state.inline_miss_in_flight.fetch_add(1, Ordering::Relaxed);
-                            if cap == 0 || prev >= cap {
-                                state.inline_miss_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                false
+                    let mut all_hit = true;
+                    if let Some(cache) = engine_docs.doc_cache_ref() {
+                        for &id in &slot_ids {
+                            if let Some(doc) = cache.get(id) {
+                                cached.push(Some(doc));
                             } else {
-                                // RAII guard decrements the counter on
-                                // any exit path (Ok, Err, or panic unwind).
-                                // Gemini caught the leak-on-panic hazard
-                                // of the original manual fetch_sub.
-                                struct InlineMissGuard<'a>(&'a AtomicU32);
-                                impl<'a> Drop for InlineMissGuard<'a> {
-                                    fn drop(&mut self) {
-                                        self.0.fetch_sub(1, Ordering::Relaxed);
-                                    }
-                                }
-                                let _guard = InlineMissGuard(&state.inline_miss_in_flight);
-
-                                let miss_idx = first_miss_idx.expect("miss_count==1 implies first_miss_idx was set");
-                                let miss_slot = slot_ids[miss_idx];
-
-                                // Use block_in_place so the tokio runtime
-                                // hands our worker's other async tasks to
-                                // a backup thread before we block on the
-                                // disk read. Without this, a burst of
-                                // 1-miss queries could park every worker
-                                // thread on sync I/O and starve the
-                                // reactor.
-                                //
-                                // INVARIANT: block_in_place PANICS on a
-                                // current_thread runtime. BitDex builds
-                                // the runtime explicitly via
-                                // `tokio::runtime::Builder::new_multi_thread()`
-                                // in src/bin/server.rs:288. If that line
-                                // ever changes to current_thread, this
-                                // path must switch to spawn_blocking.
-                                let fetch_start = Instant::now();
-                                let fetch_result = tokio::task::block_in_place(|| {
-                                    engine_docs.fetch_and_cache_one(miss_slot)
-                                });
-                                m.query_doc_disk_fetch_seconds
-                                    .with_label_values(&[&name_docs])
-                                    .observe(fetch_start.elapsed().as_secs_f64());
-
-                                match fetch_result {
-                                    Ok(doc_opt) => {
-                                        // If the doc came back as None,
-                                        // the slot was deleted. The
-                                        // response renders it as an
-                                        // empty object via the format
-                                        // loop below — correct behavior.
-                                        // A future PR can add negative
-                                        // caching (tombstone in doc_cache)
-                                        // to avoid repeated disk reads
-                                        // for deleted slots; not needed
-                                        // now because Civitai deletion
-                                        // rate is low.
-                                        cached[miss_idx] = doc_opt;
-                                        true
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("inline-1-miss fetch failed slot={miss_slot}: {e}");
-                                        false // fall through to spawn_blocking
-                                    }
-                                }
+                                all_hit = false;
+                                break;
                             }
                         }
-                        _ => false,
-                    };
-
-                    if served_inline {
+                    } else {
+                        all_hit = false;
+                    }
+                    if all_hit && cached.len() == slot_ids.len() {
+                        // All cache hits — format inline, skip spawn_blocking.
                         let format_start = Instant::now();
                         let docs: Vec<serde_json::Value> = cached.into_iter().enumerate().map(|(i, opt)| {
                             match opt {
@@ -2893,23 +2761,25 @@ async fn handle_query(
                             .observe(format_start.elapsed().as_secs_f64());
                         m.query_doc_cache_probe_seconds
                             .with_label_values(&[&name_docs])
-                            .observe(0.0); // probe included in the get() calls above
-                        // Observe actual miss count so the histogram
-                        // covers the full distribution across all paths.
+                            .observe(0.0); // cache probe included in the get() calls above
+                        // Inline fast path = 0 misses by definition.
+                        // Observe so the histogram covers the full
+                        // distribution (inline + spawn_blocking).
                         m.query_docs_batch_miss_count
                             .with_label_values(&[&name_docs])
-                            .observe(miss_count as f64);
-                        // Path label: "inline" for full-hit, "inline_1miss"
-                        // for the new 1-miss fast path — lets ops compare
-                        // the two populations separately.
-                        let path_label = if miss_count == 0 { "inline" } else { "inline_1miss" };
+                            .observe(0.0);
+                        // Count the inline fast-path hit. Lets ops compare
+                        // inline vs spawn_blocking rates and confirm the
+                        // optimization is firing as expected.
                         m.query_docs_path_total
-                            .with_label_values(&[&name_docs, path_label])
+                            .with_label_values(&[&name_docs, "inline"])
                             .inc();
                         Some(docs)
                     } else {
-                        None // fall through to spawn_blocking
+                        None // has misses, fall through to spawn_blocking
                     }
+                } else {
+                    Some(Vec::new()) // empty batch
                 };
 
                 let docs = if let Some(inline) = inline_docs {
