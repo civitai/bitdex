@@ -682,8 +682,17 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
                 write_mmap[start..end].copy_from_slice(&g.bytes);
             }
         }
-        write_mmap.flush()?;
+        // Flush the dirty mmap pages via the file handle rather than
+        // `MmapMut::flush`: on Windows the latter calls FlushViewOfFile
+        // which msyncs the entire mapping page-by-page (O(size),
+        // catastrophic for multi-GB files). Flushing the underlying File
+        // handle goes through FlushFileBuffers, which is a single kernel
+        // call and much faster. Required for persistence — on Windows,
+        // dropping an MmapMut without any flush leaves written pages
+        // unassociated with the on-disk file after the handle closes.
         drop(write_mmap);
+        data_file.sync_data()?;
+        drop(data_file);
 
         // Update the hash index. The existing index may be None if the data
         // file was previously empty.
@@ -895,5 +904,35 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
 
     pub fn index_count(&self) -> u64 {
         self.index.as_ref().map(|i| i.count()).unwrap_or(0)
+    }
+
+    /// Flush the data file to disk. `compact()` intentionally skips the
+    /// per-call flush because Windows msync is O(file size) and ruins
+    /// streaming populate perf. Callers running a batch of compacts
+    /// should call `sync()` once when the batch is complete.
+    pub fn sync(&self) -> io::Result<()> {
+        // Reopen a writable mmap on data.bin and flush it. We go through a
+        // fresh mmap because the read mmap (self.data_mmap) is read-only
+        // and can't be flushed.
+        let data_path = self.path.join("data.bin");
+        if !data_path.exists() {
+            return Ok(());
+        }
+        let file = OpenOptions::new().read(true).write(true).open(&data_path)?;
+        let len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        mmap.flush()?;
+        drop(mmap);
+        // Also flush the index file so crash-recovery finds a consistent pair.
+        let index_path = self.path.join("index.bin");
+        if index_path.exists() {
+            let idx_file = OpenOptions::new().read(true).write(true).open(&index_path)?;
+            let idx_mmap = unsafe { memmap2::MmapMut::map_mut(&idx_file)? };
+            idx_mmap.flush()?;
+        }
+        Ok(())
     }
 }

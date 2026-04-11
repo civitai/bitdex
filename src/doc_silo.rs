@@ -774,6 +774,13 @@ impl DocSilo {
         self.silo.compact()
     }
 
+    /// Flush the silo's data + index mmaps to disk. Streaming populate paths
+    /// that call `compact()` many times should call this ONCE at the end
+    /// rather than paying per-compact msync cost.
+    pub fn sync(&self) -> io::Result<()> {
+        self.silo.sync()
+    }
+
     pub fn has_ops(&self) -> bool {
         self.silo.has_ops()
     }
