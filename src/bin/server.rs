@@ -256,13 +256,45 @@ fn parse_config() -> Config {
     Config { port, data_dir, index: cli_index, index_dir, rebuild, default_query_format, log_level, enable_traces, admin_token, max_query_concurrency, trace_buffer_size }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("FATAL PANIC: {info}");
         eprintln!("Backtrace: {:?}", std::backtrace::Backtrace::force_capture());
     }));
 
+    // Explicit runtime builder to control worker thread count.
+    //
+    // Default tokio::main uses num_cpus for workers. On a CPU-dense host
+    // under heavy spawn_blocking load, the async reactor can't poll
+    // completion channels fast enough, causing multi-second delays on
+    // `.await` resumption (measured P95 = 4s, avg = 758ms in v1.0.181).
+    //
+    // Bumping workers to num_cpus × 2 gives the reactor more bandwidth
+    // to poll completion channels in parallel with other async work.
+    // Override via BITDEX_WORKER_THREADS env var for tuning.
+    let worker_threads = std::env::var("BITDEX_WORKER_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0) // 0 would panic in Runtime::Builder; fall back
+        .unwrap_or_else(|| {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            cpus.saturating_mul(2)
+        })
+        .max(1); // belt-and-suspenders: never pass 0 to Builder
+    eprintln!("BitDex starting with {} tokio worker threads", worker_threads);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let config = parse_config();
 
     // Initialize tracing with configured log level (RUST_LOG env var overrides)
