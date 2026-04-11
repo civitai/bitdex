@@ -288,3 +288,130 @@ fn alive_op_is_noop_on_cached_entry() {
         Some(&FieldValue::Single(Value::Integer(8)))
     );
 }
+
+#[test]
+fn bare_remove_on_scalar_falls_back() {
+    // Gemini H1 — Apr 11 2026. A bare Remove on a scalar field without
+    // a paired Set would previously drop the field silently, leaving
+    // the cache divergent from disk. Expected: NeedsFallback so the
+    // caller routes to the disk refresh path.
+    let cache = DocCache::new(DocCacheConfig::default());
+    cache.insert(42, seed_doc());
+    let out = cache.apply_ops_in_place(
+        42,
+        &[Op::Remove {
+            field: "nsfwLevel".into(),
+            value: json!(8),
+        }],
+    );
+    assert_eq!(out, ApplyOutcome::NeedsFallback);
+    // Entry unchanged — the cached doc still has the old value, and
+    // the caller refreshes from disk before the next read.
+    let doc = cache.get(42).unwrap();
+    assert_eq!(
+        doc.fields.get("nsfwLevel"),
+        Some(&FieldValue::Single(Value::Integer(8)))
+    );
+}
+
+#[test]
+fn remove_scalar_with_paired_set_applies_cleanly() {
+    // Regression test for the Remove look-ahead: a Remove on a scalar
+    // field followed by a Set on the SAME field should still apply
+    // in-place (the paired case that was working before the H1 fix).
+    let cache = DocCache::new(DocCacheConfig::default());
+    cache.insert(42, seed_doc());
+    let out = cache.apply_ops_in_place(
+        42,
+        &[
+            Op::Remove {
+                field: "nsfwLevel".into(),
+                value: json!(8),
+            },
+            Op::Set {
+                field: "nsfwLevel".into(),
+                value: json!(16),
+            },
+        ],
+    );
+    assert_eq!(out, ApplyOutcome::Applied);
+    let doc = cache.get(42).unwrap();
+    assert_eq!(
+        doc.fields.get("nsfwLevel"),
+        Some(&FieldValue::Single(Value::Integer(16)))
+    );
+}
+
+#[test]
+fn mid_batch_fallback_leaves_entry_unchanged() {
+    // GPT review H1 — Apr 11 2026. Earlier ops in a batch must NOT
+    // partially mutate the cached entry when a later op returns
+    // NeedsFallback. Clone-then-swap guarantees all-or-nothing
+    // semantics so the caller's fallback refresh starts from the
+    // real pre-batch state, not a half-applied mess.
+    let cache = DocCache::new(DocCacheConfig::default());
+    cache.insert(42, seed_doc());
+    let size_before = cache.size_bytes();
+    // [Set(nsfwLevel), Add(nsfwLevel)] — second op is a type-
+    // mismatch (Add on Single) that returns NeedsFallback. The
+    // earlier Set must NOT have mutated the cache.
+    let out = cache.apply_ops_in_place(
+        42,
+        &[
+            Op::Set {
+                field: "nsfwLevel".into(),
+                value: json!(16),
+            },
+            Op::Add {
+                field: "nsfwLevel".into(),
+                value: json!(99),
+            },
+        ],
+    );
+    assert_eq!(out, ApplyOutcome::NeedsFallback);
+    let doc = cache.get(42).unwrap();
+    // The pre-batch value must be intact — nsfwLevel is still 8,
+    // not the 16 that the Set would have applied.
+    assert_eq!(
+        doc.fields.get("nsfwLevel"),
+        Some(&FieldValue::Single(Value::Integer(8)))
+    );
+    // Size accounting should also be unchanged.
+    assert_eq!(cache.size_bytes(), size_before);
+}
+
+#[test]
+fn remove_scalar_followed_by_unrelated_set_falls_back() {
+    // Look-ahead must match on the same field name, not just "any Set".
+    // A Remove(nsfwLevel) followed by Set(isPublished) is NOT a paired
+    // update — it's a bare Remove plus an independent Set, and we need
+    // to fall back so disk reload preserves correctness.
+    let cache = DocCache::new(DocCacheConfig::default());
+    cache.insert(42, seed_doc());
+    let out = cache.apply_ops_in_place(
+        42,
+        &[
+            Op::Remove {
+                field: "nsfwLevel".into(),
+                value: json!(8),
+            },
+            Op::Set {
+                field: "isPublished".into(),
+                value: json!(true),
+            },
+        ],
+    );
+    assert_eq!(out, ApplyOutcome::NeedsFallback);
+    // Entry must be unchanged — critically, isPublished should NOT
+    // have been updated before the bail, because that would leave
+    // the cache in a partially-mutated state.
+    let doc = cache.get(42).unwrap();
+    assert_eq!(
+        doc.fields.get("nsfwLevel"),
+        Some(&FieldValue::Single(Value::Integer(8)))
+    );
+    assert_eq!(
+        doc.fields.get("isPublished"),
+        Some(&FieldValue::Single(Value::Bool(false)))
+    );
+}

@@ -433,17 +433,38 @@ impl DocCache {
         // lock across op application is fine — no disk I/O, no allocs
         // outside the entry's own HashMap. Single-threaded WAL reader
         // means no concurrent writer contention on the same entry.
+        //
+        // GPT review H1 — Apr 11 2026: apply ops to a *clone* of the
+        // stored doc, then atomically swap it back only if every op
+        // succeeded. The previous version mutated `entry.doc` in place
+        // and early-returned `NeedsFallback` from inside the loop,
+        // which left the cached doc in a half-applied state on bail.
+        // While `doc_cache_apply_ops_batch`'s fallback path eventually
+        // overwrote the entry from disk, the transient window had
+        // divergent state and `size_bytes` was never updated for the
+        // partial mutation. Clone-then-swap gives all-or-nothing
+        // semantics: either every op lands or the entry is untouched
+        // and the caller routes to the disk-refresh fallback. The
+        // clone cost is ~1 doc per WAL batch (hundreds per second
+        // in prod) — cheaper than one `get_many` disk read, which
+        // is what we're replacing.
         for gen in gens.iter() {
             if let Some(mut entry) = gen.entries.get_mut(&slot_id) {
                 let old_size = entry.size_bytes;
+
+                // Apply to a clone. Delete short-circuits before the
+                // swap because it drops the slot entirely — no swap
+                // needed, just remove.
+                let mut working = entry.doc.clone();
                 let mut deleted = false;
 
-                for op in ops {
+                for i in 0..ops.len() {
+                    let op = &ops[i];
                     match op {
                         Op::Set { field, value } => {
                             match json_value_to_query_value(value) {
                                 Some(v) => {
-                                    entry.doc.fields.insert(
+                                    working.fields.insert(
                                         field.clone(),
                                         FieldValue::Single(v),
                                     );
@@ -452,7 +473,7 @@ impl DocCache {
                             }
                         }
                         Op::Remove { field, value } => {
-                            match entry.doc.fields.get_mut(field) {
+                            match working.fields.get_mut(field) {
                                 Some(FieldValue::Multi(vec)) => {
                                     if let Some(target) = json_value_to_query_value(value) {
                                         vec.retain(|v| v != &target);
@@ -460,10 +481,27 @@ impl DocCache {
                                 }
                                 Some(FieldValue::Single(_)) => {
                                     // Scalar remove is the "old value"
-                                    // half of a remove/set pair. Drop
-                                    // the field; a paired Set in the
-                                    // same ops list will re-insert.
-                                    entry.doc.fields.remove(field);
+                                    // half of a remove/set pair in
+                                    // pg-sync's ops protocol. Common
+                                    // case, but nothing in the wire
+                                    // format guarantees a paired Set
+                                    // exists (SET NULL, trigger bugs,
+                                    // future op shapes). Bail unless
+                                    // a matching Set follows in the
+                                    // same ops list so disk refresh
+                                    // reloads authoritative state.
+                                    // Gemini review H1 — Apr 11 2026.
+                                    let has_paired_set = ops[i + 1..].iter().any(|later| {
+                                        matches!(
+                                            later,
+                                            Op::Set { field: f, .. } if f == field
+                                        )
+                                    });
+                                    if has_paired_set {
+                                        working.fields.remove(field);
+                                    } else {
+                                        return ApplyOutcome::NeedsFallback;
+                                    }
                                 }
                                 None => {
                                     // No current value — no-op.
@@ -475,19 +513,23 @@ impl DocCache {
                                 Some(v) => v,
                                 None => return ApplyOutcome::NeedsFallback,
                             };
-                            match entry.doc.fields.get_mut(field) {
+                            match working.fields.get_mut(field) {
                                 Some(FieldValue::Multi(vec)) => {
                                     if !vec.iter().any(|v| v == &target) {
                                         vec.push(target);
                                     }
                                 }
                                 Some(FieldValue::Single(_)) => {
-                                    // Type mismatch — caller should
-                                    // have flagged this as a fallback.
+                                    // Type mismatch on a single-value
+                                    // field. The upfront check in
+                                    // `doc_cache_apply_ops_batch` only
+                                    // knows about computed deps, not
+                                    // type shape, so this is the
+                                    // correct place to bail.
                                     return ApplyOutcome::NeedsFallback;
                                 }
                                 None => {
-                                    entry.doc.fields.insert(
+                                    working.fields.insert(
                                         field.clone(),
                                         FieldValue::Multi(vec![target]),
                                     );
@@ -505,8 +547,7 @@ impl DocCache {
                         }
                         Op::QueryOpSet { .. } => {
                             // Fan-out ops need query resolution; the
-                            // caller should route these to the refresh
-                            // path, not here. If we see one, bail.
+                            // caller routes these to the refresh path.
                             return ApplyOutcome::NeedsFallback;
                         }
                     }
@@ -523,9 +564,10 @@ impl DocCache {
                     return ApplyOutcome::Deleted;
                 }
 
-                // Update size accounting: recompute from the mutated
-                // doc and apply the delta to the generation counter.
-                let new_size = estimate_doc_size(&entry.doc);
+                // Commit: swap the working clone into the entry and
+                // update size accounting.
+                let new_size = estimate_doc_size(&working);
+                entry.doc = working;
                 entry.size_bytes = new_size;
                 drop(entry);
                 if new_size >= old_size {
