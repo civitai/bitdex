@@ -186,6 +186,10 @@ name = "rebuild_bench"
 path = "src/bin/rebuild_bench.rs"
 required-features = ["server"]
 
+[[bin]]
+name = "silo_copy"
+path = "src/bin/silo_copy.rs"
+
 [[example]]
 name = "load_from_csv"
 path = "examples/load_from_csv.rs"

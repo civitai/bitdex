@@ -215,6 +215,54 @@ that it's effectively doing a full read pass over a 27 GB docstore that
 was just written — the OS page cache can't hold it all alongside the
 growing silo at 32 GB RAM.
 
+### Attempt 5: standalone `silo_copy` bin (no engine)
+
+Added `src/bin/silo_copy.rs` — a standalone binary that opens
+`DocStoreV3` + `DocSilo` directly, skipping `ConcurrentEngine`'s
+~3 GB of bitmap state + flush thread + doc cache. Combined with the
+packed-path encoder from attempt 4, this was the leanest populate
+configuration I could build without rewriting the dump pipeline.
+
+Results (107M, from the fresh dump):
+
+```
+shards  15000/300000  (5%)   docs   6,056,074   elapsed  13.9s
+shards  30000/300000  (10%)  docs  12,391,892   elapsed  29.2s
+shards  45000/300000  (15%)  docs  18,723,956   elapsed  84.1s
+shards  45000/300000  (15%)  docs  ~24M         elapsed  ~420s  (stalled)
+```
+
+The first 10% flew (31K docs/sec × 2 CPUs reading hot pages from the
+just-written docstore). The next bucket (15%) took ~55s as the OS
+page cache started rotating. After that, rate collapsed to ~15K
+docs/sec — strongly suggesting a disk-I/O bottleneck on the cold
+shard reads once the working set exceeded the page cache budget.
+
+Extrapolating the degraded rate: ~85M docs × 15K/s ≈ 95 min more
+populate, plus bulk_load_encoded at the end. Not tractable for a
+session.
+
+### Why every docstore-intermediary path hits the same wall
+
+Every approach (streaming compact, single bulk_load, packed single
+bulk_load, engine-free packed single bulk_load) has to read the
+**entire 27 GB DocStoreV3** end-to-end in a tight loop while also
+holding a growing encoded output. On a 32 GB box the OS page cache
+can't keep both hot. The cold-read thrashing is the hard ceiling.
+
+The four variations matter for a 32 GB box, and in future they'll
+matter for memory-constrained production. But the work the populate
+has to DO — read 27 GB, write 20 GB — is fundamentally disk-bound at
+this data scale. Splitting it into memory chunks doesn't help because
+the chunks are still back-and-forth between two big mmaps that thrash
+each other.
+
+The only escape is to skip DocStoreV3 in the write path entirely: a
+dedicated CSV → DocSilo dump that never materializes the 27 GB
+intermediate. That removes 50% of the disk I/O and all of the
+page-cache contention. `bulk_load_encoded` + `encode_slot_bytes` are
+the building blocks the future direct path will use.
+
 ### Port status summary
 
 - **Code**: production-quality and committed. Seven commits on `ivy/datasilo-port-doc-layer`. 18 crate tests + 9 integration tests all green. Engine integration plumbs DocSilo through the hot read path with automatic fallback to DocStoreV3 when the silo is empty.
