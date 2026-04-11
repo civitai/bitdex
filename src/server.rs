@@ -2733,6 +2733,12 @@ async fn handle_query(
                         m.query_doc_cache_probe_seconds
                             .with_label_values(&[&name_docs])
                             .observe(0.0); // cache probe included in the get() calls above
+                        // Count the inline fast-path hit. Lets ops compare
+                        // inline vs spawn_blocking rates and confirm the
+                        // optimization is firing as expected.
+                        m.query_docs_path_total
+                            .with_label_values(&[&name_docs, "inline"])
+                            .inc();
                         Some(docs)
                     } else {
                         None // has misses, fall through to spawn_blocking
@@ -2759,10 +2765,14 @@ async fn handle_query(
                 let reverse_maps_docs = Arc::clone(&reverse_maps_docs);
                 let include_docs_docs = include_docs_docs.clone();
                 let schema_registry_docs = Arc::clone(&schema_registry_docs);
+                // Count the spawn_blocking path hit (any slot was a cache miss).
+                m.query_docs_path_total
+                    .with_label_values(&[&name_docs, "spawn_blocking"])
+                    .inc();
                 // C1 isolation: capture wall time immediately before the
                 // spawn_blocking call so we can measure dispatch gap.
                 let dispatch_start = Instant::now();
-                tokio::task::spawn_blocking(move || {
+                let (docs_vec, closure_end) = tokio::task::spawn_blocking(move || {
                     // First line inside the closure: close the dispatch
                     // gap window. Delta is pure tokio pool handoff cost.
                     let dispatch_elapsed = dispatch_start.elapsed().as_secs_f64();
@@ -2775,7 +2785,7 @@ async fn handle_query(
                     let batch_result = engine_docs.get_documents_batch(&slot_ids);
                     let batch_elapsed = batch_start.elapsed().as_secs_f64();
 
-                    match batch_result {
+                    let docs: Vec<serde_json::Value> = match batch_result {
                         Ok((stored_opts, stats, unique_shards, cache_probe_ns, disk_fetch_ns)) => {
                             // Split Phase 1 (cache probe) vs Phase 2
                             // (disk fetch) from inside get_documents_batch.
@@ -2854,8 +2864,21 @@ async fn handle_query(
                                 .map(|&id| serde_json::json!({ "id": id }))
                                 .collect()
                         }
-                    }
-                }).await.unwrap()
+                    };
+                    // Capture the closure-end timestamp as the LAST thing
+                    // before returning. Comparing this to Instant::now()
+                    // after .await resolves yields the tokio reactor wake
+                    // delay — time the completion channel waited to be
+                    // polled by the reactor. This is the ~571ms ghost
+                    // under load.
+                    let closure_end = std::time::Instant::now();
+                    (docs, closure_end)
+                }).await.unwrap();
+                // Observe tokio return delay (spawn_blocking path only).
+                m.query_tokio_return_delay_seconds
+                    .with_label_values(&[&name_docs])
+                    .observe(closure_end.elapsed().as_secs_f64());
+                docs_vec
                 }; // end if let Some(inline) / else spawn_blocking
                 Some(docs)
             } else {
