@@ -6385,6 +6385,34 @@ impl ConcurrentEngine {
         (applied, deleted, not_cached, fallback_count)
     }
 
+    /// Apr 11 2026: fetch a single slot from disk synchronously and
+    /// insert it into the doc cache. Used by the handle_query inline
+    /// 1-miss fast path to avoid the tokio reactor wake delay
+    /// (~2s P95 in prod) of a spawn_blocking round-trip when only one
+    /// slot is missing from the batch.
+    ///
+    /// The caller MUST bound concurrency around this call (e.g. via
+    /// an inline-miss in-flight counter) — it blocks the calling
+    /// thread for the duration of the shard read. The design assumes
+    /// an async worker thread calls this, so too many simultaneous
+    /// callers would starve the runtime.
+    ///
+    /// Returns:
+    /// - `Ok(Some(doc))` — fetched and cached
+    /// - `Ok(None)` — slot not present on disk (e.g. deleted)
+    /// - `Err(_)` — disk read error; caller should fall through to
+    ///   the spawn_blocking path
+    pub fn fetch_and_cache_one(&self, slot: u32) -> Result<Option<StoredDoc>> {
+        let (mut results, _, _) = self.docstore.read().get_many(&[slot])?;
+        let doc_opt = results.pop().unwrap_or(None);
+        if let Some(ref doc) = doc_opt {
+            if let Some(ref cache) = self.doc_cache {
+                cache.insert(slot, doc.clone());
+            }
+        }
+        Ok(doc_opt)
+    }
+
     /// Read live-update counters for metric scrape.
     /// Returns (refreshed, deleted, skipped, applied_in_place, fallback_refresh).
     /// `refreshed` and `fallback_refresh` both refer to disk-reload
