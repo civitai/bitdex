@@ -2161,27 +2161,40 @@ pub fn evaluate_sort_work(
             if !qualifies {
                 continue;
             }
-            // Sort-only fast path: if this slot had NO filter field changes
-            // this cycle, its filter membership hasn't changed. Use the
-            // entry's bitmap to determine membership in O(1) instead of
-            // calling slot_matches_filter (8+ bitmap lookups + string
-            // parsing per call).
+            // Sort-only fast path: use bitmap.contains only to PROVE
+            // membership, never to disprove it. A slot can be absent
+            // from the bitmap for two reasons:
+            //   1. It doesn't match the filters
+            //   2. It DOES match but its previous sort value was below
+            //      min_tracked_value (below the Top-N cutoff)
             //
-            // - Slot in bitmap → already matches filters, add to results
-            // - Slot NOT in bitmap → still doesn't match, skip
-            // - Slot HAD filter changes → full slot_matches_filter
+            // The fast path short-circuits case (2) — a rising-popularity
+            // slot crosses the threshold and bm.contains returns false
+            // because it wasn't previously in the Top-N. Treating that
+            // as "doesn't match" would prevent it from entering the
+            // cache. Instead, we fall through to slot_matches_filter
+            // for any slot not already in the bitmap.
+            //
+            // (Gemini review caught this before deploy — do NOT remove
+            // the fall-through.)
             let is_sort_only = filter_changed_slots
                 .map(|fcs| !fcs.contains(slot))
                 .unwrap_or(false);
             if is_sort_only {
                 if let Some(ref bm) = item.bitmap {
                     if bm.contains(slot) {
+                        // Already in the bitmap ⇒ already matches filters
+                        // (filter fields unchanged). Add directly, skip
+                        // the expensive slot_matches_filter call.
                         adds.push((slot, sort_value));
+                        continue;
                     }
-                    continue;
+                    // NOT in the bitmap: could be a new addition crossing
+                    // the threshold, not necessarily a filter mismatch.
+                    // Fall through to full evaluation.
                 }
             }
-            // Full filter evaluation (filter changed, or no bitmap)
+            // Full filter evaluation (filter changed, or rising-threshold)
             if slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts) {
                 adds.push((slot, sort_value));
             }
