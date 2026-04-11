@@ -2758,6 +2758,7 @@ async fn handle_query(
                 let cache_probe_hist = m.query_doc_cache_probe_seconds.clone();
                 let disk_fetch_hist = m.query_doc_disk_fetch_seconds.clone();
                 let format_hist = m.query_doc_format_seconds.clone();
+                let read_path_total = m.docstore_read_path_total.clone();
                 let docstore_hist_clone = docstore_hist.clone();
                 let name_docs_clone = name_docs.clone();
                 let ids = result.ids.clone();
@@ -2806,6 +2807,15 @@ async fn handle_query(
                                 disk_fetch_hist
                                     .with_label_values(&[&name_docs_clone])
                                     .observe(disk_fetch_ns as f64 / 1_000_000_000.0);
+                                // Track which get_many path fired. The threshold
+                                // at >4 shards matches the rayon dispatch rule in
+                                // DocStoreV3::get_many — below that, serial reads
+                                // avoid rayon overhead. If most batches are
+                                // serial, the parallel optimization isn't firing.
+                                let path = if unique_shards > 4 { "parallel" } else { "serial" };
+                                read_path_total
+                                    .with_label_values(&[&name_docs_clone, path])
+                                    .inc();
                             }
                             // Observe the phase split. Cache hits don't
                             // contribute to stats (both nanos are zero

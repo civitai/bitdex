@@ -158,6 +158,12 @@ pub struct Metrics {
     // Labeled counter to see inline-vs-spawn_blocking hit rate.
     pub query_docs_path_total: IntCounterVec,
     pub query_tokio_return_delay_seconds: HistogramVec,
+    // -- Apr 11 2026 get_many serial vs parallel path split --
+    // At unique_shards > 4, get_many dispatches via rayon. Below that it
+    // goes serial. This counter shows how often each path fires, so we
+    // can tell if the parallel optimization is actually kicking in on
+    // cache-miss batches or whether most batches are too small to qualify.
+    pub docstore_read_path_total: IntCounterVec,
     // -- Apr 10 2026 lock-wait instrumentation (Justin's flush-blocks-reads hypothesis) --
     // Measures how long query threads BLOCK waiting for locks held by the
     // flush thread. Zero under no contention; spikes when flush thread
@@ -858,6 +864,14 @@ impl Metrics {
             &["index", "path"],
         )
         .unwrap();
+        let docstore_read_path_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_docstore_read_path_total",
+                "Cumulative count of DocStoreV3::get_many path taken: serial (≤4 shards) vs parallel (>4 shards via rayon)",
+            ),
+            &["index", "path"],
+        )
+        .unwrap();
         let query_tokio_return_delay_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "bitdex_query_tokio_return_delay_seconds",
@@ -1196,6 +1210,7 @@ impl Metrics {
         registry.register(Box::new(query_doc_disk_fetch_seconds.clone())).unwrap();
         registry.register(Box::new(query_doc_format_seconds.clone())).unwrap();
         registry.register(Box::new(query_docs_path_total.clone())).unwrap();
+        registry.register(Box::new(docstore_read_path_total.clone())).unwrap();
         registry.register(Box::new(query_tokio_return_delay_seconds.clone())).unwrap();
         registry.register(Box::new(query_response_build_seconds.clone())).unwrap();
         registry.register(Box::new(query_cache_lock_wait_seconds.clone())).unwrap();
@@ -1325,6 +1340,7 @@ impl Metrics {
             query_doc_disk_fetch_seconds,
             query_doc_format_seconds,
             query_docs_path_total,
+            docstore_read_path_total,
             query_tokio_return_delay_seconds,
             query_response_build_seconds,
             query_cache_lock_wait_seconds,
