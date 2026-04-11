@@ -472,6 +472,24 @@ impl HashIndex {
     pub fn build_bulk(path: &Path, entries: &[(u64, IndexEntry)]) -> Result<Self> {
         let count = entries.len() as u64;
         let capacity = (count * 2).max(16);
+        Self::build_bulk_with_capacity(path, entries, capacity)
+    }
+
+    /// Bulk-build a hash index at `path` with exactly `capacity` slots.
+    ///
+    /// Overwrites any existing file at `path`. Use this when you need to
+    /// grow an existing index to a larger capacity — the caller is
+    /// responsible for passing all live entries AND ensuring `capacity`
+    /// leaves room under the 75% load factor.
+    pub fn build_bulk_with_capacity(
+        path: &Path,
+        entries: &[(u64, IndexEntry)],
+        capacity: u64,
+    ) -> Result<Self> {
+        let count = entries.len() as u64;
+        if capacity * 3 / 4 <= count {
+            return Err(SiloError::TableFull);
+        }
         let file_size = Self::file_size_for(capacity);
 
         // Build in heap buffer — zero-initialized (all keys = KEY_EMPTY = 0)
@@ -504,7 +522,11 @@ impl HashIndex {
             }
         }
 
-        // Write entire buffer to file in one shot
+        // Write entire buffer to file in one shot. Truncate-and-overwrite
+        // so callers can use this as an in-place rebuild for grow.
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
         let file = OpenOptions::new()
             .read(true).write(true).create_new(true).open(path)?;
         file.set_len(file_size as u64)?;

@@ -169,6 +169,50 @@ fn get_many_batches_the_overlay_scan() {
 }
 
 #[test]
+fn multi_chunk_compact_grows_hash_index() {
+    // Regression test for the TableFull bug on streaming populate:
+    // first chunk cold-compacts (sizes the index for that chunk),
+    // subsequent chunks hot-compact and would previously hit TableFull
+    // once the cumulative count passed 75% of the first chunk's capacity.
+    let dir = tempfile::tempdir().unwrap();
+    let mut silo: TestSilo = DataSilo::open(dir.path(), SiloConfig::default()).unwrap();
+
+    // First chunk: 500 unique keys → cold compact builds index with
+    // capacity = 500 * 2 = 1000, load limit 750.
+    let chunk1: Vec<CounterOp> = (1..=500u64)
+        .map(|k| CounterOp::Set { key: k, value: k as i64 })
+        .collect();
+    silo.append_ops_batch(&chunk1).unwrap();
+    let folded = silo.compact().unwrap();
+    assert_eq!(folded, 500);
+
+    // Second chunk: 1500 more unique keys. Without the grow fix this
+    // would trip TableFull when the 751st put exceeds the load limit.
+    let chunk2: Vec<CounterOp> = (501..=2000u64)
+        .map(|k| CounterOp::Set { key: k, value: k as i64 })
+        .collect();
+    silo.append_ops_batch(&chunk2).unwrap();
+    let folded = silo.compact().unwrap();
+    assert_eq!(folded, 1500);
+
+    // Third chunk: 3000 more — force another grow.
+    let chunk3: Vec<CounterOp> = (2001..=5000u64)
+        .map(|k| CounterOp::Set { key: k, value: k as i64 })
+        .collect();
+    silo.append_ops_batch(&chunk3).unwrap();
+    let folded = silo.compact().unwrap();
+    assert_eq!(folded, 3000);
+
+    // Every key from every chunk must still read back correctly.
+    for k in [1u64, 250, 500, 501, 1000, 2000, 2001, 3500, 5000] {
+        let v = silo.get(k).unwrap().unwrap();
+        assert_eq!(v.0, k as i64, "key {k}");
+    }
+    // Total live entries match.
+    assert_eq!(silo.index_count(), 5000);
+}
+
+#[test]
 fn ops_log_survives_reopen_and_applies_on_get() {
     let dir = tempfile::tempdir().unwrap();
     {

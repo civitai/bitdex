@@ -708,6 +708,123 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build_bulk: {e}")))?;
             self.index = Some(idx);
         } else {
+            // Count how many grow entries introduce new keys (put) vs update
+            // existing keys (update_existing_concurrent). If the projected
+            // total live count after the put loop would exceed the HashIndex
+            // 75% load factor, rebuild the index at a larger capacity up
+            // front so every put below fits.
+            {
+                let idx = self.index.as_ref().unwrap();
+                let mut new_key_count: u64 = 0;
+                for g in &grow_layouts {
+                    if idx.get(g.key).is_none() {
+                        new_key_count += 1;
+                    }
+                }
+                let projected = idx.count() + new_key_count;
+                let load_limit = idx.capacity() * 3 / 4;
+                if projected >= load_limit {
+                    // Grow: snapshot every live entry, drop the current
+                    // index, re-build with headroom for future growth.
+                    let mut all_entries: Vec<(u64, IndexEntry)> =
+                        idx.iter().collect();
+                    // Overlay in-place length updates onto the snapshot so
+                    // the rebuild sees post-compact offsets/lengths.
+                    use std::collections::HashMap;
+                    let in_place_map: HashMap<u64, &InPlace> =
+                        in_place.iter().map(|ip| (ip.key, ip)).collect();
+                    for (key, entry) in all_entries.iter_mut() {
+                        if let Some(ip) = in_place_map.get(key) {
+                            entry.length = ip.new_length;
+                            entry.allocated = ip.allocated;
+                        }
+                    }
+                    // Append the brand-new grow entries (new keys only;
+                    // updates to existing keys get overlaid in the next
+                    // pass after rebuild).
+                    let grow_set: std::collections::HashSet<u64> =
+                        grow_layouts.iter().map(|g| g.key).collect();
+                    // Partition grow into new-key and existing-key updates.
+                    for g in &grow_layouts {
+                        if idx.get(g.key).is_none() {
+                            all_entries.push((
+                                g.key,
+                                IndexEntry {
+                                    offset: g.offset,
+                                    length: g.length,
+                                    allocated: g.allocated,
+                                },
+                            ));
+                        }
+                    }
+                    // For existing-key grow entries, apply after rebuild
+                    // via update_existing_concurrent — they stay in the
+                    // snapshot at their PRE-rebuild offsets otherwise.
+                    // Reflect the new offsets in `all_entries` before rebuild
+                    // so the fresh index already has them correct.
+                    for (key, entry) in all_entries.iter_mut() {
+                        if grow_set.contains(key) {
+                            if let Some(g) =
+                                grow_layouts.iter().find(|g| g.key == *key)
+                            {
+                                entry.offset = g.offset;
+                                entry.length = g.length;
+                                entry.allocated = g.allocated;
+                            }
+                        }
+                    }
+                    // Size new index for `all_entries.len() * 2`.
+                    let target_capacity = (all_entries.len() as u64) * 2;
+                    eprintln!(
+                        "DataSilo: growing HashIndex from capacity {} to {} ({} entries)",
+                        idx.capacity(),
+                        target_capacity,
+                        all_entries.len()
+                    );
+                    // Drop the old index mmap before bulk_build recreates the file.
+                    self.index = None;
+                    let index_path = self.path.join("index.bin");
+                    let new_idx = HashIndex::build_bulk_with_capacity(
+                        &index_path,
+                        &all_entries,
+                        target_capacity,
+                    )
+                    .map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("HashIndex::build_bulk_with_capacity: {e}"),
+                        )
+                    })?;
+                    self.index = Some(new_idx);
+                    // The in_place and grow entries have already been written
+                    // into the new index via all_entries; skip the post-rebuild
+                    // update loops. Account dead bytes.
+                    for ip in &in_place {
+                        if ip.new_length < ip.old_length {
+                            self.dead_bytes.fetch_add(
+                                (ip.old_length - ip.new_length) as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    for g in &grow_layouts {
+                        if let Some(old_alloc) = g.old_allocated {
+                            self.dead_bytes
+                                .fetch_add(old_alloc as u64, Ordering::Relaxed);
+                        }
+                    }
+                    // Skip the put-loop path below.
+                    self.data_len = new_data_len;
+                    self.load_data()?;
+                    if frozen_is_b {
+                        self.ops_b.lock().truncate()?;
+                    } else {
+                        self.ops_a.lock().truncate()?;
+                    }
+                    return Ok(total_ops);
+                }
+            }
+            // No grow needed — normal in-place + put path.
             let idx = self.index.as_mut().unwrap();
             for ip in &in_place {
                 unsafe {

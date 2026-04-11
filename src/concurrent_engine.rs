@@ -6192,19 +6192,22 @@ impl ConcurrentEngine {
     }
 
     /// Bulk-copy every document from DocStoreV3 into DocSilo by iterating
-    /// the alive bitmap (which has the authoritative set of live slot IDs)
-    /// and calling `get_many` in chunks. All retrieved docs are accumulated
-    /// into a single `Vec` and written to the silo via one destructive
-    /// `bulk_load` call.
+    /// the alive bitmap and calling `get_many` in FETCH_CHUNK-sized batches,
+    /// then writing everything to the silo via one destructive `bulk_load`.
     ///
     /// `get_many` reads both the compacted snapshot AND the ops log section
     /// per shard, so it sees all documents the dump has written — whereas
     /// `get_shard` only returns compacted snapshots and silently misses
     /// uncompacted shards.
     ///
-    /// Memory footprint is O(total_alive). 14M works (~3 GB). 107M will
-    /// need a real streaming path with a hash-index grow + incremental
-    /// compact strategy.
+    /// **Memory**: the accumulator holds every StoredDoc for the duration
+    /// of the copy. For 14M that's ~3 GB; 107M would be ~21 GB and blow
+    /// a 32 GB machine. A streaming version that appends to the ops log
+    /// and compacts per chunk was tried (c.f. `datasilo::DataSilo::compact`
+    /// grow path) but the Windows mmap flush cost made each per-chunk
+    /// compact 100-200 seconds even at 500K ops — unusable at 107M scale.
+    /// The real fix is a dedicated DocSilo dump path that writes during
+    /// CSV parsing (no DocStoreV3 detour); out of scope here.
     ///
     /// Returns `(docs_copied, data_bytes)` on success.
     pub fn copy_docstore_to_silo(&self) -> Result<(u64, u64)> {
@@ -6241,7 +6244,7 @@ impl ConcurrentEngine {
                     }
                 }
                 batch_slots.clear();
-                if all_docs.len() % 1_000_000 == 0 || all_docs.len() >= total_alive as usize {
+                if all_docs.len() % 1_000_000 < FETCH_CHUNK {
                     eprintln!(
                         "  fetched {} / {} ({:.1}%), elapsed {:.1}s",
                         all_docs.len(),
