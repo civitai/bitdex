@@ -1409,6 +1409,7 @@ impl BitdexServer {
             .route("/api/internal/sync-lag", get(handle_sync_lag))
             .route("/api/indexes/{name}/dumps", get(handle_list_dumps))
             .route("/api/indexes/{name}/dumps", put(handle_register_dump))
+            .route("/api/indexes/{name}/silo/populate", post(handle_silo_populate))
             .route("/api/indexes/{name}/dumps/{dump_name}/loaded", post(handle_dump_loaded))
             .route("/api/indexes/{name}/dumps/{dump_name}", delete(handle_delete_dump))
             .route("/api/indexes/{name}/dumps/clear", post(handle_clear_dumps))
@@ -5394,6 +5395,50 @@ async fn handle_list_dumps(
 #[cfg(not(feature = "pg-sync"))]
 async fn handle_list_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoResponse {
     Json(serde_json::json!({"dumps": {}}))
+}
+
+/// POST /api/indexes/{name}/silo/populate — bulk-copy every document from
+/// DocStoreV3 into DocSilo. Used after a dump to seed the silo without
+/// rewriting the dump pipeline.
+async fn handle_silo_populate(
+    State(state): State<SharedState>,
+    AxumPath(_name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let idx = state.index.lock();
+        match idx.as_ref() {
+            Some(i) => Arc::clone(&i.engine),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "index not loaded"})),
+                );
+            }
+        }
+    };
+    let start = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || engine.copy_docstore_to_silo())
+        .await
+        .map_err(|e| format!("join: {e}"));
+    let elapsed = start.elapsed().as_secs_f64();
+    match result {
+        Ok(Ok((docs, data_bytes))) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "docs_copied": docs,
+                "data_bytes": data_bytes,
+                "elapsed_secs": elapsed,
+            })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}"), "elapsed_secs": elapsed})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e, "elapsed_secs": elapsed})),
+        ),
+    }
 }
 
 /// PUT /api/indexes/{name}/dumps — Register and process a dump.

@@ -231,6 +231,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "dashmap",
+ "datasilo",
  "futures-core",
  "futures-util",
  "memmap2",
@@ -581,6 +582,18 @@ dependencies = [
  "lock_api",
  "once_cell",
  "parking_lot_core",
+]
+
+[[package]]
+name = "datasilo"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "memmap2",
+ "parking_lot",
+ "rayon",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
