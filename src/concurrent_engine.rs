@@ -6351,6 +6351,22 @@ impl ConcurrentEngine {
     pub fn prepare_streaming_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::StreamingDocWriter> {
         Ok(self.docstore.write().prepare_streaming_writer(field_names)?)
     }
+
+    /// Prepare a DocSiloBulkWriter that writes the dump output DIRECTLY to
+    /// the silo's data.bin, bypassing DocStoreV3. Used by `dump_processor`
+    /// as the replacement for `prepare_streaming_writer`.
+    ///
+    /// Location: `<docstore_root>/silo/` — the same subdirectory that
+    /// `DocSilo::open` looks at, so a subsequent engine restart picks up
+    /// the populated silo automatically.
+    pub fn prepare_silo_bulk_writer(
+        &self,
+        field_names: &[String],
+    ) -> crate::error::Result<crate::doc_silo::DocSiloBulkWriter> {
+        let silo_root = self.docstore_root.join("silo");
+        crate::doc_silo::DocSiloBulkWriter::new(silo_root, field_names)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("DocSiloBulkWriter::new: {e}")))
+    }
     /// Return the set of indexed field names (filter + sort + "id").
     /// Used by the loader to strip doc-only fields from the bitmap accumulator.
     pub fn indexed_field_names(&self) -> HashSet<String> {

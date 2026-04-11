@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
 use crate::shard_store_doc::PackedValue;
-use crate::shard_store_doc::StreamingDocWriter;
+use crate::doc_silo::DocSiloBulkWriter;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
 use crate::dump_expression::ExprValue as NateExprValue;
@@ -1595,8 +1595,8 @@ pub fn process_dump_with_progress(
     }
     let bulk_writer = Arc::new(
         engine
-            .prepare_streaming_writer(&all_target_names)
-            .map_err(|e| format!("prepare_streaming_writer: {e}"))?,
+            .prepare_silo_bulk_writer(&all_target_names)
+            .map_err(|e| format!("prepare_silo_bulk_writer: {e}"))?,
     );
 
     // Log docstore field dictionary for debugging computed field persistence
@@ -2836,7 +2836,7 @@ fn process_multi_value_phase_removed_placeholder(
     delimiter: u8,
     col_index: &Arc<HashMap<String, usize>>,
     filter_expr: &Option<FilterExpression>,
-    bulk_writer: &Arc<StreamingDocWriter>,
+    bulk_writer: &Arc<DocSiloBulkWriter>,
     progress_counter: &Option<Arc<AtomicU64>>,
     slot_watermark: Option<&Arc<AtomicU64>>,
     shutdown: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -3222,7 +3222,7 @@ fn write_docstore_row_indexed(
     col_idx: &HashMap<String, usize>,
     slot: u32,
     request_fields: &[DumpFieldMapping],
-    bulk_writer: &Arc<StreamingDocWriter>,
+    bulk_writer: &Arc<DocSiloBulkWriter>,
     field_idx: &HashMap<String, u16>,
     boolean_fields: &HashSet<String>,
     extra_i64_fields: &[(&str, i64)],

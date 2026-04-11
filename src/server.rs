@@ -5513,24 +5513,17 @@ async fn handle_register_dump(
             reg.save(&dumps_path).ok();
         }
 
-        // Start shard pre-creator on first dump (progressive file creation)
-        if !state.precreator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            // Derive docstore root from the index storage path
-            let idx_name = state.index.lock().as_ref().map(|e| e.definition.name.clone()).unwrap_or_else(|| "civitai".to_string());
-            let docstore_root = state.data_dir.join("indexes").join(&idx_name).join("docs");
-            let bitmap_path = engine.config().storage.bitmap_path.clone();
-            let filter_names: Vec<String> = engine.config()
-                .filter_fields.iter().map(|f| f.name.clone()).collect();
-            let _precreator = crate::dump_processor::ShardPreCreator::spawn(
-                Arc::clone(&state.slot_watermark),
-                Arc::clone(&state.precreator_done),
-                docstore_root,
-                bitmap_path,
-                filter_names,
-            );
-            eprintln!("  ShardPreCreator started (background file creation)");
-            // Note: precreator handle intentionally leaked — it runs until precreator_done is set
-        }
+        // ShardPreCreator was a speed-up for DocStoreV3's hex-sharded file
+        // layout — we now write directly to DocSilo's single `data.bin` via
+        // `DocSiloBulkWriter`, so pre-creating thousands of docstore shard
+        // files is pure waste. Mark the pre-creator as "done" so any
+        // downstream waits on `precreator_done` unblock immediately.
+        state
+            .precreator_done
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = &state.precreator_started; // suppress unused warnings
+        let _ = &state.slot_watermark;
+        eprintln!("  ShardPreCreator disabled (DocSilo path skips hex-sharded files)");
         let slot_watermark = Arc::clone(&state.slot_watermark);
 
         // Spawn async processing — inline parse + save

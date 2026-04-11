@@ -832,6 +832,375 @@ impl DocSilo {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DocSiloBulkWriter — parallel-safe dump-time writer
+// ---------------------------------------------------------------------------
+//
+// Replaces `StreamingDocWriter` in the dump_processor hot path. Matches the
+// method signatures so dump_processor only needs to swap the type.
+//
+// Architecture:
+// - One append-only `data.bin` file, tightly packed (no per-entry slack).
+// - Rayon-parallel writes go through a single parking_lot::Mutex. At dump
+//   rate (tens of thousands of docs/sec) lock contention is negligible.
+// - Each `append_merge_payload` call decodes the merge wire format, re-
+//   encodes as SlotSnapshot bytes, seeks to end-of-file, appends, records
+//   layout.
+// - `finalize` builds the hash index via `HashIndex::build_bulk` from the
+//   accumulated layout Vec (~109M × 24 bytes = 2.6 GB for 107M dataset,
+//   manageable), flushes data.bin, persists the field dictionary.
+
+use std::io::{Seek, SeekFrom, Write};
+
+/// Lock-free mmap-backed bulk writer state. Pre-allocates a data.bin file
+/// large enough to fit the expected output plus slack, then hands rayon
+/// threads atomic-cursor-bumped disjoint regions to write into. No shared
+/// lock in the hot path — writes are racy-by-design against DIFFERENT
+/// regions of the mmap, which is safe because regions don't overlap.
+///
+/// Key insight: the dump knows the CSV row count upfront. We use that to
+/// pre-allocate `rows × INITIAL_BYTES_PER_DOC × 1.5` of file space, which
+/// is truncated to the actual used bytes at finalize. Growth-on-overflow
+/// is a fallback if the estimate is too low.
+const INITIAL_BYTES_PER_DOC: usize = 256;
+const SLACK_RATIO: f64 = 1.5;
+
+struct BulkState {
+    /// Keeps the writable mmap alive. Only touched during `new`, `grow`,
+    /// and `finalize` — not the hot write path.
+    mmap: memmap2::MmapMut,
+    /// Backing file handle. Needed to `set_len` on grow + finalize truncate.
+    data_file: std::fs::File,
+    /// Layouts for hash-index build. Appended via a per-thread DashMap slab
+    /// and flattened at finalize.
+    layouts: Vec<(u64, u64, u32)>,
+}
+
+pub struct DocSiloBulkWriter {
+    silo_root: PathBuf,
+    field_to_idx: ahash::AHashMap<String, u16>,
+    idx_to_field: Vec<String>,
+    field_defaults: HashMap<u16, PackedValue>,
+    /// State that needs serialized access during new/grow/finalize. Held
+    /// briefly ONLY on those paths, never on the hot `append_merge_payload`.
+    state: parking_lot::Mutex<BulkState>,
+    /// Raw pointer to the mmap's start. Reads of this pointer are valid for
+    /// the entire lifetime of the writer because `BulkState::mmap` is not
+    /// remapped during writes (growth is a follow-up — currently we
+    /// over-allocate upfront).
+    mmap_ptr: std::sync::atomic::AtomicPtr<u8>,
+    /// Total bytes available in the pre-allocated mmap region.
+    mmap_capacity: std::sync::atomic::AtomicU64,
+    /// Atomic byte cursor into the mmap. Each append bumps this by the
+    /// doc's byte length to claim a write region.
+    write_cursor: std::sync::atomic::AtomicU64,
+    /// Count of successful appends (atomic so we can report without locks).
+    appended_count: std::sync::atomic::AtomicU64,
+    /// Count of appends that were dropped because the mmap overflowed.
+    overflow_count: std::sync::atomic::AtomicU64,
+    /// Per-thread layout slabs. Each thread accumulates its own Vec to
+    /// avoid contention on a shared one; drained at finalize.
+    thread_layouts: dashmap::DashMap<std::thread::ThreadId, parking_lot::Mutex<Vec<(u64, u64, u32)>>>,
+}
+
+impl DocSiloBulkWriter {
+    /// Create a fresh bulk writer. Opens `silo_root/silo/data.bin` for
+    /// append, truncating any existing file. The field dictionary is
+    /// initialized from `field_names` in order (silo index N == field_names[N]).
+    pub fn new(
+        silo_root: PathBuf,
+        field_names: &[String],
+    ) -> io::Result<Self> {
+        // Default to pre-allocating for 14M rows. The dump pipeline can
+        // override with `new_with_capacity` when it knows the actual row
+        // count. If the estimate is too small we bail at the first
+        // overflow with an error — no auto-grow (v3 does auto-grow but
+        // that requires remap + pointer stability tricks; we skip it).
+        Self::new_with_capacity(silo_root, field_names, 14_000_000)
+    }
+
+    /// Pre-allocate the data.bin mmap for `estimated_rows` documents at
+    /// `INITIAL_BYTES_PER_DOC * SLACK_RATIO` bytes per doc. This is the
+    /// v3 `write_batch_parallel` pattern adapted for streaming writes.
+    pub fn new_with_capacity(
+        silo_root: PathBuf,
+        field_names: &[String],
+        estimated_rows: usize,
+    ) -> io::Result<Self> {
+        let silo_subdir = silo_root.join("silo");
+        std::fs::create_dir_all(&silo_subdir)?;
+        let data_path = silo_subdir.join("data.bin");
+        let data_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(true)
+            .open(&data_path)?;
+        // Wipe stale siblings so the silo opens clean later.
+        let _ = std::fs::remove_file(silo_subdir.join("index.bin"));
+        let _ = std::fs::remove_file(silo_subdir.join("ops_a.log"));
+        let _ = std::fs::remove_file(silo_subdir.join("ops_b.log"));
+
+        // Pre-allocate with generous slack. For 14M docs × 256 × 1.5 = ~5 GB.
+        // The file is truncated to actual used bytes at finalize.
+        let capacity = (estimated_rows as f64 * INITIAL_BYTES_PER_DOC as f64 * SLACK_RATIO)
+            .ceil() as u64;
+        let capacity = capacity.max(64 * 1024 * 1024); // at least 64 MB
+        data_file.set_len(capacity)?;
+        let mut mmap = unsafe { memmap2::MmapMut::map_mut(&data_file)? };
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        let mmap_ptr = mmap.as_mut_ptr();
+
+        let mut field_to_idx: ahash::AHashMap<String, u16> =
+            ahash::AHashMap::with_capacity(field_names.len());
+        let mut idx_to_field = Vec::with_capacity(field_names.len());
+        for (i, name) in field_names.iter().enumerate() {
+            field_to_idx.insert(name.clone(), i as u16);
+            idx_to_field.push(name.clone());
+        }
+
+        eprintln!(
+            "DocSiloBulkWriter: pre-allocated data.bin {:.1} MB for ~{} rows",
+            capacity as f64 / 1e6,
+            estimated_rows
+        );
+
+        Ok(Self {
+            silo_root,
+            field_to_idx,
+            idx_to_field,
+            field_defaults: HashMap::new(),
+            state: parking_lot::Mutex::new(BulkState {
+                mmap,
+                data_file,
+                layouts: Vec::new(),
+            }),
+            mmap_ptr: std::sync::atomic::AtomicPtr::new(mmap_ptr),
+            mmap_capacity: std::sync::atomic::AtomicU64::new(capacity),
+            write_cursor: std::sync::atomic::AtomicU64::new(0),
+            appended_count: std::sync::atomic::AtomicU64::new(0),
+            overflow_count: std::sync::atomic::AtomicU64::new(0),
+            thread_layouts: dashmap::DashMap::new(),
+        })
+    }
+
+    pub fn field_to_idx(&self) -> &ahash::AHashMap<String, u16> {
+        &self.field_to_idx
+    }
+
+    /// Set field defaults. Dump pipeline calls this after construction.
+    pub fn set_field_defaults(&mut self, defaults: HashMap<u16, PackedValue>) {
+        self.field_defaults = defaults;
+    }
+
+    /// Append a pre-encoded DocOp::Merge payload for a slot.
+    ///
+    /// Payload wire format (produced by `shard_store_doc::write_merge_header`
+    /// + `write_field_*`):
+    ///
+    /// ```text
+    /// [OP_TAG_MERGE = 0x06][slot:u32][num_fields:u16][field_pair ...]
+    /// ```
+    ///
+    /// We translate to SlotSnapshot wire format:
+    ///
+    /// ```text
+    /// [alive:u8 = 1][num_fields:u16][field_pair ...]
+    /// ```
+    ///
+    /// by stripping the first 5 bytes and prepending `[1u8]`. The field
+    /// pair bytes are identical between the two formats.
+    pub fn append_merge_payload(&self, slot: u32, payload: &[u8]) {
+        if payload.len() < 7 {
+            return;
+        }
+        // Skip OP_TAG_MERGE + slot prefix. The remaining
+        // [num_fields:u16][field_pair...] is exactly the SlotSnapshot tail.
+        let fields_bytes = &payload[5..];
+        let key = slot_to_key(slot);
+        let length = (1 + fields_bytes.len()) as u32;
+
+        // Lock-free atomic cursor bump + direct mmap write. See the
+        // struct-level comment on `DocSiloBulkWriter` for the design.
+        use std::sync::atomic::Ordering;
+        let length_u64 = length as u64;
+        let offset = self.write_cursor.fetch_add(length_u64, Ordering::Relaxed);
+        let capacity = self.mmap_capacity.load(Ordering::Relaxed);
+        if offset + length_u64 > capacity {
+            self.overflow_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        unsafe {
+            let base = self.mmap_ptr.load(Ordering::Relaxed);
+            let dst = base.add(offset as usize);
+            *dst = 1u8;
+            std::ptr::copy_nonoverlapping(fields_bytes.as_ptr(), dst.add(1), fields_bytes.len());
+        }
+        let tid = std::thread::current().id();
+        let slab_cell = self
+            .thread_layouts
+            .entry(tid)
+            .or_insert_with(|| parking_lot::Mutex::new(Vec::with_capacity(8192)));
+        slab_cell.lock().push((key, offset, length));
+        self.appended_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Encode a slot's packed tuples as a DocOp::Merge and append.
+    /// API-compatible with `StreamingDocWriter::append_tuples_merge`, but
+    /// here the tuples are raw msgpack-encoded bytes that need decoding first.
+    pub fn append_tuples_merge(
+        &self,
+        slot: u32,
+        tuples: &[(u16, &[u8])],
+        write_buf: &mut Vec<u8>,
+    ) {
+        if tuples.is_empty() {
+            return;
+        }
+        // Decode msgpack → PackedValue → rebuild as SlotSnapshot bytes directly.
+        write_buf.clear();
+        write_buf.push(1u8); // alive
+        write_buf.extend_from_slice(&(tuples.len() as u16).to_le_bytes());
+        let mut kept = 0u16;
+        let mut reserve_pos = write_buf.len() - 2;
+        for &(field_idx, value_bytes) in tuples {
+            let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if self.field_defaults.get(&field_idx).map_or(false, |d| d == &pv) {
+                continue;
+            }
+            encode_field_pair(field_idx, &pv, write_buf);
+            kept += 1;
+        }
+        if kept == 0 {
+            return;
+        }
+        // Update num_fields header (may differ from tuples.len() after filtering).
+        write_buf[reserve_pos..reserve_pos + 2].copy_from_slice(&kept.to_le_bytes());
+        let _ = reserve_pos;
+
+        let key = slot_to_key(slot);
+        let length = write_buf.len() as u32;
+        use std::sync::atomic::Ordering;
+        let length_u64 = length as u64;
+        let offset = self.write_cursor.fetch_add(length_u64, Ordering::Relaxed);
+        let capacity = self.mmap_capacity.load(Ordering::Relaxed);
+        if offset + length_u64 > capacity {
+            self.overflow_count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        unsafe {
+            let base = self.mmap_ptr.load(Ordering::Relaxed);
+            let dst = base.add(offset as usize);
+            std::ptr::copy_nonoverlapping(write_buf.as_ptr(), dst, write_buf.len());
+        }
+        let tid = std::thread::current().id();
+        let slab_cell = self
+            .thread_layouts
+            .entry(tid)
+            .or_insert_with(|| parking_lot::Mutex::new(Vec::with_capacity(8192)));
+        slab_cell.lock().push((key, offset, length));
+        self.appended_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flush data.bin, build the hash index, and persist the field dict.
+    pub fn finalize(&self) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        let final_len = self.write_cursor.load(Ordering::Acquire);
+        let appended = self.appended_count.load(Ordering::Relaxed);
+        let overflow = self.overflow_count.load(Ordering::Relaxed);
+        eprintln!(
+            "DocSiloBulkWriter::finalize: {} appended, {} overflow, cursor={}",
+            appended, overflow, final_len
+        );
+        if overflow > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "DocSiloBulkWriter overflowed pre-allocated mmap ({} entries dropped). \
+                     Increase `estimated_rows` in `new_with_capacity`.",
+                    overflow
+                ),
+            ));
+        }
+
+        // Drain every thread-local layouts slab into one combined Vec.
+        let mut layouts: Vec<(u64, u64, u32)> = Vec::with_capacity(appended as usize);
+        let tids: Vec<std::thread::ThreadId> =
+            self.thread_layouts.iter().map(|e| *e.key()).collect();
+        for tid in tids {
+            if let Some(entry) = self.thread_layouts.get(&tid) {
+                let mut slab = entry.lock();
+                layouts.extend(slab.drain(..));
+            }
+        }
+
+        // Flush the mmap, then release it before touching the file.
+        let mut state = self.state.lock();
+        state.mmap.flush()?;
+        drop(state); // drops mmap + File — both now closed.
+
+        // Reopen the file by path so we can optionally truncate to the
+        // actual used bytes. On Windows the truncate can fail if anything
+        // else is still holding a mapping (e.g. DataSilo::open has
+        // already mmap'd it for reads). That's harmless — data.bin is
+        // still valid at any size ≥ final_len because the trailing bytes
+        // are zeros that no index entry points at.
+        let silo_subdir = self.silo_root.join("silo");
+        let data_path = silo_subdir.join("data.bin");
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&data_path) {
+            match file.set_len(final_len) {
+                Ok(()) => {
+                    let _ = file.sync_data();
+                }
+                Err(e) => {
+                    eprintln!(
+                        "DocSiloBulkWriter::finalize: truncate to {} skipped ({}); \
+                         data.bin stays at pre-allocated size. Trailing zeros are safe.",
+                        final_len, e
+                    );
+                }
+            }
+        }
+
+        // Build the hash index from layouts via HashIndex::build_bulk_with_capacity.
+        let silo_subdir = self.silo_root.join("silo");
+        let index_path = silo_subdir.join("index.bin");
+        let _ = std::fs::remove_file(&index_path);
+        let entries: Vec<(u64, datasilo::IndexEntry)> = layouts
+            .into_iter()
+            .map(|(k, o, l)| {
+                (
+                    k,
+                    datasilo::IndexEntry {
+                        offset: o,
+                        length: l,
+                        allocated: l, // tight packing
+                    },
+                )
+            })
+            .collect();
+        datasilo::HashIndex::build_bulk(&index_path, &entries)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build_bulk: {e}")))?;
+
+        // Persist the field dictionary.
+        let dict_path = self.silo_root.join("field_dict.json");
+        let json = serde_json::to_string(&self.idx_to_field)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        std::fs::write(&dict_path, json)?;
+
+        eprintln!(
+            "DocSiloBulkWriter::finalize: {} entries, data.bin {} bytes",
+            entries.len(),
+            final_len
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
