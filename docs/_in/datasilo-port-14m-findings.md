@@ -104,6 +104,44 @@ Reran the full end-to-end flow on a clean wipe with the fixed populate path (ali
 
 **HashIndex TableFull**: a brief streaming-compact attempt (chunked `apply_ops_batch` + `compact()` per chunk, to bound memory for 107M) tripped `SiloError::TableFull` in the hot-compact path when cumulative entries exceeded 75% of the HashIndex capacity set by the first (cold) compact. Needs a HashIndex grow-on-insert or a compact-time rebuild at higher capacity. Reverted to single `bulk_load` for this session — see next section for the 107M implications.
 
+## Session 3: streaming populate attempt + HashIndex grow
+
+Added `HashIndex::build_bulk_with_capacity` + a grow-check in
+`DataSilo::compact` so streaming populate paths that repeatedly call
+`apply_ops_batch(chunk) + compact()` no longer hit `TableFull` once the
+cumulative live-key count crosses the 75% load factor of the first
+chunk's index. New test `multi_chunk_compact_grows_hash_index` exercises
+three sequential chunks (500 / 1500 / 3000 keys) with two grow events.
+
+**Result of trying this on 14M Civitai data:** first chunk (500K ops)
+compact took **170 seconds**. Subsequent chunks each took several
+more minutes. The bottleneck is `MmapMut::flush` on multi-GB files —
+Windows msync doesn't support async/incremental flush, so every per-
+chunk compact pays full-file flush cost, which scales linearly with
+cumulative data.bin size. The math:
+
+```
+chunk 1 (500K ops, 500MB data.bin):  170s flush
+chunk 2 (1M entries, 1GB data.bin):  projected 340s flush
+chunk 3 (1.5M, 1.5GB):               projected 510s
+...
+chunk N (7.3M, 7.5GB):                projected ~2500s
+```
+
+That's > 2 hours for one 14M populate, vs 160s for the single-pass
+`bulk_load`. Reverted to single-pass. The grow fix stays (it's the
+correct behavior when streaming writes do happen; the crate tests
+prove it) but it's not the right tool for this population.
+
+**Implication for 107M**: the single-pass path memory-caps out at
+~21 GB working set (107M × ~200 bytes per StoredDoc), which blows a
+32 GB box. The streaming path Windows-flush-caps out at ~2 hours.
+Neither is acceptable. The real answer is a dedicated DocSilo dump
+path that parses CSV rows directly into the silo's parallel mmap
+writer (v3's datasilo crate ships a `ParallelOpsWriter` primitive I
+ported but don't use from the engine yet). That's a follow-up
+session's worth of work, not an incremental patch. Tracked below.
+
 ## 107M Stretch Goal — Blocked
 
 Two independent blockers tripped the 107M attempt this session:
