@@ -1613,8 +1613,26 @@ impl ConcurrentEngine {
                             } else {
                                 (Vec::new(), Vec::new())
                             };
+                            // Build filter_changed_slots for the sort-only fast path.
+                            // Slots that had filter field changes need full slot_matches_filter;
+                            // slots with sort-only changes use bitmap.contains() (O(1) per slot
+                            // instead of 8+ bitmap lookups with string parsing).
+                            let filter_changed_slots: RoaringBitmap = {
+                                let mut fcs = RoaringBitmap::new();
+                                for slots in coalescer.filter_insert_entries().values() {
+                                    for &slot in slots {
+                                        fcs.insert(slot);
+                                    }
+                                }
+                                for slots in coalescer.filter_remove_entries().values() {
+                                    for &slot in slots {
+                                        fcs.insert(slot);
+                                    }
+                                }
+                                fcs
+                            };
                             let (sort_results, sort_timed_out) = if !sort_work.is_empty() {
-                                evaluate_sort_work(&sort_work, &staging.filters, &staging.sorts, deadline)
+                                evaluate_sort_work(&sort_work, &staging.filters, &staging.sorts, deadline, Some(&filter_changed_slots))
                             } else {
                                 (Vec::new(), Vec::new())
                             };

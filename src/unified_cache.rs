@@ -33,6 +33,11 @@ pub struct CacheMaintenanceItem {
     pub slots: Vec<u32>,
     pub min_tracked_value: u32,
     pub direction: SortDirection,
+    /// Entry bitmap snapshot for sort-only fast path: when a slot had no
+    /// filter changes, bitmap.contains(slot) determines filter membership
+    /// without calling slot_matches_filter (which does 8+ bitmap lookups
+    /// with string parsing per call).
+    pub bitmap: Option<Arc<RoaringBitmap>>,
 }
 /// Result of evaluating maintenance for one cache entry (computed without lock).
 pub struct CacheMaintenanceResult {
@@ -1696,6 +1701,7 @@ impl UnifiedCache {
                     slots,
                     min_tracked_value: entry.min_tracked_value,
                     direction: entry.direction,
+                    bitmap: None, // filter work doesn't need bitmap fast-path
                 })
             })
             .collect();
@@ -1747,6 +1753,7 @@ impl UnifiedCache {
                     slots,
                     min_tracked_value: entry.min_tracked_value,
                     direction: entry.direction,
+                    bitmap: Some(Arc::clone(&entry.bitmap)),
                 })
             })
             .collect();
@@ -2118,6 +2125,7 @@ pub fn evaluate_sort_work(
     filters: &FilterIndex,
     sorts: &SortIndex,
     deadline: Option<Instant>,
+    filter_changed_slots: Option<&RoaringBitmap>,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Preamble: reconstruct_value once per unique (sort_field, slot).
     let reconstructed = precompute_sort_values(work, sorts);
@@ -2153,6 +2161,27 @@ pub fn evaluate_sort_work(
             if !qualifies {
                 continue;
             }
+            // Sort-only fast path: if this slot had NO filter field changes
+            // this cycle, its filter membership hasn't changed. Use the
+            // entry's bitmap to determine membership in O(1) instead of
+            // calling slot_matches_filter (8+ bitmap lookups + string
+            // parsing per call).
+            //
+            // - Slot in bitmap → already matches filters, add to results
+            // - Slot NOT in bitmap → still doesn't match, skip
+            // - Slot HAD filter changes → full slot_matches_filter
+            let is_sort_only = filter_changed_slots
+                .map(|fcs| !fcs.contains(slot))
+                .unwrap_or(false);
+            if is_sort_only {
+                if let Some(ref bm) = item.bitmap {
+                    if bm.contains(slot) {
+                        adds.push((slot, sort_value));
+                    }
+                    continue;
+                }
+            }
+            // Full filter evaluation (filter changed, or no bitmap)
             if slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts) {
                 adds.push((slot, sort_value));
             }
