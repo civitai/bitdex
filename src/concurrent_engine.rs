@@ -378,6 +378,8 @@ pub struct ConcurrentEngine {
     doc_cache_live_update_refreshed: Arc<AtomicU64>,
     doc_cache_live_update_deleted: Arc<AtomicU64>,
     doc_cache_live_update_skipped: Arc<AtomicU64>,
+    doc_cache_live_update_applied_in_place: Arc<AtomicU64>,
+    doc_cache_live_update_fallback_refresh: Arc<AtomicU64>,
     /// Apr 11 2026 miss-path diagnostic: map of shard_id → last-open Instant.
     /// Used to classify each shard read in `get_documents_batch` as "first"
     /// (not opened within the window) or "concurrent_duplicate" (another
@@ -1154,6 +1156,8 @@ impl ConcurrentEngine {
                 doc_cache_live_update_refreshed: Arc::new(AtomicU64::new(0)),
                 doc_cache_live_update_deleted: Arc::new(AtomicU64::new(0)),
                 doc_cache_live_update_skipped: Arc::new(AtomicU64::new(0)),
+                doc_cache_live_update_applied_in_place: Arc::new(AtomicU64::new(0)),
+                doc_cache_live_update_fallback_refresh: Arc::new(AtomicU64::new(0)),
                 shard_recent_opens: Arc::new(DashMap::new()),
                 shard_read_first: Arc::new(AtomicU64::new(0)),
                 shard_read_duplicate: Arc::new(AtomicU64::new(0)),
@@ -3180,6 +3184,8 @@ impl ConcurrentEngine {
             doc_cache_live_update_refreshed: Arc::new(AtomicU64::new(0)),
             doc_cache_live_update_deleted: Arc::new(AtomicU64::new(0)),
             doc_cache_live_update_skipped: Arc::new(AtomicU64::new(0)),
+            doc_cache_live_update_applied_in_place: Arc::new(AtomicU64::new(0)),
+            doc_cache_live_update_fallback_refresh: Arc::new(AtomicU64::new(0)),
             shard_recent_opens: Arc::new(DashMap::new()),
             shard_read_first: Arc::new(AtomicU64::new(0)),
             shard_read_duplicate: Arc::new(AtomicU64::new(0)),
@@ -6280,12 +6286,118 @@ impl ConcurrentEngine {
         (refreshed, deleted, skipped)
     }
 
+    /// Apr 11 2026 (v1.0.186): Apply pg-sync Ops directly to cached
+    /// StoredDoc entries, avoiding the disk read tail of
+    /// `doc_cache_refresh_slots`.
+    ///
+    /// **Why this exists**: v1.0.185 routed WAL-touched slots through
+    /// `doc_cache_refresh_slots`, which called `DocStoreV3::get_many`
+    /// on every cached slot. That dispatches to the global rayon pool,
+    /// stealing worker threads from query handlers. Under high cache
+    /// saturation (~91%) at T+30, the refresh disk reads dominated the
+    /// latency tail: `query_docs` P95 100ms → 2500ms, `tokio_return_delay`
+    /// avg 114ms → 839ms.
+    ///
+    /// **What this does**: iterates `entries` and, for each EntityOps
+    /// whose ops can all be safely applied in-place, calls
+    /// `DocCache::apply_ops_in_place(slot, &ops)`. Entries with any
+    /// op that needs disk reload (QueryOpSet, Alive, or a Set/Remove/Add
+    /// whose field feeds a computed sort dep) are collected into a
+    /// fallback list and processed via the old `doc_cache_refresh_slots`
+    /// path. The expected hot-path case (~95%+ of ops on Civitai's
+    /// field schema) applies in-place with zero disk I/O.
+    ///
+    /// Caller keeps `FieldMeta` alive; we borrow it for the duration.
+    ///
+    /// Returns: (applied_in_place, deleted, not_cached, fallback_count).
+    #[cfg(feature = "pg-sync")]
+    pub fn doc_cache_apply_ops_batch(
+        &self,
+        entries: &[crate::pg_sync::ops::EntityOps],
+        meta: &crate::ops_processor::FieldMeta,
+    ) -> (u64, u64, u64, u64) {
+        use crate::doc_cache::ApplyOutcome;
+        use crate::pg_sync::ops::Op;
+
+        let cache = match &self.doc_cache {
+            Some(c) => c,
+            None => return (0, 0, 0, 0),
+        };
+
+        let mut applied: u64 = 0;
+        let mut deleted: u64 = 0;
+        let mut not_cached: u64 = 0;
+        let mut fallback_slots: Vec<u32> = Vec::new();
+
+        for entry in entries {
+            let slot = entry.entity_id as u32;
+
+            // Decide upfront whether ANY op on this entity forces a
+            // disk reload. Bail out of the in-place attempt entirely
+            // for such entries — mixing partial in-place + fallback
+            // on the same slot would double-read.
+            let needs_fallback = entry.ops.iter().any(|op| match op {
+                Op::QueryOpSet { .. } => true,
+                Op::Set { field, .. }
+                | Op::Remove { field, .. }
+                | Op::Add { field, .. } => meta.has_computed_deps(field.as_str()),
+                Op::Delete | Op::Alive => false,
+            });
+
+            if needs_fallback {
+                fallback_slots.push(slot);
+                continue;
+            }
+
+            match cache.apply_ops_in_place(slot, &entry.ops) {
+                ApplyOutcome::Applied => applied += 1,
+                ApplyOutcome::Deleted => deleted += 1,
+                ApplyOutcome::NotCached => not_cached += 1,
+                ApplyOutcome::NeedsFallback => {
+                    // Defensive: the upfront check missed a shape
+                    // (e.g. an Add on a Single field, or a value that
+                    // json_value_to_query_value couldn't parse). Route
+                    // the slot through the disk refresh path so nothing
+                    // silently diverges.
+                    fallback_slots.push(slot);
+                }
+            }
+        }
+
+        self.doc_cache_live_update_applied_in_place
+            .fetch_add(applied, Ordering::Relaxed);
+        self.doc_cache_live_update_deleted
+            .fetch_add(deleted, Ordering::Relaxed);
+        self.doc_cache_live_update_skipped
+            .fetch_add(not_cached, Ordering::Relaxed);
+
+        // Fallback path: dedup + refresh-from-disk for the minority of
+        // slots whose ops couldn't be applied in-place. This preserves
+        // the v1.0.185 semantics for complex cases but contains the
+        // rayon contention to a small fraction of the traffic.
+        let fallback_count = fallback_slots.len() as u64;
+        if fallback_count > 0 {
+            let (_r, _d, _s) = self.doc_cache_refresh_slots(&fallback_slots);
+            self.doc_cache_live_update_fallback_refresh
+                .fetch_add(fallback_count, Ordering::Relaxed);
+        }
+
+        (applied, deleted, not_cached, fallback_count)
+    }
+
     /// Read live-update counters for metric scrape.
-    pub fn doc_cache_live_update_stats(&self) -> (u64, u64, u64) {
+    /// Returns (refreshed, deleted, skipped, applied_in_place, fallback_refresh).
+    /// `refreshed` and `fallback_refresh` both refer to disk-reload
+    /// operations — `refreshed` is the legacy v1.0.185 path counter,
+    /// `fallback_refresh` is the v1.0.186 slot count routed through
+    /// the disk path because the in-place apply couldn't handle it.
+    pub fn doc_cache_live_update_stats(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.doc_cache_live_update_refreshed.load(Ordering::Relaxed),
             self.doc_cache_live_update_deleted.load(Ordering::Relaxed),
             self.doc_cache_live_update_skipped.load(Ordering::Relaxed),
+            self.doc_cache_live_update_applied_in_place.load(Ordering::Relaxed),
+            self.doc_cache_live_update_fallback_refresh.load(Ordering::Relaxed),
         )
     }
     /// Clear the entire doc cache. Used after dump phases when many docs may

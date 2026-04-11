@@ -1232,19 +1232,22 @@ impl BitdexServer {
                                     // Flush pending docstore writes (DocWriter buffers tuples)
                                     doc_writer.flush();
 
-                                    // Apr 11 2026: live-update doc cache for mutated
-                                    // entities. Replaces the old evict-on-op path
-                                    // that destroyed cache state on every pg-sync
-                                    // op (~hundreds of evictions/sec in prod,
-                                    // pegging hit rate at ~48%). Now: cached slots
-                                    // are re-read from disk and re-inserted;
-                                    // uncached slots are left alone (preserving
-                                    // cache-on-read semantics).
+                                    // Apr 11 2026 (v1.0.186): in-place op apply
+                                    // for cached docs. v1.0.185 shipped a live-
+                                    // update path that re-read from disk for every
+                                    // cached slot pg-sync touched, which dispatched
+                                    // to the global rayon pool and stole worker
+                                    // threads from query handlers. Under high cache
+                                    // saturation that dominated the tail latency
+                                    // (tokio_return_delay avg 114ms → 839ms
+                                    // between T+15 and T+30 of the v1.0.185 bake).
+                                    // Now: apply Set/Remove/Add/Delete directly
+                                    // to the cached StoredDoc HashMap with zero
+                                    // disk I/O. Fall back to the old disk-refresh
+                                    // path only for computed-dep sources and
+                                    // QueryOpSet fan-outs.
                                     if applied > 0 {
-                                        let touched: Vec<u32> = entries.iter()
-                                            .map(|e| e.entity_id as u32)
-                                            .collect();
-                                        engine.doc_cache_refresh_slots(&touched);
+                                        engine.doc_cache_apply_ops_batch(&entries, &meta);
                                     }
 
                                     // WAL read-side metrics
@@ -5194,7 +5197,8 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .set(shard_dup as i64);
 
             // Apr 11 2026: ops-driven live update counters
-            let (lu_refreshed, lu_deleted, lu_skipped) = engine.doc_cache_live_update_stats();
+            let (lu_refreshed, lu_deleted, lu_skipped, lu_applied, lu_fallback)
+                = engine.doc_cache_live_update_stats();
             m.doc_cache_live_update_total
                 .with_label_values(&[name, "refreshed"])
                 .set(lu_refreshed as i64);
@@ -5204,6 +5208,12 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.doc_cache_live_update_total
                 .with_label_values(&[name, "skipped"])
                 .set(lu_skipped as i64);
+            m.doc_cache_live_update_total
+                .with_label_values(&[name, "applied_in_place"])
+                .set(lu_applied as i64);
+            m.doc_cache_live_update_total
+                .with_label_values(&[name, "fallback_refresh"])
+                .set(lu_fallback as i64);
 
             eprintln!("[metrics-timing] cache_stats={:?} doc_cache={:?} total={:?}",
                 t_cache_stats, t_doc_cache, metrics_start.elapsed());
