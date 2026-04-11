@@ -373,6 +373,11 @@ pub struct ConcurrentEngine {
     bitmap_memory_cache: Arc<crate::bitmap_memory_cache::BitmapMemoryCache>,
     /// In-memory document cache (DashMap, cache-on-read, write-through, LRU eviction).
     doc_cache: Option<Arc<crate::doc_cache::DocCache>>,
+    /// Apr 11 2026: live-update counters for ops-driven cache refresh.
+    /// Replaces the old evict-on-op path that pegged hit rate at ~48%.
+    doc_cache_live_update_refreshed: Arc<AtomicU64>,
+    doc_cache_live_update_deleted: Arc<AtomicU64>,
+    doc_cache_live_update_skipped: Arc<AtomicU64>,
     /// Apr 11 2026 miss-path diagnostic: map of shard_id → last-open Instant.
     /// Used to classify each shard read in `get_documents_batch` as "first"
     /// (not opened within the window) or "concurrent_duplicate" (another
@@ -1146,6 +1151,9 @@ impl ConcurrentEngine {
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
                 bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
                 doc_cache: doc_cache.clone(),
+                doc_cache_live_update_refreshed: Arc::new(AtomicU64::new(0)),
+                doc_cache_live_update_deleted: Arc::new(AtomicU64::new(0)),
+                doc_cache_live_update_skipped: Arc::new(AtomicU64::new(0)),
                 shard_recent_opens: Arc::new(DashMap::new()),
                 shard_read_first: Arc::new(AtomicU64::new(0)),
                 shard_read_duplicate: Arc::new(AtomicU64::new(0)),
@@ -3169,6 +3177,9 @@ impl ConcurrentEngine {
             metrics_bridge,
             bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
             doc_cache: doc_cache.clone(),
+            doc_cache_live_update_refreshed: Arc::new(AtomicU64::new(0)),
+            doc_cache_live_update_deleted: Arc::new(AtomicU64::new(0)),
+            doc_cache_live_update_skipped: Arc::new(AtomicU64::new(0)),
             shard_recent_opens: Arc::new(DashMap::new()),
             shard_read_first: Arc::new(AtomicU64::new(0)),
             shard_read_duplicate: Arc::new(AtomicU64::new(0)),
@@ -6182,6 +6193,100 @@ impl ConcurrentEngine {
         if let Some(ref cache) = self.doc_cache {
             cache.remove(slot);
         }
+    }
+
+    /// Apr 11 2026: live-update the doc cache for a set of slots whose
+    /// on-disk state just changed (via the WAL reader's ops batch).
+    ///
+    /// Replaces the old "evict on any touch" strategy that silently
+    /// destroyed ~hundreds of cache entries per second in prod, pegging
+    /// the hit rate at ~48%. Now: we re-read fresh docs from disk
+    /// (bypassing the cache probe so we don't serve stale bytes) and
+    /// re-insert them under the same slot, only for slots that were
+    /// already cached. Slots that weren't cached stay uncached —
+    /// preserves cache-on-read semantics.
+    ///
+    /// Returns (refreshed, deleted, skipped) counts for metric reporting:
+    ///   refreshed = entries re-inserted with fresh data
+    ///   deleted   = slots that came back as None from get_many (doc
+    ///               was deleted on disk) and are now removed from cache
+    ///   skipped   = slots not in cache (no-op, cache-on-read preserved)
+    pub fn doc_cache_refresh_slots(&self, slots: &[u32]) -> (u64, u64, u64) {
+        let cache = match &self.doc_cache {
+            Some(c) => c,
+            None => return (0, 0, 0),
+        };
+        if slots.is_empty() {
+            return (0, 0, 0);
+        }
+
+        // Dedup first: WAL batches commonly have multiple ops for the
+        // same slot (INSERT + UPDATE in one txn, or multiple field
+        // edits). Without this, we do duplicate shard reads, double-
+        // count metrics, and re-insert the same doc repeatedly.
+        // Gemini caught this.
+        let mut unique_slots: Vec<u32> = slots.to_vec();
+        unique_slots.sort_unstable();
+        unique_slots.dedup();
+
+        // Filter to only slots already in cache so we don't populate
+        // cold entries on every pg-sync op.
+        let mut to_refresh: Vec<u32> = Vec::with_capacity(unique_slots.len());
+        let mut skipped: u64 = 0;
+        for slot in unique_slots {
+            if cache.contains(slot) {
+                to_refresh.push(slot);
+            } else {
+                skipped += 1;
+            }
+        }
+        if to_refresh.is_empty() {
+            self.doc_cache_live_update_skipped.fetch_add(skipped, Ordering::Relaxed);
+            return (0, 0, skipped);
+        }
+
+        // Bypass the cache — we want the fresh on-disk bytes. Single
+        // get_many call amortizes shard reads across all touched slots
+        // (parallel path when unique_shards > 4).
+        let fresh = match self.docstore.read().get_many(&to_refresh) {
+            Ok((docs, _, _)) => docs,
+            Err(e) => {
+                tracing::warn!("doc_cache_refresh_slots get_many failed: {e}");
+                return (0, 0, skipped);
+            }
+        };
+
+        let mut refreshed: u64 = 0;
+        let mut deleted: u64 = 0;
+        for (i, opt) in fresh.into_iter().enumerate() {
+            let slot = to_refresh[i];
+            match opt {
+                Some(doc) => {
+                    cache.insert(slot, doc);
+                    refreshed += 1;
+                }
+                None => {
+                    // Doc gone from disk (Delete op). Drop the cached
+                    // entry so future queries don't serve a ghost.
+                    cache.remove(slot);
+                    deleted += 1;
+                }
+            }
+        }
+
+        self.doc_cache_live_update_refreshed.fetch_add(refreshed, Ordering::Relaxed);
+        self.doc_cache_live_update_deleted.fetch_add(deleted, Ordering::Relaxed);
+        self.doc_cache_live_update_skipped.fetch_add(skipped, Ordering::Relaxed);
+        (refreshed, deleted, skipped)
+    }
+
+    /// Read live-update counters for metric scrape.
+    pub fn doc_cache_live_update_stats(&self) -> (u64, u64, u64) {
+        (
+            self.doc_cache_live_update_refreshed.load(Ordering::Relaxed),
+            self.doc_cache_live_update_deleted.load(Ordering::Relaxed),
+            self.doc_cache_live_update_skipped.load(Ordering::Relaxed),
+        )
     }
     /// Clear the entire doc cache. Used after dump phases when many docs may
     /// have been merged with new fields — any cached entries from prior phases

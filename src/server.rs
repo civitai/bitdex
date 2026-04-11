@@ -1232,13 +1232,19 @@ impl BitdexServer {
                                     // Flush pending docstore writes (DocWriter buffers tuples)
                                     doc_writer.flush();
 
-                                    // Invalidate doc cache for mutated entities so
-                                    // GET /documents returns fresh data after ops.
+                                    // Apr 11 2026: live-update doc cache for mutated
+                                    // entities. Replaces the old evict-on-op path
+                                    // that destroyed cache state on every pg-sync
+                                    // op (~hundreds of evictions/sec in prod,
+                                    // pegging hit rate at ~48%). Now: cached slots
+                                    // are re-read from disk and re-inserted;
+                                    // uncached slots are left alone (preserving
+                                    // cache-on-read semantics).
                                     if applied > 0 {
-                                        for entry in &entries {
-                                            let slot = entry.entity_id as u32;
-                                            engine.evict_doc_cache(slot);
-                                        }
+                                        let touched: Vec<u32> = entries.iter()
+                                            .map(|e| e.entity_id as u32)
+                                            .collect();
+                                        engine.doc_cache_refresh_slots(&touched);
                                     }
 
                                     // WAL read-side metrics
@@ -5186,6 +5192,18 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.docstore_shard_concurrent_read_total
                 .with_label_values(&[name, "concurrent_duplicate"])
                 .set(shard_dup as i64);
+
+            // Apr 11 2026: ops-driven live update counters
+            let (lu_refreshed, lu_deleted, lu_skipped) = engine.doc_cache_live_update_stats();
+            m.doc_cache_live_update_total
+                .with_label_values(&[name, "refreshed"])
+                .set(lu_refreshed as i64);
+            m.doc_cache_live_update_total
+                .with_label_values(&[name, "deleted"])
+                .set(lu_deleted as i64);
+            m.doc_cache_live_update_total
+                .with_label_values(&[name, "skipped"])
+                .set(lu_skipped as i64);
 
             eprintln!("[metrics-timing] cache_stats={:?} doc_cache={:?} total={:?}",
                 t_cache_stats, t_doc_cache, metrics_start.elapsed());

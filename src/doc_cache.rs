@@ -234,11 +234,14 @@ impl DocCache {
         let size = estimate_doc_size(&doc);
         let gens = self.generations.load();
 
-        // Check all generations for existing entry and remove it first
+        // Remove from EVERY generation before inserting. Normally only
+        // one copy exists (promote/insert preserve single-entry), but
+        // scan all defensively — a single stale entry in an older
+        // generation would become visible after remove() exposes it.
+        // Gemini caught this as a theoretical race worth closing.
         for gen in gens.iter() {
             if let Some((_, old)) = gen.entries.remove(&slot_id) {
                 gen.size_bytes.fetch_sub(old.size_bytes, Ordering::Relaxed);
-                break;
             }
         }
 
@@ -315,15 +318,36 @@ impl DocCache {
         }
     }
 
-    /// Remove a document from the cache (on delete).
+    /// Remove a document from the cache (on delete). Does NOT bump the
+    /// `evictions` counter because that would conflate LRU/retention
+    /// pressure with explicit application-driven deletes, muddying
+    /// cache-pressure dashboards. Explicit deletes are tracked via the
+    /// caller-side `doc_cache_live_update_total{result="deleted"}`
+    /// counter instead. Removes from ALL generations defensively,
+    /// even though insert() maintains the single-entry invariant —
+    /// covers theoretical races that could leave a stale entry in an
+    /// older generation.
     pub fn remove(&self, slot_id: u32) {
         let gens = self.generations.load();
         for gen in gens.iter() {
             if let Some((_, entry)) = gen.entries.remove(&slot_id) {
                 gen.size_bytes.fetch_sub(entry.size_bytes, Ordering::Relaxed);
-                return;
             }
         }
+    }
+
+    /// Check whether a slot is currently cached WITHOUT promoting it
+    /// to the current generation. Used by maintenance paths (e.g. the
+    /// ops-driven refresh path) where a `get()` would incorrectly
+    /// count as a user hit and skew `hits_by_gen_bucket` stats.
+    pub fn contains(&self, slot_id: u32) -> bool {
+        let gens = self.generations.load();
+        for gen in gens.iter() {
+            if gen.entries.contains_key(&slot_id) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Push a new empty generation to the front (current position).
