@@ -151,6 +151,13 @@ pub struct Metrics {
     pub query_doc_disk_fetch_seconds: HistogramVec,
     pub query_doc_format_seconds: HistogramVec,
     pub query_response_build_seconds: HistogramVec,
+    // -- Apr 11 2026 tokio .await return delay + inline/spawn_blocking split --
+    // Directly measures the time between the blocking closure completing
+    // and the .await resuming on the async side. Under reactor saturation
+    // this delay dominates query_docs P95 (was ~571ms avg in prior analysis).
+    // Labeled counter to see inline-vs-spawn_blocking hit rate.
+    pub query_docs_path_total: IntCounterVec,
+    pub query_tokio_return_delay_seconds: HistogramVec,
     // -- Apr 10 2026 lock-wait instrumentation (Justin's flush-blocks-reads hypothesis) --
     // Measures how long query threads BLOCK waiting for locks held by the
     // flush thread. Zero under no contention; spikes when flush thread
@@ -840,6 +847,26 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        // Apr 11 2026: tokio .await return delay instrumentation
+        // Doc phase buckets extend to 60s since reactor-saturation delays
+        // can be multi-second.
+        let query_docs_path_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_query_docs_path_total",
+                "Cumulative count of doc fetch path taken: inline (full cache hit) vs spawn_blocking (any miss)",
+            ),
+            &["index", "path"],
+        )
+        .unwrap();
+        let query_tokio_return_delay_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_tokio_return_delay_seconds",
+                "Time from blocking closure completion to .await resuming on async side (reactor wake delay)",
+            )
+            .buckets(doc_phase_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
         let query_response_build_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "bitdex_query_response_build_seconds",
@@ -1168,6 +1195,8 @@ impl Metrics {
         registry.register(Box::new(query_doc_cache_probe_seconds.clone())).unwrap();
         registry.register(Box::new(query_doc_disk_fetch_seconds.clone())).unwrap();
         registry.register(Box::new(query_doc_format_seconds.clone())).unwrap();
+        registry.register(Box::new(query_docs_path_total.clone())).unwrap();
+        registry.register(Box::new(query_tokio_return_delay_seconds.clone())).unwrap();
         registry.register(Box::new(query_response_build_seconds.clone())).unwrap();
         registry.register(Box::new(query_cache_lock_wait_seconds.clone())).unwrap();
         registry.register(Box::new(query_cache_hold_seconds.clone())).unwrap();
@@ -1295,6 +1324,8 @@ impl Metrics {
             query_doc_cache_probe_seconds,
             query_doc_disk_fetch_seconds,
             query_doc_format_seconds,
+            query_docs_path_total,
+            query_tokio_return_delay_seconds,
             query_response_build_seconds,
             query_cache_lock_wait_seconds,
             query_cache_hold_seconds,
