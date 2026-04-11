@@ -6191,70 +6191,107 @@ impl ConcurrentEngine {
         self.doc_silo.as_ref().map(Arc::clone)
     }
 
-    /// Bulk-copy every document from DocStoreV3 into DocSilo. Used post-dump
-    /// to populate the silo without rewriting the dump pipeline. Destructive:
-    /// truncates the silo's existing data and ops logs.
+    /// Bulk-copy every document from DocStoreV3 into DocSilo by iterating
+    /// the alive bitmap (which has the authoritative set of live slot IDs)
+    /// and calling `get_many` in chunks. All retrieved docs are accumulated
+    /// into a single `Vec` and written to the silo via one destructive
+    /// `bulk_load` call.
+    ///
+    /// `get_many` reads both the compacted snapshot AND the ops log section
+    /// per shard, so it sees all documents the dump has written — whereas
+    /// `get_shard` only returns compacted snapshots and silently misses
+    /// uncompacted shards.
+    ///
+    /// Memory footprint is O(total_alive). 14M works (~3 GB). 107M will
+    /// need a real streaming path with a hash-index grow + incremental
+    /// compact strategy.
     ///
     /// Returns `(docs_copied, data_bytes)` on success.
     pub fn copy_docstore_to_silo(&self) -> Result<(u64, u64)> {
-        use crate::shard_store_doc::SlotHexShard;
+        const FETCH_CHUNK: usize = 200_000;
+
         let silo = self
             .doc_silo
             .as_ref()
             .ok_or_else(|| crate::error::BitdexError::Storage("DocSilo not initialized".into()))?;
 
-        let docstore = self.docstore.read();
-        let max_slot = self.snapshot().slots.slot_counter();
-        let num_shards = SlotHexShard::slot_to_shard(max_slot.saturating_sub(1)) + 1;
-
+        let snap = self.snapshot();
+        let alive_bitmap = snap.slots.alive_bitmap().clone();
+        drop(snap);
+        let total_alive = alive_bitmap.len() as u64;
         eprintln!(
-            "copy_docstore_to_silo: scanning {} shards, up to slot {}",
-            num_shards, max_slot
+            "copy_docstore_to_silo: {} alive slots, fetch_chunk={}",
+            total_alive, FETCH_CHUNK
         );
 
-        // Accumulate all docs first; bulk_load is a single destructive rewrite.
-        // For 107M this needs streaming; 14M fits in memory (~2 GB).
-        let mut all_docs: Vec<(u32, StoredDoc)> = Vec::with_capacity(max_slot as usize);
-        let mut shards_scanned = 0u32;
-        for shard_id in 0..num_shards {
-            match docstore.get_shard(shard_id) {
-                Ok(docs) => {
-                    for (slot_id, doc) in docs {
-                        all_docs.push((slot_id, doc));
+        let overall_start = std::time::Instant::now();
+        let mut all_docs: Vec<(u32, StoredDoc)> = Vec::with_capacity(total_alive as usize);
+        let mut batch_slots: Vec<u32> = Vec::with_capacity(FETCH_CHUNK);
+
+        for slot in alive_bitmap.iter() {
+            batch_slots.push(slot);
+            if batch_slots.len() >= FETCH_CHUNK {
+                let (docs, _, _) = {
+                    let guard = self.docstore.read();
+                    guard.get_many(&batch_slots)?
+                };
+                for (slot_id, maybe_doc) in batch_slots.iter().zip(docs.into_iter()) {
+                    if let Some(doc) = maybe_doc {
+                        all_docs.push((*slot_id, doc));
                     }
                 }
-                Err(e) => {
-                    eprintln!("  shard {} read error (skipping): {}", shard_id, e);
+                batch_slots.clear();
+                if all_docs.len() % 1_000_000 == 0 || all_docs.len() >= total_alive as usize {
+                    eprintln!(
+                        "  fetched {} / {} ({:.1}%), elapsed {:.1}s",
+                        all_docs.len(),
+                        total_alive,
+                        100.0 * all_docs.len() as f64 / total_alive.max(1) as f64,
+                        overall_start.elapsed().as_secs_f64()
+                    );
                 }
             }
-            shards_scanned += 1;
-            if shards_scanned % 1000 == 0 {
-                eprintln!(
-                    "  ... {} / {} shards scanned, {} docs collected",
-                    shards_scanned,
-                    num_shards,
-                    all_docs.len()
-                );
+        }
+        if !batch_slots.is_empty() {
+            let (docs, _, _) = {
+                let guard = self.docstore.read();
+                guard.get_many(&batch_slots)?
+            };
+            for (slot_id, maybe_doc) in batch_slots.iter().zip(docs.into_iter()) {
+                if let Some(doc) = maybe_doc {
+                    all_docs.push((*slot_id, doc));
+                }
             }
         }
-        drop(docstore);
 
-        let doc_count = all_docs.len() as u64;
-        eprintln!("copy_docstore_to_silo: collected {} docs, bulk-loading silo", doc_count);
+        let fetched_docs = all_docs.len() as u64;
+        eprintln!(
+            "copy_docstore_to_silo: fetched {} docs in {:.1}s, bulk-loading silo",
+            fetched_docs,
+            overall_start.elapsed().as_secs_f64()
+        );
 
-        let mut silo_guard = silo.write();
-        let loaded = silo_guard
-            .bulk_load(&all_docs)
-            .map_err(|e| crate::error::BitdexError::Storage(format!("silo bulk_load: {e}")))?;
-        silo_guard
-            .save_field_dict()
-            .map_err(|e| crate::error::BitdexError::Storage(format!("silo save_field_dict: {e}")))?;
-        let data_bytes = silo_guard.data_bytes();
-        drop(silo_guard);
+        let loaded = {
+            let mut guard = silo.write();
+            guard.bulk_load(&all_docs).map_err(|e| {
+                crate::error::BitdexError::Storage(format!("silo bulk_load: {e}"))
+            })?
+        };
+        let data_bytes = {
+            let guard = silo.read();
+            guard.data_bytes()
+        };
+        {
+            let guard = silo.read();
+            guard.save_field_dict().map_err(|e| {
+                crate::error::BitdexError::Storage(format!("silo save_field_dict: {e}"))
+            })?;
+        }
 
         eprintln!(
-            "copy_docstore_to_silo: loaded {} docs, data.bin = {:.1} MB",
+            "copy_docstore_to_silo: loaded {} docs in {:.1}s, data.bin = {:.1} MB",
             loaded,
+            overall_start.elapsed().as_secs_f64(),
             data_bytes as f64 / 1e6
         );
         Ok((loaded, data_bytes))
