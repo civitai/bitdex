@@ -200,6 +200,7 @@ pub struct Metrics {
     pub doc_cache_miss_reason_total: IntGaugeVec,  // labels: reason=above_high_water|at_or_below_high_water
     pub docstore_shard_concurrent_read_total: IntGaugeVec, // labels: context=first|concurrent_duplicate
     pub query_docs_batch_miss_count: HistogramVec, // buckets: 0,1,2,3,5,10,25,100,500+
+    pub doc_cache_live_update_total: IntGaugeVec, // labels: result=refreshed|deleted|skipped
 
     // -- Phase 2.5: ShardStore ops (stub — wired when Phase 1 lands) --
     pub shardstore_ops_count: IntGaugeVec,
@@ -1048,6 +1049,14 @@ impl Metrics {
         // 0 = full hit, 1 = one miss forces whole batch to spawn_blocking,
         // 100+ = large working-set miss.
         let batch_miss_buckets = vec![0.0, 1.0, 2.0, 3.0, 5.0, 10.0, 25.0, 100.0, 500.0];
+        let doc_cache_live_update_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_doc_cache_live_update_total",
+                "Ops-driven cache refresh outcomes (replaces evict-on-op). refreshed: doc was cached, re-read from disk and re-inserted. deleted: doc was cached, Delete op removed it. skipped: doc was not cached (cache-on-read preserved, no action).",
+            ),
+            &["index", "result"],
+        )
+        .unwrap();
         let query_docs_batch_miss_count = HistogramVec::new(
             HistogramOpts::new(
                 "bitdex_query_docs_batch_miss_count",
@@ -1294,6 +1303,7 @@ impl Metrics {
         registry.register(Box::new(doc_cache_miss_reason_total.clone())).unwrap();
         registry.register(Box::new(docstore_shard_concurrent_read_total.clone())).unwrap();
         registry.register(Box::new(query_docs_batch_miss_count.clone())).unwrap();
+        registry.register(Box::new(doc_cache_live_update_total.clone())).unwrap();
         registry.register(Box::new(shardstore_ops_count.clone())).unwrap();
         registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
         registry.register(Box::new(pgsync_rows_fetched_total.clone())).unwrap();
@@ -1429,6 +1439,7 @@ impl Metrics {
             doc_cache_miss_reason_total,
             docstore_shard_concurrent_read_total,
             query_docs_batch_miss_count,
+            doc_cache_live_update_total,
             shardstore_ops_count,
             pgsync_cycle_seconds,
             pgsync_rows_fetched_total,
