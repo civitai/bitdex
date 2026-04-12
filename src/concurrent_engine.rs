@@ -237,6 +237,7 @@ pub struct CompactResult {
     pub shards_scanned: u64,
     pub shards_compacted: u64,
     pub shards_skipped: u64,
+    pub docs_compacted: bool,
     pub elapsed_secs: f64,
 }
 
@@ -1224,6 +1225,7 @@ impl ConcurrentEngine {
                 .filter_map(|fc| fc.eviction.as_ref().map(|e| (fc.name.clone(), e.idle_seconds)))
                 .collect();
             let flush_mem_cache = Arc::clone(&bitmap_memory_cache);
+            let flush_doc_silo = Arc::clone(&doc_silo);
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
                 let max_sleep = Duration::from_micros(flush_interval_us * 10);
@@ -1759,6 +1761,26 @@ impl ConcurrentEngine {
                                 }
                             }
                             flush_compact_ns.store(t_compact.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            // DocSilo janitor: compact ops log into data.bin when ops
+                            // accumulate past the threshold. Runs on the same cadence as
+                            // filter compaction (~5s). The write lock blocks doc reads
+                            // briefly but compaction is fast (in-place writes to mmap).
+                            // Threshold: 1 MB of ops log = ~10K ops at ~100 bytes each.
+                            const DOC_SILO_COMPACT_THRESHOLD_BYTES: u64 = 1_024 * 1_024;
+                            if flush_cycle % COMPACTION_INTERVAL == 0 {
+                                let ops_bytes = flush_doc_silo.read().ops_size();
+                                if ops_bytes >= DOC_SILO_COMPACT_THRESHOLD_BYTES {
+                                    if flush_doc_silo.read().has_ops() {
+                                        match flush_doc_silo.write().compact() {
+                                            Ok(n) if n > 0 => {
+                                                eprintln!("[janitor] DocSilo compaction folded {n} ops into data.bin (was {ops_bytes} bytes)");
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => eprintln!("[janitor] DocSilo compaction error: {e}"),
+                                        }
+                                    }
+                                }
+                            }
                             flush_cycle += 1;
                             flush_cycle_clone.store(flush_cycle, Ordering::Relaxed);
                             // Precompute not-null bitmaps for nullable fields.
@@ -6026,7 +6048,25 @@ impl ConcurrentEngine {
 
         Ok((results, stats, unique_shards, cache_probe_nanos, disk_fetch_nanos, miss_count))
     }
-    pub fn compact_docstore(&self) -> Result<bool> { Ok(false) }
+    /// Compact the DocSilo: fold pending ops from the ops log into data.bin.
+    /// Returns true if compaction ran, false if no ops pending.
+    pub fn compact_docstore(&self) -> Result<bool> {
+        if !self.doc_silo.read().has_ops() {
+            return Ok(false);
+        }
+        let ops_folded = self.doc_silo.write().compact()
+            .map_err(|e| crate::error::BitdexError::Storage(format!("docsilo compact: {e}")))?;
+        if ops_folded > 0 {
+            eprintln!("[janitor] DocSilo compaction folded {ops_folded} ops into data.bin");
+        }
+        Ok(ops_folded > 0)
+    }
+
+    /// Check if DocSilo ops log exceeds the compaction threshold (bytes).
+    /// Called by the flush thread to decide when to trigger compaction.
+    pub fn doc_silo_needs_compaction(&self, threshold_bytes: u64) -> bool {
+        self.doc_silo.read().ops_size() >= threshold_bytes
+    }
     pub fn set_docstore_defaults(&self, _schema: &crate::config::DataSchema) {}
     pub fn docstore_schema_version(&self) -> u8 { 0 }
 
@@ -7186,7 +7226,15 @@ impl ConcurrentEngine {
                     if let Err(e) = sort_s.delete_generation(gen) { eprintln!("compact_all: delete sort gen {gen}: {e}"); }
                 }
             }
-            let _ = compact_docs;
+            if compact_docs {
+                match self.compact_docstore() {
+                    Ok(true) => {
+                        result.docs_compacted = true;
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("compact_all: docstore compaction failed: {e}"),
+                }
+            }
             eprintln!("compact_all: deleted generations 0..{}", frozen_gen - 1);
         } else if any_failed {
             eprintln!("compact_all: skipping old gen deletion due to errors");

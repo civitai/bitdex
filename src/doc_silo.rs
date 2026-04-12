@@ -644,12 +644,12 @@ impl DocSilo {
     pub fn open(path: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(path)?;
         let silo_path = path.join("silo");
-        // buffer_ratio=4.0 + min_entry_size=1024 mirrors v3 doc silo config:
-        // multi-phase dumps grow each doc ~3-5x between phase 1 and phase N,
-        // so we overallocate up front to keep rewrites in-place.
+        // buffer_ratio=2.5 + min_entry_size=512: sized for the expected final
+        // merged doc (~400-600 bytes), not a blind multiplier on Phase 1 size.
+        // Compaction uses these values when relocating entries that overflow.
         let config = SiloConfig {
-            buffer_ratio: 4.0,
-            min_entry_size: 1024,
+            buffer_ratio: BUFFER_RATIO as f32,
+            min_entry_size: MIN_ENTRY_SIZE,
             ..SiloConfig::default()
         };
         let silo: Inner = DataSilo::open(&silo_path, config)?;
@@ -913,23 +913,21 @@ use std::io::Write;
 /// is truncated to the actual used bytes at finalize. Growth-on-overflow
 /// is a fallback if the estimate is too low.
 const INITIAL_BYTES_PER_DOC: usize = 256;
-/// Ratio of data.bin capacity to estimated data size. Must be large enough
-/// to fit all entries with their BUFFER_RATIO headroom. Each entry uses
-/// max(length * BUFFER_RATIO, MIN_ENTRY_SIZE) bytes. For typical ~200 byte
-/// image docs, that's 1024 bytes/entry = 4x the raw data. The file is
-/// truncated to actual cursor position at finalize, so disk usage = sum of
-/// allocated, not the pre-allocated capacity.
-/// 14.6M × 256 × 4.5 = 16.8 GB pre-alloc, 14.6M × 1024 = 15 GB actual.
-const SLACK_RATIO: f64 = 4.5;
-/// Per-entry buffer ratio: how much extra space to reserve for each doc to
-/// allow Phase 2+ DumpMergeWriter in-place merges (tags, resources, etc.).
-/// 4.0 means each entry gets 4x its written data size as allocated space.
-/// Matches SiloConfig::buffer_ratio used by DocSilo::open().
-const BUFFER_RATIO: f64 = 4.0;
-/// Minimum allocated bytes per entry. Ensures even tiny docs (a few bytes)
-/// have enough room for tags/resources to be merged in later phases.
-/// Matches SiloConfig::min_entry_size used by DocSilo::open().
-const MIN_ENTRY_SIZE: u32 = 1024;
+/// Pre-allocation ratio for data.bin capacity. Must be large enough to
+/// hold all entries with their per-entry headroom. The mmap is sparse —
+/// zeros are never paged into RSS, so excess disk allocation is free
+/// from a memory perspective. File is truncated to actual cursor at finalize.
+const SLACK_RATIO: f64 = 3.0;
+/// Per-entry buffer ratio: extra space reserved for Phase 2+ in-place merges.
+/// Phase 1 image docs are ~200 bytes. Fully merged docs (images + tags +
+/// resources + tools + techniques) are ~400-600 bytes. 2.5x gives ~500 bytes
+/// for a 200 byte doc, which covers the typical merged size with room to spare.
+const BUFFER_RATIO: f64 = 2.5;
+/// Minimum allocated bytes per entry. Even small docs need enough room for
+/// tags to be merged in. A fully-tagged image with 10+ tags is ~300-400 bytes.
+/// 512 bytes covers the common case without excessive waste.
+/// At 107M records: 107M × 512 = 55 GB disk, ~20 GB RSS (only written pages).
+const MIN_ENTRY_SIZE: u32 = 512;
 
 struct BulkState {
     /// Keeps the writable mmap alive. Only touched during `new`, `grow`,
