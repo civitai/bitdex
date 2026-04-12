@@ -243,48 +243,109 @@ mod tests {
         }
     }
 
-    // ── 6. DumpMergeWriter (will fail until ported from v3) ────────────
+    // ── 6. DumpMergeWriter ───────────────────────────────────────────
 
-    // These tests define the DumpMergeWriter contract. They will not compile
-    // until the struct is ported from the v3 branch. Uncomment as you port.
+    fn open_with_buffer_ratio(ratio: f32) -> (tempfile::TempDir, TestSilo) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SiloConfig {
+            buffer_ratio: ratio,
+            ..SiloConfig::default()
+        };
+        let silo = TestSilo::open(dir.path(), config).unwrap();
+        (dir, silo)
+    }
 
-    /*
     #[test]
     fn test_merge_put_combines_data() {
-        // Phase 1: bulk load base entries
-        // Phase 2: merge_put with a function that appends new bytes
-        // Verify: get returns combined bytes
-        todo!("Port DumpMergeWriter from v3")
+        let (_dir, mut silo) = open_with_buffer_ratio(4.0);
+        silo.bulk_load(&[(1, TestSnap(b"hello".to_vec()))]).unwrap();
+        let mut writer = silo.prepare_dump_merge().unwrap().unwrap();
+        let ok = writer.merge_put(1, b" world", |existing, new| {
+            let mut merged = existing.to_vec();
+            merged.extend_from_slice(new);
+            merged
+        });
+        assert!(ok);
+        writer.flush().unwrap();
+        drop(writer);
+        silo.reload_data().unwrap();
+        let got = silo.get_compacted(1).unwrap().unwrap();
+        assert_eq!(got.0, b"hello world");
     }
 
     #[test]
     fn test_merge_put_fits_in_buffer() {
-        // bulk load with buffer_ratio=4.0
-        // merge_put that fits in 4x allocation
-        // Verify: in_place_count == 1, overflow_count == 0
-        todo!("Port DumpMergeWriter from v3")
+        let (_dir, mut silo) = open_with_buffer_ratio(4.0);
+        silo.bulk_load(&[(1, TestSnap(b"base".to_vec()))]).unwrap();
+        let writer = silo.prepare_dump_merge().unwrap().unwrap();
+        let ok = writer.merge_put(1, b"extra", |existing, new| {
+            let mut m = existing.to_vec();
+            m.extend_from_slice(new);
+            m
+        });
+        assert!(ok);
+        assert_eq!(writer.in_place_count.load(Ordering::Relaxed), 1);
+        assert_eq!(writer.overflow_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn test_merge_put_overflow() {
-        // bulk load with buffer_ratio=1.0 (no headroom)
-        // merge_put that doubles the data size
-        // Verify: returns false, overflow_count == 1
-        todo!("Port DumpMergeWriter from v3")
+        let dir = tempfile::tempdir().unwrap();
+        let config = SiloConfig {
+            buffer_ratio: 1.0,
+            min_entry_size: 1, // prevent min_entry_size from adding headroom
+            ..SiloConfig::default()
+        };
+        let mut silo = TestSilo::open(dir.path(), config).unwrap();
+        // Use data larger than any min_entry_size default
+        let big = vec![0xABu8; 2048];
+        silo.bulk_load(&[(1, TestSnap(big))]).unwrap();
+        let writer = silo.prepare_dump_merge().unwrap().unwrap();
+        // Try to merge another 2048 bytes — should overflow since allocated == 2048
+        let ok = writer.merge_put(1, &[0xCDu8; 2048], |existing, new| {
+            let mut m = existing.to_vec();
+            m.extend_from_slice(new);
+            m
+        });
+        assert!(!ok, "should overflow when merged data exceeds allocated");
+        assert_eq!(writer.overflow_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn test_merge_put_empty_slot() {
-        // bulk load with length=0 entry
-        // merge_put writes new_bytes directly without calling merge_fn
-        todo!("Port DumpMergeWriter from v3")
+        let (_dir, mut silo) = open_with_buffer_ratio(4.0);
+        // Bulk load with an empty snapshot
+        silo.bulk_load(&[(1, TestSnap(Vec::new()))]).unwrap();
+        let mut writer = silo.prepare_dump_merge().unwrap().unwrap();
+        let ok = writer.merge_put(1, b"fresh", |_existing, _new| {
+            panic!("merge_fn should NOT be called for empty slots");
+        });
+        assert!(ok);
+        writer.flush().unwrap();
+        drop(writer);
+        silo.reload_data().unwrap();
+        let got = silo.get_compacted(1).unwrap().unwrap();
+        assert_eq!(got.0, b"fresh");
     }
 
     #[test]
     fn test_merge_put_concurrent() {
-        // 32 rayon threads merge_put to 1000 different keys
-        // All final values correct
-        todo!("Port DumpMergeWriter from v3")
+        let (_dir, mut silo) = open_with_buffer_ratio(4.0);
+        let entries: Vec<(u64, TestSnap)> = (1..=1000)
+            .map(|i| (i, TestSnap(format!("v{i}").into_bytes())))
+            .collect();
+        silo.bulk_load(&entries).unwrap();
+        let writer = silo.prepare_dump_merge().unwrap().unwrap();
+        use rayon::prelude::*;
+        (1..=1000u64).into_par_iter().for_each(|i| {
+            let ok = writer.merge_put(i, b"+merged", |existing, new| {
+                let mut m = existing.to_vec();
+                m.extend_from_slice(new);
+                m
+            });
+            assert!(ok, "key {i} merge failed");
+        });
+        assert_eq!(writer.in_place_count.load(Ordering::Relaxed), 1000);
+        assert_eq!(writer.overflow_count.load(Ordering::Relaxed), 0);
     }
-    */
 }
