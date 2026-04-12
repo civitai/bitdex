@@ -1101,9 +1101,11 @@ impl DocSiloBulkWriter {
         let _ = std::fs::remove_file(silo_subdir.join("ops_a.log"));
         let _ = std::fs::remove_file(silo_subdir.join("ops_b.log"));
 
-        // Pre-allocate with generous slack. For 14M docs × 256 × 1.5 = ~5 GB.
-        // The file is truncated to actual used bytes at finalize.
-        let capacity = (estimated_rows as f64 * INITIAL_BYTES_PER_DOC as f64 * SLACK_RATIO)
+        // Pre-allocate based on MIN_ENTRY_SIZE (the actual per-entry allocation)
+        // plus a small slack factor. This gives a tight estimate that doesn't
+        // waste disk space or address space.
+        // At 110M rows × 512 × 1.1 = ~62 GB pre-alloc, ~56 GB actual.
+        let capacity = (estimated_rows as f64 * MIN_ENTRY_SIZE as f64 * 1.1)
             .ceil() as u64;
         let capacity = capacity.max(64 * 1024 * 1024); // at least 64 MB
         data_file.set_len(capacity)?;
@@ -1453,10 +1455,12 @@ impl DocSiloBulkWriter {
             layouts.len(), spill_paths.len()
         );
 
-        // Flush the mmap, then release it before touching the file.
-        let state = self.state.lock();
-        state.mmap.flush()?;
-        drop(state); // drops mmap + File — both now closed.
+        // Drop the mmap + file handle. MmapMut::drop calls flush_async
+        // which is sufficient — the kernel will persist dirty pages before
+        // allowing a new mmap on the same file. Explicit msync on a 60+ GB
+        // region can SIGBUS on Linux if disk pressure causes write failures
+        // during the synchronous flush.
+        drop(self.state.lock()); // drops mmap + File — both now closed.
 
         // Reopen the file by path so we can optionally truncate to the
         // actual used bytes. On Windows the truncate can fail if anything
