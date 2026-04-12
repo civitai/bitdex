@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "scratch"]
+members = [".", "scratch", "crates/datasilo"]
 default-members = ["."]
 
 [package]
@@ -83,6 +83,9 @@ bytes = { version = "1", optional = true }
 
 # Memory-mapped files (slot arena for bulk loading)
 memmap2 = "0.9"
+
+# DataSilo — mmap-backed typed KV store for doc storage.
+datasilo = { path = "crates/datasilo" }
 
 # RNG (used by benchmark and loadtest binaries)
 rand = "0.8"
@@ -181,6 +184,11 @@ required-features = ["replay"]
 [[bin]]
 name = "rebuild_bench"
 path = "src/bin/rebuild_bench.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "silo_copy"
+path = "src/bin/silo_copy.rs"
 
 [[example]]
 name = "load_from_csv"

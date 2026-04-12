@@ -1,0 +1,16 @@
+[package]
+name = "datasilo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Mmap-backed key-value store with typed ops log — the doc storage half of BitDex v2."
+
+[dependencies]
+memmap2 = "0.9"
+parking_lot = "0.12"
+rayon = "1"
+crc32fast = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

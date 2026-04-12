@@ -16,6 +16,7 @@ pub mod config;
 pub mod dictionary;
 
 pub mod doc_cache;
+pub mod doc_silo;
 pub mod engine;
 pub mod error;
 pub mod ingester;

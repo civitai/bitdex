@@ -19,8 +19,9 @@ use serde_json::Value as JsonValue;
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
-use crate::shard_store_doc::PackedValue;
+use crate::doc_silo::{DocOp, DocSilo};
 use crate::shard_store_doc::DocStoreV3;
+use crate::shard_store_doc::PackedValue;
 use crate::filter::{FilterFieldType, NULL_BITMAP_KEY};
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
@@ -39,18 +40,50 @@ use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 /// the read and write within a single WAL batch cycle.
 pub struct DocWriter {
     docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
+    /// Optional DocSilo for dual-write. When set, every flush mirrors the
+    /// pending ops into the silo so steady-state sync-v2 writes remain
+    /// visible to the read path (which prefers DocSilo when populated).
+    doc_silo: Option<Arc<parking_lot::RwLock<DocSilo>>>,
     field_dict: HashMap<String, u16>,
-    pending: Vec<(u32, u16, Vec<u8>)>,
-    pending_append: Vec<(u32, u16, PackedValue)>,
-    pending_remove: Vec<(u32, u16, PackedValue)>,
+    /// Independent field index for DocSilo. The silo and DocStoreV3
+    /// assign indices in their own namespaces so a name may map to
+    /// different integers in each.
+    silo_field_dict: HashMap<String, u16>,
+    /// pending entries store the field NAME so flush can resolve indices
+    /// in both the V3 and silo dictionaries independently.
+    pending: Vec<(u32, String, PackedValue)>,
+    pending_append: Vec<(u32, String, PackedValue)>,
+    pending_remove: Vec<(u32, String, PackedValue)>,
 }
 impl DocWriter {
     /// Create a DocWriter from the engine's docstore.
     pub fn new(docstore: Arc<parking_lot::RwLock<DocStoreV3>>) -> Self {
+        Self::new_dual(docstore, None)
+    }
+
+    /// Create a DocWriter that dual-writes to both DocStoreV3 and DocSilo.
+    /// The silo mirror keeps the sync-v2 ops path coherent with the read
+    /// path after a DocSilo bulk dump.
+    pub fn new_dual(
+        docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
+        doc_silo: Option<Arc<parking_lot::RwLock<DocSilo>>>,
+    ) -> Self {
         let field_dict = docstore.read().field_dict_snapshot();
+        let silo_field_dict: HashMap<String, u16> = doc_silo
+            .as_ref()
+            .map(|s| {
+                s.read()
+                    .field_to_idx()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             docstore,
+            doc_silo,
             field_dict,
+            silo_field_dict,
             pending: Vec::new(),
             pending_append: Vec::new(),
             pending_remove: Vec::new(),
@@ -61,10 +94,6 @@ impl DocWriter {
     /// unsigned in bitmaps; storing negatives in docstore would diverge from
     /// the bitmap value and confuse shadow-mode comparisons.
     fn write_set(&mut self, slot: u32, field: &str, value: &JsonValue) {
-        let idx = match self.resolve_field(field) {
-            Some(idx) => idx,
-            None => return,
-        };
         // Clamp negative integers to 0 before docstore write
         let clamped;
         let effective = if let Some(n) = value.as_i64() {
@@ -78,9 +107,7 @@ impl DocWriter {
             value
         };
         if let Some(packed) = json_to_packed(effective) {
-            if let Ok(bytes) = rmp_serde::to_vec(&packed) {
-                self.pending.push((slot, idx, bytes));
-            }
+            self.pending.push((slot, field.to_string(), packed));
         }
     }
     /// Write a multi-value add by emitting DocOp::Append. The apply path
@@ -88,66 +115,162 @@ impl DocWriter {
     /// is needed — eliminates the batch race where two adds for the same
     /// slot in one batch would each emit a Set and clobber each other.
     fn write_add(&mut self, slot: u32, field: &str, value: &JsonValue) {
-        let idx = match self.resolve_field(field) {
-            Some(idx) => idx,
-            None => return,
-        };
         let add_val = match value.as_i64() {
             Some(v) => v,
             None => return,
         };
-        self.pending_append.push((slot, idx, PackedValue::I(add_val)));
+        self.pending_append
+            .push((slot, field.to_string(), PackedValue::I(add_val)));
     }
     /// Write a multi-value remove by emitting DocOp::Remove.
     fn write_remove(&mut self, slot: u32, field: &str, value: &JsonValue) {
-        let idx = match self.resolve_field(field) {
-            Some(idx) => idx,
-            None => return,
-        };
         let remove_val = match value.as_i64() {
             Some(v) => v,
             None => return,
         };
-        self.pending_remove.push((slot, idx, PackedValue::I(remove_val)));
+        self.pending_remove
+            .push((slot, field.to_string(), PackedValue::I(remove_val)));
     }
-    /// Flush pending tuples to the docstore.
+    /// Flush pending ops to DocStoreV3 and (if configured) DocSilo.
     ///
-    /// Uses the concurrent-read fast paths
-    /// (`append_tuples_batch_concurrent` / `append_multi_ops_batch_concurrent`)
-    /// so doc fetches proceed in parallel with the apply. This is the
-    /// steady-state hot path for the metrics poller (~5K Set ops every few
-    /// seconds) — switching it off the docstore write lock is the main win
-    /// in iter 7.
+    /// The V3 path uses the concurrent-read fast paths so doc fetches
+    /// proceed in parallel with the apply. The silo mirror uses
+    /// `apply_ops_batch` which is also concurrent-read-safe (the silo
+    /// write path takes a brief mutex internally for ops-log append only).
+    ///
+    /// Field indices are resolved independently against each store's
+    /// dictionary — the same name may map to different integers, so we
+    /// keep two caches. Indices are lazily registered via
+    /// `ensure_field_index` on first write.
     pub fn flush(&mut self) {
+        // ── Set ops ───────────────────────────────────────────────────
         if !self.pending.is_empty() {
-            let tuples = std::mem::take(&mut self.pending);
-            if let Err(e) = self.docstore.read().append_tuples_batch_concurrent(tuples) {
-                tracing::warn!("DocWriter flush failed: {e}");
+            let pending = std::mem::take(&mut self.pending);
+
+            // V3 path: resolve each field to its V3 index, then encode
+            // the PackedValue into rmp bytes (V3's on-disk format).
+            let v3_tuples: Vec<(u32, u16, Vec<u8>)> = pending
+                .iter()
+                .filter_map(|(slot, field, pv)| {
+                    let v3_idx = self.resolve_v3_field(field)?;
+                    let bytes = rmp_serde::to_vec(pv).ok()?;
+                    Some((*slot, v3_idx, bytes))
+                })
+                .collect();
+            if !v3_tuples.is_empty() {
+                if let Err(e) = self.docstore.read().append_tuples_batch_concurrent(v3_tuples) {
+                    tracing::warn!("DocWriter V3 flush failed: {e}");
+                }
+            }
+
+            // Silo path: resolve each field to its silo index and emit
+            // DocOp::Set directly — no rmp encode needed since the silo
+            // ops log stores typed ops natively.
+            if self.doc_silo.is_some() {
+                let silo_ops: Vec<DocOp> = pending
+                    .into_iter()
+                    .filter_map(|(slot, field, pv)| {
+                        let silo_idx = self.resolve_silo_field(&field)?;
+                        Some(DocOp::Set { slot, field: silo_idx, value: pv })
+                    })
+                    .collect();
+                if !silo_ops.is_empty() {
+                    if let Err(e) = self
+                        .doc_silo
+                        .as_ref()
+                        .unwrap()
+                        .read()
+                        .apply_ops_batch(&silo_ops)
+                    {
+                        tracing::warn!("DocWriter silo set flush failed: {e}");
+                    }
+                }
             }
         }
+
+        // ── Append / Remove multi-int ops ─────────────────────────────
         if !self.pending_append.is_empty() || !self.pending_remove.is_empty() {
             let appends = std::mem::take(&mut self.pending_append);
             let removes = std::mem::take(&mut self.pending_remove);
-            if let Err(e) = self.docstore.read().append_multi_ops_batch_concurrent(appends, removes) {
-                tracing::warn!("DocWriter multi-ops flush failed: {e}");
+
+            // V3 path — resolve to V3 indices.
+            let v3_appends: Vec<(u32, u16, PackedValue)> = appends
+                .iter()
+                .filter_map(|(slot, field, pv)| {
+                    let idx = self.resolve_v3_field(field)?;
+                    Some((*slot, idx, pv.clone()))
+                })
+                .collect();
+            let v3_removes: Vec<(u32, u16, PackedValue)> = removes
+                .iter()
+                .filter_map(|(slot, field, pv)| {
+                    let idx = self.resolve_v3_field(field)?;
+                    Some((*slot, idx, pv.clone()))
+                })
+                .collect();
+            if !v3_appends.is_empty() || !v3_removes.is_empty() {
+                if let Err(e) = self
+                    .docstore
+                    .read()
+                    .append_multi_ops_batch_concurrent(v3_appends, v3_removes)
+                {
+                    tracing::warn!("DocWriter V3 multi-ops flush failed: {e}");
+                }
+            }
+
+            // Silo path — emit DocOp::Append / DocOp::Remove batch.
+            if self.doc_silo.is_some() {
+                let mut silo_ops: Vec<DocOp> =
+                    Vec::with_capacity(appends.len() + removes.len());
+                for (slot, field, pv) in appends {
+                    if let Some(idx) = self.resolve_silo_field(&field) {
+                        silo_ops.push(DocOp::Append { slot, field: idx, value: pv });
+                    }
+                }
+                for (slot, field, pv) in removes {
+                    if let Some(idx) = self.resolve_silo_field(&field) {
+                        silo_ops.push(DocOp::Remove { slot, field: idx, value: pv });
+                    }
+                }
+                if !silo_ops.is_empty() {
+                    if let Err(e) = self
+                        .doc_silo
+                        .as_ref()
+                        .unwrap()
+                        .read()
+                        .apply_ops_batch(&silo_ops)
+                    {
+                        tracing::warn!("DocWriter silo multi-ops flush failed: {e}");
+                    }
+                }
             }
         }
     }
-    fn resolve_field(&mut self, field: &str) -> Option<u16> {
+
+    fn resolve_v3_field(&mut self, field: &str) -> Option<u16> {
         if let Some(&idx) = self.field_dict.get(field) {
             return Some(idx);
         }
-        // Field not in snapshot — try to ensure it exists
         match self.docstore.write().ensure_field_index(field) {
             Ok(idx) => {
                 self.field_dict.insert(field.to_string(), idx);
                 Some(idx)
             }
             Err(e) => {
-                tracing::warn!("DocWriter: failed to ensure field '{field}': {e}");
+                tracing::warn!("DocWriter: failed to ensure V3 field '{field}': {e}");
                 None
             }
         }
+    }
+
+    fn resolve_silo_field(&mut self, field: &str) -> Option<u16> {
+        if let Some(&idx) = self.silo_field_dict.get(field) {
+            return Some(idx);
+        }
+        let silo = self.doc_silo.as_ref()?;
+        let idx = silo.write().ensure_field_index(field);
+        self.silo_field_dict.insert(field.to_string(), idx);
+        Some(idx)
     }
 }
 // ---------------------------------------------------------------------------
@@ -1241,7 +1364,8 @@ pub fn process_wal_dump(
     let mut total_errors = 0u64;
     // Create DocWriter so computed sort fields (sortAt = GREATEST) are written
     // to docstore during dump. Without this, only bitmaps get the computed value.
-    let mut doc_writer = DocWriter::new(engine.docstore_arc());
+    // Dual-writes to DocSilo when present so the silo stays in sync with V3.
+    let mut doc_writer = DocWriter::new_dual(engine.docstore_arc(), engine.doc_silo());
     loop {
         let batch = match reader.read_batch(batch_size) {
             Ok(b) => b,

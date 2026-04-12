@@ -1218,8 +1218,13 @@ impl BitdexServer {
                                     let meta = crate::ops_processor::FieldMeta::from_config(engine.config());
                                     let sender = engine.mutation_sender();
                                     let mut sink = crate::ingester::CoalescerSink::new(sender);
-                                    let mut doc_writer = crate::ops_processor::DocWriter::new(
+                                    // Dual-write to DocSilo when present so the silo stays
+                                    // coherent with V3 for the steady-state sync-v2 path. Reads
+                                    // prefer DocSilo whenever it's populated, so a V3-only write
+                                    // would be invisible after a bulk dump.
+                                    let mut doc_writer = crate::ops_processor::DocWriter::new_dual(
                                         engine.docstore_arc(),
+                                        engine.doc_silo(),
                                     );
 
                                     let mut entries = batch.entries;
@@ -1409,6 +1414,7 @@ impl BitdexServer {
             .route("/api/internal/sync-lag", get(handle_sync_lag))
             .route("/api/indexes/{name}/dumps", get(handle_list_dumps))
             .route("/api/indexes/{name}/dumps", put(handle_register_dump))
+            .route("/api/indexes/{name}/silo/populate", post(handle_silo_populate))
             .route("/api/indexes/{name}/dumps/{dump_name}/loaded", post(handle_dump_loaded))
             .route("/api/indexes/{name}/dumps/{dump_name}", delete(handle_delete_dump))
             .route("/api/indexes/{name}/dumps/clear", post(handle_clear_dumps))
@@ -5396,6 +5402,50 @@ async fn handle_list_dumps(AxumPath(_name): AxumPath<String>) -> impl IntoRespon
     Json(serde_json::json!({"dumps": {}}))
 }
 
+/// POST /api/indexes/{name}/silo/populate — bulk-copy every document from
+/// DocStoreV3 into DocSilo. Used after a dump to seed the silo without
+/// rewriting the dump pipeline.
+async fn handle_silo_populate(
+    State(state): State<SharedState>,
+    AxumPath(_name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let idx = state.index.lock();
+        match idx.as_ref() {
+            Some(i) => Arc::clone(&i.engine),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "index not loaded"})),
+                );
+            }
+        }
+    };
+    let start = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || engine.copy_docstore_to_silo())
+        .await
+        .map_err(|e| format!("join: {e}"));
+    let elapsed = start.elapsed().as_secs_f64();
+    match result {
+        Ok(Ok((docs, data_bytes))) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "docs_copied": docs,
+                "data_bytes": data_bytes,
+                "elapsed_secs": elapsed,
+            })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}"), "elapsed_secs": elapsed})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e, "elapsed_secs": elapsed})),
+        ),
+    }
+}
+
 /// PUT /api/indexes/{name}/dumps — Register and process a dump.
 ///
 /// Accepts either:
@@ -5468,24 +5518,17 @@ async fn handle_register_dump(
             reg.save(&dumps_path).ok();
         }
 
-        // Start shard pre-creator on first dump (progressive file creation)
-        if !state.precreator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            // Derive docstore root from the index storage path
-            let idx_name = state.index.lock().as_ref().map(|e| e.definition.name.clone()).unwrap_or_else(|| "civitai".to_string());
-            let docstore_root = state.data_dir.join("indexes").join(&idx_name).join("docs");
-            let bitmap_path = engine.config().storage.bitmap_path.clone();
-            let filter_names: Vec<String> = engine.config()
-                .filter_fields.iter().map(|f| f.name.clone()).collect();
-            let _precreator = crate::dump_processor::ShardPreCreator::spawn(
-                Arc::clone(&state.slot_watermark),
-                Arc::clone(&state.precreator_done),
-                docstore_root,
-                bitmap_path,
-                filter_names,
-            );
-            eprintln!("  ShardPreCreator started (background file creation)");
-            // Note: precreator handle intentionally leaked — it runs until precreator_done is set
-        }
+        // ShardPreCreator was a speed-up for DocStoreV3's hex-sharded file
+        // layout — we now write directly to DocSilo's single `data.bin` via
+        // `DocSiloBulkWriter`, so pre-creating thousands of docstore shard
+        // files is pure waste. Mark the pre-creator as "done" so any
+        // downstream waits on `precreator_done` unblock immediately.
+        state
+            .precreator_done
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = &state.precreator_started; // suppress unused warnings
+        let _ = &state.slot_watermark;
+        eprintln!("  ShardPreCreator disabled (DocSilo path skips hex-sharded files)");
         let slot_watermark = Arc::clone(&state.slot_watermark);
 
         // Spawn async processing — inline parse + save

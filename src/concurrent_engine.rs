@@ -247,6 +247,11 @@ pub struct ConcurrentEngine {
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
     docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
+    /// DocSilo — mmap-backed typed-op doc storage. Present when constructed with
+    /// `new_with_path`; None for in-memory test engines. Routes all hot reads
+    /// and dump-path writes through a single data.bin + ops log instead of
+    /// hex-sharded files.
+    doc_silo: Option<Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>>>,
     /// Docstore root path, cached to avoid locking docstore just to read the path.
     docstore_root: Arc<PathBuf>,
     config: Arc<Config>,
@@ -418,17 +423,26 @@ impl ConcurrentEngine {
         config.validate()?;
         let docstore = DocStoreV3::open_temp()
             .map_err(|e| crate::error::BitdexError::Storage(format!("open temp: {e}")))?;
-        Self::build(config, docstore)
+        Self::build(config, docstore, None)
     }
     /// Create a new concurrent engine with an on-disk docstore.
     pub fn new_with_path(config: Config, path: &Path) -> Result<Self> {
         config.validate()?;
         let docstore = DocStoreV3::open(path)
             .map_err(|e| crate::error::BitdexError::Storage(format!("open: {e}")))?;
-        Self::build(config, docstore)
+        // Open a DocSilo alongside the docstore. Located under `<path>/silo`
+        // so it lives in the same on-disk tree as the bitmaps + docstore.
+        let silo_path = path.join("silo");
+        let doc_silo = crate::doc_silo::DocSilo::open(&silo_path)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("open silo: {e}")))?;
+        Self::build(config, docstore, Some(doc_silo))
     }
 
-    fn build(config: Config, mut docstore: DocStoreV3) -> Result<Self> {
+    fn build(
+        config: Config,
+        mut docstore: DocStoreV3,
+        doc_silo: Option<crate::doc_silo::DocSilo>,
+    ) -> Result<Self> {
         let mut filters = crate::filter::FilterIndex::new();
         let mut sorts = crate::sort::SortIndex::new();
         // All fields are in-memory (no tier 2 distinction).
@@ -954,6 +968,7 @@ impl ConcurrentEngine {
 
         let docstore_root = Arc::new(docstore.path().to_path_buf());
         let docstore = Arc::new(parking_lot::RwLock::new(docstore));
+        let doc_silo = doc_silo.map(|s| Arc::new(parking_lot::RwLock::new(s)));
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
         let dirty_flag = Arc::new(AtomicBool::new(false));
@@ -1094,6 +1109,7 @@ impl ConcurrentEngine {
                 sender,
                 doc_tx,
                 docstore,
+                doc_silo: doc_silo.clone(),
                 docstore_root: Arc::clone(&docstore_root),
                 config,
                 field_registry,
@@ -1175,6 +1191,13 @@ impl ConcurrentEngine {
             let inner = Arc::clone(&inner);
             let shutdown = Arc::clone(&shutdown);
             let docstore = Arc::clone(&docstore);
+            // Clone the DocSilo handle so the flush thread can mirror doc
+            // writes into the silo. Steady-state writes from /documents
+            // endpoints arrive on the doc_tx channel, and the silo-preferring
+            // read path would miss any slot the flush thread only wrote to
+            // V3 after a silo-only bulk dump.
+            let flush_doc_silo: Option<Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>>> =
+                doc_silo.as_ref().map(Arc::clone);
             let flush_interval_us = config.flush_interval_us;
             let flush_unified_cache = Arc::clone(&unified_cache);
             let flush_loading_mode = Arc::clone(&loading_mode);
@@ -2454,6 +2477,20 @@ impl ConcurrentEngine {
                                 );
                             }
                         }
+                        // Mirror into DocSilo so reads via the silo-preferring
+                        // path see the update. Without this, any /documents
+                        // endpoint write after a silo-only bulk dump would be
+                        // invisible to queries. Silo write path uses its own
+                        // field dictionary which may not match V3's — the
+                        // silo::put_batch auto-registers new fields.
+                        if let Some(ref silo) = flush_doc_silo {
+                            if let Err(e) = silo.write().put_batch(&doc_batch) {
+                                eprintln!(
+                                    "WARNING: doc_silo put_batch failed ({} docs): {e}",
+                                    doc_batch.len()
+                                );
+                            }
+                        }
                     }
                     if bitmap_count > 0 || doc_count > 0 || lazy_loaded {
                         current_sleep = min_sleep;
@@ -2484,6 +2521,17 @@ impl ConcurrentEngine {
                 if !doc_batch.is_empty() {
                     if let Err(e) = docstore.write().put_batch(&doc_batch) {
                         panic!("docstore final batch write failed: {e}");
+                    }
+                    // Final-drain silo mirror. Best-effort — we prefer to
+                    // flush V3 successfully over panicking if the silo
+                    // write hiccups on shutdown.
+                    if let Some(ref silo) = flush_doc_silo {
+                        if let Err(e) = silo.write().put_batch(&doc_batch) {
+                            eprintln!(
+                                "WARNING: doc_silo final drain put_batch failed ({} docs): {e}",
+                                doc_batch.len()
+                            );
+                        }
                     }
                 }
             })
@@ -3122,6 +3170,7 @@ impl ConcurrentEngine {
             sender,
             doc_tx,
             docstore,
+            doc_silo,
             docstore_root,
             config,
             field_registry,
@@ -3341,9 +3390,11 @@ impl ConcurrentEngine {
     #[cfg(feature = "pg-sync")]
     fn put_via_wal(&self, id: u32, doc: &Document, wal: &crate::ops_wal::WalWriter) -> Result<()> {
         let is_alive = self.is_slot_alive(id);
-        // Read old doc for upsert diffing
+        // Read old doc for upsert diffing. `get_document` prefers DocSilo
+        // when populated and falls back to DocStoreV3, which matters after
+        // a silo-only bulk dump where V3 is empty.
         let old_doc = if is_alive {
-            self.docstore.read().get(id)?
+            self.get_document(id)?
         } else {
             None
         };
@@ -3367,8 +3418,8 @@ impl ConcurrentEngine {
             // New slot — full PUT via WAL
             return self.put_via_wal(id, doc, wal);
         }
-        // Read old doc for diffing
-        let old_doc = self.docstore.read().get(id)?;
+        // Read old doc for diffing — silo-preferring read.
+        let old_doc = self.get_document(id)?;
         // For PATCH, only emit ops for fields present in the new doc
         let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config, true);
         if ops.is_empty() {
@@ -3398,9 +3449,9 @@ impl ConcurrentEngine {
             };
             (alive, alloc)
         };
-        // Read old doc from docstore if needed
+        // Read old doc from docstore if needed — silo-preferring read.
         let old_doc = if is_upsert || was_allocated {
-            self.docstore.read().get(id)?
+            self.get_document(id)?
         } else {
             None
         };
@@ -3468,8 +3519,8 @@ impl ConcurrentEngine {
                 // This handles new records (e.g., images created after the bulk load).
                 return self.put_inner(id, doc);
             }
-            // Read old doc for diffing
-            let old_doc = self.docstore.read().get(id)?;
+            // Read old doc for diffing — silo-preferring read.
+            let old_doc = self.get_document(id)?;
             // Compute partial diff — only fields present in doc are processed
             let ops = crate::mutation::diff_document_partial(
                 id, old_doc.as_ref(), doc, &self.config, &self.field_registry,
@@ -3511,8 +3562,12 @@ impl ConcurrentEngine {
     pub fn delete(&self, id: u32) -> Result<()> {
         self.in_flight.mark_in_flight(id);
         let result = (|| -> Result<()> {
-            // Read the doc to know which bitmaps to clear
-            let old_doc = self.docstore.read().get(id)?;
+            // Read the doc to know which bitmaps to clear. Silo-preferring
+            // read — after a DocSilo bulk dump V3 is empty, and without
+            // this the delete would fail to clear stale filter/sort bits
+            // from the dumped slot, leaking them onto any future reused
+            // slot at the same ID.
+            let old_doc = self.get_document(id)?;
             let mut ops = Vec::new();
             // Generate filter/sort cleanup ops from the stored doc
             if let Some(doc) = &old_doc {
@@ -5899,8 +5954,22 @@ impl ConcurrentEngine {
                 return Ok(Some(doc));
             }
         }
-        // Slow path: disk read + cache populate
-        let doc = self.docstore.read().get(slot_id)?;
+        // Slow path: disk read + cache populate. Prefer DocSilo if it's present
+        // AND populated — when the silo is empty (fresh boot, pre-populate),
+        // fall back to DocStoreV3 so A/B comparisons don't need a rebuild.
+        let doc = if let Some(ref silo) = self.doc_silo {
+            let silo_guard = silo.read();
+            if silo_guard.index_count() > 0 {
+                silo_guard
+                    .get(slot_id)
+                    .map_err(|e| crate::error::BitdexError::Storage(format!("docsilo get: {e}")))?
+            } else {
+                drop(silo_guard);
+                self.docstore.read().get(slot_id)?
+            }
+        } else {
+            self.docstore.read().get(slot_id)?
+        };
         if let (Some(ref cache), Some(ref doc)) = (&self.doc_cache, &doc) {
             cache.insert(slot_id, doc.clone());
             // Eviction handled by dedicated eviction thread — no inline check
@@ -6066,7 +6135,22 @@ impl ConcurrentEngine {
         // build + scatter loop in DocStoreV3::get_many, which is NOT
         // covered by the inner `stats` split (file_read vs decode).
         let disk_start = Instant::now();
-        let (mut disk_results, stats, unique_shards) = {
+        let use_silo = self
+            .doc_silo
+            .as_ref()
+            .map(|s| s.read().index_count() > 0)
+            .unwrap_or(false);
+        let (mut disk_results, stats, unique_shards) = if use_silo {
+            // DocSilo path — every slot is an independent hash probe on a single
+            // mmap. No shard grouping, no 62-file-open tail. Returns zero file-read
+            // stats because the silo does not expose per-file timing — that concept
+            // does not apply.
+            let guard = self.doc_silo.as_ref().unwrap().read();
+            let results = guard
+                .get_many(&miss_ids)
+                .map_err(|e| crate::error::BitdexError::Storage(format!("docsilo get_many: {e}")))?;
+            (results, ShardReadStats::default(), 0usize)
+        } else {
             let guard = self.docstore.read();
             guard.get_many(&miss_ids)?
         };
@@ -6138,6 +6222,147 @@ impl ConcurrentEngine {
     pub fn docstore_arc(&self) -> Arc<parking_lot::RwLock<DocStoreV3>> {
         Arc::clone(&self.docstore)
     }
+
+    /// Borrow the DocSilo handle (None when the engine was constructed without
+    /// an on-disk path — in-memory tests).
+    pub fn doc_silo(&self) -> Option<Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>>> {
+        self.doc_silo.as_ref().map(Arc::clone)
+    }
+
+    /// Bulk-copy every document from DocStoreV3 into DocSilo by iterating
+    /// the alive bitmap and streaming typed `DocOp::Create` ops through the
+    /// silo's ops-log + compact cycle in FETCH_CHUNK-sized chunks.
+    ///
+    /// `get_many` reads both the compacted snapshot AND the ops log section
+    /// per shard, so it sees all documents the dump has written — whereas
+    /// `get_shard` only returns compacted snapshots and silently misses
+    /// uncompacted shards.
+    ///
+    /// Memory is bounded to one chunk (~300 MB for 500K docs). Per-chunk
+    /// compact intentionally skips `MmapMut::flush` — Windows msync is
+    /// O(data.bin size) and blows up for multi-GB files — then `sync()` is
+    /// called once at the end to commit the data + index mmaps to disk.
+    ///
+    /// Returns `(docs_copied, data_bytes)` on success.
+    pub fn copy_docstore_to_silo(&self) -> Result<(u64, u64)> {
+        use crate::doc_silo::{encode_slot_bytes, slot_to_key};
+        use crate::shard_store_doc::SlotHexShard;
+
+        let silo = self
+            .doc_silo
+            .as_ref()
+            .ok_or_else(|| crate::error::BitdexError::Storage("DocSilo not initialized".into()))?;
+
+        // Iterate DocStoreV3 shards in order via get_shard_packed, which
+        // returns Vec<(u32, Vec<(u16, PackedValue)>)> — the same shape as
+        // SlotSnapshot, skipping the StoredDoc HashMap detour that blew up
+        // memory at 107M (~1.4KB/doc → ~200B/doc after this rewrite).
+        //
+        // Encode each doc to bytes inline and accumulate into a single
+        // Vec<(u64 silo_key, Vec<u8> encoded_bytes)>. Then call
+        // `DocSilo::bulk_load_encoded` which skips the re-encode step.
+
+        // Snapshot field-dict translation up front under a brief write lock.
+        // DocStoreV3 and DocSilo have independent field indices — we build
+        // a translation table so the encoded bytes use silo indices.
+        let (docstore_idx_to_name, max_docstore_idx) = {
+            let ds = self.docstore.read();
+            let names: Vec<String> = ds.idx_to_field().iter().cloned().collect();
+            let max = names.len();
+            (names, max)
+        };
+        let mut silo_idx_for: Vec<u16> = Vec::with_capacity(max_docstore_idx);
+        {
+            let mut guard = silo.write();
+            for name in &docstore_idx_to_name {
+                silo_idx_for.push(guard.ensure_field_index(name));
+            }
+        }
+
+        // How many shards does DocStoreV3 span?
+        let snap = self.snapshot();
+        let total_alive = snap.slots.alive_bitmap().len() as u64;
+        let max_slot = snap.slots.slot_counter();
+        drop(snap);
+        let num_shards = SlotHexShard::slot_to_shard(max_slot.saturating_sub(1)) + 1;
+        eprintln!(
+            "copy_docstore_to_silo: {} alive slots across {} shards (packed encode path)",
+            total_alive, num_shards
+        );
+
+        let overall_start = std::time::Instant::now();
+        let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(total_alive as usize);
+        let mut last_progress_pct = -1i64;
+        let mut encode_buf = Vec::with_capacity(256);
+
+        // Hold the docstore read lock for the whole scan loop. Re-acquiring
+        // it per shard was ~100x slower (245K lock ops with flush-thread
+        // contention). The loop is read-only.
+        let ds = self.docstore.read();
+        for shard_id in 0..num_shards {
+            let shard = ds.get_shard_packed(shard_id).unwrap_or_default();
+            for (slot_id, mut pairs) in shard {
+                // Remap field indices from docstore space → silo space.
+                for (idx, _) in pairs.iter_mut() {
+                    let ds_idx = *idx as usize;
+                    if ds_idx < silo_idx_for.len() {
+                        *idx = silo_idx_for[ds_idx];
+                    }
+                }
+                encode_slot_bytes(true, &pairs, &mut encode_buf);
+                encoded.push((slot_to_key(slot_id), encode_buf.clone()));
+            }
+
+            let pct = (100.0 * encoded.len() as f64 / total_alive.max(1) as f64) as i64;
+            if pct / 5 > last_progress_pct / 5 {
+                eprintln!(
+                    "  encoded {} / {} ({}%), shards {}/{}, elapsed {:.1}s",
+                    encoded.len(),
+                    total_alive,
+                    pct,
+                    shard_id + 1,
+                    num_shards,
+                    overall_start.elapsed().as_secs_f64()
+                );
+                last_progress_pct = pct;
+            }
+        }
+        drop(ds);
+
+        let fetched_docs = encoded.len() as u64;
+        eprintln!(
+            "copy_docstore_to_silo: encoded {} docs in {:.1}s, bulk-loading silo",
+            fetched_docs,
+            overall_start.elapsed().as_secs_f64()
+        );
+
+        let loaded = {
+            let mut guard = silo.write();
+            guard.bulk_load_encoded(encoded).map_err(|e| {
+                crate::error::BitdexError::Storage(format!("silo bulk_load_encoded: {e}"))
+            })?
+        };
+
+        let data_bytes = {
+            let guard = silo.read();
+            guard.data_bytes()
+        };
+        {
+            let guard = silo.read();
+            guard.save_field_dict().map_err(|e| {
+                crate::error::BitdexError::Storage(format!("silo save_field_dict: {e}"))
+            })?;
+        }
+
+        eprintln!(
+            "copy_docstore_to_silo: loaded {} docs in {:.1}s, data.bin = {:.1} MB",
+            loaded,
+            overall_start.elapsed().as_secs_f64(),
+            data_bytes as f64 / 1e6
+        );
+        Ok((loaded, data_bytes))
+    }
+
     /// Set the WAL writer for the V2 write path. When set, put() and patch_document()
     /// decompose documents into ops and write to WAL instead of directly to coalescer.
     #[cfg(feature = "pg-sync")]
@@ -6163,6 +6388,22 @@ impl ConcurrentEngine {
     /// Prepare a StreamingDocWriter for write-through docstore writes during dump processing.
     pub fn prepare_streaming_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::StreamingDocWriter> {
         Ok(self.docstore.write().prepare_streaming_writer(field_names)?)
+    }
+
+    /// Prepare a DocSiloBulkWriter that writes the dump output DIRECTLY to
+    /// the silo's data.bin, bypassing DocStoreV3. Used by `dump_processor`
+    /// as the replacement for `prepare_streaming_writer`.
+    ///
+    /// Location: `<docstore_root>/silo/` — the same subdirectory that
+    /// `DocSilo::open` looks at, so a subsequent engine restart picks up
+    /// the populated silo automatically.
+    pub fn prepare_silo_bulk_writer(
+        &self,
+        field_names: &[String],
+    ) -> crate::error::Result<crate::doc_silo::DocSiloBulkWriter> {
+        let silo_root = self.docstore_root.join("silo");
+        crate::doc_silo::DocSiloBulkWriter::new(silo_root, field_names)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("DocSiloBulkWriter::new: {e}")))
     }
     /// Return the set of indexed field names (filter + sort + "id").
     /// Used by the loader to strip doc-only fields from the bitmap accumulator.
@@ -6251,16 +6492,43 @@ impl ConcurrentEngine {
             return (0, 0, skipped);
         }
 
-        // Bypass the cache — we want the fresh on-disk bytes. Single
-        // get_many call amortizes shard reads across all touched slots
-        // (parallel path when unique_shards > 4).
-        let fresh = match self.docstore.read().get_many(&to_refresh) {
-            Ok((docs, _, _)) => docs,
-            Err(e) => {
-                tracing::warn!("doc_cache_refresh_slots get_many failed: {e}");
-                return (0, 0, skipped);
-            }
-        };
+        // Bypass the cache — we want the fresh on-disk bytes. Prefer the
+        // DocSilo mmap path when populated (every read is a hash probe +
+        // slice, no shard file opens), fall back to DocStoreV3 get_many
+        // when the silo is empty (pre-populate window). After a
+        // DocSilo-only bulk dump V3 is empty for dumped slots, so the
+        // old direct-V3 path would return None and cause cache deletions
+        // for live docs — the silo branch fixes that.
+        let fresh: Vec<Option<crate::shard_store_doc::StoredDoc>> =
+            if let Some(ref silo_handle) = self.doc_silo {
+                let silo = silo_handle.read();
+                if silo.index_count() > 0 {
+                    match silo.get_many(&to_refresh) {
+                        Ok(docs) => docs,
+                        Err(e) => {
+                            tracing::warn!("doc_cache_refresh_slots silo get_many failed: {e}");
+                            return (0, 0, skipped);
+                        }
+                    }
+                } else {
+                    drop(silo);
+                    match self.docstore.read().get_many(&to_refresh) {
+                        Ok((docs, _, _)) => docs,
+                        Err(e) => {
+                            tracing::warn!("doc_cache_refresh_slots V3 get_many failed: {e}");
+                            return (0, 0, skipped);
+                        }
+                    }
+                }
+            } else {
+                match self.docstore.read().get_many(&to_refresh) {
+                    Ok((docs, _, _)) => docs,
+                    Err(e) => {
+                        tracing::warn!("doc_cache_refresh_slots V3 get_many failed: {e}");
+                        return (0, 0, skipped);
+                    }
+                }
+            };
 
         let mut refreshed: u64 = 0;
         let mut deleted: u64 = 0;
@@ -7375,12 +7643,15 @@ impl ConcurrentEngine {
                     })
                     .collect()
             };
-            // Phase 3: Batch docstore reads for upserts (outside any lock)
+            // Phase 3: Batch doc reads for upserts (outside any lock). Uses
+            // the silo-preferring `get_document` path — after a DocSilo-only
+            // bulk dump, V3 is empty so a direct V3 read would return None
+            // and silently skip every upsert's diff logic.
             let old_docs: Vec<Option<crate::shard_store_doc::StoredDoc>> = statuses
                 .iter()
                 .map(|&(id, is_upsert, was_allocated)| {
                     if is_upsert || was_allocated {
-                        self.docstore.read().get(id).ok().flatten()
+                        self.get_document(id).ok().flatten()
                     } else {
                         None
                     }
