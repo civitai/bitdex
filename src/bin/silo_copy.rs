@@ -10,7 +10,7 @@
 //! DocStoreV3 tree. Writes the silo at `<same>/docs/silo/silo/`.
 
 use bitdex_v2::doc_silo::{encode_slot_bytes, slot_to_key, DocSilo};
-use bitdex_v2::shard_store_doc::DocStoreV3;
+use bitdex_v2::doc_wire_format::DocStoreV3;
 use std::path::PathBuf;
 use std::time::Instant;
 

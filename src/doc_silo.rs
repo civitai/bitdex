@@ -22,7 +22,7 @@ use datasilo::{DataSilo, OpCodec, SiloConfig, SnapshotCodec};
 
 use crate::mutation::FieldValue;
 use crate::query::Value;
-use crate::shard_store_doc::{PackedValue, StoredDoc};
+use crate::doc_wire_format::{PackedValue, StoredDoc};
 
 // ---------------------------------------------------------------------------
 // Slot-key bijection
@@ -65,8 +65,8 @@ impl SlotSnapshot {
 // DocOp — typed document operations (silo-native variant)
 // ---------------------------------------------------------------------------
 //
-// Mirrors `shard_store_doc::DocOp` exactly; kept in this module so the port
-// doesn't depend on the soon-to-be-deleted `shard_store_doc`. Encoding is
+// Mirrors `doc_wire_format::DocOp` exactly; kept in this module so the port
+// doesn't depend on the soon-to-be-deleted `doc_wire_format`. Encoding is
 // wire-compatible with `DocOpCodec`.
 
 #[derive(Debug, Clone)]
@@ -109,7 +109,7 @@ const PV_TAG_MI: u8 = 0x05;
 const PV_TAG_MM: u8 = 0x06;
 
 // ---------------------------------------------------------------------------
-// PackedValue encode / decode (same wire format as shard_store_doc)
+// PackedValue encode / decode (same wire format as doc_wire_format)
 // ---------------------------------------------------------------------------
 
 fn encode_packed_value(pv: &PackedValue, buf: &mut Vec<u8>) {
@@ -1045,7 +1045,7 @@ impl DocSiloBulkWriter {
 
     /// Append a pre-encoded DocOp::Merge payload for a slot.
     ///
-    /// Payload wire format (produced by `shard_store_doc::write_merge_header`
+    /// Payload wire format (produced by `doc_wire_format::write_merge_header`
     /// + `write_field_*`):
     ///
     /// ```text

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
-use crate::shard_store_doc::PackedValue;
+use crate::doc_wire_format::PackedValue;
 use crate::doc_silo::DocSiloBulkWriter;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
@@ -3299,13 +3299,13 @@ pub(crate) enum DumpFieldValue<'a> {
 pub(crate) fn encode_dump_merge(slot: u32, fields: &[(u16, DumpFieldValue)], buf: &mut Vec<u8>) {
     debug_assert!(fields.len() <= u16::MAX as usize, "encode_dump_merge: too many fields");
     buf.clear();
-    crate::shard_store_doc::write_merge_header(slot, fields.len() as u16, buf);
+    crate::doc_wire_format::write_merge_header(slot, fields.len() as u16, buf);
     for (field_idx, value) in fields {
         match value {
-            DumpFieldValue::Int(v) => crate::shard_store_doc::write_field_int(*field_idx, *v, buf),
-            DumpFieldValue::Bool(v) => crate::shard_store_doc::write_field_bool(*field_idx, *v, buf),
-            DumpFieldValue::Str(s) => crate::shard_store_doc::write_field_str(*field_idx, s, buf),
-            DumpFieldValue::MultiInt(v) => crate::shard_store_doc::write_field_multi_int(*field_idx, v, buf),
+            DumpFieldValue::Int(v) => crate::doc_wire_format::write_field_int(*field_idx, *v, buf),
+            DumpFieldValue::Bool(v) => crate::doc_wire_format::write_field_bool(*field_idx, *v, buf),
+            DumpFieldValue::Str(s) => crate::doc_wire_format::write_field_str(*field_idx, s, buf),
+            DumpFieldValue::MultiInt(v) => crate::doc_wire_format::write_field_multi_int(*field_idx, v, buf),
         }
     }
 }
@@ -4046,8 +4046,8 @@ mod tests {
     /// ("t"/"f") to PackedValue::B for fields declared as boolean in the data schema.
     #[test]
     fn test_boolean_coercion_in_docstore_write() {
-        use crate::shard_store_doc::DocStoreV3;
-        use crate::shard_store_doc::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4110,8 +4110,8 @@ mod tests {
     /// Test that extra_i64_fields (config-computed sorts) are written to docstore.
     #[test]
     fn test_extra_i64_fields_in_docstore_write() {
-        use crate::shard_store_doc::DocStoreV3;
-        use crate::shard_store_doc::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4172,7 +4172,7 @@ mod tests {
     #[test]
     fn test_encode_dump_merge_matches_codec() {
         use crate::shard_store::OpCodec;
-        use crate::shard_store_doc::{DocOp, DocOpCodec, PackedValue};
+        use crate::doc_wire_format::{DocOp, DocOpCodec, PackedValue};
 
         // Build the same merge two ways and compare.
         let cases: Vec<(u32, Vec<(u16, DumpFieldValue, PackedValue)>)> = vec![

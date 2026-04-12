@@ -1,6 +1,6 @@
-//! Document storage engine — types, codecs, and ShardStore-backed persistence.
+//! Document wire format — types, codecs, and serialization primitives.
 //!
-//! This module is the single source of truth for document storage:
+//! This module defines the on-disk encoding shared by DocSilo's underlying ShardStore:
 //! - `StoredDoc` — the named-field document type used across the codebase
 //! - `PackedValue` — compact enum for field values (integer, float, bool, string, multi)
 //! - `DocStoreV3` — high-level document store backed by ShardStore

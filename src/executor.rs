@@ -1086,7 +1086,7 @@ mod tests {
         filters: FilterIndex,
         sorts: SortIndex,
         config: Config,
-        docstore: crate::shard_store_doc::DocStoreV3,
+        docstore: crate::doc_wire_format::DocStoreV3,
     }
     impl TestHarness {
         fn new() -> Self {
@@ -1094,7 +1094,7 @@ mod tests {
             let slots = SlotAllocator::new();
             let mut filters = FilterIndex::new();
             let mut sorts = SortIndex::new();
-            let docstore = crate::shard_store_doc::DocStoreV3::open_temp().unwrap();
+            let docstore = crate::doc_wire_format::DocStoreV3::open_temp().unwrap();
 
             for fc in &config.filter_fields {
                 filters.add_field(fc.clone());

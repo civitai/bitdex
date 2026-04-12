@@ -20,7 +20,7 @@ use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
 use crate::doc_silo::{DocOp, DocSilo};
-use crate::shard_store_doc::PackedValue;
+use crate::doc_wire_format::PackedValue;
 use crate::filter::{FilterFieldType, NULL_BITMAP_KEY};
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
@@ -188,7 +188,7 @@ fn qvalue_to_json(v: &QValue) -> JsonValue {
 /// are treated as deletions and their old bitmap bits are cleared.
 pub fn document_to_ops(
     new_doc: &crate::mutation::Document,
-    old_doc: Option<&crate::shard_store_doc::StoredDoc>,
+    old_doc: Option<&crate::doc_wire_format::StoredDoc>,
     config: &crate::config::Config,
     is_patch: bool,
 ) -> Vec<Op> {
@@ -1743,8 +1743,8 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_doc_writer_write_set() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -1769,8 +1769,8 @@ mod tests {
     }
     #[test]
     fn test_doc_writer_write_add_remove() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -1826,8 +1826,8 @@ mod tests {
 
     #[test]
     fn test_doc_writer_batch_add_race() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -1865,8 +1865,8 @@ mod tests {
 
     #[test]
     fn test_doc_writer_batch_add_dedup() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -1903,7 +1903,7 @@ mod tests {
     /// Validates the production ops pipeline docstore write path.
     #[test]
     fn test_docstore_v3_doc_writer_e2e_roundtrip() {
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -2113,7 +2113,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_json_to_packed_types() {
-        use crate::shard_store_doc::PackedValue;
+        use crate::doc_wire_format::PackedValue;
 
         assert_eq!(json_to_packed(&json!(42)), Some(PackedValue::I(42)));
         assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
@@ -2152,7 +2152,7 @@ mod tests {
         // Old doc: nsfwLevel=8
         let mut old_fields = HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::doc_wire_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // New doc: nsfwLevel=16
         let mut new_fields = HashMap::new();
@@ -2172,7 +2172,7 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
 
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: fields.clone(), schema_version: 0 };
+        let old_doc = crate::doc_wire_format::StoredDoc { fields: fields.clone(), schema_version: 0 };
         let new_doc = Document { fields };
         let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
         assert!(ops.is_empty(), "unchanged fields should produce no ops");
@@ -2185,7 +2185,7 @@ mod tests {
         // Old doc has nsfwLevel=8 AND reactionCount sort field
         let mut old_fields = HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::doc_wire_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH only sends userId=42 (nsfwLevel absent from patch)
         let mut new_fields = HashMap::new();

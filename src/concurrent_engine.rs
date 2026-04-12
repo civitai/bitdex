@@ -14,7 +14,7 @@ use crate::filter::FilterFieldType;
 use crate::cache;
 use crate::concurrency::InFlightTracker;
 use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
-use crate::shard_store_doc::StoredDoc;
+use crate::doc_wire_format::StoredDoc;
 use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
 use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, value_to_sort_u32, Document, FieldRegistry, PatchPayload};
@@ -5951,7 +5951,7 @@ impl ConcurrentEngine {
             // <100 shards per batch — so Vec+sort+dedup is fine.
             let mut shard_keys: Vec<u32> = miss_ids
                 .iter()
-                .map(|&id| crate::shard_store_doc::SlotHexShard::slot_to_shard(id))
+                .map(|&id| crate::doc_wire_format::SlotHexShard::slot_to_shard(id))
                 .collect();
             shard_keys.sort_unstable();
             shard_keys.dedup();
@@ -6152,7 +6152,7 @@ impl ConcurrentEngine {
         }
 
         // Bypass the cache — we want the fresh on-disk bytes. Prefer the
-        let fresh: Vec<Option<crate::shard_store_doc::StoredDoc>> =
+        let fresh: Vec<Option<crate::doc_wire_format::StoredDoc>> =
             match self.doc_silo.read().get_many(&to_refresh) {
                 Ok(docs) => docs,
                 Err(e) => {
@@ -7236,7 +7236,7 @@ impl ConcurrentEngine {
             // the silo-preferring `get_document` path — after a DocSilo-only
             // bulk dump, V3 is empty so a direct V3 read would return None
             // and silently skip every upsert's diff logic.
-            let old_docs: Vec<Option<crate::shard_store_doc::StoredDoc>> = statuses
+            let old_docs: Vec<Option<crate::doc_wire_format::StoredDoc>> = statuses
                 .iter()
                 .map(|&(id, is_upsert, was_allocated)| {
                     if is_upsert || was_allocated {
@@ -7248,7 +7248,7 @@ impl ConcurrentEngine {
                 .collect();
             // Phase 4: Compute all diffs and collect all ops
             let mut all_ops: Vec<MutationOp> = Vec::new();
-            let mut doc_writes: Vec<(u32, crate::shard_store_doc::StoredDoc)> = Vec::new();
+            let mut doc_writes: Vec<(u32, crate::doc_wire_format::StoredDoc)> = Vec::new();
 
             for (i, &(id, ref doc)) in docs.iter().enumerate() {
                 let (_, is_upsert, _) = statuses[i];
@@ -7256,7 +7256,7 @@ impl ConcurrentEngine {
                 all_ops.extend(ops);
                 doc_writes.push((
                     id,
-                    crate::shard_store_doc::StoredDoc {
+                    crate::doc_wire_format::StoredDoc {
                         fields: doc.fields.clone(),
                         schema_version: 0,
                     },
@@ -9725,8 +9725,8 @@ mod tests {
     }
     #[test]
     fn test_compaction_worker_e2e() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::{DocStoreV3, SlotHexShard};
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::{DocStoreV3, SlotHexShard};
 
         // Use an on-disk docstore so ShardStore ops and compaction can run.
         let dir = tempfile::tempdir().unwrap();
@@ -10550,7 +10550,7 @@ mod tests {
     /// E2E: bulk loading with ShardStoreBulkWriter writes docs readable by DocStoreV3.
     #[test]
     fn test_docstore_v3_bulk_writer_roundtrip() {
-        use crate::shard_store_doc::PackedValue;
+        use crate::doc_wire_format::PackedValue;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");

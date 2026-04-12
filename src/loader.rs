@@ -28,7 +28,7 @@ use crate::dictionary::FieldDictionary;
 use crate::mutation::{Document, FieldValue};
 use crate::query::Value;
 #[cfg(test)]
-use crate::shard_store_doc::StoredDoc;
+use crate::doc_wire_format::StoredDoc;
 
 /// Statistics from a completed load operation.
 #[derive(Debug, Clone)]

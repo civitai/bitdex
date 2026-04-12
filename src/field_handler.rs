@@ -11,8 +11,8 @@
 use ahash::AHashMap as HashMap;
 use std::sync::Arc;
 
-use crate::shard_store_doc::PackedValue;
-use crate::shard_store_doc::DocOp;
+use crate::doc_wire_format::PackedValue;
+use crate::doc_wire_format::DocOp;
 
 // ---------------------------------------------------------------------------
 // FieldHandler trait

@@ -23,7 +23,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{Config, DataSchema, FieldValueType, FilterFieldConfig, SortFieldConfig};
-use crate::shard_store_doc::StoredDoc;
+use crate::doc_wire_format::StoredDoc;
 use crate::executor::{CaseSensitiveFields, StringMaps};
 use crate::loader;
 use crate::metrics::Metrics;
@@ -2696,7 +2696,7 @@ async fn handle_query(
                 // spawn_blocking for full-cache-hit batches eliminates this.
                 let slot_ids: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
                 let inline_docs = if !slot_ids.is_empty() {
-                    let mut cached: Vec<Option<crate::shard_store_doc::StoredDoc>> = Vec::with_capacity(slot_ids.len());
+                    let mut cached: Vec<Option<crate::doc_wire_format::StoredDoc>> = Vec::with_capacity(slot_ids.len());
                     let mut all_hit = true;
                     if let Some(cache) = engine_docs.doc_cache_ref() {
                         for &id in &slot_ids {
