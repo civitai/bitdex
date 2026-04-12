@@ -861,9 +861,24 @@ impl DocSilo {
         self.silo.prepare_dump_merge()
     }
 
-    /// Reload the data mmap after DumpMergeWriter writes complete.
+    /// Reload the index + data mmap + field dictionary after dump writes complete.
+    /// Called after BulkWriter (phase 1) or DumpMergeWriter (phases 2+) finalize.
     pub fn reload_data(&mut self) -> std::io::Result<()> {
-        self.silo.reload_data()
+        self.silo.reload_data()?;
+        // Reload the field dictionary — the BulkWriter may have written a new one.
+        let dict_path = self.root.join("field_dict.json");
+        if dict_path.exists() {
+            let data = std::fs::read_to_string(&dict_path)?;
+            let dict: Vec<String> = serde_json::from_str(&data)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            self.field_to_idx = dict
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), i as u16))
+                .collect();
+            self.idx_to_field = dict;
+        }
+        Ok(())
     }
 }
 

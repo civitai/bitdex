@@ -1156,9 +1156,13 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
         }))
     }
 
-    /// Reload the data mmap after DumpMergeWriter writes complete.
-    /// Call after dropping the writer so queries see the updated data.
+    /// Reload the index + data mmap after BulkWriter or DumpMergeWriter writes
+    /// complete. For Phase 1 (BulkWriter), this also builds the HashIndex from
+    /// `layouts.bin` if no `index.bin` exists yet. For phases 2+
+    /// (DumpMergeWriter), the index already exists and only the data mmap
+    /// needs refreshing.
     pub fn reload_data(&mut self) -> io::Result<()> {
+        self.load_index()?;
         self.data_mmap = None;
         self.load_data()
     }

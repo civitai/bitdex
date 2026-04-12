@@ -1413,6 +1413,17 @@ pub fn process_dump(
     let t_save = Instant::now();
     save_phase_to_disk(&mut result, &alive_s, &filter_s, &sort_s, &meta_s, &bitmap_path, &dictionaries, &request.name, request.sets_alive)?;
     eprintln!("  Dump {} save_phase_to_disk in {:.1}s", request.name, t_save.elapsed().as_secs_f64());
+    // Reload the DocSilo mmap so it picks up the data.bin + layouts.bin written
+    // by this phase's BulkWriter or MergeWriter. Without this, the in-memory
+    // DocSilo still points at the old (possibly empty) mmap and all doc reads
+    // return None even though the data is on disk.
+    {
+        let t_reload = Instant::now();
+        if let Err(e) = engine.doc_silo_arc().write().reload_data() {
+            eprintln!("  WARNING: DocSilo reload_data failed after dump {}: {e}", request.name);
+        }
+        eprintln!("  Dump {} DocSilo reload_data in {:.3}s", request.name, t_reload.elapsed().as_secs_f64());
+    }
     // Clear the doc cache so subsequent reads see merged fields written by this
     // phase. Without this, any slot cached during a prior phase keeps its old
     // field set (e.g., images-phase cache entries hide tagIds added by tags phase).
