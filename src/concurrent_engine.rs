@@ -3358,9 +3358,11 @@ impl ConcurrentEngine {
     #[cfg(feature = "pg-sync")]
     fn put_via_wal(&self, id: u32, doc: &Document, wal: &crate::ops_wal::WalWriter) -> Result<()> {
         let is_alive = self.is_slot_alive(id);
-        // Read old doc for upsert diffing
+        // Read old doc for upsert diffing. `get_document` prefers DocSilo
+        // when populated and falls back to DocStoreV3, which matters after
+        // a silo-only bulk dump where V3 is empty.
         let old_doc = if is_alive {
-            self.docstore.read().get(id)?
+            self.get_document(id)?
         } else {
             None
         };
@@ -3384,8 +3386,8 @@ impl ConcurrentEngine {
             // New slot — full PUT via WAL
             return self.put_via_wal(id, doc, wal);
         }
-        // Read old doc for diffing
-        let old_doc = self.docstore.read().get(id)?;
+        // Read old doc for diffing — silo-preferring read.
+        let old_doc = self.get_document(id)?;
         // For PATCH, only emit ops for fields present in the new doc
         let ops = crate::ops_processor::document_to_ops(doc, old_doc.as_ref(), &self.config, true);
         if ops.is_empty() {
@@ -3415,9 +3417,9 @@ impl ConcurrentEngine {
             };
             (alive, alloc)
         };
-        // Read old doc from docstore if needed
+        // Read old doc from docstore if needed — silo-preferring read.
         let old_doc = if is_upsert || was_allocated {
-            self.docstore.read().get(id)?
+            self.get_document(id)?
         } else {
             None
         };
@@ -3485,8 +3487,8 @@ impl ConcurrentEngine {
                 // This handles new records (e.g., images created after the bulk load).
                 return self.put_inner(id, doc);
             }
-            // Read old doc for diffing
-            let old_doc = self.docstore.read().get(id)?;
+            // Read old doc for diffing — silo-preferring read.
+            let old_doc = self.get_document(id)?;
             // Compute partial diff — only fields present in doc are processed
             let ops = crate::mutation::diff_document_partial(
                 id, old_doc.as_ref(), doc, &self.config, &self.field_registry,
@@ -3528,8 +3530,12 @@ impl ConcurrentEngine {
     pub fn delete(&self, id: u32) -> Result<()> {
         self.in_flight.mark_in_flight(id);
         let result = (|| -> Result<()> {
-            // Read the doc to know which bitmaps to clear
-            let old_doc = self.docstore.read().get(id)?;
+            // Read the doc to know which bitmaps to clear. Silo-preferring
+            // read — after a DocSilo bulk dump V3 is empty, and without
+            // this the delete would fail to clear stale filter/sort bits
+            // from the dumped slot, leaking them onto any future reused
+            // slot at the same ID.
+            let old_doc = self.get_document(id)?;
             let mut ops = Vec::new();
             // Generate filter/sort cleanup ops from the stored doc
             if let Some(doc) = &old_doc {
