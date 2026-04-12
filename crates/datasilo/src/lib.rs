@@ -30,6 +30,8 @@ use parking_lot::Mutex;
 pub mod hash_index;
 pub mod ops_log;
 pub mod traits;
+#[cfg(test)]
+mod tests;
 
 pub use hash_index::HashIndex;
 pub use ops_log::{OpsLog, ParallelOpsWriter};
