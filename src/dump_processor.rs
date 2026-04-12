@@ -79,9 +79,14 @@ impl DocWriteTarget {
         match self {
             DocWriteTarget::Bulk(w) => w.finalize().map_err(|e| format!("finalize: {e}")),
             DocWriteTarget::Merge(w) => {
+                let in_place = w.in_place_count.load(std::sync::atomic::Ordering::Relaxed);
+                let overflow = w.overflow_count.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!("  DumpMergeWriter stats: in_place={in_place} overflow={overflow}");
                 // DumpMergeWriter is behind Arc — we can't call flush(&mut self).
-                // The mmap will flush on drop. This is fine for dump phases.
-                let _ = w;
+                // The mmap pages are flushed on drop (MmapMut::drop calls flush_async).
+                // This is safe because process_dump_with_progress returns before
+                // reload_data() is called, so the Arc is dropped and the MmapMut
+                // flush completes before the new read mmap is opened.
                 Ok(())
             }
         }
@@ -1413,6 +1418,15 @@ pub fn process_dump(
     let t_save = Instant::now();
     save_phase_to_disk(&mut result, &alive_s, &filter_s, &sort_s, &meta_s, &bitmap_path, &dictionaries, &request.name, request.sets_alive)?;
     eprintln!("  Dump {} save_phase_to_disk in {:.1}s", request.name, t_save.elapsed().as_secs_f64());
+    // Sync data.bin to disk before reloading. The DumpMergeWriter's MmapMut
+    // was dropped when process_dump_with_progress returned, which calls
+    // flush_async — but that's asynchronous on some platforms. An explicit
+    // sync ensures all dirty pages are persisted before we remap read-only.
+    if !request.sets_alive {
+        if let Err(e) = engine.doc_silo_arc().read().sync() {
+            eprintln!("  WARNING: DocSilo sync failed after dump {}: {e}", request.name);
+        }
+    }
     // Reload the DocSilo mmap so it picks up the data.bin + layouts.bin written
     // by this phase's BulkWriter or MergeWriter. Without this, the in-memory
     // DocSilo still points at the old (possibly empty) mmap and all doc reads
@@ -1601,20 +1615,18 @@ pub fn process_dump_with_progress(
                 DocWriteTarget::Merge(Arc::new(writer))
             }
             Ok(None) => {
-                eprintln!("  WARNING: no existing data.bin/index for DumpMergeWriter — falling back to BulkWriter");
-                DocWriteTarget::Bulk(Arc::new(
-                    engine
-                        .prepare_silo_bulk_writer(&all_target_names)
-                        .map_err(|e| format!("prepare_silo_bulk_writer fallback: {e}"))?,
-                ))
+                return Err(format!(
+                    "Phase 2+ dump '{}' requires existing data.bin/index from Phase 1 but none found. \
+                     Run the sets_alive phase first.",
+                    request.name
+                ));
             }
             Err(e) => {
-                eprintln!("  WARNING: DumpMergeWriter prepare failed: {e} — falling back to BulkWriter");
-                DocWriteTarget::Bulk(Arc::new(
-                    engine
-                        .prepare_silo_bulk_writer(&all_target_names)
-                        .map_err(|e| format!("prepare_silo_bulk_writer fallback: {e}"))?,
-                ))
+                return Err(format!(
+                    "Phase 2+ dump '{}' failed to prepare DumpMergeWriter: {e}. \
+                     Cannot fall back to BulkWriter — that would destroy Phase 1 data.",
+                    request.name
+                ));
             }
         }
     };
