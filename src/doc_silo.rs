@@ -947,13 +947,21 @@ impl ThreadSlot {
         }
         // Write all buffered layouts to disk
         if let Some(ref mut writer) = self.layout_file {
+            let mut ok = true;
             for &(key, offset, length) in &self.layouts {
-                let _ = writer.write_all(&key.to_le_bytes());
-                let _ = writer.write_all(&offset.to_le_bytes());
-                let _ = writer.write_all(&length.to_le_bytes());
+                if writer.write_all(&key.to_le_bytes()).is_err()
+                    || writer.write_all(&offset.to_le_bytes()).is_err()
+                    || writer.write_all(&length.to_le_bytes()).is_err()
+                {
+                    eprintln!("WARNING: layout spill write failed — keeping remaining in memory");
+                    ok = false;
+                    break;
+                }
             }
-            self.spilled_count += self.layouts.len() as u64;
-            self.layouts.clear();
+            if ok {
+                self.spilled_count += self.layouts.len() as u64;
+                self.layouts.clear();
+            }
         }
     }
 }
@@ -1277,13 +1285,20 @@ impl DocSiloBulkWriter {
                 // If there are still entries (below threshold), force-spill them
                 if !slab.layouts.is_empty() && slab.layout_file.is_some() {
                     if let Some(ref mut writer) = slab.layout_file {
+                        let mut ok = true;
                         for &(key, offset, length) in &slab.layouts {
-                            let _ = writer.write_all(&key.to_le_bytes());
-                            let _ = writer.write_all(&offset.to_le_bytes());
-                            let _ = writer.write_all(&length.to_le_bytes());
+                            if writer.write_all(&key.to_le_bytes()).is_err()
+                                || writer.write_all(&offset.to_le_bytes()).is_err()
+                                || writer.write_all(&length.to_le_bytes()).is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
                         }
-                        slab.spilled_count += slab.layouts.len() as u64;
-                        slab.layouts.clear();
+                        if ok {
+                            slab.spilled_count += slab.layouts.len() as u64;
+                            slab.layouts.clear();
+                        }
                     }
                 }
             }
@@ -1319,18 +1334,27 @@ impl DocSiloBulkWriter {
             }
         }
 
-        // Read all spill files back into one combined Vec
-        let mut layouts: Vec<(u64, u64, u32)> = Vec::with_capacity(appended as usize);
+        // Read all spill files back into one combined Vec.
+        // Don't pre-allocate for `appended` entries — that would be 5.3 GB at 220M.
+        // Instead grow incrementally; Vec doubling strategy keeps total alloc < 2× final.
+        const SPILL_ENTRY_SIZE: usize = 20; // u64(8) + u64(8) + u32(4)
+        let mut layouts: Vec<(u64, u64, u32)> = Vec::new();
         for path in &spill_paths {
-            if let Ok(data) = std::fs::read(path) {
-                let entry_size = 24; // u64 + u64 + u32 = 20, but we wrote 24 (3 × 8)
-                let mut pos = 0;
-                while pos + entry_size <= data.len() {
-                    let key = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
-                    let offset = u64::from_le_bytes(data[pos+8..pos+16].try_into().unwrap());
-                    let length = u32::from_le_bytes(data[pos+16..pos+20].try_into().unwrap());
-                    layouts.push((key, offset, length));
-                    pos += 20; // 8 + 8 + 4
+            match std::fs::read(path) {
+                Ok(data) => {
+                    let n_entries = data.len() / SPILL_ENTRY_SIZE;
+                    layouts.reserve(n_entries);
+                    let mut pos = 0;
+                    while pos + SPILL_ENTRY_SIZE <= data.len() {
+                        let key = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                        let offset = u64::from_le_bytes(data[pos+8..pos+16].try_into().unwrap());
+                        let length = u32::from_le_bytes(data[pos+16..pos+20].try_into().unwrap());
+                        layouts.push((key, offset, length));
+                        pos += SPILL_ENTRY_SIZE;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("WARNING: failed to read spill file {}: {e}", path.display());
                 }
             }
             let _ = std::fs::remove_file(path);
