@@ -1683,7 +1683,7 @@ fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
     let guard = state.index.lock();
     let idx = guard.as_ref().ok_or("No index found — cannot rebuild without config")?;
 
-    let engine = Arc::clone(&idx.engine);
+    let _engine = Arc::clone(&idx.engine);
     let index_name = idx.definition.name.clone();
     let bitmap_path = state.data_dir.join("indexes").join(&index_name).join("bitmaps");
     drop(guard);
@@ -2676,7 +2676,7 @@ async fn handle_query(
             let doc_start = Instant::now();
             let documents = if !include_docs.is_none() {
                 let engine_docs = Arc::clone(&engine);
-                let ids = result.ids.clone();
+                let _ids = result.ids.clone();
                 let schema_docs = schema.clone();
                 let reverse_maps_docs = Arc::clone(&reverse_maps);
                 let include_docs_docs = include_docs.clone();
@@ -3739,7 +3739,7 @@ async fn handle_rebuild(
         }
     }
 
-    let (task_id, progress) = match tasks.try_start(TaskType::Rebuild) {
+    let (task_id, _progress) = match tasks.try_start(TaskType::Rebuild) {
         Ok(v) => v,
         Err(active_info) => {
             return (
@@ -3752,8 +3752,8 @@ async fn handle_rebuild(
         }
     };
 
-    let sort_fields = req.sort_fields;
-    let filter_fields = req.filter_fields;
+    let _sort_fields = req.sort_fields;
+    let _filter_fields = req.filter_fields;
     let save = req.save_snapshot;
 
     let tasks_clone = Arc::clone(&tasks);
@@ -4007,7 +4007,7 @@ async fn handle_add_fields(
 
     // Validate fields exist in docstore (unless skipped)
     if !req.skip_validation {
-        let all_names: Vec<&str> = req.filter_fields.iter().map(|f| f.name.as_str())
+        let _all_names: Vec<&str> = req.filter_fields.iter().map(|f| f.name.as_str())
             .chain(req.sort_fields.iter().map(|f| f.name.as_str()))
             .collect();
 
@@ -4031,7 +4031,7 @@ async fn handle_add_fields(
         }
     }
 
-    let (task_id, progress) = match tasks.try_start(TaskType::AddFields) {
+    let (task_id, _progress) = match tasks.try_start(TaskType::AddFields) {
         Ok(v) => v,
         Err(active_info) => {
             return (
@@ -4044,8 +4044,8 @@ async fn handle_add_fields(
         }
     };
 
-    let filter_fields = req.filter_fields;
-    let sort_fields = req.sort_fields;
+    let _filter_fields = req.filter_fields;
+    let _sort_fields = req.sort_fields;
     let save = req.save_snapshot;
 
     let tasks_clone = Arc::clone(&tasks);

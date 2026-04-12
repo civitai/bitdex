@@ -420,7 +420,7 @@ const FINALIZE_CHUNK_SIZE: u32 = 65_536;
 #[allow(dead_code)]
 fn finalize_from_bitmaps(
     bulk_writer: &crate::doc_silo::DocSiloBulkWriter,
-    schema: &crate::config::DataSchema,
+    _schema: &crate::config::DataSchema,
     alive: &RoaringBitmap,
     image_scalars: &HashMap<u32, ImageScalars>,
     resource_enrichments: &HashMap<u32, ResourceEnrichment>,

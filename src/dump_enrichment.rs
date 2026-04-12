@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use crate::dictionary::FieldDictionary;
 use crate::dump_expression::{
-    ColumnIndex, ComputedFieldDef, CsvRow, EvalContext, ExprValue, FilterExpression,
+    ColumnIndex, ComputedFieldDef, CsvRow, ExprValue, FilterExpression,
 };
 
 /// Configuration for a single enrichment level, parsed from the dump request body.
@@ -75,7 +75,7 @@ impl LookupRow {
     }
 
     /// Convert to CsvRow for expression evaluation.
-    pub fn to_csv_row(&self) -> CsvRow {
+    pub fn to_csv_row(&self) -> CsvRow<'_> {
         let mut row = CsvRow::new();
         for (name, &idx) in self.col_index.as_ref() {
             let val = self.values.get(idx).and_then(|v| v.as_deref());

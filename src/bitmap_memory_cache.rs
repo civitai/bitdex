@@ -9,7 +9,6 @@
 
 use ahash::AHashSet as HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;

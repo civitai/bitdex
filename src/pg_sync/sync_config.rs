@@ -228,7 +228,7 @@ impl DumpPhase {
 
     /// Build the dump request body JSON to send to BitDex via PUT /dumps.
     pub fn to_dump_request(&self, stage_dir: &Path) -> serde_json::Value {
-        let csv_path = if let Some(ref lookup) = self.enrichment.first().and_then(|_| None::<String>) {
+        let _csv_path = if let Some(_lookup) = self.enrichment.first().and_then(|_| None::<String>) {
             // Not needed at top level
             serde_json::Value::Null
         } else {

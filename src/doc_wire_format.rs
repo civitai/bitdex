@@ -12,9 +12,7 @@
 use ahash::AHashMap as HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use dashmap::{DashMap, DashSet};
 
 use crate::config::{FieldMapping, FieldValueType};
 use crate::mutation::FieldValue;

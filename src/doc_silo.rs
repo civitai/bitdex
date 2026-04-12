@@ -855,7 +855,7 @@ impl DocSilo {
 //   accumulated layout Vec (~109M × 24 bytes = 2.6 GB for 107M dataset,
 //   manageable), flushes data.bin, persists the field dictionary.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 
 /// Lock-free mmap-backed bulk writer state. Pre-allocates a data.bin file
 /// large enough to fit the expected output plus slack, then hands rayon
@@ -1106,7 +1106,7 @@ impl DocSiloBulkWriter {
         write_buf.push(1u8); // alive
         write_buf.extend_from_slice(&(tuples.len() as u16).to_le_bytes());
         let mut kept = 0u16;
-        let mut reserve_pos = write_buf.len() - 2;
+        let reserve_pos = write_buf.len() - 2;
         for &(field_idx, value_bytes) in tuples {
             let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
                 Ok(v) => v,
@@ -1222,7 +1222,7 @@ impl DocSiloBulkWriter {
         }
 
         // Flush the mmap, then release it before touching the file.
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         state.mmap.flush()?;
         drop(state); // drops mmap + File — both now closed.
 

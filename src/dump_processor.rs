@@ -27,8 +27,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
-use crate::doc_wire_format::PackedValue;
-use crate::doc_silo::DocSiloBulkWriter;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
 use crate::dump_expression::ExprValue as NateExprValue;
@@ -1206,23 +1204,19 @@ impl ShardPreCreator {
     pub fn spawn(
         watermark: Arc<AtomicU64>,
         done: Arc<std::sync::atomic::AtomicBool>,
-        docstore_root: std::path::PathBuf,
+        _docstore_root: std::path::PathBuf,
         bitmap_path: Option<std::path::PathBuf>,
         filter_field_names: Vec<String>,
     ) -> Self {
         let handle = std::thread::Builder::new()
             .name("shard-precreator".into())
             .spawn(move || {
-                let mut created_up_to: u32 = 0;
-                let mut files_created: u32 = 0;
+                let _created_up_to: u32 = 0;
+                let files_created: u32 = 0;
                 let mut bitmap_dirs_done = false;
-                let mut docstore_dirs_done = false;
 
                 loop {
                     let current_max_slot = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
-                    let target_shard = current_max_slot >> 9; // SHARD_SHIFT = 9
-
-                    docstore_dirs_done = true;
 
                     // Create filter bitmap dirs once (first time watermark > 0)
                     if !bitmap_dirs_done && current_max_slot > 0 {

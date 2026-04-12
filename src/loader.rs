@@ -385,7 +385,7 @@ pub fn load_ndjson(
             let s_configs = &sort_configs_clone;
             let f_set = &filter_set_clone;
             let s_bits = &sort_bits_clone;
-            let writer = &parse_writer;
+            let _writer = &parse_writer;
             let id_field_ref = &id_field;
             let dicts = dicts_clone.as_deref();
 

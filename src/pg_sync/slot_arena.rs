@@ -52,9 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use memmap2::MmapMut;
-use roaring::RoaringBitmap;
 
-use crate::config::DataSchema;
 use crate::error::Result;
 
 // ---------------------------------------------------------------------------
