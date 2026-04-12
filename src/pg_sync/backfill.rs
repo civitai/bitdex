@@ -260,7 +260,7 @@ pub async fn auto_backfill(
         match field_name.as_str() {
             "collectionIds" => {
                 // Step 1: Download CSV if not staged
-                let csv_path = stage_dir.join("collection_items.csv");
+                let _csv_path = stage_dir.join("collection_items.csv");
                 let done_path = stage_dir.join("collection_items.csv.done");
                 if !done_path.exists() {
                     eprintln!("  Downloading collection_items.csv from PG...");

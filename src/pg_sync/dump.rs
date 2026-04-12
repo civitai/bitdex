@@ -11,7 +11,7 @@
 //! 5. GET /dumps — check status per table
 
 use ahash::AHashMap as HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,11 @@ impl DumpRegistry {
     pub fn all_complete(&self) -> bool {
         !self.dumps.is_empty()
             && self.dumps.values().all(|e| e.status == DumpStatus::Complete)
+    }
+
+    /// Number of registered dump phases.
+    pub fn count(&self) -> usize {
+        self.dumps.len()
     }
 }
 

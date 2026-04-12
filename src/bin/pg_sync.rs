@@ -301,22 +301,37 @@ async fn run_boot_sequence(
     eprintln!("BitDex is healthy.");
 
     // Step 1b: Check if ALL dump phases are already complete — skip dump if so.
-    // Uses per-phase completion check via GET /dumps to avoid skipping incomplete phases.
-    // Previous alive_count > 0 check was too aggressive (skipped tools/techniques when
-    // images loaded but other phases hadn't run yet).
+    // Must verify BOTH conditions:
+    //   1. Server reports all_complete (every registered phase is Complete)
+    //   2. The number of registered phases >= the number of configured phases
+    // Without check #2, a mid-dump restart that only registered 1 of 6 phases
+    // would report all_complete=true and skip phases 2-6 entirely.
     if let Some(config) = full_sync_config {
-        let all_complete = match bitdex_client.get_dumps().await {
-            Ok(resp) => resp.get("all_complete").and_then(|v| v.as_bool()).unwrap_or(false),
-            Err(_) => false,
+        let (all_complete, registered_count) = match bitdex_client.get_dumps().await {
+            Ok(resp) => {
+                let complete = resp.get("all_complete").and_then(|v| v.as_bool()).unwrap_or(false);
+                let count = resp.get("dumps")
+                    .and_then(|v| v.as_object())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                (complete, count)
+            }
+            Err(_) => (false, 0),
         };
-        if all_complete && !config.dump_phases.is_empty() {
+        let expected_count = config.dump_phases.len();
+        if all_complete && registered_count >= expected_count && !config.dump_phases.is_empty() {
             let alive_count = bitdex_client.get_alive_count().await;
             eprintln!(
-                "All dump phases complete ({alive_count} alive docs) — skipping dump pipeline. \
-                 Transitioning directly to steady-state ops polling."
+                "All {registered_count}/{expected_count} dump phases complete ({alive_count} alive docs) — \
+                 skipping dump pipeline. Transitioning directly to steady-state ops polling."
             );
             run_setup(pool, full_sync_config).await;
             return;
+        } else if all_complete && registered_count < expected_count {
+            eprintln!(
+                "WARNING: Server reports all_complete but only {registered_count}/{expected_count} phases \
+                 registered — mid-dump restart detected. Re-running full dump pipeline."
+            );
         }
     }
 

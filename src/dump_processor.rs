@@ -27,8 +27,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
-use crate::shard_store_doc::PackedValue;
-use crate::doc_silo::DocSiloBulkWriter;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
 use crate::dump_expression::ExprValue as NateExprValue;
@@ -1206,69 +1204,19 @@ impl ShardPreCreator {
     pub fn spawn(
         watermark: Arc<AtomicU64>,
         done: Arc<std::sync::atomic::AtomicBool>,
-        docstore_root: std::path::PathBuf,
+        _docstore_root: std::path::PathBuf,
         bitmap_path: Option<std::path::PathBuf>,
         filter_field_names: Vec<String>,
     ) -> Self {
         let handle = std::thread::Builder::new()
             .name("shard-precreator".into())
             .spawn(move || {
-                let mut created_up_to: u32 = 0;
-                let mut files_created: u32 = 0;
+                let _created_up_to: u32 = 0;
+                let files_created: u32 = 0;
                 let mut bitmap_dirs_done = false;
-                let mut docstore_dirs_done = false;
 
                 loop {
                     let current_max_slot = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
-                    let target_shard = current_max_slot >> 9; // SHARD_SHIFT = 9
-
-                    // Pre-create all 256 hex subdirectories once (eliminates per-file create_dir_all)
-                    if !docstore_dirs_done && current_max_slot > 0 {
-                        // Derive shards dir from DocStoreV3::shard_path to match ShardStore layout.
-                        // shard_path returns root/gen_NNN/shards/xx/NNNNNN.shard — go up 2 levels for shards dir.
-                        let sample_path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, 0);
-                        let shards_dir = sample_path.parent().unwrap().parent().unwrap();
-                        for hex in 0..=255u8 {
-                            let _ = std::fs::create_dir_all(shards_dir.join(format!("{:02x}", hex)));
-                        }
-                        docstore_dirs_done = true;
-                        eprintln!("  ShardPreCreator: docstore hex dirs created at {}", shards_dir.display());
-                    }
-
-                    // Create docstore shard files up to target (no create_dir_all per file)
-                    while created_up_to < target_shard {
-                        created_up_to += 1;
-                        let path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, created_up_to);
-                        if let Ok(f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)
-                        {
-                            let meta = f.metadata().ok();
-                            if meta.map(|m| m.len()).unwrap_or(0) == 0 {
-                                // Write a full valid ShardStore header (28 bytes).
-                                // Previous code only wrote the 4-byte magic, leaving
-                                // stubs that append_ops_to_shard can't read (needs 28).
-                                let header = crate::shard_store::ShardHeader {
-                                    version: crate::shard_store::SHARD_VERSION,
-                                    ops_section_offset: crate::shard_store::HEADER_SIZE as u64,
-                                    snapshot_len: 0,
-                                    ops_count: 0,
-                                    flags: 0,
-                                };
-                                let mut buf = Vec::with_capacity(crate::shard_store::HEADER_SIZE);
-                                header.encode(&mut buf);
-                                let mut bw = std::io::BufWriter::new(f);
-                                use std::io::Write as _;
-                                let _ = bw.write_all(&buf);
-                                let _ = bw.flush();
-                            }
-                        }
-                        files_created += 1;
-                        if files_created % 50_000 == 0 {
-                            eprintln!("  ShardPreCreator: {}K docstore files created", files_created / 1000);
-                        }
-                    }
 
                     // Create filter bitmap dirs once (first time watermark > 0)
                     if !bitmap_dirs_done && current_max_slot > 0 {
@@ -1287,35 +1235,7 @@ impl ShardPreCreator {
                     }
 
                     if done.load(std::sync::atomic::Ordering::Relaxed) {
-                        // Final sweep for any remaining shards
-                        let final_max = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
-                        let final_shard = final_max >> 9;
-                        while created_up_to < final_shard {
-                            created_up_to += 1;
-                            let path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, created_up_to);
-                            if let Ok(f) = std::fs::OpenOptions::new()
-                                .create(true).append(true).open(&path)
-                            {
-                                let meta = f.metadata().ok();
-                                if meta.map(|m| m.len()).unwrap_or(0) == 0 {
-                                    let header = crate::shard_store::ShardHeader {
-                                        version: crate::shard_store::SHARD_VERSION,
-                                        ops_section_offset: crate::shard_store::HEADER_SIZE as u64,
-                                        snapshot_len: 0,
-                                        ops_count: 0,
-                                        flags: 0,
-                                    };
-                                    let mut buf = Vec::with_capacity(crate::shard_store::HEADER_SIZE);
-                                    header.encode(&mut buf);
-                                    let mut bw = std::io::BufWriter::new(f);
-                                    use std::io::Write as _;
-                                    let _ = bw.write_all(&buf);
-                                    let _ = bw.flush();
-                                }
-                            }
-                            files_created += 1;
-                        }
-                        eprintln!("  ShardPreCreator: done — {} files created (max shard {})", files_created, created_up_to);
+                        eprintln!("  ShardPreCreator: done — bitmap dirs created");
                         return files_created;
                     }
 
@@ -3373,13 +3293,13 @@ pub(crate) enum DumpFieldValue<'a> {
 pub(crate) fn encode_dump_merge(slot: u32, fields: &[(u16, DumpFieldValue)], buf: &mut Vec<u8>) {
     debug_assert!(fields.len() <= u16::MAX as usize, "encode_dump_merge: too many fields");
     buf.clear();
-    crate::shard_store_doc::write_merge_header(slot, fields.len() as u16, buf);
+    crate::doc_wire_format::write_merge_header(slot, fields.len() as u16, buf);
     for (field_idx, value) in fields {
         match value {
-            DumpFieldValue::Int(v) => crate::shard_store_doc::write_field_int(*field_idx, *v, buf),
-            DumpFieldValue::Bool(v) => crate::shard_store_doc::write_field_bool(*field_idx, *v, buf),
-            DumpFieldValue::Str(s) => crate::shard_store_doc::write_field_str(*field_idx, s, buf),
-            DumpFieldValue::MultiInt(v) => crate::shard_store_doc::write_field_multi_int(*field_idx, v, buf),
+            DumpFieldValue::Int(v) => crate::doc_wire_format::write_field_int(*field_idx, *v, buf),
+            DumpFieldValue::Bool(v) => crate::doc_wire_format::write_field_bool(*field_idx, *v, buf),
+            DumpFieldValue::Str(s) => crate::doc_wire_format::write_field_str(*field_idx, s, buf),
+            DumpFieldValue::MultiInt(v) => crate::doc_wire_format::write_field_multi_int(*field_idx, v, buf),
         }
     }
 }
@@ -4120,8 +4040,8 @@ mod tests {
     /// ("t"/"f") to PackedValue::B for fields declared as boolean in the data schema.
     #[test]
     fn test_boolean_coercion_in_docstore_write() {
-        use crate::shard_store_doc::DocStoreV3;
-        use crate::shard_store_doc::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4184,8 +4104,8 @@ mod tests {
     /// Test that extra_i64_fields (config-computed sorts) are written to docstore.
     #[test]
     fn test_extra_i64_fields_in_docstore_write() {
-        use crate::shard_store_doc::DocStoreV3;
-        use crate::shard_store_doc::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
@@ -4246,7 +4166,7 @@ mod tests {
     #[test]
     fn test_encode_dump_merge_matches_codec() {
         use crate::shard_store::OpCodec;
-        use crate::shard_store_doc::{DocOp, DocOpCodec, PackedValue};
+        use crate::doc_wire_format::{DocOp, DocOpCodec, PackedValue};
 
         // Build the same merge two ways and compare.
         let cases: Vec<(u32, Vec<(u16, DumpFieldValue, PackedValue)>)> = vec![

@@ -65,7 +65,7 @@ fn dedup_entity_ops(ops: &mut Vec<Op>) {
     }
 
     // First pass: collect all ops, tracking which fields have Set ops
-    let mut all_ops: Vec<Op> = ops.drain(..).collect();
+    let all_ops: Vec<Op> = ops.drain(..).collect();
     let mut set_fields: HashSet<String> = HashSet::new();
     for op in &all_ops {
         if let Op::Set { field, .. } = op {

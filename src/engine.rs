@@ -1,7 +1,6 @@
 use std::path::Path;
 use crate::concurrency::InFlightTracker;
 use crate::config::Config;
-use crate::shard_store_doc::DocStoreV3;
 use crate::error::Result;
 use crate::executor::QueryExecutor;
 use crate::filter::FilterIndex;
@@ -20,7 +19,7 @@ pub struct Engine {
     filters: FilterIndex,
     sorts: SortIndex,
     in_flight: InFlightTracker,
-    docstore: DocStoreV3,
+    docstore: crate::doc_silo::DocSilo,
     config: Config,
 }
 impl Engine {
@@ -30,7 +29,9 @@ impl Engine {
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let docstore = DocStoreV3::open(docstore_path)?;
+        let silo_path = docstore_path.join("silo");
+        let docstore = crate::doc_silo::DocSilo::open(&silo_path)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("open silo: {e}")))?;
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());
@@ -47,13 +48,14 @@ impl Engine {
             config,
         })
     }
-    /// Create a new engine with an in-memory docstore (for testing).
+    /// Create a new engine with a temp docstore (for testing).
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
         let slots = SlotAllocator::new();
         let mut filters = FilterIndex::new();
         let mut sorts = SortIndex::new();
-        let docstore = DocStoreV3::open_temp()?;
+        let docstore = crate::doc_silo::DocSilo::open_temp()
+            .map_err(|e| crate::error::BitdexError::Storage(format!("open temp silo: {e}")))?;
 
         for fc in &config.filter_fields {
             filters.add_field(fc.clone());

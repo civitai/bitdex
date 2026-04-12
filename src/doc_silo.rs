@@ -22,7 +22,7 @@ use datasilo::{DataSilo, OpCodec, SiloConfig, SnapshotCodec};
 
 use crate::mutation::FieldValue;
 use crate::query::Value;
-use crate::shard_store_doc::{PackedValue, StoredDoc};
+use crate::doc_wire_format::{PackedValue, StoredDoc};
 
 // ---------------------------------------------------------------------------
 // Slot-key bijection
@@ -65,8 +65,8 @@ impl SlotSnapshot {
 // DocOp — typed document operations (silo-native variant)
 // ---------------------------------------------------------------------------
 //
-// Mirrors `shard_store_doc::DocOp` exactly; kept in this module so the port
-// doesn't depend on the soon-to-be-deleted `shard_store_doc`. Encoding is
+// Mirrors `doc_wire_format::DocOp` exactly; kept in this module so the port
+// doesn't depend on the soon-to-be-deleted `doc_wire_format`. Encoding is
 // wire-compatible with `DocOpCodec`.
 
 #[derive(Debug, Clone)]
@@ -109,7 +109,7 @@ const PV_TAG_MI: u8 = 0x05;
 const PV_TAG_MM: u8 = 0x06;
 
 // ---------------------------------------------------------------------------
-// PackedValue encode / decode (same wire format as shard_store_doc)
+// PackedValue encode / decode (same wire format as doc_wire_format)
 // ---------------------------------------------------------------------------
 
 fn encode_packed_value(pv: &PackedValue, buf: &mut Vec<u8>) {
@@ -617,6 +617,11 @@ pub struct DocSilo {
 }
 
 impl DocSilo {
+    pub fn open_temp() -> io::Result<Self> {
+        let dir = tempfile::tempdir()?;
+        Self::open(dir.path())
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(path)?;
         let silo_path = path.join("silo");
@@ -850,7 +855,7 @@ impl DocSilo {
 //   accumulated layout Vec (~109M × 24 bytes = 2.6 GB for 107M dataset,
 //   manageable), flushes data.bin, persists the field dictionary.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 
 /// Lock-free mmap-backed bulk writer state. Pre-allocates a data.bin file
 /// large enough to fit the expected output plus slack, then hands rayon
@@ -863,7 +868,10 @@ use std::io::{Seek, SeekFrom, Write};
 /// is truncated to the actual used bytes at finalize. Growth-on-overflow
 /// is a fallback if the estimate is too low.
 const INITIAL_BYTES_PER_DOC: usize = 256;
-const SLACK_RATIO: f64 = 1.5;
+/// Ratio of data.bin capacity to estimated data size. 1.1 = 10% slack.
+/// Previously 1.5, reduced to fit within 32 GiB pod limit at 107M records.
+/// At 107M × ~200 bytes/doc, 1.5 = ~31 GB sparse vs 1.1 = ~23 GB.
+const SLACK_RATIO: f64 = 1.1;
 
 struct BulkState {
     /// Keeps the writable mmap alive. Only touched during `new`, `grow`,
@@ -1040,7 +1048,7 @@ impl DocSiloBulkWriter {
 
     /// Append a pre-encoded DocOp::Merge payload for a slot.
     ///
-    /// Payload wire format (produced by `shard_store_doc::write_merge_header`
+    /// Payload wire format (produced by `doc_wire_format::write_merge_header`
     /// + `write_field_*`):
     ///
     /// ```text
@@ -1101,7 +1109,7 @@ impl DocSiloBulkWriter {
         write_buf.push(1u8); // alive
         write_buf.extend_from_slice(&(tuples.len() as u16).to_le_bytes());
         let mut kept = 0u16;
-        let mut reserve_pos = write_buf.len() - 2;
+        let reserve_pos = write_buf.len() - 2;
         for &(field_idx, value_bytes) in tuples {
             let pv: PackedValue = match rmp_serde::from_slice(value_bytes) {
                 Ok(v) => v,
@@ -1217,7 +1225,7 @@ impl DocSiloBulkWriter {
         }
 
         // Flush the mmap, then release it before touching the file.
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         state.mmap.flush()?;
         drop(state); // drops mmap + File — both now closed.
 

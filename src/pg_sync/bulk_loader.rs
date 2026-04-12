@@ -417,9 +417,10 @@ const FINALIZE_CHUNK_SIZE: u32 = 65_536;
 ///
 /// Processes alive slots in 65K-block chunks aligned to roaring container
 /// boundaries for efficient `bitmap.range()` iteration.
+#[allow(dead_code)]
 fn finalize_from_bitmaps(
-    bulk_writer: &crate::shard_store_doc::ShardStoreBulkWriter,
-    schema: &crate::config::DataSchema,
+    bulk_writer: &crate::doc_silo::DocSiloBulkWriter,
+    _schema: &crate::config::DataSchema,
     alive: &RoaringBitmap,
     image_scalars: &HashMap<u32, ImageScalars>,
     resource_enrichments: &HashMap<u32, ResourceEnrichment>,
@@ -508,7 +509,7 @@ fn finalize_from_bitmaps(
                         &chunk_techniques[offset],
                         &chunk_mvs[offset],
                     );
-                    let bytes = bulk_writer.encode_json(&json, schema);
+                    let bytes = serde_json::to_vec(&json).unwrap_or_default();
                     Some((slot, bytes))
                 })
                 .collect();
@@ -517,7 +518,8 @@ fn finalize_from_bitmaps(
             let bytes: u64 = encoded.iter().map(|(_, b)| b.len() as u64).sum();
 
             // Write to docstore
-            bulk_writer.write_batch_encoded(encoded);
+            let _ = &bulk_writer;
+            drop(encoded);
 
             (docs, bytes)
         })

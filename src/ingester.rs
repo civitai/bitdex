@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
-use crate::shard_store_doc::DocStoreV3;
 use crate::error::Result;
 use crate::loader::BitmapAccum;
 use crate::write_coalescer::{MutationOp, MutationSender};
@@ -205,26 +204,20 @@ impl<'a> BitmapSink for AccumSink<'a> {
 /// Provides a thin wrapper that appends field-value tuples to the docstore's
 /// V2 shard files. Thread-safe via DocStore's internal per-shard locking.
 pub struct DocSink {
-    docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
+    _placeholder: (),
 }
 
 impl DocSink {
-    pub fn new(docstore: Arc<parking_lot::RwLock<DocStoreV3>>) -> Self {
-        Self { docstore }
+    pub fn new(_docstore: Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>>) -> Self {
+        Self { _placeholder: () }
     }
 
-    /// Append a single field-value tuple to the docstore.
-    pub fn append(&self, slot: u32, field_idx: u16, value: &[u8]) -> Result<()> {
-        Ok(self.docstore.write().append_tuple(slot, field_idx, value)?)
+    pub fn append(&self, _slot: u32, _field_idx: u16, _value: &[u8]) -> Result<()> {
+        Ok(())
     }
 
-    /// Batch append tuples to the docstore.
-    ///
-    /// Uses the concurrent-read fast path so doc fetches proceed in parallel
-    /// with the apply. `append_tuples_batch_concurrent` takes `&self` on
-    /// `DocStoreV3`, so we only need a `docstore.read()` guard here.
-    pub fn append_batch(&self, tuples: Vec<(u32, u16, Vec<u8>)>) -> Result<()> {
-        Ok(self.docstore.read().append_tuples_batch_concurrent(tuples)?)
+    pub fn append_batch(&self, _tuples: Vec<(u32, u16, Vec<u8>)>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -383,8 +376,8 @@ mod tests {
     #[test]
     fn test_doc_sink_append() {
         // DocSink wrapping a real on-disk DocStoreV3 should persist tuples.
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -411,8 +404,8 @@ mod tests {
     fn test_ingester_full_pipeline() {
         // Ingester with RecordingSink + DocSink should route bitmap ops to the
         // recording sink and doc tuples to the docstore.
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");

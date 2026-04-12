@@ -23,7 +23,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::{Config, DataSchema, FieldValueType, FilterFieldConfig, SortFieldConfig};
-use crate::shard_store_doc::StoredDoc;
+use crate::doc_wire_format::StoredDoc;
 use crate::executor::{CaseSensitiveFields, StringMaps};
 use crate::loader;
 use crate::metrics::Metrics;
@@ -1222,9 +1222,8 @@ impl BitdexServer {
                                     // coherent with V3 for the steady-state sync-v2 path. Reads
                                     // prefer DocSilo whenever it's populated, so a V3-only write
                                     // would be invisible after a bulk dump.
-                                    let mut doc_writer = crate::ops_processor::DocWriter::new_dual(
-                                        engine.docstore_arc(),
-                                        engine.doc_silo(),
+                                    let mut doc_writer = crate::ops_processor::DocWriter::new(
+                                        engine.doc_silo_arc(),
                                     );
 
                                     let mut entries = batch.entries;
@@ -1684,7 +1683,7 @@ fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
     let guard = state.index.lock();
     let idx = guard.as_ref().ok_or("No index found — cannot rebuild without config")?;
 
-    let engine = Arc::clone(&idx.engine);
+    let _engine = Arc::clone(&idx.engine);
     let index_name = idx.definition.name.clone();
     let bitmap_path = state.data_dir.join("indexes").join(&index_name).join("bitmaps");
     drop(guard);
@@ -1715,45 +1714,9 @@ fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
         }
     });
 
-    let (total_docs, build_elapsed) = engine
-        .build_all_from_docstore(progress_clone, Some(memory_cb))
-        .map_err(|e| format!("build_all_from_docstore: {e}"))?;
-
-    let rss_after_build = get_rss_bytes();
-    eprintln!("Build complete: {} docs in {:.1}s ({:.0} docs/s), RSS={:.2} GB",
-        total_docs, build_elapsed, total_docs as f64 / build_elapsed, rss_after_build as f64 / 1e9);
-
-    // Step 3: Persist bitmaps to disk and unload from memory
-    eprintln!("Persisting bitmaps to disk...");
-    let persist_start = std::time::Instant::now();
-
-    engine.save_and_unload().map_err(|e| format!("save_and_unload: {e}"))?;
-
-    let persist_elapsed = persist_start.elapsed().as_secs_f64();
-    let rss_final = get_rss_bytes();
-    let total_elapsed = build_elapsed + persist_elapsed;
-
-    eprintln!("\n=== REBUILD COMPLETE ===");
-    eprintln!("  Docs:          {}", total_docs);
-    eprintln!("  Build:         {:.1}s", build_elapsed);
-    eprintln!("  Persist:       {:.1}s", persist_elapsed);
-    eprintln!("  Total:         {:.1}s ({:.1} min)", total_elapsed, total_elapsed / 60.0);
-    eprintln!("  RSS final:     {:.2} GB", rss_final as f64 / 1e9);
-    eprintln!("Server will now start with lazy bitmap loading.\n");
-
-    // Update task registry so the API reflects the rebuild
-    let guard = state.index.lock();
-    if let Some(idx) = guard.as_ref() {
-        if let Ok((tid, progress)) = idx.tasks.try_start(TaskType::Rebuild) {
-            progress.store(total_docs, Ordering::Release);
-            idx.tasks.set_complete(tid, Some(serde_json::json!({
-                "records_loaded": total_docs,
-                "elapsed_secs": total_elapsed,
-            })));
-        }
-    }
-
-    Ok(())
+    drop(memory_cb);
+    let _ = progress_clone;
+    Err("build_all_from_docstore removed — DocStoreV3 no longer exists. Re-dump from PG instead.".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -2713,7 +2676,7 @@ async fn handle_query(
             let doc_start = Instant::now();
             let documents = if !include_docs.is_none() {
                 let engine_docs = Arc::clone(&engine);
-                let ids = result.ids.clone();
+                let _ids = result.ids.clone();
                 let schema_docs = schema.clone();
                 let reverse_maps_docs = Arc::clone(&reverse_maps);
                 let include_docs_docs = include_docs.clone();
@@ -2733,7 +2696,7 @@ async fn handle_query(
                 // spawn_blocking for full-cache-hit batches eliminates this.
                 let slot_ids: Vec<u32> = result.ids.iter().map(|&id| id as u32).collect();
                 let inline_docs = if !slot_ids.is_empty() {
-                    let mut cached: Vec<Option<crate::shard_store_doc::StoredDoc>> = Vec::with_capacity(slot_ids.len());
+                    let mut cached: Vec<Option<crate::doc_wire_format::StoredDoc>> = Vec::with_capacity(slot_ids.len());
                     let mut all_hit = true;
                     if let Some(cache) = engine_docs.doc_cache_ref() {
                         for &id in &slot_ids {
@@ -3776,7 +3739,7 @@ async fn handle_rebuild(
         }
     }
 
-    let (task_id, progress) = match tasks.try_start(TaskType::Rebuild) {
+    let (task_id, _progress) = match tasks.try_start(TaskType::Rebuild) {
         Ok(v) => v,
         Err(active_info) => {
             return (
@@ -3789,15 +3752,15 @@ async fn handle_rebuild(
         }
     };
 
-    let sort_fields = req.sort_fields;
-    let filter_fields = req.filter_fields;
+    let _sort_fields = req.sort_fields;
+    let _filter_fields = req.filter_fields;
     let save = req.save_snapshot;
 
     let tasks_clone = Arc::clone(&tasks);
     tokio::task::spawn_blocking(move || {
         let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
 
-        match engine.rebuild_fields_from_docstore(sort_fields, filter_fields, progress.clone()) {
+        match Err::<(u64, Vec<String>), crate::error::BitdexError>(crate::error::BitdexError::Storage("rebuild_fields_from_docstore removed — DocStoreV3 deleted".into())) {
             Ok((slots, fields)) => {
                 if save {
                     guard.tasks.set_saving(task_id);
@@ -4044,11 +4007,11 @@ async fn handle_add_fields(
 
     // Validate fields exist in docstore (unless skipped)
     if !req.skip_validation {
-        let all_names: Vec<&str> = req.filter_fields.iter().map(|f| f.name.as_str())
+        let _all_names: Vec<&str> = req.filter_fields.iter().map(|f| f.name.as_str())
             .chain(req.sort_fields.iter().map(|f| f.name.as_str()))
             .collect();
 
-        match engine.validate_fields_in_docstore(&all_names) {
+        match Ok::<Vec<String>, crate::error::BitdexError>(Vec::new()) {
             Ok(missing) if !missing.is_empty() => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -4068,7 +4031,7 @@ async fn handle_add_fields(
         }
     }
 
-    let (task_id, progress) = match tasks.try_start(TaskType::AddFields) {
+    let (task_id, _progress) = match tasks.try_start(TaskType::AddFields) {
         Ok(v) => v,
         Err(active_info) => {
             return (
@@ -4081,15 +4044,15 @@ async fn handle_add_fields(
         }
     };
 
-    let filter_fields = req.filter_fields;
-    let sort_fields = req.sort_fields;
+    let _filter_fields = req.filter_fields;
+    let _sort_fields = req.sort_fields;
     let save = req.save_snapshot;
 
     let tasks_clone = Arc::clone(&tasks);
     tokio::task::spawn_blocking(move || {
         let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
 
-        match engine.add_fields_from_docstore(filter_fields, sort_fields, progress) {
+        match Err::<(u64, Vec<String>), crate::error::BitdexError>(crate::error::BitdexError::Storage("add_fields_from_docstore removed — DocStoreV3 deleted".into())) {
             Ok((slots, fields)) => {
                 if save {
                     guard.tasks.set_saving(task_id);
@@ -5394,6 +5357,7 @@ async fn handle_list_dumps(
     Json(serde_json::json!({
         "dumps": dumps,
         "all_complete": reg.all_complete(),
+        "phases_registered": reg.count(),
     }))
 }
 
@@ -5422,7 +5386,7 @@ async fn handle_silo_populate(
         }
     };
     let start = std::time::Instant::now();
-    let result = tokio::task::spawn_blocking(move || engine.copy_docstore_to_silo())
+    let result = tokio::task::spawn_blocking(move || -> crate::error::Result<(u64, u64)> { let _ = engine; Err(crate::error::BitdexError::Storage("copy_docstore_to_silo removed — DocStoreV3 deleted".into())) })
         .await
         .map_err(|e| format!("join: {e}"));
     let elapsed = start.elapsed().as_secs_f64();

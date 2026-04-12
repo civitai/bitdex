@@ -87,6 +87,9 @@ memmap2 = "0.9"
 # DataSilo — mmap-backed typed KV store for doc storage.
 datasilo = { path = "crates/datasilo" }
 
+# Temp directories (used by DocSilo::open_temp for test engines)
+tempfile = "3"
+
 # RNG (used by benchmark and loadtest binaries)
 rand = "0.8"
 

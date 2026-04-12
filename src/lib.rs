@@ -35,7 +35,7 @@ pub mod field_handler;
 pub mod radix_sort;
 pub mod shard_store;
 pub mod shard_store_bitmap;
-pub mod shard_store_doc;
+pub mod doc_wire_format;
 pub mod shard_store_meta;
 #[cfg(feature = "server")]
 pub mod metrics;

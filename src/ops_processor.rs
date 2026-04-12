@@ -20,8 +20,7 @@ use crate::concurrent_engine::ConcurrentEngine;
 use crate::config::Config;
 use crate::dictionary::FieldDictionary;
 use crate::doc_silo::{DocOp, DocSilo};
-use crate::shard_store_doc::DocStoreV3;
-use crate::shard_store_doc::PackedValue;
+use crate::doc_wire_format::PackedValue;
 use crate::filter::{FilterFieldType, NULL_BITMAP_KEY};
 use crate::ingester::BitmapSink;
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
@@ -39,51 +38,23 @@ use crate::query::{BitdexQuery, FilterClause, Value as QValue};
 /// is safe because no concurrent writer can modify the same slot's doc between
 /// the read and write within a single WAL batch cycle.
 pub struct DocWriter {
-    docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
-    /// Optional DocSilo for dual-write. When set, every flush mirrors the
-    /// pending ops into the silo so steady-state sync-v2 writes remain
-    /// visible to the read path (which prefers DocSilo when populated).
-    doc_silo: Option<Arc<parking_lot::RwLock<DocSilo>>>,
+    doc_silo: Arc<parking_lot::RwLock<DocSilo>>,
     field_dict: HashMap<String, u16>,
-    /// Independent field index for DocSilo. The silo and DocStoreV3
-    /// assign indices in their own namespaces so a name may map to
-    /// different integers in each.
-    silo_field_dict: HashMap<String, u16>,
-    /// pending entries store the field NAME so flush can resolve indices
-    /// in both the V3 and silo dictionaries independently.
     pending: Vec<(u32, String, PackedValue)>,
     pending_append: Vec<(u32, String, PackedValue)>,
     pending_remove: Vec<(u32, String, PackedValue)>,
 }
 impl DocWriter {
-    /// Create a DocWriter from the engine's docstore.
-    pub fn new(docstore: Arc<parking_lot::RwLock<DocStoreV3>>) -> Self {
-        Self::new_dual(docstore, None)
-    }
-
-    /// Create a DocWriter that dual-writes to both DocStoreV3 and DocSilo.
-    /// The silo mirror keeps the sync-v2 ops path coherent with the read
-    /// path after a DocSilo bulk dump.
-    pub fn new_dual(
-        docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
-        doc_silo: Option<Arc<parking_lot::RwLock<DocSilo>>>,
-    ) -> Self {
-        let field_dict = docstore.read().field_dict_snapshot();
-        let silo_field_dict: HashMap<String, u16> = doc_silo
-            .as_ref()
-            .map(|s| {
-                s.read()
-                    .field_to_idx()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), *v))
-                    .collect()
-            })
-            .unwrap_or_default();
+    pub fn new(doc_silo: Arc<parking_lot::RwLock<DocSilo>>) -> Self {
+        let field_dict: HashMap<String, u16> = doc_silo
+            .read()
+            .field_to_idx()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         Self {
-            docstore,
             doc_silo,
             field_dict,
-            silo_field_dict,
             pending: Vec::new(),
             pending_append: Vec::new(),
             pending_remove: Vec::new(),
@@ -131,145 +102,51 @@ impl DocWriter {
         self.pending_remove
             .push((slot, field.to_string(), PackedValue::I(remove_val)));
     }
-    /// Flush pending ops to DocStoreV3 and (if configured) DocSilo.
-    ///
-    /// The V3 path uses the concurrent-read fast paths so doc fetches
-    /// proceed in parallel with the apply. The silo mirror uses
-    /// `apply_ops_batch` which is also concurrent-read-safe (the silo
-    /// write path takes a brief mutex internally for ops-log append only).
-    ///
-    /// Field indices are resolved independently against each store's
-    /// dictionary — the same name may map to different integers, so we
-    /// keep two caches. Indices are lazily registered via
-    /// `ensure_field_index` on first write.
     pub fn flush(&mut self) {
-        // ── Set ops ───────────────────────────────────────────────────
         if !self.pending.is_empty() {
             let pending = std::mem::take(&mut self.pending);
-
-            // V3 path: resolve each field to its V3 index, then encode
-            // the PackedValue into rmp bytes (V3's on-disk format).
-            let v3_tuples: Vec<(u32, u16, Vec<u8>)> = pending
-                .iter()
+            let silo_ops: Vec<DocOp> = pending
+                .into_iter()
                 .filter_map(|(slot, field, pv)| {
-                    let v3_idx = self.resolve_v3_field(field)?;
-                    let bytes = rmp_serde::to_vec(pv).ok()?;
-                    Some((*slot, v3_idx, bytes))
+                    let idx = self.resolve_field(&field)?;
+                    Some(DocOp::Set { slot, field: idx, value: pv })
                 })
                 .collect();
-            if !v3_tuples.is_empty() {
-                if let Err(e) = self.docstore.read().append_tuples_batch_concurrent(v3_tuples) {
-                    tracing::warn!("DocWriter V3 flush failed: {e}");
-                }
-            }
-
-            // Silo path: resolve each field to its silo index and emit
-            // DocOp::Set directly — no rmp encode needed since the silo
-            // ops log stores typed ops natively.
-            if self.doc_silo.is_some() {
-                let silo_ops: Vec<DocOp> = pending
-                    .into_iter()
-                    .filter_map(|(slot, field, pv)| {
-                        let silo_idx = self.resolve_silo_field(&field)?;
-                        Some(DocOp::Set { slot, field: silo_idx, value: pv })
-                    })
-                    .collect();
-                if !silo_ops.is_empty() {
-                    if let Err(e) = self
-                        .doc_silo
-                        .as_ref()
-                        .unwrap()
-                        .read()
-                        .apply_ops_batch(&silo_ops)
-                    {
-                        tracing::warn!("DocWriter silo set flush failed: {e}");
-                    }
+            if !silo_ops.is_empty() {
+                if let Err(e) = self.doc_silo.read().apply_ops_batch(&silo_ops) {
+                    tracing::warn!("DocWriter silo set flush failed: {e}");
                 }
             }
         }
 
-        // ── Append / Remove multi-int ops ─────────────────────────────
         if !self.pending_append.is_empty() || !self.pending_remove.is_empty() {
             let appends = std::mem::take(&mut self.pending_append);
             let removes = std::mem::take(&mut self.pending_remove);
-
-            // V3 path — resolve to V3 indices.
-            let v3_appends: Vec<(u32, u16, PackedValue)> = appends
-                .iter()
-                .filter_map(|(slot, field, pv)| {
-                    let idx = self.resolve_v3_field(field)?;
-                    Some((*slot, idx, pv.clone()))
-                })
-                .collect();
-            let v3_removes: Vec<(u32, u16, PackedValue)> = removes
-                .iter()
-                .filter_map(|(slot, field, pv)| {
-                    let idx = self.resolve_v3_field(field)?;
-                    Some((*slot, idx, pv.clone()))
-                })
-                .collect();
-            if !v3_appends.is_empty() || !v3_removes.is_empty() {
-                if let Err(e) = self
-                    .docstore
-                    .read()
-                    .append_multi_ops_batch_concurrent(v3_appends, v3_removes)
-                {
-                    tracing::warn!("DocWriter V3 multi-ops flush failed: {e}");
+            let mut silo_ops: Vec<DocOp> = Vec::with_capacity(appends.len() + removes.len());
+            for (slot, field, pv) in appends {
+                if let Some(idx) = self.resolve_field(&field) {
+                    silo_ops.push(DocOp::Append { slot, field: idx, value: pv });
                 }
             }
-
-            // Silo path — emit DocOp::Append / DocOp::Remove batch.
-            if self.doc_silo.is_some() {
-                let mut silo_ops: Vec<DocOp> =
-                    Vec::with_capacity(appends.len() + removes.len());
-                for (slot, field, pv) in appends {
-                    if let Some(idx) = self.resolve_silo_field(&field) {
-                        silo_ops.push(DocOp::Append { slot, field: idx, value: pv });
-                    }
+            for (slot, field, pv) in removes {
+                if let Some(idx) = self.resolve_field(&field) {
+                    silo_ops.push(DocOp::Remove { slot, field: idx, value: pv });
                 }
-                for (slot, field, pv) in removes {
-                    if let Some(idx) = self.resolve_silo_field(&field) {
-                        silo_ops.push(DocOp::Remove { slot, field: idx, value: pv });
-                    }
-                }
-                if !silo_ops.is_empty() {
-                    if let Err(e) = self
-                        .doc_silo
-                        .as_ref()
-                        .unwrap()
-                        .read()
-                        .apply_ops_batch(&silo_ops)
-                    {
-                        tracing::warn!("DocWriter silo multi-ops flush failed: {e}");
-                    }
+            }
+            if !silo_ops.is_empty() {
+                if let Err(e) = self.doc_silo.read().apply_ops_batch(&silo_ops) {
+                    tracing::warn!("DocWriter silo multi-ops flush failed: {e}");
                 }
             }
         }
     }
 
-    fn resolve_v3_field(&mut self, field: &str) -> Option<u16> {
+    fn resolve_field(&mut self, field: &str) -> Option<u16> {
         if let Some(&idx) = self.field_dict.get(field) {
             return Some(idx);
         }
-        match self.docstore.write().ensure_field_index(field) {
-            Ok(idx) => {
-                self.field_dict.insert(field.to_string(), idx);
-                Some(idx)
-            }
-            Err(e) => {
-                tracing::warn!("DocWriter: failed to ensure V3 field '{field}': {e}");
-                None
-            }
-        }
-    }
-
-    fn resolve_silo_field(&mut self, field: &str) -> Option<u16> {
-        if let Some(&idx) = self.silo_field_dict.get(field) {
-            return Some(idx);
-        }
-        let silo = self.doc_silo.as_ref()?;
-        let idx = silo.write().ensure_field_index(field);
-        self.silo_field_dict.insert(field.to_string(), idx);
+        let idx = self.doc_silo.write().ensure_field_index(field);
+        self.field_dict.insert(field.to_string(), idx);
         Some(idx)
     }
 }
@@ -311,7 +188,7 @@ fn qvalue_to_json(v: &QValue) -> JsonValue {
 /// are treated as deletions and their old bitmap bits are cleared.
 pub fn document_to_ops(
     new_doc: &crate::mutation::Document,
-    old_doc: Option<&crate::shard_store_doc::StoredDoc>,
+    old_doc: Option<&crate::doc_wire_format::StoredDoc>,
     config: &crate::config::Config,
     is_patch: bool,
 ) -> Vec<Op> {
@@ -1365,7 +1242,7 @@ pub fn process_wal_dump(
     // Create DocWriter so computed sort fields (sortAt = GREATEST) are written
     // to docstore during dump. Without this, only bitmaps get the computed value.
     // Dual-writes to DocSilo when present so the silo stays in sync with V3.
-    let mut doc_writer = DocWriter::new_dual(engine.docstore_arc(), engine.doc_silo());
+    let mut doc_writer = DocWriter::new(engine.doc_silo_arc());
     loop {
         let batch = match reader.read_batch(batch_size) {
             Ok(b) => b,
@@ -1866,8 +1743,8 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_doc_writer_write_set() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -1892,8 +1769,8 @@ mod tests {
     }
     #[test]
     fn test_doc_writer_write_add_remove() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -1949,8 +1826,8 @@ mod tests {
 
     #[test]
     fn test_doc_writer_batch_add_race() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -1988,8 +1865,8 @@ mod tests {
 
     #[test]
     fn test_doc_writer_batch_add_dedup() {
-        use crate::shard_store_doc::PackedValue;
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::PackedValue;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -2026,7 +1903,7 @@ mod tests {
     /// Validates the production ops pipeline docstore write path.
     #[test]
     fn test_docstore_v3_doc_writer_e2e_roundtrip() {
-        use crate::shard_store_doc::DocStoreV3;
+        use crate::doc_wire_format::DocStoreV3;
 
         let dir = tempfile::tempdir().unwrap();
         let docs_dir = dir.path().join("docs");
@@ -2236,7 +2113,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_json_to_packed_types() {
-        use crate::shard_store_doc::PackedValue;
+        use crate::doc_wire_format::PackedValue;
 
         assert_eq!(json_to_packed(&json!(42)), Some(PackedValue::I(42)));
         assert_eq!(json_to_packed(&json!(3.14)), Some(PackedValue::F(3.14)));
@@ -2275,7 +2152,7 @@ mod tests {
         // Old doc: nsfwLevel=8
         let mut old_fields = HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::doc_wire_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // New doc: nsfwLevel=16
         let mut new_fields = HashMap::new();
@@ -2295,7 +2172,7 @@ mod tests {
         let mut fields = HashMap::new();
         fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
 
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: fields.clone(), schema_version: 0 };
+        let old_doc = crate::doc_wire_format::StoredDoc { fields: fields.clone(), schema_version: 0 };
         let new_doc = Document { fields };
         let ops = document_to_ops(&new_doc, Some(&old_doc), &config, false);
         assert!(ops.is_empty(), "unchanged fields should produce no ops");
@@ -2308,7 +2185,7 @@ mod tests {
         // Old doc has nsfwLevel=8 AND reactionCount sort field
         let mut old_fields = HashMap::new();
         old_fields.insert("nsfwLevel".into(), FieldValue::Single(QValue::Integer(8)));
-        let old_doc = crate::shard_store_doc::StoredDoc { fields: old_fields, schema_version: 0 };
+        let old_doc = crate::doc_wire_format::StoredDoc { fields: old_fields, schema_version: 0 };
 
         // PATCH only sends userId=42 (nsfwLevel absent from patch)
         let mut new_fields = HashMap::new();
