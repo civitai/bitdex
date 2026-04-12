@@ -1266,24 +1266,25 @@ impl DocSiloBulkWriter {
         let _ = std::fs::remove_file(&layouts_path);
 
         // Sort by key, then dedup keeping the LAST write per slot. Duplicates
-        // happen when the dump parallel chunks split a slot's tag list across
-        // a boundary and `append_merge_payload` is called twice for the same
-        // slot — the second call is the fully merged frame we want to keep.
-        // Dedup keeps keys strictly unique so `HashIndex::build_bulk`'s
-        // sorted-dense fast path triggers and the build finishes in seconds
-        // instead of running the page-fault-storm fallback.
+        // indicate the dump source wrote the same PG ID twice (e.g. the
+        // legacy `images-small.csv` test fixture is a byte-doubled export).
+        // Real Civitai exports never produce duplicates, so this path must
+        // be a no-op in production; we warn loudly if it isn't so regression
+        // is caught early.
         let mut sorted = layouts;
         sorted.sort_unstable_by_key(|(k, _, _)| *k);
         let before_dedup = sorted.len();
         // dedup_by_key keeps the FIRST of each run; reverse → dedup → reverse
-        // keeps the last write per slot.
+        // keeps the LAST write per slot (the more recent payload wins).
         sorted.reverse();
         sorted.dedup_by_key(|(k, _, _)| *k);
         sorted.reverse();
         let dedup_removed = before_dedup - sorted.len();
         if dedup_removed > 0 {
             eprintln!(
-                "DocSiloBulkWriter::finalize: deduped {} duplicate slot writes ({} → {} layouts)",
+                "WARN: DocSiloBulkWriter::finalize deduped {} duplicate slot writes \
+                 ({} → {} layouts). This should be zero for a clean dump — non-zero \
+                 means the upstream CSV contains duplicate PG IDs.",
                 dedup_removed, before_dedup, sorted.len()
             );
         }

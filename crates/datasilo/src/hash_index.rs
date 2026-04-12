@@ -503,10 +503,6 @@ impl HashIndex {
         //
         // If the input is not sorted or has collisions we fall back to the
         // heap-buffer + linear-probe path below.
-        eprintln!("HashIndex::build_bulk: entering, count={}, capacity={}", count, capacity);
-        use std::io::Write as _IoWriteFlush;
-        let _ = std::io::stderr().flush();
-        let _t0 = std::time::Instant::now();
         let sorted_dense = !entries.is_empty()
             && entries.windows(2).all(|w| {
                 let a = w[0].0 % capacity;
@@ -516,10 +512,7 @@ impl HashIndex {
                     && a < b
             });
 
-        eprintln!("HashIndex::build_bulk: sorted_dense={} (check took {:.2}s)", sorted_dense, _t0.elapsed().as_secs_f64());
-        let _ = std::io::stderr().flush();
         if sorted_dense {
-            let _t1 = std::time::Instant::now();
             if path.exists() {
                 std::fs::remove_file(path)?;
             }
@@ -558,8 +551,6 @@ impl HashIndex {
             drop(w);
             file.sync_data()?;
             drop(file);
-            eprintln!("HashIndex::build_bulk: streaming write done in {:.2}s", _t1.elapsed().as_secs_f64());
-            let _ = std::io::stderr().flush();
 
             // Re-open + mmap the completed file for the returned HashIndex.
             let file = OpenOptions::new().read(true).write(true).open(path)?;
