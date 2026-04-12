@@ -536,6 +536,25 @@ impl OpCodec for SlotDocOpCodec {
 /// wire format without constructing a `SlotSnapshot` intermediate. Used
 /// by populate paths that read `Vec<(u16, PackedValue)>` straight from
 /// DocStoreV3 shards and want to avoid allocating StoredDoc HashMaps.
+/// Merge two encoded snapshot byte slices: decode both, combine fields
+/// (new overwrites existing by field_idx), re-encode. Used by DumpMergeWriter
+/// during multi-phase dumps and by the dump processor's DocWriteTarget::Merge path.
+pub fn merge_encoded_snapshots(existing: &[u8], new: &[u8]) -> Vec<u8> {
+    let existing_snap = SlotSnapshotCodec::decode(existing).unwrap_or_else(|_| SlotSnapshot::empty());
+    let new_snap = SlotSnapshotCodec::decode(new).unwrap_or_else(|_| SlotSnapshot::empty());
+    let mut merged: std::collections::HashMap<u16, PackedValue> = std::collections::HashMap::new();
+    for (idx, val) in &existing_snap.fields {
+        merged.insert(*idx, val.clone());
+    }
+    for (idx, val) in &new_snap.fields {
+        merged.insert(*idx, val.clone());
+    }
+    let fields: Vec<(u16, PackedValue)> = merged.into_iter().collect();
+    let mut buf = Vec::new();
+    encode_slot_bytes(true, &fields, &mut buf);
+    buf
+}
+
 pub fn encode_slot_bytes(alive: bool, fields: &[(u16, PackedValue)], out: &mut Vec<u8>) {
     out.clear();
     out.push(if alive { 1 } else { 0 });

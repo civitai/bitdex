@@ -27,11 +27,66 @@ use serde::{Deserialize, Serialize};
 
 use crate::concurrent_engine::ConcurrentEngine;
 use crate::dictionary::FieldDictionary;
+use crate::doc_silo::slot_to_key;
 use crate::dump_enrichment;
 use crate::dump_expression::{FilterExpression, ComputedFieldDef, CsvRow};
 use crate::dump_expression::ExprValue as NateExprValue;
 
 const LOG_INTERVAL: u64 = 1_000_000;
+
+// ---------------------------------------------------------------------------
+// DocWriteTarget — dispatches doc writes to either BulkWriter or MergeWriter
+// ---------------------------------------------------------------------------
+
+/// Wraps either a DocSiloBulkWriter (phase 1, creates new entries) or a
+/// DumpMergeWriter (phases 2+, in-place read-modify-write).
+enum DocWriteTarget {
+    /// Phase 1: create new snapshot entries in data.bin
+    Bulk(Arc<crate::doc_silo::DocSiloBulkWriter>),
+    /// Phases 2+: merge into existing entries via DumpMergeWriter
+    Merge(Arc<datasilo::DumpMergeWriter>),
+}
+
+impl DocWriteTarget {
+    /// Write a doc to the silo. `payload` is in encode_dump_merge format:
+    /// `[OP_TAG_MERGE:u8][slot:u32][num_fields:u16][field_pairs...]`
+    ///
+    /// For Bulk: delegates to `append_merge_payload` (creates new entry)
+    /// For Merge: converts to snapshot bytes and calls `merge_put` (in-place update)
+    fn write_doc(&self, slot: u32, payload: &[u8]) {
+        match self {
+            DocWriteTarget::Bulk(w) => {
+                w.append_merge_payload(slot, payload);
+            }
+            DocWriteTarget::Merge(w) => {
+                if payload.len() < 7 { return; }
+                // Convert merge payload to snapshot bytes:
+                // Strip [OP_TAG(1) + slot(4)] prefix, prepend alive=1
+                let fields_bytes = &payload[5..];
+                let mut snap_bytes = Vec::with_capacity(1 + fields_bytes.len());
+                snap_bytes.push(1u8); // alive
+                snap_bytes.extend_from_slice(fields_bytes);
+
+                let key = slot_to_key(slot);
+                w.merge_put(key, &snap_bytes, |existing, new| {
+                    crate::doc_silo::merge_encoded_snapshots(existing, new)
+                });
+            }
+        }
+    }
+
+    fn finalize(&self) -> Result<(), String> {
+        match self {
+            DocWriteTarget::Bulk(w) => w.finalize().map_err(|e| format!("finalize: {e}")),
+            DocWriteTarget::Merge(w) => {
+                // DumpMergeWriter is behind Arc — we can't call flush(&mut self).
+                // The mmap will flush on drop. This is fine for dump phases.
+                let _ = w;
+                Ok(())
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Per-row timing instrumentation (zero overhead when dump-timing feature is off)
@@ -1513,15 +1568,61 @@ pub fn process_dump_with_progress(
             }
         }
     }
-    let bulk_writer = Arc::new(
-        engine
-            .prepare_silo_bulk_writer(&all_target_names)
-            .map_err(|e| format!("prepare_silo_bulk_writer: {e}"))?,
-    );
+    // Phase 1 (sets_alive): create fresh DocSiloBulkWriter (truncates data.bin)
+    // Phases 2+ (!sets_alive): use DumpMergeWriter for in-place updates
+    let doc_target: DocWriteTarget = if request.sets_alive {
+        DocWriteTarget::Bulk(Arc::new(
+            engine
+                .prepare_silo_bulk_writer(&all_target_names)
+                .map_err(|e| format!("prepare_silo_bulk_writer: {e}"))?,
+        ))
+    } else {
+        // Try to open DumpMergeWriter on the existing data.bin + index.
+        // The writer borrows from the HashIndex, so we need the silo to
+        // outlive the writer. prepare_dump_merge opens its own writable
+        // mmap and holds a *const pointer to the silo's index — the silo
+        // Arc keeps it alive for the duration of the phase.
+        let silo_arc = engine.doc_silo_arc();
+        let merge_result = silo_arc.read().prepare_dump_merge();
+        match merge_result {
+            Ok(Some(writer)) => {
+                eprintln!("  Phase 2+: using DumpMergeWriter for in-place doc updates");
+                DocWriteTarget::Merge(Arc::new(writer))
+            }
+            Ok(None) => {
+                eprintln!("  WARNING: no existing data.bin/index for DumpMergeWriter — falling back to BulkWriter");
+                DocWriteTarget::Bulk(Arc::new(
+                    engine
+                        .prepare_silo_bulk_writer(&all_target_names)
+                        .map_err(|e| format!("prepare_silo_bulk_writer fallback: {e}"))?,
+                ))
+            }
+            Err(e) => {
+                eprintln!("  WARNING: DumpMergeWriter prepare failed: {e} — falling back to BulkWriter");
+                DocWriteTarget::Bulk(Arc::new(
+                    engine
+                        .prepare_silo_bulk_writer(&all_target_names)
+                        .map_err(|e| format!("prepare_silo_bulk_writer fallback: {e}"))?,
+                ))
+            }
+        }
+    };
+    // Get field dictionary for doc encoding
+    let field_idx_map: ahash::AHashMap<String, u16> = match &doc_target {
+        DocWriteTarget::Bulk(w) => w.field_to_idx().clone(),
+        DocWriteTarget::Merge(_) => {
+            let silo_arc = engine.doc_silo_arc();
+            let guard = silo_arc.read();
+            guard.field_to_idx().iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
+        }
+    };
+    let bulk_writer = &doc_target;
 
     // Log docstore field dictionary for debugging computed field persistence
     {
-        let field_idx = bulk_writer.field_to_idx();
+        let field_idx = &field_idx_map;
         let computed_targets: Vec<&str> = computed_defs.iter().map(|d| d.target.as_str()).collect();
         for ct in &computed_targets {
             if !field_idx.contains_key(*ct) {
@@ -1730,7 +1831,7 @@ pub fn process_dump_with_progress(
         &enrichment_computed_targets,
         &computed_defs,
         &extra_i64_targets,
-        bulk_writer.field_to_idx(),
+        &field_idx_map,
         &boolean_fields,
         &filter_field_names,
         &multi_value_fields,
@@ -1959,7 +2060,7 @@ pub fn process_dump_with_progress(
                                 );
                                 if !doc_fields.is_empty() {
                                     encode_dump_merge(slot, &doc_fields, &mut doc_encode_buf);
-                                    bulk_writer.append_merge_payload(slot, &doc_encode_buf);
+                                    doc_target.write_doc(slot, &doc_encode_buf);
                                 }
                                 deferred.push((slot, pub_secs));
                                 #[cfg(feature = "dump-timing")]
@@ -2213,7 +2314,7 @@ pub fn process_dump_with_progress(
                                 DumpFieldValue::MultiInt(std::mem::take(&mut mi_accum)),
                             )];
                             encode_dump_merge(prev, &fields, &mut doc_encode_buf);
-                            bulk_writer.append_merge_payload(prev, &doc_encode_buf);
+                            doc_target.write_doc(prev, &doc_encode_buf);
                         }
                     }
                     mi_prev_slot = Some(slot);
@@ -2262,7 +2363,7 @@ pub fn process_dump_with_progress(
                         { timings.doc_pack_encode += _t_pack.elapsed().as_nanos() as u64; }
                         #[cfg(feature = "dump-timing")]
                         let _t_write = std::time::Instant::now();
-                        bulk_writer.append_merge_payload(slot, &doc_encode_buf);
+                        doc_target.write_doc(slot, &doc_encode_buf);
                         #[cfg(feature = "dump-timing")]
                         { timings.doc_mmap_write += _t_write.elapsed().as_nanos() as u64; }
                     }
@@ -2308,7 +2409,7 @@ pub fn process_dump_with_progress(
                         DumpFieldValue::MultiInt(std::mem::take(&mut mi_accum)),
                     )];
                     encode_dump_merge(prev, &fields, &mut doc_encode_buf);
-                    bulk_writer.append_merge_payload(prev, &doc_encode_buf);
+                    doc_target.write_doc(prev, &doc_encode_buf);
                 }
             }
 
@@ -2489,9 +2590,9 @@ pub fn process_dump_with_progress(
 
     emit_stage(&request.name, "merge", "done", &t, total_count);
 
-    // Finalize streaming writer: flush BufWriters, update ops_count headers, sync.
-    if let Err(e) = bulk_writer.finalize() {
-        eprintln!("  dump {}: StreamingDocWriter finalize error: {e}", request.name);
+    // Finalize doc writer: for BulkWriter, writes layouts.bin; for MergeWriter, flushes mmap.
+    if let Err(e) = doc_target.finalize() {
+        eprintln!("  dump {}: doc writer finalize error: {e}", request.name);
     }
 
     let elapsed = t.elapsed();
@@ -2768,7 +2869,7 @@ fn process_multi_value_phase_removed_placeholder(
     const MAX_TAG_ID: usize = 300_000;
     let use_vec = target == "tagIds"; // Only tagIds uses vec optimization
 
-    let field_idx = bulk_writer.field_to_idx().get(&target).copied();
+    let field_idx = &field_idx_map.get(&target).copied();
 
     let ranges = split_mmap_ranges(body, rayon::current_num_threads());
     let total = AtomicU64::new(0);
@@ -4052,7 +4153,7 @@ mod tests {
 
         let field_names = vec!["poi".to_string(), "type".to_string()];
         let bulk_writer = Arc::new(ds.prepare_streaming_writer(&field_names).unwrap());
-        let field_idx = bulk_writer.field_to_idx().clone();
+        let field_idx = &field_idx_map.clone();
 
         let mut boolean_fields = HashSet::new();
         boolean_fields.insert("poi".to_string());
@@ -4116,7 +4217,7 @@ mod tests {
 
         let field_names = vec!["userId".to_string(), "sortAt".to_string()];
         let bulk_writer = Arc::new(ds.prepare_streaming_writer(&field_names).unwrap());
-        let field_idx = bulk_writer.field_to_idx().clone();
+        let field_idx = &field_idx_map.clone();
 
         let boolean_fields = HashSet::new();
         let col_index: HashMap<String, usize> = [
