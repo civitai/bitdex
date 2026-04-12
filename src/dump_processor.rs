@@ -1600,6 +1600,20 @@ pub fn process_dump_with_progress(
     // Phase 1 (sets_alive): create fresh DocSiloBulkWriter (truncates data.bin)
     // Phases 2+ (!sets_alive): use DumpMergeWriter for in-place updates
     let doc_target: DocWriteTarget = if request.sets_alive {
+        // Guard: reject sets_alive=true when the silo already has data from
+        // a prior Phase 1. This prevents pg-sync restart bugs from destroying
+        // existing image docs by re-running BulkWriter (which truncates data.bin).
+        {
+            let silo_data_bytes = engine.doc_silo_arc().read().data_bytes();
+            if silo_data_bytes > 0 {
+                return Err(format!(
+                    "Dump '{}' has sets_alive=true but DocSilo already has {} bytes of data. \
+                     A prior Phase 1 already ran. Refusing to truncate — this would destroy \
+                     existing documents. To force a fresh dump, clear the data dir first.",
+                    request.name, silo_data_bytes
+                ));
+            }
+        }
         // Estimate row count from CSV file size. Average Civitai image row
         // is ~120 bytes. Add 20% headroom for safety.
         let csv_file_size = std::fs::metadata(&request.csv_path)
