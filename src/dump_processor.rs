@@ -1645,15 +1645,27 @@ pub fn process_dump_with_progress(
             }
         }
     };
-    // Get field dictionary for doc encoding
+    // Get field dictionary for doc encoding.
+    // For Phase 2+ (Merge), register any new target fields (e.g. tagIds)
+    // in the silo's field dictionary BEFORE building the doc_field_plan.
+    // Phase 1 only writes image fields; Phase 2+ introduces tag/resource
+    // fields that must be added to the dictionary so field_to_idx lookups
+    // succeed and doc writes aren't silently skipped.
     let field_idx_map: ahash::AHashMap<String, u16> = match &doc_target {
         DocWriteTarget::Bulk(w) => w.field_to_idx().clone(),
         DocWriteTarget::Merge(_) => {
             let silo_arc = engine.doc_silo_arc();
-            let guard = silo_arc.read();
-            guard.field_to_idx().iter()
+            let mut guard = silo_arc.write();
+            // Register any target fields from this phase that aren't in the dict yet
+            for target in &all_target_names {
+                guard.ensure_field_index(target);
+            }
+            guard.save_field_dict().map_err(|e| format!("save_field_dict: {e}"))?;
+            let map = guard.field_to_idx().iter()
                 .map(|(k, v)| (k.clone(), *v))
-                .collect()
+                .collect();
+            drop(guard);
+            map
         }
     };
     let bulk_writer = &doc_target;
