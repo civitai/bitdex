@@ -1218,8 +1218,13 @@ impl BitdexServer {
                                     let meta = crate::ops_processor::FieldMeta::from_config(engine.config());
                                     let sender = engine.mutation_sender();
                                     let mut sink = crate::ingester::CoalescerSink::new(sender);
-                                    let mut doc_writer = crate::ops_processor::DocWriter::new(
+                                    // Dual-write to DocSilo when present so the silo stays
+                                    // coherent with V3 for the steady-state sync-v2 path. Reads
+                                    // prefer DocSilo whenever it's populated, so a V3-only write
+                                    // would be invisible after a bulk dump.
+                                    let mut doc_writer = crate::ops_processor::DocWriter::new_dual(
                                         engine.docstore_arc(),
+                                        engine.doc_silo(),
                                     );
 
                                     let mut entries = batch.entries;
