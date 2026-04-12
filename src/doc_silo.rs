@@ -835,6 +835,17 @@ impl DocSilo {
     pub fn path(&self) -> &Path {
         &self.root
     }
+
+    /// Create a DumpMergeWriter for in-place read-modify-write during dump
+    /// phases 2+. Returns None if no data/index exist (phase 1 hasn't run).
+    pub fn prepare_dump_merge(&self) -> std::io::Result<Option<datasilo::DumpMergeWriter>> {
+        self.silo.prepare_dump_merge()
+    }
+
+    /// Reload the data mmap after DumpMergeWriter writes complete.
+    pub fn reload_data(&mut self) -> std::io::Result<()> {
+        self.silo.reload_data()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,31 +1737,159 @@ mod tests {
     }
 
     // ── Multi-phase dump (DumpMergeWriter) ─────────────────────────
-    // These tests define the contract for phases 2+. They will fail
-    // until DumpMergeWriter is ported from v3.
 
-    /*
-    #[test]
-    fn multi_phase_images_then_tags() {
-        // Phase 1: DocSiloBulkWriter writes image docs (nsfwLevel, sortAt)
-        // Phase 1 finalize: builds index
-        // Phase 2: DumpMergeWriter merge_put adds tagIds to existing docs
-        // Verify: get returns doc with BOTH nsfwLevel AND tagIds
-        todo!("Port DumpMergeWriter from v3")
+    /// Merge two encoded snapshots: decode both, combine fields (new overwrites
+    /// existing by field_idx), re-encode. This is the merge function for
+    /// DumpMergeWriter during multi-phase dumps.
+    fn merge_encoded_snapshots(existing: &[u8], new: &[u8]) -> Vec<u8> {
+        use std::collections::HashMap;
+        let existing_snap = SlotSnapshotCodec::decode(existing).unwrap_or_else(|_| SlotSnapshot::empty());
+        let new_snap = SlotSnapshotCodec::decode(new).unwrap_or_else(|_| SlotSnapshot::empty());
+        // Build merged field map: existing fields + new fields (new wins on conflict)
+        let mut merged: HashMap<u16, PackedValue> = HashMap::new();
+        for (idx, val) in &existing_snap.fields {
+            merged.insert(*idx, val.clone());
+        }
+        for (idx, val) in &new_snap.fields {
+            merged.insert(*idx, val.clone());
+        }
+        let fields: Vec<(u16, PackedValue)> = merged.into_iter().collect();
+        let mut buf = Vec::new();
+        encode_slot_bytes(true, &fields, &mut buf);
+        buf
     }
 
     #[test]
-    fn multi_phase_preserves_all_fields() {
-        // 3 phases, each adds different fields
-        // Final doc has all fields from all phases
-        todo!("Port DumpMergeWriter from v3")
+    fn multi_phase_images_then_tags() {
+        use crate::doc_silo::slot_to_key;
+
+        let dir = tempfile::tempdir().unwrap();
+        let silo_path = dir.path();
+
+        // Phase 1: write image docs via put (simulating bulk load)
+        {
+            let mut silo = DocSilo::open(silo_path).unwrap();
+            silo.put(1, &make_doc(&[
+                ("nsfwLevel", FieldValue::Single(Value::Integer(8))),
+                ("sortAt", FieldValue::Single(Value::Integer(1000))),
+            ])).unwrap();
+            silo.put(2, &make_doc(&[
+                ("nsfwLevel", FieldValue::Single(Value::Integer(4))),
+                ("sortAt", FieldValue::Single(Value::Integer(2000))),
+            ])).unwrap();
+            silo.save_field_dict().unwrap();
+            // Compact so data is in data.bin (not just ops log)
+            silo.compact().unwrap();
+        }
+
+        // Phase 2: merge tags into existing docs via DumpMergeWriter
+        {
+            let mut silo = DocSilo::open(silo_path).unwrap();
+            let tag_idx = silo.ensure_field_index("tagIds");
+            silo.save_field_dict().unwrap();
+
+            let mut writer = silo.prepare_dump_merge().unwrap()
+                .expect("should have data after phase 1");
+
+            // Encode tag fields as snapshot bytes
+            let mut buf1 = Vec::new();
+            encode_slot_bytes(true, &[
+                (tag_idx, PackedValue::Mi(vec![10, 20, 30])),
+            ], &mut buf1);
+
+            let mut buf2 = Vec::new();
+            encode_slot_bytes(true, &[
+                (tag_idx, PackedValue::Mi(vec![40, 50])),
+            ], &mut buf2);
+
+            // merge_put: read existing doc, combine fields, write back
+            assert!(writer.merge_put(slot_to_key(1), &buf1, merge_encoded_snapshots));
+            assert!(writer.merge_put(slot_to_key(2), &buf2, merge_encoded_snapshots));
+
+            writer.flush().unwrap();
+            drop(writer);
+            silo.reload_data().unwrap();
+
+            // Verify: get returns doc with BOTH image fields AND tagIds
+            let d1 = silo.get(1).unwrap().unwrap();
+            assert_eq!(d1.fields.get("nsfwLevel"), Some(&FieldValue::Single(Value::Integer(8))));
+            assert_eq!(d1.fields.get("sortAt"), Some(&FieldValue::Single(Value::Integer(1000))));
+            match d1.fields.get("tagIds") {
+                Some(FieldValue::Multi(vs)) => {
+                    let ints: Vec<i64> = vs.iter().filter_map(|v| {
+                        if let Value::Integer(i) = v { Some(*i) } else { None }
+                    }).collect();
+                    assert!(ints.contains(&10) && ints.contains(&20) && ints.contains(&30),
+                        "expected tagIds [10,20,30], got {:?}", ints);
+                }
+                other => panic!("expected Multi tagIds, got {:?}", other),
+            }
+
+            let d2 = silo.get(2).unwrap().unwrap();
+            assert_eq!(d2.fields.get("nsfwLevel"), Some(&FieldValue::Single(Value::Integer(4))));
+            match d2.fields.get("tagIds") {
+                Some(FieldValue::Multi(vs)) => {
+                    let ints: Vec<i64> = vs.iter().filter_map(|v| {
+                        if let Value::Integer(i) = v { Some(*i) } else { None }
+                    }).collect();
+                    assert!(ints.contains(&40) && ints.contains(&50),
+                        "expected tagIds [40,50], got {:?}", ints);
+                }
+                other => panic!("expected Multi tagIds, got {:?}", other),
+            }
+        }
     }
 
     #[test]
     fn multi_phase_no_data_loss() {
-        // Phase 1: 1000 docs, Phase 2: merge into same 1000
-        // get_many returns 1000 docs, each with combined fields
-        todo!("Port DumpMergeWriter from v3")
+        use crate::doc_silo::slot_to_key;
+
+        let dir = tempfile::tempdir().unwrap();
+        let silo_path = dir.path();
+
+        // Phase 1: write 100 docs
+        {
+            let mut silo = DocSilo::open(silo_path).unwrap();
+            for i in 0..100u32 {
+                silo.put(i, &make_doc(&[
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(i as i64))),
+                ])).unwrap();
+            }
+            silo.save_field_dict().unwrap();
+            silo.compact().unwrap();
+        }
+
+        // Phase 2: merge extra field into all 100
+        {
+            let mut silo = DocSilo::open(silo_path).unwrap();
+            let extra_idx = silo.ensure_field_index("extra");
+            silo.save_field_dict().unwrap();
+
+            let mut writer = silo.prepare_dump_merge().unwrap().unwrap();
+            for i in 0..100u32 {
+                let mut buf = Vec::new();
+                encode_slot_bytes(true, &[
+                    (extra_idx, PackedValue::I(i as i64 * 100)),
+                ], &mut buf);
+                assert!(writer.merge_put(slot_to_key(i), &buf, merge_encoded_snapshots),
+                    "merge_put failed for slot {i}");
+            }
+            writer.flush().unwrap();
+            drop(writer);
+            silo.reload_data().unwrap();
+
+            // Verify: all 100 docs have BOTH nsfwLevel AND extra
+            let keys: Vec<u32> = (0..100).collect();
+            let results = silo.get_many(&keys).unwrap();
+            for (i, opt) in results.iter().enumerate() {
+                let doc = opt.as_ref().unwrap_or_else(|| panic!("doc {i} missing"));
+                assert_eq!(doc.fields.get("nsfwLevel"),
+                    Some(&FieldValue::Single(Value::Integer(i as i64))),
+                    "doc {i} nsfwLevel wrong");
+                assert_eq!(doc.fields.get("extra"),
+                    Some(&FieldValue::Single(Value::Integer(i as i64 * 100))),
+                    "doc {i} extra wrong");
+            }
+        }
     }
-    */
 }
