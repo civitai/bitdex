@@ -5357,6 +5357,7 @@ async fn handle_list_dumps(
     Json(serde_json::json!({
         "dumps": dumps,
         "all_complete": reg.all_complete(),
+        "phases_registered": reg.count(),
     }))
 }
 

@@ -168,6 +168,11 @@ impl DumpRegistry {
         !self.dumps.is_empty()
             && self.dumps.values().all(|e| e.status == DumpStatus::Complete)
     }
+
+    /// Number of registered dump phases.
+    pub fn count(&self) -> usize {
+        self.dumps.len()
+    }
 }
 
 /// Build the dump name from a table name and config hash.

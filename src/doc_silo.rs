@@ -868,7 +868,10 @@ use std::io::Write;
 /// is truncated to the actual used bytes at finalize. Growth-on-overflow
 /// is a fallback if the estimate is too low.
 const INITIAL_BYTES_PER_DOC: usize = 256;
-const SLACK_RATIO: f64 = 1.5;
+/// Ratio of data.bin capacity to estimated data size. 1.1 = 10% slack.
+/// Previously 1.5, reduced to fit within 32 GiB pod limit at 107M records.
+/// At 107M × ~200 bytes/doc, 1.5 = ~31 GB sparse vs 1.1 = ~23 GB.
+const SLACK_RATIO: f64 = 1.1;
 
 struct BulkState {
     /// Keeps the writable mmap alive. Only touched during `new`, `grow`,
