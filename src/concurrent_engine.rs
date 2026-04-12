@@ -1191,6 +1191,13 @@ impl ConcurrentEngine {
             let inner = Arc::clone(&inner);
             let shutdown = Arc::clone(&shutdown);
             let docstore = Arc::clone(&docstore);
+            // Clone the DocSilo handle so the flush thread can mirror doc
+            // writes into the silo. Steady-state writes from /documents
+            // endpoints arrive on the doc_tx channel, and the silo-preferring
+            // read path would miss any slot the flush thread only wrote to
+            // V3 after a silo-only bulk dump.
+            let flush_doc_silo: Option<Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>>> =
+                doc_silo.as_ref().map(Arc::clone);
             let flush_interval_us = config.flush_interval_us;
             let flush_unified_cache = Arc::clone(&unified_cache);
             let flush_loading_mode = Arc::clone(&loading_mode);
@@ -2470,6 +2477,20 @@ impl ConcurrentEngine {
                                 );
                             }
                         }
+                        // Mirror into DocSilo so reads via the silo-preferring
+                        // path see the update. Without this, any /documents
+                        // endpoint write after a silo-only bulk dump would be
+                        // invisible to queries. Silo write path uses its own
+                        // field dictionary which may not match V3's — the
+                        // silo::put_batch auto-registers new fields.
+                        if let Some(ref silo) = flush_doc_silo {
+                            if let Err(e) = silo.write().put_batch(&doc_batch) {
+                                eprintln!(
+                                    "WARNING: doc_silo put_batch failed ({} docs): {e}",
+                                    doc_batch.len()
+                                );
+                            }
+                        }
                     }
                     if bitmap_count > 0 || doc_count > 0 || lazy_loaded {
                         current_sleep = min_sleep;
@@ -2500,6 +2521,17 @@ impl ConcurrentEngine {
                 if !doc_batch.is_empty() {
                     if let Err(e) = docstore.write().put_batch(&doc_batch) {
                         panic!("docstore final batch write failed: {e}");
+                    }
+                    // Final-drain silo mirror. Best-effort — we prefer to
+                    // flush V3 successfully over panicking if the silo
+                    // write hiccups on shutdown.
+                    if let Some(ref silo) = flush_doc_silo {
+                        if let Err(e) = silo.write().put_batch(&doc_batch) {
+                            eprintln!(
+                                "WARNING: doc_silo final drain put_batch failed ({} docs): {e}",
+                                doc_batch.len()
+                            );
+                        }
                     }
                 }
             })
@@ -6460,16 +6492,43 @@ impl ConcurrentEngine {
             return (0, 0, skipped);
         }
 
-        // Bypass the cache — we want the fresh on-disk bytes. Single
-        // get_many call amortizes shard reads across all touched slots
-        // (parallel path when unique_shards > 4).
-        let fresh = match self.docstore.read().get_many(&to_refresh) {
-            Ok((docs, _, _)) => docs,
-            Err(e) => {
-                tracing::warn!("doc_cache_refresh_slots get_many failed: {e}");
-                return (0, 0, skipped);
-            }
-        };
+        // Bypass the cache — we want the fresh on-disk bytes. Prefer the
+        // DocSilo mmap path when populated (every read is a hash probe +
+        // slice, no shard file opens), fall back to DocStoreV3 get_many
+        // when the silo is empty (pre-populate window). After a
+        // DocSilo-only bulk dump V3 is empty for dumped slots, so the
+        // old direct-V3 path would return None and cause cache deletions
+        // for live docs — the silo branch fixes that.
+        let fresh: Vec<Option<crate::shard_store_doc::StoredDoc>> =
+            if let Some(ref silo_handle) = self.doc_silo {
+                let silo = silo_handle.read();
+                if silo.index_count() > 0 {
+                    match silo.get_many(&to_refresh) {
+                        Ok(docs) => docs,
+                        Err(e) => {
+                            tracing::warn!("doc_cache_refresh_slots silo get_many failed: {e}");
+                            return (0, 0, skipped);
+                        }
+                    }
+                } else {
+                    drop(silo);
+                    match self.docstore.read().get_many(&to_refresh) {
+                        Ok((docs, _, _)) => docs,
+                        Err(e) => {
+                            tracing::warn!("doc_cache_refresh_slots V3 get_many failed: {e}");
+                            return (0, 0, skipped);
+                        }
+                    }
+                }
+            } else {
+                match self.docstore.read().get_many(&to_refresh) {
+                    Ok((docs, _, _)) => docs,
+                    Err(e) => {
+                        tracing::warn!("doc_cache_refresh_slots V3 get_many failed: {e}");
+                        return (0, 0, skipped);
+                    }
+                }
+            };
 
         let mut refreshed: u64 = 0;
         let mut deleted: u64 = 0;
@@ -7584,12 +7643,15 @@ impl ConcurrentEngine {
                     })
                     .collect()
             };
-            // Phase 3: Batch docstore reads for upserts (outside any lock)
+            // Phase 3: Batch doc reads for upserts (outside any lock). Uses
+            // the silo-preferring `get_document` path — after a DocSilo-only
+            // bulk dump, V3 is empty so a direct V3 read would return None
+            // and silently skip every upsert's diff logic.
             let old_docs: Vec<Option<crate::shard_store_doc::StoredDoc>> = statuses
                 .iter()
                 .map(|&(id, is_upsert, was_allocated)| {
                     if is_upsert || was_allocated {
-                        self.docstore.read().get(id).ok().flatten()
+                        self.get_document(id).ok().flatten()
                     } else {
                         None
                     }
