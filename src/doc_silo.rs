@@ -889,14 +889,25 @@ struct BulkState {
 /// single-threaded and needs no synchronization. The cursor-lease pattern
 /// batches global `fetch_add` calls, trading a few KB of trailing slack
 /// per thread for ~8000x fewer atomic ops.
+/// Max layouts to hold in memory per thread before spilling to disk.
+/// 64K entries × 24 bytes = 1.5 MB per thread, ~48 MB total at 32 threads.
+/// Previously unlimited, which meant 220M entries × 24 bytes = 5.3 GB at 107M.
+const LAYOUT_SPILL_THRESHOLD: usize = 64 * 1024;
+
 #[repr(align(64))] // cache-line pad to avoid false sharing between workers
 struct ThreadSlot {
     /// Next free byte within the current lease region.
     lease_cur: u64,
     /// End of the current lease region (exclusive).
     lease_end: u64,
-    /// Layouts accumulated by this thread; drained at finalize.
+    /// In-memory layout buffer; spilled to `layout_file` when full.
     layouts: Vec<(u64, u64, u32)>,
+    /// Spill file for layouts that exceed the in-memory threshold.
+    layout_file: Option<std::io::BufWriter<std::fs::File>>,
+    /// Path to the spill file (for reading back at finalize).
+    layout_path: Option<PathBuf>,
+    /// Total entries spilled to disk.
+    spilled_count: u64,
 }
 
 impl ThreadSlot {
@@ -904,7 +915,45 @@ impl ThreadSlot {
         Self {
             lease_cur: 0,
             lease_end: 0,
-            layouts: Vec::with_capacity(16 * 1024),
+            layouts: Vec::with_capacity(LAYOUT_SPILL_THRESHOLD),
+            layout_file: None,
+            layout_path: None,
+            spilled_count: 0,
+        }
+    }
+
+    /// Spill in-memory layouts to a temp file when the buffer is full.
+    fn maybe_spill(&mut self, silo_root: &Path) {
+        if self.layouts.len() < LAYOUT_SPILL_THRESHOLD {
+            return;
+        }
+        use std::io::Write;
+        // Lazy-init the spill file
+        if self.layout_file.is_none() {
+            let spill_dir = silo_root.join("silo");
+            let _ = std::fs::create_dir_all(&spill_dir);
+            let tid = std::thread::current().id();
+            let path = spill_dir.join(format!("layouts_spill_{:?}.tmp", tid));
+            match std::fs::File::create(&path) {
+                Ok(f) => {
+                    self.layout_file = Some(std::io::BufWriter::with_capacity(256 * 1024, f));
+                    self.layout_path = Some(path);
+                }
+                Err(e) => {
+                    eprintln!("WARNING: layout spill file create failed: {e} — keeping in memory");
+                    return;
+                }
+            }
+        }
+        // Write all buffered layouts to disk
+        if let Some(ref mut writer) = self.layout_file {
+            for &(key, offset, length) in &self.layouts {
+                let _ = writer.write_all(&key.to_le_bytes());
+                let _ = writer.write_all(&offset.to_le_bytes());
+                let _ = writer.write_all(&length.to_le_bytes());
+            }
+            self.spilled_count += self.layouts.len() as u64;
+            self.layouts.clear();
         }
     }
 }
@@ -1074,6 +1123,7 @@ impl DocSiloBulkWriter {
         let length = (1 + fields_bytes.len()) as u32;
         let length_u64 = length as u64;
 
+        let silo_root = &self.silo_root;
         self.with_thread_slot(|ts| {
             let Some(offset) = self.reserve(ts, length_u64) else { return };
             unsafe {
@@ -1087,6 +1137,7 @@ impl DocSiloBulkWriter {
                 );
             }
             ts.layouts.push((key, offset, length));
+            ts.maybe_spill(silo_root);
         });
         self.appended_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1132,6 +1183,7 @@ impl DocSiloBulkWriter {
         let length = write_buf.len() as u32;
         let length_u64 = length as u64;
 
+        let silo_root = &self.silo_root;
         self.with_thread_slot(|ts| {
             let Some(offset) = self.reserve(ts, length_u64) else { return };
             unsafe {
@@ -1140,6 +1192,7 @@ impl DocSiloBulkWriter {
                 std::ptr::copy_nonoverlapping(write_buf.as_ptr(), dst, write_buf.len());
             }
             ts.layouts.push((key, offset, length));
+            ts.maybe_spill(silo_root);
         });
         self.appended_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1210,19 +1263,88 @@ impl DocSiloBulkWriter {
             ));
         }
 
-        // Drain every per-rayon-worker layouts slab into one combined Vec.
-        // Safety: finalize is only called after all rayon workers have
-        // completed their appends, so we hold the only live reference to
-        // each slot.
+        // Drain every per-rayon-worker layouts: flush remaining in-memory
+        // entries to spill files, then read all spill files back into one Vec.
+        // This keeps peak memory at ~48 MB (32 threads × 1.5 MB) instead of
+        // 5.3 GB (220M entries × 24 bytes).
+        use std::io::{Read as IoRead, Write as IoWrite2};
+        let mut spill_paths: Vec<PathBuf> = Vec::new();
+        for cell in &self.thread_slots.slots {
+            let slab = unsafe { &mut *cell.get() };
+            // Flush remaining in-memory layouts to spill file
+            if !slab.layouts.is_empty() {
+                slab.maybe_spill(&self.silo_root);
+                // If there are still entries (below threshold), force-spill them
+                if !slab.layouts.is_empty() && slab.layout_file.is_some() {
+                    if let Some(ref mut writer) = slab.layout_file {
+                        for &(key, offset, length) in &slab.layouts {
+                            let _ = writer.write_all(&key.to_le_bytes());
+                            let _ = writer.write_all(&offset.to_le_bytes());
+                            let _ = writer.write_all(&length.to_le_bytes());
+                        }
+                        slab.spilled_count += slab.layouts.len() as u64;
+                        slab.layouts.clear();
+                    }
+                }
+            }
+            // Flush the BufWriter
+            if let Some(ref mut writer) = slab.layout_file {
+                let _ = writer.flush();
+            }
+            slab.layout_file = None; // close file handle
+            if let Some(path) = slab.layout_path.take() {
+                spill_paths.push(path);
+            }
+        }
+        {
+            let mut fallback = self.thread_slots.fallback.lock();
+            if !fallback.layouts.is_empty() {
+                fallback.maybe_spill(&self.silo_root);
+            }
+            // Drain remaining layouts into a temp vec to avoid borrow conflict
+            let remaining: Vec<(u64, u64, u32)> = std::mem::take(&mut fallback.layouts);
+            if !remaining.is_empty() {
+                if let Some(ref mut writer) = fallback.layout_file {
+                    for &(key, offset, length) in &remaining {
+                        let _ = writer.write_all(&key.to_le_bytes());
+                        let _ = writer.write_all(&offset.to_le_bytes());
+                        let _ = writer.write_all(&length.to_le_bytes());
+                    }
+                    let _ = writer.flush();
+                }
+            }
+            fallback.layout_file = None;
+            if let Some(path) = fallback.layout_path.take() {
+                spill_paths.push(path);
+            }
+        }
+
+        // Read all spill files back into one combined Vec
         let mut layouts: Vec<(u64, u64, u32)> = Vec::with_capacity(appended as usize);
+        for path in &spill_paths {
+            if let Ok(data) = std::fs::read(path) {
+                let entry_size = 24; // u64 + u64 + u32 = 20, but we wrote 24 (3 × 8)
+                let mut pos = 0;
+                while pos + entry_size <= data.len() {
+                    let key = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
+                    let offset = u64::from_le_bytes(data[pos+8..pos+16].try_into().unwrap());
+                    let length = u32::from_le_bytes(data[pos+16..pos+20].try_into().unwrap());
+                    layouts.push((key, offset, length));
+                    pos += 20; // 8 + 8 + 4
+                }
+            }
+            let _ = std::fs::remove_file(path);
+        }
+        // Also collect any remaining in-memory layouts from threads that
+        // never hit the spill threshold (small dumps / tests)
         for cell in &self.thread_slots.slots {
             let slab = unsafe { &mut *cell.get() };
             layouts.append(&mut slab.layouts);
         }
-        {
-            let mut fallback = self.thread_slots.fallback.lock();
-            layouts.append(&mut fallback.layouts);
-        }
+        eprintln!(
+            "DocSiloBulkWriter::finalize: read {} layouts from {} spill files",
+            layouts.len(), spill_paths.len()
+        );
 
         // Flush the mmap, then release it before touching the file.
         let state = self.state.lock();
