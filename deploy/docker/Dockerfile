@@ -8,7 +8,7 @@ WORKDIR /build
 COPY . .
 
 # Remove dev-only scratch workspace member (not included via .dockerignore)
-RUN sed -i 's/members = \[".", "scratch"\]/members = ["."]/' Cargo.toml
+RUN sed -i 's/, "scratch"//' Cargo.toml
 
 # Build for the native CPU architecture of the build host.
 # Override at build time: docker build --build-arg TARGET_CPU=znver5 ...
