@@ -1462,28 +1462,19 @@ impl DocSiloBulkWriter {
         // during the synchronous flush.
         drop(self.state.lock()); // drops mmap + File — both now closed.
 
-        // Reopen the file by path so we can optionally truncate to the
-        // actual used bytes. On Windows the truncate can fail if anything
-        // else is still holding a mapping (e.g. DataSilo::open has
-        // already mmap'd it for reads). That's harmless — data.bin is
-        // still valid at any size ≥ final_len because the trailing bytes
-        // are zeros that no index entry points at.
-        let silo_subdir = self.silo_root.join("silo");
-        let data_path = silo_subdir.join("data.bin");
-        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&data_path) {
-            match file.set_len(final_len) {
-                Ok(()) => {
-                    let _ = file.sync_data();
-                }
-                Err(e) => {
-                    eprintln!(
-                        "DocSiloBulkWriter::finalize: truncate to {} skipped ({}); \
-                         data.bin stays at pre-allocated size. Trailing zeros are safe.",
-                        final_len, e
-                    );
-                }
-            }
-        }
+        // Do NOT truncate data.bin. The DataSilo (used by WAL reader for
+        // concurrent real-time ops) holds a read-only mmap covering the full
+        // pre-allocated file. Truncating shrinks the file below the mmap's
+        // extent → SIGBUS on Linux when the concurrent mmap accesses pages
+        // beyond the new EOF. On Windows, set_len fails safely; on Linux it
+        // succeeds and silently invalidates the concurrent mmap.
+        //
+        // The trailing zeros cost nothing: the file is sparse (zeros not
+        // allocated on disk), and no index entry points past final_len.
+        eprintln!(
+            "DocSiloBulkWriter::finalize: data.bin cursor={} (pre-allocated size retained, trailing zeros are sparse)",
+            final_len
+        );
 
         // Write layouts to a `layouts.bin` sidecar and defer the hash index
         // build to `DocSilo::open` time. Building the index inline here runs
