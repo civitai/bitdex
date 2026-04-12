@@ -492,23 +492,90 @@ impl HashIndex {
         }
         let file_size = Self::file_size_for(capacity);
 
-        // Build the whole hash table in a heap buffer, then write it to disk
-        // with a single `write_all` call. Writing directly to an mmap'd file
-        // triggers per-page disk allocation on NTFS and turns the hot loop
-        // into a page-fault storm; a plain heap Vec is backed by the Windows
-        // pagefile (cheap commits) and serialised via one large file write.
+        // Fast path — stream the hash table directly to disk via BufWriter
+        // if the input is already sorted by `key % capacity` with no
+        // collisions. This is the common case for the `DocSilo` bulk build
+        // (dense slot keys 1..N with capacity 2N means slot = key, strictly
+        // increasing). It avoids allocating a multi-hundred-MB scratch
+        // buffer entirely, which dodges a Windows memory-manager pathology
+        // where jemalloc's lazy page commits turn the probe loop into a
+        // multi-minute page-fault storm.
         //
-        // Callers building tables with dense keys should pre-sort by key to
-        // keep probe writes sequential across the buffer's pages.
-        let mut buf = vec![0u8; file_size];
+        // If the input is not sorted or has collisions we fall back to the
+        // heap-buffer + linear-probe path below.
+        eprintln!("HashIndex::build_bulk: entering, count={}, capacity={}", count, capacity);
+        use std::io::Write as _IoWriteFlush;
+        let _ = std::io::stderr().flush();
+        let _t0 = std::time::Instant::now();
+        let sorted_dense = !entries.is_empty()
+            && entries.windows(2).all(|w| {
+                let a = w[0].0 % capacity;
+                let b = w[1].0 % capacity;
+                w[0].0 != KEY_EMPTY && w[0].0 != KEY_TOMBSTONE
+                    && w[1].0 != KEY_EMPTY && w[1].0 != KEY_TOMBSTONE
+                    && a < b
+            });
 
-        // Write header into the heap buffer.
+        eprintln!("HashIndex::build_bulk: sorted_dense={} (check took {:.2}s)", sorted_dense, _t0.elapsed().as_secs_f64());
+        let _ = std::io::stderr().flush();
+        if sorted_dense {
+            let _t1 = std::time::Instant::now();
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+            let file = OpenOptions::new()
+                .read(true).write(true).create_new(true).open(path)?;
+            file.set_len(file_size as u64)?;
+
+            // Stream the file sequentially: header, then for each slot
+            // either the entry (if its `key % capacity` matches this slot)
+            // or 24 zero bytes. BufWriter keeps this at ~16 KB syscalls.
+            use std::io::{BufWriter, Write};
+            let mut w = BufWriter::with_capacity(64 * 1024, &file);
+
+            // Header
+            w.write_all(&MAGIC.to_le_bytes())?;
+            w.write_all(&capacity.to_le_bytes())?;
+            w.write_all(&count.to_le_bytes())?;
+            w.write_all(&count.to_le_bytes())?; // occupied
+
+            // Body — walk slots 0..capacity in order
+            let zero_entry = [0u8; ENTRY_SIZE];
+            let mut next = 0usize; // index into `entries`
+            for slot in 0..capacity {
+                if next < entries.len() && (entries[next].0 % capacity) == slot {
+                    let (key, ref ie) = entries[next];
+                    w.write_all(&key.to_le_bytes())?;
+                    w.write_all(&ie.offset.to_le_bytes())?;
+                    w.write_all(&ie.length.to_le_bytes())?;
+                    w.write_all(&ie.allocated.to_le_bytes())?;
+                    next += 1;
+                } else {
+                    w.write_all(&zero_entry)?;
+                }
+            }
+            w.flush()?;
+            drop(w);
+            file.sync_data()?;
+            drop(file);
+            eprintln!("HashIndex::build_bulk: streaming write done in {:.2}s", _t1.elapsed().as_secs_f64());
+            let _ = std::io::stderr().flush();
+
+            // Re-open + mmap the completed file for the returned HashIndex.
+            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
+            return Ok(Self { mmap, capacity, count, occupied: count });
+        }
+
+        // Fallback path for unsorted / colliding input: heap buffer + probe.
+        // Small builds take the perf hit; bulk builds should always pre-sort
+        // to get onto the fast path above.
+        let mut buf = vec![0u8; file_size];
         buf[0..8].copy_from_slice(&MAGIC.to_le_bytes());
         buf[8..16].copy_from_slice(&capacity.to_le_bytes());
         buf[16..24].copy_from_slice(&count.to_le_bytes());
-        buf[24..32].copy_from_slice(&count.to_le_bytes()); // occupied = count
+        buf[24..32].copy_from_slice(&count.to_le_bytes());
 
-        // Insert entries via linear probing.
         for &(key, ref entry) in entries {
             if key == KEY_EMPTY || key == KEY_TOMBSTONE {
                 continue;
@@ -538,7 +605,6 @@ impl HashIndex {
         file.sync_data()?;
         drop(buf);
 
-        // Re-mmap the completed file for the returned HashIndex.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
         Ok(Self { mmap, capacity, count, occupied: count })

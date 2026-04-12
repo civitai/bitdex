@@ -1244,30 +1244,72 @@ impl DocSiloBulkWriter {
             }
         }
 
-        // Build the hash index from layouts. Sort by key first so the
-        // HashIndex probe writes hit the heap buffer in linear offset order;
-        // a random insertion order touches ~14M pages non-sequentially on
-        // Windows and turns a fast build into a minutes-long page-fault
-        // storm.
+        // Write layouts to a `layouts.bin` sidecar and defer the hash index
+        // build to `DocSilo::open` time. Building the index inline here runs
+        // into a Windows memory-manager pathology where the 5.4 GB sparse
+        // `data.bin` mmap we just released interacts with the subsequent
+        // 670 MB `build_bulk` heap buffer and the probe loop slows from
+        // nanoseconds to hundreds of microseconds per entry. By the time
+        // the server cold-starts and calls `DocSilo::open`, the dump
+        // mmap is long gone and `build_bulk` runs in normal time.
+        //
+        // layouts.bin wire format (matches `DocSilo::load_index` loader):
+        //     [count:u64]
+        //     [ (key:u64, offset:u64, length:u32, allocated:u32) × count ]
+        // All little-endian, 24 bytes per entry. Sorted by key so that the
+        // subsequent `HashIndex::build_bulk` writes hit its heap buffer
+        // pages sequentially.
         let silo_subdir = self.silo_root.join("silo");
         let index_path = silo_subdir.join("index.bin");
+        let layouts_path = silo_subdir.join("layouts.bin");
         let _ = std::fs::remove_file(&index_path);
-        let mut entries: Vec<(u64, datasilo::IndexEntry)> = layouts
-            .into_iter()
-            .map(|(k, o, l)| {
-                (
-                    k,
-                    datasilo::IndexEntry {
-                        offset: o,
-                        length: l,
-                        allocated: l, // tight packing
-                    },
-                )
-            })
-            .collect();
-        entries.sort_unstable_by_key(|(k, _)| *k);
-        datasilo::HashIndex::build_bulk(&index_path, &entries)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build_bulk: {e}")))?;
+        let _ = std::fs::remove_file(&layouts_path);
+
+        // Sort by key, then dedup keeping the LAST write per slot. Duplicates
+        // happen when the dump parallel chunks split a slot's tag list across
+        // a boundary and `append_merge_payload` is called twice for the same
+        // slot — the second call is the fully merged frame we want to keep.
+        // Dedup keeps keys strictly unique so `HashIndex::build_bulk`'s
+        // sorted-dense fast path triggers and the build finishes in seconds
+        // instead of running the page-fault-storm fallback.
+        let mut sorted = layouts;
+        sorted.sort_unstable_by_key(|(k, _, _)| *k);
+        let before_dedup = sorted.len();
+        // dedup_by_key keeps the FIRST of each run; reverse → dedup → reverse
+        // keeps the last write per slot.
+        sorted.reverse();
+        sorted.dedup_by_key(|(k, _, _)| *k);
+        sorted.reverse();
+        let dedup_removed = before_dedup - sorted.len();
+        if dedup_removed > 0 {
+            eprintln!(
+                "DocSiloBulkWriter::finalize: deduped {} duplicate slot writes ({} → {} layouts)",
+                dedup_removed, before_dedup, sorted.len()
+            );
+        }
+
+        use std::io::Write as _IoWrite;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&layouts_path)?;
+        let count_u64 = sorted.len() as u64;
+        file.write_all(&count_u64.to_le_bytes())?;
+        // Write in ~1 MB chunks to avoid a single 300+ MB allocation.
+        const CHUNK_ENTRIES: usize = 1 << 15; // 32768 × 24 B ≈ 768 KB
+        let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_ENTRIES * 24);
+        for chunk in sorted.chunks(CHUNK_ENTRIES) {
+            buf.clear();
+            for &(key, offset, length) in chunk {
+                buf.extend_from_slice(&key.to_le_bytes());
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(&length.to_le_bytes());
+                buf.extend_from_slice(&length.to_le_bytes()); // allocated == length, tight packing
+            }
+            file.write_all(&buf)?;
+        }
+        file.sync_data()?;
+        drop(file);
 
         // Persist the field dictionary.
         let dict_path = self.silo_root.join("field_dict.json");
@@ -1276,8 +1318,8 @@ impl DocSiloBulkWriter {
         std::fs::write(&dict_path, json)?;
 
         eprintln!(
-            "DocSiloBulkWriter::finalize: {} entries, data.bin {} bytes",
-            entries.len(),
+            "DocSiloBulkWriter::finalize: {} entries, data.bin {} bytes (index deferred to open via layouts.bin)",
+            sorted.len(),
             final_len
         );
         Ok(())

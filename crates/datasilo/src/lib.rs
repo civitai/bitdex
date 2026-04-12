@@ -163,6 +163,42 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
 
     fn load_index(&mut self) -> io::Result<()> {
         let index_path = self.path.join("index.bin");
+        let layouts_path = self.path.join("layouts.bin");
+
+        // Lazy-build fallback: if `layouts.bin` is present we were asked to
+        // build the hash index at open time (the bulk writer deferred it).
+        // `layouts.bin` wire format:
+        //     [count:u64][ (key:u64, offset:u64, length:u32, allocated:u32) × count ]
+        // All little-endian, tightly packed (24 bytes per entry).
+        if !index_path.exists() && layouts_path.exists() {
+            use std::io::Read;
+            let mut file = std::fs::File::open(&layouts_path)?;
+            let mut count_buf = [0u8; 8];
+            file.read_exact(&mut count_buf)?;
+            let count = u64::from_le_bytes(count_buf) as usize;
+            let mut raw = vec![0u8; count * 24];
+            file.read_exact(&mut raw)?;
+            let mut entries: Vec<(u64, IndexEntry)> = Vec::with_capacity(count);
+            for i in 0..count {
+                let b = &raw[i * 24..(i + 1) * 24];
+                let key = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
+                let length = u32::from_le_bytes(b[16..20].try_into().unwrap());
+                let allocated = u32::from_le_bytes(b[20..24].try_into().unwrap());
+                entries.push((key, IndexEntry { offset, length, allocated }));
+            }
+            drop(raw);
+            let idx = HashIndex::build_bulk(&index_path, &entries)
+                .map_err(|e| io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("lazy build hash index from layouts.bin: {e}"),
+                ))?;
+            self.index = Some(idx);
+            // Drop the sidecar now that index.bin is persisted.
+            let _ = std::fs::remove_file(&layouts_path);
+            return Ok(());
+        }
+
         if !index_path.exists() {
             return Ok(());
         }
