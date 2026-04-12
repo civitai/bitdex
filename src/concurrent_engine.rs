@@ -263,6 +263,10 @@ pub struct ConcurrentEngine {
     sort_store: Option<Arc<crate::shard_store_bitmap::SortBitmapStore>>,
     meta_store: Option<Arc<crate::shard_store_meta::MetaStore>>,
     loading_mode: Arc<AtomicBool>,
+    /// Set true while any DumpMergeWriter is alive. Prevents the janitor
+    /// from compacting the DocSilo (which can grow/replace the HashIndex
+    /// and invalidate the writer's raw pointer → SIGSEGV).
+    dump_merge_active: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
     time_buckets: Option<Arc<ArcSwap<TimeBucketManager>>>,
     /// Pending bucket diffs for lazy application on cache reads.
@@ -752,6 +756,7 @@ impl ConcurrentEngine {
         };
         let unified_cache = Arc::new(parking_lot::Mutex::new(uc));
         let loading_mode = Arc::new(AtomicBool::new(false));
+        let dump_merge_active = Arc::new(AtomicBool::new(false));
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
         let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
             let mut tb = TimeBucketManager::new_with_sort_field(
@@ -1107,6 +1112,7 @@ impl ConcurrentEngine {
                 sort_store: sort_store.clone(),
                 meta_store: meta_store.clone(),
                 loading_mode,
+                dump_merge_active: Arc::new(AtomicBool::new(false)),
                 dirty_since_snapshot: dirty_flag,
                 time_buckets,
                 pending_bucket_diffs: Arc::clone(&pending_bucket_diffs),
@@ -1226,6 +1232,7 @@ impl ConcurrentEngine {
                 .collect();
             let flush_mem_cache = Arc::clone(&bitmap_memory_cache);
             let flush_doc_silo = Arc::clone(&doc_silo);
+            let flush_dump_merge_active = Arc::clone(&dump_merge_active);
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
                 let max_sleep = Duration::from_micros(flush_interval_us * 10);
@@ -1771,8 +1778,11 @@ impl ConcurrentEngine {
                             // holds a raw *const pointer to the HashIndex. Compaction can
                             // grow the HashIndex (drop old mmap + rebuild), turning the
                             // writer's pointer into a dangling reference → SIGSEGV.
+                            // Check BOTH is_loading (Phase 1 BulkWriter) AND
+                            // dump_merge_active (Phase 2+ DumpMergeWriter).
                             const DOC_SILO_COMPACT_THRESHOLD_BYTES: u64 = 1_024 * 1_024;
-                            if !is_loading && flush_cycle % COMPACTION_INTERVAL == 0 {
+                            let merge_active = flush_dump_merge_active.load(Ordering::Relaxed);
+                            if !is_loading && !merge_active && flush_cycle % COMPACTION_INTERVAL == 0 {
                                 let ops_bytes = flush_doc_silo.read().ops_size();
                                 if ops_bytes >= DOC_SILO_COMPACT_THRESHOLD_BYTES {
                                     if flush_doc_silo.read().has_ops() {
@@ -3090,6 +3100,7 @@ impl ConcurrentEngine {
             sort_store,
             meta_store,
             loading_mode,
+            dump_merge_active: Arc::new(AtomicBool::new(false)),
             dirty_since_snapshot: Arc::clone(&dirty_flag),
             time_buckets,
             pending_bucket_diffs,
@@ -6109,6 +6120,15 @@ impl ConcurrentEngine {
         crate::doc_silo::DocSiloBulkWriter::new(silo_root, field_names)
             .map_err(|e| crate::error::BitdexError::Storage(format!("DocSiloBulkWriter::new: {e}")))
     }
+    pub fn prepare_silo_bulk_writer_with_capacity(
+        &self,
+        field_names: &[String],
+        estimated_rows: usize,
+    ) -> crate::error::Result<crate::doc_silo::DocSiloBulkWriter> {
+        let silo_root = self.docstore_root.join("silo");
+        crate::doc_silo::DocSiloBulkWriter::new_with_capacity(silo_root, field_names, estimated_rows)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("DocSiloBulkWriter::new_with_capacity: {e}")))
+    }
     /// Return the set of indexed field names (filter + sort + "id").
     /// Used by the loader to strip doc-only fields from the bitmap accumulator.
     pub fn indexed_field_names(&self) -> HashSet<String> {
@@ -6615,6 +6635,12 @@ impl ConcurrentEngine {
     /// Call `exit_loading_mode()` to publish the final state and resume normal operation.
     pub fn enter_loading_mode(&self) {
         self.loading_mode.store(true, Ordering::Release);
+    }
+    /// Signal that a DumpMergeWriter is active. Prevents the flush thread
+    /// janitor from compacting the DocSilo (which can grow/replace the
+    /// HashIndex and invalidate the writer's raw pointer).
+    pub fn set_dump_merge_active(&self, active: bool) {
+        self.dump_merge_active.store(active, Ordering::Release);
     }
     /// Exit loading mode: publish the current staging state and resume normal operation.
     ///

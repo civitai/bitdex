@@ -1408,6 +1408,10 @@ pub fn process_dump(
 
     let t_total = Instant::now();
     let mut result = process_dump_with_progress(request, engine, stage_dir, progress_counter, data_schema, slot_watermark.as_ref(), shutdown.as_ref())?;
+    // Clear the dump_merge_active flag now that DumpMergeWriter is dropped
+    // (process_dump_with_progress returned, all locals including doc_target dropped).
+    // This re-enables the janitor on the flush thread.
+    engine.set_dump_merge_active(false);
     eprintln!("  Dump {} process_dump_with_progress returned in {:.1}s", request.name, t_total.elapsed().as_secs_f64());
     let (alive_s, filter_s, sort_s, meta_s) = engine
         .shard_stores()
@@ -1596,9 +1600,16 @@ pub fn process_dump_with_progress(
     // Phase 1 (sets_alive): create fresh DocSiloBulkWriter (truncates data.bin)
     // Phases 2+ (!sets_alive): use DumpMergeWriter for in-place updates
     let doc_target: DocWriteTarget = if request.sets_alive {
+        // Estimate row count from CSV file size. Average Civitai image row
+        // is ~120 bytes. Add 20% headroom for safety.
+        let csv_file_size = std::fs::metadata(&request.csv_path)
+            .map(|m| m.len())
+            .unwrap_or(14_000_000 * 120); // fallback: 14M rows
+        let estimated_rows = ((csv_file_size / 120) as f64 * 1.2) as usize;
+        eprintln!("  Phase 1: CSV size={} bytes, estimated_rows={}", csv_file_size, estimated_rows);
         DocWriteTarget::Bulk(Arc::new(
             engine
-                .prepare_silo_bulk_writer(&all_target_names)
+                .prepare_silo_bulk_writer_with_capacity(&all_target_names, estimated_rows)
                 .map_err(|e| format!("prepare_silo_bulk_writer: {e}"))?,
         ))
     } else {
@@ -1612,6 +1623,10 @@ pub fn process_dump_with_progress(
         match merge_result {
             Ok(Some(writer)) => {
                 eprintln!("  Phase 2+: using DumpMergeWriter for in-place doc updates");
+                // Signal that a merge writer is active so the flush thread
+                // janitor skips DocSilo compaction (which can grow/replace
+                // the HashIndex and invalidate our raw pointer → SIGSEGV).
+                engine.set_dump_merge_active(true);
                 DocWriteTarget::Merge(Arc::new(writer))
             }
             Ok(None) => {
