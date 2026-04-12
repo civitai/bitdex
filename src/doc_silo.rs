@@ -913,10 +913,23 @@ use std::io::Write;
 /// is truncated to the actual used bytes at finalize. Growth-on-overflow
 /// is a fallback if the estimate is too low.
 const INITIAL_BYTES_PER_DOC: usize = 256;
-/// Ratio of data.bin capacity to estimated data size. 1.1 = 10% slack.
-/// Previously 1.5, reduced to fit within 32 GiB pod limit at 107M records.
-/// At 107M × ~200 bytes/doc, 1.5 = ~31 GB sparse vs 1.1 = ~23 GB.
-const SLACK_RATIO: f64 = 1.1;
+/// Ratio of data.bin capacity to estimated data size. Must be large enough
+/// to fit all entries with their BUFFER_RATIO headroom. Each entry uses
+/// max(length * BUFFER_RATIO, MIN_ENTRY_SIZE) bytes. For typical ~200 byte
+/// image docs, that's 1024 bytes/entry = 4x the raw data. The file is
+/// truncated to actual cursor position at finalize, so disk usage = sum of
+/// allocated, not the pre-allocated capacity.
+/// 14.6M × 256 × 4.5 = 16.8 GB pre-alloc, 14.6M × 1024 = 15 GB actual.
+const SLACK_RATIO: f64 = 4.5;
+/// Per-entry buffer ratio: how much extra space to reserve for each doc to
+/// allow Phase 2+ DumpMergeWriter in-place merges (tags, resources, etc.).
+/// 4.0 means each entry gets 4x its written data size as allocated space.
+/// Matches SiloConfig::buffer_ratio used by DocSilo::open().
+const BUFFER_RATIO: f64 = 4.0;
+/// Minimum allocated bytes per entry. Ensures even tiny docs (a few bytes)
+/// have enough room for tags/resources to be merged in later phases.
+/// Matches SiloConfig::min_entry_size used by DocSilo::open().
+const MIN_ENTRY_SIZE: u32 = 1024;
 
 struct BulkState {
     /// Keeps the writable mmap alive. Only touched during `new`, `grow`,
@@ -1174,11 +1187,17 @@ impl DocSiloBulkWriter {
         let fields_bytes = &payload[5..];
         let key = slot_to_key(slot);
         let length = (1 + fields_bytes.len()) as u32;
-        let length_u64 = length as u64;
+        // Reserve extra space (buffer_ratio) so Phase 2+ DumpMergeWriter can
+        // merge tags/resources in-place without overflowing.
+        let allocated = std::cmp::max(
+            (length as f64 * BUFFER_RATIO) as u32,
+            MIN_ENTRY_SIZE,
+        );
+        let allocated_u64 = allocated as u64;
 
         let silo_root = &self.silo_root;
         self.with_thread_slot(|ts| {
-            let Some(offset) = self.reserve(ts, length_u64) else { return };
+            let Some(offset) = self.reserve(ts, allocated_u64) else { return };
             unsafe {
                 let base = self.mmap_ptr.load(std::sync::atomic::Ordering::Relaxed);
                 let dst = base.add(offset as usize);
@@ -1234,11 +1253,16 @@ impl DocSiloBulkWriter {
 
         let key = slot_to_key(slot);
         let length = write_buf.len() as u32;
-        let length_u64 = length as u64;
+        // Reserve with buffer_ratio headroom for Phase 2+ in-place merges.
+        let allocated = std::cmp::max(
+            (length as f64 * BUFFER_RATIO) as u32,
+            MIN_ENTRY_SIZE,
+        );
+        let allocated_u64 = allocated as u64;
 
         let silo_root = &self.silo_root;
         self.with_thread_slot(|ts| {
-            let Some(offset) = self.reserve(ts, length_u64) else { return };
+            let Some(offset) = self.reserve(ts, allocated_u64) else { return };
             unsafe {
                 let base = self.mmap_ptr.load(std::sync::atomic::Ordering::Relaxed);
                 let dst = base.add(offset as usize);
@@ -1517,10 +1541,17 @@ impl DocSiloBulkWriter {
         for chunk in sorted.chunks(CHUNK_ENTRIES) {
             buf.clear();
             for &(key, offset, length) in chunk {
+                // Apply buffer_ratio so Phase 2+ DumpMergeWriter has headroom
+                // for in-place merges. Without this, allocated == length and
+                // every merge_put overflows (100% data loss on Phase 2+).
+                let allocated = std::cmp::max(
+                    (length as f64 * BUFFER_RATIO) as u32,
+                    MIN_ENTRY_SIZE,
+                );
                 buf.extend_from_slice(&key.to_le_bytes());
                 buf.extend_from_slice(&offset.to_le_bytes());
                 buf.extend_from_slice(&length.to_le_bytes());
-                buf.extend_from_slice(&length.to_le_bytes()); // allocated == length, tight packing
+                buf.extend_from_slice(&allocated.to_le_bytes());
             }
             file.write_all(&buf)?;
         }
