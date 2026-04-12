@@ -54,7 +54,6 @@ use std::sync::Mutex;
 use memmap2::MmapMut;
 use roaring::RoaringBitmap;
 
-use crate::shard_store_doc::ShardStoreBulkWriter as BulkWriter;
 use crate::config::DataSchema;
 use crate::error::Result;
 
@@ -659,69 +658,6 @@ impl SlotArena {
             resource_poi,
             published_at_unix: self.read_u64(base + OFF_PUBLISHED_AT),
         })
-    }
-
-    /// Finalize all populated slots to the docstore.
-    ///
-    /// Iterates alive bitmap, reads each slot (with overflow merge), converts to
-    /// JSON doc, encodes via BulkWriter, and writes to docstore shards.
-    ///
-    /// Uses rayon for parallel encoding + compression.
-    pub fn finalize_to_docstore(
-        &self,
-        bulk_writer: &BulkWriter,
-        schema: &DataSchema,
-        alive: &RoaringBitmap,
-    ) -> Result<(u64, u64)> {
-        use rayon::prelude::*;
-
-        let total = alive.len() as u64;
-        eprintln!("SlotArena: finalizing {} docs to docstore...", total);
-
-        // Build overflow lookup
-        let overflow_entries = self.overflow.lock().unwrap();
-        let mut overflow_map: HashMap<u32, Vec<&OverflowEntry>> =
-            HashMap::new();
-        for entry in overflow_entries.iter() {
-            overflow_map.entry(entry.slot).or_default().push(entry);
-        }
-        let overflow_count = overflow_map.len();
-        if overflow_count > 0 {
-            eprintln!(
-                "SlotArena: {} slots have overflow data ({:.1}%)",
-                overflow_count,
-                overflow_count as f64 / total as f64 * 100.0
-            );
-        }
-
-        // Collect all slot IDs from alive bitmap
-        let slots: Vec<u32> = alive.iter().collect();
-
-        // Process in chunks matching docstore shard size (512 docs)
-        // Parallel encode: read slots, convert to JSON, encode to msgpack
-        let encoded: Vec<(u32, Vec<u8>)> = slots
-            .par_iter()
-            .filter_map(|&slot| {
-                let slot_data = self.read_slot(slot, &overflow_map)?;
-                let json = slot_data_to_json(&slot_data);
-                let bytes = bulk_writer.encode_json(&json, schema);
-                Some((slot, bytes))
-            })
-            .collect();
-
-        let docs_written = encoded.len() as u64;
-        let bytes_written: u64 = encoded.iter().map(|(_, b)| b.len() as u64).sum();
-
-        // Write to docstore via BulkWriter (handles sharding + compression)
-        bulk_writer.write_batch_encoded(encoded);
-
-        eprintln!(
-            "SlotArena: finalized {} docs, {} MB encoded",
-            docs_written,
-            bytes_written / (1024 * 1024)
-        );
-
-        Ok((docs_written, bytes_written))
     }
 
     /// Clean up the arena file.

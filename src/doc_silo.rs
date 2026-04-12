@@ -617,6 +617,11 @@ pub struct DocSilo {
 }
 
 impl DocSilo {
+    pub fn open_temp() -> io::Result<Self> {
+        let dir = tempfile::tempdir()?;
+        Self::open(dir.path())
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(path)?;
         let silo_path = path.join("silo");

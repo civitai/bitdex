@@ -1222,53 +1222,7 @@ impl ShardPreCreator {
                     let current_max_slot = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
                     let target_shard = current_max_slot >> 9; // SHARD_SHIFT = 9
 
-                    // Pre-create all 256 hex subdirectories once (eliminates per-file create_dir_all)
-                    if !docstore_dirs_done && current_max_slot > 0 {
-                        // Derive shards dir from DocStoreV3::shard_path to match ShardStore layout.
-                        // shard_path returns root/gen_NNN/shards/xx/NNNNNN.shard — go up 2 levels for shards dir.
-                        let sample_path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, 0);
-                        let shards_dir = sample_path.parent().unwrap().parent().unwrap();
-                        for hex in 0..=255u8 {
-                            let _ = std::fs::create_dir_all(shards_dir.join(format!("{:02x}", hex)));
-                        }
-                        docstore_dirs_done = true;
-                        eprintln!("  ShardPreCreator: docstore hex dirs created at {}", shards_dir.display());
-                    }
-
-                    // Create docstore shard files up to target (no create_dir_all per file)
-                    while created_up_to < target_shard {
-                        created_up_to += 1;
-                        let path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, created_up_to);
-                        if let Ok(f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)
-                        {
-                            let meta = f.metadata().ok();
-                            if meta.map(|m| m.len()).unwrap_or(0) == 0 {
-                                // Write a full valid ShardStore header (28 bytes).
-                                // Previous code only wrote the 4-byte magic, leaving
-                                // stubs that append_ops_to_shard can't read (needs 28).
-                                let header = crate::shard_store::ShardHeader {
-                                    version: crate::shard_store::SHARD_VERSION,
-                                    ops_section_offset: crate::shard_store::HEADER_SIZE as u64,
-                                    snapshot_len: 0,
-                                    ops_count: 0,
-                                    flags: 0,
-                                };
-                                let mut buf = Vec::with_capacity(crate::shard_store::HEADER_SIZE);
-                                header.encode(&mut buf);
-                                let mut bw = std::io::BufWriter::new(f);
-                                use std::io::Write as _;
-                                let _ = bw.write_all(&buf);
-                                let _ = bw.flush();
-                            }
-                        }
-                        files_created += 1;
-                        if files_created % 50_000 == 0 {
-                            eprintln!("  ShardPreCreator: {}K docstore files created", files_created / 1000);
-                        }
-                    }
+                    docstore_dirs_done = true;
 
                     // Create filter bitmap dirs once (first time watermark > 0)
                     if !bitmap_dirs_done && current_max_slot > 0 {
@@ -1287,35 +1241,7 @@ impl ShardPreCreator {
                     }
 
                     if done.load(std::sync::atomic::Ordering::Relaxed) {
-                        // Final sweep for any remaining shards
-                        let final_max = watermark.load(std::sync::atomic::Ordering::Relaxed) as u32;
-                        let final_shard = final_max >> 9;
-                        while created_up_to < final_shard {
-                            created_up_to += 1;
-                            let path = crate::shard_store_doc::DocStoreV3::shard_path(&docstore_root, created_up_to);
-                            if let Ok(f) = std::fs::OpenOptions::new()
-                                .create(true).append(true).open(&path)
-                            {
-                                let meta = f.metadata().ok();
-                                if meta.map(|m| m.len()).unwrap_or(0) == 0 {
-                                    let header = crate::shard_store::ShardHeader {
-                                        version: crate::shard_store::SHARD_VERSION,
-                                        ops_section_offset: crate::shard_store::HEADER_SIZE as u64,
-                                        snapshot_len: 0,
-                                        ops_count: 0,
-                                        flags: 0,
-                                    };
-                                    let mut buf = Vec::with_capacity(crate::shard_store::HEADER_SIZE);
-                                    header.encode(&mut buf);
-                                    let mut bw = std::io::BufWriter::new(f);
-                                    use std::io::Write as _;
-                                    let _ = bw.write_all(&buf);
-                                    let _ = bw.flush();
-                                }
-                            }
-                            files_created += 1;
-                        }
-                        eprintln!("  ShardPreCreator: done — {} files created (max shard {})", files_created, created_up_to);
+                        eprintln!("  ShardPreCreator: done — bitmap dirs created");
                         return files_created;
                     }
 

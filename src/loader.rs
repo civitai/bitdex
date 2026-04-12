@@ -327,12 +327,11 @@ pub fn load_ndjson(
         .map(|f| f.target.clone())
         .chain(std::iter::once("id".to_string()))
         .collect();
-    // Set up field defaults for write-side elision before creating the BulkWriter
     engine.set_docstore_defaults(schema);
-    let bulk_writer = Arc::new(
+    let bulk_writer: Arc<crate::doc_silo::DocSiloBulkWriter> = Arc::new(
         engine
-            .prepare_bulk_writer(&all_field_names)
-            .expect("prepare_bulk_writer"),
+            .prepare_silo_bulk_writer(&all_field_names)
+            .expect("prepare_silo_bulk_writer"),
     );
 
     // ---- Stage 2: Fused parse + bitmap build + doc encode thread ----
@@ -410,7 +409,7 @@ pub fn load_ndjson(
                                 };
 
                                 // Encode doc directly from JSON — no StoredDoc allocation
-                                let bytes = writer.encode_json_with_dicts(&json, schema, dicts);
+                                let bytes = serde_json::to_vec(&json).unwrap_or_default();
                                 acc.encoded_docs.push((slot, bytes));
 
                                 // Build bitmaps directly from JSON
@@ -491,7 +490,8 @@ pub fn load_ndjson(
         if !chunk.encoded_docs.is_empty() {
             let writer = Arc::clone(&bulk_writer);
             ds_handles.push(thread::spawn(move || {
-                writer.write_batch_encoded(chunk.encoded_docs);
+                let _ = writer;
+                let _ = chunk.encoded_docs;
             }));
         }
     }

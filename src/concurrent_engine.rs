@@ -14,7 +14,7 @@ use crate::filter::FilterFieldType;
 use crate::cache;
 use crate::concurrency::InFlightTracker;
 use crate::config::{Config, FilterFieldConfig, SortFieldConfig};
-use crate::shard_store_doc::{DocStoreV3, StoredDoc};
+use crate::shard_store_doc::StoredDoc;
 use crate::error::Result;
 use crate::executor::{CaseSensitiveFields, QueryExecutor, StringMaps};
 use crate::mutation::{diff_document, diff_patch, value_to_bitmap_key, value_to_sort_u32, Document, FieldRegistry, PatchPayload};
@@ -246,12 +246,7 @@ pub struct ConcurrentEngine {
     inner: Arc<ArcSwap<InnerEngine>>,
     sender: MutationSender,
     doc_tx: Sender<(u32, StoredDoc)>,
-    docstore: Arc<parking_lot::RwLock<DocStoreV3>>,
-    /// DocSilo — mmap-backed typed-op doc storage. Present when constructed with
-    /// `new_with_path`; None for in-memory test engines. Routes all hot reads
-    /// and dump-path writes through a single data.bin + ops log instead of
-    /// hex-sharded files.
-    doc_silo: Option<Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>>>,
+    doc_silo: Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>>,
     /// Docstore root path, cached to avoid locking docstore just to read the path.
     docstore_root: Arc<PathBuf>,
     config: Arc<Config>,
@@ -418,30 +413,25 @@ pub struct ConcurrentEngine {
     wal_writer: Option<Arc<crate::ops_wal::WalWriter>>,
 }
 impl ConcurrentEngine {
-    /// Create a new concurrent engine with an in-memory docstore (for testing).
+    /// Create a new concurrent engine with a temp docstore (for testing).
     pub fn new(config: Config) -> Result<Self> {
         config.validate()?;
-        let docstore = DocStoreV3::open_temp()
-            .map_err(|e| crate::error::BitdexError::Storage(format!("open temp: {e}")))?;
-        Self::build(config, docstore, None)
+        let doc_silo = crate::doc_silo::DocSilo::open_temp()
+            .map_err(|e| crate::error::BitdexError::Storage(format!("open temp silo: {e}")))?;
+        Self::build(config, doc_silo)
     }
     /// Create a new concurrent engine with an on-disk docstore.
     pub fn new_with_path(config: Config, path: &Path) -> Result<Self> {
         config.validate()?;
-        let docstore = DocStoreV3::open(path)
-            .map_err(|e| crate::error::BitdexError::Storage(format!("open: {e}")))?;
-        // Open a DocSilo alongside the docstore. Located under `<path>/silo`
-        // so it lives in the same on-disk tree as the bitmaps + docstore.
         let silo_path = path.join("silo");
         let doc_silo = crate::doc_silo::DocSilo::open(&silo_path)
             .map_err(|e| crate::error::BitdexError::Storage(format!("open silo: {e}")))?;
-        Self::build(config, docstore, Some(doc_silo))
+        Self::build(config, doc_silo)
     }
 
     fn build(
         config: Config,
-        mut docstore: DocStoreV3,
-        doc_silo: Option<crate::doc_silo::DocSilo>,
+        doc_silo: crate::doc_silo::DocSilo,
     ) -> Result<Self> {
         let mut filters = crate::filter::FilterIndex::new();
         let mut sorts = crate::sort::SortIndex::new();
@@ -959,16 +949,10 @@ impl ConcurrentEngine {
         #[cfg(feature = "server")]
         let metrics_bridge: Arc<ArcSwap<Option<Arc<MetricsBridge>>>> = Arc::new(ArcSwap::from_pointee(None));
 
-        // DocStoreV3 uses ShardStore native compaction — no manual compaction worker needed.
-        // Set threshold for auto-compaction within DocStoreV3.
-        if config.compact_threshold_pct > 0 {
-            docstore.set_compact_threshold(config.compact_threshold_pct as u32);
-        }
         let (compact_tx, compact_handle): (Option<Sender<(u32, Vec<u8>)>>, Option<JoinHandle<()>>) = (None, None);
 
-        let docstore_root = Arc::new(docstore.path().to_path_buf());
-        let docstore = Arc::new(parking_lot::RwLock::new(docstore));
-        let doc_silo = doc_silo.map(|s| Arc::new(parking_lot::RwLock::new(s)));
+        let docstore_root = Arc::new(doc_silo.path().parent().unwrap_or(doc_silo.path()).to_path_buf());
+        let doc_silo = Arc::new(parking_lot::RwLock::new(doc_silo));
         // Shared dirty flag: flush thread sets when mutations applied, merge thread
         // clears after persisting snapshot. Prevents continuous 20GB rewrites at idle.
         let dirty_flag = Arc::new(AtomicBool::new(false));
@@ -1108,7 +1092,6 @@ impl ConcurrentEngine {
                 inner,
                 sender,
                 doc_tx,
-                docstore,
                 doc_silo: doc_silo.clone(),
                 docstore_root: Arc::clone(&docstore_root),
                 config,
@@ -1190,14 +1173,7 @@ impl ConcurrentEngine {
         let flush_handle = {
             let inner = Arc::clone(&inner);
             let shutdown = Arc::clone(&shutdown);
-            let docstore = Arc::clone(&docstore);
-            // Clone the DocSilo handle so the flush thread can mirror doc
-            // writes into the silo. Steady-state writes from /documents
-            // endpoints arrive on the doc_tx channel, and the silo-preferring
-            // read path would miss any slot the flush thread only wrote to
-            // V3 after a silo-only bulk dump.
-            let flush_doc_silo: Option<Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>>> =
-                doc_silo.as_ref().map(Arc::clone);
+            let docstore = Arc::clone(&doc_silo);
             let flush_interval_us = config.flush_interval_us;
             let flush_unified_cache = Arc::clone(&unified_cache);
             let flush_loading_mode = Arc::clone(&loading_mode);
@@ -2444,52 +2420,11 @@ impl ConcurrentEngine {
                         if let Some(ref cache) = flush_doc_cache {
                             cache.update_batch_if_cached(&doc_batch);
                         }
-                        // Fast path: if all fields are already in the dict,
-                        // append under a READ lock so concurrent doc fetches
-                        // aren't blocked by writer priority. The parking_lot
-                        // RwLock's writer-priority semantics meant every
-                        // flush cycle's ~28 ms write lock queued hundreds of
-                        // readers, which was the dominant source of
-                        // `query_docs_seconds` p95 spikes.
-                        //
-                        // Slow path runs only when the batch introduces a
-                        // new field name — rare in steady state since the
-                        // metrics poller only touches already-known fields
-                        // (reactionCount / commentCount / collectedCount).
-                        let fast_handled = match docstore
-                            .read()
-                            .put_batch_known_fields(&doc_batch)
-                        {
-                            Ok(handled) => handled,
-                            Err(e) => {
-                                eprintln!(
-                                    "WARNING: docstore fast-path write failed ({} docs): {e}",
-                                    doc_batch.len()
-                                );
-                                true // logged; don't retry on slow path
-                            }
-                        };
-                        if !fast_handled {
-                            if let Err(e) = docstore.write().put_batch(&doc_batch) {
-                                eprintln!(
-                                    "WARNING: docstore slow-path write failed ({} docs): {e}",
-                                    doc_batch.len()
-                                );
-                            }
-                        }
-                        // Mirror into DocSilo so reads via the silo-preferring
-                        // path see the update. Without this, any /documents
-                        // endpoint write after a silo-only bulk dump would be
-                        // invisible to queries. Silo write path uses its own
-                        // field dictionary which may not match V3's — the
-                        // silo::put_batch auto-registers new fields.
-                        if let Some(ref silo) = flush_doc_silo {
-                            if let Err(e) = silo.write().put_batch(&doc_batch) {
-                                eprintln!(
-                                    "WARNING: doc_silo put_batch failed ({} docs): {e}",
-                                    doc_batch.len()
-                                );
-                            }
+                        if let Err(e) = docstore.write().put_batch(&doc_batch) {
+                            eprintln!(
+                                "WARNING: docstore write failed ({} docs): {e}",
+                                doc_batch.len()
+                            );
                         }
                     }
                     if bitmap_count > 0 || doc_count > 0 || lazy_loaded {
@@ -2522,16 +2457,11 @@ impl ConcurrentEngine {
                     if let Err(e) = docstore.write().put_batch(&doc_batch) {
                         panic!("docstore final batch write failed: {e}");
                     }
-                    // Final-drain silo mirror. Best-effort — we prefer to
-                    // flush V3 successfully over panicking if the silo
-                    // write hiccups on shutdown.
-                    if let Some(ref silo) = flush_doc_silo {
-                        if let Err(e) = silo.write().put_batch(&doc_batch) {
-                            eprintln!(
-                                "WARNING: doc_silo final drain put_batch failed ({} docs): {e}",
-                                doc_batch.len()
-                            );
-                        }
+                    if let Err(e) = docstore.write().put_batch(&doc_batch) {
+                        eprintln!(
+                            "WARNING: final drain put_batch failed ({} docs): {e}",
+                            doc_batch.len()
+                        );
                     }
                 }
             })
@@ -2556,8 +2486,7 @@ impl ConcurrentEngine {
             let merge_cursors = Arc::clone(&cursors);
             let merge_bound_store = bound_store.clone();
             let merge_unified_cache = Arc::clone(&unified_cache);
-            let merge_doc_shard_store = docstore.read().shard_store_arc();
-            let merge_dirty_shards = docstore.read().dirty_shards_arc();
+            // DocSilo doesn't use shard-based compaction — no merge_doc_shard_store needed
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
@@ -2608,41 +2537,12 @@ impl ConcurrentEngine {
                             }
                         }
 
-                        // Compact docstore shards that received writes this cycle.
-                        // Uses atomic retain(false) to avoid TOCTOU race with writers.
-                        {
-                            let mut dirty = Vec::new();
-                            merge_dirty_shards.retain(|k| {
-                                dirty.push(*k);
-                                false
-                            });
-                            for shard_key in dirty {
-                                if merge_doc_shard_store.needs_compaction(&shard_key).unwrap_or(false) {
-                                    if let Err(e) = merge_doc_shard_store.compact_current(&shard_key) {
-                                        eprintln!("merge: doc compaction failed for shard {shard_key}: {e}");
-                                        // Re-insert so it gets retried next cycle
-                                        merge_dirty_shards.insert(shard_key);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Cross-generation compaction: when generation count exceeds
-                        // threshold, compact all stores down to a single generation.
-                        // This prevents the "15 stale gens" problem where each shard
-                        // read must open N files (one per gen), causing disk_fetch
-                        // P95 to scale with gen count.
-                        //
-                        // Threshold default: 3 (current gen + 2 old = reasonable).
-                        // Only runs when the normal per-shard compaction is also
-                        // running (needs_write was true), so it piggybacks on the
-                        // existing merge cycle timing.
+                        // Cross-generation compaction for bitmap stores
                         {
                             let max_gen = [
                                 as_.current_generation(),
                                 fs_.current_generation(),
                                 ss_.current_generation(),
-                                merge_doc_shard_store.current_generation(),
                             ].into_iter().max().unwrap_or(0);
                             let gen_threshold = merge_config.compact_gen_threshold.unwrap_or(3);
                             if max_gen >= gen_threshold {
@@ -2651,20 +2551,16 @@ impl ConcurrentEngine {
                                 );
                                 let t_crossgen = std::time::Instant::now();
 
-                                // Pin all stores — freezes current gen, new writes go to N+1
                                 let frozen_gen = as_.pin_generation().unwrap_or(max_gen);
                                 let _ = fs_.pin_generation();
                                 let _ = ss_.pin_generation();
-                                let _ = merge_doc_shard_store.pin_generation();
 
-                                // Compact alive (single shard)
                                 if let Err(e) = as_.compact_shard_bounded(
                                     &AliveShardKey, frozen_gen, frozen_gen,
                                 ) {
                                     eprintln!("merge cross-gen: alive compact failed: {e}");
                                 }
 
-                                // Compact filter shards
                                 if let Ok(keys) = fs_.list_all_shards() {
                                     for key in &keys {
                                         if let Err(e) = fs_.compact_shard_bounded(key, frozen_gen, frozen_gen) {
@@ -2673,7 +2569,6 @@ impl ConcurrentEngine {
                                     }
                                 }
 
-                                // Compact sort shards
                                 if let Ok(keys) = ss_.list_all_shards() {
                                     for key in &keys {
                                         if let Err(e) = ss_.compact_shard_bounded(key, frozen_gen, frozen_gen) {
@@ -2682,26 +2577,11 @@ impl ConcurrentEngine {
                                     }
                                 }
 
-                                // Compact doc shards
-                                let slot_counter = merge_inner.load().slots.slot_counter();
-                                if slot_counter > 0 {
-                                    let max_shard = (slot_counter - 1) >> crate::shard_store_doc::SHARD_SHIFT_PUB;
-                                    for shard_id in 0..=max_shard {
-                                        if let Err(e) = merge_doc_shard_store.compact_shard_bounded(
-                                            &shard_id, frozen_gen, frozen_gen,
-                                        ) {
-                                            eprintln!("merge cross-gen: doc shard {shard_id}: {e}");
-                                        }
-                                    }
-                                }
-
-                                // Grace period then delete old generations
                                 std::thread::sleep(Duration::from_secs(2));
                                 for gen in 0..frozen_gen {
                                     let _ = as_.delete_generation(gen);
                                     let _ = fs_.delete_generation(gen);
                                     let _ = ss_.delete_generation(gen);
-                                    let _ = merge_doc_shard_store.delete_generation(gen);
                                 }
 
                                 eprintln!(
@@ -3169,7 +3049,6 @@ impl ConcurrentEngine {
             inner,
             sender,
             doc_tx,
-            docstore,
             doc_silo,
             docstore_root,
             config,
@@ -5795,19 +5674,9 @@ impl ConcurrentEngine {
             self.flush_cache_cycles_total.load(Ordering::Relaxed),
         )
     }
-    /// Iter 6 — DocStoreV3 put_batch fast/slow path counters.
-    /// Returns `(fast_path_total, slow_path_total)`.
-    pub fn docstore_put_batch_path_stats(&self) -> (u64, u64) {
-        self.docstore.read().put_batch_path_stats()
-    }
-    /// Iter 7 — DocStoreV3 append_tuples_batch fast/slow path counters.
-    pub fn docstore_append_tuples_path_stats(&self) -> (u64, u64) {
-        self.docstore.read().append_tuples_path_stats()
-    }
-    /// Iter 7 — DocStoreV3 append_multi_ops_batch fast/slow path counters.
-    pub fn docstore_append_multi_ops_path_stats(&self) -> (u64, u64) {
-        self.docstore.read().append_multi_ops_path_stats()
-    }
+    pub fn docstore_put_batch_path_stats(&self) -> (u64, u64) { (0, 0) }
+    pub fn docstore_append_tuples_path_stats(&self) -> (u64, u64) { (0, 0) }
+    pub fn docstore_append_multi_ops_path_stats(&self) -> (u64, u64) { (0, 0) }
     /// Iter 4a instrumentation — cache-maintenance shape stats:
     /// `(unique_filter_shapes, sort_work_items, unique_shapes_max, sort_work_items_max)`.
     ///
@@ -5954,22 +5823,8 @@ impl ConcurrentEngine {
                 return Ok(Some(doc));
             }
         }
-        // Slow path: disk read + cache populate. Prefer DocSilo if it's present
-        // AND populated — when the silo is empty (fresh boot, pre-populate),
-        // fall back to DocStoreV3 so A/B comparisons don't need a rebuild.
-        let doc = if let Some(ref silo) = self.doc_silo {
-            let silo_guard = silo.read();
-            if silo_guard.index_count() > 0 {
-                silo_guard
-                    .get(slot_id)
-                    .map_err(|e| crate::error::BitdexError::Storage(format!("docsilo get: {e}")))?
-            } else {
-                drop(silo_guard);
-                self.docstore.read().get(slot_id)?
-            }
-        } else {
-            self.docstore.read().get(slot_id)?
-        };
+        let doc = self.doc_silo.read().get(slot_id)
+            .map_err(|e| crate::error::BitdexError::Storage(format!("docsilo get: {e}")))?;
         if let (Some(ref cache), Some(ref doc)) = (&self.doc_cache, &doc) {
             cache.insert(slot_id, doc.clone());
             // Eviction handled by dedicated eviction thread — no inline check
@@ -6135,24 +5990,12 @@ impl ConcurrentEngine {
         // build + scatter loop in DocStoreV3::get_many, which is NOT
         // covered by the inner `stats` split (file_read vs decode).
         let disk_start = Instant::now();
-        let use_silo = self
-            .doc_silo
-            .as_ref()
-            .map(|s| s.read().index_count() > 0)
-            .unwrap_or(false);
-        let (mut disk_results, stats, unique_shards) = if use_silo {
-            // DocSilo path — every slot is an independent hash probe on a single
-            // mmap. No shard grouping, no 62-file-open tail. Returns zero file-read
-            // stats because the silo does not expose per-file timing — that concept
-            // does not apply.
-            let guard = self.doc_silo.as_ref().unwrap().read();
+        let (mut disk_results, stats, unique_shards) = {
+            let guard = self.doc_silo.read();
             let results = guard
                 .get_many(&miss_ids)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("docsilo get_many: {e}")))?;
             (results, ShardReadStats::default(), 0usize)
-        } else {
-            let guard = self.docstore.read();
-            guard.get_many(&miss_ids)?
         };
 
         // Phase 3: scatter disk results into the output and populate
@@ -6177,190 +6020,18 @@ impl ConcurrentEngine {
         // The shard files were just decoded by get_many, so the OS page
         // cache has them hot. The cost is CPU for decode + cache insert,
         // not disk I/O.
-        if self.config.doc_cache_prepopulate_shard {
-            if let Some(ref cache) = self.doc_cache {
-                // Collect unique shard keys from miss IDs
-                let mut shard_keys: Vec<u32> = miss_ids.iter()
-                    .map(|&id| crate::shard_store_doc::SlotHexShard::slot_to_shard(id))
-                    .collect();
-                shard_keys.sort_unstable();
-                shard_keys.dedup();
-                let guard = self.docstore.read();
-                for shard_key in shard_keys {
-                    if let Ok(shard_docs) = guard.get_shard(shard_key) {
-                        for (slot_id, doc) in shard_docs {
-                            // Only insert if not already cached (don't
-                            // overwrite fresher entries from write-through)
-                            if cache.get(slot_id).is_none() {
-                                cache.insert(slot_id, doc);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Shard prepopulate disabled — DocSilo uses mmap, not sharded files
 
         let disk_fetch_nanos = disk_start.elapsed().as_nanos() as u64;
 
         Ok((results, stats, unique_shards, cache_probe_nanos, disk_fetch_nanos, miss_count))
     }
-    /// Compact the docstore, reclaiming space from old write transactions.
-    pub fn compact_docstore(&self) -> Result<bool> {
-        Ok(self.docstore.read().compact()?)
-    }
-    /// Configure docstore field defaults from a DataSchema.
-    /// Must be called before `prepare_bulk_writer()` so the BulkWriter inherits the defaults.
-    pub fn set_docstore_defaults(&self, schema: &crate::config::DataSchema) {
-        self.docstore.write().set_field_defaults(schema);
-    }
-    /// Get the current schema version from the docstore.
-    pub fn docstore_schema_version(&self) -> u8 {
-        self.docstore.read().schema_version()
-    }
+    pub fn compact_docstore(&self) -> Result<bool> { Ok(false) }
+    pub fn set_docstore_defaults(&self, _schema: &crate::config::DataSchema) {}
+    pub fn docstore_schema_version(&self) -> u8 { 0 }
 
-    /// Get a clone of the Arc<Mutex<DocStoreV3>> for external writers (e.g., DocWriter).
-    pub fn docstore_arc(&self) -> Arc<parking_lot::RwLock<DocStoreV3>> {
-        Arc::clone(&self.docstore)
-    }
-
-    /// Borrow the DocSilo handle (None when the engine was constructed without
-    /// an on-disk path — in-memory tests).
-    pub fn doc_silo(&self) -> Option<Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>>> {
-        self.doc_silo.as_ref().map(Arc::clone)
-    }
-
-    /// Bulk-copy every document from DocStoreV3 into DocSilo by iterating
-    /// the alive bitmap and streaming typed `DocOp::Create` ops through the
-    /// silo's ops-log + compact cycle in FETCH_CHUNK-sized chunks.
-    ///
-    /// `get_many` reads both the compacted snapshot AND the ops log section
-    /// per shard, so it sees all documents the dump has written — whereas
-    /// `get_shard` only returns compacted snapshots and silently misses
-    /// uncompacted shards.
-    ///
-    /// Memory is bounded to one chunk (~300 MB for 500K docs). Per-chunk
-    /// compact intentionally skips `MmapMut::flush` — Windows msync is
-    /// O(data.bin size) and blows up for multi-GB files — then `sync()` is
-    /// called once at the end to commit the data + index mmaps to disk.
-    ///
-    /// Returns `(docs_copied, data_bytes)` on success.
-    pub fn copy_docstore_to_silo(&self) -> Result<(u64, u64)> {
-        use crate::doc_silo::{encode_slot_bytes, slot_to_key};
-        use crate::shard_store_doc::SlotHexShard;
-
-        let silo = self
-            .doc_silo
-            .as_ref()
-            .ok_or_else(|| crate::error::BitdexError::Storage("DocSilo not initialized".into()))?;
-
-        // Iterate DocStoreV3 shards in order via get_shard_packed, which
-        // returns Vec<(u32, Vec<(u16, PackedValue)>)> — the same shape as
-        // SlotSnapshot, skipping the StoredDoc HashMap detour that blew up
-        // memory at 107M (~1.4KB/doc → ~200B/doc after this rewrite).
-        //
-        // Encode each doc to bytes inline and accumulate into a single
-        // Vec<(u64 silo_key, Vec<u8> encoded_bytes)>. Then call
-        // `DocSilo::bulk_load_encoded` which skips the re-encode step.
-
-        // Snapshot field-dict translation up front under a brief write lock.
-        // DocStoreV3 and DocSilo have independent field indices — we build
-        // a translation table so the encoded bytes use silo indices.
-        let (docstore_idx_to_name, max_docstore_idx) = {
-            let ds = self.docstore.read();
-            let names: Vec<String> = ds.idx_to_field().iter().cloned().collect();
-            let max = names.len();
-            (names, max)
-        };
-        let mut silo_idx_for: Vec<u16> = Vec::with_capacity(max_docstore_idx);
-        {
-            let mut guard = silo.write();
-            for name in &docstore_idx_to_name {
-                silo_idx_for.push(guard.ensure_field_index(name));
-            }
-        }
-
-        // How many shards does DocStoreV3 span?
-        let snap = self.snapshot();
-        let total_alive = snap.slots.alive_bitmap().len() as u64;
-        let max_slot = snap.slots.slot_counter();
-        drop(snap);
-        let num_shards = SlotHexShard::slot_to_shard(max_slot.saturating_sub(1)) + 1;
-        eprintln!(
-            "copy_docstore_to_silo: {} alive slots across {} shards (packed encode path)",
-            total_alive, num_shards
-        );
-
-        let overall_start = std::time::Instant::now();
-        let mut encoded: Vec<(u64, Vec<u8>)> = Vec::with_capacity(total_alive as usize);
-        let mut last_progress_pct = -1i64;
-        let mut encode_buf = Vec::with_capacity(256);
-
-        // Hold the docstore read lock for the whole scan loop. Re-acquiring
-        // it per shard was ~100x slower (245K lock ops with flush-thread
-        // contention). The loop is read-only.
-        let ds = self.docstore.read();
-        for shard_id in 0..num_shards {
-            let shard = ds.get_shard_packed(shard_id).unwrap_or_default();
-            for (slot_id, mut pairs) in shard {
-                // Remap field indices from docstore space → silo space.
-                for (idx, _) in pairs.iter_mut() {
-                    let ds_idx = *idx as usize;
-                    if ds_idx < silo_idx_for.len() {
-                        *idx = silo_idx_for[ds_idx];
-                    }
-                }
-                encode_slot_bytes(true, &pairs, &mut encode_buf);
-                encoded.push((slot_to_key(slot_id), encode_buf.clone()));
-            }
-
-            let pct = (100.0 * encoded.len() as f64 / total_alive.max(1) as f64) as i64;
-            if pct / 5 > last_progress_pct / 5 {
-                eprintln!(
-                    "  encoded {} / {} ({}%), shards {}/{}, elapsed {:.1}s",
-                    encoded.len(),
-                    total_alive,
-                    pct,
-                    shard_id + 1,
-                    num_shards,
-                    overall_start.elapsed().as_secs_f64()
-                );
-                last_progress_pct = pct;
-            }
-        }
-        drop(ds);
-
-        let fetched_docs = encoded.len() as u64;
-        eprintln!(
-            "copy_docstore_to_silo: encoded {} docs in {:.1}s, bulk-loading silo",
-            fetched_docs,
-            overall_start.elapsed().as_secs_f64()
-        );
-
-        let loaded = {
-            let mut guard = silo.write();
-            guard.bulk_load_encoded(encoded).map_err(|e| {
-                crate::error::BitdexError::Storage(format!("silo bulk_load_encoded: {e}"))
-            })?
-        };
-
-        let data_bytes = {
-            let guard = silo.read();
-            guard.data_bytes()
-        };
-        {
-            let guard = silo.read();
-            guard.save_field_dict().map_err(|e| {
-                crate::error::BitdexError::Storage(format!("silo save_field_dict: {e}"))
-            })?;
-        }
-
-        eprintln!(
-            "copy_docstore_to_silo: loaded {} docs in {:.1}s, data.bin = {:.1} MB",
-            loaded,
-            overall_start.elapsed().as_secs_f64(),
-            data_bytes as f64 / 1e6
-        );
-        Ok((loaded, data_bytes))
+    pub fn doc_silo_arc(&self) -> Arc<parking_lot::RwLock<crate::doc_silo::DocSilo>> {
+        Arc::clone(&self.doc_silo)
     }
 
     /// Set the WAL writer for the V2 write path. When set, put() and patch_document()
@@ -6374,20 +6045,8 @@ impl ConcurrentEngine {
         let snap = self.snapshot();
         snap.slots.is_alive(slot)
     }
-    /// Build the schema registry for version-aware default reconstruction.
     pub fn build_schema_registry(&self) -> HashMap<u8, HashMap<String, serde_json::Value>> {
-        self.docstore.read().build_schema_registry()
-    }
-
-    /// Prepare a ShardStoreBulkWriter for lock-free parallel docstore writes during bulk loading.
-    /// The writer holds a snapshot of the field dictionary and can encode/write
-    /// docs without acquiring the DocStoreV3 Mutex.
-    pub fn prepare_bulk_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::ShardStoreBulkWriter> {
-        Ok(self.docstore.write().prepare_bulk_load(field_names)?)
-    }
-    /// Prepare a StreamingDocWriter for write-through docstore writes during dump processing.
-    pub fn prepare_streaming_writer(&self, field_names: &[String]) -> crate::error::Result<crate::shard_store_doc::StreamingDocWriter> {
-        Ok(self.docstore.write().prepare_streaming_writer(field_names)?)
+        HashMap::new()
     }
 
     /// Prepare a DocSiloBulkWriter that writes the dump output DIRECTLY to
@@ -6493,40 +6152,12 @@ impl ConcurrentEngine {
         }
 
         // Bypass the cache — we want the fresh on-disk bytes. Prefer the
-        // DocSilo mmap path when populated (every read is a hash probe +
-        // slice, no shard file opens), fall back to DocStoreV3 get_many
-        // when the silo is empty (pre-populate window). After a
-        // DocSilo-only bulk dump V3 is empty for dumped slots, so the
-        // old direct-V3 path would return None and cause cache deletions
-        // for live docs — the silo branch fixes that.
         let fresh: Vec<Option<crate::shard_store_doc::StoredDoc>> =
-            if let Some(ref silo_handle) = self.doc_silo {
-                let silo = silo_handle.read();
-                if silo.index_count() > 0 {
-                    match silo.get_many(&to_refresh) {
-                        Ok(docs) => docs,
-                        Err(e) => {
-                            tracing::warn!("doc_cache_refresh_slots silo get_many failed: {e}");
-                            return (0, 0, skipped);
-                        }
-                    }
-                } else {
-                    drop(silo);
-                    match self.docstore.read().get_many(&to_refresh) {
-                        Ok((docs, _, _)) => docs,
-                        Err(e) => {
-                            tracing::warn!("doc_cache_refresh_slots V3 get_many failed: {e}");
-                            return (0, 0, skipped);
-                        }
-                    }
-                }
-            } else {
-                match self.docstore.read().get_many(&to_refresh) {
-                    Ok((docs, _, _)) => docs,
-                    Err(e) => {
-                        tracing::warn!("doc_cache_refresh_slots V3 get_many failed: {e}");
-                        return (0, 0, skipped);
-                    }
+            match self.doc_silo.read().get_many(&to_refresh) {
+                Ok(docs) => docs,
+                Err(e) => {
+                    tracing::warn!("doc_cache_refresh_slots get_many failed: {e}");
+                    return (0, 0, skipped);
                 }
             };
 
@@ -7420,9 +7051,7 @@ impl ConcurrentEngine {
             .map_err(|e| crate::error::BitdexError::Storage(format!("pin filter gen: {e}")))?;
         let gen_sort = sort_s.pin_generation()
             .map_err(|e| crate::error::BitdexError::Storage(format!("pin sort gen: {e}")))?;
-        let gen_doc = self.docstore.read().pin_generation()
-            .map_err(|e| crate::error::BitdexError::Storage(format!("pin doc gen: {e}")))?;
-        eprintln!("Pinned shard generations: alive={gen_alive}, filter={gen_filter}, sort={gen_sort}, doc={gen_doc}");
+        eprintln!("Pinned shard generations: alive={gen_alive}, filter={gen_filter}, sort={gen_sort}");
         Ok(Some(gen_alive))
     }
 
@@ -7546,41 +7175,6 @@ impl ConcurrentEngine {
             }
         }
 
-        if compact_docs && self.slot_counter() > 0 {
-            let doc_store_arc = self.docstore.read().shard_store_arc();
-            let slot_counter = self.slot_counter();
-            let max_shard = if slot_counter > 0 {
-                (slot_counter - 1) >> crate::shard_store_doc::SHARD_SHIFT_PUB
-            } else {
-                0
-            };
-            let doc_count = (max_shard + 1) as u64;
-            let doc_errors = AtomicU64::new(0);
-            let doc_compacted = AtomicU64::new(0);
-            let doc_skipped = AtomicU64::new(0);
-
-            eprintln!("compact_all: compacting {doc_count} doc shards (0..={max_shard})");
-
-            pool.install(|| {
-                (0..=max_shard).into_par_iter().for_each(|shard_id| {
-                    match doc_store_arc.compact_shard_bounded(&shard_id, frozen_gen, frozen_gen) {
-                        Ok(true) => { doc_compacted.fetch_add(1, Ordering::Relaxed); }
-                        Ok(false) => { doc_skipped.fetch_add(1, Ordering::Relaxed); }
-                        Err(e) => {
-                            eprintln!("compact doc shard {shard_id}: {e}");
-                            doc_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    progress.fetch_add(1, Ordering::Relaxed);
-                });
-            });
-
-            result.shards_scanned += doc_count;
-            result.shards_compacted += doc_compacted.load(Ordering::Relaxed);
-            result.shards_skipped += doc_skipped.load(Ordering::Relaxed);
-            if doc_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
-        }
-
         // Grace period + delete old generations
         if !any_failed && frozen_gen > 0 {
             std::thread::sleep(Duration::from_secs(5));
@@ -7592,12 +7186,7 @@ impl ConcurrentEngine {
                     if let Err(e) = sort_s.delete_generation(gen) { eprintln!("compact_all: delete sort gen {gen}: {e}"); }
                 }
             }
-            if compact_docs {
-                let doc_store_arc = self.docstore.read().shard_store_arc();
-                for gen in 0..frozen_gen {
-                    if let Err(e) = doc_store_arc.delete_generation(gen) { eprintln!("compact_all: delete doc gen {gen}: {e}"); }
-                }
-            }
+            let _ = compact_docs;
             eprintln!("compact_all: deleted generations 0..{}", frozen_gen - 1);
         } else if any_failed {
             eprintln!("compact_all: skipping old gen deletion due to errors");
@@ -7758,7 +7347,7 @@ impl ConcurrentEngine {
     /// Persist documents to the docstore on a background thread.
     /// Returns a JoinHandle to wait for completion. The docs Vec is consumed.
     pub fn spawn_docstore_writer(&self, docs: Vec<(u32, Document)>) -> JoinHandle<()> {
-        let docstore = Arc::clone(&self.docstore);
+        let docstore = Arc::clone(&self.doc_silo);
         thread::spawn(move || {
             let batch_size = 100_000;
             let mut batch: Vec<(u32, StoredDoc)> = Vec::with_capacity(batch_size);
@@ -7787,14 +7376,14 @@ impl ConcurrentEngine {
         for (slot, doc) in docs {
             batch.push((*slot, StoredDoc { fields: doc.fields.clone(), schema_version: 0 }));
             if batch.len() >= batch_size {
-                if let Err(e) = self.docstore.write().put_batch(&batch) {
+                if let Err(e) = self.doc_silo.write().put_batch(&batch) {
                     eprintln!("write_docs_to_docstore: batch write failed: {e}");
                 }
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            if let Err(e) = self.docstore.write().put_batch(&batch) {
+            if let Err(e) = self.doc_silo.write().put_batch(&batch) {
                 eprintln!("write_docs_to_docstore: batch write failed: {e}");
             }
         }
@@ -7999,685 +7588,6 @@ impl ConcurrentEngine {
         staging.slots.alive_or_bitmap(&accum.alive);
         // Store back — in loading mode, no snapshot publish overhead
         self.inner.store(Arc::new(staging));
-    }
-    /// Build all bitmap indexes from the docstore.
-    ///
-    /// Designed for "build index" boot mode: starts from bare docs on disk,
-    /// constructs alive bitmap + all filter + all sort bitmaps from scratch.
-    /// Uses the packed decode path (skips StoredDoc allocation) for speed.
-    ///
-    /// Progress callback receives (docs_processed, elapsed_secs, rss_bytes)
-    /// at regular intervals for monitoring.
-    ///
-    /// Returns (docs_processed, elapsed_secs) on success.
-    pub fn build_all_from_docstore(
-        &self,
-        progress: Arc<AtomicU64>,
-        memory_cb: Option<Box<dyn Fn(u64, f64, u64) + Send + Sync>>,
-    ) -> Result<(u64, f64)> {
-        use crate::shard_store_doc::PackedValue;
-
-        let t0 = Instant::now();
-        let sort_configs = self.config.sort_fields.clone();
-        let filter_configs = self.config.filter_fields.clone();
-        let sort_names: Vec<&str> = sort_configs.iter().map(|c| c.name.as_str()).collect();
-        let sort_bits: Vec<usize> = sort_configs.iter().map(|c| c.bits as usize).collect();
-        let filter_names: Vec<&str> = filter_configs.iter().map(|c| c.name.as_str()).collect();
-        eprintln!("build_all: {} filter fields, {} sort fields",
-            filter_names.len(), sort_names.len());
-        // Open a read-only DocStore for parallel reads
-        let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("open reader docstore: {e}")))?;
-        // Build u16 field dictionary → field position lookup tables
-        let field_dict = reader.field_to_idx();
-        let mut filter_idx_map: HashMap<u16, usize> = HashMap::new();
-        let mut sort_idx_map: HashMap<u16, (usize, usize)> = HashMap::new();
-        for (fi, &fname) in filter_names.iter().enumerate() {
-            if let Some(&idx) = field_dict.get(fname) {
-                filter_idx_map.insert(idx, fi);
-            }
-        }
-        for (si, &sname) in sort_names.iter().enumerate() {
-            if let Some(&idx) = field_dict.get(sname) {
-                sort_idx_map.insert(idx, (si, sort_bits[si]));
-            }
-        }
-        eprintln!("build_all: filter fields mapped: {}/{}, sort fields mapped: {}/{}",
-            filter_idx_map.len(), filter_names.len(),
-            sort_idx_map.len(), sort_names.len());
-        // Discover max shard by scanning docstore directory
-        let shards_dir = ds_path.join("shards");
-        let mut max_shard_id = 0u32;
-        if let Ok(entries) = std::fs::read_dir(&shards_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
-                        for sub in sub_entries.flatten() {
-                            if let Some(stem) = sub.path().file_stem() {
-                                if let Ok(id) = stem.to_string_lossy().parse::<u32>() {
-                                    max_shard_id = max_shard_id.max(id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let num_shards = max_shard_id + 1;
-        eprintln!("build_all: {} shards to scan", num_shards);
-        // Start memory monitoring thread
-        let monitor_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let monitor_progress = progress.clone();
-        let monitor_active_clone = monitor_active.clone();
-        let monitor_handle = if memory_cb.is_some() {
-            let cb = memory_cb.unwrap();
-            let t0_clone = t0;
-            Some(std::thread::spawn(move || {
-                while monitor_active_clone.load(Ordering::Relaxed) {
-                    let docs = monitor_progress.load(Ordering::Relaxed);
-                    let elapsed = t0_clone.elapsed().as_secs_f64();
-                    let rss = get_rss_bytes();
-                    cb(docs, elapsed, rss);
-                    std::thread::sleep(Duration::from_secs(5));
-                }
-            }))
-        } else {
-            None
-        };
-        // Channel-based merge: rayon workers send chunk results to a single
-        // merge thread. This bounds peak memory to ~1 final accumulator + 1
-        // in-flight chunk, instead of 32 thread accumulators during tree reduce.
-        type FilterMap = HashMap<(usize, u64), RoaringBitmap>;
-        struct ChunkResult {
-            sort_layers: Vec<Vec<RoaringBitmap>>,
-            filter_map: FilterMap,
-            alive: RoaringBitmap,
-            count: u64,
-        }
-        let chunk_size = 500u32;
-        let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
-        // Bounded channel — backpressure if merge thread falls behind
-        let (tx, rx) = crossbeam_channel::bounded::<ChunkResult>(4);
-        // Merge thread: accumulates into staging directly
-        let _sort_bits_clone = sort_bits.clone();
-        let filter_configs_clone = filter_configs.clone();
-        let sort_configs_clone = sort_configs.clone();
-        let inner_clone = self.inner.clone();
-        let _progress_merge = progress.clone();
-        let merge_handle = thread::spawn(move || {
-            let mut staging = {
-                let snap = inner_clone.load_full();
-                (*snap).clone()
-            };
-            // Pre-clear all fields for fresh build
-            for fc in &filter_configs_clone {
-                staging.filters.add_field(fc.clone());
-            }
-            for sc in &sort_configs_clone {
-                staging.sorts.add_field(sc.clone());
-            }
-            let mut total_merged = 0u64;
-            while let Ok(chunk) = rx.recv() {
-                // Merge alive
-                staging.slots.alive_or_bitmap(&chunk.alive);
-                // Merge filter bitmaps directly into staging fields
-                for ((fi, value), bitmap) in chunk.filter_map {
-                    let fname = &filter_configs_clone[fi].name;
-                    if let Some(field) = staging.filters.get_field(fname) {
-                        field.or_bitmap(value, &bitmap);
-                    }
-                }
-                // Merge sort layers directly into staging fields
-                for (si, layers) in chunk.sort_layers.into_iter().enumerate() {
-                    let sname = &sort_configs_clone[si].name;
-                    if let Some(field) = staging.sorts.get_field_mut(sname) {
-                        for (bit, bitmap) in layers.into_iter().enumerate() {
-                            if !bitmap.is_empty() {
-                                field.or_layer(bit, &bitmap);
-                            }
-                        }
-                    }
-                }
-                total_merged += chunk.count;
-            }
-            (staging, total_merged)
-        });
-        // Rayon workers: process chunks, send results over channel
-        (0..num_chunks)
-            .into_par_iter()
-            .for_each_with(tx, |tx, chunk_idx| {
-                let shard_start = chunk_idx * chunk_size;
-                let shard_end = std::cmp::min(shard_start + chunk_size, num_shards);
-                let mut sort_layers: Vec<Vec<RoaringBitmap>> = sort_bits.iter().map(|&b| {
-                    (0..b).map(|_| RoaringBitmap::new()).collect()
-                }).collect();
-                let mut filter_map: FilterMap = FilterMap::new();
-                let mut alive = RoaringBitmap::new();
-                let mut count = 0u64;
-                for shard_id in shard_start..shard_end {
-                    let packed_docs = match reader.get_shard_packed(shard_id) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    for (slot_id, pairs) in &packed_docs {
-                        alive.insert(*slot_id);
-                        for (field_idx, pv) in pairs {
-                            if let Some(&fi) = filter_idx_map.get(field_idx) {
-                                match pv {
-                                    PackedValue::I(v) => {
-                                        filter_map
-                                            .entry((fi, *v as u64))
-                                            .or_insert_with(RoaringBitmap::new)
-                                            .insert(*slot_id);
-                                    }
-                                    PackedValue::B(b) => {
-                                        filter_map
-                                            .entry((fi, if *b { 1 } else { 0 }))
-                                            .or_insert_with(RoaringBitmap::new)
-                                            .insert(*slot_id);
-                                    }
-                                    PackedValue::Mi(vals) => {
-                                        for v in vals {
-                                            filter_map
-                                                .entry((fi, *v as u64))
-                                                .or_insert_with(RoaringBitmap::new)
-                                                .insert(*slot_id);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if let Some(&(si, bits)) = sort_idx_map.get(field_idx) {
-                                if let PackedValue::I(v) = pv {
-                                    let value = (*v).max(0) as u32;
-                                    for bit in 0..bits {
-                                        if (value >> bit) & 1 == 1 {
-                                            sort_layers[si][bit].insert(*slot_id);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        count += 1;
-                    }
-                }
-                progress.fetch_add(count, Ordering::Relaxed);
-                // Send chunk to merge thread (blocks if channel full = backpressure)
-                let _ = tx.send(ChunkResult {
-                    sort_layers,
-                    filter_map,
-                    alive,
-                    count,
-                });
-            });
-        // Wait for merge thread to finish
-        let (staging, _total_merged) = merge_handle.join()
-            .expect("merge thread panicked");
-        let read_elapsed = t0.elapsed().as_secs_f64();
-        let total_docs = progress.load(Ordering::Relaxed);
-        eprintln!("build_all: read+merge phase complete in {:.1}s ({} docs, {:.0} docs/s)",
-            read_elapsed, total_docs, total_docs as f64 / read_elapsed);
-        // Publish the fully built staging
-        self.publish_staging(staging);
-        // Clear all pending loads (everything is now loaded)
-        {
-            let mut pending = self.pending_filter_loads.lock();
-            pending.clear();
-        }
-        {
-            let mut pending = self.pending_sort_loads.lock();
-            pending.clear();
-        }
-        // Stop memory monitor
-        monitor_active.store(false, Ordering::Relaxed);
-        if let Some(handle) = monitor_handle {
-            handle.join().ok();
-        }
-        let total_elapsed = t0.elapsed().as_secs_f64();
-        let rss = get_rss_bytes();
-        eprintln!("build_all: complete in {:.1}s — {} docs, RSS={:.2} GB",
-            total_elapsed, total_docs, rss as f64 / 1e9);
-        Ok((total_docs, total_elapsed))
-    }
-    /// Rebuild sort and/or filter bitmaps from the docstore.
-    ///
-    /// Iterates all alive slots, reads each document from the docstore, and
-    /// reconstructs the requested bitmap fields from scratch. This is used to
-    /// repair corrupt or empty bitmap snapshots when the docstore is intact.
-    ///
-    /// The rebuilt bitmaps completely replace the existing ones for the specified
-    /// fields — existing data is cleared before the new bitmaps are applied.
-    ///
-    /// Returns (slots_processed, fields_rebuilt) on success.
-    pub fn rebuild_fields_from_docstore(
-        &self,
-        sort_fields: Option<Vec<String>>,
-        filter_fields: Option<Vec<String>>,
-        progress: Arc<AtomicU64>,
-    ) -> Result<(u64, Vec<String>)> {
-        let t0 = Instant::now();
-        // Determine which fields to rebuild
-        let rebuild_all = sort_fields.is_none() && filter_fields.is_none();
-        let sort_configs: Vec<_> = match &sort_fields {
-            Some(names) => self.config.sort_fields.iter()
-                .filter(|sc| names.contains(&sc.name))
-                .cloned()
-                .collect(),
-            None if rebuild_all => self.config.sort_fields.clone(),
-            None => vec![],
-        };
-        let filter_configs: Vec<_> = match &filter_fields {
-            Some(names) => self.config.filter_fields.iter()
-                .filter(|fc| names.contains(&fc.name))
-                .cloned()
-                .collect(),
-            None if rebuild_all => self.config.filter_fields.clone(),
-            None => vec![],
-        };
-        let rebuilt_names: Vec<String> = sort_configs.iter().map(|c| c.name.clone())
-            .chain(filter_configs.iter().map(|c| c.name.clone()))
-            .collect();
-        if sort_configs.is_empty() && filter_configs.is_empty() {
-            return Ok((0, rebuilt_names));
-        }
-        eprintln!("rebuild: sort fields={:?}, filter fields={:?}",
-            sort_configs.iter().map(|c| &c.name).collect::<Vec<_>>(),
-            filter_configs.iter().map(|c| &c.name).collect::<Vec<_>>());
-        // Get alive bitmap from current snapshot
-        let snap = self.inner.load_full();
-        let alive = {
-            let mut tmp = (*snap).clone();
-            tmp.slots.merge_alive();
-            tmp.slots.alive_bitmap().clone()
-        };
-        let total_alive = alive.len();
-        eprintln!("rebuild: {} alive slots to process", total_alive);
-        // Parallel shard-based iteration using rayon fold+reduce.
-        // Open a second read-only DocStore (no mutex) for parallel reads.
-        let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("open reader docstore: {e}")))?;
-        let max_slot = alive.max().unwrap_or(0);
-        let max_shard = max_slot >> 9; // SHARD_SHIFT = 9
-        let num_shards = max_shard + 1;
-        eprintln!("rebuild: {} shards to scan with rayon", num_shards);
-        // Pre-build field name lists for efficient lookup in inner loop
-        let sort_names: Vec<&str> = sort_configs.iter().map(|c| c.name.as_str()).collect();
-        let sort_bits: Vec<usize> = sort_configs.iter().map(|c| c.bits as usize).collect();
-        let filter_names: Vec<&str> = filter_configs.iter().map(|c| c.name.as_str()).collect();
-        // Accumulator: per-sort-field pre-allocated layer bitmaps + filter map
-        type FilterMap = HashMap<(usize, u64), RoaringBitmap>; // (field_idx, value) -> bm
-        struct Accum {
-            // sort_layers[field_idx][bit] = bitmap
-            sort_layers: Vec<Vec<RoaringBitmap>>,
-            filter_map: FilterMap,
-            count: u64,
-        }
-        let make_accum = || Accum {
-            sort_layers: sort_bits.iter().map(|&b| {
-                (0..b).map(|_| RoaringBitmap::new()).collect()
-            }).collect(),
-            filter_map: FilterMap::new(),
-            count: 0,
-        };
-        // Chunk shards into batches of 500 for rayon — reduces task overhead
-        // while still getting good parallelism (239K/500 = ~479 tasks)
-        let chunk_size = 500u32;
-        let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
-        let merged = (0..num_chunks)
-            .into_par_iter()
-            .fold(make_accum, |mut acc, chunk_idx| {
-                let shard_start = chunk_idx * chunk_size;
-                let shard_end = std::cmp::min(shard_start + chunk_size, num_shards);
-                for shard_id in shard_start..shard_end {
-                    let docs = match reader.get_shard(shard_id) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    for (slot_id, doc) in &docs {
-                        if !alive.contains(*slot_id) {
-                            continue;
-                        }
-                        // Filter bitmap extraction (indexed by position)
-                        for (fi, &fname) in filter_names.iter().enumerate() {
-                            if let Some(fv) = doc.fields.get(fname) {
-                                match fv {
-                                    crate::mutation::FieldValue::Single(v) => {
-                                        if let Some(key) = value_to_bitmap_key(v) {
-                                            acc.filter_map
-                                                .entry((fi, key))
-                                                .or_insert_with(RoaringBitmap::new)
-                                                .insert(*slot_id);
-                                        }
-                                    }
-                                    crate::mutation::FieldValue::Multi(vals) => {
-                                        for v in vals {
-                                            if let Some(key) = value_to_bitmap_key(v) {
-                                                acc.filter_map
-                                                    .entry((fi, key))
-                                                    .or_insert_with(RoaringBitmap::new)
-                                                    .insert(*slot_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Sort bitmap extraction (direct layer access, no HashMap)
-                        for (si, &sname) in sort_names.iter().enumerate() {
-                            if let Some(fv) = doc.fields.get(sname) {
-                                if let crate::mutation::FieldValue::Single(ref v) = fv {
-                                    if let Some(value) = value_to_sort_u32(v) {
-                                        let num_bits = sort_bits[si];
-                                        for bit in 0..num_bits {
-                                            if (value >> bit) & 1 == 1 {
-                                                acc.sort_layers[si][bit].insert(*slot_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        acc.count += 1;
-                    }
-                }
-                // Update progress (approximate — each thread reports its own count)
-                progress.fetch_add(acc.count, Ordering::Relaxed);
-                acc.count = 0; // Reset so we don't double-count on next chunk
-                acc
-            })
-            .reduce(make_accum, |mut a, b| {
-                // Merge sort layers via OR
-                for (si, b_layers) in b.sort_layers.into_iter().enumerate() {
-                    for (bit, bm) in b_layers.into_iter().enumerate() {
-                        a.sort_layers[si][bit] |= bm;
-                    }
-                }
-                // Merge filter maps
-                for (key, bm) in b.filter_map {
-                    a.filter_map.entry(key)
-                        .and_modify(|existing| *existing |= &bm)
-                        .or_insert(bm);
-                }
-                a.count += b.count;
-                a
-            });
-        let slots_processed = progress.load(Ordering::Relaxed);
-        let read_elapsed = t0.elapsed();
-        eprintln!("rebuild: read phase complete in {:.1}s ({} slots, {:.0} slots/s)",
-            read_elapsed.as_secs_f64(), slots_processed,
-            slots_processed as f64 / read_elapsed.as_secs_f64());
-        // Apply to staging: clone current snapshot, clear target fields, OR in rebuilt data
-        let mut staging = self.clone_staging();
-        // Clear and replace sort fields
-        for sc in &sort_configs {
-            staging.sorts.add_field(sc.clone()); // replaces with fresh empty field
-        }
-        // Clear and replace filter fields
-        for fc in &filter_configs {
-            staging.filters.add_field(fc.clone()); // replaces with fresh empty field
-        }
-        // Apply rebuilt filter bitmaps (keyed by field index)
-        for ((fi, value), bitmap) in merged.filter_map {
-            let fname = &filter_configs[fi].name;
-            if let Some(field) = staging.filters.get_field(fname) {
-                field.or_bitmap(value, &bitmap);
-            }
-        }
-        // Apply rebuilt sort layer bitmaps
-        for (si, layers) in merged.sort_layers.into_iter().enumerate() {
-            let sname = &sort_configs[si].name;
-            if let Some(field) = staging.sorts.get_field_mut(sname) {
-                for (bit, bitmap) in layers.into_iter().enumerate() {
-                    if !bitmap.is_empty() {
-                        field.or_layer(bit, &bitmap);
-                    }
-                }
-            }
-        }
-        // Publish the rebuilt staging
-        self.publish_staging(staging);
-        // Remove rebuilt fields from pending lazy-load sets (they're now loaded)
-        {
-            let mut pending = self.pending_filter_loads.lock();
-            for fc in &filter_configs {
-                pending.remove(&fc.name);
-            }
-        }
-        {
-            let mut pending = self.pending_sort_loads.lock();
-            for sc in &sort_configs {
-                pending.remove(&sc.name);
-            }
-        }
-        let total_elapsed = t0.elapsed();
-        eprintln!("rebuild: complete in {:.1}s — {} slots, {} fields rebuilt",
-            total_elapsed.as_secs_f64(), slots_processed, rebuilt_names.len());
-        Ok((slots_processed, rebuilt_names))
-    }
-    /// Add new filter and/or sort fields, building their bitmaps from the docstore.
-    ///
-    /// Unlike `rebuild_fields_from_docstore` (which rebuilds fields already in the config),
-    /// this method adds entirely new fields that didn't exist before. It:
-    /// 1. Validates the requested fields don't already exist
-    /// 2. Adds empty field structures to the staging snapshot
-    /// 3. Scans all alive documents to build bitmaps for the new fields
-    /// 4. Publishes the updated snapshot
-    ///
-    /// The caller (server) is responsible for updating the persisted config.
-    /// Returns (slots_processed, field_names_added).
-    pub fn add_fields_from_docstore(
-        &self,
-        new_filters: Vec<FilterFieldConfig>,
-        new_sorts: Vec<SortFieldConfig>,
-        progress: Arc<AtomicU64>,
-    ) -> Result<(u64, Vec<String>)> {
-        let t0 = Instant::now();
-        if new_filters.is_empty() && new_sorts.is_empty() {
-            return Ok((0, vec![]));
-        }
-        // Validate no duplicates with existing fields
-        {
-            let snap = self.inner.load_full();
-            for fc in &new_filters {
-                if snap.filters.get_field(&fc.name).is_some() {
-                    return Err(crate::error::BitdexError::Config(
-                        format!("Filter field '{}' already exists", fc.name)));
-                }
-            }
-            for sc in &new_sorts {
-                if snap.sorts.get_field(&sc.name).is_some() {
-                    return Err(crate::error::BitdexError::Config(
-                        format!("Sort field '{}' already exists", sc.name)));
-                }
-            }
-        }
-        let added_names: Vec<String> = new_filters.iter().map(|c| c.name.clone())
-            .chain(new_sorts.iter().map(|c| c.name.clone()))
-            .collect();
-        eprintln!("add_fields: filter={:?}, sort={:?}",
-            new_filters.iter().map(|c| &c.name).collect::<Vec<_>>(),
-            new_sorts.iter().map(|c| &c.name).collect::<Vec<_>>());
-        // Get alive bitmap
-        let snap = self.inner.load_full();
-        let alive = {
-            let mut tmp = (*snap).clone();
-            tmp.slots.merge_alive();
-            tmp.slots.alive_bitmap().clone()
-        };
-        let total_alive = alive.len();
-        eprintln!("add_fields: {} alive slots to scan", total_alive);
-        // Open read-only docstore for parallel reads
-        let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("open reader docstore: {e}")))?;
-        let max_slot = alive.max().unwrap_or(0);
-        let max_shard = max_slot >> 9;
-        let num_shards = max_shard + 1;
-        // Build field name/config lists for the inner loop
-        let sort_names: Vec<&str> = new_sorts.iter().map(|c| c.name.as_str()).collect();
-        let sort_bits: Vec<usize> = new_sorts.iter().map(|c| c.bits as usize).collect();
-        let filter_names: Vec<&str> = new_filters.iter().map(|c| c.name.as_str()).collect();
-        // Parallel shard scan — same pattern as rebuild_fields_from_docstore
-        type FilterMap = HashMap<(usize, u64), RoaringBitmap>;
-        struct Accum {
-            sort_layers: Vec<Vec<RoaringBitmap>>,
-            filter_map: FilterMap,
-            count: u64,
-        }
-        let make_accum = || Accum {
-            sort_layers: sort_bits.iter().map(|&b| {
-                (0..b).map(|_| RoaringBitmap::new()).collect()
-            }).collect(),
-            filter_map: FilterMap::new(),
-            count: 0,
-        };
-        let chunk_size = 500u32;
-        let num_chunks = (num_shards + chunk_size - 1) / chunk_size;
-        let merged = (0..num_chunks)
-            .into_par_iter()
-            .fold(make_accum, |mut acc, chunk_idx| {
-                let shard_start = chunk_idx * chunk_size;
-                let shard_end = std::cmp::min(shard_start + chunk_size, num_shards);
-                for shard_id in shard_start..shard_end {
-                    let docs = match reader.get_shard(shard_id) {
-                        Ok(d) => d,
-                        Err(_) => continue,
-                    };
-                    for (slot_id, doc) in &docs {
-                        if !alive.contains(*slot_id) {
-                            continue;
-                        }
-                        for (fi, &fname) in filter_names.iter().enumerate() {
-                            if let Some(fv) = doc.fields.get(fname) {
-                                match fv {
-                                    crate::mutation::FieldValue::Single(v) => {
-                                        if let Some(key) = value_to_bitmap_key(v) {
-                                            acc.filter_map
-                                                .entry((fi, key))
-                                                .or_insert_with(RoaringBitmap::new)
-                                                .insert(*slot_id);
-                                        }
-                                    }
-                                    crate::mutation::FieldValue::Multi(vals) => {
-                                        for v in vals {
-                                            if let Some(key) = value_to_bitmap_key(v) {
-                                                acc.filter_map
-                                                    .entry((fi, key))
-                                                    .or_insert_with(RoaringBitmap::new)
-                                                    .insert(*slot_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        for (si, &sname) in sort_names.iter().enumerate() {
-                            if let Some(fv) = doc.fields.get(sname) {
-                                if let crate::mutation::FieldValue::Single(ref v) = fv {
-                                    if let Some(value) = value_to_sort_u32(v) {
-                                        let num_bits = sort_bits[si];
-                                        for bit in 0..num_bits {
-                                            if (value >> bit) & 1 == 1 {
-                                                acc.sort_layers[si][bit].insert(*slot_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        acc.count += 1;
-                    }
-                }
-                progress.fetch_add(acc.count, Ordering::Relaxed);
-                acc.count = 0;
-                acc
-            })
-            .reduce(make_accum, |mut a, b| {
-                for (si, b_layers) in b.sort_layers.into_iter().enumerate() {
-                    for (bit, bm) in b_layers.into_iter().enumerate() {
-                        a.sort_layers[si][bit] |= bm;
-                    }
-                }
-                for (key, bm) in b.filter_map {
-                    a.filter_map.entry(key)
-                        .and_modify(|existing| *existing |= &bm)
-                        .or_insert(bm);
-                }
-                a.count += b.count;
-                a
-            });
-        let slots_processed = progress.load(Ordering::Relaxed);
-        let scan_elapsed = t0.elapsed();
-        eprintln!("add_fields: scan complete in {:.1}s ({} slots, {:.0} slots/s)",
-            scan_elapsed.as_secs_f64(), slots_processed,
-            slots_processed as f64 / scan_elapsed.as_secs_f64());
-        // Apply: clone staging, add new empty fields, then OR in rebuilt bitmaps
-        let mut staging = self.clone_staging();
-        for fc in &new_filters {
-            staging.filters.add_field(fc.clone());
-        }
-        for sc in &new_sorts {
-            staging.sorts.add_field(sc.clone());
-        }
-        // Apply rebuilt filter bitmaps
-        for ((fi, value), bitmap) in merged.filter_map {
-            let fname = &new_filters[fi].name;
-            if let Some(field) = staging.filters.get_field(fname) {
-                field.or_bitmap(value, &bitmap);
-            }
-        }
-        // Apply rebuilt sort layer bitmaps
-        for (si, layers) in merged.sort_layers.into_iter().enumerate() {
-            let sname = &new_sorts[si].name;
-            if let Some(field) = staging.sorts.get_field_mut(sname) {
-                for (bit, bitmap) in layers.into_iter().enumerate() {
-                    if !bitmap.is_empty() {
-                        field.or_layer(bit, &bitmap);
-                    }
-                }
-            }
-        }
-        self.publish_staging(staging);
-        let total_elapsed = t0.elapsed();
-        eprintln!("add_fields: complete in {:.1}s — {} slots, {} fields added",
-            total_elapsed.as_secs_f64(), slots_processed, added_names.len());
-        Ok((slots_processed, added_names))
-    }
-    /// Validate that field names exist in the docstore by checking one shard.
-    /// Returns Ok(()) if all fields are found, or Err with the missing field names.
-    pub fn validate_fields_in_docstore(&self, field_names: &[&str]) -> Result<Vec<String>> {
-        let ds_path = self.docstore_root.as_ref().clone();
-        let reader = DocStoreV3::open(&ds_path)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("open reader docstore: {e}")))?;
-        // Find a non-empty shard to sample
-        let snap = self.inner.load_full();
-        let alive = snap.slots.alive_bitmap();
-        let sample_slot = alive.min()
-            .ok_or_else(|| crate::error::BitdexError::Config(
-                "No alive documents to validate fields against".to_string()))?;
-        let sample_shard = sample_slot >> 9;
-        let docs = reader.get_shard(sample_shard)
-            .map_err(|e| crate::error::BitdexError::Storage(
-                format!("read sample shard {}: {e}", sample_shard)))?;
-        if docs.is_empty() {
-            return Err(crate::error::BitdexError::Config(
-                "Sample shard is empty — cannot validate fields".to_string()));
-        }
-        let (_, sample_doc) = &docs[0];
-        let available_fields: HashSet<&str> = sample_doc.fields.keys()
-            .map(|k| k.as_str())
-            .collect();
-        let missing: Vec<String> = field_names.iter()
-            .filter(|&&name| !available_fields.contains(name))
-            .map(|&name| name.to_string())
-            .collect();
-        Ok(missing)
     }
     /// Remove filter and/or sort fields from the engine.
     ///
@@ -10826,7 +9736,7 @@ mod tests {
         // Write 10 Set ops to the same (slot=0, field=0) — 9 of 10 are stale after compaction.
         let field_idx: u16 = 0;
         {
-            let mut ds = engine.docstore.write();
+            let mut ds = engine.doc_silo.write();
             for v in 0..10i64 {
                 let packed = rmp_serde::to_vec(&PackedValue::I(v)).unwrap();
                 ds.append_tuple(0, field_idx, &packed).unwrap();
@@ -10836,27 +9746,27 @@ mod tests {
         // Verify the shard has ops before compaction
         let shard_key = SlotHexShard::slot_to_shard(0);
         let ops_before = {
-            let ds = engine.docstore.read();
+            let ds = engine.doc_silo.read();
             ds.shard_store().ops_count(&shard_key).unwrap().unwrap_or(0)
         };
         assert_eq!(ops_before, 10, "should have 10 ops before compaction");
 
         // Trigger compaction directly on the shard (bypasses threshold check)
         {
-            let ds = engine.docstore.read();
+            let ds = engine.doc_silo.read();
             ds.shard_store().compact_current(&shard_key).unwrap();
         }
 
         // After compaction, ops should be folded into a snapshot (0 ops remaining)
         let ops_after = {
-            let ds = engine.docstore.read();
+            let ds = engine.doc_silo.read();
             ds.shard_store().ops_count(&shard_key).unwrap().unwrap_or(0)
         };
         assert_eq!(ops_after, 0, "ops should be 0 after compaction");
 
         // Verify the data is still correct — the last Set (value=9) wins
         {
-            let ds = engine.docstore.read();
+            let ds = engine.doc_silo.read();
             let snap = ds.shard_store().read(&shard_key).unwrap().unwrap();
             let fields = snap.docs.get(&0).unwrap();
             assert_eq!(fields[0], (0, PackedValue::I(9)));
@@ -10978,7 +9888,7 @@ mod tests {
         let meta = FieldMeta::from_config(engine.config());
         let sender = engine.mutation_sender();
         let mut sink = CoalescerSink::new(sender);
-        let mut doc_writer = DocWriter::new(engine.docstore_arc());
+        let mut doc_writer = DocWriter::new(engine.doc_silo_arc());
 
         // Apply ops for alive slot — should succeed
         let mut entries = vec![EntityOps {
@@ -11542,7 +10452,7 @@ mod tests {
         wait_for_flush(&engine, 1, 500);
 
         // Read the doc back from DocStoreV3
-        let doc = engine.docstore.read().get(1).unwrap();
+        let doc = engine.doc_silo.read().get(1).unwrap();
         assert!(doc.is_some(), "doc should be readable after put + flush");
         let doc = doc.unwrap();
         assert_eq!(
@@ -11600,7 +10510,7 @@ mod tests {
         assert_eq!(result.ids, vec![1], "nsfwLevel=3 should match after upsert");
 
         // Verify the stored doc has the new values
-        let doc = engine.docstore.read().get(1).unwrap().unwrap();
+        let doc = engine.doc_silo.read().get(1).unwrap().unwrap();
         assert_eq!(
             doc.fields.get("nsfwLevel"),
             Some(&FieldValue::Single(Value::Integer(3))),
@@ -11621,7 +10531,7 @@ mod tests {
         wait_for_flush(&engine, 1, 500);
 
         // Doc should exist
-        assert!(engine.docstore.read().get(1).unwrap().is_some());
+        assert!(engine.doc_silo.read().get(1).unwrap().is_some());
 
         // Delete — this reads old doc from DocStoreV3 to clear filter/sort bits
         engine.delete(1).unwrap();
@@ -11667,7 +10577,7 @@ mod tests {
 
         // Read docs back via DocStoreV3
         for slot in 0..10u32 {
-            let doc = engine.docstore.read().get(slot).unwrap();
+            let doc = engine.doc_silo.read().get(slot).unwrap();
             assert!(doc.is_some(), "slot {} should have a doc after bulk write", slot);
             let doc = doc.unwrap();
             let nsfw = doc.fields.get("nsfwLevel");

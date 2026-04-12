@@ -1222,9 +1222,8 @@ impl BitdexServer {
                                     // coherent with V3 for the steady-state sync-v2 path. Reads
                                     // prefer DocSilo whenever it's populated, so a V3-only write
                                     // would be invisible after a bulk dump.
-                                    let mut doc_writer = crate::ops_processor::DocWriter::new_dual(
-                                        engine.docstore_arc(),
-                                        engine.doc_silo(),
+                                    let mut doc_writer = crate::ops_processor::DocWriter::new(
+                                        engine.doc_silo_arc(),
                                     );
 
                                     let mut entries = batch.entries;
@@ -1715,45 +1714,9 @@ fn rebuild_on_boot(state: &SharedState) -> Result<(), String> {
         }
     });
 
-    let (total_docs, build_elapsed) = engine
-        .build_all_from_docstore(progress_clone, Some(memory_cb))
-        .map_err(|e| format!("build_all_from_docstore: {e}"))?;
-
-    let rss_after_build = get_rss_bytes();
-    eprintln!("Build complete: {} docs in {:.1}s ({:.0} docs/s), RSS={:.2} GB",
-        total_docs, build_elapsed, total_docs as f64 / build_elapsed, rss_after_build as f64 / 1e9);
-
-    // Step 3: Persist bitmaps to disk and unload from memory
-    eprintln!("Persisting bitmaps to disk...");
-    let persist_start = std::time::Instant::now();
-
-    engine.save_and_unload().map_err(|e| format!("save_and_unload: {e}"))?;
-
-    let persist_elapsed = persist_start.elapsed().as_secs_f64();
-    let rss_final = get_rss_bytes();
-    let total_elapsed = build_elapsed + persist_elapsed;
-
-    eprintln!("\n=== REBUILD COMPLETE ===");
-    eprintln!("  Docs:          {}", total_docs);
-    eprintln!("  Build:         {:.1}s", build_elapsed);
-    eprintln!("  Persist:       {:.1}s", persist_elapsed);
-    eprintln!("  Total:         {:.1}s ({:.1} min)", total_elapsed, total_elapsed / 60.0);
-    eprintln!("  RSS final:     {:.2} GB", rss_final as f64 / 1e9);
-    eprintln!("Server will now start with lazy bitmap loading.\n");
-
-    // Update task registry so the API reflects the rebuild
-    let guard = state.index.lock();
-    if let Some(idx) = guard.as_ref() {
-        if let Ok((tid, progress)) = idx.tasks.try_start(TaskType::Rebuild) {
-            progress.store(total_docs, Ordering::Release);
-            idx.tasks.set_complete(tid, Some(serde_json::json!({
-                "records_loaded": total_docs,
-                "elapsed_secs": total_elapsed,
-            })));
-        }
-    }
-
-    Ok(())
+    drop(memory_cb);
+    let _ = progress_clone;
+    Err("build_all_from_docstore removed — DocStoreV3 no longer exists. Re-dump from PG instead.".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -3797,7 +3760,7 @@ async fn handle_rebuild(
     tokio::task::spawn_blocking(move || {
         let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
 
-        match engine.rebuild_fields_from_docstore(sort_fields, filter_fields, progress.clone()) {
+        match Err::<(u64, Vec<String>), crate::error::BitdexError>(crate::error::BitdexError::Storage("rebuild_fields_from_docstore removed — DocStoreV3 deleted".into())) {
             Ok((slots, fields)) => {
                 if save {
                     guard.tasks.set_saving(task_id);
@@ -4048,7 +4011,7 @@ async fn handle_add_fields(
             .chain(req.sort_fields.iter().map(|f| f.name.as_str()))
             .collect();
 
-        match engine.validate_fields_in_docstore(&all_names) {
+        match Ok::<Vec<String>, crate::error::BitdexError>(Vec::new()) {
             Ok(missing) if !missing.is_empty() => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -4089,7 +4052,7 @@ async fn handle_add_fields(
     tokio::task::spawn_blocking(move || {
         let mut guard = TaskGuard { tasks: tasks_clone, task_id: Some(task_id) };
 
-        match engine.add_fields_from_docstore(filter_fields, sort_fields, progress) {
+        match Err::<(u64, Vec<String>), crate::error::BitdexError>(crate::error::BitdexError::Storage("add_fields_from_docstore removed — DocStoreV3 deleted".into())) {
             Ok((slots, fields)) => {
                 if save {
                     guard.tasks.set_saving(task_id);
@@ -5422,7 +5385,7 @@ async fn handle_silo_populate(
         }
     };
     let start = std::time::Instant::now();
-    let result = tokio::task::spawn_blocking(move || engine.copy_docstore_to_silo())
+    let result = tokio::task::spawn_blocking(move || -> crate::error::Result<(u64, u64)> { let _ = engine; Err(crate::error::BitdexError::Storage("copy_docstore_to_silo removed — DocStoreV3 deleted".into())) })
         .await
         .map_err(|e| format!("join: {e}"));
     let elapsed = start.elapsed().as_secs_f64();

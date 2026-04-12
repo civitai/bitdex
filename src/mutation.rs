@@ -2,7 +2,7 @@ use ahash::AHashMap as HashMap;
 use std::sync::Arc;
 use roaring::RoaringBitmap;
 use crate::config::{ComputedOp, ComputedField, Config};
-use crate::shard_store_doc::{DocStoreV3, StoredDoc};
+use crate::shard_store_doc::StoredDoc;
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
 use crate::query::Value;
@@ -645,7 +645,7 @@ pub struct MutationEngine<'a> {
     filters: &'a mut FilterIndex,
     sorts: &'a mut SortIndex,
     config: &'a Config,
-    docstore: &'a mut DocStoreV3,
+    docstore: &'a mut crate::doc_silo::DocSilo,
 }
 impl<'a> MutationEngine<'a> {
     pub fn new(
@@ -653,7 +653,7 @@ impl<'a> MutationEngine<'a> {
         filters: &'a mut FilterIndex,
         sorts: &'a mut SortIndex,
         config: &'a Config,
-        docstore: &'a mut DocStoreV3,
+        docstore: &'a mut crate::doc_silo::DocSilo,
     ) -> Self {
         Self {
             slots,
