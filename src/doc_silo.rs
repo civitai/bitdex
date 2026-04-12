@@ -1311,21 +1311,35 @@ impl DocSiloBulkWriter {
                 spill_paths.push(path);
             }
         }
+        // Collect fallback slot layouts that never spilled (kept in-memory).
+        // These must be captured here so they're not lost.
+        let mut fallback_unsorted: Vec<(u64, u64, u32)> = Vec::new();
         {
             let mut fallback = self.thread_slots.fallback.lock();
             if !fallback.layouts.is_empty() {
                 fallback.maybe_spill(&self.silo_root);
             }
-            // Drain remaining layouts into a temp vec to avoid borrow conflict
             let remaining: Vec<(u64, u64, u32)> = std::mem::take(&mut fallback.layouts);
             if !remaining.is_empty() {
                 if let Some(ref mut writer) = fallback.layout_file {
+                    let mut ok = true;
                     for &(key, offset, length) in &remaining {
-                        let _ = writer.write_all(&key.to_le_bytes());
-                        let _ = writer.write_all(&offset.to_le_bytes());
-                        let _ = writer.write_all(&length.to_le_bytes());
+                        if writer.write_all(&key.to_le_bytes()).is_err()
+                            || writer.write_all(&offset.to_le_bytes()).is_err()
+                            || writer.write_all(&length.to_le_bytes()).is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        // Write failed — keep entries in fallback_unsorted
+                        fallback_unsorted = remaining;
                     }
                     let _ = writer.flush();
+                } else {
+                    // No spill file — keep entries directly
+                    fallback_unsorted = remaining;
                 }
             }
             fallback.layout_file = None;
@@ -1359,12 +1373,14 @@ impl DocSiloBulkWriter {
             }
             let _ = std::fs::remove_file(path);
         }
-        // Also collect any remaining in-memory layouts from threads that
+        // Collect any remaining in-memory layouts from threads that
         // never hit the spill threshold (small dumps / tests)
         for cell in &self.thread_slots.slots {
             let slab = unsafe { &mut *cell.get() };
             layouts.append(&mut slab.layouts);
         }
+        // Collect fallback entries that never spilled
+        layouts.append(&mut fallback_unsorted);
         eprintln!(
             "DocSiloBulkWriter::finalize: read {} layouts from {} spill files",
             layouts.len(), spill_paths.len()
