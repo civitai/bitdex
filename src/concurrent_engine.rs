@@ -1766,8 +1766,13 @@ impl ConcurrentEngine {
                             // filter compaction (~5s). The write lock blocks doc reads
                             // briefly but compaction is fast (in-place writes to mmap).
                             // Threshold: 1 MB of ops log = ~10K ops at ~100 bytes each.
+                            //
+                            // CRITICAL: Skip during loading/dump phases. DumpMergeWriter
+                            // holds a raw *const pointer to the HashIndex. Compaction can
+                            // grow the HashIndex (drop old mmap + rebuild), turning the
+                            // writer's pointer into a dangling reference → SIGSEGV.
                             const DOC_SILO_COMPACT_THRESHOLD_BYTES: u64 = 1_024 * 1_024;
-                            if flush_cycle % COMPACTION_INTERVAL == 0 {
+                            if !is_loading && flush_cycle % COMPACTION_INTERVAL == 0 {
                                 let ops_bytes = flush_doc_silo.read().ops_size();
                                 if ops_bytes >= DOC_SILO_COMPACT_THRESHOLD_BYTES {
                                     if flush_doc_silo.read().has_ops() {
