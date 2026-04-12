@@ -1502,7 +1502,7 @@ mod tests {
     use super::*;
 
     fn make_doc(fields: &[(&str, FieldValue)]) -> StoredDoc {
-        let mut map = HashMap::new();
+        let mut map = ahash::AHashMap::new();
         for (k, v) in fields {
             map.insert(k.to_string(), v.clone());
         }
@@ -1668,4 +1668,89 @@ mod tests {
         assert!(got[2].is_some());
         assert!(got[3].is_none());
     }
+
+    // ── Cold restart ───────────────────────────────────────────────
+
+    #[test]
+    fn cold_restart_preserves_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut silo = DocSilo::open(dir.path()).unwrap();
+            silo.put(1, &make_doc(&[
+                ("nsfwLevel", FieldValue::Single(Value::Integer(8))),
+            ])).unwrap();
+            silo.put(2, &make_doc(&[
+                ("nsfwLevel", FieldValue::Single(Value::Integer(4))),
+            ])).unwrap();
+            silo.save_field_dict().unwrap();
+        }
+        // Reopen
+        let silo = DocSilo::open(dir.path()).unwrap();
+        let d1 = silo.get(1).unwrap().unwrap();
+        assert_eq!(d1.fields.get("nsfwLevel"), Some(&FieldValue::Single(Value::Integer(8))));
+        let d2 = silo.get(2).unwrap().unwrap();
+        assert_eq!(d2.fields.get("nsfwLevel"), Some(&FieldValue::Single(Value::Integer(4))));
+    }
+
+    #[test]
+    fn cold_restart_replays_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut silo = DocSilo::open(dir.path()).unwrap();
+            silo.put(1, &make_doc(&[
+                ("nsfwLevel", FieldValue::Single(Value::Integer(8))),
+            ])).unwrap();
+            let idx = silo.ensure_field_index("nsfwLevel");
+            silo.apply_op(&DocOp::Set { slot: 1, field: idx, value: PackedValue::I(16) }).unwrap();
+            silo.save_field_dict().unwrap();
+        }
+        let silo = DocSilo::open(dir.path()).unwrap();
+        let got = silo.get(1).unwrap().unwrap();
+        assert_eq!(got.fields.get("nsfwLevel"), Some(&FieldValue::Single(Value::Integer(16))));
+    }
+
+    #[test]
+    fn cold_restart_field_dict_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut silo = DocSilo::open(dir.path()).unwrap();
+            let idx_a = silo.ensure_field_index("nsfwLevel");
+            let idx_b = silo.ensure_field_index("tagIds");
+            silo.save_field_dict().unwrap();
+            assert_eq!(idx_a, 0);
+            assert_eq!(idx_b, 1);
+        }
+        let silo = DocSilo::open(dir.path()).unwrap();
+        assert_eq!(silo.field_to_idx().get("nsfwLevel"), Some(&0));
+        assert_eq!(silo.field_to_idx().get("tagIds"), Some(&1));
+    }
+
+    // ── Multi-phase dump (DumpMergeWriter) ─────────────────────────
+    // These tests define the contract for phases 2+. They will fail
+    // until DumpMergeWriter is ported from v3.
+
+    /*
+    #[test]
+    fn multi_phase_images_then_tags() {
+        // Phase 1: DocSiloBulkWriter writes image docs (nsfwLevel, sortAt)
+        // Phase 1 finalize: builds index
+        // Phase 2: DumpMergeWriter merge_put adds tagIds to existing docs
+        // Verify: get returns doc with BOTH nsfwLevel AND tagIds
+        todo!("Port DumpMergeWriter from v3")
+    }
+
+    #[test]
+    fn multi_phase_preserves_all_fields() {
+        // 3 phases, each adds different fields
+        // Final doc has all fields from all phases
+        todo!("Port DumpMergeWriter from v3")
+    }
+
+    #[test]
+    fn multi_phase_no_data_loss() {
+        // Phase 1: 1000 docs, Phase 2: merge into same 1000
+        // get_many returns 1000 docs, each with combined fields
+        todo!("Port DumpMergeWriter from v3")
+    }
+    */
 }
