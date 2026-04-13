@@ -1780,13 +1780,13 @@ impl ConcurrentEngine {
                             // writer's pointer into a dangling reference → SIGSEGV.
                             // Check BOTH is_loading (Phase 1 BulkWriter) AND
                             // dump_merge_active (Phase 2+ DumpMergeWriter).
-                            // Apr 12 2026: Lowered from 1 MB to 64 KB. At steady-state
-                            // ops rate (~30 DocOps/sec × 24 bytes = 720 bytes/sec), 1 MB
-                            // takes 23+ minutes to accumulate. Meanwhile every get_many
-                            // call scans the ENTIRE ops log under Mutex — at P99 with
-                            // 98 miss docs, this serializes 23 concurrent readers.
-                            // 64 KB = ~90s of ops accumulation, ~2700 ops to scan.
-                            const DOC_SILO_COMPACT_THRESHOLD_BYTES: u64 = 64 * 1_024;
+                            // Apr 13 2026: Raised back to 512 KB from 64 KB. The lower
+                            // threshold caused the janitor to compact too frequently,
+                            // and compact() holds a write lock on doc_silo that blocks
+                            // all doc reads. 512 KB = ~10 min accumulation at steady
+                            // state, ~21K ops to scan. Compaction now runs on a
+                            // background thread to avoid stalling the flush cycle.
+                            const DOC_SILO_COMPACT_THRESHOLD_BYTES: u64 = 512 * 1_024;
                             let merge_active = flush_dump_merge_active.load(Ordering::Relaxed);
                             if !is_loading && !merge_active && flush_cycle % COMPACTION_INTERVAL == 0 {
                                 let ops_bytes = flush_doc_silo.read().ops_size();
@@ -1796,18 +1796,29 @@ impl ConcurrentEngine {
                                 }
                                 if ops_bytes >= DOC_SILO_COMPACT_THRESHOLD_BYTES {
                                     if flush_doc_silo.read().has_ops() {
-                                        let compact_start = Instant::now();
-                                        match flush_doc_silo.write().compact() {
-                                            Ok(n) if n > 0 => {
-                                                let compact_ms = compact_start.elapsed().as_millis();
-                                                eprintln!("[janitor] DocSilo compaction folded {n} ops into data.bin in {compact_ms}ms (was {ops_bytes} bytes)");
-                                            }
-                                            Ok(_) => {
-                                                let compact_ms = compact_start.elapsed().as_millis();
-                                                eprintln!("[janitor] DocSilo compaction returned 0 ops folded in {compact_ms}ms (ops_bytes was {ops_bytes})");
-                                            }
-                                            Err(e) => eprintln!("[janitor] DocSilo compaction error: {e}"),
-                                        }
+                                        // Spawn compaction on a background thread so the
+                                        // flush cycle isn't blocked. compact() takes a
+                                        // write lock on doc_silo which blocks readers,
+                                        // but at least the flush thread can continue
+                                        // publishing snapshots and doing cache maintenance.
+                                        let bg_silo = Arc::clone(&flush_doc_silo);
+                                        std::thread::Builder::new()
+                                            .name("docsilo-compact".into())
+                                            .spawn(move || {
+                                                let compact_start = Instant::now();
+                                                match bg_silo.write().compact() {
+                                                    Ok(n) if n > 0 => {
+                                                        let compact_ms = compact_start.elapsed().as_millis();
+                                                        eprintln!("[janitor] DocSilo compaction folded {n} ops into data.bin in {compact_ms}ms (was {ops_bytes} bytes)");
+                                                    }
+                                                    Ok(_) => {
+                                                        let compact_ms = compact_start.elapsed().as_millis();
+                                                        eprintln!("[janitor] DocSilo compaction returned 0 ops folded in {compact_ms}ms (ops_bytes was {ops_bytes})");
+                                                    }
+                                                    Err(e) => eprintln!("[janitor] DocSilo compaction error: {e}"),
+                                                }
+                                            })
+                                            .ok(); // If thread spawn fails, skip this cycle
                                     }
                                 }
                             }
