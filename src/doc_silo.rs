@@ -715,15 +715,22 @@ impl DocSilo {
     }
 
     pub fn get_many(&self, slots: &[u32]) -> io::Result<Vec<Option<StoredDoc>>> {
+        let (docs, _timing) = self.get_many_timed(slots)?;
+        Ok(docs)
+    }
+
+    /// Like `get_many` but returns timing breakdown (mmap_nanos, ops_scan_nanos, ops_bytes).
+    pub fn get_many_timed(&self, slots: &[u32]) -> io::Result<(Vec<Option<StoredDoc>>, datasilo::GetManyTiming)> {
         let keys: Vec<u64> = slots.iter().map(|&s| slot_to_key(s)).collect();
-        let snapshots = self.silo.get_many(&keys)?;
-        Ok(snapshots
+        let (snapshots, timing) = self.silo.get_many_timed(&keys)?;
+        let docs = snapshots
             .into_iter()
             .map(|snap| match snap {
                 Some(s) if s.alive => Some(self.snapshot_to_stored_doc(&s)),
                 _ => None,
             })
-            .collect())
+            .collect();
+        Ok((docs, timing))
     }
 
     pub fn contains(&self, slot: u32) -> io::Result<bool> {

@@ -37,6 +37,17 @@ pub use hash_index::HashIndex;
 pub use ops_log::{OpsLog, ParallelOpsWriter};
 pub use traits::{OpCodec, SnapshotCodec};
 
+/// Timing breakdown from `DataSilo::get_many_timed`.
+#[derive(Debug, Default)]
+pub struct GetManyTiming {
+    /// Nanoseconds spent reading + decoding from mmap'd data.bin.
+    pub mmap_nanos: u64,
+    /// Nanoseconds spent scanning ops logs (includes Mutex acquire).
+    pub ops_scan_nanos: u64,
+    /// Combined data_size() of both ops logs at read time.
+    pub ops_bytes: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Error types + result alias
 // ---------------------------------------------------------------------------
@@ -499,11 +510,20 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
     /// Batched read — one hash probe + ops-log scan per key. Shares the
     /// ops-log locks across the whole batch to avoid per-key lock thrash.
     pub fn get_many(&self, keys: &[u64]) -> io::Result<Vec<Option<S::Snapshot>>> {
+        let (results, _timing) = self.get_many_timed(keys)?;
+        Ok(results)
+    }
+
+    /// Like `get_many` but returns a timing breakdown for instrumentation.
+    pub fn get_many_timed(&self, keys: &[u64]) -> io::Result<(Vec<Option<S::Snapshot>>, GetManyTiming)> {
+        use std::time::Instant;
+
         if keys.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), GetManyTiming::default()));
         }
 
         // Phase 1: seed snapshots from data.bin (no locks).
+        let mmap_start = Instant::now();
         let mut out: Vec<Option<S::Snapshot>> = keys
             .iter()
             .map(|&key| match self.data_bytes_for(key) {
@@ -511,17 +531,21 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
                 None => None,
             })
             .collect();
+        let mmap_nanos = mmap_start.elapsed().as_nanos() as u64;
 
         // Phase 2: scan each ops log once, applying every op to any key that
         // matches. O(keys × ops_in_log) worst case — fine at steady state
         // where ops_in_log is bounded by compaction.
+        let ops_start = Instant::now();
         let key_set: std::collections::HashMap<u64, usize> = keys
             .iter()
             .enumerate()
             .map(|(i, &k)| (k, i))
             .collect();
 
+        let mut ops_bytes: u64 = 0;
         let mut scan = |log: &OpsLog| -> io::Result<()> {
+            ops_bytes += log.data_size();
             log.for_each(|op_bytes| {
                 if let Ok(op) = O::decode_op(op_bytes) {
                     if let Some(&idx) = key_set.get(&O::op_key(&op)) {
@@ -535,8 +559,10 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
 
         scan(&self.ops_a.lock())?;
         scan(&self.ops_b.lock())?;
+        let ops_scan_nanos = ops_start.elapsed().as_nanos() as u64;
 
-        Ok(out)
+        let timing = GetManyTiming { mmap_nanos, ops_scan_nanos, ops_bytes };
+        Ok((out, timing))
     }
 
     // ── Bulk load (destructive) ────────────────────────────────────────

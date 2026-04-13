@@ -1780,17 +1780,29 @@ impl ConcurrentEngine {
                             // writer's pointer into a dangling reference → SIGSEGV.
                             // Check BOTH is_loading (Phase 1 BulkWriter) AND
                             // dump_merge_active (Phase 2+ DumpMergeWriter).
-                            const DOC_SILO_COMPACT_THRESHOLD_BYTES: u64 = 1_024 * 1_024;
+                            // Apr 12 2026: Lowered from 1 MB to 64 KB. At steady-state
+                            // ops rate (~30 DocOps/sec × 24 bytes = 720 bytes/sec), 1 MB
+                            // takes 23+ minutes to accumulate. Meanwhile every get_many
+                            // call scans the ENTIRE ops log under Mutex — at P99 with
+                            // 98 miss docs, this serializes 23 concurrent readers.
+                            // 64 KB = ~90s of ops accumulation, ~2700 ops to scan.
+                            const DOC_SILO_COMPACT_THRESHOLD_BYTES: u64 = 64 * 1_024;
                             let merge_active = flush_dump_merge_active.load(Ordering::Relaxed);
                             if !is_loading && !merge_active && flush_cycle % COMPACTION_INTERVAL == 0 {
                                 let ops_bytes = flush_doc_silo.read().ops_size();
+                                if ops_bytes > 0 && flush_cycle % (COMPACTION_INTERVAL * 60) == 0 {
+                                    // Periodic diagnostic — every ~5 minutes, log ops state.
+                                    eprintln!("[janitor] DocSilo ops_bytes={ops_bytes} threshold={DOC_SILO_COMPACT_THRESHOLD_BYTES} is_loading={is_loading} merge_active={merge_active}");
+                                }
                                 if ops_bytes >= DOC_SILO_COMPACT_THRESHOLD_BYTES {
                                     if flush_doc_silo.read().has_ops() {
                                         match flush_doc_silo.write().compact() {
                                             Ok(n) if n > 0 => {
                                                 eprintln!("[janitor] DocSilo compaction folded {n} ops into data.bin (was {ops_bytes} bytes)");
                                             }
-                                            Ok(_) => {}
+                                            Ok(_) => {
+                                                eprintln!("[janitor] DocSilo compaction returned 0 ops folded (ops_bytes was {ops_bytes})");
+                                            }
                                             Err(e) => eprintln!("[janitor] DocSilo compaction error: {e}"),
                                         }
                                     }
@@ -6028,12 +6040,14 @@ impl ConcurrentEngine {
         // build + scatter loop in DocStoreV3::get_many, which is NOT
         // covered by the inner `stats` split (file_read vs decode).
         let disk_start = Instant::now();
-        let (mut disk_results, stats, unique_shards) = {
+        let (mut disk_results, stats, unique_shards, silo_mmap_nanos, silo_ops_scan_nanos, silo_ops_bytes) = {
             let guard = self.doc_silo.read();
-            let results = guard
-                .get_many(&miss_ids)
+            let (results, timing) = guard
+                .get_many_timed(&miss_ids)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("docsilo get_many: {e}")))?;
-            (results, ShardReadStats::default(), 0usize)
+            // Use miss_ids.len() as "unique_shards" proxy — triggers disk_fetch_hist observation.
+            let shards = if !miss_ids.is_empty() { miss_ids.len() } else { 0 };
+            (results, ShardReadStats::default(), shards, timing.mmap_nanos, timing.ops_scan_nanos, timing.ops_bytes)
         };
 
         // Phase 3: scatter disk results into the output and populate
@@ -6061,6 +6075,19 @@ impl ConcurrentEngine {
         // Shard prepopulate disabled — DocSilo uses mmap, not sharded files
 
         let disk_fetch_nanos = disk_start.elapsed().as_nanos() as u64;
+
+        // Apr 12 2026: Log slow doc reads with ops breakdown. If ops_scan_nanos
+        // dominates, the janitor isn't compacting fast enough and the ops log
+        // is the bottleneck (all readers serialize on the Mutex).
+        if disk_fetch_nanos > 50_000_000 {
+            // > 50ms total disk fetch — log the breakdown
+            eprintln!(
+                "[doc_read] slow batch: {miss_count} misses, total={:.1}ms, mmap={:.1}ms, ops_scan={:.1}ms, ops_bytes={silo_ops_bytes}",
+                disk_fetch_nanos as f64 / 1e6,
+                silo_mmap_nanos as f64 / 1e6,
+                silo_ops_scan_nanos as f64 / 1e6,
+            );
+        }
 
         Ok((results, stats, unique_shards, cache_probe_nanos, disk_fetch_nanos, miss_count))
     }
