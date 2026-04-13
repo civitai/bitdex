@@ -691,7 +691,7 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
             }
         });
         #[cfg(unix)]
-        let _ = data_mmap.advise(memmap2::Advice::DontNeed);
+        let _ = unsafe { data_mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
         data_mmap.flush()?;
         drop(data_mmap);
 
@@ -953,7 +953,7 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
         // madvise(DONTNEED) tells the kernel to release these pages
         // from the page cache after they've been synced to disk.
         #[cfg(unix)]
-        let _ = write_mmap.advise(memmap2::Advice::DontNeed);
+        let _ = unsafe { write_mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
         write_mmap.flush()?;
         drop(write_mmap);
         data_file.sync_data()?;
