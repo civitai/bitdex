@@ -46,6 +46,8 @@ pub struct GetManyTiming {
     pub ops_scan_nanos: u64,
     /// Combined data_size() of both ops logs at read time.
     pub ops_bytes: u64,
+    /// Nanoseconds spent converting snapshots to StoredDocs (set by DocSilo layer).
+    pub decode_nanos: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +563,7 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
         scan(&self.ops_b.lock())?;
         let ops_scan_nanos = ops_start.elapsed().as_nanos() as u64;
 
-        let timing = GetManyTiming { mmap_nanos, ops_scan_nanos, ops_bytes };
+        let timing = GetManyTiming { mmap_nanos, ops_scan_nanos, ops_bytes, decode_nanos: 0 };
         Ok((out, timing))
     }
 
