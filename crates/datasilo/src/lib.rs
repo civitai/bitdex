@@ -151,6 +151,17 @@ pub struct DumpMergeWriter {
 unsafe impl Send for DumpMergeWriter {}
 unsafe impl Sync for DumpMergeWriter {}
 
+impl Drop for DumpMergeWriter {
+    fn drop(&mut self) {
+        // Release dirty MAP_SHARED pages from the page cache. On cgroupv2,
+        // these count against the cgroup memory limit. Without this, dump
+        // phases 2-6 accumulate dirty pages that push toward OOM.
+        #[cfg(unix)]
+        let _ = self.write_mmap.advise(memmap2::Advice::DontNeed);
+        let _ = self.write_mmap.flush();
+    }
+}
+
 impl DumpMergeWriter {
     /// Merge new data into an existing entry using a caller-provided merge function.
     ///
@@ -679,6 +690,8 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
                 }
             }
         });
+        #[cfg(unix)]
+        let _ = data_mmap.advise(memmap2::Advice::DontNeed);
         data_mmap.flush()?;
         drop(data_mmap);
 
@@ -933,6 +946,15 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
         // call and much faster. Required for persistence — on Windows,
         // dropping an MmapMut without any flush leaves written pages
         // unassociated with the on-disk file after the handle closes.
+        // Apr 13 2026: Advise DONTNEED before dropping the write mmap.
+        // On cgroupv2, MAP_SHARED dirty pages count against the cgroup
+        // memory limit. Without this, repeated compactions accumulate
+        // dirty pages that push RSS toward the 32 GB OOM threshold.
+        // madvise(DONTNEED) tells the kernel to release these pages
+        // from the page cache after they've been synced to disk.
+        #[cfg(unix)]
+        let _ = write_mmap.advise(memmap2::Advice::DontNeed);
+        write_mmap.flush()?;
         drop(write_mmap);
         data_file.sync_data()?;
         drop(data_file);
