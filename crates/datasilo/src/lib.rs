@@ -157,7 +157,7 @@ impl Drop for DumpMergeWriter {
         // these count against the cgroup memory limit. Without this, dump
         // phases 2-6 accumulate dirty pages that push toward OOM.
         #[cfg(unix)]
-        let _ = self.write_mmap.advise(memmap2::Advice::DontNeed);
+        let _ = unsafe { self.write_mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
         let _ = self.write_mmap.flush();
     }
 }
