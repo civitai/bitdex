@@ -29,12 +29,6 @@ use crate::loader;
 use crate::metrics::Metrics;
 use crate::mutation::FieldValue;
 
-/// Limit concurrent disk doc reads to prevent mmap page-fault storms.
-/// At 109M records with multi-GB data.bin, 78 concurrent readers doing
-/// random page faults thrash the I/O scheduler — P99 doc reads hit 5-10s.
-/// 16 permits keeps disk utilization high without contention collapse.
-static DOC_DISK_READ_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(16));
 use crate::query::{BitdexQuery, Value};
 
 // ---------------------------------------------------------------------------
@@ -2782,11 +2776,9 @@ async fn handle_query(
                 m.query_docs_path_total
                     .with_label_values(&[&name_docs, "spawn_blocking"])
                     .inc();
-                // Acquire disk read permit before spawn_blocking. This queues
-                // excess readers in async context (no thread consumed) rather
-                // than spawning 78 blocking threads that all page-fault at once.
-                let _disk_permit = DOC_DISK_READ_SEMAPHORE.acquire().await
-                    .expect("doc disk read semaphore closed");
+                // Semaphore removed: 16 permits caused 14.5s convoy effect under
+                // cold page cache (47 QPS × 1-5s holds = instant queue buildup).
+                // Offset-sorted reads handle I/O contention via sequential access.
                 // C1 isolation: capture wall time immediately before the
                 // spawn_blocking call so we can measure dispatch gap.
                 let dispatch_start = Instant::now();
