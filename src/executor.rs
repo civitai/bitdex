@@ -388,25 +388,33 @@ impl<'a> QueryExecutor<'a> {
     /// materialization of the full clause bitmap. Returns Some(Ok(())) if handled,
     /// Some(Err) on error, None if this clause can't be fast-pathed.
     fn try_and_by_ref(&self, acc: &mut RoaringBitmap, clause: &FilterClause) -> Option<Result<()>> {
+        // Selectivity gate for apply_diff_eq vs fused_cow.
+        // apply_diff_eq is O(candidates) but does 3 bitmap ops (AND + AND|OR + SUB).
+        // fused_cow is O(base) but only 1 clone + 1 AND.
+        // When acc is broad (>10M bits), fused_cow wins because memcpy + 1 AND
+        // is cheaper than 3 full-width bitmap ops. v1.0.214 proved this:
+        // broad queries (100M candidates) regressed 2.5-4x with unconditional apply_diff_eq.
+        const NARROW_THRESHOLD: u64 = 10_000_000;
         match clause {
             FilterClause::Eq(field, value) => {
                 if field == "id" { return None; }
                 let ff = self.filters.get_field(field)?;
                 let key = self.resolve_value_key(field, value)?;
-                // Apr 13 2026: Use apply_diff_eq instead of get_versioned + fused_cow.
-                // fused_cow clones the entire base bitmap (~13MB) when dirty.
-                // apply_diff_eq computes (candidates & fused) at O(candidates) cost,
-                // avoiding the base clone entirely. 2-10x faster for dirty bitmaps
-                // when the accumulator is already narrowed by prior clauses.
-                if let Some(result) = ff.apply_diff_eq(key, acc) {
-                    *acc = result;
-                    Some(Ok(()))
+                if acc.len() <= NARROW_THRESHOLD {
+                    if let Some(result) = ff.apply_diff_eq(key, acc) {
+                        *acc = result;
+                    } else {
+                        *acc = RoaringBitmap::new();
+                    }
                 } else {
-                    // Value has no bitmap — no documents match.
-                    // Same as old path: get_versioned returned None → acc &= empty
-                    *acc = RoaringBitmap::new();
-                    Some(Ok(()))
+                    // Broad path: fused_cow (clone base + apply diffs) then AND.
+                    let vb = ff.get_versioned(key);
+                    match vb {
+                        Some(vb) => *acc &= vb.fused_cow().as_ref(),
+                        None => *acc = RoaringBitmap::new(),
+                    }
                 }
+                Some(Ok(()))
             }
             FilterClause::In(field, values) => {
                 if field == "id" { return None; }
@@ -448,18 +456,33 @@ impl<'a> QueryExecutor<'a> {
                     false
                 };
                 if use_complement {
-                    // Apr 13 2026: Use union_with_diff for complement to avoid
-                    // N × 13MB base clones on dirty bitmaps. Build the union of
-                    // complement values intersected with acc, then subtract once.
-                    let mut exclude_keys = complement_keys.clone();
-                    exclude_keys.push(crate::filter::NULL_BITMAP_KEY);
-                    let to_exclude = ff.union_with_diff(&exclude_keys, acc);
-                    *acc -= &to_exclude;
+                    if acc.len() <= NARROW_THRESHOLD {
+                        let mut exclude_keys = complement_keys.clone();
+                        exclude_keys.push(crate::filter::NULL_BITMAP_KEY);
+                        let to_exclude = ff.union_with_diff(&exclude_keys, acc);
+                        *acc -= &to_exclude;
+                    } else {
+                        for &ck in &complement_keys {
+                            if let Some(vb) = ff.get_versioned(ck) {
+                                *acc -= vb.fused_cow().as_ref();
+                            }
+                        }
+                        if let Some(null_vb) = ff.get_versioned(crate::filter::NULL_BITMAP_KEY) {
+                            *acc -= null_vb.fused_cow().as_ref();
+                        }
+                    }
                 } else {
-                    // Apr 13 2026: Use union_with_diff instead of per-value
-                    // get_versioned + fused_cow. Avoids N × 13MB base clones
-                    // for dirty bitmaps. Single lock acquisition for all values.
-                    *acc = ff.union_with_diff(&in_keys, acc);
+                    if acc.len() <= NARROW_THRESHOLD {
+                        *acc = ff.union_with_diff(&in_keys, acc);
+                    } else {
+                        let mut result = RoaringBitmap::new();
+                        for &k in &in_keys {
+                            if let Some(vb) = ff.get_versioned(k) {
+                                result |= vb.fused_cow().as_ref();
+                            }
+                        }
+                        *acc &= &result;
+                    }
                 }
                 Some(Ok(()))
             }
@@ -482,10 +505,15 @@ impl<'a> QueryExecutor<'a> {
                 if field == "id" { return None; }
                 let ff = self.filters.get_field(field)?;
                 let key = self.resolve_value_key(field, value)?;
-                // Diff-aware: compute (acc & value_bitmap) then subtract.
-                // Avoids 13MB base clone for dirty bitmaps.
-                if let Some(hits) = ff.apply_diff_eq(key, acc) {
-                    *acc -= &hits;
+                if acc.len() <= NARROW_THRESHOLD {
+                    if let Some(hits) = ff.apply_diff_eq(key, acc) {
+                        *acc -= &hits;
+                    }
+                } else {
+                    let vb = ff.get_versioned(key);
+                    if let Some(vb) = vb {
+                        *acc -= vb.fused_cow().as_ref();
+                    }
                 }
                 Some(Ok(()))
             }
@@ -496,10 +524,16 @@ impl<'a> QueryExecutor<'a> {
                         .iter()
                         .filter_map(|v| self.resolve_value_key(field, v))
                         .collect();
-                    // Diff-aware: union all excluded values intersected with
-                    // acc, then subtract once. Single lock acquisition.
-                    let to_exclude = ff.union_with_diff(&keys, acc);
-                    *acc -= &to_exclude;
+                    if acc.len() <= NARROW_THRESHOLD {
+                        let to_exclude = ff.union_with_diff(&keys, acc);
+                        *acc -= &to_exclude;
+                    } else {
+                        for &k in &keys {
+                            if let Some(vb) = ff.get_versioned(k) {
+                                *acc -= vb.fused_cow().as_ref();
+                            }
+                        }
+                    }
                     return Some(Ok(()));
                 }
                 None
