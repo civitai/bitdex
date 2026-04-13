@@ -407,35 +407,38 @@ impl<'a> QueryExecutor<'a> {
                     .iter()
                     .filter_map(|v| self.resolve_value_key(field, v))
                     .collect();
-                // Apr 13 2026: Complement optimization. If the IN set covers
-                // most of the field's distinct values, subtract the complement
-                // instead of ORing the included values. Example: nsfwLevel has
-                // 6 distinct values; IN [1,2,4,8,16] = 5 of 6. Subtracting
-                // the 1 excluded bitmap (nsfwLevel=32) from acc is O(small)
-                // instead of 5× O(100M) AND+OR operations.
+                // Apr 13 2026: Complement optimization. When the complement
+                // (excluded values) has less total cardinality than the
+                // accumulator, subtract the complement instead of OR-ing the
+                // included values. Subtracting small bitmaps from acc is
+                // O(complement_cardinality) while the union path is
+                // O(in_count × acc_size) — at 100M acc, even 7 small
+                // subtractions beats 5 large AND+ORs.
                 //
-                // Safety: bitmap_keys() only returns LOADED keys. For fields
-                // with per_value_lazy loading, unloaded keys won't appear.
-                // Guard: only use complement when the loaded key count is
-                // reasonable (≤64 distinct values) — ensures all values are
-                // likely loaded for low-cardinality fields like nsfwLevel.
-                // High-cardinality fields (tagIds: 31K values) always use
-                // the original path.
+                // nsfwLevel has 12 loaded values (6 real + stale). IN [1..16]
+                // = 5 keys, complement = 7 keys. Old condition (7 < 5) failed.
+                // New condition: compare cardinality, not key count.
                 let all_keys = ff.bitmap_keys();
                 let loaded_count = all_keys.len();
-                // Filter out the null bitmap key — it's metadata, not a real value.
                 let complement_keys: Vec<u64> = all_keys
                     .iter()
                     .filter(|k| **k != crate::filter::NULL_BITMAP_KEY && !in_keys.contains(k))
                     .copied()
                     .collect();
-                if !complement_keys.is_empty() && complement_keys.len() < in_keys.len() && loaded_count <= 64 {
-                    // Complement is smaller — subtract excluded values from acc.
-                    // Also subtract the null bitmap (nulls should not match IN).
-                    eprintln!(
-                        "[IN_COMPLEMENT] field={field} acc_len={} in_keys={} complement_keys={} loaded_count={loaded_count}",
-                        acc.len(), in_keys.len(), complement_keys.len()
-                    );
+                let use_complement = if !complement_keys.is_empty() && loaded_count <= 64 {
+                    let complement_card: u64 = complement_keys.iter()
+                        .map(|&k| ff.cardinality(k))
+                        .sum();
+                    let acc_card = acc.len();
+                    // Use complement when total bits to subtract is less than
+                    // half the accumulator, OR complement is absolutely small
+                    // (<10M). Either way, N subtractions of small bitmaps is
+                    // cheaper than M AND+ORs over the full acc.
+                    complement_card < acc_card / 2 || complement_card < 10_000_000
+                } else {
+                    false
+                };
+                if use_complement {
                     for &key in &complement_keys {
                         if let Some(vb) = ff.get_versioned(key) {
                             *acc -= vb.fused_cow().as_ref();
@@ -445,12 +448,6 @@ impl<'a> QueryExecutor<'a> {
                         *acc -= null_vb.fused_cow().as_ref();
                     }
                 } else {
-                    // Original path: distribute AND over OR.
-                    // (acc & val1) | (acc & val2) | ...
-                    eprintln!(
-                        "[IN_ORIGINAL] field={field} acc_len={} in_keys={} complement_keys={} loaded_count={loaded_count} complement_empty={} complement_lt_in={}",
-                        acc.len(), in_keys.len(), complement_keys.len(), complement_keys.is_empty(), complement_keys.len() < in_keys.len()
-                    );
                     let mut union = RoaringBitmap::new();
                     for &key in &in_keys {
                         if let Some(vb) = ff.get_versioned(key) {
