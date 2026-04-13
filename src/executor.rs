@@ -402,18 +402,47 @@ impl<'a> QueryExecutor<'a> {
             FilterClause::In(field, values) => {
                 if field == "id" { return None; }
                 let ff = self.filters.get_field(field)?;
-                // Distribute AND over OR: (acc & val1) | (acc & val2) | ...
-                // When acc is small, this avoids materializing the full union.
-                let mut union = RoaringBitmap::new();
-                for v in values {
-                    if let Some(key) = self.resolve_value_key(field, v) {
+                // Resolve IN keys
+                let in_keys: Vec<u64> = values
+                    .iter()
+                    .filter_map(|v| self.resolve_value_key(field, v))
+                    .collect();
+                // Apr 13 2026: Complement optimization. If the IN set covers
+                // most of the field's distinct values, subtract the complement
+                // instead of ORing the included values. Example: nsfwLevel has
+                // 6 distinct values; IN [1,2,4,8,16] = 5 of 6. Subtracting
+                // the 1 excluded bitmap (nsfwLevel=32) from acc is O(small)
+                // instead of 5× O(100M) AND+OR operations.
+                let all_keys = ff.bitmap_keys();
+                // Filter out the null bitmap key — it's metadata, not a real value.
+                let complement_keys: Vec<u64> = all_keys
+                    .iter()
+                    .filter(|k| **k != crate::filter::NULL_BITMAP_KEY && !in_keys.contains(k))
+                    .copied()
+                    .collect();
+                if !complement_keys.is_empty() && complement_keys.len() < in_keys.len() {
+                    // Complement is smaller — subtract excluded values from acc.
+                    // Also subtract the null bitmap (nulls should not match IN).
+                    for &key in &complement_keys {
+                        if let Some(vb) = ff.get_versioned(key) {
+                            *acc -= vb.fused_cow().as_ref();
+                        }
+                    }
+                    if let Some(null_vb) = ff.get_versioned(crate::filter::NULL_BITMAP_KEY) {
+                        *acc -= null_vb.fused_cow().as_ref();
+                    }
+                } else {
+                    // Original path: distribute AND over OR.
+                    // (acc & val1) | (acc & val2) | ...
+                    let mut union = RoaringBitmap::new();
+                    for &key in &in_keys {
                         if let Some(vb) = ff.get_versioned(key) {
                             let cow = vb.fused_cow();
                             union |= &*acc & cow.as_ref();
                         }
                     }
+                    *acc = union;
                 }
-                *acc = union;
                 Some(Ok(()))
             }
             FilterClause::BucketBitmap { bitmap, .. } => {
