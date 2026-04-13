@@ -2062,6 +2062,45 @@ impl ConcurrentEngine {
                         flush_mem_cache.mark_all_stale();
                     }
                     was_loading = is_loading;
+                    // DocSilo janitor: runs every cycle, NOT gated on bitmap_count.
+                    // DocOps flow through WAL→ops_processor→DocSilo ops log, which
+                    // is independent of the bitmap mutation channel. If we only check
+                    // inside bitmap_count>0, the ops log grows unbounded when ops are
+                    // flowing but bitmap mutations are quiet.
+                    {
+                        static JANITOR_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let jt = JANITOR_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+                        let merge_active = flush_dump_merge_active.load(Ordering::Relaxed);
+                        if !is_loading && !merge_active && jt % COMPACTION_INTERVAL == 0 {
+                            const DOC_SILO_COMPACT_THRESHOLD_BYTES: u64 = 512 * 1_024;
+                            let ops_bytes = flush_doc_silo.read().ops_size();
+                            if ops_bytes > 0 && jt % (COMPACTION_INTERVAL * 60) == 0 {
+                                eprintln!("[janitor] DocSilo ops_bytes={ops_bytes} threshold={DOC_SILO_COMPACT_THRESHOLD_BYTES} is_loading={is_loading} merge_active={merge_active}");
+                            }
+                            if ops_bytes >= DOC_SILO_COMPACT_THRESHOLD_BYTES {
+                                if flush_doc_silo.read().has_ops() {
+                                    let bg_silo = Arc::clone(&flush_doc_silo);
+                                    std::thread::Builder::new()
+                                        .name("docsilo-compact".into())
+                                        .spawn(move || {
+                                            let compact_start = Instant::now();
+                                            match bg_silo.write().compact() {
+                                                Ok(n) if n > 0 => {
+                                                    let compact_ms = compact_start.elapsed().as_millis();
+                                                    eprintln!("[janitor] DocSilo compaction folded {n} ops into data.bin in {compact_ms}ms (was {ops_bytes} bytes)");
+                                                }
+                                                Ok(_) => {
+                                                    let compact_ms = compact_start.elapsed().as_millis();
+                                                    eprintln!("[janitor] DocSilo compaction returned 0 ops folded in {compact_ms}ms (ops_bytes was {ops_bytes})");
+                                                }
+                                                Err(e) => eprintln!("[janitor] DocSilo compaction error: {e}"),
+                                            }
+                                        })
+                                        .ok();
+                                }
+                            }
+                        }
+                    }
                     // Process flush commands (force publish, unload, etc.)
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
