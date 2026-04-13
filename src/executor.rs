@@ -413,14 +413,23 @@ impl<'a> QueryExecutor<'a> {
                 // 6 distinct values; IN [1,2,4,8,16] = 5 of 6. Subtracting
                 // the 1 excluded bitmap (nsfwLevel=32) from acc is O(small)
                 // instead of 5× O(100M) AND+OR operations.
+                //
+                // Safety: bitmap_keys() only returns LOADED keys. For fields
+                // with per_value_lazy loading, unloaded keys won't appear.
+                // Guard: only use complement when the loaded key count is
+                // reasonable (≤64 distinct values) — ensures all values are
+                // likely loaded for low-cardinality fields like nsfwLevel.
+                // High-cardinality fields (tagIds: 31K values) always use
+                // the original path.
                 let all_keys = ff.bitmap_keys();
+                let loaded_count = all_keys.len();
                 // Filter out the null bitmap key — it's metadata, not a real value.
                 let complement_keys: Vec<u64> = all_keys
                     .iter()
                     .filter(|k| **k != crate::filter::NULL_BITMAP_KEY && !in_keys.contains(k))
                     .copied()
                     .collect();
-                if !complement_keys.is_empty() && complement_keys.len() < in_keys.len() {
+                if !complement_keys.is_empty() && complement_keys.len() < in_keys.len() && loaded_count <= 64 {
                     // Complement is smaller — subtract excluded values from acc.
                     // Also subtract the null bitmap (nulls should not match IN).
                     for &key in &complement_keys {
