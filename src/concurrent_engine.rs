@@ -1796,12 +1796,15 @@ impl ConcurrentEngine {
                                 }
                                 if ops_bytes >= DOC_SILO_COMPACT_THRESHOLD_BYTES {
                                     if flush_doc_silo.read().has_ops() {
+                                        let compact_start = Instant::now();
                                         match flush_doc_silo.write().compact() {
                                             Ok(n) if n > 0 => {
-                                                eprintln!("[janitor] DocSilo compaction folded {n} ops into data.bin (was {ops_bytes} bytes)");
+                                                let compact_ms = compact_start.elapsed().as_millis();
+                                                eprintln!("[janitor] DocSilo compaction folded {n} ops into data.bin in {compact_ms}ms (was {ops_bytes} bytes)");
                                             }
                                             Ok(_) => {
-                                                eprintln!("[janitor] DocSilo compaction returned 0 ops folded (ops_bytes was {ops_bytes})");
+                                                let compact_ms = compact_start.elapsed().as_millis();
+                                                eprintln!("[janitor] DocSilo compaction returned 0 ops folded in {compact_ms}ms (ops_bytes was {ops_bytes})");
                                             }
                                             Err(e) => eprintln!("[janitor] DocSilo compaction error: {e}"),
                                         }
@@ -6040,14 +6043,16 @@ impl ConcurrentEngine {
         // build + scatter loop in DocStoreV3::get_many, which is NOT
         // covered by the inner `stats` split (file_read vs decode).
         let disk_start = Instant::now();
-        let (mut disk_results, stats, unique_shards, silo_mmap_nanos, silo_ops_scan_nanos, silo_ops_bytes) = {
+        let lock_start = Instant::now();
+        let (mut disk_results, stats, unique_shards, silo_mmap_nanos, silo_ops_scan_nanos, silo_ops_bytes, silo_decode_nanos, lock_wait_nanos) = {
             let guard = self.doc_silo.read();
+            let lock_nanos = lock_start.elapsed().as_nanos() as u64;
             let (results, timing) = guard
                 .get_many_timed(&miss_ids)
                 .map_err(|e| crate::error::BitdexError::Storage(format!("docsilo get_many: {e}")))?;
             // Use miss_ids.len() as "unique_shards" proxy — triggers disk_fetch_hist observation.
             let shards = if !miss_ids.is_empty() { miss_ids.len() } else { 0 };
-            (results, ShardReadStats::default(), shards, timing.mmap_nanos, timing.ops_scan_nanos, timing.ops_bytes)
+            (results, ShardReadStats::default(), shards, timing.mmap_nanos, timing.ops_scan_nanos, timing.ops_bytes, timing.decode_nanos, lock_nanos)
         };
 
         // Phase 3: scatter disk results into the output and populate
@@ -6080,12 +6085,20 @@ impl ConcurrentEngine {
         // dominates, the janitor isn't compacting fast enough and the ops log
         // is the bottleneck (all readers serialize on the Mutex).
         if disk_fetch_nanos > 50_000_000 {
-            // > 50ms total disk fetch — log the breakdown
+            // > 50ms total disk fetch — log the breakdown.
+            // Phases: lock_wait → mmap → ops_scan → decode → (scatter+cache).
+            // gap = total - lock_wait - mmap - ops_scan - decode = scatter+cache insert time.
+            let decode_nanos = silo_decode_nanos;
+            let accounted = lock_wait_nanos + silo_mmap_nanos + silo_ops_scan_nanos + decode_nanos;
+            let scatter_nanos = disk_fetch_nanos.saturating_sub(accounted);
             eprintln!(
-                "[doc_read] slow batch: {miss_count} misses, total={:.1}ms, mmap={:.1}ms, ops_scan={:.1}ms, ops_bytes={silo_ops_bytes}",
+                "[doc_read] slow batch: {miss_count} misses, total={:.1}ms, lock={:.1}ms, mmap={:.1}ms, ops={:.1}ms, decode={:.1}ms, scatter={:.1}ms, ops_bytes={silo_ops_bytes}",
                 disk_fetch_nanos as f64 / 1e6,
+                lock_wait_nanos as f64 / 1e6,
                 silo_mmap_nanos as f64 / 1e6,
                 silo_ops_scan_nanos as f64 / 1e6,
+                decode_nanos as f64 / 1e6,
+                scatter_nanos as f64 / 1e6,
             );
         }
 

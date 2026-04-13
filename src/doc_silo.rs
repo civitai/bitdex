@@ -722,7 +722,8 @@ impl DocSilo {
     /// Like `get_many` but returns timing breakdown (mmap_nanos, ops_scan_nanos, ops_bytes).
     pub fn get_many_timed(&self, slots: &[u32]) -> io::Result<(Vec<Option<StoredDoc>>, datasilo::GetManyTiming)> {
         let keys: Vec<u64> = slots.iter().map(|&s| slot_to_key(s)).collect();
-        let (snapshots, timing) = self.silo.get_many_timed(&keys)?;
+        let (snapshots, mut timing) = self.silo.get_many_timed(&keys)?;
+        let decode_start = std::time::Instant::now();
         let docs = snapshots
             .into_iter()
             .map(|snap| match snap {
@@ -730,6 +731,7 @@ impl DocSilo {
                 _ => None,
             })
             .collect();
+        timing.decode_nanos = decode_start.elapsed().as_nanos() as u64;
         Ok((docs, timing))
     }
 
