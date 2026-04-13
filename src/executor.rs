@@ -432,6 +432,10 @@ impl<'a> QueryExecutor<'a> {
                 if !complement_keys.is_empty() && complement_keys.len() < in_keys.len() && loaded_count <= 64 {
                     // Complement is smaller — subtract excluded values from acc.
                     // Also subtract the null bitmap (nulls should not match IN).
+                    eprintln!(
+                        "[IN_COMPLEMENT] field={field} acc_len={} in_keys={} complement_keys={} loaded_count={loaded_count}",
+                        acc.len(), in_keys.len(), complement_keys.len()
+                    );
                     for &key in &complement_keys {
                         if let Some(vb) = ff.get_versioned(key) {
                             *acc -= vb.fused_cow().as_ref();
@@ -443,6 +447,10 @@ impl<'a> QueryExecutor<'a> {
                 } else {
                     // Original path: distribute AND over OR.
                     // (acc & val1) | (acc & val2) | ...
+                    eprintln!(
+                        "[IN_ORIGINAL] field={field} acc_len={} in_keys={} complement_keys={} loaded_count={loaded_count} complement_empty={} complement_lt_in={}",
+                        acc.len(), in_keys.len(), complement_keys.len(), complement_keys.is_empty(), complement_keys.len() < in_keys.len()
+                    );
                     let mut union = RoaringBitmap::new();
                     for &key in &in_keys {
                         if let Some(vb) = ff.get_versioned(key) {
