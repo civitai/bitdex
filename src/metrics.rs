@@ -773,7 +773,10 @@ impl Metrics {
         ).unwrap();
 
         // Phase 2.5: DocStore I/O observability
-        let docstore_read_buckets = vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0];
+        // Apr 13 2026: Widened from 1.0 max to 60.0. P50 was pinned at 1s
+        // ceiling — real values exceed 1s during warm-up. Same range as
+        // phase_buckets so dashboards can compare without ceiling artifacts.
+        let docstore_read_buckets = vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0];
         let docstore_read_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "bitdex_docstore_read_seconds",
@@ -793,7 +796,7 @@ impl Metrics {
         // two dominant phases so we can tell disk-bound from decode-bound
         // work without guessing. Same bucket shape as docstore_read_seconds.
         let shard_read_buckets = vec![
-            0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
+            0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
         ];
         let docstore_shard_file_read_seconds = HistogramVec::new(
             HistogramOpts::new(
