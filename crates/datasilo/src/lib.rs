@@ -536,14 +536,32 @@ impl<S: SnapshotCodec, O: OpCodec<Snapshot = S::Snapshot>> DataSilo<S, O> {
         }
 
         // Phase 1: seed snapshots from data.bin (no locks).
+        // Sort keys by their offset in data.bin so mmap reads are sequential.
+        // This turns random page faults into sequential readahead — the kernel
+        // prefetches adjacent pages, and the I/O scheduler merges requests.
         let mmap_start = Instant::now();
-        let mut out: Vec<Option<S::Snapshot>> = keys
+        let mut out: Vec<Option<S::Snapshot>> = vec![None; keys.len()];
+
+        // Build (original_index, offset) pairs, sort by offset, read in order.
+        let mut order: Vec<(usize, u64)> = keys
             .iter()
-            .map(|&key| match self.data_bytes_for(key) {
-                Some(bytes) => S::decode(bytes).ok(),
-                None => None,
+            .enumerate()
+            .map(|(i, &key)| {
+                let offset = self.index.as_ref()
+                    .and_then(|idx| idx.get(key))
+                    .map_or(u64::MAX, |e| e.offset);
+                (i, offset)
             })
             .collect();
+        order.sort_unstable_by_key(|&(_, offset)| offset);
+
+        for &(orig_idx, _) in &order {
+            let key = keys[orig_idx];
+            out[orig_idx] = match self.data_bytes_for(key) {
+                Some(bytes) => S::decode(bytes).ok(),
+                None => None,
+            };
+        }
         let mmap_nanos = mmap_start.elapsed().as_nanos() as u64;
 
         // Phase 2: scan each ops log once, applying every op to any key that
