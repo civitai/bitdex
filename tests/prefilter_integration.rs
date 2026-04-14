@@ -171,6 +171,60 @@ fn prefilter_substitution_preserves_results() {
 }
 
 #[test]
+fn deleted_docs_excluded_from_stale_prefilter() {
+    // Engine uses clean-delete: filter bitmaps are kept clean and there is no
+    // `alive AND filter` in the query hot path. Our cached prefilter bitmap is
+    // NOT maintained by clean-delete — it's a frozen snapshot. Between
+    // refreshes a deleted doc's bit stays set in the cached prefilter. Without
+    // a guard, a query whose clause set matches the prefilter would resurface
+    // deleted docs.
+    //
+    // substitute() intersects the prefilter with live alive at substitute
+    // time. Verify end-to-end.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = ConcurrentEngine::new_with_path(
+        test_config(&dir.path().join("bitmaps")),
+        &dir.path().join("docs"),
+    ).unwrap();
+
+    for i in 1..=10u32 {
+        engine.put(i, &doc(1, true, 500, i as i64 * 10)).unwrap();
+    }
+    wait_for_alive(&engine, 10, 2000);
+
+    let entry = engine.register_prefilter(
+        "nsfw1".into(),
+        vec![FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+        300,
+    ).unwrap();
+    assert_eq!(entry.cardinality(), 10);
+
+    // Delete 3/5/7 WITHOUT refreshing the prefilter.
+    engine.delete(3).unwrap();
+    engine.delete(5).unwrap();
+    engine.delete(7).unwrap();
+    wait_for_alive(&engine, 7, 2000);
+
+    // Cached prefilter cardinality is still 10 — confirms the guard has to
+    // handle stale bitmaps.
+    assert_eq!(entry.cardinality(), 10, "prefilter bitmap NOT auto-refreshed");
+
+    let q = BitdexQuery {
+        filters: vec![FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+        sort: None,
+        limit: 100,
+        cursor: None,
+        offset: None,
+        skip_cache: true,
+    };
+    let (result, trace) = engine.execute_query_traced(&q, "test").unwrap();
+    assert_eq!(trace.prefilter.as_deref(), Some("nsfw1"), "substitution should have fired");
+    let mut ids = result.ids;
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 4, 6, 8, 9, 10], "deleted slots 3/5/7 must not leak through");
+}
+
+#[test]
 fn refresh_updates_cardinality() {
     let dir = tempfile::tempdir().unwrap();
     let engine = ConcurrentEngine::new_with_path(

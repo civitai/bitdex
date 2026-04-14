@@ -172,6 +172,18 @@ Both evaluate to the same set, assuming the prefilter bitmap is an accurate mate
 
 **Drift-free fallback (optional):** If drift is unacceptable, we can track ops that touch prefilter fields and apply them incrementally (same pattern as alive_bitmap). Phase 2 work.
 
+**Deleted-doc resurrection (Phase 1 hazard + mitigation):** The engine uses clean-delete — on delete, the doc's bits are cleared from every filter/sort bitmap AND from alive, so filter bitmaps stay clean and the query hot path has no `alive AND filter`. The cached prefilter bitmap is NOT maintained by clean-delete — it's a frozen snapshot. Between refreshes a deleted doc's bit stays set in the cached prefilter. If a query's clauses match the prefilter and no other constraint filters against a clean bitmap (e.g. a "show me everything safe" pagination with no extra filter), the deleted doc would re-surface in results.
+
+*Mitigation:* `substitute()` intersects the cached prefilter with live `alive` at substitute time. Cost: one bitmap AND (~20–50 ms at 107 M) per substituted query — still a large win vs the 300–900 ms saved by eliding the original clauses. Verified by `substitute_excludes_dead_slots_from_stale_prefilter` unit test and the `deleted_docs_excluded_from_stale_prefilter` integration test.
+
+## Implementation deviations from this design
+
+- **Registry placement.** The design specified `InnerEngine` so the registry participated in the ArcSwap snapshot. The implementation puts it on `ConcurrentEngine` so registrations don't force a snapshot publish. Consequence: the clause list is fixed at register time from the live engine, not the caller's snapshot, but clause sets are immutable after registration so snapshot coherence isn't load-bearing. The cached bitmap lives in its own `ArcSwap` for per-entry atomic refresh.
+
+- **Phase 1b (flag-gated substitution) was skipped.** The registry's empty-by-default `is_empty()` early-return in `substitute()` is sufficient as a kill switch: no registrations → zero hot-path cost and no behavior change. The opt-in-per-query flag was belt-and-suspenders and was consciously dropped.
+
+- **Cache interaction with drift.** The unified cache is keyed off the pre-substitution clause list. On cache-hit the flush-thread-maintained result is returned (accurate). On cache-miss, substitution fires and the possibly-stale prefilter is intersected with live alive. Same user query can thus see slightly different result sets under cache churn — bounded by drift window × refresh interval. Acceptable for Phase 1 per the design's explicit "mild drift is acceptable" stance; Phase 2 would include a prefilter version in the cache key.
+
 ## Testing plan
 
 ### Unit tests (src/prefilter.rs)

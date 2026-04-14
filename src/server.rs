@@ -4427,9 +4427,19 @@ async fn handle_register_prefilter(
         ).into_response();
     }
 
+    // compute_filters walks up to ~100M-bit bitmaps; at prod scale the
+    // register compute is ~300-900ms. Running that on the Axum async worker
+    // would starve the reactor and cause latency spikes for other requests.
+    // Offload to the blocking pool.
     let t0 = Instant::now();
-    match engine.register_prefilter(req.name.clone(), req.clauses, req.refresh_interval_secs) {
-        Ok(entry) => {
+    let req_name = req.name.clone();
+    let clauses = req.clauses;
+    let interval = req.refresh_interval_secs;
+    let result = tokio::task::spawn_blocking(move || {
+        engine.register_prefilter(req_name, clauses, interval)
+    }).await;
+    match result {
+        Ok(Ok(entry)) => {
             let compute_ms = t0.elapsed().as_millis() as u64;
             Json(serde_json::json!({
                 "name": entry.name,
@@ -4438,9 +4448,13 @@ async fn handle_register_prefilter(
                 "refresh_interval_secs": entry.refresh_interval_secs(),
             })).into_response()
         }
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("register_prefilter: {e}")})),
+        ).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("register_prefilter task panicked: {e}")})),
         ).into_response(),
     }
 }
@@ -4513,20 +4527,29 @@ async fn handle_refresh_prefilter(
         }
     };
 
+    // Offload to blocking pool — compute_filters runs ~300-900ms at prod scale.
     let t0 = Instant::now();
-    match engine.refresh_prefilter(&prefilter_name) {
-        Ok(Some(entry)) => Json(serde_json::json!({
+    let pname = prefilter_name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        engine.refresh_prefilter(&pname)
+    }).await;
+    match result {
+        Ok(Ok(Some(entry))) => Json(serde_json::json!({
             "name": entry.name,
             "cardinality": entry.cardinality(),
             "compute_time_ms": t0.elapsed().as_millis() as u64,
         })).into_response(),
-        Ok(None) => (
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("prefilter '{}' not found", prefilter_name)})),
         ).into_response(),
-        Err(e) => (
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("refresh_prefilter: {e}")})),
+        ).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("refresh_prefilter task panicked: {e}")})),
         ).into_response(),
     }
 }
