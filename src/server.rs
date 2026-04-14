@@ -5154,6 +5154,36 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .with_label_values(&[name])
                 .set(engine.slot_counter() as i64);
 
+            // Prefilter registry gauges (see src/prefilter.rs)
+            let prefilter_entries = engine.prefilters().entries();
+            m.prefilter_registered
+                .with_label_values(&[name])
+                .set(prefilter_entries.len() as i64);
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            for entry in &prefilter_entries {
+                let labels = &[name.as_str(), entry.name.as_str()];
+                m.prefilter_cardinality
+                    .with_label_values(labels)
+                    .set(entry.cardinality() as i64);
+                m.prefilter_substitutions_total
+                    .with_label_values(labels)
+                    .set(entry.substitutions() as i64);
+                // Last compute duration as integer seconds (IntGauge API).
+                m.prefilter_last_compute_seconds
+                    .with_label_values(labels)
+                    .set((entry.compute_ms() / 1000) as i64);
+                m.prefilter_refresh_errors_total
+                    .with_label_values(labels)
+                    .set(entry.refresh_errors() as i64);
+                let age = now_secs.saturating_sub(entry.last_refreshed()).max(0);
+                m.prefilter_age_seconds
+                    .with_label_values(labels)
+                    .set(age);
+            }
+
             // Cache gauges
             let t0 = std::time::Instant::now();
             let uc = engine.unified_cache_stats();

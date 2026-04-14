@@ -232,6 +232,22 @@ pub struct Metrics {
 
     // -- Boot phase breakdown --
     pub boot_phase_seconds: IntGaugeVec,
+
+    // -- Prefilter registry (see src/prefilter.rs) --
+    /// Number of registered prefilters per index.
+    pub prefilter_registered: IntGaugeVec,
+    /// Current bitmap cardinality per registered prefilter.
+    pub prefilter_cardinality: IntGaugeVec,
+    /// Cumulative number of queries that substituted this prefilter.
+    pub prefilter_substitutions_total: IntGaugeVec,
+    /// Seconds spent on the last compute/refresh for this prefilter.
+    pub prefilter_last_compute_seconds: IntGaugeVec,
+    /// Cumulative refresh errors per prefilter.
+    pub prefilter_refresh_errors_total: IntGaugeVec,
+    /// Seconds since last successful refresh per prefilter. Useful for
+    /// paging on stale prefilters that should have been refreshed by the
+    /// SWR thread or manual `/refresh` calls.
+    pub prefilter_age_seconds: IntGaugeVec,
 }
 
 impl Metrics {
@@ -1163,6 +1179,31 @@ impl Metrics {
             &["phase"],
         ).unwrap();
 
+        let prefilter_registered = IntGaugeVec::new(
+            Opts::new("bitdex_prefilter_registered", "Number of registered prefilters"),
+            &["index"],
+        ).unwrap();
+        let prefilter_cardinality = IntGaugeVec::new(
+            Opts::new("bitdex_prefilter_cardinality", "Current bitmap cardinality of a registered prefilter"),
+            &["index", "name"],
+        ).unwrap();
+        let prefilter_substitutions_total = IntGaugeVec::new(
+            Opts::new("bitdex_prefilter_substitutions_total", "Queries that matched this prefilter"),
+            &["index", "name"],
+        ).unwrap();
+        let prefilter_last_compute_seconds = IntGaugeVec::new(
+            Opts::new("bitdex_prefilter_last_compute_seconds", "Seconds spent on the last compute/refresh"),
+            &["index", "name"],
+        ).unwrap();
+        let prefilter_refresh_errors_total = IntGaugeVec::new(
+            Opts::new("bitdex_prefilter_refresh_errors_total", "Cumulative refresh errors"),
+            &["index", "name"],
+        ).unwrap();
+        let prefilter_age_seconds = IntGaugeVec::new(
+            Opts::new("bitdex_prefilter_age_seconds", "Seconds since last successful refresh"),
+            &["index", "name"],
+        ).unwrap();
+
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
         registry.register(Box::new(slot_high_water.clone())).unwrap();
@@ -1325,6 +1366,12 @@ impl Metrics {
         registry.register(Box::new(wal_ops_written_total.clone())).unwrap();
         registry.register(Box::new(wal_last_applied_timestamp_seconds.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
+        registry.register(Box::new(prefilter_registered.clone())).unwrap();
+        registry.register(Box::new(prefilter_cardinality.clone())).unwrap();
+        registry.register(Box::new(prefilter_substitutions_total.clone())).unwrap();
+        registry.register(Box::new(prefilter_last_compute_seconds.clone())).unwrap();
+        registry.register(Box::new(prefilter_refresh_errors_total.clone())).unwrap();
+        registry.register(Box::new(prefilter_age_seconds.clone())).unwrap();
 
         Self {
             registry,
@@ -1461,6 +1508,12 @@ impl Metrics {
             wal_ops_written_total,
             wal_last_applied_timestamp_seconds,
             boot_phase_seconds,
+            prefilter_registered,
+            prefilter_cardinality,
+            prefilter_substitutions_total,
+            prefilter_last_compute_seconds,
+            prefilter_refresh_errors_total,
+            prefilter_age_seconds,
         }
     }
 
