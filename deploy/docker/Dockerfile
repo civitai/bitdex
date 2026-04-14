@@ -15,7 +15,7 @@ RUN sed -i 's/members = \[".", "scratch"\]/members = ["."]/' Cargo.toml
 ARG TARGET_CPU=native
 ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 
-RUN cargo build --release --features server,pg-sync --bin bitdex-server && \
+RUN cargo build --release --features server,pg-sync,heap-prof --bin bitdex-server && \
     cargo build --release --features pg-sync --bin bitdex-sync
 
 # --- Runtime ---
