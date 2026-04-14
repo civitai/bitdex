@@ -20,6 +20,9 @@ simd = ["roaring/simd"]
 dump-timing = []
 heap-prof = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 serde_yaml = ["dep:serde_yaml"]
+# Pre-existing utility binary (silo_copy) that references the removed
+# DocStoreV3 type. Build it explicitly with `--features legacy-docstorev3`.
+legacy-docstorev3 = []
 
 [dependencies]
 # Bitmap indexes
@@ -192,6 +195,10 @@ required-features = ["server"]
 [[bin]]
 name = "silo_copy"
 path = "src/bin/silo_copy.rs"
+# Pre-existing broken: references removed DocStoreV3 type. Gated behind an
+# opt-in feature so it doesn't block the default build. Task #132 tracks full
+# DocStoreV3 deletion.
+required-features = ["legacy-docstorev3"]
 
 [[example]]
 name = "load_from_csv"

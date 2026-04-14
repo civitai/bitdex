@@ -1399,6 +1399,9 @@ impl BitdexServer {
             .route("/api/indexes/{name}/time-buckets/rebuild", post(handle_rebuild_time_buckets))
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
+            .route("/api/indexes/{name}/prefilters", post(handle_register_prefilter).get(handle_list_prefilters))
+            .route("/api/indexes/{name}/prefilters/{prefilter_name}", delete(handle_delete_prefilter))
+            .route("/api/indexes/{name}/prefilters/{prefilter_name}/refresh", post(handle_refresh_prefilter))
             // Capture endpoints (Phase 2)
             .route("/debug/capture/start", post(handle_capture_start))
             .route("/debug/capture/stop", post(handle_capture_stop))
@@ -4372,6 +4375,159 @@ async fn handle_save_snapshot(
                 Json(serde_json::json!({"error": format!("Snapshot save failed: {e}")})),
             ).into_response()
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Prefilter registry
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct RegisterPrefilterRequest {
+    name: String,
+    clauses: Vec<crate::query::FilterClause>,
+    #[serde(default = "default_refresh_interval")]
+    refresh_interval_secs: u64,
+}
+
+fn default_refresh_interval() -> u64 {
+    crate::prefilter::DEFAULT_REFRESH_INTERVAL_SECS
+}
+
+/// POST /api/indexes/{name}/prefilters — register (or replace) a prefilter.
+/// Computes the bitmap synchronously from the current snapshot.
+async fn handle_register_prefilter(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<RegisterPrefilterRequest>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    if req.name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name must not be empty"})),
+        ).into_response();
+    }
+    if req.clauses.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "clauses must not be empty"})),
+        ).into_response();
+    }
+
+    let t0 = Instant::now();
+    match engine.register_prefilter(req.name.clone(), req.clauses, req.refresh_interval_secs) {
+        Ok(entry) => {
+            let compute_ms = t0.elapsed().as_millis() as u64;
+            Json(serde_json::json!({
+                "name": entry.name,
+                "cardinality": entry.cardinality(),
+                "compute_time_ms": compute_ms,
+                "refresh_interval_secs": entry.refresh_interval_secs(),
+            })).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("register_prefilter: {e}")})),
+        ).into_response(),
+    }
+}
+
+/// GET /api/indexes/{name}/prefilters — list registered prefilters.
+async fn handle_list_prefilters(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let prefilters = engine.prefilters().list();
+    Json(serde_json::json!({ "prefilters": prefilters })).into_response()
+}
+
+/// DELETE /api/indexes/{name}/prefilters/{prefilter_name} — unregister.
+async fn handle_delete_prefilter(
+    State(state): State<SharedState>,
+    AxumPath((name, prefilter_name)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    if engine.unregister_prefilter(&prefilter_name) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("prefilter '{}' not found", prefilter_name)})),
+        ).into_response()
+    }
+}
+
+/// POST /api/indexes/{name}/prefilters/{prefilter_name}/refresh — manual refresh.
+async fn handle_refresh_prefilter(
+    State(state): State<SharedState>,
+    AxumPath((name, prefilter_name)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    let t0 = Instant::now();
+    match engine.refresh_prefilter(&prefilter_name) {
+        Ok(Some(entry)) => Json(serde_json::json!({
+            "name": entry.name,
+            "cardinality": entry.cardinality(),
+            "compute_time_ms": t0.elapsed().as_millis() as u64,
+        })).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("prefilter '{}' not found", prefilter_name)})),
+        ).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("refresh_prefilter: {e}")})),
+        ).into_response(),
     }
 }
 

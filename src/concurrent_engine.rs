@@ -416,6 +416,11 @@ pub struct ConcurrentEngine {
     /// The WAL reader thread picks up ops and routes through apply_ops_batch.
     #[cfg(feature = "pg-sync")]
     wal_writer: Option<Arc<crate::ops_wal::WalWriter>>,
+    /// Registry of named precomputed filter bitmaps. Queries whose canonical
+    /// clause set is a superset of a registered prefilter's clauses will have
+    /// those clauses elided and replaced with a single AND against the cached
+    /// bitmap. See src/prefilter.rs and docs/_in/design-prefilter-registry.md.
+    prefilters: Arc<crate::prefilter::PrefilterRegistry>,
 }
 impl ConcurrentEngine {
     /// Create a new concurrent engine with a temp docstore (for testing).
@@ -1175,6 +1180,7 @@ impl ConcurrentEngine {
                 doc_cache_eviction_handle: None,
                 #[cfg(feature = "pg-sync")]
                 wal_writer: None,
+                prefilters: Arc::new(crate::prefilter::PrefilterRegistry::new()),
             });
         }
         let flush_handle = {
@@ -3228,6 +3234,7 @@ impl ConcurrentEngine {
             doc_cache_eviction_handle,
             #[cfg(feature = "pg-sync")]
             wal_writer: None,
+            prefilters: Arc::new(crate::prefilter::PrefilterRegistry::new()),
         })
     }
     /// Set the string maps for MappedString field query resolution.
@@ -5601,11 +5608,18 @@ impl ConcurrentEngine {
         } else {
             filters
         };
+        // Substitute registered prefilters: if the query's canonical clause
+        // set contains a registered prefilter's clauses as a subset, replace
+        // those clauses with a single BucketBitmap AND. See src/prefilter.rs.
+        let (post_prefilter, substituted) = crate::prefilter::substitute(&self.prefilters, effective_filters);
+        if let Some(ref entry) = substituted {
+            collector.prefilter_name = Some(entry.name.clone());
+        }
         let planner_ctx = planner::PlannerContext {
             string_maps: executor.string_maps(),
             dictionaries: executor.dictionaries(),
         };
-        let plan = planner::plan_query_with_context(effective_filters, executor.filter_index(), executor.slot_allocator(), Some(&planner_ctx));
+        let plan = planner::plan_query_with_context(&post_prefilter, executor.filter_index(), executor.slot_allocator(), Some(&planner_ctx));
         let filter_bitmap = Arc::new(executor.compute_filters_traced(&plan.ordered_clauses, Some(collector))?);
         Ok((filter_bitmap, plan.use_simple_sort))
     }
@@ -5638,11 +5652,15 @@ impl ConcurrentEngine {
         } else {
             filters
         };
+        // Substitute registered prefilters: if the query's canonical clause
+        // set is a superset of a registered prefilter's clauses, replace
+        // those clauses with a single BucketBitmap AND. See src/prefilter.rs.
+        let (post_prefilter, _entry) = crate::prefilter::substitute(&self.prefilters, effective_filters);
         let planner_ctx = planner::PlannerContext {
             string_maps: executor.string_maps(),
             dictionaries: executor.dictionaries(),
         };
-        let plan = planner::plan_query_with_context(effective_filters, executor.filter_index(), executor.slot_allocator(), Some(&planner_ctx));
+        let plan = planner::plan_query_with_context(&post_prefilter, executor.filter_index(), executor.slot_allocator(), Some(&planner_ctx));
         let filter_bitmap = Arc::new(executor.compute_filters(&plan.ordered_clauses)?);
         Ok((filter_bitmap, plan.use_simple_sort))
     }
@@ -6714,6 +6732,141 @@ impl ConcurrentEngine {
     /// Clear unified cache entries and reset counters (RAM only).
     pub fn clear_unified_cache(&self) {
         self.unified_cache.lock().clear();
+    }
+
+    /// Access the prefilter registry. Used by HTTP handlers and tests.
+    /// See `src/prefilter.rs`.
+    pub fn prefilters(&self) -> &Arc<crate::prefilter::PrefilterRegistry> {
+        &self.prefilters
+    }
+
+    /// Register (or replace) a prefilter by name: compute its bitmap from the
+    /// current snapshot, then store it in the registry for later substitution.
+    ///
+    /// Returns the newly-registered entry on success.
+    pub fn register_prefilter(
+        &self,
+        name: String,
+        clauses: Vec<FilterClause>,
+        refresh_interval_secs: u64,
+    ) -> Result<Arc<crate::prefilter::PrefilterEntry>> {
+        use crate::executor::QueryExecutor;
+        // Load any fields referenced by the clauses so compute_filters sees
+        // real bitmaps rather than empty lazy placeholders.
+        self.ensure_fields_loaded(&clauses, None)?;
+
+        let snap = self.snapshot();
+        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.load_full());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let executor = {
+            let mut base = QueryExecutor::new(
+                &snap.slots,
+                &snap.filters,
+                &snap.sorts,
+                self.config.max_page_size,
+            ).with_not_null_bitmaps(&snap.not_null_bitmaps);
+            if let Some(ref maps) = self.string_maps {
+                base = base.with_string_maps(maps);
+            }
+            if let Some(ref cs) = self.case_sensitive_fields {
+                base = base.with_case_sensitive_fields(cs);
+            }
+            if !self.dictionaries.is_empty() {
+                base = base.with_dictionaries(&self.dictionaries);
+            }
+            if let Some(ref tb) = tb_guard {
+                base.with_time_buckets(tb, now_unix)
+            } else {
+                base
+            }
+        };
+
+        let canonical = crate::prefilter::canonicalize_clauses(&clauses);
+        let planner_ctx = planner::PlannerContext {
+            string_maps: executor.string_maps(),
+            dictionaries: executor.dictionaries(),
+        };
+        let plan = planner::plan_query_with_context(
+            &canonical, executor.filter_index(), executor.slot_allocator(), Some(&planner_ctx),
+        );
+
+        let start = std::time::Instant::now();
+        let bitmap = executor.compute_filters(&plan.ordered_clauses)?;
+        let compute_ns = start.elapsed().as_nanos() as u64;
+
+        self.prefilters
+            .insert(name, clauses, bitmap, refresh_interval_secs, compute_ns)
+            .map_err(|e| crate::error::BitdexError::QueryParse(format!("prefilter: {e}")))
+    }
+
+    /// Recompute the bitmap for a registered prefilter and publish it via
+    /// ArcSwap. Called by the background refresh thread and manual refresh
+    /// endpoints. No-op if `name` is not registered.
+    pub fn refresh_prefilter(&self, name: &str) -> Result<Option<Arc<crate::prefilter::PrefilterEntry>>> {
+        use crate::executor::QueryExecutor;
+        let entry = match self.prefilters.get(name) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        // Load any referenced fields (they may have been evicted since last refresh).
+        self.ensure_fields_loaded(&entry.clauses, None)?;
+
+        let snap = self.snapshot();
+        let tb_guard = self.time_buckets.as_ref().map(|tb| tb.load_full());
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let executor = {
+            let mut base = QueryExecutor::new(
+                &snap.slots,
+                &snap.filters,
+                &snap.sorts,
+                self.config.max_page_size,
+            ).with_not_null_bitmaps(&snap.not_null_bitmaps);
+            if let Some(ref maps) = self.string_maps {
+                base = base.with_string_maps(maps);
+            }
+            if let Some(ref cs) = self.case_sensitive_fields {
+                base = base.with_case_sensitive_fields(cs);
+            }
+            if !self.dictionaries.is_empty() {
+                base = base.with_dictionaries(&self.dictionaries);
+            }
+            if let Some(ref tb) = tb_guard {
+                base.with_time_buckets(tb, now_unix)
+            } else {
+                base
+            }
+        };
+        let planner_ctx = planner::PlannerContext {
+            string_maps: executor.string_maps(),
+            dictionaries: executor.dictionaries(),
+        };
+        let plan = planner::plan_query_with_context(
+            &entry.clauses, executor.filter_index(), executor.slot_allocator(), Some(&planner_ctx),
+        );
+
+        let start = std::time::Instant::now();
+        match executor.compute_filters(&plan.ordered_clauses) {
+            Ok(bm) => {
+                let compute_ns = start.elapsed().as_nanos() as u64;
+                entry.publish_refresh(bm, compute_ns);
+                Ok(Some(entry))
+            }
+            Err(e) => {
+                entry.refresh_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    /// Remove a registered prefilter. Returns `true` if it existed.
+    pub fn unregister_prefilter(&self, name: &str) -> bool {
+        self.prefilters.remove(name)
     }
     /// Purge the entire BoundStore: disk first, then memory.
     /// Order matters: wipe disk before clearing RAM to prevent stale shard loads.
