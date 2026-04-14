@@ -56,8 +56,8 @@ rayon = "1"
 rpmalloc = "0.2"
 
 # Heap profiling (optional — jemalloc with profiling support)
-tikv-jemallocator = { version = "0.6", features = ["profiling"], optional = true }
-tikv-jemalloc-ctl = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.6", features = ["profiling", "stats"], optional = true }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
 
 # HTTP server (optional — only needed for HTTP server)
 axum = { version = "0.8", optional = true }

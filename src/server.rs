@@ -4630,7 +4630,7 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
     // Jemalloc memory stats (only available when heap-prof feature is active)
     #[cfg(feature = "heap-prof")]
     {
-        if let Ok(()) = tikv_jemalloc_ctl::epoch::advance() {
+        if let Ok(_) = tikv_jemalloc_ctl::epoch::advance() {
             if let Ok(allocated) = tikv_jemalloc_ctl::stats::allocated::read() {
                 m.jemalloc_allocated_bytes.set(allocated as i64);
             }
