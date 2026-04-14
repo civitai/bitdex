@@ -225,6 +225,66 @@ fn deleted_docs_excluded_from_stale_prefilter() {
 }
 
 #[test]
+fn swr_thread_refreshes_stale_prefilters() {
+    // Spawn the SWR thread with a 1s tick and a prefilter whose refresh
+    // interval clamps to the 30s minimum — that's too long for a fast
+    // test, so drive staleness manually by rewinding last_refreshed.
+    //
+    // Flow:
+    //   1. Register prefilter covering 10 initial docs.
+    //   2. Insert 5 more matching docs (cached cardinality stays at 10).
+    //   3. Rewind last_refreshed so is_stale() returns true.
+    //   4. SWR thread picks it up on its next tick → cardinality flips to 15.
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(ConcurrentEngine::new_with_path(
+        test_config(&dir.path().join("bitmaps")),
+        &dir.path().join("docs"),
+    ).unwrap());
+
+    for i in 1..=10u32 {
+        engine.put(i, &doc(1, true, 100, i as i64)).unwrap();
+    }
+    wait_for_alive(&engine, 10, 2000);
+
+    let entry = engine.register_prefilter(
+        "nsfw1".into(),
+        vec![FilterClause::Eq("nsfwLevel".into(), Value::Integer(1))],
+        30, // clamped to MIN_REFRESH_INTERVAL_SECS
+    ).unwrap();
+    assert_eq!(entry.cardinality(), 10);
+
+    // Boot SWR with a 1-second tick.
+    let _handle = engine.start_prefilter_refresh_thread(1);
+
+    // Add 5 more matching docs.
+    for i in 11..=15u32 {
+        engine.put(i, &doc(1, true, 100, i as i64)).unwrap();
+    }
+    wait_for_alive(&engine, 15, 2000);
+
+    // Cardinality still reflects the pre-refresh snapshot.
+    assert_eq!(entry.cardinality(), 10, "still stale before rewind");
+
+    // Force the entry past its refresh interval: rewind last_refreshed to
+    // the epoch. SWR thread should see this on its next tick.
+    entry.last_refreshed.store(0, Ordering::Relaxed);
+
+    // Wait up to 5s for the SWR thread to pick it up and refresh.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if entry.cardinality() == 15 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(entry.cardinality(), 15, "SWR thread did not refresh within 5s");
+}
+
+#[test]
 fn refresh_updates_cardinality() {
     let dir = tempfile::tempdir().unwrap();
     let engine = ConcurrentEngine::new_with_path(

@@ -6870,6 +6870,57 @@ impl ConcurrentEngine {
     pub fn unregister_prefilter(&self, name: &str) -> bool {
         self.prefilters.remove(name)
     }
+
+    /// Spawn the prefilter stale-while-revalidate refresh thread.
+    ///
+    /// Ticks every `tick_secs` and, for each registered prefilter past its
+    /// `refresh_interval_secs`, recomputes the bitmap and atomically swaps it
+    /// via ArcSwap. In-flight queries holding the old Arc continue reading
+    /// the old bitmap; the next query after publish sees the new one.
+    ///
+    /// Holds a `Weak<ConcurrentEngine>` so engine drop breaks the cycle.
+    /// Respects `self.shutdown` for cooperative exit.
+    ///
+    /// Call this *after* constructing the engine Arc (e.g. from the server
+    /// during the post-listen phase).
+    pub fn start_prefilter_refresh_thread(
+        self: &Arc<Self>,
+        tick_secs: u64,
+    ) -> std::thread::JoinHandle<()> {
+        let weak = Arc::downgrade(self);
+        let shutdown = Arc::clone(&self.shutdown);
+        let tick = std::time::Duration::from_secs(tick_secs.max(1));
+        std::thread::Builder::new()
+            .name("bitdex-prefilter-swr".into())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Relaxed) {
+                    let engine = match weak.upgrade() {
+                        Some(e) => e,
+                        None => return, // engine dropped
+                    };
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    for entry in engine.prefilters.entries() {
+                        if shutdown.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if entry.is_stale(now_unix) {
+                            if let Err(e) = engine.refresh_prefilter(&entry.name) {
+                                tracing::warn!(
+                                    "prefilter SWR refresh failed for '{}': {}",
+                                    entry.name, e
+                                );
+                            }
+                        }
+                    }
+                    drop(engine);
+                    std::thread::sleep(tick);
+                }
+            })
+            .expect("Failed to spawn prefilter SWR thread")
+    }
     /// Purge the entire BoundStore: disk first, then memory.
     /// Order matters: wipe disk before clearing RAM to prevent stale shard loads.
     /// Safe to call while the server is running — the merge thread will simply
