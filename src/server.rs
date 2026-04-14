@@ -1498,6 +1498,12 @@ impl BitdexServer {
                 state.metrics.boot_phase_seconds
                     .with_label_values(&["bound_cache"])
                     .set(phase6_elapsed.as_secs() as i64);
+
+                // Phase 7: prefilter stale-while-revalidate refresh thread.
+                // Ticks every 10s; refreshes entries past their interval via
+                // ArcSwap so in-flight queries never block on compute.
+                let _handle = engine.start_prefilter_refresh_thread(10);
+                eprintln!("  Boot phase: prefilter SWR thread spawned");
             }
         }
 
