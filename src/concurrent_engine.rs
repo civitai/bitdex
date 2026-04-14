@@ -5611,7 +5611,8 @@ impl ConcurrentEngine {
         // Substitute registered prefilters: if the query's canonical clause
         // set contains a registered prefilter's clauses as a subset, replace
         // those clauses with a single BucketBitmap AND. See src/prefilter.rs.
-        let (post_prefilter, substituted) = crate::prefilter::substitute(&self.prefilters, effective_filters);
+        let alive = executor.slot_allocator().alive_fused_cow();
+        let (post_prefilter, substituted) = crate::prefilter::substitute(&self.prefilters, effective_filters, &alive);
         if let Some(ref entry) = substituted {
             collector.prefilter_name = Some(entry.name.clone());
         }
@@ -5655,7 +5656,8 @@ impl ConcurrentEngine {
         // Substitute registered prefilters: if the query's canonical clause
         // set is a superset of a registered prefilter's clauses, replace
         // those clauses with a single BucketBitmap AND. See src/prefilter.rs.
-        let (post_prefilter, _entry) = crate::prefilter::substitute(&self.prefilters, effective_filters);
+        let alive = executor.slot_allocator().alive_fused_cow();
+        let (post_prefilter, _entry) = crate::prefilter::substitute(&self.prefilters, effective_filters, &alive);
         let planner_ctx = planner::PlannerContext {
             string_maps: executor.string_maps(),
             dictionaries: executor.dictionaries(),

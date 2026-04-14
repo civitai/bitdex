@@ -10,9 +10,19 @@
 //! the cached bitmap — turning ~900 ms of filter work into a single intersect.
 //!
 //! The registry lives on `ConcurrentEngine` (outside the `ArcSwap<InnerEngine>`
-//! snapshot) so registrations don't force a snapshot publish. Each entry's
-//! bitmap is an `ArcSwap<RoaringBitmap>` so a refresh thread can publish a
-//! fresh version without disrupting in-flight queries.
+//! snapshot) so registrations don't force a snapshot publish. This is a
+//! deliberate deviation from the design doc — see
+//! `docs/_in/design-prefilter-registry.md#implementation-deviations`. Each
+//! entry's bitmap is an `ArcSwap<RoaringBitmap>` so a refresh thread can
+//! publish a fresh version without disrupting in-flight queries.
+//!
+//! **Delete safety.** The engine uses clean-delete: on delete, a doc's bits
+//! are cleared from every filter/sort bitmap and from `alive`. The cached
+//! prefilter bitmap is NOT maintained by clean-delete — it's a frozen
+//! snapshot. Between refreshes, deleted docs still have bits set in the
+//! cached prefilter. `substitute()` therefore intersects the cached bitmap
+//! with the live `alive` bitmap at substitute time to avoid resurrecting
+//! deleted docs through a superset-only query.
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -336,6 +346,7 @@ fn now_unix_secs() -> i64 {
 pub fn substitute<'a>(
     registry: &PrefilterRegistry,
     query_clauses: &'a [FilterClause],
+    alive: &RoaringBitmap,
 ) -> (std::borrow::Cow<'a, [FilterClause]>, Option<Arc<PrefilterEntry>>) {
     use std::borrow::Cow;
     if registry.is_empty() {
@@ -362,11 +373,28 @@ pub fn substitute<'a>(
         }
     }
 
-    let bitmap = entry.bitmap.load_full();
+    // Intersect with alive at substitute time.
+    //
+    // The engine uses clean-delete: on delete, the doc's bits are cleared
+    // from every filter/sort bitmap AND from alive. Filter bitmaps are thus
+    // kept clean and there is no `alive AND filter` in the query hot path.
+    //
+    // The cached prefilter bitmap is NOT maintained by clean-delete — it's
+    // a frozen snapshot. Between refreshes, bits for deleted docs remain
+    // set. If a query's only constraint is the prefilter (no extra clauses
+    // to narrow against a clean filter bitmap), the deleted doc would
+    // re-surface in results. Guard against that by intersecting with the
+    // current alive bitmap.
+    //
+    // Cost: one AND against alive per substituted query. At 107M records
+    // this is ~20-50 ms — still a large win vs the 300-900 ms we save by
+    // eliding the original clauses, and cheap insurance against drift.
+    let stale = entry.bitmap.load_full();
+    let live = Arc::new(stale.as_ref() & alive);
     let bucket_clause = FilterClause::BucketBitmap {
         field: "__prefilter".to_string(),
         bucket_name: entry.name.clone(),
-        bitmap,
+        bitmap: live,
     };
     let mut out = Vec::with_capacity(remaining.len() + 1);
     out.push(bucket_clause);
@@ -496,6 +524,12 @@ mod tests {
         assert_eq!(matched.len(), 2);
     }
 
+    fn alive_all() -> RoaringBitmap {
+        let mut bm = RoaringBitmap::new();
+        bm.insert_range(0..100u32);
+        bm
+    }
+
     #[test]
     fn substitute_replaces_matched_clauses_with_bucket_bitmap() {
         let reg = PrefilterRegistry::new();
@@ -503,7 +537,8 @@ mod tests {
         bm.insert(10); bm.insert(20);
         reg.insert("safe".into(), vec![eq("a", 1), eq("b", 2)], bm, 300, 0).unwrap();
         let query = vec![eq("c", 3), eq("a", 1), eq("b", 2)];
-        let (out, entry) = substitute(&reg, &query);
+        let alive = alive_all();
+        let (out, entry) = substitute(&reg, &query, &alive);
         let entry = entry.unwrap();
         assert_eq!(entry.name, "safe");
         assert_eq!(out.len(), 2);
@@ -523,11 +558,38 @@ mod tests {
     }
 
     #[test]
+    fn substitute_excludes_dead_slots_from_stale_prefilter() {
+        // Regression: cached prefilter has bits for slots 10, 20, 30, but
+        // slot 20 has since been deleted (not in alive). Substitution must
+        // NOT leak slot 20 through the returned BucketBitmap.
+        let reg = PrefilterRegistry::new();
+        let mut stale = RoaringBitmap::new();
+        stale.insert(10); stale.insert(20); stale.insert(30);
+        reg.insert("safe".into(), vec![eq("a", 1)], stale, 300, 0).unwrap();
+
+        let mut alive = RoaringBitmap::new();
+        alive.insert(10); alive.insert(30); // 20 was deleted
+
+        let query = vec![eq("a", 1)];
+        let (out, _) = substitute(&reg, &query, &alive);
+        match &out[0] {
+            FilterClause::BucketBitmap { bitmap, .. } => {
+                assert_eq!(bitmap.len(), 2, "dead slot 20 must not leak through");
+                assert!(bitmap.contains(10));
+                assert!(!bitmap.contains(20), "slot 20 was deleted, must not appear");
+                assert!(bitmap.contains(30));
+            }
+            other => panic!("expected BucketBitmap, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn substitute_is_noop_when_no_match() {
         let reg = PrefilterRegistry::new();
         reg.insert("safe".into(), vec![eq("a", 1)], RoaringBitmap::new(), 300, 0).unwrap();
         let query = vec![eq("b", 2)];
-        let (out, entry) = substitute(&reg, &query);
+        let alive = alive_all();
+        let (out, entry) = substitute(&reg, &query, &alive);
         assert!(entry.is_none());
         assert_eq!(out.len(), 1);
     }
@@ -536,8 +598,21 @@ mod tests {
     fn substitute_is_noop_on_empty_registry() {
         let reg = PrefilterRegistry::new();
         let query = vec![eq("a", 1)];
-        let (out, entry) = substitute(&reg, &query);
+        let alive = alive_all();
+        let (out, entry) = substitute(&reg, &query, &alive);
         assert!(entry.is_none());
         assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn canonicalize_does_not_reorder_or_children() {
+        // Design open question #1: Or(A, B) and Or(B, A) currently canonicalize
+        // distinctly. This regression test pins that behavior — a future
+        // change adding Or reordering must update it explicitly (and consider
+        // the test coverage implied by reordering).
+        let c1 = FilterClause::Or(vec![eq("a", 1), eq("b", 2)]);
+        let c2 = FilterClause::Or(vec![eq("b", 2), eq("a", 1)]);
+        assert_ne!(canonicalize_clause(c1), canonicalize_clause(c2),
+            "Or canonicalization changed — update substitution matching logic or this test");
     }
 }
