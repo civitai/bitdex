@@ -43,6 +43,11 @@ pub struct QueryTrace {
     pub cache_hold_us: u64,
     /// Time from function entry to just before cache lookup.
     pub pre_cache_us: u64,
+    /// Name of the registered prefilter that was substituted into this query,
+    /// if any. When set, the first ClauseTrace's `op` will be "BucketBitmap"
+    /// and a chunk of the canonical clause set was elided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefilter: Option<String>,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -84,6 +89,8 @@ pub struct QueryTraceCollector {
     pub cache_lock_wait_us: u64,
     pub cache_hold_us: u64,
     pub pre_cache_us: u64,
+    /// Name of a registered prefilter that was substituted into this query.
+    pub prefilter_name: Option<String>,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -100,6 +107,7 @@ impl QueryTraceCollector {
             cache_lock_wait_us: 0,
             cache_hold_us: 0,
             pre_cache_us: 0,
+            prefilter_name: None,
             clauses: Vec::new(),
             sort: None,
         }
@@ -133,6 +141,7 @@ impl QueryTraceCollector {
             cache_lock_wait_us: self.cache_lock_wait_us,
             cache_hold_us: self.cache_hold_us,
             pre_cache_us: self.pre_cache_us,
+            prefilter: self.prefilter_name,
             clauses: self.clauses,
             sort: self.sort,
         }
