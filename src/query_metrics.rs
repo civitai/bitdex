@@ -30,6 +30,12 @@ pub struct QueryTrace {
     pub lazy_load_us: u64,
     pub docs_us: u64,
     pub docs_count: u64,
+    /// Doc cache hits (slots served from doc_cache without disk read)
+    #[serde(default)]
+    pub docs_cache_hits: u64,
+    /// Doc cache misses (slots that required spawn_blocking disk read)
+    #[serde(default)]
+    pub docs_cache_misses: u64,
     /// Time (µs) the query thread spent blocked waiting for unified_cache
     /// Mutex, contended by the flush thread's Phase A/C lock-held work.
     pub cache_lock_wait_us: u64,
@@ -122,6 +128,8 @@ impl QueryTraceCollector {
             lazy_load_us: self.lazy_load_us,
             docs_us: 0,
             docs_count: 0,
+            docs_cache_hits: 0,
+            docs_cache_misses: 0,
             cache_lock_wait_us: self.cache_lock_wait_us,
             cache_hold_us: self.cache_hold_us,
             pre_cache_us: self.pre_cache_us,
@@ -374,6 +382,8 @@ mod tests {
             result_count: n,
             docs_us: 0,
             docs_count: 0,
+            docs_cache_hits: 0,
+            docs_cache_misses: 0,
             cache_hit: false,
             clauses: vec![],
             sort: None,
