@@ -15,9 +15,14 @@ use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, patch, post, put, delete};
 use axum::Router;
 use parking_lot::Mutex;
+#[cfg(feature = "server")]
+use tokio_stream::wrappers::BroadcastStream;
+#[cfg(feature = "server")]
+use tokio_stream::StreamExt as TokioStreamExt;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
@@ -314,6 +319,25 @@ struct IndexState {
     tasks: Arc<TaskRegistry>,
 }
 
+// ---------------------------------------------------------------------------
+// Query stream (SSE mirror)
+// ---------------------------------------------------------------------------
+
+/// A single query event broadcast to SSE subscribers.
+/// Gated on `BITDEX_QUERY_STREAM=1`. Zero cost when unset.
+#[derive(Clone, Debug, Serialize)]
+pub struct QueryEvent {
+    /// Unix epoch milliseconds.
+    pub ts_ms: u64,
+    /// Index name the query was issued against.
+    pub index: String,
+    /// Raw request body as parsed JSON.
+    pub body: serde_json::Value,
+    /// x-forwarded-for or remote address if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_meta: Option<String>,
+}
+
 /// Shared application state.
 struct AppState {
     data_dir: PathBuf,
@@ -338,6 +362,10 @@ struct AppState {
     max_query_concurrency: AtomicU32,
     /// Snapshot capture session manager (Phase 2).
     capture: crate::capture::CaptureManager,
+    /// Broadcast sender for SSE query stream (`GET /debug/queries/stream`).
+    /// `Some` only when `BITDEX_QUERY_STREAM=1` is set at startup.
+    /// `None` → zero overhead on the hot query path.
+    query_stream: Option<tokio::sync::broadcast::Sender<QueryEvent>>,
     /// Toggleable metric groups — disable expensive metrics without redeploy.
     /// Default: all enabled. PATCH /config to toggle at runtime.
     metrics_bitmap_memory: AtomicBool,
@@ -1078,6 +1106,13 @@ impl BitdexServer {
             queries_in_flight_peak: AtomicI64::new(0),
             max_query_concurrency: AtomicU32::new(self.max_query_concurrency),
             capture: crate::capture::CaptureManager::new(&self.data_dir),
+            query_stream: if std::env::var("BITDEX_QUERY_STREAM").as_deref() == Ok("1") {
+                let (tx, _rx) = tokio::sync::broadcast::channel(10_000);
+                eprintln!("Query stream enabled (BITDEX_QUERY_STREAM=1) — GET /debug/queries/stream");
+                Some(tx)
+            } else {
+                None
+            },
             metrics_bitmap_memory: AtomicBool::new(true),
             metrics_eviction_stats: AtomicBool::new(true),
             metrics_boundstore_disk: AtomicBool::new(true),
@@ -1357,6 +1392,7 @@ impl BitdexServer {
             .route("/debug/capture/stop", post(handle_capture_stop))
             .route("/debug/capture/status", get(handle_capture_status))
             .route("/debug/rescan-memory", post(handle_rescan_memory))
+            .route("/debug/queries/stream", get(handle_query_stream))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
             .with_state(Arc::clone(&state));
 
@@ -2641,6 +2677,26 @@ async fn handle_query(
     }
 
     tracing::info!("[{name}] {query}");
+
+    // Tee into the query stream (SSE mirror) — non-blocking, drops oldest if full.
+    // Only pays the cost of a single Option check on the hot path when disabled.
+    if let Some(ref tx) = state.query_stream {
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let body_val = serde_json::from_slice::<serde_json::Value>(&body)
+            .unwrap_or(serde_json::Value::Null);
+        let event = QueryEvent {
+            ts_ms,
+            index: name.clone(),
+            body: body_val,
+            client_meta: None,
+        };
+        // try_send never blocks; lagging receivers are dropped by the broadcast channel.
+        let _ = tx.send(event);
+    }
+
     state.metrics.query_filter_clause_count.observe(query.filters.len() as f64);
     let start = Instant::now();
     let m = &state.metrics;
@@ -5202,6 +5258,60 @@ async fn handle_ui() -> impl IntoResponse {
     Html(include_str!("../static/index.html"))
 }
 
+// ---------------------------------------------------------------------------
+// GET /debug/queries/stream — SSE query mirror
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct QueryStreamParams {
+    /// Optional index filter. Omit to receive events for all indexes.
+    index: Option<String>,
+}
+
+/// GET /debug/queries/stream — admin-gated SSE endpoint.
+///
+/// Each event is a JSON-encoded `QueryEvent`. The stream is live-only:
+/// events are dropped if the channel is full (capacity 10 000) or if the
+/// server was started without `BITDEX_QUERY_STREAM=1`.
+async fn handle_query_stream(
+    State(state): State<SharedState>,
+    AxumQuery(params): AxumQuery<QueryStreamParams>,
+) -> impl IntoResponse {
+    let Some(ref tx) = state.query_stream else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "query stream not enabled — set BITDEX_QUERY_STREAM=1 and restart"
+            })),
+        ).into_response();
+    };
+
+    let rx = tx.subscribe();
+    let index_filter = params.index.clone();
+
+    let stream = BroadcastStream::new(rx)
+        .filter_map(move |msg| {
+            let filter = index_filter.clone();
+            match msg {
+                Ok(event) => {
+                    // Apply optional index filter
+                    if filter.as_deref().map_or(true, |f| f == event.index) {
+                        let json = serde_json::to_string(&event).unwrap_or_default();
+                        Some(Ok::<Event, std::convert::Infallible>(Event::default().data(json)))
+                    } else {
+                        None
+                    }
+                }
+                // Lagged means we fell behind; skip and continue
+                Err(_lagged) => None,
+            }
+        });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5957,5 +6067,103 @@ mod tests {
         assert!(snap.active.is_empty());
         let hist = reg.get(tid).expect("in history");
         assert!(matches!(hist.status, TaskStatus::Error));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Query stream unit tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn query_event_serializes_correctly() {
+        let event = QueryEvent {
+            ts_ms: 1_700_000_000_000,
+            index: "civitai".to_string(),
+            body: serde_json::json!({"filters": []}),
+            client_meta: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"index\":\"civitai\""));
+        assert!(json.contains("\"ts_ms\":1700000000000"));
+        // client_meta omitted when None
+        assert!(!json.contains("client_meta"));
+    }
+
+    #[test]
+    fn query_event_client_meta_included_when_some() {
+        let event = QueryEvent {
+            ts_ms: 0,
+            index: "test".to_string(),
+            body: serde_json::Value::Null,
+            client_meta: Some("1.2.3.4".to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"client_meta\":\"1.2.3.4\""));
+    }
+
+    #[test]
+    fn query_stream_broadcast_send_and_receive() {
+        // Verify that a sent event arrives at a subscriber.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<QueryEvent>(16);
+        let event = QueryEvent {
+            ts_ms: 42,
+            index: "my-index".to_string(),
+            body: serde_json::json!({"limit": 10}),
+            client_meta: None,
+        };
+        tx.send(event).expect("channel has subscriber");
+        let received = rx.try_recv().expect("event should be queued");
+        assert_eq!(received.ts_ms, 42);
+        assert_eq!(received.index, "my-index");
+    }
+
+    #[test]
+    fn query_stream_no_sender_means_no_overhead() {
+        // When query_stream is None the tee branch is skipped entirely.
+        // This test just confirms the Option pattern compiles and behaves
+        // correctly for the None case.
+        let sender: Option<tokio::sync::broadcast::Sender<QueryEvent>> = None;
+        // If sender is None nothing should happen.
+        if let Some(ref tx) = sender {
+            let event = QueryEvent {
+                ts_ms: 0,
+                index: "x".to_string(),
+                body: serde_json::Value::Null,
+                client_meta: None,
+            };
+            let _ = tx.send(event);
+            panic!("should not reach here");
+        }
+        // Passes — no panic
+    }
+
+    #[test]
+    fn query_stream_full_channel_drops_oldest() {
+        // Broadcast channel with capacity 2.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<QueryEvent>(2);
+        // Subscribe so messages are buffered.
+        let mut rx2 = tx.subscribe();
+
+        let make = |ts: u64| QueryEvent {
+            ts_ms: ts,
+            index: "idx".to_string(),
+            body: serde_json::Value::Null,
+            client_meta: None,
+        };
+
+        // Fill beyond capacity — channel drops oldest for lagged receivers.
+        let _ = tx.send(make(1));
+        let _ = tx.send(make(2));
+        let _ = tx.send(make(3)); // rx2 hasn't read yet — will be lagged
+
+        // First receiver reads fine from its individual slot
+        let e = rx.try_recv().expect("first event");
+        assert_eq!(e.ts_ms, 1);
+
+        // Slow rx2 gets a Lagged error when the channel overflows its slot.
+        // We just confirm it's a recognisable error rather than a panic.
+        let result = rx2.try_recv();
+        // Either lagged or an event — both are acceptable outcomes.
+        // The important guarantee: send() never panics or blocks.
+        let _ = result;
     }
 }

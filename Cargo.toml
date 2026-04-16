@@ -12,7 +12,7 @@ keywords = ["bitmap", "index", "database", "search", "roaring"]
 
 [features]
 default = []
-server = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus", "dep:serde_yaml"]
+server = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus", "dep:serde_yaml", "dep:tokio-stream"]
 loadtest = ["ureq"]
 replay = ["ureq"]
 pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes", "dep:serde_yaml"]
@@ -33,6 +33,7 @@ toml = "0.8"
 # Async runtime (optional — only needed for HTTP server and pg-sync)
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "fs", "io-util"], optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 
 # Concurrency
 dashmap = "6"

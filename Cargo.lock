@@ -253,6 +253,7 @@ dependencies = [
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "toml",
  "tower-http",
@@ -2827,6 +2828,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
