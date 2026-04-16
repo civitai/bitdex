@@ -1356,11 +1356,6 @@ impl BitdexServer {
             .route("/debug/capture/start", post(handle_capture_start))
             .route("/debug/capture/stop", post(handle_capture_stop))
             .route("/debug/capture/status", get(handle_capture_status))
-            .route("/debug/snapshot/{session_id}/package", post(handle_package_snapshot))
-            .route("/debug/snapshot/{session_id}/status", get(handle_package_status))
-            .route("/debug/snapshot/{session_id}/download", get(handle_package_download))
-            .route("/debug/snapshot/{session_id}", delete(handle_snapshot_delete))
-            .route("/debug/snapshots", get(handle_snapshots_list))
             .route("/debug/rescan-memory", post(handle_rescan_memory))
             .route_layer(axum::middleware::from_fn_with_state(Arc::clone(&state), require_admin))
             .with_state(Arc::clone(&state));
@@ -4104,19 +4099,6 @@ async fn handle_capture_start(
 
     match state.capture.start(&req) {
         Ok(status) => {
-            // Pin ShardStore generations at capture start boundary.
-            // Gen N = pre-capture state, Gen N+1 = where mutations during capture go.
-            if let Some(ref idx) = *state.index.lock() {
-                match idx.engine.pin_shard_generations() {
-                    Ok(Some(gen)) => {
-                        state.capture.set_gen_start(gen);
-                        tracing::info!("Capture start: pinned shard generation {gen}");
-                    }
-                    Ok(None) => tracing::debug!("Capture start: no shard stores configured"),
-                    Err(e) => tracing::warn!("Capture start: gen pin failed: {e}"),
-                }
-            }
-
             // Scrape Prometheus metrics at capture start (Phase 2.4)
             let metrics_text = state.metrics.gather();
             if let Some(dir) = state.capture.session_dir() {
@@ -4138,13 +4120,6 @@ async fn handle_capture_start(
                 if auto_stop_state.capture.is_recording() {
                     tracing::info!("Capture auto-stopping after {duration}s");
                     if let Ok(status) = auto_stop_state.capture.stop() {
-                        // Pin shard generations at auto-stop boundary
-                        if let Some(ref idx) = *auto_stop_state.index.lock() {
-                            if let Ok(Some(gen)) = idx.engine.pin_shard_generations() {
-                                auto_stop_state.capture.set_gen_stop(gen);
-                                tracing::info!("Capture auto-stop: pinned shard generation {gen}");
-                            }
-                        }
                         // Scrape metrics at auto-stop
                         let metrics_text = auto_stop_state.metrics.gather();
                         if let Some(dir) = auto_stop_state.capture.session_dir() {
@@ -4174,19 +4149,6 @@ async fn handle_capture_stop(
 ) -> impl IntoResponse {
     match state.capture.stop() {
         Ok(status) => {
-            // Pin ShardStore generations at capture stop boundary.
-            // Gen N+1 = mutations during capture, Gen N+2 = post-capture.
-            if let Some(ref idx) = *state.index.lock() {
-                match idx.engine.pin_shard_generations() {
-                    Ok(Some(gen)) => {
-                        state.capture.set_gen_stop(gen);
-                        tracing::info!("Capture stop: pinned shard generation {gen}");
-                    }
-                    Ok(None) => tracing::debug!("Capture stop: no shard stores configured"),
-                    Err(e) => tracing::warn!("Capture stop: gen pin failed: {e}"),
-                }
-            }
-
             // Scrape Prometheus metrics at capture stop (Phase 2.4)
             let metrics_text = state.metrics.gather();
             if let Some(dir) = state.capture.session_dir() {
@@ -4219,128 +4181,6 @@ async fn handle_capture_status(
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
     Json(serde_json::json!(state.capture.status()))
-}
-
-#[derive(Deserialize)]
-struct PackageParams {
-    mode: Option<crate::capture::PackageMode>,
-}
-
-/// POST /debug/snapshot/{session_id}/package?mode=metrics_only|bitmaps|full
-/// Start packaging a captured session.
-async fn handle_package_snapshot(
-    State(state): State<SharedState>,
-    AxumPath(session_id): AxumPath<String>,
-    query: axum::extract::Query<PackageParams>,
-) -> impl IntoResponse {
-    let (session_dir, pkg_state) = match state.capture.start_package(&session_id) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e.to_string()})),
-            ).into_response();
-        }
-    };
-
-    let mode = query.mode.unwrap_or_default();
-    let data_dir = state.data_dir.clone();
-
-    // Spawn blocking task for tar.zst creation
-    let pkg_state_clone = pkg_state.clone();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = crate::capture::create_package(&session_dir, &data_dir, mode, &pkg_state_clone) {
-            *pkg_state_clone.lock().unwrap() = crate::capture::PackageState::Failed { error: e };
-        }
-    });
-
-    Json(serde_json::json!({
-        "status": "packaging",
-        "session_id": session_id,
-        "mode": format!("{:?}", mode),
-    })).into_response()
-}
-
-/// GET /debug/snapshot/{session_id}/status — Get packaging progress.
-async fn handle_package_status(
-    State(state): State<SharedState>,
-    AxumPath(session_id): AxumPath<String>,
-) -> impl IntoResponse {
-    match state.capture.package_state(&session_id) {
-        Some(pkg_state) => Json(serde_json::json!({
-            "session_id": session_id,
-            "package": pkg_state,
-        })).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("no package for session '{session_id}'")})),
-        ).into_response(),
-    }
-}
-
-/// GET /debug/snapshot/{session_id}/download — Stream the packaged tar.zst.
-async fn handle_package_download(
-    State(state): State<SharedState>,
-    AxumPath(session_id): AxumPath<String>,
-) -> impl IntoResponse {
-    let path = match state.capture.package_path(&session_id) {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "package not ready or not found"})),
-            ).into_response();
-        }
-    };
-
-    // Stream the file
-    match tokio::fs::File::open(&path).await {
-        Ok(file) => {
-            let stream = tokio_util::io::ReaderStream::new(file);
-            let body = axum::body::Body::from_stream(stream);
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("snapshot.tar.zst");
-            axum::response::Response::builder()
-                .header("content-type", "application/zstd")
-                .header("content-disposition", format!("attachment; filename=\"{filename}\""))
-                .body(body)
-                .unwrap()
-                .into_response()
-        }
-        Err(e) => {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("open package file: {e}")})),
-            ).into_response()
-        }
-    }
-}
-
-/// GET /debug/snapshots — List all snapshot packages on disk.
-async fn handle_snapshots_list(
-    State(state): State<SharedState>,
-) -> impl IntoResponse {
-    let packages = state.capture.list_packages();
-    let list: Vec<_> = packages.iter().map(|(id, size)| {
-        serde_json::json!({"session_id": id, "size_bytes": size})
-    }).collect();
-    Json(serde_json::json!({"packages": list}))
-}
-
-/// DELETE /debug/snapshot/{session_id} — Delete a snapshot package and its session data.
-async fn handle_snapshot_delete(
-    State(state): State<SharedState>,
-    AxumPath(session_id): AxumPath<String>,
-) -> impl IntoResponse {
-    match state.capture.delete_package(&session_id) {
-        Ok(freed) => Json(serde_json::json!({
-            "deleted": session_id,
-            "freed_bytes": freed,
-        })).into_response(),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": e})),
-        ).into_response(),
-    }
 }
 
 // ---------------------------------------------------------------------------

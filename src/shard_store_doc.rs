@@ -649,10 +649,8 @@ pub type DocShardKey = u32;
 
 /// Maps slot IDs to hex-bucketed shard files.
 ///
-/// Layout: `{gen_root}/shards/{xx}/{NNNNNN}.shard`
+/// Layout: `{root}/shards/{xx}/{NNNNNN}.shard`
 /// where xx = (shard_id >> 8) & 0xFF, NNNNNN = shard_id.
-///
-/// This matches the existing DocStore V2 directory structure.
 pub struct SlotHexShard;
 
 impl SlotHexShard {
@@ -665,16 +663,16 @@ impl SlotHexShard {
 impl ShardingStrategy for SlotHexShard {
     type Key = DocShardKey;
 
-    fn shard_path(&self, key: &DocShardKey, gen_root: &Path) -> PathBuf {
+    fn shard_path(&self, key: &DocShardKey, root: &Path) -> PathBuf {
         let dir_byte = ((*key >> 8) & 0xFF) as u8;
-        gen_root
+        root
             .join("shards")
             .join(format!("{:02x}", dir_byte))
             .join(format!("{:06}.shard", key))
     }
 
-    fn list_shards(&self, gen_root: &Path) -> io::Result<Vec<DocShardKey>> {
-        let shards_dir = gen_root.join("shards");
+    fn list_shards(&self, root: &Path) -> io::Result<Vec<DocShardKey>> {
+        let shards_dir = root.join("shards");
         let mut keys = Vec::new();
 
         if !shards_dir.exists() {
@@ -1362,11 +1360,6 @@ impl DocStoreV3 {
         )
     }
 
-    /// Pin the current generation for crash-consistent snapshots.
-    pub fn pin_generation(&self) -> io::Result<u64> {
-        self.store.pin_generation()
-    }
-
     /// List all shard keys on disk.
     pub fn list_shards(&self) -> io::Result<Vec<u32>> {
         self.store.list_current_shards()
@@ -1377,12 +1370,10 @@ impl DocStoreV3 {
         SlotHexShard::slot_to_shard(slot_id)
     }
 
-    /// Get the shard file path for a shard ID (compatibility with code that computes paths).
+    /// Get the shard file path for a shard ID.
     pub fn shard_path(root: &Path, shard_id: u32) -> PathBuf {
-        // Matches SlotHexShard layout in gen_000
         let dir_byte = ((shard_id >> 8) & 0xFF) as u8;
-        root.join("gen_000")
-            .join("shards")
+        root.join("shards")
             .join(format!("{:02x}", dir_byte))
             .join(format!("{:06}.shard", shard_id))
     }
@@ -2737,8 +2728,8 @@ mod tests {
     fn test_slot_hex_shard_path() {
         let shard = SlotHexShard;
         let key: DocShardKey = 0x0123; // shard ID
-        let path = shard.shard_path(&key, Path::new("/data/gen_000"));
-        assert_eq!(path, PathBuf::from("/data/gen_000/shards/01/000291.shard"));
+        let path = shard.shard_path(&key, Path::new("/data"));
+        assert_eq!(path, PathBuf::from("/data/shards/01/000291.shard"));
     }
 
     #[test]
@@ -2812,7 +2803,7 @@ mod tests {
         assert_eq!(store.ops_count(&shard_key).unwrap(), Some(2));
 
         // Compact
-        store.compact_shard(&shard_key, 0).unwrap();
+        store.compact_shard(&shard_key).unwrap();
 
         // After compaction: zero ops, data preserved
         assert_eq!(store.ops_count(&shard_key).unwrap(), Some(0));

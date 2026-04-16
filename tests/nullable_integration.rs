@@ -73,7 +73,7 @@ fn alive_remove(inner: &mut InnerEngine, slot: u32) {
 
 /// Insert NULL_BITMAP_KEY for a field+slot in an InnerEngine.
 fn null_insert(inner: &mut InnerEngine, field: &str, slot: u32) {
-    if let Some(ff) = inner.filters.get_field_mut(field) {
+    if let Some(ff) = inner.filters.get_field(field) {
         ff.insert(NULL_BITMAP_KEY, slot);
         ff.merge_dirty();
     }
@@ -81,7 +81,7 @@ fn null_insert(inner: &mut InnerEngine, field: &str, slot: u32) {
 
 /// Remove NULL_BITMAP_KEY for a field+slot in an InnerEngine.
 fn null_remove(inner: &mut InnerEngine, field: &str, slot: u32) {
-    if let Some(ff) = inner.filters.get_field_mut(field) {
+    if let Some(ff) = inner.filters.get_field(field) {
         ff.remove(NULL_BITMAP_KEY, slot);
         ff.merge_dirty();
     }
@@ -89,7 +89,7 @@ fn null_remove(inner: &mut InnerEngine, field: &str, slot: u32) {
 
 /// Insert a concrete value key for a field+slot in an InnerEngine.
 fn value_insert(inner: &mut InnerEngine, field: &str, value: u64, slot: u32) {
-    if let Some(ff) = inner.filters.get_field_mut(field) {
+    if let Some(ff) = inner.filters.get_field(field) {
         ff.insert(value, slot);
         ff.merge_dirty();
     }
@@ -97,7 +97,7 @@ fn value_insert(inner: &mut InnerEngine, field: &str, value: u64, slot: u32) {
 
 /// Remove a concrete value key for a field+slot in an InnerEngine.
 fn value_remove(inner: &mut InnerEngine, field: &str, value: u64, slot: u32) {
-    if let Some(ff) = inner.filters.get_field_mut(field) {
+    if let Some(ff) = inner.filters.get_field(field) {
         ff.remove(value, slot);
         ff.merge_dirty();
     }
@@ -733,7 +733,7 @@ fn test_null_bitmaps_survive_restart() {
         for (value, bm) in &bitmaps {
             inner
                 .filters
-                .get_field_mut("postId")
+                .get_field("postId")
                 .unwrap()
                 .or_bitmap(*value, bm);
         }

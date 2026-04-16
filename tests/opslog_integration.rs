@@ -343,10 +343,7 @@ fn test_crash_recovery_truncated_opslog_replay() {
     // Now truncate those new ops (simulating crash before they were written)
     // Read header to find ops section, then truncate file there
     let header = alive_store.read_header(&AliveShardKey).unwrap().unwrap();
-    let shard_path = alive_store.shard_path_in_gen(
-        &AliveShardKey,
-        alive_store.current_generation(),
-    );
+    let shard_path = alive_store.shard_path(&AliveShardKey);
     // Truncate to just snapshot (remove ops section)
     let truncate_to = header.ops_section_offset;
     let file = std::fs::OpenOptions::new()
