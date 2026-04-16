@@ -40,3 +40,18 @@ jobs:
 
       - name: Check server compiles
         run: cargo check --features server
+
+      # Compile guard for the prod release feature set. The Docker image
+      # builds with `--features server,pg-sync,heap-prof`, which enables
+      # the jemalloc global allocator and the jemalloc stats scrape path.
+      # Enabling `heap-prof` pulls in `tikv-jemalloc-ctl` features that
+      # change public signatures (e.g. `epoch::advance()` becomes
+      # `Result<u64, _>` instead of `Result<(), _>`), and breakage in
+      # that code path is invisible on Windows/macOS because
+      # tikv-jemalloc-sys cannot build jemalloc without a Unix `sh`.
+      #
+      # This step is the only pre-merge gate that exercises that code
+      # path and caught a v1.0.158 build break retrospectively — keep
+      # it in every PR run.
+      - name: Check release feature set compiles (heap-prof)
+        run: cargo check --features server,pg-sync,heap-prof --bin bitdex-server

@@ -68,6 +68,14 @@ pub struct Metrics {
     pub flush_publish_nanos: IntGaugeVec,
     pub flush_timebucket_nanos: IntGaugeVec,
     pub flush_compact_nanos: IntGaugeVec,
+    pub flush_opslog_nanos: IntGaugeVec,
+    pub flush_sort_promote_nanos: IntGaugeVec,
+    pub cache_maint_unique_filter_shapes: IntGaugeVec,
+    pub cache_maint_sort_work_items: IntGaugeVec,
+    pub cache_maint_unique_filter_shapes_max: IntGaugeVec,
+    pub cache_maint_sort_work_items_max: IntGaugeVec,
+    pub docstore_put_batch_fast_path_total: IntGaugeVec,
+    pub docstore_put_batch_slow_path_total: IntGaugeVec,
 
     // -- Tier 2: Lazy loading --
     pub lazy_load_duration_seconds: HistogramVec,
@@ -415,6 +423,70 @@ impl Metrics {
         .unwrap();
         let flush_compact_nanos = IntGaugeVec::new(
             Opts::new("bitdex_flush_compact_nanos", "Last flush diff compaction duration in nanoseconds"),
+            &["index"],
+        )
+        .unwrap();
+        let flush_opslog_nanos = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_flush_opslog_nanos",
+                "Last flush ops-log append duration in nanoseconds (runs after publish, not included in flush_last_duration_nanos)",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let flush_sort_promote_nanos = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_flush_sort_promote_nanos",
+                "Duration of the most recent sort-layer promote pass (merge_dirty across dirty sort fields) in nanoseconds. Sort-promote runs inside the flush thread but only fires every ~5s, so this gauge updates on promote cycles, NOT on every flush. A value of 0 means no promote has run since boot. Contributes to flush_last_duration_nanos on the cycle it fires.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_maint_unique_filter_shapes = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_maint_unique_filter_shapes",
+                "Number of unique canonical filter-clause vectors across sort-maintenance work items in the most recent cache-maintenance cycle. Compare to cache_maint_sort_work_items to get the collapse factor (shapes/items). Low collapse = many entries share filters, filter-shape grouping in Phase B would pay off. High collapse = filters are diverse.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_maint_sort_work_items = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_maint_sort_work_items",
+                "Number of sort-maintenance work items collected in the most recent cache-maintenance cycle. Denominator for the filter-shape collapse ratio (see cache_maint_unique_filter_shapes).",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_maint_unique_filter_shapes_max = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_maint_unique_filter_shapes_max",
+                "Maximum observed unique canonical filter-clause vectors in a single cache-maintenance cycle since boot. Captures burst-time peaks that the last-cycle gauge can miss on quiet samples.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_maint_sort_work_items_max = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_maint_sort_work_items_max",
+                "Maximum observed sort-maintenance work item count in a single cache-maintenance cycle since boot. Denominator for the burst-time filter-shape collapse ratio.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let docstore_put_batch_fast_path_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_docstore_put_batch_fast_path_total",
+                "Cumulative count of DocStoreV3::put_batch_known_fields invocations that took the concurrent-read fast path (field dict already contained all batch fields). Ratio with slow_path tells us how often we avoid the outer RwLock write guard.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let docstore_put_batch_slow_path_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_docstore_put_batch_slow_path_total",
+                "Cumulative count of DocStoreV3::put_batch calls (write-lock path), either from dict-update fallback or direct calls that bypass the fast path.",
+            ),
             &["index"],
         )
         .unwrap();
@@ -777,6 +849,14 @@ impl Metrics {
         registry.register(Box::new(flush_publish_nanos.clone())).unwrap();
         registry.register(Box::new(flush_timebucket_nanos.clone())).unwrap();
         registry.register(Box::new(flush_compact_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_opslog_nanos.clone())).unwrap();
+        registry.register(Box::new(flush_sort_promote_nanos.clone())).unwrap();
+        registry.register(Box::new(cache_maint_unique_filter_shapes.clone())).unwrap();
+        registry.register(Box::new(cache_maint_sort_work_items.clone())).unwrap();
+        registry.register(Box::new(cache_maint_unique_filter_shapes_max.clone())).unwrap();
+        registry.register(Box::new(cache_maint_sort_work_items_max.clone())).unwrap();
+        registry.register(Box::new(docstore_put_batch_fast_path_total.clone())).unwrap();
+        registry.register(Box::new(docstore_put_batch_slow_path_total.clone())).unwrap();
         registry
             .register(Box::new(lazy_load_duration_seconds.clone()))
             .unwrap();
@@ -884,6 +964,14 @@ impl Metrics {
             flush_publish_nanos,
             flush_timebucket_nanos,
             flush_compact_nanos,
+            flush_opslog_nanos,
+            flush_sort_promote_nanos,
+            cache_maint_unique_filter_shapes,
+            cache_maint_sort_work_items,
+            cache_maint_unique_filter_shapes_max,
+            cache_maint_sort_work_items_max,
+            docstore_put_batch_fast_path_total,
+            docstore_put_batch_slow_path_total,
             lazy_load_duration_seconds,
             pending_fields,
             eviction_total,

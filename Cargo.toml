@@ -56,8 +56,13 @@ rayon = "1"
 rpmalloc = "0.2"
 
 # Heap profiling (optional — jemalloc with profiling support)
-tikv-jemallocator = { version = "0.6", features = ["profiling"], optional = true }
-tikv-jemalloc-ctl = { version = "0.6", optional = true }
+# `stats` is required for tikv_jemalloc_ctl::stats::{allocated, resident}
+# to work at runtime. Without it, tikv-jemalloc-sys passes `--disable-stats`
+# to the jemalloc configure script and every `stats::*::read()` call fails
+# silently, leaving `bitdex_jemalloc_*_bytes` metrics at zero. `profiling`
+# is also kept so heap profiles can be dumped via `MALLOC_CONF=prof:true`.
+tikv-jemallocator = { version = "0.6", features = ["profiling", "stats"], optional = true }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
 
 # HTTP server (optional — only needed for HTTP server)
 axum = { version = "0.8", optional = true }

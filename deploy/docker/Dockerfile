@@ -15,7 +15,21 @@ RUN sed -i 's/members = \[".", "scratch"\]/members = ["."]/' Cargo.toml
 ARG TARGET_CPU=native
 ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU}"
 
-RUN cargo build --release --features server,pg-sync --bin bitdex-server && \
+# heap-prof swaps the bitdex-server global allocator from the system
+# allocator (glibc malloc in this debian base image) to jemalloc, and
+# exposes `bitdex_jemalloc_allocated_bytes` / `_resident_bytes` stats.
+#
+# See src/bin/server.rs:30-32: the `#[global_allocator]` declaration is
+# gated on `#[cfg(feature = "heap-prof")]`. Without this feature the
+# `_RJEM_MALLOC_CONF` env var at runtime below is a no-op (jemalloc is
+# not loaded), and the jemalloc stats Prometheus gauges stay at zero —
+# exactly what we observed when diagnosing the v1.0.156 OOM and hunting
+# the untracked RSS growth.
+#
+# jemalloc with `dirty_decay_ms:0` / `muzzy_decay_ms:0` should return
+# freed pages to the kernel promptly, which targets the exact pattern
+# causing glibc arena retention in the current build.
+RUN cargo build --release --features server,pg-sync,heap-prof --bin bitdex-server && \
     cargo build --release --features pg-sync --bin bitdex-sync
 
 # --- Runtime ---

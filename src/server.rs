@@ -2522,6 +2522,36 @@ impl Drop for QueryInflightGuard<'_> {
     }
 }
 
+/// RAII guard that decrements `docstore_concurrent_reads` on drop.
+///
+/// The previous code wrapped the doc-fetch `spawn_blocking` with
+/// `gauge.inc()` + `.await.unwrap()` + `gauge.dec()`. The `dec()` line
+/// was unreachable whenever the `.await` was cancelled — which happens
+/// on HTTP client disconnect, even though the `spawn_blocking` task
+/// itself keeps running until it finishes. That leaked `inc()`s into
+/// the gauge permanently.
+///
+/// Production pod observed at 19,541 concurrent reads under an admission
+/// cap of 200 — clearly impossible. With this guard on the async stack
+/// frame, `Drop` runs whether the future completes, panics, or is
+/// cancelled, so the gauge stays honest.
+struct ConcurrentReadGuard<'a> {
+    gauge: &'a prometheus::IntGauge,
+}
+
+impl<'a> ConcurrentReadGuard<'a> {
+    fn new(gauge: &'a prometheus::IntGauge) -> Self {
+        gauge.inc();
+        Self { gauge }
+    }
+}
+
+impl Drop for ConcurrentReadGuard<'_> {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
 async fn handle_query(
     State(state): State<SharedState>,
     AxumPath(name): AxumPath<String>,
@@ -2644,7 +2674,10 @@ async fn handle_query(
                 let docstore_hist = m.docstore_read_seconds.clone();
                 let name_docs = name.clone();
 
-                m.docstore_concurrent_reads.inc();
+                // RAII guard replaces the old inc()/dec() bookend that
+                // leaked on `.await` cancellation (HTTP client disconnect).
+                // Dropped unconditionally when the async stack frame unwinds.
+                let _read_guard = ConcurrentReadGuard::new(&m.docstore_concurrent_reads);
                 let docs = tokio::task::spawn_blocking(move || {
                     let mut docs = Vec::with_capacity(ids.len());
                     for &id in &ids {
@@ -2668,7 +2701,6 @@ async fn handle_query(
                     }
                     docs
                 }).await.unwrap();
-                m.docstore_concurrent_reads.dec();
                 Some(docs)
             } else {
                 None
@@ -4630,7 +4662,9 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
     // Jemalloc memory stats (only available when heap-prof feature is active)
     #[cfg(feature = "heap-prof")]
     {
-        if let Ok(()) = tikv_jemalloc_ctl::epoch::advance() {
+        // With the `stats` feature enabled, epoch::advance() returns
+        // Result<u64, _> (the previous epoch value) instead of Result<(), _>.
+        if tikv_jemalloc_ctl::epoch::advance().is_ok() {
             if let Ok(allocated) = tikv_jemalloc_ctl::stats::allocated::read() {
                 m.jemalloc_allocated_bytes.set(allocated as i64);
             }
@@ -4737,13 +4771,38 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
                 .set(last_nanos as i64);
 
             // Flush phase timing
-            let (apply_ns, cache_ns, publish_ns, tb_ns, compact_ns, opslog_ns) = engine.flush_phase_stats();
+            let (apply_ns, cache_ns, publish_ns, tb_ns, compact_ns, opslog_ns, sort_promote_ns) =
+                engine.flush_phase_stats();
             m.flush_apply_nanos.with_label_values(&[name]).set(apply_ns as i64);
             m.flush_cache_nanos.with_label_values(&[name]).set(cache_ns as i64);
             m.flush_publish_nanos.with_label_values(&[name]).set(publish_ns as i64);
             m.flush_timebucket_nanos.with_label_values(&[name]).set(tb_ns as i64);
             m.flush_compact_nanos.with_label_values(&[name]).set(compact_ns as i64);
-            let _ = opslog_ns; // TODO: add bitdex_flush_opslog_nanos Prometheus metric
+            m.flush_opslog_nanos.with_label_values(&[name]).set(opslog_ns as i64);
+            m.flush_sort_promote_nanos.with_label_values(&[name]).set(sort_promote_ns as i64);
+            // Iter 4a — cache maintenance shape stats + iter 6 max-seen
+            let (unique_shapes, sort_work_items, unique_shapes_max, sort_work_items_max) =
+                engine.cache_maint_shape_stats();
+            m.cache_maint_unique_filter_shapes
+                .with_label_values(&[name])
+                .set(unique_shapes as i64);
+            m.cache_maint_sort_work_items
+                .with_label_values(&[name])
+                .set(sort_work_items as i64);
+            m.cache_maint_unique_filter_shapes_max
+                .with_label_values(&[name])
+                .set(unique_shapes_max as i64);
+            m.cache_maint_sort_work_items_max
+                .with_label_values(&[name])
+                .set(sort_work_items_max as i64);
+            // Iter 6 — put_batch fast/slow path counters
+            let (fast_path, slow_path) = engine.docstore_put_batch_path_stats();
+            m.docstore_put_batch_fast_path_total
+                .with_label_values(&[name])
+                .set(fast_path as i64);
+            m.docstore_put_batch_slow_path_total
+                .with_label_values(&[name])
+                .set(slow_path as i64);
 
             // Pending fields (lazy loading)
             let pending = engine.pending_field_count();
