@@ -1190,6 +1190,8 @@ impl DocStoreV3 {
 
     /// Append tuples for a single slot (used by DocWriter in ops_processor).
     pub fn append_tuples_batch(&mut self, tuples: Vec<(u32, u16, Vec<u8>)>) -> io::Result<()> {
+        use rayon::prelude::*;
+
         // Group tuples by shard
         let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
         for (slot, field_idx, value_bytes) in tuples {
@@ -1204,10 +1206,18 @@ impl DocStoreV3 {
             });
         }
 
-        for (shard_key, ops) in by_shard {
-            self.store.append_ops(&shard_key, &ops)?;
-            self.dirty_shards.insert(shard_key);
-        }
+        // Parallel per-shard append without per-shard fsync. Durability is
+        // deferred to the merge thread, which fsyncs before persisting the
+        // WAL cursor. On crash, the WAL replays unapplied ops from the last
+        // durable cursor position.
+        let store = Arc::clone(&self.store);
+        let dirty_shards = Arc::clone(&self.dirty_shards);
+        let items: Vec<(u32, Vec<DocOp>)> = by_shard.into_iter().collect();
+        items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
+            store.append_ops(&shard_key, &ops)?;
+            dirty_shards.insert(shard_key);
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1219,6 +1229,8 @@ impl DocStoreV3 {
         appends: Vec<(u32, u16, PackedValue)>,
         removes: Vec<(u32, u16, PackedValue)>,
     ) -> io::Result<()> {
+        use rayon::prelude::*;
+
         let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
         for (slot, field, value) in appends {
             let shard_key = SlotHexShard::slot_to_shard(slot);
@@ -1228,10 +1240,14 @@ impl DocStoreV3 {
             let shard_key = SlotHexShard::slot_to_shard(slot);
             by_shard.entry(shard_key).or_default().push(DocOp::Remove { slot, field, value });
         }
-        for (shard_key, ops) in by_shard {
-            self.store.append_ops(&shard_key, &ops)?;
-            self.dirty_shards.insert(shard_key);
-        }
+        let store = Arc::clone(&self.store);
+        let dirty_shards = Arc::clone(&self.dirty_shards);
+        let items: Vec<(u32, Vec<DocOp>)> = by_shard.into_iter().collect();
+        items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
+            store.append_ops(&shard_key, &ops)?;
+            dirty_shards.insert(shard_key);
+            Ok(())
+        })?;
         Ok(())
     }
 
