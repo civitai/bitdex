@@ -4104,19 +4104,6 @@ async fn handle_capture_start(
 
     match state.capture.start(&req) {
         Ok(status) => {
-            // Pin ShardStore generations at capture start boundary.
-            // Gen N = pre-capture state, Gen N+1 = where mutations during capture go.
-            if let Some(ref idx) = *state.index.lock() {
-                match idx.engine.pin_shard_generations() {
-                    Ok(Some(gen)) => {
-                        state.capture.set_gen_start(gen);
-                        tracing::info!("Capture start: pinned shard generation {gen}");
-                    }
-                    Ok(None) => tracing::debug!("Capture start: no shard stores configured"),
-                    Err(e) => tracing::warn!("Capture start: gen pin failed: {e}"),
-                }
-            }
-
             // Scrape Prometheus metrics at capture start (Phase 2.4)
             let metrics_text = state.metrics.gather();
             if let Some(dir) = state.capture.session_dir() {
@@ -4138,13 +4125,6 @@ async fn handle_capture_start(
                 if auto_stop_state.capture.is_recording() {
                     tracing::info!("Capture auto-stopping after {duration}s");
                     if let Ok(status) = auto_stop_state.capture.stop() {
-                        // Pin shard generations at auto-stop boundary
-                        if let Some(ref idx) = *auto_stop_state.index.lock() {
-                            if let Ok(Some(gen)) = idx.engine.pin_shard_generations() {
-                                auto_stop_state.capture.set_gen_stop(gen);
-                                tracing::info!("Capture auto-stop: pinned shard generation {gen}");
-                            }
-                        }
                         // Scrape metrics at auto-stop
                         let metrics_text = auto_stop_state.metrics.gather();
                         if let Some(dir) = auto_stop_state.capture.session_dir() {
@@ -4174,19 +4154,6 @@ async fn handle_capture_stop(
 ) -> impl IntoResponse {
     match state.capture.stop() {
         Ok(status) => {
-            // Pin ShardStore generations at capture stop boundary.
-            // Gen N+1 = mutations during capture, Gen N+2 = post-capture.
-            if let Some(ref idx) = *state.index.lock() {
-                match idx.engine.pin_shard_generations() {
-                    Ok(Some(gen)) => {
-                        state.capture.set_gen_stop(gen);
-                        tracing::info!("Capture stop: pinned shard generation {gen}");
-                    }
-                    Ok(None) => tracing::debug!("Capture stop: no shard stores configured"),
-                    Err(e) => tracing::warn!("Capture stop: gen pin failed: {e}"),
-                }
-            }
-
             // Scrape Prometheus metrics at capture stop (Phase 2.4)
             let metrics_text = state.metrics.gather();
             if let Some(dir) = state.capture.session_dir() {

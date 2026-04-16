@@ -1,7 +1,7 @@
 //! ShardStore integration tests — cross-system E2E scenarios.
 //!
 //! These tests exercise the ShardStore at the integration level:
-//! doc + bitmap stores working together, generation lifecycle,
+//! doc + bitmap stores working together, flat compaction lifecycle,
 //! crash recovery, compaction, and concurrent access patterns.
 //!
 //! Written by Ivanna (QA) for Adam to wire in as ShardStore matures.
@@ -16,7 +16,6 @@ use roaring::RoaringBitmap;
 use bitdex_v2::shard_store::ShardHeader;
 use bitdex_v2::shard_store_doc::*;
 use bitdex_v2::shard_store_bitmap::*;
-use bitdex_v2::docstore::PackedValue;
 
 // ===========================================================================
 // Scenario 1: ShardStore round-trip (doc + bitmap)
@@ -63,7 +62,7 @@ fn test_doc_store_roundtrip_create_modify_compact_verify() {
     assert_eq!(store.ops_count(&shard_key).unwrap(), Some(4));
 
     // Step 4: Compact
-    store.compact_shard(&shard_key, 0).unwrap();
+    store.compact_shard(&shard_key).unwrap();
 
     // Step 5: Verify post-compaction: zero ops, same data
     assert_eq!(store.ops_count(&shard_key).unwrap(), Some(0));
@@ -99,7 +98,7 @@ fn test_bitmap_store_roundtrip_ops_compact_verify() {
     assert!(bm.contains(200));
 
     // Compact
-    store.compact_shard(&key, 0).unwrap();
+    store.compact_shard(&key).unwrap();
 
     // Verify post-compact: same bitmap, zero ops
     assert_eq!(store.ops_count(&key).unwrap(), Some(0));
@@ -109,86 +108,79 @@ fn test_bitmap_store_roundtrip_ops_compact_verify() {
 }
 
 // ===========================================================================
-// Scenario 2: Generation lifecycle
-// Create gen → write → pin gen → write to new gen → fall-through → compact
+// Scenario 2: Flat compaction lifecycle
+// Write ops → compact (flat, no gen) → verify snapshot absorbed ops
 // ===========================================================================
 
 #[test]
-fn test_generation_lifecycle_pin_fallthrough_compact() {
+fn test_flat_compaction_doc_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let store = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
 
     let key_a = SlotHexShard::slot_to_shard(100);
     let key_b = SlotHexShard::slot_to_shard(600); // different shard
 
-    // Gen 0: create doc A
+    // Write doc A, then update it
     store.append_op(&key_a, &DocOp::Create {
         slot: 100,
         fields: vec![(0, PackedValue::I(1))],
     }).unwrap();
+    store.append_op(&key_a, &DocOp::Set {
+        slot: 100, field: 0, value: PackedValue::I(42),
+    }).unwrap();
 
-    // Pin → gen 0 frozen, gen 1 current
-    let frozen = store.pin_generation().unwrap();
-    assert_eq!(frozen, 0);
-    assert_eq!(store.current_generation(), 1);
-
-    // Gen 1: create doc B (different shard)
+    // Write doc B (different shard)
     store.append_op(&key_b, &DocOp::Create {
         slot: 600,
         fields: vec![(0, PackedValue::I(99))],
     }).unwrap();
 
-    // Gen 1: modify doc A (overwrites in new gen)
-    store.append_op(&key_a, &DocOp::Set {
-        slot: 100, field: 0, value: PackedValue::I(42),
-    }).unwrap();
-
-    // Read doc A: should find gen 1 version (newest first)
+    // Reads reflect latest ops
     let snap_a = store.read(&key_a).unwrap().unwrap();
-    // Gen 1 has Set{42} on top of empty snapshot → field 0 = 42
-    let doc_a = &snap_a.docs[&100];
-    assert_eq!(doc_a.iter().find(|(f, _)| *f == 0).unwrap().1, PackedValue::I(42));
-
-    // Read doc B: should find gen 1
+    assert_eq!(snap_a.docs[&100].iter().find(|(f, _)| *f == 0).unwrap().1, PackedValue::I(42));
     let snap_b = store.read(&key_b).unwrap().unwrap();
     assert_eq!(snap_b.docs[&600][0], (0, PackedValue::I(99)));
 
-    // Compact gen 1: merge everything into fresh snapshots
-    store.compact_generation(1).unwrap();
+    // Compact both shards
+    store.compact_shard(&key_a).unwrap();
+    store.compact_shard(&key_b).unwrap();
 
-    // After compaction: reads still correct
+    // After compaction: ops absorbed into snapshot, reads still correct
+    assert_eq!(store.ops_count(&key_a).unwrap(), Some(0));
+    assert_eq!(store.ops_count(&key_b).unwrap(), Some(0));
     let snap_a2 = store.read(&key_a).unwrap().unwrap();
     assert_eq!(snap_a2.docs[&100].iter().find(|(f, _)| *f == 0).unwrap().1, PackedValue::I(42));
 }
 
 #[test]
-fn test_bitmap_generation_fallthrough() {
+fn test_flat_compaction_bitmap_two_fields() {
     let dir = tempfile::tempdir().unwrap();
     let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
 
     let key1 = FilterBucketKey::from_value("nsfwLevel".into(), 1);
     let key2 = FilterBucketKey::from_value("nsfwLevel".into(), 2);
 
-    // Gen 0: write bitmap for value 1 via ops
+    // Write 50 bits to value 1
     for bit in 0..50u32 {
         store.append_op(&key1, &FilterOp::SetBit { value: 1, bit }).unwrap();
     }
-
-    // Pin to gen 1
-    store.pin_generation().unwrap();
-
-    // Gen 1: write bitmap for value 2 via ops
+    // Write 50 bits to value 2
     for bit in 50..100u32 {
         store.append_op(&key2, &FilterOp::SetBit { value: 2, bit }).unwrap();
     }
 
-    // value 1 falls through to gen 0
+    // Compact both; verify data survives
+    store.compact_shard(&key1).unwrap();
+    store.compact_shard(&key2).unwrap();
+
+    assert_eq!(store.ops_count(&key1).unwrap(), Some(0));
+    assert_eq!(store.ops_count(&key2).unwrap(), Some(0));
+
     let r1 = store.read(&key1).unwrap().unwrap();
     let bm1 = r1.values.get(&1).unwrap();
     assert_eq!(bm1.len(), 50);
     assert!(bm1.contains(0));
 
-    // value 2 found in gen 1
     let r2 = store.read(&key2).unwrap().unwrap();
     let bm2 = r2.values.get(&2).unwrap();
     assert_eq!(bm2.len(), 50);
@@ -224,7 +216,7 @@ fn test_crash_recovery_truncated_op_ignored() {
     // Simulate crash: truncate the last few bytes of the shard file
     let shard_key = SlotHexShard::slot_to_shard(42);
     let store_tmp = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
-    let shard_path = store_tmp.shard_path_in_gen(&shard_key, 0);
+    let shard_path = store_tmp.shard_path(&shard_key);
 
     let metadata = std::fs::metadata(&shard_path).unwrap();
     let truncated_len = metadata.len() - 5; // chop 5 bytes off the last op
@@ -265,7 +257,7 @@ fn test_crash_recovery_corrupted_crc_ignored() {
 
     // Corrupt the CRC of the second op by flipping a byte in the file
     let store_tmp = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
-    let shard_path = store_tmp.shard_path_in_gen(&shard_key, 0);
+    let shard_path = store_tmp.shard_path(&shard_key);
 
     let mut data = std::fs::read(&shard_path).unwrap();
     // Flip the last byte (part of the second op's CRC)
@@ -355,26 +347,21 @@ fn test_cross_store_doc_filter_alive_consistency() {
 // ===========================================================================
 
 #[test]
-fn test_existence_set_across_generations() {
+fn test_existence_set_flat() {
     let dir = tempfile::tempdir().unwrap();
     let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
 
-    // Gen 0: values 1, 2, 3
+    // Write values 1-5 across multiple shards
     for v in [1u64, 2, 3] {
         let key = FilterBucketKey::from_value("tags".into(), v);
         store.append_op(&key, &FilterOp::SetBit { value: v, bit: v as u32 }).unwrap();
     }
-
-    // Pin → gen 1
-    store.pin_generation().unwrap();
-
-    // Gen 1: values 4, 5
     for v in [4u64, 5] {
         let key = FilterBucketKey::from_value("tags".into(), v);
         store.append_op(&key, &FilterOp::SetBit { value: v, bit: v as u32 }).unwrap();
     }
 
-    // Existence set should span both generations
+    // Existence set should see all 5 values
     let exist = store.existence_set("tags").unwrap();
     assert_eq!(exist.len(), 5);
     for v in 1..=5 {
@@ -520,7 +507,7 @@ fn f1_1_shard_file_header_magic_and_version() {
     }).unwrap();
 
     // Read raw bytes of the shard file
-    let shard_path = store.shard_path_in_gen(&shard_key, 0);
+    let shard_path = store.shard_path(&shard_key);
 
     let data = std::fs::read(&shard_path).unwrap();
     assert!(data.len() >= 28 /* HEADER_SIZE */, "shard too small for header");
@@ -598,13 +585,15 @@ fn f4_3_zero_byte_shard_returns_error() {
         slot: 42, fields: vec![(0, PackedValue::I(1))],
     }).unwrap();
 
-    // Overwrite with zero bytes
-    let shard_path = store.shard_path_in_gen(&shard_key, 0);
+    // Overwrite with zero bytes (simulates a crashed pre-creation stub)
+    let shard_path = store.shard_path(&shard_key);
     std::fs::write(&shard_path, &[]).unwrap();
 
-    // Read should return error, not panic
+    // ShardStore treats invalid stubs as absent (Ok(None)), not as an error.
+    // This allows recovery from partial writes without erroring on legitimate stubs.
     let result = store.read(&shard_key);
-    assert!(result.is_err(), "zero-byte shard should return error");
+    assert!(result.is_ok(), "zero-byte shard should not panic or propagate error");
+    assert!(result.unwrap().is_none(), "zero-byte shard should return None (treated as absent)");
 }
 
 #[test]
@@ -620,7 +609,7 @@ fn f4_4_wrong_magic_returns_error() {
     }).unwrap();
 
     // Corrupt the magic bytes
-    let shard_path = store.shard_path_in_gen(&shard_key, 0);
+    let shard_path = store.shard_path(&shard_key);
     let mut data = std::fs::read(&shard_path).unwrap();
     data[0] = 0xFF; // corrupt first byte of magic
     data[1] = 0xFF;
@@ -632,12 +621,12 @@ fn f4_4_wrong_magic_returns_error() {
 }
 
 #[test]
-fn f4_5_generation_reopen_finds_latest() {
+fn f4_5_reopen_finds_latest_data() {
     let dir = tempfile::tempdir().unwrap();
 
     let shard_key = SlotHexShard::slot_to_shard(42);
 
-    // Create store, write to gen 0, pin to gen 1, write to gen 1
+    // Write two ops then compact
     {
         let store = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
 
@@ -645,44 +634,43 @@ fn f4_5_generation_reopen_finds_latest() {
             slot: 42, fields: vec![(0, PackedValue::I(1))],
         }).unwrap();
 
-        store.pin_generation().unwrap();
-
         store.append_op(&shard_key, &DocOp::Set {
             slot: 42, field: 0, value: PackedValue::I(99),
         }).unwrap();
 
-        assert_eq!(store.current_generation(), 1);
+        // Compact → snapshot contains value 99
+        store.compact_shard(&shard_key).unwrap();
     }
 
-    // Reopen store from same directory — should find gen 1
+    // Reopen store from same directory — flat shard, should read compacted data
     let store = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
-    assert_eq!(store.current_generation(), 1, "reopened store must find latest generation");
-
-    // Should read gen 1 data
     let snap = store.read(&shard_key).unwrap().unwrap();
     assert_eq!(
         snap.docs[&42].iter().find(|(f, _)| *f == 0).unwrap().1,
         PackedValue::I(99),
-        "reopened store should read latest data"
+        "reopened store should read latest compacted data"
     );
+    assert_eq!(store.ops_count(&shard_key).unwrap(), Some(0), "compacted shard has zero ops");
 }
 
 #[test]
-fn f4_6_multiple_sequential_pins() {
+fn f4_6_multiple_compactions_are_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let store = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
 
-    // Pin 5 times
-    for expected_frozen in 0..5u64 {
-        let frozen = store.pin_generation().unwrap();
-        assert_eq!(frozen, expected_frozen);
+    let shard_key = SlotHexShard::slot_to_shard(42);
+    store.append_op(&shard_key, &DocOp::Create {
+        slot: 42, fields: vec![(0, PackedValue::I(7))],
+    }).unwrap();
+
+    // Compact 5 times — result must be stable
+    for _ in 0..5 {
+        let changed = store.compact_shard(&shard_key).unwrap();
+        // First compact returns true (had ops), rest return false (already clean)
+        let _ = changed;
     }
 
-    assert_eq!(store.current_generation(), 5);
-
-    // Verify all gen directories exist
-    for gen in 0..=5 {
-        let gen_dir = dir.path().join(format!("gen_{:03}", gen));
-        assert!(gen_dir.exists(), "gen_{:03} directory must exist", gen);
-    }
+    let snap = store.read(&shard_key).unwrap().unwrap();
+    assert_eq!(snap.docs[&42][0].1, PackedValue::I(7));
+    assert_eq!(store.ops_count(&shard_key).unwrap(), Some(0));
 }

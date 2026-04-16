@@ -672,7 +672,7 @@ impl FilterBucketKey {
 
 /// Maps (field, bucket) to hex-bucketed filter shard files.
 ///
-/// Layout: `{gen_root}/filter/{field}/{xx}.shard`
+/// Layout: `{root}/filter/{field}/{xx}.shard`
 /// where xx = bucket (0x00..0xFF).
 ///
 /// Each shard contains a BucketSnapshot with all values in that bucket.
@@ -681,15 +681,15 @@ pub struct FieldValueBucketShard;
 impl ShardingStrategy for FieldValueBucketShard {
     type Key = FilterBucketKey;
 
-    fn shard_path(&self, key: &FilterBucketKey, gen_root: &Path) -> PathBuf {
-        gen_root
+    fn shard_path(&self, key: &FilterBucketKey, root: &Path) -> PathBuf {
+        root
             .join("filter")
             .join(&key.field)
             .join(format!("{:02x}.shard", key.bucket))
     }
 
-    fn list_shards(&self, gen_root: &Path) -> io::Result<Vec<FilterBucketKey>> {
-        let filter_dir = gen_root.join("filter");
+    fn list_shards(&self, root: &Path) -> io::Result<Vec<FilterBucketKey>> {
+        let filter_dir = root.join("filter");
         let mut keys = Vec::new();
 
         if !filter_dir.exists() {
@@ -728,18 +728,18 @@ pub struct SortLayerShardKey {
 }
 
 /// Maps (field, bit_position) to sort layer files.
-/// Layout: `{gen_root}/sort/{field}/bit{NN}.shard`
+/// Layout: `{root}/sort/{field}/bit{NN}.shard`
 pub struct SortLayerShard;
 
 impl ShardingStrategy for SortLayerShard {
     type Key = SortLayerShardKey;
 
-    fn shard_path(&self, key: &SortLayerShardKey, gen_root: &Path) -> PathBuf {
-        gen_root.join("sort").join(&key.field).join(format!("bit{:02}.shard", key.bit_position))
+    fn shard_path(&self, key: &SortLayerShardKey, root: &Path) -> PathBuf {
+        root.join("sort").join(&key.field).join(format!("bit{:02}.shard", key.bit_position))
     }
 
-    fn list_shards(&self, gen_root: &Path) -> io::Result<Vec<SortLayerShardKey>> {
-        let sort_dir = gen_root.join("sort");
+    fn list_shards(&self, root: &Path) -> io::Result<Vec<SortLayerShardKey>> {
+        let sort_dir = root.join("sort");
         let mut keys = Vec::new();
         if !sort_dir.exists() { return Ok(keys); }
         for field_entry in std::fs::read_dir(&sort_dir)? {
@@ -769,7 +769,7 @@ pub struct SortFieldShardKey {
 }
 
 /// Maps field name to a single packed sort shard file.
-/// Layout: `{gen_root}/sort/{field}.shard`
+/// Layout: `{root}/sort/{field}.shard`
 ///
 /// All bit layers for the field are packed into one file using SortFieldSnapshotCodec.
 pub struct SortFieldShard;
@@ -777,12 +777,12 @@ pub struct SortFieldShard;
 impl ShardingStrategy for SortFieldShard {
     type Key = SortFieldShardKey;
 
-    fn shard_path(&self, key: &SortFieldShardKey, gen_root: &Path) -> PathBuf {
-        gen_root.join("sort").join(format!("{}.shard", key.field))
+    fn shard_path(&self, key: &SortFieldShardKey, root: &Path) -> PathBuf {
+        root.join("sort").join(format!("{}.shard", key.field))
     }
 
-    fn list_shards(&self, gen_root: &Path) -> io::Result<Vec<SortFieldShardKey>> {
-        let sort_dir = gen_root.join("sort");
+    fn list_shards(&self, root: &Path) -> io::Result<Vec<SortFieldShardKey>> {
+        let sort_dir = root.join("sort");
         let mut keys = Vec::new();
         if !sort_dir.exists() { return Ok(keys); }
         for entry in std::fs::read_dir(&sort_dir)? {
@@ -804,16 +804,16 @@ impl ShardingStrategy for SortFieldShard {
 pub struct AliveShardKey;
 
 /// Single file for the alive bitmap.
-/// Layout: `{gen_root}/system/alive.shard`
+/// Layout: `{root}/system/alive.shard`
 pub struct SingletonShard;
 
 impl ShardingStrategy for SingletonShard {
     type Key = AliveShardKey;
-    fn shard_path(&self, _key: &AliveShardKey, gen_root: &Path) -> PathBuf {
-        gen_root.join("system").join("alive.shard")
+    fn shard_path(&self, _key: &AliveShardKey, root: &Path) -> PathBuf {
+        root.join("system").join("alive.shard")
     }
-    fn list_shards(&self, gen_root: &Path) -> io::Result<Vec<AliveShardKey>> {
-        if gen_root.join("system").join("alive.shard").exists() {
+    fn list_shards(&self, root: &Path) -> io::Result<Vec<AliveShardKey>> {
+        if root.join("system").join("alive.shard").exists() {
             Ok(vec![AliveShardKey])
         } else {
             Ok(vec![])
@@ -835,24 +835,19 @@ impl FilterBitmapStore {
     /// on nonexistent values.
     pub fn existence_set(&self, field: &str) -> io::Result<HashSet<u64>> {
         let mut values = HashSet::new();
-        let current_gen = self.current_generation();
+        let field_dir = self.root().join("filter").join(field);
+        if !field_dir.exists() { return Ok(values); }
 
-        for gen in (0..=current_gen).rev() {
-            let gen_dir = self.gen_dir(gen);
-            let field_dir = gen_dir.join("filter").join(field);
-            if !field_dir.exists() { continue; }
-
-            for entry in std::fs::read_dir(&field_dir)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if let Some(hex_str) = name.strip_suffix(".shard") {
-                    if let Ok(bucket) = u8::from_str_radix(hex_str, 16) {
-                        let key = FilterBucketKey { field: field.to_string(), bucket };
-                        // Read the bucket snapshot to get value IDs
-                        if let Ok(Some(snap)) = self.read(&key) {
-                            for &v in snap.values.keys() {
-                                values.insert(v);
-                            }
+        for entry in std::fs::read_dir(&field_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(hex_str) = name.strip_suffix(".shard") {
+                if let Ok(bucket) = u8::from_str_radix(hex_str, 16) {
+                    let key = FilterBucketKey { field: field.to_string(), bucket };
+                    // Read the bucket snapshot to get value IDs
+                    if let Ok(Some(snap)) = self.read(&key) {
+                        for &v in snap.values.keys() {
+                            values.insert(v);
                         }
                     }
                 }
@@ -868,23 +863,18 @@ impl FilterBitmapStore {
     /// field and collects value→bitmap entries into a single HashMap.
     pub fn load_field(&self, field: &str) -> io::Result<HashMap<u64, RoaringBitmap>> {
         let mut result = HashMap::new();
-        let current_gen = self.current_generation();
+        let field_dir = self.root().join("filter").join(field);
+        if !field_dir.exists() { return Ok(result); }
 
-        for gen in (0..=current_gen).rev() {
-            let gen_dir = self.gen_dir(gen);
-            let field_dir = gen_dir.join("filter").join(field);
-            if !field_dir.exists() { continue; }
-
-            for entry in std::fs::read_dir(&field_dir)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if let Some(hex_str) = name.strip_suffix(".shard") {
-                    if let Ok(bucket) = u8::from_str_radix(hex_str, 16) {
-                        let key = FilterBucketKey { field: field.to_string(), bucket };
-                        if let Some(snap) = self.read(&key)? {
-                            for (value, bm) in snap.values {
-                                result.entry(value).or_insert(bm);
-                            }
+        for entry in std::fs::read_dir(&field_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(hex_str) = name.strip_suffix(".shard") {
+                if let Ok(bucket) = u8::from_str_radix(hex_str, 16) {
+                    let key = FilterBucketKey { field: field.to_string(), bucket };
+                    if let Some(snap) = self.read(&key)? {
+                        for (value, bm) in snap.values {
+                            result.entry(value).or_insert(bm);
                         }
                     }
                 }
@@ -969,8 +959,7 @@ impl FilterBitmapStore {
     /// BucketSnapshot or cloning any bitmaps.
     pub fn write_filter_bucket_raw(&self, field: &str, bucket: u8, entries: &[(u64, &RoaringBitmap)]) -> io::Result<()> {
         let key = FilterBucketKey { field: field.to_string(), bucket };
-        let gen = self.current_generation();
-        let shard_path = self.shard_path_in_gen(&key, gen);
+        let shard_path = self.shard_path(&key);
 
         // Encode bucket snapshot format directly from references:
         // [u32 num_values]
@@ -1017,10 +1006,9 @@ impl FilterBitmapStore {
     /// Pre-create shard directories for a field's filter buckets.
     /// Avoids per-write `create_dir_all` overhead during parallel writes.
     pub fn ensure_filter_dirs(&self, field: &str, buckets: &[u8]) -> io::Result<()> {
-        let gen = self.current_generation();
         for &bucket in buckets {
             let key = FilterBucketKey { field: field.to_string(), bucket };
-            let shard_path = self.shard_path_in_gen(&key, gen);
+            let shard_path = self.shard_path(&key);
             if let Some(parent) = shard_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -1049,65 +1037,48 @@ impl SortBitmapStore {
     /// and unpacks into a Vec<RoaringBitmap> ordered by bit position.
     /// Returns None if no packed shard exists on disk.
     pub fn load_sort_layers(&self, field: &str, bits: usize) -> io::Result<Option<Vec<RoaringBitmap>>> {
-        // Fall through generations to find the packed shard
-        let gen = self.current_generation();
-        let snapshot = {
-            let mut found = None;
-            for g in (0..=gen).rev() {
-                let path = self.gen_dir(g).join("sort").join(format!("{}.shard", field));
-                if path.exists() {
-                    let data = std::fs::read(&path)?;
-                    let header = crate::shard_store::ShardHeader::decode(&data)?;
-                    let snap_start = crate::shard_store::HEADER_SIZE;
-                    let snap_end = snap_start + header.snapshot_len as usize;
-                    let mut snap = if header.snapshot_len > 0 {
-                        SortFieldSnapshotCodec::decode(&data[snap_start..snap_end])?
-                    } else {
-                        SortFieldSnapshot::new()
-                    };
-                    // Apply any ops
-                    if header.ops_count > 0 {
-                        let ops_start = header.ops_section_offset as usize;
-                        let ops_data = &data[ops_start..];
-                        let ops = crate::shard_store::read_op_entries_pub::<SortLayerOpCodec>(ops_data);
-                        for op in &ops {
-                            SortLayerOpCodec::apply(&mut snap, op);
-                        }
-                    }
-                    found = Some(snap);
-                    break;
+        // Try packed shard first
+        let packed_path = self.root().join("sort").join(format!("{}.shard", field));
+        if packed_path.exists() {
+            let data = std::fs::read(&packed_path)?;
+            let header = crate::shard_store::ShardHeader::decode(&data)?;
+            let snap_start = crate::shard_store::HEADER_SIZE;
+            let snap_end = snap_start + header.snapshot_len as usize;
+            let mut snap = if header.snapshot_len > 0 {
+                SortFieldSnapshotCodec::decode(&data[snap_start..snap_end])?
+            } else {
+                SortFieldSnapshot::new()
+            };
+            // Apply any ops
+            if header.ops_count > 0 {
+                let ops_start = header.ops_section_offset as usize;
+                let ops_data = &data[ops_start..];
+                let ops = crate::shard_store::read_op_entries_pub::<SortLayerOpCodec>(ops_data);
+                for op in &ops {
+                    SortLayerOpCodec::apply(&mut snap, op);
                 }
             }
-            found
-        };
+            let mut layers = Vec::with_capacity(bits);
+            for bit in 0..bits {
+                layers.push(snap.layers.get(&(bit as u8)).cloned().unwrap_or_default());
+            }
+            return Ok(Some(layers));
+        }
 
-        match snapshot {
-            Some(snap) => {
-                let mut layers = Vec::with_capacity(bits);
-                for bit in 0..bits {
-                    layers.push(
-                        snap.layers.get(&(bit as u8)).cloned().unwrap_or_default()
-                    );
+        // Fall back to legacy per-layer format
+        let mut layers = Vec::with_capacity(bits);
+        let mut any_found = false;
+        for bit in 0..bits {
+            let key = SortLayerShardKey { field: field.to_string(), bit_position: bit as u8 };
+            match self.read(&key)? {
+                Some(bm) => {
+                    any_found = true;
+                    layers.push(bm);
                 }
-                Ok(Some(layers))
-            }
-            None => {
-                // Fall back to legacy per-layer format
-                let mut layers = Vec::with_capacity(bits);
-                let mut any_found = false;
-                for bit in 0..bits {
-                    let key = SortLayerShardKey { field: field.to_string(), bit_position: bit as u8 };
-                    match self.read(&key)? {
-                        Some(bm) => {
-                            any_found = true;
-                            layers.push(bm);
-                        }
-                        None => layers.push(RoaringBitmap::new()),
-                    }
-                }
-                if any_found { Ok(Some(layers)) } else { Ok(None) }
+                None => layers.push(RoaringBitmap::new()),
             }
         }
+        if any_found { Ok(Some(layers)) } else { Ok(None) }
     }
 
     /// Write sort layers for a field in the packed format.
@@ -1115,8 +1086,7 @@ impl SortBitmapStore {
     /// Encodes all layers into a single `sort/{field}.shard` file using
     /// the SortFieldSnapshotCodec packed format (index + packed bitmaps).
     pub fn write_sort_layers(&self, field: &str, layers: &[&RoaringBitmap]) -> io::Result<()> {
-        let gen = self.current_generation();
-        let shard_path = self.gen_dir(gen).join("sort").join(format!("{}.shard", field));
+        let shard_path = self.root().join("sort").join(format!("{}.shard", field));
 
         // Encode packed snapshot directly from layer refs
         let mut snapshot_bytes = Vec::new();
@@ -1138,10 +1108,8 @@ impl SortBitmapStore {
 
     /// Pre-create the sort directory.
     /// Ensures `sort/` exists for packed shard writes.
-    pub fn ensure_sort_dir(&self, field: &str) -> io::Result<()> {
-        let _ = field; // field name used for API compat; we just need sort/ dir
-        let gen = self.current_generation();
-        let sort_dir = self.gen_dir(gen).join("sort");
+    pub fn ensure_sort_dir(&self, _field: &str) -> io::Result<()> {
+        let sort_dir = self.root().join("sort");
         std::fs::create_dir_all(&sort_dir)?;
         Ok(())
     }
@@ -1197,8 +1165,7 @@ impl PackedSortBitmapStore {
 
     /// Pre-create the sort directory for packed shard writes.
     pub fn ensure_sort_dir(&self, _field: &str) -> io::Result<()> {
-        let gen = self.current_generation();
-        let sort_dir = self.gen_dir(gen).join("sort");
+        let sort_dir = self.root().join("sort");
         std::fs::create_dir_all(&sort_dir)?;
         Ok(())
     }
@@ -1311,8 +1278,8 @@ mod tests {
     fn test_filter_shard_path() {
         let shard = FieldValueBucketShard;
         let key = FilterBucketKey { field: "tagIds".into(), bucket: 0x01 };
-        let path = shard.shard_path(&key, Path::new("/data/gen_000"));
-        assert_eq!(path, PathBuf::from("/data/gen_000/filter/tagIds/01.shard"));
+        let path = shard.shard_path(&key, Path::new("/data"));
+        assert_eq!(path, PathBuf::from("/data/filter/tagIds/01.shard"));
     }
 
     #[test]
@@ -1434,15 +1401,15 @@ mod tests {
     fn test_sort_layer_shard_path() {
         let shard = SortLayerShard;
         let key = SortLayerShardKey { field: "reactionCount".into(), bit_position: 15 };
-        let path = shard.shard_path(&key, Path::new("/data/gen_000"));
-        assert_eq!(path, PathBuf::from("/data/gen_000/sort/reactionCount/bit15.shard"));
+        let path = shard.shard_path(&key, Path::new("/data"));
+        assert_eq!(path, PathBuf::from("/data/sort/reactionCount/bit15.shard"));
     }
 
     #[test]
     fn test_alive_shard_path() {
         let shard = SingletonShard;
-        let path = shard.shard_path(&AliveShardKey, Path::new("/data/gen_000"));
-        assert_eq!(path, PathBuf::from("/data/gen_000/system/alive.shard"));
+        let path = shard.shard_path(&AliveShardKey, Path::new("/data"));
+        assert_eq!(path, PathBuf::from("/data/system/alive.shard"));
     }
 
     #[test]
@@ -1588,8 +1555,8 @@ mod tests {
     fn test_sort_field_shard_path() {
         let shard = SortFieldShard;
         let key = SortFieldShardKey { field: "reactionCount".into() };
-        let path = shard.shard_path(&key, Path::new("/data/gen_000"));
-        assert_eq!(path, PathBuf::from("/data/gen_000/sort/reactionCount.shard"));
+        let path = shard.shard_path(&key, Path::new("/data"));
+        assert_eq!(path, PathBuf::from("/data/sort/reactionCount.shard"));
     }
 
     #[test]
@@ -1704,10 +1671,10 @@ mod tests {
     #[test]
     fn test_sort_field_shard_list() {
         let dir = tempfile::tempdir().unwrap();
-        let gen_root = dir.path();
+        let root = dir.path();
 
         // Create sort directory with packed shard files
-        let sort_dir = gen_root.join("sort");
+        let sort_dir = root.join("sort");
         std::fs::create_dir_all(&sort_dir).unwrap();
         std::fs::write(sort_dir.join("reactionCount.shard"), b"dummy").unwrap();
         std::fs::write(sort_dir.join("sortAt.shard"), b"dummy").unwrap();
@@ -1715,7 +1682,7 @@ mod tests {
         std::fs::create_dir_all(sort_dir.join("legacyField")).unwrap();
 
         let shard = SortFieldShard;
-        let mut keys = shard.list_shards(gen_root).unwrap();
+        let mut keys = shard.list_shards(root).unwrap();
         keys.sort_by(|a, b| a.field.cmp(&b.field));
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].field, "reactionCount");
