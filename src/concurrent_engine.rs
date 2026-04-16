@@ -6315,7 +6315,6 @@ impl ConcurrentEngine {
         progress: Arc<AtomicU64>,
     ) -> Result<CompactResult> {
         use rayon::prelude::*;
-        use crate::shard_store::fsync_shard_file;
 
         let t0 = std::time::Instant::now();
         let mut result = CompactResult::default();
@@ -6331,23 +6330,26 @@ impl ConcurrentEngine {
             .build()
             .map_err(|e| crate::error::BitdexError::Storage(format!("rayon pool: {e}")))?;
 
-        // Collect all .new paths for the final fsync+rename pass
-        let new_paths: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+        // Each shard is its own atomic transaction: compact_shard holds the exclusive
+        // per-shard RwLock for the full read → encode → write-new → fsync → rename window.
+        // There is no deferred-fsync split — no window where a writer can append between
+        // the snapshot read and the rename. Cross-shard parallelism comes from the pool.
         let mut any_failed = false;
 
         if compact_bitmaps {
             if let Some((ref alive_s, ref filter_s, ref sort_s, _)) = self.shard_stores() {
-                // Alive: single shard — always compact (alive bitmap never "clean" after ops)
-                if alive_s.should_compact(&crate::shard_store_bitmap::AliveShardKey, threshold).unwrap_or(true) {
-                    match alive_s.compact_shard_no_fsync(&crate::shard_store_bitmap::AliveShardKey) {
-                        Ok(Some(p)) => { new_paths.lock().unwrap().push(p); result.shards_compacted += 1; }
-                        Ok(None) => { result.shards_skipped += 1; }
-                        Err(e) => { eprintln!("compact alive: {e}"); any_failed = true; }
-                    }
-                } else {
-                    result.shards_skipped += 1;
-                }
+                // Alive: single shard
                 result.shards_scanned += 1;
+                match alive_s.should_compact(&crate::shard_store_bitmap::AliveShardKey, threshold) {
+                    Ok(false) => { result.shards_skipped += 1; }
+                    _ => {
+                        match alive_s.compact_shard(&crate::shard_store_bitmap::AliveShardKey) {
+                            Ok(true)  => { result.shards_compacted += 1; }
+                            Ok(false) => { result.shards_skipped += 1; }
+                            Err(e)    => { eprintln!("compact alive: {e}"); any_failed = true; }
+                        }
+                    }
+                }
                 progress.fetch_add(1, Ordering::Relaxed);
 
                 // Filter shards
@@ -6360,23 +6362,19 @@ impl ConcurrentEngine {
                     }
                 };
                 if !filter_keys.is_empty() {
-                    let filter_errors = AtomicU64::new(0);
+                    let filter_errors    = AtomicU64::new(0);
                     let filter_compacted = AtomicU64::new(0);
-                    let filter_skipped = AtomicU64::new(0);
-                    let filter_count = filter_keys.len() as u64;
+                    let filter_skipped   = AtomicU64::new(0);
+                    let filter_count     = filter_keys.len() as u64;
 
                     pool.install(|| {
                         filter_keys.par_iter().for_each(|key| {
-                            // Gate on threshold — skip shards that don't need compaction
                             match filter_s.should_compact(key, threshold) {
                                 Ok(false) => { filter_skipped.fetch_add(1, Ordering::Relaxed); }
                                 _ => {
-                                    match filter_s.compact_shard_no_fsync(key) {
-                                        Ok(Some(p)) => {
-                                            new_paths.lock().unwrap().push(p);
-                                            filter_compacted.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        Ok(None) => { filter_skipped.fetch_add(1, Ordering::Relaxed); }
+                                    match filter_s.compact_shard(key) {
+                                        Ok(true)  => { filter_compacted.fetch_add(1, Ordering::Relaxed); }
+                                        Ok(false) => { filter_skipped.fetch_add(1, Ordering::Relaxed); }
                                         Err(e) => {
                                             eprintln!("compact filter {}: {e}", key.field);
                                             filter_errors.fetch_add(1, Ordering::Relaxed);
@@ -6388,9 +6386,9 @@ impl ConcurrentEngine {
                         });
                     });
 
-                    result.shards_scanned += filter_count;
-                    result.shards_compacted += filter_compacted.load(Ordering::Relaxed);
-                    result.shards_skipped += filter_skipped.load(Ordering::Relaxed);
+                    result.shards_scanned    += filter_count;
+                    result.shards_compacted  += filter_compacted.load(Ordering::Relaxed);
+                    result.shards_skipped    += filter_skipped.load(Ordering::Relaxed);
                     if filter_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
                 }
 
@@ -6404,23 +6402,19 @@ impl ConcurrentEngine {
                     }
                 };
                 if !sort_keys.is_empty() {
-                    let sort_errors = AtomicU64::new(0);
+                    let sort_errors    = AtomicU64::new(0);
                     let sort_compacted = AtomicU64::new(0);
-                    let sort_skipped = AtomicU64::new(0);
-                    let sort_count = sort_keys.len() as u64;
+                    let sort_skipped   = AtomicU64::new(0);
+                    let sort_count     = sort_keys.len() as u64;
 
                     pool.install(|| {
                         sort_keys.par_iter().for_each(|key| {
-                            // Gate on threshold
                             match sort_s.should_compact(key, threshold) {
                                 Ok(false) => { sort_skipped.fetch_add(1, Ordering::Relaxed); }
                                 _ => {
-                                    match sort_s.compact_shard_no_fsync(key) {
-                                        Ok(Some(p)) => {
-                                            new_paths.lock().unwrap().push(p);
-                                            sort_compacted.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        Ok(None) => { sort_skipped.fetch_add(1, Ordering::Relaxed); }
+                                    match sort_s.compact_shard(key) {
+                                        Ok(true)  => { sort_compacted.fetch_add(1, Ordering::Relaxed); }
+                                        Ok(false) => { sort_skipped.fetch_add(1, Ordering::Relaxed); }
                                         Err(e) => {
                                             eprintln!("compact sort {}/{}: {e}", key.field, key.bit_position);
                                             sort_errors.fetch_add(1, Ordering::Relaxed);
@@ -6432,9 +6426,9 @@ impl ConcurrentEngine {
                         });
                     });
 
-                    result.shards_scanned += sort_count;
+                    result.shards_scanned   += sort_count;
                     result.shards_compacted += sort_compacted.load(Ordering::Relaxed);
-                    result.shards_skipped += sort_skipped.load(Ordering::Relaxed);
+                    result.shards_skipped   += sort_skipped.load(Ordering::Relaxed);
                     if sort_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
                 }
             }
@@ -6448,25 +6442,21 @@ impl ConcurrentEngine {
             } else {
                 0
             };
-            let doc_count = (max_shard + 1) as u64;
-            let doc_errors = AtomicU64::new(0);
+            let doc_count     = (max_shard + 1) as u64;
+            let doc_errors    = AtomicU64::new(0);
             let doc_compacted = AtomicU64::new(0);
-            let doc_skipped = AtomicU64::new(0);
+            let doc_skipped   = AtomicU64::new(0);
 
             eprintln!("compact_all: compacting {doc_count} doc shards (0..={max_shard})");
 
             pool.install(|| {
                 (0..=max_shard).into_par_iter().for_each(|shard_id| {
-                    // Gate on threshold for doc shards too
                     match doc_store_arc.should_compact(&shard_id, threshold) {
                         Ok(false) => { doc_skipped.fetch_add(1, Ordering::Relaxed); }
                         _ => {
-                            match doc_store_arc.compact_shard_no_fsync(&shard_id) {
-                                Ok(Some(p)) => {
-                                    new_paths.lock().unwrap().push(p);
-                                    doc_compacted.fetch_add(1, Ordering::Relaxed);
-                                }
-                                Ok(None) => { doc_skipped.fetch_add(1, Ordering::Relaxed); }
+                            match doc_store_arc.compact_shard(&shard_id) {
+                                Ok(true)  => { doc_compacted.fetch_add(1, Ordering::Relaxed); }
+                                Ok(false) => { doc_skipped.fetch_add(1, Ordering::Relaxed); }
                                 Err(e) => {
                                     eprintln!("compact doc shard {shard_id}: {e}");
                                     doc_errors.fetch_add(1, Ordering::Relaxed);
@@ -6478,46 +6468,15 @@ impl ConcurrentEngine {
                 });
             });
 
-            result.shards_scanned += doc_count;
+            result.shards_scanned   += doc_count;
             result.shards_compacted += doc_compacted.load(Ordering::Relaxed);
-            result.shards_skipped += doc_skipped.load(Ordering::Relaxed);
+            result.shards_skipped   += doc_skipped.load(Ordering::Relaxed);
             if doc_errors.load(Ordering::Relaxed) > 0 { any_failed = true; }
         }
 
-        // Batched fsync+rename pass — parallel fsync on all .new files, then rename
-        if !any_failed {
-            let paths = new_paths.into_inner().unwrap();
-            eprintln!("compact_all: fsync+rename {} .new files", paths.len());
-            let fsync_errors = AtomicU64::new(0);
-            let fsync_compacted = AtomicU64::new(0);
-            pool.install(|| {
-                paths.par_iter().for_each(|p| {
-                    match fsync_shard_file(p) {
-                        Ok(()) => { fsync_compacted.fetch_add(1, Ordering::Relaxed); }
-                        Err(e) => {
-                            eprintln!("compact_all: fsync+rename {}: {e}", p.display());
-                            fsync_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                });
-            });
-            let failed_fsyncs = fsync_errors.load(Ordering::Relaxed);
-            if failed_fsyncs > 0 {
-                // Some .new files were not renamed — those shards retain their old data
-                // (stale but consistent). Callers must treat this as an error.
-                let succeeded = fsync_compacted.load(Ordering::Relaxed);
-                // Adjust: only count shards that actually landed on disk
-                result.shards_compacted = result.shards_compacted
-                    .saturating_sub(failed_fsyncs);
-                result.shards_skipped += failed_fsyncs;
-                return Err(crate::error::BitdexError::Storage(format!(
-                    "compact_all: {failed_fsyncs} fsync/rename failure(s), {succeeded} succeeded"
-                )));
-            }
-        } else {
-            eprintln!("compact_all: skipping fsync pass due to earlier errors");
+        if any_failed {
             return Err(crate::error::BitdexError::Storage(
-                "compact_all: aborted due to compaction errors; no .new files were fsynced".into()
+                "compact_all: one or more shards failed to compact — see eprintln logs above".into()
             ));
         }
 

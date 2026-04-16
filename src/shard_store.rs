@@ -304,43 +304,16 @@ fn read_shard_file_raw(path: &Path) -> io::Result<(ShardHeader, Vec<u8>, Vec<u8>
     Ok((header, snapshot_bytes, ops_bytes))
 }
 
-/// Options for writing a shard file.
-pub struct WriteOpts {
-    /// If true, call sync_all() before renaming. Set false for batched-fsync workflows.
-    pub fsync: bool,
-}
-
-impl Default for WriteOpts {
-    fn default() -> Self {
-        WriteOpts { fsync: true }
-    }
-}
-
-/// Write a complete shard file atomically (tmp → [fsync] → rename).
+/// Write a complete shard file atomically: write to `.new`, fsync, rename over `path`,
+/// then fsync the parent directory for POSIX durability.
 ///
-/// With `opts.fsync = true` (default): syncs the tmp file before rename.
-/// With `opts.fsync = false`: skips sync — caller is responsible for a later
-/// `fsync_shard_file` call before the `.new` file is renamed into place.
+/// This is the single write path for both initial creation and compaction.
+/// All writes are durable and atomic — no split-lock windows.
 pub(crate) fn write_shard_file_atomic(
     path: &Path,
     header: &ShardHeader,
     snapshot_bytes: &[u8],
     ops_bytes: &[u8],
-) -> io::Result<()> {
-    write_shard_file_atomic_opts(path, header, snapshot_bytes, ops_bytes, &WriteOpts::default())
-}
-
-/// Write a complete shard file with explicit fsync control.
-///
-/// Writes to `<path>.new` then either:
-/// - `fsync=true`:  sync_all() + rename to `path` (atomic durable commit)
-/// - `fsync=false`: leave as `<path>.new` for caller to fsync + rename in batch
-pub(crate) fn write_shard_file_atomic_opts(
-    path: &Path,
-    header: &ShardHeader,
-    snapshot_bytes: &[u8],
-    ops_bytes: &[u8],
-    opts: &WriteOpts,
 ) -> io::Result<()> {
     let new_path = path.with_extension("new");
 
@@ -354,43 +327,17 @@ pub(crate) fn write_shard_file_atomic_opts(
     buf.extend_from_slice(snapshot_bytes);
     buf.extend_from_slice(ops_bytes);
 
-    let mut file = File::create(&new_path)?;
+    // Must open read-write: Windows requires write permission for sync_all().
+    let mut file = OpenOptions::new()
+        .read(true).write(true).create(true).truncate(true)
+        .open(&new_path)?;
     file.write_all(&buf)?;
-
-    if opts.fsync {
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&new_path, path)?;
-        // Fsync parent directory for POSIX durability (no-op on Windows)
-        fsync_parent_dir(path)?;
-    } else {
-        drop(file);
-        // Leave as .new — caller must call fsync_shard_file + rename
-    }
-
-    Ok(())
-}
-
-/// Fsync a `.new` shard file and rename it over `path`.
-///
-/// Used in the batched-fsync compaction workflow:
-/// 1. `write_shard_file_atomic_opts(..., fsync: false)` writes `<path>.new`
-/// 2. Collect all `.new` paths
-/// 3. Parallel `fsync_shard_file` on each
-/// 4. Parallel rename (atomic over existing shard on NTFS/ext4/APFS)
-///
-/// # Platform notes
-/// Opens the `.new` file read-write (required on Windows for `sync_all()`).
-/// After rename, fsyncs the parent directory for POSIX durability (no-op on Windows).
-pub fn fsync_shard_file(path: &Path) -> io::Result<()> {
-    let new_path = path.with_extension("new");
-    // Must open read-write: Windows requires write permission for sync_all()
-    let file = OpenOptions::new().read(true).write(true).open(&new_path)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&new_path, path)?;
-    // Fsync parent directory for POSIX durability (no-op on Windows)
+    // Fsync parent directory for POSIX durability (no-op on Windows).
     fsync_parent_dir(path)?;
+
     Ok(())
 }
 
@@ -458,9 +405,9 @@ fn append_ops_to_shard(path: &Path, new_ops_bytes: &[u8], additional_count: u32)
 /// A per-shard `RwLock<()>` prevents compaction from racing with appends on
 /// the same shard file. Writers (`append_op`, `append_ops`) and readers hold a
 /// **shared** (read) lock so they run in parallel across different shards.
-/// Compaction (`compact_shard`, `compact_shard_no_fsync`) holds an **exclusive**
-/// (write) lock for the full read→build→write cycle so no appends can slip in
-/// between the snapshot read and the rename.
+/// Compaction (`compact_shard`) holds an **exclusive** (write) lock for the
+/// full read→encode→write→fsync→rename cycle so no appends can slip in between
+/// the snapshot read and the rename.
 pub struct ShardStore<S, O, Sh>
 where
     S: SnapshotCodec,
@@ -828,16 +775,21 @@ where
         self.should_compact(key, DEFAULT_COMPACT_THRESHOLD)
     }
 
-    /// Compact a shard in-place: read snapshot + ops, write back as a fresh snapshot
-    /// with zero ops.
+    /// Compact a shard in-place: read snapshot + ops under an exclusive lock, write back
+    /// as a fresh snapshot with zero ops. The write is fully atomic: write `.new`,
+    /// fsync, rename over `shard_path`, fsync parent dir — all while holding the lock.
     ///
     /// **Skip-clean fast-path:** If the shard already has a snapshot with zero ops,
-    /// returns `Ok(false)` (no work done).
+    /// returns `Ok(false)` immediately (no I/O, no lock contention).
     ///
-    /// Returns `true` if compaction was performed (`.new` file written, fsynced, and renamed).
+    /// Returns `true` if compaction was performed.
     ///
-    /// Holds an **exclusive** shard lock for the full compact window — no concurrent
-    /// appends can slip in between the snapshot read and the atomic rename.
+    /// # Concurrency safety
+    ///
+    /// Holds an **exclusive** shard lock for the entire window: snapshot read →
+    /// encode → write `.new` → fsync → rename. No writer can append to this shard
+    /// between the snapshot read and the rename. This eliminates the split-lock
+    /// race that existed when fsync+rename was deferred to a separate pass.
     pub fn compact_shard(&self, key: &Sh::Key) -> io::Result<bool> {
         let lock = self.shard_lock(key);
         let _guard = lock.write();
@@ -851,7 +803,7 @@ where
             }
         }
 
-        // Read snapshot holding the exclusive lock (no new ops can append during this window)
+        // Read snapshot holding the exclusive lock — no new ops can append during this window.
         let snapshot = match self.read_unlocked(key)? {
             Some(s) => s,
             None => return Ok(false),
@@ -869,67 +821,15 @@ where
             flags: 0,
         };
 
-        // Write atomically (fsync=true by default for single-shard compact).
+        // Atomic: write .new, fsync, rename, fsync parent. All under the exclusive lock.
         write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])?;
         Ok(true)
     }
 
-    /// Compact a shard without fsync — writes `<path>.new` only.
-    ///
-    /// Part of the batched-fsync compaction workflow:
-    /// 1. Call `compact_shard_no_fsync` for all dirty shards
-    /// 2. Collect returned `PathBuf`s of `.new` files
-    /// 3. Parallel `fsync_shard_file` on each (syncs + renames atomically)
-    ///
-    /// Returns `None` if the shard is already clean (skipped).
-    /// Returns `Some(shard_path)` if `.new` was written.
-    ///
-    /// Holds an **exclusive** shard lock for the full compact window.
-    pub fn compact_shard_no_fsync(&self, key: &Sh::Key) -> io::Result<Option<PathBuf>> {
-        let lock = self.shard_lock(key);
-        let _guard = lock.write();
-
-        let shard_path = self.shard_path(key);
-
-        // Fast-path: check header only.
-        if let Some(header) = Self::read_header_at(&shard_path)? {
-            if header.snapshot_len > 0 && header.ops_count == 0 {
-                return Ok(None); // already clean
-            }
-        }
-
-        let snapshot = match self.read_unlocked(key)? {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        let mut snapshot_bytes = Vec::new();
-        S::encode(&snapshot, &mut snapshot_bytes);
-
-        let ops_offset = HEADER_SIZE as u64 + snapshot_bytes.len() as u64;
-        let header = ShardHeader {
-            version: SHARD_VERSION,
-            ops_section_offset: ops_offset,
-            snapshot_len: snapshot_bytes.len() as u32,
-            ops_count: 0,
-            flags: 0,
-        };
-
-        write_shard_file_atomic_opts(
-            &shard_path,
-            &header,
-            &snapshot_bytes,
-            &[],
-            &WriteOpts { fsync: false },
-        )?;
-
-        Ok(Some(shard_path))
-    }
-
     /// Internal read without acquiring the shard lock.
     ///
-    /// Used by `compact_shard` / `compact_shard_no_fsync` which hold the exclusive
-    /// lock themselves for the entire compact window.
+    /// Used by `compact_shard` which holds the exclusive lock for the entire
+    /// compact window (read → encode → write → rename).
     fn read_unlocked(&self, key: &Sh::Key) -> io::Result<Option<S::Snapshot>> {
         let shard_path = self.shard_path(key);
 
@@ -1543,7 +1443,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_shard_no_fsync() {
+    fn test_compact_shard_is_atomic() {
+        // Verifies that compact_shard write+fsync+rename happens atomically under lock:
+        // after compact_shard returns Ok(true) the shard has ops_count=0 and is readable.
         let (_dir, store) = temp_store();
 
         store.append_op(&"doc1".to_string(), &TestOp::Set {
@@ -1553,20 +1455,17 @@ mod tests {
             key: "y".into(), value: "99".into()
         }).unwrap();
 
-        // compact_shard_no_fsync should write a .new file and return the shard path
-        let shard_path = store.compact_shard_no_fsync(&"doc1".to_string()).unwrap();
-        assert!(shard_path.is_some());
+        // After compact_shard: no .new file on disk, live shard exists with 0 ops
+        let did_compact = store.compact_shard(&"doc1".to_string()).unwrap();
+        assert!(did_compact);
 
-        let path = shard_path.unwrap();
-        let new_path = path.with_extension("new");
-        assert!(new_path.exists(), ".new file should exist");
+        let shard_path = store.shard_path(&"doc1".to_string());
+        let new_path = shard_path.with_extension("new");
+        assert!(!new_path.exists(), ".new file must not remain after compact_shard");
+        assert!(shard_path.exists(), "live shard must exist");
+        assert_eq!(store.ops_count(&"doc1".to_string()).unwrap(), Some(0));
 
-        // Fsync + rename
-        fsync_shard_file(&path).unwrap();
-        assert!(!new_path.exists(), ".new file should be gone after rename");
-        assert!(path.exists(), "shard should now exist");
-
-        // Verify data
+        // Data is correct
         let result = store.read(&"doc1".to_string()).unwrap().unwrap();
         assert_eq!(result.values.get("x").unwrap(), "42");
         assert_eq!(result.values.get("y").unwrap(), "99");

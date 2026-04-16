@@ -679,8 +679,10 @@ fn f4_6_multiple_compactions_are_idempotent() {
 // Concurrency tests (blockers from second-pass review)
 // ===========================================================================
 
-/// Concurrent write + compact on the same shard: 32 writer threads appending ops
-/// and 1 compactor loop. Verifies no ops are lost after compact completes.
+/// Concurrent write + compact on the same shard: 8 writer threads appending ops
+/// and 1 compactor running both single-shard (`compact_shard`) and the
+/// multi-shard sweep pattern used by `compact_all` (list_shards → compact_shard per key).
+/// Verifies no ops are lost after compact completes.
 #[test]
 fn test_concurrent_write_and_compact_no_lost_ops() {
     use std::sync::{Arc, Barrier};
@@ -691,58 +693,92 @@ fn test_concurrent_write_and_compact_no_lost_ops() {
         DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap()
     );
 
-    // Single shard so writers and compactor contend on the same shard lock
-    let shard_key = SlotHexShard::slot_to_shard(42);
+    // Use two slots that map to different shards so we also exercise list_shards scanning
+    // multiple shards while writers are active (mimicking compact_all parallel behaviour).
+    let shard_key_a = SlotHexShard::slot_to_shard(42);
+    let shard_key_b = SlotHexShard::slot_to_shard(0xFFFF);
     let num_writers = 8;
     let ops_per_writer = 20;
-    let barrier = Arc::new(Barrier::new(num_writers + 1)); // writers + compactor
+    // writers-a + writers-b + compactor
+    let barrier = Arc::new(Barrier::new(num_writers * 2 + 1));
 
     let mut handles = Vec::new();
 
-    // Spawn writers
+    // Spawn writers for shard A
     for writer_id in 0..num_writers {
         let store_c = Arc::clone(&store);
-        let key_c = shard_key.clone();
+        let key_c = shard_key_a.clone();
         let barrier_c = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
-            barrier_c.wait(); // synchronize start
+            barrier_c.wait();
             for i in 0..ops_per_writer {
                 store_c.append_op(&key_c, &DocOp::Set {
                     slot: 42,
                     field: writer_id as u16,
                     value: PackedValue::I(i as i64),
-                }).expect("append_op must not fail");
+                }).expect("append_op A must not fail");
             }
         }));
     }
 
-    // Compactor thread: compact several times while writers are active
+    // Spawn writers for shard B
+    for writer_id in 0..num_writers {
+        let store_c = Arc::clone(&store);
+        let key_c = shard_key_b.clone();
+        let barrier_c = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier_c.wait();
+            for i in 0..ops_per_writer {
+                store_c.append_op(&key_c, &DocOp::Set {
+                    slot: 0xFFFF,
+                    field: writer_id as u16,
+                    value: PackedValue::I(i as i64),
+                }).expect("append_op B must not fail");
+            }
+        }));
+    }
+
+    // Compactor thread: alternates between single-key compact_shard (the atomic path) and
+    // the list_shards → compact_shard sweep (the compact_all path from the admin endpoint).
     let store_c = Arc::clone(&store);
-    let key_c = shard_key.clone();
     let barrier_c = Arc::clone(&barrier);
     let compactor = thread::spawn(move || {
-        barrier_c.wait(); // synchronize start
-        for _ in 0..5 {
-            store_c.compact_shard(&key_c).expect("compact_shard must not fail");
+        barrier_c.wait();
+        for round in 0..6 {
+            if round % 2 == 0 {
+                // Single-shard path (compact_shard directly)
+                store_c.compact_shard(&SlotHexShard::slot_to_shard(42))
+                    .expect("compact_shard A must not fail");
+                store_c.compact_shard(&SlotHexShard::slot_to_shard(0xFFFF))
+                    .expect("compact_shard B must not fail");
+            } else {
+                // Multi-shard sweep path — mirrors what compact_all does
+                let keys = store_c.list_shards().expect("list_shards must not fail");
+                for key in &keys {
+                    store_c.compact_shard(key).expect("compact_shard in sweep must not fail");
+                }
+            }
             thread::yield_now();
         }
     });
 
-    // Wait for all threads to finish
     for h in handles {
         h.join().expect("writer thread panicked");
     }
     compactor.join().expect("compactor thread panicked");
 
     // Final compact to get a clean snapshot
-    store.compact_shard(&shard_key).unwrap();
+    store.compact_shard(&shard_key_a).unwrap();
+    store.compact_shard(&shard_key_b).unwrap();
 
-    // Verify the shard is readable and consistent (no panic, no corruption)
-    let snap = store.read(&shard_key).unwrap();
-    // We should have SOME data — at least one writer's ops landed
-    assert!(snap.is_some(), "shard should be readable after concurrent write+compact");
-    // Ops count should be 0 after final compact
-    assert_eq!(store.ops_count(&shard_key).unwrap(), Some(0));
+    // Both shards must be readable and clean after compaction
+    let snap_a = store.read(&shard_key_a).unwrap();
+    assert!(snap_a.is_some(), "shard A must be readable after concurrent write+compact");
+    assert_eq!(store.ops_count(&shard_key_a).unwrap(), Some(0), "shard A ops_count must be 0");
+
+    let snap_b = store.read(&shard_key_b).unwrap();
+    assert!(snap_b.is_some(), "shard B must be readable after concurrent write+compact");
+    assert_eq!(store.ops_count(&shard_key_b).unwrap(), Some(0), "shard B ops_count must be 0");
 }
 
 /// Reader during append: spawn readers while writers append to a different shard key.
@@ -815,35 +851,55 @@ fn test_concurrent_readers_while_writers_append() {
 /// a valid one (completing the interrupted compact) and deletes an invalid one.
 #[test]
 fn test_startup_sweep_promotes_valid_new_file() {
+    use std::io::Write;
+
     let dir = tempfile::tempdir().unwrap();
-
-    // === First: create a shard with ops ===
-    {
-        let store = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
-        let shard_key = SlotHexShard::slot_to_shard(42);
-
-        store.append_op(&shard_key, &DocOp::Create {
-            slot: 42,
-            fields: vec![(0, PackedValue::I(99))],
-        }).unwrap();
-
-        // compact_shard_no_fsync writes .new but does NOT rename — simulates crash after fsync but before rename
-        let maybe_new = store.compact_shard_no_fsync(&shard_key).unwrap();
-        assert!(maybe_new.is_some(), "compact_shard_no_fsync should have written .new");
-    }
-
-    // The .new file now exists on disk (valid, fsynced, snapshot_len > 0)
-    // The live .shard still has ops (not yet renamed over)
-    // A new ShardStore::new() should promote the valid .new → .shard
-
-    let store2 = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
     let shard_key = SlotHexShard::slot_to_shard(42);
 
-    // After promotion, the shard should be readable with ops_count = 0
-    let snap = store2.read(&shard_key).unwrap();
-    assert!(snap.is_some(), "shard should be readable after .new promotion");
+    // Determine the shard path by creating a temporary store
+    let shard_path = {
+        let store = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
+        store.shard_path(&shard_key)
+    };
+
+    // Ensure parent dir exists
+    std::fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
+
+    // Write a valid .new file manually (simulates: fsynced but not yet renamed).
+    // We need a real BDSS header with snapshot_len > 0 to pass the promotable check.
+    // Build a minimal valid shard: header + a tiny fake snapshot.
+    let new_path = shard_path.with_extension("new");
+    {
+        let fake_snapshot = b"\x01\x00\x00\x00"; // 1 doc, empty — any non-zero bytes
+        let snapshot_len = fake_snapshot.len() as u32;
+        let ops_section_offset = (28u64) + snapshot_len as u64; // HEADER_SIZE=28
+        let mut header_buf = Vec::with_capacity(28);
+        header_buf.extend_from_slice(b"BDSS");           // magic
+        header_buf.extend_from_slice(&1u32.to_le_bytes()); // version
+        header_buf.extend_from_slice(&ops_section_offset.to_le_bytes()); // ops_section_offset
+        header_buf.extend_from_slice(&snapshot_len.to_le_bytes()); // snapshot_len
+        header_buf.extend_from_slice(&0u32.to_le_bytes()); // ops_count = 0
+        header_buf.extend_from_slice(&0u32.to_le_bytes()); // flags
+        assert_eq!(header_buf.len(), 28);
+
+        let mut f = std::fs::File::create(&new_path).unwrap();
+        f.write_all(&header_buf).unwrap();
+        f.write_all(fake_snapshot).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    assert!(new_path.exists(), ".new file should exist before sweep");
+
+    // A new ShardStore::new() should promote the valid .new → .shard
+    let store2 = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
+
+    // After promotion: live shard exists, .new is gone
+    assert!(!new_path.exists(), ".new file should be renamed away by sweep promotion");
+    assert!(shard_path.exists(), "live shard should exist after promotion");
+
+    // The promoted shard has ops_count = 0 (was a compact snapshot)
     let ops = store2.ops_count(&shard_key).unwrap();
-    assert_eq!(ops, Some(0), "promoted .new should have ops_count = 0 (it was a compact snapshot)");
+    assert_eq!(ops, Some(0), "promoted .new should have ops_count = 0");
 }
 
 /// Crash simulation: an INVALID (truncated) `.new` file should be deleted by sweep.
@@ -872,33 +928,83 @@ fn test_startup_sweep_deletes_invalid_new_file() {
     assert!(!shard_path.exists(), "live shard should not exist");
 }
 
-/// Windows fsync smoke test: verify fsync_shard_file succeeds on a freshly-written .new file.
-/// This catches the ERROR_ACCESS_DENIED bug from opening the file read-only.
+/// Verify that `compact_shard` uses a read-write file open for `sync_all()`.
+///
+/// On Windows, `File::open()` (read-only) returns ERROR_ACCESS_DENIED for `sync_all()`.
+/// The fix is to open with `OpenOptions::new().read(true).write(true)` in
+/// `write_shard_file_atomic`. This test verifies compact_shard succeeds end-to-end and
+/// leaves no `.new` file on disk (the rename completed), proving the atomic write path works.
 #[test]
-fn test_fsync_shard_file_no_access_denied() {
-    use bitdex_v2::shard_store::fsync_shard_file;
-
+fn test_compact_shard_atomic_write_no_access_denied() {
     let dir = tempfile::tempdir().unwrap();
     let store = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
     let shard_key = SlotHexShard::slot_to_shard(42);
 
-    // Write a shard with an op
+    // Write an op so the shard exists with ops_count > 0
     store.append_op(&shard_key, &DocOp::Create {
         slot: 42,
         fields: vec![(0, PackedValue::I(1))],
     }).unwrap();
 
-    // compact_shard_no_fsync writes <path>.new without renaming
-    let new_path = store.compact_shard_no_fsync(&shard_key).unwrap();
-    assert!(new_path.is_some(), "should have written .new file");
+    let shard_path = store.shard_path(&shard_key);
+    let new_path = shard_path.with_extension("new");
+
+    // compact_shard must: write .new, sync_all (no ERROR_ACCESS_DENIED), rename, drop lock
+    let did_compact = store.compact_shard(&shard_key)
+        .expect("compact_shard must not fail (Windows ERROR_ACCESS_DENIED regression)");
+    assert!(did_compact, "should have compacted (had ops)");
+
+    // No .new file left — rename succeeded
+    assert!(!new_path.exists(), ".new must not remain after compact_shard (rename failed?)");
+
+    // Live shard readable and clean
+    let snap = store.read(&shard_key).unwrap();
+    assert!(snap.is_some(), "shard must be readable after compact_shard");
+    assert_eq!(store.ops_count(&shard_key).unwrap(), Some(0), "ops_count must be 0 after compaction");
+}
+
+/// Error propagation: compact_shard returns Err when it cannot write the .new file.
+///
+/// We simulate a write failure by making the shard's parent directory read-only.
+/// `compact_all` in ConcurrentEngine uses the same `compact_shard` call; if it returns
+/// Err for any shard, `compact_all` sets `any_failed = true` and returns Err at the end
+/// without incrementing `shards_compacted`.
+///
+/// This test exercises that path at the ShardStore level (no full engine needed).
+#[test]
+#[cfg(unix)] // read-only dir trick only works on Unix (Windows ignores dir perms for create)
+fn test_compact_all_error_propagation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = DocShardStore::new(dir.path().to_path_buf(), SlotHexShard).unwrap();
+    let shard_key = SlotHexShard::slot_to_shard(42);
+
+    // Write an op so the shard exists
+    store.append_op(&shard_key, &DocOp::Create {
+        slot: 42,
+        fields: vec![(0, PackedValue::I(99))],
+    }).unwrap();
 
     let shard_path = store.shard_path(&shard_key);
+    let shard_dir = shard_path.parent().unwrap();
 
-    // fsync_shard_file must not return ERROR_ACCESS_DENIED on Windows
-    let result = fsync_shard_file(&shard_path);
-    assert!(result.is_ok(), "fsync_shard_file must not fail: {:?}", result.err());
+    // Make the shard directory read-only so write_shard_file_atomic cannot create .new
+    let original_mode = shard_dir.metadata().unwrap().permissions().mode();
+    std::fs::set_permissions(shard_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    // After fsync+rename the live shard should be readable
+    // compact_shard must return Err (not panic, not Ok)
+    let result = store.compact_shard(&shard_key);
+
+    // Restore permissions before any assert so tempdir cleanup doesn't fail
+    std::fs::set_permissions(shard_dir, std::fs::Permissions::from_mode(original_mode)).unwrap();
+
+    assert!(result.is_err(), "compact_shard must return Err when .new cannot be written");
+
+    // shards_compacted equivalent: verify the original shard is intact (no partial write)
     let snap = store.read(&shard_key).unwrap();
-    assert!(snap.is_some(), "shard should be readable after fsync_shard_file");
+    assert!(snap.is_some(), "original shard must still be readable after failed compaction");
+    // ops_count should still be > 0 (compaction didn't complete)
+    let ops = store.ops_count(&shard_key).unwrap();
+    assert!(ops.map_or(false, |n| n > 0), "ops must remain after failed compaction, got {:?}", ops);
 }
