@@ -14,10 +14,13 @@
 //! - `Sh: ShardingStrategy` — how to map keys to shard file paths
 
 use ahash::AHashSet as HashSet;
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use std::fmt;
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Codec traits
@@ -358,6 +361,8 @@ pub(crate) fn write_shard_file_atomic_opts(
         file.sync_all()?;
         drop(file);
         fs::rename(&new_path, path)?;
+        // Fsync parent directory for POSIX durability (no-op on Windows)
+        fsync_parent_dir(path)?;
     } else {
         drop(file);
         // Leave as .new — caller must call fsync_shard_file + rename
@@ -373,12 +378,38 @@ pub(crate) fn write_shard_file_atomic_opts(
 /// 2. Collect all `.new` paths
 /// 3. Parallel `fsync_shard_file` on each
 /// 4. Parallel rename (atomic over existing shard on NTFS/ext4/APFS)
+///
+/// # Platform notes
+/// Opens the `.new` file read-write (required on Windows for `sync_all()`).
+/// After rename, fsyncs the parent directory for POSIX durability (no-op on Windows).
 pub fn fsync_shard_file(path: &Path) -> io::Result<()> {
     let new_path = path.with_extension("new");
-    let file = File::open(&new_path)?;
+    // Must open read-write: Windows requires write permission for sync_all()
+    let file = OpenOptions::new().read(true).write(true).open(&new_path)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&new_path, path)?;
+    // Fsync parent directory for POSIX durability (no-op on Windows)
+    fsync_parent_dir(path)?;
+    Ok(())
+}
+
+/// Fsync the parent directory of `path`.
+///
+/// Required on POSIX (ext4, xfs) for a rename to be durable across power loss.
+/// On Windows this is a no-op: the OS durability model doesn't require it.
+fn fsync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path; // suppress unused warning on Windows
+    }
     Ok(())
 }
 
@@ -421,6 +452,15 @@ fn append_ops_to_shard(path: &Path, new_ops_bytes: &[u8], additional_count: u32)
 /// Generic over snapshot codec, op codec, and sharding strategy.
 /// Flat, single-file-per-shard — no generation directories.
 /// Provides read/write/compact operations.
+///
+/// # Concurrency
+///
+/// A per-shard `RwLock<()>` prevents compaction from racing with appends on
+/// the same shard file. Writers (`append_op`, `append_ops`) and readers hold a
+/// **shared** (read) lock so they run in parallel across different shards.
+/// Compaction (`compact_shard`, `compact_shard_no_fsync`) holds an **exclusive**
+/// (write) lock for the full read→build→write cycle so no appends can slip in
+/// between the snapshot read and the rename.
 pub struct ShardStore<S, O, Sh>
 where
     S: SnapshotCodec,
@@ -429,6 +469,8 @@ where
 {
     root: PathBuf,
     sharding: Sh,
+    /// Per-shard RwLock. Shared for readers/writers; exclusive for compactors.
+    shard_locks: DashMap<Sh::Key, Arc<RwLock<()>>>,
     _phantom_s: std::marker::PhantomData<S>,
     _phantom_o: std::marker::PhantomData<O>,
 }
@@ -453,6 +495,7 @@ where
         Ok(ShardStore {
             root,
             sharding,
+            shard_locks: DashMap::new(),
             _phantom_s: std::marker::PhantomData,
             _phantom_o: std::marker::PhantomData,
         })
@@ -463,32 +506,127 @@ where
         &self.root
     }
 
+    /// Get (or lazily create) the per-shard RwLock for `key`.
+    ///
+    /// Shared lock — for readers and writers (concurrent across different shards, but
+    /// serialized with the compactor on the same shard).
+    /// Exclusive lock — for compactors (blocks all other accessors on this shard).
+    fn shard_lock(&self, key: &Sh::Key) -> Arc<RwLock<()>> {
+        if let Some(existing) = self.shard_locks.get(key) {
+            return Arc::clone(&*existing);
+        }
+        self.shard_locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
     /// Get the shard file path for a key.
     pub fn shard_path(&self, key: &Sh::Key) -> PathBuf {
         self.sharding.shard_path(key, &self.root)
     }
 
     /// Sweep orphan `.new` files from the store root (recursively).
-    /// Called on startup to clean up after a crash during batched-fsync compaction.
+    ///
+    /// Called on startup to recover from a crash during batched-fsync compaction.
+    ///
+    /// **Smart sweep:** For each `.new` file found:
+    /// - If the header is valid (`snapshot_len > 0`, parseable magic/version):
+    ///   **promote** by renaming `.new → shard_path` (completes the interrupted compact).
+    /// - Otherwise: delete (file was truncated or corrupt before fsync completed).
+    ///
+    /// Returns `Err` if any promotion or deletion fails.
     fn sweep_orphan_new_files(root: &Path) -> io::Result<()> {
-        Self::sweep_dir(root)
+        let (promoted, deleted, failed) = Self::sweep_dir(root)?;
+        if promoted > 0 || deleted > 0 {
+            eprintln!(
+                "shard_store: startup sweep — promoted={promoted}, deleted={deleted}, failed={failed}"
+            );
+        }
+        if failed > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("shard_store: sweep failed for {failed} orphan .new file(s)"),
+            ));
+        }
+        Ok(())
     }
 
-    fn sweep_dir(dir: &Path) -> io::Result<()> {
+    /// Recursively sweep a directory for orphan `.new` files.
+    /// Returns (promoted, deleted, failed) counts.
+    fn sweep_dir(dir: &Path) -> io::Result<(u64, u64, u64)> {
         if !dir.is_dir() {
-            return Ok(());
+            return Ok((0, 0, 0));
         }
+        let mut promoted = 0u64;
+        let mut deleted = 0u64;
+        let mut failed = 0u64;
+
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                Self::sweep_dir(&path)?;
+                let (p, d, f) = Self::sweep_dir(&path)?;
+                promoted += p;
+                deleted += d;
+                failed += f;
             } else if path.extension().map_or(false, |e| e == "new") {
-                // Orphan .new file — remove it
-                let _ = fs::remove_file(&path);
+                // Decide: promote (valid header) or delete (truncated/corrupt)
+                let target = path.with_extension("shard");
+                let should_promote = Self::new_file_is_promotable(&path);
+                if should_promote {
+                    // Complete the interrupted compaction: rename .new → .shard
+                    match fs::rename(&path, &target) {
+                        Ok(()) => {
+                            if let Err(e) = fsync_parent_dir(&target) {
+                                eprintln!(
+                                    "shard_store: sweep: fsync parent after promote {}: {e}",
+                                    target.display()
+                                );
+                            }
+                            promoted += 1;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "shard_store: sweep: failed to promote {}: {e}",
+                                path.display()
+                            );
+                            failed += 1;
+                        }
+                    }
+                } else {
+                    // Truncated or corrupt — delete
+                    match fs::remove_file(&path) {
+                        Ok(()) => { deleted += 1; }
+                        Err(e) => {
+                            eprintln!(
+                                "shard_store: sweep: failed to delete orphan {}: {e}",
+                                path.display()
+                            );
+                            failed += 1;
+                        }
+                    }
+                }
             }
         }
-        Ok(())
+        Ok((promoted, deleted, failed))
+    }
+
+    /// Returns true if a `.new` file has a valid, complete header with `snapshot_len > 0`.
+    /// A fully-fsynced compaction result will always have a non-zero snapshot section.
+    fn new_file_is_promotable(path: &Path) -> bool {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut buf = [0u8; HEADER_SIZE];
+        if file.read_exact(&mut buf).is_err() {
+            return false;
+        }
+        match ShardHeader::decode(&buf) {
+            Ok(h) => h.snapshot_len > 0,
+            Err(_) => false,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -501,7 +639,13 @@ where
     /// and returns the fully-materialized snapshot.
     ///
     /// Returns `None` if no shard exists for this key.
+    ///
+    /// Holds a **shared** shard lock to prevent reading a half-renamed file
+    /// during concurrent compaction.
     pub fn read(&self, key: &Sh::Key) -> io::Result<Option<S::Snapshot>> {
+        let lock = self.shard_lock(key);
+        let _guard = lock.read();
+
         let shard_path = self.shard_path(key);
 
         // Skip invalid shard stubs (e.g. PreCreator empty files)
@@ -568,12 +712,13 @@ where
     /// If no shard exists yet, creates one with an empty snapshot section.
     /// The snapshot will be populated on compaction.
     ///
-    /// # Concurrency
-    ///
-    /// This method is NOT thread-safe for concurrent writes to the same shard.
-    /// The caller must ensure single-writer access (e.g., flush thread only).
-    /// Concurrent reads are safe — readers use snapshot + ops from completed writes.
+    /// Holds a **shared** shard lock — multiple callers can append to different
+    /// shards concurrently, but a concurrent compactor on the same shard will
+    /// block until this write completes.
     pub fn append_op(&self, key: &Sh::Key, op: &O::Op) -> io::Result<()> {
+        let lock = self.shard_lock(key);
+        let _guard = lock.read();
+
         let shard_path = self.shard_path(key);
 
         let mut ops_buf = Vec::new();
@@ -598,10 +743,15 @@ where
     }
 
     /// Append multiple ops to the shard for this key.
+    ///
+    /// Holds a **shared** shard lock — same semantics as `append_op`.
     pub fn append_ops(&self, key: &Sh::Key, ops: &[O::Op]) -> io::Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
+
+        let lock = self.shard_lock(key);
+        let _guard = lock.read();
 
         let shard_path = self.shard_path(key);
 
@@ -633,7 +783,12 @@ where
     ///
     /// This is the "bulk write" path — used during initial loading or compaction.
     /// Creates a shard with a materialized snapshot and zero ops.
+    ///
+    /// Holds a **shared** shard lock.
     pub fn write_snapshot(&self, key: &Sh::Key, snapshot: &S::Snapshot) -> io::Result<()> {
+        let lock = self.shard_lock(key);
+        let _guard = lock.read();
+
         let shard_path = self.shard_path(key);
 
         let mut snapshot_bytes = Vec::new();
@@ -674,14 +829,19 @@ where
     }
 
     /// Compact a shard in-place: read snapshot + ops, write back as a fresh snapshot
-    /// with zero ops. Uses the batched-fsync path (writes `.new`, caller should
-    /// call `fsync_shard_file` in a batch then rename).
+    /// with zero ops.
     ///
     /// **Skip-clean fast-path:** If the shard already has a snapshot with zero ops,
     /// returns `Ok(false)` (no work done).
     ///
-    /// Returns `true` if compaction was performed (`.new` file written and renamed).
+    /// Returns `true` if compaction was performed (`.new` file written, fsynced, and renamed).
+    ///
+    /// Holds an **exclusive** shard lock for the full compact window — no concurrent
+    /// appends can slip in between the snapshot read and the atomic rename.
     pub fn compact_shard(&self, key: &Sh::Key) -> io::Result<bool> {
+        let lock = self.shard_lock(key);
+        let _guard = lock.write();
+
         let shard_path = self.shard_path(key);
 
         // Fast-path: read only the 28-byte header to check if already clean.
@@ -691,7 +851,8 @@ where
             }
         }
 
-        let snapshot = match self.read(key)? {
+        // Read snapshot holding the exclusive lock (no new ops can append during this window)
+        let snapshot = match self.read_unlocked(key)? {
             Some(s) => s,
             None => return Ok(false),
         };
@@ -722,7 +883,12 @@ where
     ///
     /// Returns `None` if the shard is already clean (skipped).
     /// Returns `Some(shard_path)` if `.new` was written.
+    ///
+    /// Holds an **exclusive** shard lock for the full compact window.
     pub fn compact_shard_no_fsync(&self, key: &Sh::Key) -> io::Result<Option<PathBuf>> {
+        let lock = self.shard_lock(key);
+        let _guard = lock.write();
+
         let shard_path = self.shard_path(key);
 
         // Fast-path: check header only.
@@ -732,7 +898,7 @@ where
             }
         }
 
-        let snapshot = match self.read(key)? {
+        let snapshot = match self.read_unlocked(key)? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -758,6 +924,38 @@ where
         )?;
 
         Ok(Some(shard_path))
+    }
+
+    /// Internal read without acquiring the shard lock.
+    ///
+    /// Used by `compact_shard` / `compact_shard_no_fsync` which hold the exclusive
+    /// lock themselves for the entire compact window.
+    fn read_unlocked(&self, key: &Sh::Key) -> io::Result<Option<S::Snapshot>> {
+        let shard_path = self.shard_path(key);
+
+        if shard_path.exists() && !is_valid_shard_file(&shard_path) {
+            return Ok(None);
+        }
+
+        let (header, snapshot_bytes, ops_bytes) = match read_shard_file_raw(&shard_path) {
+            Ok(result) => result,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        let mut snapshot = if header.snapshot_len > 0 {
+            S::decode(&snapshot_bytes)?
+        } else {
+            S::empty()
+        };
+
+        if header.ops_count > 0 {
+            for op in read_op_entries::<O>(&ops_bytes) {
+                O::apply(&mut snapshot, &op);
+            }
+        }
+
+        Ok(Some(snapshot))
     }
 
     /// Compact a shard in-place (alias for `compact_shard`).
