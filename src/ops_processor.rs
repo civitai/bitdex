@@ -641,16 +641,13 @@ pub fn apply_ops_batch<S: BitmapSink>(
     mut doc_writer: Option<&mut DocWriter>,
 ) -> (usize, usize, usize) {
     dedup_ops(batch);
-    // One-time diagnostic: log computed_deps status
-    if !batch.is_empty() && !meta.computed_deps.is_empty() {
-        eprintln!(
-            "apply_ops_batch: {} entries, computed_deps has {} source fields: {:?}",
+    // Per-batch diagnostic at trace level (was eprintln, hot-path cost).
+    if !batch.is_empty() {
+        tracing::trace!(
+            "apply_ops_batch: {} entries, computed_deps sources: {}",
             batch.len(),
             meta.computed_deps.len(),
-            meta.computed_deps.keys().collect::<Vec<_>>(),
         );
-    } else if !batch.is_empty() && meta.computed_deps.is_empty() {
-        eprintln!("apply_ops_batch: {} entries, computed_deps is EMPTY", batch.len());
     }
     let mut applied = 0usize;
     let mut skipped = 0usize;
@@ -823,15 +820,14 @@ pub fn apply_ops_batch<S: BitmapSink>(
         // First clear old computed value bits, then set new ones.
         // PG triggers emit remove+set pairs, so we have both old and new values.
         if !meta.computed_deps.is_empty() {
-            // Diagnostic: log computed_deps trigger for first batch entry with sort changes
-            if !sort_values.is_empty() || !old_sort_values.is_empty() {
-                eprintln!(
-                    "  computed_deps: slot={} sort_vals={:?} old_sort_vals={:?} deps_keys={:?}",
-                    slot, sort_values.keys().collect::<Vec<_>>(),
-                    old_sort_values.keys().collect::<Vec<_>>(),
-                    meta.computed_deps.keys().collect::<Vec<_>>(),
-                );
-            }
+            // Per-op diagnostic was costing ~100µs/op in stderr allocation + flush.
+            // Left as tracing::trace so it's compiled out unless explicitly enabled.
+            tracing::trace!(
+                "computed_deps: slot={} sort_vals={:?} old_sort_vals={:?} deps_keys={:?}",
+                slot, sort_values.keys().collect::<Vec<_>>(),
+                old_sort_values.keys().collect::<Vec<_>>(),
+                meta.computed_deps.keys().collect::<Vec<_>>(),
+            );
             // Determine which source fields changed (have either old or new value)
             let mut changed_sources: HashSet<&str> = HashSet::new();
             for k in sort_values.keys() {

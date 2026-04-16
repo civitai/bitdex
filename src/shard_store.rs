@@ -370,23 +370,35 @@ fn is_valid_shard_file(path: &Path) -> bool {
 
 /// Append ops bytes to an existing shard file and update the header's ops_count.
 fn append_ops_to_shard(path: &Path, new_ops_bytes: &[u8], additional_count: u32) -> io::Result<()> {
+    append_ops_to_shard_opts(path, new_ops_bytes, additional_count, true)
+}
+
+/// Append ops bytes with optional fsync. Set `fsync=false` when durability is
+/// guaranteed by an upstream layer (WAL + cursor-gated persistence) — writes
+/// still land in OS page cache and get flushed later, but we skip the per-op
+/// journal round-trip that serializes on NTFS.
+fn append_ops_to_shard_opts(
+    path: &Path,
+    new_ops_bytes: &[u8],
+    additional_count: u32,
+    fsync: bool,
+) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 
-    // Read current ops_count from header
     let mut header_buf = [0u8; HEADER_SIZE];
     file.read_exact(&mut header_buf)?;
     let mut header = ShardHeader::decode(&header_buf)?;
 
-    // Append ops at end of file
     file.seek(SeekFrom::End(0))?;
     file.write_all(new_ops_bytes)?;
 
-    // Update ops_count in header
     header.ops_count += additional_count;
     file.seek(SeekFrom::Start(HEADER_OPS_COUNT_OFFSET))?;
     file.write_all(&header.ops_count.to_le_bytes())?;
 
-    file.sync_all()?;
+    if fsync {
+        file.sync_all()?;
+    }
     Ok(())
 }
 
@@ -693,6 +705,17 @@ where
     ///
     /// Holds a **shared** shard lock — same semantics as `append_op`.
     pub fn append_ops(&self, key: &Sh::Key, ops: &[O::Op]) -> io::Result<()> {
+        self.append_ops_opts(key, ops, true)
+    }
+
+    /// Like `append_ops` but optionally skips the per-shard fsync.
+    ///
+    /// Durability contract: callers passing `fsync=false` MUST ensure writes
+    /// are durable before any externally-visible commit (e.g. before
+    /// acknowledging a WAL cursor advance). The WAL itself is fsync'd on
+    /// write, so an unfsynced docstore append will be re-applied on crash
+    /// recovery from the WAL.
+    pub fn append_ops_opts(&self, key: &Sh::Key, ops: &[O::Op], fsync: bool) -> io::Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
@@ -710,9 +733,10 @@ where
         let count = ops.len() as u32;
 
         if shard_path.exists() && is_valid_shard_file(&shard_path) {
-            append_ops_to_shard(&shard_path, &ops_buf, count)?;
+            append_ops_to_shard_opts(&shard_path, &ops_buf, count, fsync)?;
         } else {
-            // Create new shard (or replace undersized stub from PreCreator)
+            // Cold-path shard creation: always fsync to ensure the shard file
+            // actually exists on disk. The cost here is once per shard lifetime.
             let header = ShardHeader {
                 version: SHARD_VERSION,
                 ops_section_offset: HEADER_SIZE as u64,

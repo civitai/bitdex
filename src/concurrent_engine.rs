@@ -1630,6 +1630,9 @@ impl ConcurrentEngine {
                             if let (Some(ref as_), Some(ref fs_), Some(ref ss_)) =
                                 (&flush_alive_store, &flush_filter_store, &flush_sort_store)
                             {
+                                use rayon::prelude::*;
+
+                                // Alive shard is singular — no parallelism benefit.
                                 let alive_ins = coalescer.alive_inserts();
                                 if !alive_ins.is_empty() {
                                     let op = BitmapOp::BatchSet { bits: alive_ins.to_vec() };
@@ -1644,44 +1647,58 @@ impl ConcurrentEngine {
                                         eprintln!("flush: alive remove op failed: {e}");
                                     }
                                 }
-                                for (fgk, slots) in coalescer.filter_insert_entries() {
-                                    let bucket_key = FilterBucketKey::from_value(
-                                        fgk.field.to_string(), fgk.value,
-                                    );
-                                    let op = FilterOp::BatchSet { value: fgk.value, bits: slots.clone() };
-                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
-                                        eprintln!("flush: filter insert op failed: {e}");
-                                    }
-                                }
-                                for (fgk, slots) in coalescer.filter_remove_entries() {
-                                    let bucket_key = FilterBucketKey::from_value(
-                                        fgk.field.to_string(), fgk.value,
-                                    );
-                                    let op = FilterOp::BatchClear { value: fgk.value, bits: slots.clone() };
-                                    if let Err(e) = fs_.append_op(&bucket_key, &op) {
-                                        eprintln!("flush: filter remove op failed: {e}");
-                                    }
-                                }
-                                for (sgk, slots) in coalescer.sort_set_entries() {
-                                    let shard_key = SortLayerShardKey {
-                                        field: sgk.field.to_string(),
-                                        bit_position: sgk.bit_layer as u8,
-                                    };
-                                    let op = BitmapOp::BatchSet { bits: slots.clone() };
-                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
-                                        eprintln!("flush: sort set op failed: {e}");
-                                    }
-                                }
-                                for (sgk, slots) in coalescer.sort_clear_entries() {
-                                    let shard_key = SortLayerShardKey {
-                                        field: sgk.field.to_string(),
-                                        bit_position: sgk.bit_layer as u8,
-                                    };
-                                    let op = BitmapOp::BatchClear { bits: slots.clone() };
-                                    if let Err(e) = ss_.append_op(&shard_key, &op) {
-                                        eprintln!("flush: sort clear op failed: {e}");
-                                    }
-                                }
+
+                                // Filter + sort buckets: each shard independent, parallel
+                                // append lets NTFS coalesce concurrent fsyncs instead of
+                                // serializing per-bucket. 249K shards × ~5ms fsync serial
+                                // → 1-2s. Parallel over rayon pool → 100-200ms.
+                                let filter_ins: Vec<(FilterBucketKey, FilterOp)> = coalescer
+                                    .filter_insert_entries()
+                                    .iter()
+                                    .map(|(fgk, slots)| (
+                                        FilterBucketKey::from_value(fgk.field.to_string(), fgk.value),
+                                        FilterOp::BatchSet { value: fgk.value, bits: slots.clone() },
+                                    ))
+                                    .collect();
+                                let filter_rem: Vec<(FilterBucketKey, FilterOp)> = coalescer
+                                    .filter_remove_entries()
+                                    .iter()
+                                    .map(|(fgk, slots)| (
+                                        FilterBucketKey::from_value(fgk.field.to_string(), fgk.value),
+                                        FilterOp::BatchClear { value: fgk.value, bits: slots.clone() },
+                                    ))
+                                    .collect();
+                                filter_ins.into_par_iter().chain(filter_rem.into_par_iter()).for_each(
+                                    |(bucket_key, op)| {
+                                        if let Err(e) = fs_.append_op(&bucket_key, &op) {
+                                            eprintln!("flush: filter op failed: {e}");
+                                        }
+                                    },
+                                );
+
+                                let sort_set: Vec<(SortLayerShardKey, BitmapOp)> = coalescer
+                                    .sort_set_entries()
+                                    .iter()
+                                    .map(|(sgk, slots)| (
+                                        SortLayerShardKey { field: sgk.field.to_string(), bit_position: sgk.bit_layer as u8 },
+                                        BitmapOp::BatchSet { bits: slots.clone() },
+                                    ))
+                                    .collect();
+                                let sort_clr: Vec<(SortLayerShardKey, BitmapOp)> = coalescer
+                                    .sort_clear_entries()
+                                    .iter()
+                                    .map(|(sgk, slots)| (
+                                        SortLayerShardKey { field: sgk.field.to_string(), bit_position: sgk.bit_layer as u8 },
+                                        BitmapOp::BatchClear { bits: slots.clone() },
+                                    ))
+                                    .collect();
+                                sort_set.into_par_iter().chain(sort_clr.into_par_iter()).for_each(
+                                    |(shard_key, op)| {
+                                        if let Err(e) = ss_.append_op(&shard_key, &op) {
+                                            eprintln!("flush: sort op failed: {e}");
+                                        }
+                                    },
+                                );
                             }
                             flush_opslog_ns.store(t_opslog.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
