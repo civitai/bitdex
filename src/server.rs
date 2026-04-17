@@ -1493,20 +1493,32 @@ impl BitdexServer {
             }
         }
 
-        // Spawn a lightweight health-only listener on port+1.
-        // This is completely independent of query traffic so health probes
-        // never contend with query handlers. Without this, 70+ QPS of CPU-
-        // intensive bitmap queries saturates the tokio runtime threads,
-        // preventing new connection accept — health probes fail, pod restarts.
+        // Health listener on its own tokio runtime (port+1).
+        // MUST be a separate runtime — not just a separate tokio::spawn.
+        // When query handlers saturate the main tokio thread pool (.awaiting
+        // spawn_blocking JoinHandles for bitmap ops at 70+ QPS), ALL tasks
+        // on that runtime stall, including health handlers. A separate
+        // runtime with its own OS threads is completely isolated.
         let health_port = addr.port() + 1;
-        let health_addr = format!("0.0.0.0:{health_port}");
-        let health_app = axum::Router::new()
-            .route("/api/health", axum::routing::get(|| async { "ok" }));
-        let health_listener = tokio::net::TcpListener::bind(&health_addr).await?;
-        eprintln!("Health listener on http://0.0.0.0:{health_port}/api/health (isolated from query traffic)");
-        tokio::spawn(async move {
-            let _ = axum::serve(health_listener, health_app).await;
-        });
+        let health_addr_str = format!("0.0.0.0:{health_port}");
+        std::thread::Builder::new()
+            .name("health-listener".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("health runtime build");
+                rt.block_on(async move {
+                    let health_app = axum::Router::new()
+                        .route("/api/health", axum::routing::get(|| async { "ok" }));
+                    let listener = tokio::net::TcpListener::bind(&health_addr_str)
+                        .await
+                        .expect("health listener bind");
+                    eprintln!("Health listener on http://0.0.0.0:{health_port}/api/health (separate runtime)");
+                    let _ = axum::serve(listener, health_app).await;
+                });
+            })
+            .expect("health thread spawn");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
