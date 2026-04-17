@@ -1251,6 +1251,50 @@ impl DocStoreV3 {
         Ok(())
     }
 
+    /// Append a mixed batch of Set, Append, and Remove ops in a single pass.
+    /// Groups all ops by shard key, writing once per shard instead of twice
+    /// (once for sets, once for appends/removes). This halves the file-open
+    /// count when an entity update touches both single-value and multi-value
+    /// fields (the common production pattern).
+    pub fn append_mixed_batch(
+        &mut self,
+        sets: Vec<(u32, u16, Vec<u8>)>,
+        appends: Vec<(u32, u16, PackedValue)>,
+        removes: Vec<(u32, u16, PackedValue)>,
+    ) -> io::Result<()> {
+        use rayon::prelude::*;
+
+        let mut by_shard: HashMap<u32, Vec<DocOp>> = HashMap::new();
+        for (slot, field_idx, value_bytes) in sets {
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            let pv: PackedValue = rmp_serde::from_slice(&value_bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("decode packed: {e}")))?;
+            by_shard.entry(shard_key).or_default().push(DocOp::Set {
+                slot,
+                field: field_idx,
+                value: pv,
+            });
+        }
+        for (slot, field, value) in appends {
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            by_shard.entry(shard_key).or_default().push(DocOp::Append { slot, field, value });
+        }
+        for (slot, field, value) in removes {
+            let shard_key = SlotHexShard::slot_to_shard(slot);
+            by_shard.entry(shard_key).or_default().push(DocOp::Remove { slot, field, value });
+        }
+
+        let store = Arc::clone(&self.store);
+        let dirty_shards = Arc::clone(&self.dirty_shards);
+        let items: Vec<(u32, Vec<DocOp>)> = by_shard.into_iter().collect();
+        items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
+            store.append_ops(&shard_key, &ops)?;
+            dirty_shards.insert(shard_key);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Append a single tuple (used by ingester).
     pub fn append_tuple(&mut self, slot: u32, field_idx: u16, value_bytes: &[u8]) -> io::Result<()> {
         let shard_key = SlotHexShard::slot_to_shard(slot);

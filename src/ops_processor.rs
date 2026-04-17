@@ -110,20 +110,20 @@ impl DocWriter {
         };
         self.pending_remove.push((slot, idx, PackedValue::I(remove_val)));
     }
-    /// Flush pending tuples to the docstore.
+    /// Flush all pending ops to the docstore in a single pass.
+    /// Groups Set + Append + Remove ops by shard, writing once per shard
+    /// instead of twice (halves file-open count for multi-field entity updates).
     pub fn flush(&mut self) {
-        if !self.pending.is_empty() {
-            let tuples = std::mem::take(&mut self.pending);
-            if let Err(e) = self.docstore.write().append_tuples_batch(tuples) {
-                tracing::warn!("DocWriter flush failed: {e}");
-            }
+        let has_sets = !self.pending.is_empty();
+        let has_multi = !self.pending_append.is_empty() || !self.pending_remove.is_empty();
+        if !has_sets && !has_multi {
+            return;
         }
-        if !self.pending_append.is_empty() || !self.pending_remove.is_empty() {
-            let appends = std::mem::take(&mut self.pending_append);
-            let removes = std::mem::take(&mut self.pending_remove);
-            if let Err(e) = self.docstore.write().append_multi_ops_batch(appends, removes) {
-                tracing::warn!("DocWriter multi-ops flush failed: {e}");
-            }
+        let sets = std::mem::take(&mut self.pending);
+        let appends = std::mem::take(&mut self.pending_append);
+        let removes = std::mem::take(&mut self.pending_remove);
+        if let Err(e) = self.docstore.write().append_mixed_batch(sets, appends, removes) {
+            tracing::warn!("DocWriter flush failed: {e}");
         }
     }
     fn resolve_field(&mut self, field: &str) -> Option<u16> {
