@@ -675,6 +675,18 @@ where
     /// shards concurrently, but a concurrent compactor on the same shard will
     /// block until this write completes.
     pub fn append_op(&self, key: &Sh::Key, op: &O::Op) -> io::Result<()> {
+        self.append_op_opts(key, op, true)
+    }
+
+    /// Like `append_op` but optionally skips the per-shard fsync.
+    ///
+    /// Durability contract: callers passing `fsync=false` MUST ensure writes
+    /// are durable before any externally-visible commit. For bitmap opslog,
+    /// the WAL provides this — on crash, WAL replay re-applies ops from the
+    /// last durable cursor position, which is only advanced after the merge
+    /// thread successfully persists + fsyncs. Page-cache writes are visible
+    /// to the merge thread's compaction reader in the same process.
+    pub fn append_op_opts(&self, key: &Sh::Key, op: &O::Op, fsync: bool) -> io::Result<()> {
         let lock = self.shard_lock(key);
         let _guard = lock.read();
 
@@ -684,10 +696,10 @@ where
         write_op_entry::<O>(op, &mut ops_buf);
 
         if shard_path.exists() && is_valid_shard_file(&shard_path) {
-            // Append to existing shard
-            append_ops_to_shard(&shard_path, &ops_buf, 1)?;
+            append_ops_to_shard_opts(&shard_path, &ops_buf, 1, fsync)?;
         } else {
-            // Create new shard (or replace undersized stub from PreCreator)
+            // Cold-path shard creation: always fsync to ensure the shard file
+            // actually exists on disk. The cost here is once per shard lifetime.
             let header = ShardHeader {
                 version: SHARD_VERSION,
                 ops_section_offset: HEADER_SIZE as u64,

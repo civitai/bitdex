@@ -1632,45 +1632,58 @@ impl ConcurrentEngine {
                             {
                                 use rayon::prelude::*;
 
+                                // Skip per-shard fsync on bitmap opslog appends.
+                                // Durability: WAL provides crash recovery. The merge
+                                // thread only advances the WAL cursor after it
+                                // successfully persists + fsyncs bitmap snapshots.
+                                // On crash, unfsynced opslog entries may be lost, but
+                                // the WAL cursor is still behind → WAL replays those
+                                // ops, recreating the opslog entries. Page-cache writes
+                                // are visible to the merge thread's compaction reader
+                                // within the same process. Same durability model as the
+                                // docstore (which already uses fsync=false).
+
                                 // Alive shard is singular — no parallelism benefit.
                                 let alive_ins = coalescer.alive_inserts();
                                 if !alive_ins.is_empty() {
                                     let op = BitmapOp::BatchSet { bits: alive_ins.to_vec() };
-                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
+                                    if let Err(e) = as_.append_op_opts(&AliveShardKey, &op, false) {
                                         eprintln!("flush: alive insert op failed: {e}");
                                     }
                                 }
                                 let alive_rem = coalescer.alive_removes();
                                 if !alive_rem.is_empty() {
                                     let op = BitmapOp::BatchClear { bits: alive_rem.to_vec() };
-                                    if let Err(e) = as_.append_op(&AliveShardKey, &op) {
+                                    if let Err(e) = as_.append_op_opts(&AliveShardKey, &op, false) {
                                         eprintln!("flush: alive remove op failed: {e}");
                                     }
                                 }
 
-                                // Filter + sort buckets: each shard independent, parallel
-                                // append lets NTFS coalesce concurrent fsyncs instead of
-                                // serializing per-bucket. 249K shards × ~5ms fsync serial
-                                // → 1-2s. Parallel over rayon pool → 100-200ms.
-                                let filter_ins: Vec<(FilterBucketKey, FilterOp)> = coalescer
-                                    .filter_insert_entries()
-                                    .iter()
-                                    .map(|(fgk, slots)| (
-                                        FilterBucketKey::from_value(fgk.field.to_string(), fgk.value),
+                                // Filter + sort buckets: each shard independent.
+                                // Without per-shard fsync, parallel writes are pure
+                                // throughput without NTFS journal serialization.
+                                // Group filter ops by bucket key so multiple values
+                                // sharing a bucket produce ONE file open, not one per
+                                // value. With 200K tagId values across 256 buckets,
+                                // this reduces file opens from ~1300 to ~256 (5x).
+                                let mut filter_by_bucket: HashMap<FilterBucketKey, Vec<FilterOp>> = HashMap::new();
+                                for (fgk, slots) in coalescer.filter_insert_entries() {
+                                    let bk = FilterBucketKey::from_value(fgk.field.to_string(), fgk.value);
+                                    filter_by_bucket.entry(bk).or_default().push(
                                         FilterOp::BatchSet { value: fgk.value, bits: slots.clone() },
-                                    ))
-                                    .collect();
-                                let filter_rem: Vec<(FilterBucketKey, FilterOp)> = coalescer
-                                    .filter_remove_entries()
-                                    .iter()
-                                    .map(|(fgk, slots)| (
-                                        FilterBucketKey::from_value(fgk.field.to_string(), fgk.value),
+                                    );
+                                }
+                                for (fgk, slots) in coalescer.filter_remove_entries() {
+                                    let bk = FilterBucketKey::from_value(fgk.field.to_string(), fgk.value);
+                                    filter_by_bucket.entry(bk).or_default().push(
                                         FilterOp::BatchClear { value: fgk.value, bits: slots.clone() },
-                                    ))
-                                    .collect();
-                                filter_ins.into_par_iter().chain(filter_rem.into_par_iter()).for_each(
-                                    |(bucket_key, op)| {
-                                        if let Err(e) = fs_.append_op(&bucket_key, &op) {
+                                    );
+                                }
+                                let filter_buckets: Vec<(FilterBucketKey, Vec<FilterOp>)> =
+                                    filter_by_bucket.into_iter().collect();
+                                filter_buckets.into_par_iter().for_each(
+                                    |(bucket_key, ops)| {
+                                        if let Err(e) = fs_.append_ops_opts(&bucket_key, &ops, false) {
                                             eprintln!("flush: filter op failed: {e}");
                                         }
                                     },
@@ -1694,7 +1707,7 @@ impl ConcurrentEngine {
                                     .collect();
                                 sort_set.into_par_iter().chain(sort_clr.into_par_iter()).for_each(
                                     |(shard_key, op)| {
-                                        if let Err(e) = ss_.append_op(&shard_key, &op) {
+                                        if let Err(e) = ss_.append_op_opts(&shard_key, &op, false) {
                                             eprintln!("flush: sort op failed: {e}");
                                         }
                                     },
