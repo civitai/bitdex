@@ -12,7 +12,7 @@ keywords = ["bitmap", "index", "database", "search", "roaring"]
 
 [features]
 default = []
-server = ["dep:axum", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus", "dep:serde_yaml", "dep:tokio-stream"]
+server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus", "dep:serde_yaml", "dep:tokio-stream"]
 loadtest = ["ureq"]
 replay = ["ureq"]
 pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes", "dep:serde_yaml"]
@@ -67,6 +67,7 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
 
 # HTTP server (optional — only needed for HTTP server)
 axum = { version = "0.8", optional = true }
+tower = { version = "0.5", features = ["limit"], optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 prometheus = { version = "0.13", features = ["process"], optional = true }
 
