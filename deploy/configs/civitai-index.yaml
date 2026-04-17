@@ -51,6 +51,9 @@ config:
       - { name: 30d, duration_secs: 2592000, refresh_interval_secs: 3600 }
       - { name: 1y, duration_secs: 31536000, refresh_interval_secs: 86400 }
 
+  cache:
+    async_maintenance: true
+
 data_schema:
   id_field: id
   schema_version: 1
