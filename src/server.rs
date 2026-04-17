@@ -2718,7 +2718,19 @@ async fn handle_query(
     state.metrics.query_filter_clause_count.observe(query.filters.len() as f64);
     let start = Instant::now();
     let m = &state.metrics;
-    match engine.execute_query_traced(&query, &name) {
+    // Execute bitmap query on a blocking thread. At 70+ QPS the sync bitmap
+    // operations (filter intersections, sort bifurcation at 110M scale) consume
+    // enough CPU to starve the tokio async runtime, preventing it from accepting
+    // new connections — health probes fail and the pod restarts.
+    let query_result = {
+        let engine_q = Arc::clone(&engine);
+        let query_q = query.clone();
+        let name_q = name.clone();
+        tokio::task::spawn_blocking(move || {
+            engine_q.execute_query_traced(&query_q, &name_q)
+        }).await.unwrap()
+    };
+    match query_result {
         Ok((result, trace)) => {
             let elapsed = start.elapsed();
             let elapsed_us = elapsed.as_micros() as u64;
