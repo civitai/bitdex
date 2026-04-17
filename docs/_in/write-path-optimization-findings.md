@@ -80,13 +80,23 @@ Images save stall: ~155s (full snapshot of all fields). Tags save stall: ~330s (
 | Publish (ArcSwap) | 13ms | 0.6% |
 | Cache maintenance | 6ms | 0.3% |
 
-### Reframed Problem
+### After Optimization (PR #216: bucket grouping + fsync skip)
 
-**Throughput is not the issue.** System accepts 11K+ ops/s today. The real optimization targets are:
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| **flush_opslog** | **1,400ms** | **86ms** | **16x** |
+| flush_last_duration | 283ms | 197ms | 1.4x |
+| Total effective cycle | ~1,700ms | ~370ms | **4.6x** |
 
-1. **Flush cycle latency**: 1.8s from op arrival to snapshot visibility. Reducing opslog time would make ops visible to queries faster.
-2. **Cache maintenance under query load**: Currently 6ms with empty cache. At production scale with thousands of cached entries, Ivy's measurements showed 2,400ms. Async cache (Ivy's branch) addresses this.
-3. **Opslog disk I/O**: 85% of flush cycle. Can't be eliminated (crash recovery depends on it), but could be reduced via fewer dirty shards per cycle.
+**Root cause**: The coalescer produced 1,301 unique `(field, value)` entries for tagIds mutations. Each entry opened the same bucket file independently — 1,300 file opens for 256 buckets. Grouping by `FilterBucketKey` collapses to 256 `append_ops` calls. Combined with fsync skip (same durability model as docstore).
+
+### Reframed Problem (Post-Optimization)
+
+**Throughput was never the issue** — system accepts 11K+ ops/s. Now flush cycle latency is ~370ms (was 1.7s). Remaining targets:
+
+1. **Cache maintenance under query load**: Currently 6ms with empty cache. At production scale with thousands of cached entries, Ivy's measurements showed 2,400ms. Async cache (Ivy's branch) addresses this.
+2. **Flush cycle further reduction**: 370ms is already good. Sort promote (69ms) and apply (29ms) are small targets.
+3. **Op visibility latency**: ~370ms from WAL write to snapshot publish. Acceptable for most use cases.
 
 ## Optimization Candidates
 
