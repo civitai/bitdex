@@ -2745,18 +2745,15 @@ async fn handle_query(
     state.metrics.query_filter_clause_count.observe(query.filters.len() as f64);
     let start = Instant::now();
     let m = &state.metrics;
-    // Execute bitmap query on a blocking thread. At 70+ QPS the sync bitmap
-    // operations (filter intersections, sort bifurcation at 110M scale) consume
-    // enough CPU to starve the tokio async runtime, preventing it from accepting
-    // new connections — health probes fail and the pod restarts.
-    let query_result = {
-        let engine_q = Arc::clone(&engine);
-        let query_q = query.clone();
-        let name_q = name.clone();
-        tokio::task::spawn_blocking(move || {
-            engine_q.execute_query_traced(&query_q, &name_q)
-        }).await.unwrap()
-    };
+    // Execute bitmap query via block_in_place. This converts the current
+    // async thread into a blocking thread in-place, letting tokio spawn a
+    // replacement async thread. Unlike spawn_blocking + .await, this does
+    // NOT park an async thread on a JoinHandle — the thread itself does
+    // the work and returns. At 70+ QPS this prevents async thread
+    // exhaustion that makes the main listener unresponsive.
+    let query_result = tokio::task::block_in_place(|| {
+        engine.execute_query_traced(&query, &name)
+    });
     match query_result {
         Ok((result, trace)) => {
             let elapsed = start.elapsed();
