@@ -366,6 +366,10 @@ struct AppState {
     /// `Some` only when `BITDEX_QUERY_STREAM=1` is set at startup.
     /// `None` → zero overhead on the hot query path.
     query_stream: Option<tokio::sync::broadcast::Sender<QueryEvent>>,
+    /// Query tee mode: broadcast query via SSE, return stub response immediately.
+    /// Prod stays responsive at any QPS while local SSE mirror gets real traffic.
+    /// Toggle at runtime via PATCH /config {"query_tee_mode": true/false}.
+    query_tee_mode: AtomicBool,
     /// Toggleable metric groups — disable expensive metrics without redeploy.
     /// Default: all enabled. PATCH /config to toggle at runtime.
     metrics_bitmap_memory: AtomicBool,
@@ -957,6 +961,10 @@ struct ConfigPatch {
     /// Takes precedence over enabled_metrics.
     #[serde(default)]
     disabled_metrics: Option<Vec<String>>,
+    /// Query tee mode: broadcast query via SSE, return stub immediately.
+    /// Prod stays responsive while local SSE mirror gets real query traffic.
+    #[serde(default)]
+    query_tee_mode: Option<bool>,
 }
 
 /// Patchable fields for a filter field.
@@ -1119,6 +1127,7 @@ impl BitdexServer {
             } else {
                 None
             },
+            query_tee_mode: AtomicBool::new(false),
             metrics_bitmap_memory: AtomicBool::new(true),
             metrics_eviction_stats: AtomicBool::new(true),
             metrics_boundstore_disk: AtomicBool::new(true),
@@ -2301,6 +2310,10 @@ async fn handle_patch_config(
                     state.max_query_concurrency.store(v, Ordering::Relaxed);
                     eprintln!("Config patch: max_query_concurrency set to {v}");
                 }
+                if let Some(v) = patch.query_tee_mode {
+                    state.query_tee_mode.store(v, Ordering::Relaxed);
+                    eprintln!("Config patch: query_tee_mode set to {v}");
+                }
 
                 // Toggle trace collection (server-wide, not persisted with index config)
                 if let Some(v) = patch.enable_traces {
@@ -2734,6 +2747,17 @@ async fn handle_query(
         };
         // try_send never blocks; lagging receivers are dropped by the broadcast channel.
         let _ = tx.send(event);
+    }
+
+    // Query tee mode: SSE broadcast already happened above. Return stub
+    // response immediately — no bitmap work, no doc fetch, no blocking.
+    // Prod stays responsive while local SSE mirror gets real query traffic.
+    if state.query_tee_mode.load(Ordering::Relaxed) {
+        return Json(serde_json::json!({
+            "ids": [],
+            "total_matched": 0,
+            "tee_mode": true
+        })).into_response();
     }
 
     state.metrics.query_filter_clause_count.observe(query.filters.len() as f64);
