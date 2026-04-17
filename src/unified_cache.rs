@@ -58,7 +58,7 @@ pub struct UnifiedCacheConfig {
     /// Maximum maintenance work per flush (affected_entries × changed_slots).
     /// When exceeded, affected entries are marked for rebuild instead of
     /// per-slot evaluation. Prevents positive feedback loops under burst writes.
-    /// Default 500_000. Used as fallback when `max_maintenance_ms` is 0.
+    /// 0 = unlimited (default). Used as fallback when `max_maintenance_ms` is 0.
     pub max_maintenance_work: usize,
     /// Time budget for cache maintenance per flush cycle in milliseconds.
     /// When > 0, replaces the count-based `max_maintenance_work` budget.
@@ -78,7 +78,7 @@ impl Default for UnifiedCacheConfig {
             initial_capacity: 4_000,
             max_capacity: 64_000,
             min_filter_size: 0,
-            max_maintenance_work: 500_000,
+            max_maintenance_work: 0, // 0 = unlimited
             max_maintenance_ms: 10,
             prefetch_threshold: 0.95,
         }
@@ -1397,7 +1397,7 @@ impl UnifiedCache {
         // Count-based: bail immediately if estimated work exceeds threshold.
         let deadline = if self.config.max_maintenance_ms > 0 {
             Some(Instant::now() + Duration::from_millis(self.config.max_maintenance_ms))
-        } else if estimated_work > self.config.max_maintenance_work {
+        } else if self.config.max_maintenance_work > 0 && estimated_work > self.config.max_maintenance_work {
             // Fallback to count-based: bail immediately if over budget
             for meta_id in affected_ids.iter() {
                 if let Some(key) = self.meta_id_to_key.get(&meta_id) {
@@ -1490,7 +1490,7 @@ impl UnifiedCache {
         let estimated_work = affected_count * total_sort_slots;
         let deadline = if self.config.max_maintenance_ms > 0 {
             Some(Instant::now() + Duration::from_millis(self.config.max_maintenance_ms))
-        } else if estimated_work > self.config.max_maintenance_work {
+        } else if self.config.max_maintenance_work > 0 && estimated_work > self.config.max_maintenance_work {
             // Fallback to count-based: bail immediately if over budget
             for meta_id in affected_ids.iter() {
                 if let Some(key) = self.meta_id_to_key.get(&meta_id) {
@@ -1642,7 +1642,7 @@ impl UnifiedCache {
         let total_changed_slots: usize = changed_slots_per_field.values().map(|s| s.len()).sum();
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_changed_slots;
-        if self.config.max_maintenance_ms == 0 && estimated_work > self.config.max_maintenance_work {
+        if self.config.max_maintenance_ms == 0 && self.config.max_maintenance_work > 0 && estimated_work > self.config.max_maintenance_work {
             // Over count-based budget: mark all for rebuild
             let over_budget: Vec<UnifiedKey> = affected_ids
                 .iter()
@@ -1701,7 +1701,7 @@ impl UnifiedCache {
         let total_sort_slots: usize = sort_mutations.values().map(|s| s.len()).sum();
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_sort_slots;
-        if self.config.max_maintenance_ms == 0 && estimated_work > self.config.max_maintenance_work {
+        if self.config.max_maintenance_ms == 0 && self.config.max_maintenance_work > 0 && estimated_work > self.config.max_maintenance_work {
             let over_budget: Vec<UnifiedKey> = affected_ids
                 .iter()
                 .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())

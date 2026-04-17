@@ -474,7 +474,7 @@ fn default_preload_bounds() -> bool {
     true
 }
 fn default_max_maintenance_work() -> usize {
-    500_000
+    0 // 0 = unlimited; the async cache worker has no flush-thread stall risk
 }
 fn default_max_maintenance_ms() -> u64 {
     // 0 = unlimited. The deadline existed to protect the flush thread; the
