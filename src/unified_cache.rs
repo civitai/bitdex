@@ -1557,6 +1557,21 @@ impl UnifiedCache {
             entry.remove_slot_blind(slot);
         }
     }
+    /// Batch version of `remove_slot_from_all`.
+    ///
+    /// Used by the async cache worker to remove all deleted slots in one pass
+    /// rather than calling `remove_slot_from_all` once per slot. Amortizes the
+    /// outer `entries` iteration across all slots.
+    pub fn remove_slots_from_all_batch(&mut self, slots: &[u32]) {
+        if slots.is_empty() || self.entries.is_empty() {
+            return;
+        }
+        for (_, entry) in self.entries.iter_mut() {
+            for &slot in slots {
+                entry.remove_slot_blind(slot);
+            }
+        }
+    }
     // ── Two-Phase Maintenance (Lock-Free Evaluation) ────────────────────
     //
     // These methods split cache maintenance into three brief-lock phases:

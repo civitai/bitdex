@@ -334,6 +334,14 @@ pub struct ConcurrentEngine {
     /// The WAL reader thread picks up ops and routes through apply_ops_batch.
     #[cfg(feature = "pg-sync")]
     wal_writer: Option<Arc<crate::ops_wal::WalWriter>>,
+    /// Async cache maintenance worker channel sender. None when
+    /// `config.cache.async_maintenance` is false.
+    cache_work_tx: Option<crossbeam_channel::Sender<crate::cache_worker::CacheWorkItem>>,
+    /// Async cache maintenance worker thread handle.
+    cache_worker_handle: Option<JoinHandle<()>>,
+    /// Metrics for the async cache worker (always allocated; reads are zero when
+    /// async_maintenance is disabled).
+    cache_worker_metrics: Arc<crate::cache_worker::CacheWorkerMetrics>,
 }
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
@@ -978,6 +986,18 @@ impl ConcurrentEngine {
         let boundstore_bytes_read = Arc::new(AtomicU64::new(0));
         let boundstore_entries_restored = Arc::new(AtomicU64::new(0));
         let boundstore_entries_skipped = Arc::new(AtomicU64::new(0));
+        // Async cache worker channel + metrics (always allocated; worker spawned below
+        // unless headless or async_maintenance=false).
+        let cache_worker_metrics = Arc::new(crate::cache_worker::CacheWorkerMetrics::default());
+        let (cache_work_tx, pre_cache_rx): (
+            Option<crossbeam_channel::Sender<crate::cache_worker::CacheWorkItem>>,
+            Option<crossbeam_channel::Receiver<crate::cache_worker::CacheWorkItem>>,
+        ) = if config.cache.async_maintenance && !config.headless {
+            let (tx, rx) = crossbeam_channel::bounded(1024);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         // Headless mode: skip all background threads.
         // The engine provides config, bitmap store, and docstore access but
         // no flush/merge/eviction threads run.
@@ -1052,6 +1072,9 @@ impl ConcurrentEngine {
                 doc_cache_eviction_handle: None,
                 #[cfg(feature = "pg-sync")]
                 wal_writer: None,
+                cache_work_tx: None,
+                cache_worker_handle: None,
+                cache_worker_metrics: Arc::new(crate::cache_worker::CacheWorkerMetrics::default()),
             });
         }
         let flush_handle = {
@@ -1105,6 +1128,8 @@ impl ConcurrentEngine {
                 .filter_map(|fc| fc.eviction.as_ref().map(|e| (fc.name.clone(), e.idle_seconds)))
                 .collect();
             let flush_mem_cache = Arc::clone(&bitmap_memory_cache);
+            let flush_cache_work_tx = cache_work_tx.clone();
+            let flush_cache_worker_metrics = Arc::clone(&cache_worker_metrics);
             thread::spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
                 let max_sleep = Duration::from_micros(flush_interval_us * 10);
@@ -1347,14 +1372,66 @@ impl ConcurrentEngine {
                                 }
                             }
                             flush_timebucket_ns.store(t_tb.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            // Unified cache live maintenance (two-phase).
+                            // Unified cache live maintenance.
                             //
-                            // Split into three brief-lock phases to avoid blocking
-                            // query handlers during the expensive slot evaluation:
-                            //   Phase A: brief lock — collect work + cheap ops
-                            //   Phase B: NO lock — evaluate slots against staging
-                            //   Phase C: brief lock — apply results
+                            // When async_maintenance=true: build a CacheWorkItem and
+                            // try_send to the cache worker. The flush thread is
+                            // unblocked immediately regardless of how long maintenance takes.
+                            //
+                            // When async_maintenance=false (default): run inline Phases A/B/C
+                            // as before. Zero change to existing behavior.
                             let t_cache = Instant::now();
+                            if let Some(ref work_tx) = flush_cache_work_tx {
+                                // Async path: build work item from coalescer output.
+                                use crate::cache_worker::CacheWorkItem;
+                                use ahash::{AHashMap, AHashSet};
+                                let filter_inserts: AHashMap<_, _> = coalescer
+                                    .filter_insert_entries()
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect();
+                                let filter_removes: AHashMap<_, _> = coalescer
+                                    .filter_remove_entries()
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect();
+                                let sort_mutations: AHashMap<Arc<str>, AHashSet<u32>> = coalescer
+                                    .mutated_sort_slots()
+                                    .iter()
+                                    .map(|(k, v)| (Arc::from(*k), v.clone()))
+                                    .collect();
+                                let mutated_filter_fields: AHashSet<Arc<str>> = coalescer
+                                    .mutated_filter_fields()
+                                    .iter()
+                                    .map(|s| Arc::from(*s))
+                                    .collect();
+                                let alive_removes = coalescer.alive_removes().to_vec();
+                                let has_alive_mutations = coalescer.has_alive_mutations();
+                                let work_item = CacheWorkItem {
+                                    filter_inserts,
+                                    filter_removes,
+                                    sort_mutations,
+                                    alive_removes,
+                                    mutated_filter_fields,
+                                    has_alive_mutations,
+                                };
+                                if !work_item.is_empty() {
+                                    if work_tx.try_send(work_item).is_err() {
+                                        // Worker channel full — fall back to conservative
+                                        // invalidation to keep cache consistent.
+                                        flush_cache_worker_metrics
+                                            .backpressure_invalidations_total
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        let mut uc = flush_unified_cache.lock();
+                                        uc.maintain_alive_changes();
+                                    }
+                                }
+                                flush_cache_ns.store(
+                                    t_cache.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            } else {
+                            // Inline path (async_maintenance=false) — unchanged.
                             let t_phase_a = Instant::now();
                             let mut ct_uc_entries: usize = 0;
                             let mut ct_alive_removes: usize = 0;
@@ -1561,6 +1638,7 @@ impl ConcurrentEngine {
                                     ct_sort_work_items, ct_sort_over_budget, ct_sort_results, ct_sort_timed_out,
                                 );
                             }
+                            } // end else (inline cache maintenance path)
                             // Yield CPU after cache maintenance to let tokio deliver responses.
                             std::thread::yield_now();
                             // Periodic filter diff compaction: merge dirty diffs into
@@ -2846,6 +2924,29 @@ impl ConcurrentEngine {
         } else {
             None
         };
+        // Async cache worker: spawn worker thread if channel was pre-created.
+        let cache_worker_handle: Option<JoinHandle<()>> = if let Some(rx) = pre_cache_rx {
+            use crate::cache_worker::{CacheWorker, CacheWorkerConfig};
+            let worker = CacheWorker::new(
+                rx,
+                Arc::clone(&unified_cache),
+                Arc::clone(&inner),
+                CacheWorkerConfig {
+                    max_maintenance_ms: config.cache.max_maintenance_ms,
+                    backlog_drop_limit: 4096,
+                },
+                Arc::clone(&cache_worker_metrics),
+                Arc::clone(&shutdown),
+            );
+            Some(
+                std::thread::Builder::new()
+                    .name("bitdex-cache-worker".to_string())
+                    .spawn(move || worker.run())
+                    .expect("Failed to spawn bitdex-cache-worker thread"),
+            )
+        } else {
+            None
+        };
         Ok(Self {
             inner,
             sender,
@@ -2915,6 +3016,9 @@ impl ConcurrentEngine {
             doc_cache_eviction_handle,
             #[cfg(feature = "pg-sync")]
             wal_writer: None,
+            cache_work_tx,
+            cache_worker_handle,
+            cache_worker_metrics,
         })
     }
     /// Set the string maps for MappedString field query resolution.
@@ -5431,6 +5535,22 @@ impl ConcurrentEngine {
             self.flush_cache_sort_work_items_max.load(Ordering::Relaxed),
         )
     }
+    /// Async cache worker metrics:
+    /// `(queue_depth, cycle_nanos, items_coalesced_total, drops_total,
+    ///   over_budget_total, backpressure_invalidations_total, cycles_total)`.
+    /// All values are zero when `async_maintenance` is disabled.
+    pub fn cache_worker_stats(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
+        let m = &self.cache_worker_metrics;
+        (
+            m.queue_depth.load(Ordering::Relaxed),
+            m.cycle_nanos.load(Ordering::Relaxed),
+            m.items_coalesced_total.load(Ordering::Relaxed),
+            m.drops_total.load(Ordering::Relaxed),
+            m.over_budget_total.load(Ordering::Relaxed),
+            m.backpressure_invalidations_total.load(Ordering::Relaxed),
+            m.cycles_total.load(Ordering::Relaxed),
+        )
+    }
     /// Number of filter + sort fields still pending lazy load.
     pub fn pending_field_count(&self) -> usize {
         self.pending_filter_loads.lock().len() + self.pending_sort_loads.lock().len()
@@ -7640,6 +7760,12 @@ impl ConcurrentEngine {
         }
         // Doc cache eviction thread uses the shutdown flag (already set above)
         if let Some(handle) = self.doc_cache_eviction_handle.take() {
+            handle.join().ok();
+        }
+        // Cache worker uses the shutdown flag (already set). Drop the sender first
+        // so the worker's channel disconnects, then join.
+        drop(self.cache_work_tx.take());
+        if let Some(handle) = self.cache_worker_handle.take() {
             handle.join().ok();
         }
     }

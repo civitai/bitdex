@@ -1,6 +1,7 @@
 pub mod bitmap_fs;
 pub mod bitmap_memory_cache;
 pub mod bound_store;
+pub mod cache_worker;
 pub mod bucket_diff_log;
 pub mod dump_enrichment;
 pub mod dump_expression;

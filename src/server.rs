@@ -999,6 +999,12 @@ struct CachePatch {
     prefetch_threshold: Option<f64>,
     max_maintenance_work: Option<usize>,
     max_maintenance_ms: Option<u64>,
+    /// Toggle async cache maintenance worker at runtime.
+    /// Note: toggling only changes the config flag. The worker thread is spawned
+    /// at startup — flipping this flag at runtime controls whether the flush thread
+    /// sends work to the channel; the thread itself is always present when
+    /// async_maintenance=true was set at startup.
+    async_maintenance: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2217,6 +2223,12 @@ async fn handle_patch_config(
                     if let Some(v) = cache_patch.max_maintenance_ms {
                         idx.definition.config.cache.max_maintenance_ms = v;
                         idx.engine.set_max_maintenance_ms(v);
+                    }
+                    if let Some(v) = cache_patch.async_maintenance {
+                        // Updates the stored config (persisted on next save).
+                        // Takes effect on next server restart — the worker channel
+                        // is wired at startup, not at runtime.
+                        idx.definition.config.cache.async_maintenance = v;
                     }
                 }
 
@@ -4691,6 +4703,16 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.cache_maint_sort_work_items_max
                 .with_label_values(&[name])
                 .set(sort_work_items_max as i64);
+            // Async cache worker metrics
+            let (cw_queue, cw_cycle_ns, cw_coalesced, cw_drops, cw_over_budget, cw_backpressure, cw_cycles) =
+                engine.cache_worker_stats();
+            m.cache_worker_queue_depth.with_label_values(&[name]).set(cw_queue as i64);
+            m.cache_worker_cycle_nanos.with_label_values(&[name]).set(cw_cycle_ns as i64);
+            m.cache_worker_items_coalesced_total.with_label_values(&[name]).set(cw_coalesced as i64);
+            m.cache_worker_drops_total.with_label_values(&[name]).set(cw_drops as i64);
+            m.cache_worker_over_budget_total.with_label_values(&[name]).set(cw_over_budget as i64);
+            m.cache_backpressure_invalidations_total.with_label_values(&[name]).set(cw_backpressure as i64);
+            m.cache_worker_cycles_total.with_label_values(&[name]).set(cw_cycles as i64);
             // Iter 6 — put_batch fast/slow path counters
             let (fast_path, slow_path) = engine.docstore_put_batch_path_stats();
             m.docstore_put_batch_fast_path_total

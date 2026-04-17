@@ -74,6 +74,16 @@ pub struct Metrics {
     pub cache_maint_sort_work_items: IntGaugeVec,
     pub cache_maint_unique_filter_shapes_max: IntGaugeVec,
     pub cache_maint_sort_work_items_max: IntGaugeVec,
+
+    // -- Async cache worker (Phase 1a) --
+    pub cache_worker_queue_depth: IntGaugeVec,
+    pub cache_worker_cycle_nanos: IntGaugeVec,
+    pub cache_worker_items_coalesced_total: IntGaugeVec,
+    pub cache_worker_drops_total: IntGaugeVec,
+    pub cache_worker_over_budget_total: IntGaugeVec,
+    pub cache_backpressure_invalidations_total: IntGaugeVec,
+    pub cache_worker_cycles_total: IntGaugeVec,
+
     pub docstore_put_batch_fast_path_total: IntGaugeVec,
     pub docstore_put_batch_slow_path_total: IntGaugeVec,
 
@@ -474,6 +484,62 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let cache_worker_queue_depth = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_worker_queue_depth",
+                "Number of pending CacheWorkItems in the async cache worker channel.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_worker_cycle_nanos = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_worker_cycle_nanos",
+                "Duration of the most recent async cache worker cycle in nanoseconds.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_worker_items_coalesced_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_worker_items_coalesced_total",
+                "Cumulative count of CacheWorkItems merged by the coalescing step. Coalescing ratio = items_coalesced / cycles.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_worker_drops_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_worker_drops_total",
+                "Number of times the cache worker backlog exceeded the drop limit and fell back to invalidation.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_worker_over_budget_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_worker_over_budget_total",
+                "Number of cache entries that timed out during worker evaluation and were marked for rebuild.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_backpressure_invalidations_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_backpressure_invalidations_total",
+                "Number of times the flush thread's try_send to the cache worker failed (channel full) and fell back to invalidation.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_worker_cycles_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_worker_cycles_total",
+                "Total number of completed async cache worker cycles.",
+            ),
+            &["index"],
+        )
+        .unwrap();
         let docstore_put_batch_fast_path_total = IntGaugeVec::new(
             Opts::new(
                 "bitdex_docstore_put_batch_fast_path_total",
@@ -855,6 +921,13 @@ impl Metrics {
         registry.register(Box::new(cache_maint_sort_work_items.clone())).unwrap();
         registry.register(Box::new(cache_maint_unique_filter_shapes_max.clone())).unwrap();
         registry.register(Box::new(cache_maint_sort_work_items_max.clone())).unwrap();
+        registry.register(Box::new(cache_worker_queue_depth.clone())).unwrap();
+        registry.register(Box::new(cache_worker_cycle_nanos.clone())).unwrap();
+        registry.register(Box::new(cache_worker_items_coalesced_total.clone())).unwrap();
+        registry.register(Box::new(cache_worker_drops_total.clone())).unwrap();
+        registry.register(Box::new(cache_worker_over_budget_total.clone())).unwrap();
+        registry.register(Box::new(cache_backpressure_invalidations_total.clone())).unwrap();
+        registry.register(Box::new(cache_worker_cycles_total.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_fast_path_total.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_slow_path_total.clone())).unwrap();
         registry
@@ -970,6 +1043,13 @@ impl Metrics {
             cache_maint_sort_work_items,
             cache_maint_unique_filter_shapes_max,
             cache_maint_sort_work_items_max,
+            cache_worker_queue_depth,
+            cache_worker_cycle_nanos,
+            cache_worker_items_coalesced_total,
+            cache_worker_drops_total,
+            cache_worker_over_budget_total,
+            cache_backpressure_invalidations_total,
+            cache_worker_cycles_total,
             docstore_put_batch_fast_path_total,
             docstore_put_batch_slow_path_total,
             lazy_load_duration_seconds,
