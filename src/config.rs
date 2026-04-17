@@ -429,6 +429,16 @@ pub struct CacheConfig {
     /// 0 = use count-based `max_maintenance_work` instead. Default: 10ms.
     #[serde(default = "default_max_maintenance_ms")]
     pub max_maintenance_ms: u64,
+    /// When true, unified-cache live maintenance runs on a dedicated
+    /// `cache_worker` thread instead of inline on the flush thread.
+    ///
+    /// Moves Phases A/B/C (~2400ms at 107M scale) off the flush cycle, allowing
+    /// the flush thread to process new mutations without waiting for cache work.
+    ///
+    /// Default: false (inline path unchanged). Enable via runtime PATCH once the
+    /// worker has been validated on local 107M data.
+    #[serde(default)]
+    pub async_maintenance: bool,
 }
 fn default_cache_max_entries() -> usize {
     100_000
@@ -485,6 +495,7 @@ impl Default for CacheConfig {
             preload_bounds: default_preload_bounds(),
             max_maintenance_work: default_max_maintenance_work(),
             max_maintenance_ms: default_max_maintenance_ms(),
+            async_maintenance: false,
         }
     }
 }
