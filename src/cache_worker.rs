@@ -75,9 +75,16 @@ pub struct CacheWorkerMetrics {
 /// Cache worker configuration. Derived from `CacheConfig` + engine state.
 #[derive(Clone)]
 pub struct CacheWorkerConfig {
-    /// Per-cycle deadline for work evaluation. Items that don't complete in
-    /// budget get marked for rebuild (same as current Phase B behavior).
-    pub max_maintenance_ms: u64,
+    /// Per-cycle deadline for work evaluation in milliseconds.
+    ///
+    /// `0` means unlimited — the worker processes all entries in the coalesced
+    /// batch before moving on. This is the correct default now that maintenance
+    /// runs on its own thread (the deadline existed to protect the flush thread
+    /// from stalling; it is unnecessary here).
+    ///
+    /// Stored as `Arc<AtomicU64>` so the engine can update it at runtime via
+    /// `PATCH /indexes/{name}/config` without restarting the worker thread.
+    pub max_maintenance_ms: Arc<AtomicU64>,
     /// Drain at most this many items per cycle before evaluating. Past this
     /// we invalidate affected entries and drop the items — same fallback as
     /// the existing `max_maintenance_ms` deadline path, just applied to the
@@ -88,7 +95,9 @@ pub struct CacheWorkerConfig {
 impl Default for CacheWorkerConfig {
     fn default() -> Self {
         Self {
-            max_maintenance_ms: 5,
+            // 0 = unlimited (no deadline). The worker has its own thread so
+            // there is no flush-thread stall risk.
+            max_maintenance_ms: Arc::new(AtomicU64::new(0)),
             backlog_drop_limit: 4096,
         }
     }
@@ -293,8 +302,9 @@ impl CacheWorker {
             // evaluate without it, then reapply. Unlike the flush-thread
             // inline path, this entire sequence runs off the flush cycle so
             // writers are unblocked regardless of how long we take.
-            let deadline = if self.config.max_maintenance_ms > 0 {
-                Some(Instant::now() + Duration::from_millis(self.config.max_maintenance_ms))
+            let ms = self.config.max_maintenance_ms.load(Ordering::Relaxed);
+            let deadline = if ms > 0 {
+                Some(Instant::now() + Duration::from_millis(ms))
             } else {
                 None
             };

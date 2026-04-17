@@ -477,7 +477,9 @@ fn default_max_maintenance_work() -> usize {
     500_000
 }
 fn default_max_maintenance_ms() -> u64 {
-    5 // low-latency preset (was 10)
+    // 0 = unlimited. The deadline existed to protect the flush thread; the
+    // async cache worker runs on its own thread so no deadline is needed.
+    0
 }
 impl Default for CacheConfig {
     fn default() -> Self {

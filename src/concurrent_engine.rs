@@ -342,6 +342,10 @@ pub struct ConcurrentEngine {
     /// Metrics for the async cache worker (always allocated; reads are zero when
     /// async_maintenance is disabled).
     cache_worker_metrics: Arc<crate::cache_worker::CacheWorkerMetrics>,
+    /// Shared deadline knob for the async cache worker. `set_max_maintenance_ms`
+    /// writes here; the worker reads it each cycle via `Ordering::Relaxed`.
+    /// `None` when `async_maintenance` is disabled at startup.
+    cache_worker_ms: Option<Arc<AtomicU64>>,
 }
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
@@ -1075,6 +1079,7 @@ impl ConcurrentEngine {
                 cache_work_tx: None,
                 cache_worker_handle: None,
                 cache_worker_metrics: Arc::new(crate::cache_worker::CacheWorkerMetrics::default()),
+                cache_worker_ms: None,
             });
         }
         let flush_handle = {
@@ -2925,6 +2930,10 @@ impl ConcurrentEngine {
             None
         };
         // Async cache worker: spawn worker thread if channel was pre-created.
+        // The shared AtomicU64 lets `set_max_maintenance_ms` update the worker's
+        // deadline at runtime without restarting the thread.
+        let cache_worker_ms_arc: Arc<AtomicU64> =
+            Arc::new(AtomicU64::new(config.cache.max_maintenance_ms));
         let cache_worker_handle: Option<JoinHandle<()>> = if let Some(rx) = pre_cache_rx {
             use crate::cache_worker::{CacheWorker, CacheWorkerConfig};
             let worker = CacheWorker::new(
@@ -2932,7 +2941,7 @@ impl ConcurrentEngine {
                 Arc::clone(&unified_cache),
                 Arc::clone(&inner),
                 CacheWorkerConfig {
-                    max_maintenance_ms: config.cache.max_maintenance_ms,
+                    max_maintenance_ms: Arc::clone(&cache_worker_ms_arc),
                     backlog_drop_limit: 4096,
                 },
                 Arc::clone(&cache_worker_metrics),
@@ -2947,6 +2956,7 @@ impl ConcurrentEngine {
         } else {
             None
         };
+        let cache_worker_ms = Some(cache_worker_ms_arc);
         Ok(Self {
             inner,
             sender,
@@ -3019,6 +3029,7 @@ impl ConcurrentEngine {
             cache_work_tx,
             cache_worker_handle,
             cache_worker_metrics,
+            cache_worker_ms,
         })
     }
     /// Set the string maps for MappedString field query resolution.
@@ -5854,9 +5865,14 @@ impl ConcurrentEngine {
     pub fn set_max_maintenance_work(&self, v: usize) {
         self.unified_cache.lock().config_mut().max_maintenance_work = v;
     }
-    /// Update the max_maintenance_ms time budget on the live unified cache.
+    /// Update the max_maintenance_ms time budget on the live unified cache and
+    /// the async cache worker (if running). Takes effect on the worker's next
+    /// cycle. `0` = unlimited (no deadline).
     pub fn set_max_maintenance_ms(&self, v: u64) {
         self.unified_cache.lock().config_mut().max_maintenance_ms = v;
+        if let Some(ref ms_arc) = self.cache_worker_ms {
+            ms_arc.store(v, Ordering::Relaxed);
+        }
     }
     /// Update the max_entries cap on the live unified cache.
     pub fn set_cache_max_entries(&self, v: usize) {
