@@ -366,11 +366,6 @@ struct AppState {
     /// `Some` only when `BITDEX_QUERY_STREAM=1` is set at startup.
     /// `None` → zero overhead on the hot query path.
     query_stream: Option<tokio::sync::broadcast::Sender<QueryEvent>>,
-    /// Semaphore limiting concurrent doc-read spawn_blocking tasks.
-    /// Without this, 70+ QPS with include_docs saturates the blocking pool
-    /// (512 threads default), starving the tokio async runtime so it can't
-    /// accept new connections — health probes fail, pod restarts.
-    doc_read_semaphore: Arc<tokio::sync::Semaphore>,
     /// Toggleable metric groups — disable expensive metrics without redeploy.
     /// Default: all enabled. PATCH /config to toggle at runtime.
     metrics_bitmap_memory: AtomicBool,
@@ -1124,7 +1119,6 @@ impl BitdexServer {
             } else {
                 None
             },
-            doc_read_semaphore: Arc::new(tokio::sync::Semaphore::new(32)),
             metrics_bitmap_memory: AtomicBool::new(true),
             metrics_eviction_stats: AtomicBool::new(true),
             metrics_boundstore_disk: AtomicBool::new(true),
@@ -2783,11 +2777,6 @@ async fn handle_query(
                 // leaked on `.await` cancellation (HTTP client disconnect).
                 // Dropped unconditionally when the async stack frame unwinds.
                 let _read_guard = ConcurrentReadGuard::new(&m.docstore_concurrent_reads);
-                // Acquire semaphore permit before spawning a blocking task.
-                // Without this, 70+ QPS with include_docs saturates the
-                // blocking pool, starving the tokio runtime so it can't
-                // accept new connections (health probes fail, pod restarts).
-                let _permit = state.doc_read_semaphore.acquire().await.unwrap();
                 let docs = tokio::task::spawn_blocking(move || {
                     let mut docs = Vec::with_capacity(ids.len());
                     for &id in &ids {
