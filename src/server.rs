@@ -1493,6 +1493,21 @@ impl BitdexServer {
             }
         }
 
+        // Spawn a lightweight health-only listener on port+1.
+        // This is completely independent of query traffic so health probes
+        // never contend with query handlers. Without this, 70+ QPS of CPU-
+        // intensive bitmap queries saturates the tokio runtime threads,
+        // preventing new connection accept — health probes fail, pod restarts.
+        let health_port = addr.port() + 1;
+        let health_addr = format!("0.0.0.0:{health_port}");
+        let health_app = axum::Router::new()
+            .route("/api/health", axum::routing::get(|| async { "ok" }));
+        let health_listener = tokio::net::TcpListener::bind(&health_addr).await?;
+        eprintln!("Health listener on http://0.0.0.0:{health_port}/api/health (isolated from query traffic)");
+        tokio::spawn(async move {
+            let _ = axum::serve(health_listener, health_app).await;
+        });
+
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
         axum::serve(listener, app)
