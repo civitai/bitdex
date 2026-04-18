@@ -39,6 +39,27 @@ pub struct WarmEntry {
     pub frequency: u64,
 }
 
+/// A hot filter clause set discovered by frequency analysis.
+/// Used by auto-prefilter promotion in the merge thread.
+#[derive(Debug, Clone)]
+pub struct HotFilterSet {
+    /// Original filter clauses for prefilter registration.
+    pub filters: Vec<FilterClause>,
+    /// Canonical clauses for dedup checking.
+    pub canonical: Vec<CanonicalClause>,
+    /// Total frequency across all sort variants.
+    pub total_frequency: u64,
+    /// Number of distinct sort field + direction combos.
+    pub sort_variants: u64,
+}
+
+struct HotFilterAccum {
+    filters: Vec<FilterClause>,
+    canonical: Vec<CanonicalClause>,
+    total_frequency: u64,
+    sort_variants: u64,
+}
+
 /// Thread-safe shape frequency tracker.
 pub struct WarmRegistry {
     /// Shape → (frequency counter, original filter clauses).
@@ -157,6 +178,47 @@ impl WarmRegistry {
         std::fs::rename(&tmp, path)?;
 
         Ok(count)
+    }
+
+    /// Get hot filter clause sets for auto-prefilter promotion.
+    ///
+    /// Groups shapes by their canonical filter clauses (ignoring sort field/direction),
+    /// sums frequencies across sort variants, and returns filter sets that exceed
+    /// the frequency threshold. Each returned entry includes the original filter
+    /// clauses (for prefilter registration) and the total frequency.
+    ///
+    /// The merge thread calls this to discover filter sets worth precomputing.
+    pub fn hot_filter_sets(&self, min_frequency: u64) -> Vec<HotFilterSet> {
+        let map = self.shapes.lock();
+
+        // Group by canonical filter clauses, sum frequencies
+        let mut by_filters: HashMap<Vec<CanonicalClause>, HotFilterAccum> = HashMap::new();
+        for (shape, record) in map.iter() {
+            let entry = by_filters
+                .entry(shape.filter_clauses.clone())
+                .or_insert_with(|| HotFilterAccum {
+                    filters: record.filters.clone(),
+                    canonical: shape.filter_clauses.clone(),
+                    total_frequency: 0,
+                    sort_variants: 0,
+                });
+            entry.total_frequency += record.frequency;
+            entry.sort_variants += 1;
+        }
+
+        let mut result: Vec<HotFilterSet> = by_filters
+            .into_values()
+            .filter(|a| a.total_frequency >= min_frequency && a.canonical.len() >= 3)
+            .map(|a| HotFilterSet {
+                filters: a.filters,
+                canonical: a.canonical,
+                total_frequency: a.total_frequency,
+                sort_variants: a.sort_variants,
+            })
+            .collect();
+
+        result.sort_by(|a, b| b.total_frequency.cmp(&a.total_frequency));
+        result
     }
 
     /// Load persisted warm entries from disk. Called on boot.

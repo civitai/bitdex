@@ -2772,6 +2772,70 @@ impl ConcurrentEngine {
                             }
                         }
                     }
+                    // ── Auto-prefilter promotion ──────────────────────────────
+                    // When a filter clause set reaches a frequency threshold,
+                    // auto-register it as a prefilter. The warm registry tracks
+                    // shapes by frequency; here we promote hot filter sets.
+                    if merge_warm_registry.total_recorded() >= 50 {
+                        let hot = merge_warm_registry.hot_filter_sets(10);
+                        for hfs in &hot {
+                            // Skip if already covered by an existing prefilter
+                            let (_, existing) = crate::prefilter::substitute(
+                                &merge_prefilter_registry,
+                                &hfs.filters,
+                            );
+                            if existing.is_some() {
+                                continue;
+                            }
+                            // Auto-register: name = "auto_" + hash of canonical clauses
+                            let name = format!(
+                                "auto_{:x}",
+                                {
+                                    use std::hash::{Hash, Hasher};
+                                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                                    hfs.canonical.hash(&mut h);
+                                    h.finish()
+                                }
+                            );
+                            if merge_prefilter_registry.get(&name).is_some() {
+                                continue; // already registered
+                            }
+                            let snap = merge_inner.load();
+                            let start = std::time::Instant::now();
+                            let executor = crate::executor::QueryExecutor::new(
+                                &snap.slots,
+                                &snap.filters,
+                                &snap.sorts,
+                                1,
+                            );
+                            match executor.compute_filters(&hfs.filters) {
+                                Ok(bitmap) => {
+                                    let ms = start.elapsed().as_millis();
+                                    let card = bitmap.len();
+                                    match merge_prefilter_registry.insert(
+                                        name.clone(),
+                                        hfs.filters.clone(),
+                                        bitmap,
+                                        300,
+                                        start.elapsed().as_nanos() as u64,
+                                    ) {
+                                        Ok(_) => {
+                                            eprintln!(
+                                                "auto-prefilter: promoted '{}' → {} slots in {}ms (freq={}, {} sort variants)",
+                                                name, card, ms, hfs.total_frequency, hfs.sort_variants,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            eprintln!("auto-prefilter: failed to register '{}': {e}", name);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("auto-prefilter: compute failed for '{}': {e}", name);
+                                }
+                            }
+                        }
+                    }
                     // ── Warm registry persist ─────────────────────────────────
                     // Persist top-N query shapes to disk every merge cycle.
                     // On next boot, server reads this file and pre-warms cache.
