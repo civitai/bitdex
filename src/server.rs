@@ -1418,8 +1418,10 @@ impl BitdexServer {
         let public_routes = Router::new()
             .route("/api/indexes", get(handle_list_indexes))
             .route("/api/indexes/{name}", get(handle_get_index))
-            .route("/api/indexes/{name}/query", post(handle_query)
-                .layer(tower::limit::ConcurrencyLimitLayer::new(32)))
+            .route("/api/indexes/{name}/query", post(handle_query))
+            // ConcurrencyLimit removed — use runtime max_query_concurrency via
+            // PATCH /config instead. The hardcoded Tower layer blocked queries
+            // before SSE broadcast and wasn't hot-configurable.
             .route("/api/indexes/{name}/document", post(handle_document))
             .route("/api/indexes/{name}/traces", get(handle_traces))
             .route("/api/indexes/{name}/stats", get(handle_stats))
