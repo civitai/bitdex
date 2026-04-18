@@ -219,7 +219,7 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitdex-v2"
-version = "1.0.151-jemalloc"
+version = "1.0.161-jemalloc"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -256,6 +256,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -2896,6 +2897,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
