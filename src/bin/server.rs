@@ -246,10 +246,15 @@ fn parse_config() -> Config {
         trace_buffer_size = v;
     }
 
-    // Env var overrides TOML for admin token (safer for deployments)
+    // Env var overrides for deployment (K8s pod spec / ConfigMap)
     if let Ok(v) = std::env::var("BITDEX_ADMIN_TOKEN") {
         if !v.is_empty() {
             admin_token = Some(v);
+        }
+    }
+    if let Ok(v) = std::env::var("BITDEX_MAX_QUERY_CONCURRENCY") {
+        if let Ok(n) = v.parse::<u32>() {
+            max_query_concurrency = n;
         }
     }
 
