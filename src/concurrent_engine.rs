@@ -1343,6 +1343,7 @@ impl ConcurrentEngine {
                                 }
                             }
                         }
+                        let t_post_apply = Instant::now();
                         // Yield CPU after apply to let tokio I/O threads deliver
                         // pending HTTP responses. Without this, the flush thread
                         // monopolizes CPU across apply+cache+publish (~20ms aggregate),
@@ -1696,6 +1697,24 @@ impl ConcurrentEngine {
                                     flush_mem_cache.mark_stale(field);
                                 }
                                 stale_fields.clear();
+                            }
+                            // Log slow flush cycles with full phase breakdown
+                            let total_ms = flush_start.elapsed().as_millis();
+                            if total_ms > 100 {
+                                let apply_ms = flush_apply_ns.load(Ordering::Relaxed) as f64 / 1e6;
+                                let promote_ms = flush_sort_promote_ns.load(Ordering::Relaxed) as f64 / 1e6;
+                                let cache_ms = flush_cache_ns.load(Ordering::Relaxed) as f64 / 1e6;
+                                let compact_ms = flush_compact_ns.load(Ordering::Relaxed) as f64 / 1e6;
+                                let tb_ms = flush_timebucket_ns.load(Ordering::Relaxed) as f64 / 1e6;
+                                let publish_ms = t_publish.elapsed().as_secs_f64() * 1000.0;
+                                let post_apply_ms = t_post_apply.elapsed().as_secs_f64() * 1000.0;
+                                tracing::warn!(
+                                    "[flush-slow] total={total_ms}ms ops={bitmap_count} | \
+                                     apply={apply_ms:.1}ms promote={promote_ms:.1}ms \
+                                     cache={cache_ms:.1}ms compact={compact_ms:.1}ms \
+                                     tb={tb_ms:.1}ms publish={publish_ms:.1}ms \
+                                     post_apply_total={post_apply_ms:.1}ms"
+                                );
                             }
                             // Record flush stats for Prometheus
                             let flush_elapsed = flush_start.elapsed().as_nanos() as u64;
