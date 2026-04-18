@@ -5539,9 +5539,17 @@ async fn handle_query_stream(
             }
         });
 
-    Sse::new(stream)
+    let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::default())
-        .into_response()
+        .into_response();
+    // Disable Cloudflare proxy buffering so events stream in real-time
+    // instead of arriving in ~60s bursts. Cloudflare honors this nginx-
+    // style header on its regular reverse proxy path.
+    response.headers_mut().insert(
+        "X-Accel-Buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
+    response
 }
 
 #[cfg(test)]
