@@ -188,8 +188,14 @@ impl<'a> QueryExecutor<'a> {
         // so no alive AND is needed here.
         let total_matched = filter_bitmap.len();
         // Step 3: Sort and paginate
+        // Override planner's simple_sort decision with actual result count.
+        // The planner estimates cardinality from filter field statistics, but
+        // the real cardinality after intersecting all clauses can be much
+        // smaller. Using simple sort (reconstruct+sort) for small result sets
+        // avoids the O(32 × bitmap_intersection) cost of bifurcation.
+        let use_simple_sort = plan.use_simple_sort || total_matched < 1000;
         let (ids, next_cursor) = if let Some(sort_clause) = sort {
-            if plan.use_simple_sort {
+            if use_simple_sort {
                 self.simple_sort_and_paginate(&filter_bitmap, sort_clause, limit, cursor)?
             } else {
                 self.sort_and_paginate(&filter_bitmap, sort_clause, limit, cursor)?
@@ -251,6 +257,8 @@ impl<'a> QueryExecutor<'a> {
         // Filter bitmaps are kept clean (no stale bits from deleted docs),
         // so no alive AND is needed.
         let total_matched = filter_bitmap.len();
+        // Override simple_sort with actual cardinality (same logic as execute_query)
+        let use_simple_sort = use_simple_sort || total_matched < 1000;
         // Sort and paginate
         let (ids, next_cursor) = if let Some(sort_clause) = sort {
             if use_simple_sort {

@@ -157,24 +157,13 @@ impl SortField {
             return Vec::new();
         }
 
-        // Pre-fuse all bit layers ONCE for this query.
-        //
-        // For clean layers (the steady-state common case after the merge
-        // thread has run) `fused_cow` returns `Cow::Borrowed(&base)` —
-        // zero-copy. For dirty layers it materializes the fused result
-        // (one ~6 MB clone per dirty layer). The fused snapshot is then
-        // shared across bifurcate / apply_cursor_filter / order_results
-        // so each layer is fused at most once per query.
-        //
-        // This replaces the prior pattern of eagerly merging dirty diffs
-        // into bases on every flush cycle (which cost ~500ms per cycle
-        // under sustained ops because every dirty layer triggered an
-        // Arc::make_mut deep clone).
+        let t_start = std::time::Instant::now();
         let layers: Vec<Cow<'_, RoaringBitmap>> = self
             .bit_layers
             .iter()
             .map(|vb| vb.fused_cow())
             .collect();
+        let t_fuse = t_start.elapsed();
 
         // Apply cursor filtering if present
         let effective_candidates;
@@ -190,16 +179,37 @@ impl SortField {
         } else {
             candidates
         };
+        let t_cursor = t_start.elapsed() - t_fuse;
 
         if candidates.is_empty() {
+            if t_start.elapsed().as_millis() > 10 {
+                tracing::warn!(
+                    "[sort-top_n] SLOW empty: fuse={:.1}ms cursor={:.1}ms total={:.1}ms input_card={} bits={}",
+                    t_fuse.as_secs_f64()*1000.0, t_cursor.as_secs_f64()*1000.0,
+                    t_start.elapsed().as_secs_f64()*1000.0, 0, self.num_bits,
+                );
+            }
             return Vec::new();
         }
 
         // MSB-to-LSB bifurcation: collect top-N slots via bitmap AND operations
         let top_n_bitmap = self.bifurcate_with_layers(candidates, limit, descending, &layers);
+        let t_bifurcate = t_start.elapsed() - t_fuse - t_cursor;
 
         // Reconstruct values ONLY for the final top-N slots and sort them
-        self.order_results(&top_n_bitmap, descending)
+        let result = self.order_results(&top_n_bitmap, descending);
+        let t_order = t_start.elapsed() - t_fuse - t_cursor - t_bifurcate;
+
+        if t_start.elapsed().as_millis() > 10 {
+            tracing::warn!(
+                "[sort-top_n] SLOW: fuse={:.1}ms cursor={:.1}ms bifurcate={:.1}ms order={:.1}ms total={:.1}ms input={} output={} bits={}",
+                t_fuse.as_secs_f64()*1000.0, t_cursor.as_secs_f64()*1000.0,
+                t_bifurcate.as_secs_f64()*1000.0, t_order.as_secs_f64()*1000.0,
+                t_start.elapsed().as_secs_f64()*1000.0,
+                candidates.len(), result.len(), self.num_bits,
+            );
+        }
+        result
     }
 
     /// MSB-to-LSB bifurcation traversal.
