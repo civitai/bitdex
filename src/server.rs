@@ -1702,8 +1702,20 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 
         let schema_registry = engine.build_schema_registry();
 
+        let engine = Arc::new(engine);
+
+        // Auto-warm: replay persisted query shapes to pre-populate cache.
+        // Runs before index is visible to HTTP handlers, so warm queries
+        // don't compete with real traffic.
+        let warmed = engine.auto_warm();
+        if warmed > 0 {
+            state.metrics.boot_phase_seconds
+                .with_label_values(&["auto_warm"])
+                .set(0); // timing already printed by auto_warm
+        }
+
         *state.index.lock() = Some(IndexState {
-            engine: Arc::new(engine),
+            engine,
             definition: def,
             reverse_maps: Arc::new(reverse_maps),
             schema_registry: Arc::new(schema_registry),
@@ -2793,6 +2805,19 @@ async fn handle_query(
             m.query_duration_seconds
                 .with_label_values(&[&name])
                 .observe(elapsed.as_secs_f64());
+
+            // Record query shape for auto-warm on next boot.
+            if let Some(ref sort) = query.sort {
+                let canonical: Vec<crate::cache::CanonicalClause> = query.filters.iter()
+                    .filter_map(crate::cache::CanonicalClause::from_filter)
+                    .collect();
+                engine.warm_registry().record(
+                    &query.filters,
+                    &canonical,
+                    &sort.field,
+                    sort.direction,
+                );
+            }
 
             let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
 

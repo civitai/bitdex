@@ -350,6 +350,8 @@ pub struct ConcurrentEngine {
     /// planner substitutes into matching queries to avoid re-evaluating
     /// common clause sets (e.g. Civitai safety prefix).
     prefilter_registry: Arc<crate::prefilter::PrefilterRegistry>,
+    /// Warm registry: tracks popular query shapes for auto-warming on boot.
+    warm_registry: Arc<crate::warm_registry::WarmRegistry>,
 }
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
@@ -1085,6 +1087,7 @@ impl ConcurrentEngine {
                 cache_worker_metrics: Arc::new(crate::cache_worker::CacheWorkerMetrics::default()),
                 cache_worker_ms: None,
                 prefilter_registry: Arc::new(crate::prefilter::PrefilterRegistry::new()),
+                warm_registry: Arc::new(crate::warm_registry::WarmRegistry::new(None)),
             });
         }
         let flush_handle = {
@@ -2390,6 +2393,9 @@ impl ConcurrentEngine {
             })
         };
         let prefilter_registry = Arc::new(crate::prefilter::PrefilterRegistry::new());
+        let warm_persist_path = config.storage.bitmap_path.as_ref()
+            .map(|p| p.join("warm.json"));
+        let warm_registry = Arc::new(crate::warm_registry::WarmRegistry::new(warm_persist_path));
         let merge_handle = {
             let shutdown = Arc::clone(&shutdown);
             let merge_inner = Arc::clone(&inner);
@@ -2413,6 +2419,7 @@ impl ConcurrentEngine {
             let merge_doc_shard_store = docstore.read().shard_store_arc();
             let merge_dirty_shards = docstore.read().dirty_shards_arc();
             let merge_prefilter_registry = Arc::clone(&prefilter_registry);
+            let merge_warm_registry = Arc::clone(&warm_registry);
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
@@ -2765,6 +2772,21 @@ impl ConcurrentEngine {
                             }
                         }
                     }
+                    // ── Warm registry persist ─────────────────────────────────
+                    // Persist top-N query shapes to disk every merge cycle.
+                    // On next boot, server reads this file and pre-warms cache.
+                    if merge_warm_registry.total_recorded() > 0 {
+                        match merge_warm_registry.persist() {
+                            Ok(n) if n > 0 => {
+                                eprintln!(
+                                    "warm registry: persisted {} shapes ({} total recorded, {} unique)",
+                                    n, merge_warm_registry.total_recorded(), merge_warm_registry.shape_count(),
+                                );
+                            }
+                            Err(e) => eprintln!("warm registry persist failed: {e}"),
+                            _ => {}
+                        }
+                    }
                     // ── RSS-aware memory pressure eviction ──────────────────
                     //
                     // Check real RSS against the memory budget. When RSS exceeds
@@ -3076,8 +3098,56 @@ impl ConcurrentEngine {
             cache_worker_metrics,
             cache_worker_ms,
             prefilter_registry,
+            warm_registry,
         })
     }
+
+    /// Get the warm registry for recording query shapes.
+    pub fn warm_registry(&self) -> &crate::warm_registry::WarmRegistry {
+        &self.warm_registry
+    }
+
+    /// Load and execute warm entries from the persisted warm file.
+    /// Called on boot after the index is loaded. Returns the number
+    /// of queries warmed.
+    pub fn auto_warm(&self) -> usize {
+        let path = match self.config.storage.bitmap_path.as_ref() {
+            Some(p) => p.join("warm.json"),
+            None => return 0,
+        };
+        let entries = crate::warm_registry::WarmRegistry::load(&path);
+        if entries.is_empty() {
+            return 0;
+        }
+        eprintln!("Auto-warming {} query shapes...", entries.len());
+        let start = std::time::Instant::now();
+        let mut warmed = 0;
+        for entry in &entries {
+            let query = crate::query::BitdexQuery {
+                filters: entry.filters.clone(),
+                sort: Some(crate::query::SortClause {
+                    field: entry.sort_field.clone(),
+                    direction: entry.direction,
+                }),
+                limit: 1,
+                cursor: None,
+                offset: None,
+                skip_cache: false,
+            };
+            match self.execute_query(&query) {
+                Ok(_) => warmed += 1,
+                Err(e) => {
+                    tracing::debug!("auto-warm query failed: {e}");
+                }
+            }
+        }
+        eprintln!(
+            "Auto-warmed {}/{} query shapes in {:.1}ms",
+            warmed, entries.len(), start.elapsed().as_secs_f64() * 1000.0,
+        );
+        warmed
+    }
+
     /// Set the string maps for MappedString field query resolution.
     /// Call after creating the engine with schema data that includes string_map entries.
     pub fn set_string_maps(&mut self, maps: StringMaps) {
