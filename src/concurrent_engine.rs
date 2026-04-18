@@ -1195,6 +1195,36 @@ impl ConcurrentEngine {
                         );
                         last_heartbeat_log = std::time::Instant::now();
                     }
+                    // Sort layer promote: merge dirty diffs into bases on a timer.
+                    // MUST run outside the bitmap_count gate — initial load can leave
+                    // sort layers dirty even when no ops are flowing. Without this,
+                    // every query on a dirty sort field pays 32 × ~6MB clone (~48ms).
+                    if last_sort_promote.elapsed() >= sort_promote_interval {
+                        let t_promote = std::time::Instant::now();
+                        let dirty_field_names: Vec<String> = staging
+                            .sorts
+                            .fields()
+                            .filter(|(_, sf)| sf.has_dirty())
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        if !dirty_field_names.is_empty() {
+                            for name in &dirty_field_names {
+                                if let Some(sf) = staging.sorts.get_field_mut(name) {
+                                    sf.merge_dirty();
+                                }
+                            }
+                            staging_dirty = true; // force publish with clean layers
+                            let promote_ns = t_promote.elapsed().as_nanos() as u64;
+                            flush_sort_promote_ns.store(promote_ns, Ordering::Relaxed);
+                            tracing::warn!(
+                                "[sort-promote] dirty={} elapsed={:.1}ms names={:?}",
+                                dirty_field_names.len(),
+                                promote_ns as f64 / 1_000_000.0,
+                                dirty_field_names,
+                            );
+                        }
+                        last_sort_promote = std::time::Instant::now();
+                    }
                     // Phase 1b: Drain lazy load channel — apply loaded fields to staging.
                     // This keeps staging in sync with snapshots published by ensure_loaded().
                     //
@@ -1276,43 +1306,7 @@ impl ConcurrentEngine {
                                 apply_timings.render_summary(),
                             );
                         }
-                        // Periodic sort layer promote: bound the per-query lazy
-                        // fuse cost by clearing dirty diffs every sort_promote_interval.
-                        // Triggered inside the apply branch because that's where
-                        // we have a recent mutation context — but rate-limited so
-                        // it only runs at the configured cadence.
-                        if last_sort_promote.elapsed() >= sort_promote_interval {
-                            let t_promote = std::time::Instant::now();
-                            // Collect dirty field names (immutable borrow ends
-                            // before we mutate via get_field_mut).
-                            let all_field_dirty: Vec<(String, bool)> = staging
-                                .sorts
-                                .fields()
-                                .map(|(name, sf)| (name.clone(), sf.has_dirty()))
-                                .collect();
-                            let dirty_field_names: Vec<String> = all_field_dirty
-                                .iter()
-                                .filter(|(_, d)| *d)
-                                .map(|(n, _)| n.clone())
-                                .collect();
-                            for name in &dirty_field_names {
-                                if let Some(sf) = staging.sorts.get_field_mut(name) {
-                                    sf.merge_dirty();
-                                }
-                            }
-                            let promote_elapsed_ns = t_promote.elapsed().as_nanos() as u64;
-                            flush_sort_promote_ns.store(promote_elapsed_ns, Ordering::Relaxed);
-                            tracing::warn!(
-                                "[sort-promote] tick interval={}ms total_fields={} dirty={} elapsed={:.1}ms dirty_names={:?} all_status={:?}",
-                                sort_promote_interval.as_millis(),
-                                all_field_dirty.len(),
-                                dirty_field_names.len(),
-                                promote_elapsed_ns as f64 / 1_000_000.0,
-                                dirty_field_names,
-                                all_field_dirty
-                            );
-                            last_sort_promote = std::time::Instant::now();
-                        }
+                        // Sort promote moved outside bitmap_count block (see below)
                         // Collect mutated field names for bitmap memory cache staleness tracking.
                         for fgk in coalescer.filter_insert_entries().keys() {
                             stale_fields.push(fgk.field.to_string());
@@ -2226,6 +2220,13 @@ impl ConcurrentEngine {
                             }
                             stale_fields.clear();
                         }
+                    }
+                    // Publish clean sort layers when sort promote set staging_dirty
+                    // but no ops or lazy loads triggered a publish.
+                    if staging_dirty && bitmap_count == 0 && !lazy_loaded && !is_loading {
+                        inner.store(Arc::new(staging.clone()));
+                        staging_dirty = false;
+                        tracing::info!("Published clean sort layers (promote-only)");
                     }
                     // Incremental time bucket refresh: instead of scanning 107M alive slots,
                     // compute expired slots via narrow range query on the sort layers.

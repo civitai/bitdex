@@ -237,38 +237,50 @@ impl SortField {
         let mut remaining = candidates.clone();
         let mut remaining_limit = limit;
 
+        let bif_start = std::time::Instant::now();
+        let mut layers_touched = 0u32;
+        let mut layers_narrowed = 0u32;
+        let mut layers_skipped = 0u32;
+        let input_card = remaining.len();
+
         for bit in (0..self.num_bits).rev() {
             if remaining_limit == 0 || remaining.is_empty() {
                 break;
             }
+            layers_touched += 1;
 
             let layer: &RoaringBitmap = &layers[bit];
 
             // preferred = slots that have the "better" bit value at this position
             let preferred = if descending {
-                // Descending: prefer bit SET (higher values)
                 &remaining & layer
             } else {
-                // Ascending: prefer bit CLEAR (lower values)
                 &remaining - layer
             };
 
             let preferred_count = preferred.len() as usize;
 
             if preferred_count == 0 {
-                // No slots have the preferred bit — all remaining are equivalent at
-                // this layer, continue to next bit with the same remaining set
+                layers_skipped += 1;
                 continue;
             } else if preferred_count >= remaining_limit {
-                // More preferred slots than we need — narrow to preferred and continue
                 remaining = preferred;
+                layers_narrowed += 1;
             } else {
-                // Fewer preferred slots than limit — all preferred are winners.
-                // Collect them, reduce limit, continue with the rest.
                 result |= &preferred;
                 remaining -= &preferred;
                 remaining_limit -= preferred_count;
+                layers_narrowed += 1;
             }
+        }
+
+        if bif_start.elapsed().as_millis() > 5 {
+            tracing::warn!(
+                "[bifurcate] SLOW: {:.1}ms input={} output={} layers_touched={} narrowed={} skipped={} remaining={}",
+                bif_start.elapsed().as_secs_f64() * 1000.0,
+                input_card, result.len() + remaining.len().min(remaining_limit as u64),
+                layers_touched, layers_narrowed, layers_skipped, remaining.len(),
+            );
         }
 
         // After all layers, if we still need more slots, take them from remaining
