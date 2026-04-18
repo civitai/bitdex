@@ -346,6 +346,10 @@ pub struct ConcurrentEngine {
     /// writes here; the worker reads it each cycle via `Ordering::Relaxed`.
     /// `None` when `async_maintenance` is disabled at startup.
     cache_worker_ms: Option<Arc<AtomicU64>>,
+    /// Prefilter registry: named precomputed filter bitmaps that the query
+    /// planner substitutes into matching queries to avoid re-evaluating
+    /// common clause sets (e.g. Civitai safety prefix).
+    prefilter_registry: Arc<crate::prefilter::PrefilterRegistry>,
 }
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
@@ -1080,6 +1084,7 @@ impl ConcurrentEngine {
                 cache_worker_handle: None,
                 cache_worker_metrics: Arc::new(crate::cache_worker::CacheWorkerMetrics::default()),
                 cache_worker_ms: None,
+                prefilter_registry: Arc::new(crate::prefilter::PrefilterRegistry::new()),
             });
         }
         let flush_handle = {
@@ -2384,6 +2389,7 @@ impl ConcurrentEngine {
                 }
             })
         };
+        let prefilter_registry = Arc::new(crate::prefilter::PrefilterRegistry::new());
         let merge_handle = {
             let shutdown = Arc::clone(&shutdown);
             let merge_inner = Arc::clone(&inner);
@@ -2406,6 +2412,7 @@ impl ConcurrentEngine {
             let merge_unified_cache = Arc::clone(&unified_cache);
             let merge_doc_shard_store = docstore.read().shard_store_arc();
             let merge_dirty_shards = docstore.read().dirty_shards_arc();
+            let merge_prefilter_registry = Arc::clone(&prefilter_registry);
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
@@ -2720,6 +2727,44 @@ impl ConcurrentEngine {
                         }
                     }
                 }
+                    // ── Prefilter refresh ──────────────────────────────────────
+                    // Refresh any stale prefilters against the current snapshot.
+                    // This runs every merge cycle (~60s default), so prefilter
+                    // bitmaps stay within their configured refresh interval.
+                    if !merge_prefilter_registry.is_empty() {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let snap = merge_inner.load();
+                        for entry in merge_prefilter_registry.entries() {
+                            if !entry.is_stale(now_secs) {
+                                continue;
+                            }
+                            let start = std::time::Instant::now();
+                            let executor = crate::executor::QueryExecutor::new(
+                                &snap.slots,
+                                &snap.filters,
+                                &snap.sorts,
+                                1, // max_page_size irrelevant for filter-only eval
+                            );
+                            match executor.compute_filters(&entry.clauses) {
+                                Ok(bitmap) => {
+                                    let ms = start.elapsed().as_millis();
+                                    let card = bitmap.len();
+                                    entry.publish_refresh(bitmap, start.elapsed().as_nanos() as u64);
+                                    eprintln!(
+                                        "prefilter refresh: '{}' → {} slots in {}ms",
+                                        entry.name, card, ms,
+                                    );
+                                }
+                                Err(e) => {
+                                    entry.refresh_errors.fetch_add(1, Ordering::Relaxed);
+                                    eprintln!("prefilter refresh failed for '{}': {e}", entry.name);
+                                }
+                            }
+                        }
+                    }
                     // ── RSS-aware memory pressure eviction ──────────────────
                     //
                     // Check real RSS against the memory budget. When RSS exceeds
@@ -3030,6 +3075,7 @@ impl ConcurrentEngine {
             cache_worker_handle,
             cache_worker_metrics,
             cache_worker_ms,
+            prefilter_registry,
         })
     }
     /// Set the string maps for MappedString field query resolution.
@@ -5562,6 +5608,80 @@ impl ConcurrentEngine {
             m.cycles_total.load(Ordering::Relaxed),
         )
     }
+    // ── Prefilter Registry ──────────────────────────────────────────────
+
+    /// Get a reference to the prefilter registry for query substitution.
+    pub fn prefilter_registry(&self) -> &crate::prefilter::PrefilterRegistry {
+        &self.prefilter_registry
+    }
+
+    /// Register a named prefilter by evaluating the given filter clauses
+    /// against the current snapshot and caching the resulting bitmap.
+    pub fn register_prefilter(
+        &self,
+        name: String,
+        clauses: Vec<crate::query::FilterClause>,
+        refresh_interval_secs: u64,
+    ) -> Result<Arc<crate::prefilter::PrefilterEntry>> {
+        let snap = self.inner.load();
+        let start = std::time::Instant::now();
+        let executor = crate::executor::QueryExecutor::new(
+            &snap.slots,
+            &snap.filters,
+            &snap.sorts,
+            self.config.max_page_size,
+        );
+        let bitmap = executor.compute_filters(&clauses)?;
+        let compute_nanos = start.elapsed().as_nanos() as u64;
+        self.prefilter_registry
+            .insert(name, clauses, bitmap, refresh_interval_secs, compute_nanos)
+            .map_err(|e| crate::error::BitdexError::Config(e.to_string()))
+    }
+
+    /// Refresh all stale prefilters against the current snapshot.
+    /// Returns the number of entries refreshed.
+    pub fn refresh_stale_prefilters(&self) -> usize {
+        let snap = self.inner.load();
+        let mut refreshed = 0;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for entry in self.prefilter_registry.entries() {
+            if !entry.is_stale(now_secs) {
+                continue;
+            }
+            let start = std::time::Instant::now();
+            let executor = crate::executor::QueryExecutor::new(
+                &snap.slots,
+                &snap.filters,
+                &snap.sorts,
+                self.config.max_page_size,
+            );
+            match executor.compute_filters(&entry.clauses) {
+                Ok(bitmap) => {
+                    entry.publish_refresh(bitmap, start.elapsed().as_nanos() as u64);
+                    refreshed += 1;
+                }
+                Err(e) => {
+                    entry.refresh_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(name = %entry.name, err = %e, "prefilter refresh failed");
+                }
+            }
+        }
+        refreshed
+    }
+
+    /// List all registered prefilters.
+    pub fn list_prefilters(&self) -> Vec<crate::prefilter::PrefilterInfo> {
+        self.prefilter_registry.list()
+    }
+
+    /// Remove a prefilter by name. Returns true if it existed.
+    pub fn remove_prefilter(&self, name: &str) -> bool {
+        self.prefilter_registry.remove(name)
+    }
+
     /// Number of filter + sort fields still pending lazy load.
     pub fn pending_field_count(&self) -> usize {
         self.pending_filter_loads.lock().len() + self.pending_sort_loads.lock().len()
