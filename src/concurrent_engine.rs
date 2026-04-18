@@ -346,6 +346,12 @@ pub struct ConcurrentEngine {
     /// writes here; the worker reads it each cycle via `Ordering::Relaxed`.
     /// `None` when `async_maintenance` is disabled at startup.
     cache_worker_ms: Option<Arc<AtomicU64>>,
+    /// Prefilter registry: named precomputed filter bitmaps that the query
+    /// planner substitutes into matching queries to avoid re-evaluating
+    /// common clause sets (e.g. Civitai safety prefix).
+    prefilter_registry: Arc<crate::prefilter::PrefilterRegistry>,
+    /// Warm registry: tracks popular query shapes for auto-warming on boot.
+    warm_registry: Arc<crate::warm_registry::WarmRegistry>,
 }
 impl ConcurrentEngine {
     /// Create a new concurrent engine with an in-memory docstore (for testing).
@@ -1080,6 +1086,8 @@ impl ConcurrentEngine {
                 cache_worker_handle: None,
                 cache_worker_metrics: Arc::new(crate::cache_worker::CacheWorkerMetrics::default()),
                 cache_worker_ms: None,
+                prefilter_registry: Arc::new(crate::prefilter::PrefilterRegistry::new()),
+                warm_registry: Arc::new(crate::warm_registry::WarmRegistry::new(None)),
             });
         }
         let flush_handle = {
@@ -2384,6 +2392,10 @@ impl ConcurrentEngine {
                 }
             })
         };
+        let prefilter_registry = Arc::new(crate::prefilter::PrefilterRegistry::new());
+        let warm_persist_path = config.storage.bitmap_path.as_ref()
+            .map(|p| p.join("warm.json"));
+        let warm_registry = Arc::new(crate::warm_registry::WarmRegistry::new(warm_persist_path));
         let merge_handle = {
             let shutdown = Arc::clone(&shutdown);
             let merge_inner = Arc::clone(&inner);
@@ -2406,6 +2418,8 @@ impl ConcurrentEngine {
             let merge_unified_cache = Arc::clone(&unified_cache);
             let merge_doc_shard_store = docstore.read().shard_store_arc();
             let merge_dirty_shards = docstore.read().dirty_shards_arc();
+            let merge_prefilter_registry = Arc::clone(&prefilter_registry);
+            let merge_warm_registry = Arc::clone(&warm_registry);
 
             thread::spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
@@ -2720,6 +2734,123 @@ impl ConcurrentEngine {
                         }
                     }
                 }
+                    // ── Prefilter refresh ──────────────────────────────────────
+                    // Refresh any stale prefilters against the current snapshot.
+                    // This runs every merge cycle (~60s default), so prefilter
+                    // bitmaps stay within their configured refresh interval.
+                    if !merge_prefilter_registry.is_empty() {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let snap = merge_inner.load();
+                        for entry in merge_prefilter_registry.entries() {
+                            if !entry.is_stale(now_secs) {
+                                continue;
+                            }
+                            let start = std::time::Instant::now();
+                            let executor = crate::executor::QueryExecutor::new(
+                                &snap.slots,
+                                &snap.filters,
+                                &snap.sorts,
+                                1, // max_page_size irrelevant for filter-only eval
+                            );
+                            match executor.compute_filters(&entry.clauses) {
+                                Ok(bitmap) => {
+                                    let ms = start.elapsed().as_millis();
+                                    let card = bitmap.len();
+                                    entry.publish_refresh(bitmap, start.elapsed().as_nanos() as u64);
+                                    eprintln!(
+                                        "prefilter refresh: '{}' → {} slots in {}ms",
+                                        entry.name, card, ms,
+                                    );
+                                }
+                                Err(e) => {
+                                    entry.refresh_errors.fetch_add(1, Ordering::Relaxed);
+                                    eprintln!("prefilter refresh failed for '{}': {e}", entry.name);
+                                }
+                            }
+                        }
+                    }
+                    // ── Auto-prefilter promotion ──────────────────────────────
+                    // When a filter clause set reaches a frequency threshold,
+                    // auto-register it as a prefilter. The warm registry tracks
+                    // shapes by frequency; here we promote hot filter sets.
+                    if merge_warm_registry.total_recorded() >= 50 {
+                        let hot = merge_warm_registry.hot_filter_sets(10);
+                        for hfs in &hot {
+                            // Skip if already covered by an existing prefilter
+                            let (_, existing) = crate::prefilter::substitute(
+                                &merge_prefilter_registry,
+                                &hfs.filters,
+                            );
+                            if existing.is_some() {
+                                continue;
+                            }
+                            // Auto-register: name = "auto_" + hash of canonical clauses
+                            let name = format!(
+                                "auto_{:x}",
+                                {
+                                    use std::hash::{Hash, Hasher};
+                                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                                    hfs.canonical.hash(&mut h);
+                                    h.finish()
+                                }
+                            );
+                            if merge_prefilter_registry.get(&name).is_some() {
+                                continue; // already registered
+                            }
+                            let snap = merge_inner.load();
+                            let start = std::time::Instant::now();
+                            let executor = crate::executor::QueryExecutor::new(
+                                &snap.slots,
+                                &snap.filters,
+                                &snap.sorts,
+                                1,
+                            );
+                            match executor.compute_filters(&hfs.filters) {
+                                Ok(bitmap) => {
+                                    let ms = start.elapsed().as_millis();
+                                    let card = bitmap.len();
+                                    match merge_prefilter_registry.insert(
+                                        name.clone(),
+                                        hfs.filters.clone(),
+                                        bitmap,
+                                        300,
+                                        start.elapsed().as_nanos() as u64,
+                                    ) {
+                                        Ok(_) => {
+                                            eprintln!(
+                                                "auto-prefilter: promoted '{}' → {} slots in {}ms (freq={}, {} sort variants)",
+                                                name, card, ms, hfs.total_frequency, hfs.sort_variants,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            eprintln!("auto-prefilter: failed to register '{}': {e}", name);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("auto-prefilter: compute failed for '{}': {e}", name);
+                                }
+                            }
+                        }
+                    }
+                    // ── Warm registry persist ─────────────────────────────────
+                    // Persist top-N query shapes to disk every merge cycle.
+                    // On next boot, server reads this file and pre-warms cache.
+                    if merge_warm_registry.total_recorded() > 0 {
+                        match merge_warm_registry.persist() {
+                            Ok(n) if n > 0 => {
+                                eprintln!(
+                                    "warm registry: persisted {} shapes ({} total recorded, {} unique)",
+                                    n, merge_warm_registry.total_recorded(), merge_warm_registry.shape_count(),
+                                );
+                            }
+                            Err(e) => eprintln!("warm registry persist failed: {e}"),
+                            _ => {}
+                        }
+                    }
                     // ── RSS-aware memory pressure eviction ──────────────────
                     //
                     // Check real RSS against the memory budget. When RSS exceeds
@@ -3030,8 +3161,57 @@ impl ConcurrentEngine {
             cache_worker_handle,
             cache_worker_metrics,
             cache_worker_ms,
+            prefilter_registry,
+            warm_registry,
         })
     }
+
+    /// Get the warm registry for recording query shapes.
+    pub fn warm_registry(&self) -> &crate::warm_registry::WarmRegistry {
+        &self.warm_registry
+    }
+
+    /// Load and execute warm entries from the persisted warm file.
+    /// Called on boot after the index is loaded. Returns the number
+    /// of queries warmed.
+    pub fn auto_warm(&self) -> usize {
+        let path = match self.config.storage.bitmap_path.as_ref() {
+            Some(p) => p.join("warm.json"),
+            None => return 0,
+        };
+        let entries = crate::warm_registry::WarmRegistry::load(&path);
+        if entries.is_empty() {
+            return 0;
+        }
+        eprintln!("Auto-warming {} query shapes...", entries.len());
+        let start = std::time::Instant::now();
+        let mut warmed = 0;
+        for entry in &entries {
+            let query = crate::query::BitdexQuery {
+                filters: entry.filters.clone(),
+                sort: Some(crate::query::SortClause {
+                    field: entry.sort_field.clone(),
+                    direction: entry.direction,
+                }),
+                limit: 1,
+                cursor: None,
+                offset: None,
+                skip_cache: false,
+            };
+            match self.execute_query(&query) {
+                Ok(_) => warmed += 1,
+                Err(e) => {
+                    tracing::debug!("auto-warm query failed: {e}");
+                }
+            }
+        }
+        eprintln!(
+            "Auto-warmed {}/{} query shapes in {:.1}ms",
+            warmed, entries.len(), start.elapsed().as_secs_f64() * 1000.0,
+        );
+        warmed
+    }
+
     /// Set the string maps for MappedString field query resolution.
     /// Call after creating the engine with schema data that includes string_map entries.
     pub fn set_string_maps(&mut self, maps: StringMaps) {
@@ -5562,6 +5742,80 @@ impl ConcurrentEngine {
             m.cycles_total.load(Ordering::Relaxed),
         )
     }
+    // ── Prefilter Registry ──────────────────────────────────────────────
+
+    /// Get a reference to the prefilter registry for query substitution.
+    pub fn prefilter_registry(&self) -> &crate::prefilter::PrefilterRegistry {
+        &self.prefilter_registry
+    }
+
+    /// Register a named prefilter by evaluating the given filter clauses
+    /// against the current snapshot and caching the resulting bitmap.
+    pub fn register_prefilter(
+        &self,
+        name: String,
+        clauses: Vec<crate::query::FilterClause>,
+        refresh_interval_secs: u64,
+    ) -> Result<Arc<crate::prefilter::PrefilterEntry>> {
+        let snap = self.inner.load();
+        let start = std::time::Instant::now();
+        let executor = crate::executor::QueryExecutor::new(
+            &snap.slots,
+            &snap.filters,
+            &snap.sorts,
+            self.config.max_page_size,
+        );
+        let bitmap = executor.compute_filters(&clauses)?;
+        let compute_nanos = start.elapsed().as_nanos() as u64;
+        self.prefilter_registry
+            .insert(name, clauses, bitmap, refresh_interval_secs, compute_nanos)
+            .map_err(|e| crate::error::BitdexError::Config(e.to_string()))
+    }
+
+    /// Refresh all stale prefilters against the current snapshot.
+    /// Returns the number of entries refreshed.
+    pub fn refresh_stale_prefilters(&self) -> usize {
+        let snap = self.inner.load();
+        let mut refreshed = 0;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for entry in self.prefilter_registry.entries() {
+            if !entry.is_stale(now_secs) {
+                continue;
+            }
+            let start = std::time::Instant::now();
+            let executor = crate::executor::QueryExecutor::new(
+                &snap.slots,
+                &snap.filters,
+                &snap.sorts,
+                self.config.max_page_size,
+            );
+            match executor.compute_filters(&entry.clauses) {
+                Ok(bitmap) => {
+                    entry.publish_refresh(bitmap, start.elapsed().as_nanos() as u64);
+                    refreshed += 1;
+                }
+                Err(e) => {
+                    entry.refresh_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(name = %entry.name, err = %e, "prefilter refresh failed");
+                }
+            }
+        }
+        refreshed
+    }
+
+    /// List all registered prefilters.
+    pub fn list_prefilters(&self) -> Vec<crate::prefilter::PrefilterInfo> {
+        self.prefilter_registry.list()
+    }
+
+    /// Remove a prefilter by name. Returns true if it existed.
+    pub fn remove_prefilter(&self, name: &str) -> bool {
+        self.prefilter_registry.remove(name)
+    }
+
     /// Number of filter + sort fields still pending lazy load.
     pub fn pending_field_count(&self) -> usize {
         self.pending_filter_loads.lock().len() + self.pending_sort_loads.lock().len()

@@ -1403,6 +1403,9 @@ impl BitdexServer {
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
             // Capture endpoints (Phase 2)
+            .route("/api/indexes/{name}/prefilters", get(handle_list_prefilters).post(handle_register_prefilter))
+            .route("/api/indexes/{name}/prefilters/{prefilter_name}", delete(handle_remove_prefilter))
+            .route("/api/indexes/{name}/prefilters/refresh", post(handle_refresh_prefilters))
             .route("/debug/capture/start", post(handle_capture_start))
             .route("/debug/capture/stop", post(handle_capture_stop))
             .route("/debug/capture/status", get(handle_capture_status))
@@ -1699,8 +1702,20 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
 
         let schema_registry = engine.build_schema_registry();
 
+        let engine = Arc::new(engine);
+
+        // Auto-warm: replay persisted query shapes to pre-populate cache.
+        // Runs before index is visible to HTTP handlers, so warm queries
+        // don't compete with real traffic.
+        let warmed = engine.auto_warm();
+        if warmed > 0 {
+            state.metrics.boot_phase_seconds
+                .with_label_values(&["auto_warm"])
+                .set(0); // timing already printed by auto_warm
+        }
+
         *state.index.lock() = Some(IndexState {
-            engine: Arc::new(engine),
+            engine,
             definition: def,
             reverse_maps: Arc::new(reverse_maps),
             schema_registry: Arc::new(schema_registry),
@@ -2761,6 +2776,15 @@ async fn handle_query(
         })).into_response();
     }
 
+    // Prefilter substitution: replace common clause subsets with a single
+    // precomputed BucketBitmap AND. This turns e.g. the 7-clause Civitai
+    // safety prefix into one cheap bitmap intersection.
+    let (substituted_clauses, _prefilter_entry) =
+        crate::prefilter::substitute(engine.prefilter_registry(), &query.filters);
+    if let std::borrow::Cow::Owned(ref new_clauses) = substituted_clauses {
+        query.filters = new_clauses.clone();
+    }
+
     state.metrics.query_filter_clause_count.observe(query.filters.len() as f64);
     let start = Instant::now();
     let m = &state.metrics;
@@ -2781,6 +2805,19 @@ async fn handle_query(
             m.query_duration_seconds
                 .with_label_values(&[&name])
                 .observe(elapsed.as_secs_f64());
+
+            // Record query shape for auto-warm on next boot.
+            if let Some(ref sort) = query.sort {
+                let canonical: Vec<crate::cache::CanonicalClause> = query.filters.iter()
+                    .filter_map(crate::cache::CanonicalClause::from_filter)
+                    .collect();
+                engine.warm_registry().record(
+                    &query.filters,
+                    &canonical,
+                    &sort.field,
+                    sort.direction,
+                );
+            }
 
             let cursor = result.cursor.map(|c| serde_json::to_value(c).unwrap());
 
@@ -3581,6 +3618,118 @@ async fn handle_warm_cache(
         already_cached,
         results,
     }).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Prefilter Registry
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RegisterPrefilterRequest {
+    name: String,
+    clauses: Vec<crate::query::FilterClause>,
+    #[serde(default = "default_refresh_interval")]
+    refresh_interval_secs: u64,
+}
+
+fn default_refresh_interval() -> u64 { crate::prefilter::DEFAULT_REFRESH_INTERVAL_SECS }
+
+async fn handle_register_prefilter(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<RegisterPrefilterRequest>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+    match engine.register_prefilter(req.name, req.clauses, req.refresh_interval_secs) {
+        Ok(entry) => Json(serde_json::json!({
+            "name": entry.name,
+            "cardinality": entry.cardinality(),
+            "compute_ms": entry.compute_ms(),
+            "refresh_interval_secs": entry.refresh_interval_secs(),
+        })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ).into_response(),
+    }
+}
+
+async fn handle_list_prefilters(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+    Json(serde_json::json!({
+        "prefilters": engine.list_prefilters(),
+    })).into_response()
+}
+
+async fn handle_remove_prefilter(
+    State(state): State<SharedState>,
+    AxumPath((name, prefilter_name)): AxumPath<(String, String)>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+    let removed = engine.remove_prefilter(&prefilter_name);
+    Json(serde_json::json!({
+        "removed": removed,
+        "name": prefilter_name,
+    })).into_response()
+}
+
+async fn handle_refresh_prefilters(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+) -> impl IntoResponse {
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+    let refreshed = engine.refresh_stale_prefilters();
+    Json(serde_json::json!({
+        "refreshed": refreshed,
+        "total": engine.list_prefilters().len(),
+    })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -5390,9 +5539,17 @@ async fn handle_query_stream(
             }
         });
 
-    Sse::new(stream)
+    let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::default())
-        .into_response()
+        .into_response();
+    // Disable Cloudflare proxy buffering so events stream in real-time
+    // instead of arriving in ~60s bursts. Cloudflare honors this nginx-
+    // style header on its regular reverse proxy path.
+    response.headers_mut().insert(
+        "X-Accel-Buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
+    response
 }
 
 #[cfg(test)]

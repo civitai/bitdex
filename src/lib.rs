@@ -28,6 +28,7 @@ pub mod meta_index;
 pub mod mutation;
 pub mod parser;
 pub mod planner;
+pub mod prefilter;
 pub mod preset;
 pub mod query;
 pub mod query_metrics;
@@ -47,6 +48,7 @@ pub mod time_buckets;
 pub mod types;
 pub mod unified_cache;
 pub mod versioned_bitmap;
+pub mod warm_registry;
 pub mod write_coalescer;
 #[cfg(feature = "pg-sync")]
 pub mod dump_processor;
