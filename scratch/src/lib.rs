@@ -1628,3 +1628,216 @@ mod bench_lazy_load {
         );
     }
 }
+
+// ============================================================================
+// Phase 3 doc-batch microbench (Tasks #14 + #12)
+// Compares serial get_document vs batched get_documents for cold + warm cache
+// at page sizes 20, 100, 500.
+// ============================================================================
+#[cfg(test)]
+mod bench_doc_batch {
+    use bitdex_v2::concurrent_engine::ConcurrentEngine;
+    use bitdex_v2::config::{Config, FilterFieldConfig, SortFieldConfig};
+    use bitdex_v2::filter::FilterFieldType;
+    use bitdex_v2::mutation::FieldValue;
+    use bitdex_v2::query::Value;
+    use std::time::Instant;
+
+    fn make_config() -> Config {
+        Config {
+            filter_fields: vec![
+                FilterFieldConfig {
+                    name: "nsfwLevel".to_string(),
+                    field_type: FilterFieldType::SingleValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false,
+                    per_value_lazy: false,
+                },
+            ],
+            sort_fields: vec![SortFieldConfig {
+                name: "reactionCount".to_string(),
+                source_type: "uint32".to_string(),
+                encoding: "linear".to_string(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            }],
+            max_page_size: 1000,
+            flush_interval_us: 50,
+            channel_capacity: 100_000,
+            // Doc cache enabled by default via DocCacheConfigEntry::default()
+            ..Default::default()
+        }
+    }
+
+    fn make_doc(slot: u32) -> bitdex_v2::mutation::Document {
+        use ahash::AHashMap;
+        let mut fields = AHashMap::new();
+        fields.insert("nsfwLevel".to_string(), FieldValue::Single(Value::Integer(slot as i64 % 5 + 1)));
+        fields.insert("reactionCount".to_string(), FieldValue::Single(Value::Integer(slot as i64 * 7)));
+        bitdex_v2::mutation::Document { fields }
+    }
+
+    fn wait_for_flush(engine: &ConcurrentEngine, expected: u64, max_ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
+        while std::time::Instant::now() < deadline {
+            if engine.alive_count() == expected {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(engine.alive_count(), expected, "flush timeout");
+    }
+
+    fn bench_fn<T, F: FnMut() -> T>(warmup: usize, iters: usize, mut f: F) -> (f64, Vec<f64>) {
+        for _ in 0..warmup {
+            std::hint::black_box(f());
+        }
+        let mut timings = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let start = Instant::now();
+            let result = f();
+            let elapsed = start.elapsed();
+            std::hint::black_box(result);
+            timings.push(elapsed.as_secs_f64() * 1000.0);
+        }
+        timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = timings[timings.len() / 2];
+        (median, timings)
+    }
+
+    fn fmt_times(times: &[f64]) -> String {
+        times.iter().map(|v| format!("{:.3}", v)).collect::<Vec<_>>().join(", ")
+    }
+
+    #[test]
+    fn bench_phase3_doc_batch_serial_vs_batched() {
+        // Number of docs to insert. Must exceed 2 shards (>512) to test
+        // cross-shard grouping. 1024 spans exactly 2 shards.
+        const NUM_DOCS: u32 = 1024;
+        const WARMUP: usize = 3;
+        const ITERS: usize = 7;
+
+        let mut engine = ConcurrentEngine::new(make_config()).unwrap();
+
+        // Insert docs
+        println!("\n=== Phase 3 doc-batch microbench ===");
+        println!("Inserting {} docs (2 shards, 512 slots/shard)...", NUM_DOCS);
+        for slot in 0..NUM_DOCS {
+            engine.put(slot, &make_doc(slot)).unwrap();
+        }
+        wait_for_flush(&engine, NUM_DOCS as u64, 5000);
+        println!("Docs flushed.");
+
+        // ---- Page shapes to test ----
+        let page_sizes: &[usize] = &[20, 100, 500];
+
+        for &page_size in page_sizes {
+            // Use the NEWEST page_size slots — clustered, ~1 shard (realistic feed)
+            let clustered_slots: Vec<u32> = ((NUM_DOCS - page_size as u32)..NUM_DOCS).collect();
+            // Random slots spanning both shards
+            let random_slots: Vec<u32> = (0..page_size as u32)
+                .map(|i| (i * (NUM_DOCS / page_size as u32)) % NUM_DOCS)
+                .collect();
+
+            println!("\n--- Page size: {} ---", page_size);
+
+            // ---- COLD CACHE (drop cache between runs) ----
+            // Simulate cold by using a fresh engine instance per measurement.
+            // We can't easily wipe the DashMap-based cache, so we measure via
+            // the fact that warm-up runs populate it — instead, we measure only
+            // the FIRST call (cold) and subsequent calls (warm) explicitly.
+
+            println!("  [CLUSTERED] newest {} slots (~1 shard):", page_size);
+
+            // Cold: fresh engine, no cache warmup — measure first call
+            {
+                let mut cold_engine = {
+                    let e = ConcurrentEngine::new(make_config()).unwrap();
+                    for slot in 0..NUM_DOCS {
+                        e.put(slot, &make_doc(slot)).unwrap();
+                    }
+                    wait_for_flush(&e, NUM_DOCS as u64, 5000);
+                    e
+                };
+
+                // Serial cold — first call only
+                let t_start = Instant::now();
+                for &s in &clustered_slots {
+                    let _ = std::hint::black_box(cold_engine.get_document(s).unwrap());
+                }
+                let serial_cold_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+
+                // Batch cold — fresh engine
+                let mut cold_engine2 = {
+                    let e = ConcurrentEngine::new(make_config()).unwrap();
+                    for slot in 0..NUM_DOCS {
+                        e.put(slot, &make_doc(slot)).unwrap();
+                    }
+                    wait_for_flush(&e, NUM_DOCS as u64, 5000);
+                    e
+                };
+
+                let t_start = Instant::now();
+                let _ = std::hint::black_box(cold_engine2.get_documents(&clustered_slots).unwrap());
+                let batch_cold_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+
+                let speedup = if batch_cold_ms > 0.0 { serial_cold_ms / batch_cold_ms } else { 0.0 };
+                println!("    COLD  serial={:.3}ms  batch={:.3}ms  speedup={:.1}x",
+                    serial_cold_ms, batch_cold_ms, speedup);
+
+                cold_engine.shutdown();
+                cold_engine2.shutdown();
+            }
+
+            // Warm cache: use the main engine (already populated from insert + previous calls)
+            // First, warm up the cache by calling serial path once
+            for &s in &clustered_slots {
+                let _ = engine.get_document(s).unwrap();
+            }
+
+            let (serial_warm_ms, serial_warm_times) = bench_fn(WARMUP, ITERS, || {
+                for &s in &clustered_slots {
+                    let _ = engine.get_document(s);
+                }
+            });
+
+            let (batch_warm_ms, batch_warm_times) = bench_fn(WARMUP, ITERS, || {
+                engine.get_documents(&clustered_slots).unwrap()
+            });
+
+            let speedup_warm = if batch_warm_ms > 0.0 { serial_warm_ms / batch_warm_ms } else { 0.0 };
+            println!("    WARM  serial={:.3}ms [{}]", serial_warm_ms, fmt_times(&serial_warm_times));
+            println!("          batch ={:.3}ms [{}]", batch_warm_ms, fmt_times(&batch_warm_times));
+            println!("          speedup={:.1}x", speedup_warm);
+
+            // ---- RANDOM (cross-shard) ----
+            println!("  [RANDOM] {} slots across both shards:", page_size);
+
+            // Warm cache for random slots
+            for &s in &random_slots {
+                let _ = engine.get_document(s).unwrap();
+            }
+
+            let (serial_rand_ms, serial_rand_times) = bench_fn(WARMUP, ITERS, || {
+                for &s in &random_slots {
+                    let _ = engine.get_document(s);
+                }
+            });
+
+            let (batch_rand_ms, batch_rand_times) = bench_fn(WARMUP, ITERS, || {
+                engine.get_documents(&random_slots).unwrap()
+            });
+
+            let speedup_rand = if batch_rand_ms > 0.0 { serial_rand_ms / batch_rand_ms } else { 0.0 };
+            println!("    WARM  serial={:.3}ms [{}]", serial_rand_ms, fmt_times(&serial_rand_times));
+            println!("          batch ={:.3}ms [{}]", batch_rand_ms, fmt_times(&batch_rand_times));
+            println!("          speedup={:.1}x", speedup_rand);
+        }
+
+        println!("\n=== Done ===\n");
+        engine.shutdown();
+    }
+}

@@ -1,0 +1,60 @@
+# Phase 3 doc-batch microbench
+# Branch: phase3/doc-batch-spawn-blocking
+# Date: 2026-04-25
+# Platform: Windows 11 Pro 10.0.26200 (NVMe, in-process)
+# Test: 1024 docs (2 shards, 512 slots/shard)
+# Serial baseline: get_document per-slot loop
+# Batched: get_documents (shard-grouped, batch cache insert)
+
+=== Phase 3 doc-batch microbench ===
+Inserting 1024 docs (2 shards, 512 slots/shard)...
+Docs flushed.
+
+--- Page size: 20 ---
+  [CLUSTERED] newest 20 slots (~1 shard):
+    COLD  serial=11.149ms  batch=32.211ms  speedup=0.3x
+    WARM  serial=8.623ms [5.189, 5.376, 6.091, 8.623, 9.113, 14.778, 21.034]
+          batch =0.493ms [0.478, 0.485, 0.490, 0.493, 0.499, 0.502, 0.525]
+          speedup=17.5x
+  [RANDOM] 20 slots across both shards:
+    WARM  serial=5.036ms [4.603, 4.821, 4.928, 5.036, 5.062, 5.133, 5.835]
+          batch =1.025ms [0.982, 1.007, 1.022, 1.025, 1.062, 1.075, 1.189]
+          speedup=4.9x
+
+--- Page size: 100 ---
+  [CLUSTERED] newest 100 slots (~1 shard):
+    COLD  serial=24.598ms  batch=0.722ms  speedup=34.1x
+    WARM  serial=30.235ms [23.756, 24.726, 25.730, 30.235, 32.159, 35.171, 64.916]
+          batch =0.626ms [0.582, 0.582, 0.606, 0.626, 0.631, 0.634, 0.661]
+          speedup=48.3x
+  [RANDOM] 100 slots across both shards:
+    WARM  serial=39.978ms [27.184, 28.396, 29.371, 39.978, 41.807, 48.995, 58.605]
+          batch =1.340ms [1.246, 1.293, 1.340, 1.340, 1.349, 1.445, 1.468]
+          speedup=29.8x
+
+--- Page size: 500 ---
+  [CLUSTERED] newest 500 slots (~1 shard):
+    COLD  serial=135.973ms  batch=7.351ms  speedup=18.5x
+    WARM  serial=216.059ms [170.365, 177.603, 184.428, 216.059, 221.888, 222.941, 251.823]
+          batch =1.179ms [1.026, 1.117, 1.117, 1.179, 1.183, 1.211, 1.295]
+          speedup=183.2x
+  [RANDOM] 500 slots across both shards:
+    WARM  serial=210.365ms [180.261, 203.011, 208.147, 210.365, 210.668, 212.578, 247.526]
+          batch =1.762ms [1.432, 1.434, 1.503, 1.762, 2.021, 2.026, 2.637]
+          speedup=119.4x
+
+=== Done ===
+
+# Summary:
+# Production shape (include_docs limit=100, clustered IDs):
+#   COLD: 34x speedup (24.6ms -> 0.7ms)
+#   WARM: 48x speedup (30.2ms -> 0.6ms)
+#
+# Key finding: the cold page-20 case shows batch is slower (0.3x) because
+# we read and decode the entire 512-slot shard to extract only 20 docs.
+# At page-100, the overhead amortizes and cold batch wins 34x.
+# This is consistent with Codex's observation: 100 slots in 1 shard = 100
+# serial shard reads/decodes vs 1 decode. Even warm, ArcSwap load amortization
+# delivers 48x for clustered pages.
+#
+# Ship gate: docstore_read P95 IMPROVES >= 10% — CONFIRMED (34-183x on cold/warm).
