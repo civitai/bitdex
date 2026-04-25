@@ -30,4 +30,15 @@ pub enum BitdexError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Returned when a range scan would exceed the configured value-count cap.
+    /// field: the filter field name.
+    /// scanned: number of values that would be scanned.
+    /// cap: the configured limit.
+    #[error("query too expensive: range scan on '{field}' would scan {scanned} values (cap: {cap})")]
+    QueryTooExpensive {
+        field: String,
+        scanned: usize,
+        cap: usize,
+    },
 }

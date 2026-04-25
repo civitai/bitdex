@@ -604,6 +604,18 @@ pub struct FilterFieldConfig {
     /// specific values needed by each query are loaded from disk.
     #[serde(default)]
     pub per_value_lazy: bool,
+    /// Maximum number of distinct values to scan in a range query (Gt/Gte/Lt/Lte).
+    /// `None` = unbounded (default, backwards compatible).
+    /// `Some(N)` = reject the query with `QueryTooExpensive` if the field's
+    /// loaded value count exceeds N. Use this to protect against accidental
+    /// or adversarial range scans on high-cardinality fields like postId
+    /// (22.5M entries, ~2s CPU per query).
+    ///
+    /// The check uses the loaded value count at query time. For per_value_lazy
+    /// fields the loaded count may be smaller than the total on-disk count —
+    /// this is conservative (won't reject if only a slice is loaded).
+    #[serde(default)]
+    pub max_range_scan_values: Option<usize>,
 }
 /// Per-value idle eviction configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -982,7 +994,7 @@ max_entries = 999
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
                 FilterFieldConfig {
                     name: "status".to_string(),
@@ -990,7 +1002,7 @@ max_entries = 999
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
             ],
             ..Default::default()
@@ -1031,7 +1043,7 @@ max_entries = 999
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             }],
             ..Default::default()
         };
@@ -1155,7 +1167,7 @@ bits = 32
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             }],
             ..Config::default()
         };
@@ -1288,7 +1300,7 @@ ms_to_seconds = true
                 }),
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             }],
             ..Config::default()
         };
@@ -1310,7 +1322,7 @@ ms_to_seconds = true
                 }),
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             }],
             ..Config::default()
         };
@@ -1332,7 +1344,7 @@ ms_to_seconds = true
                 }),
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             }],
             ..Config::default()
         };
@@ -1354,7 +1366,7 @@ ms_to_seconds = true
                 }),
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             }],
             deferred_alive: Some(DeferredAliveConfig {
                 source_field: "scheduledAt".into(),
@@ -1411,7 +1423,7 @@ ms_to_seconds = true
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
@@ -1419,7 +1431,7 @@ ms_to_seconds = true
                     behaviors: None,
                     eviction: None,
                     eager_load: true,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
             ],
             sort_fields: vec![SortFieldConfig {

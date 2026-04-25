@@ -1000,7 +1000,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
@@ -1008,7 +1008,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
@@ -1016,7 +1016,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
             ],
             sort_fields: vec![SortFieldConfig {
@@ -1540,7 +1540,7 @@ mod tests {
             behaviors: None,
             eviction: None,
             eager_load: false,
-            per_value_lazy: false,
+            per_value_lazy: false, max_range_scan_values: None,
         }];
         config.sort_fields = vec![SortFieldConfig {
             name: "publishedAt".into(),
