@@ -91,6 +91,7 @@ fn fixture_state(token: Option<&str>) -> Arc<RelayState> {
         channels,
         admin_token: token.map(|s| s.to_string()),
         metrics,
+        _capture: None,
     })
 }
 
@@ -198,6 +199,7 @@ async fn caller_compat_pg_sync_ops_batch_returns_2xx_and_emits_event() {
         channels: channels_reg,
         admin_token: None,
         metrics,
+        _capture: None,
     });
     let router = build_router(state).into_service::<Body>();
 
@@ -318,6 +320,76 @@ async fn caller_compat_health_returns_status_ok() {
 }
 
 #[tokio::test]
+async fn capture_round_trip_writes_ndjson() {
+    use bitdex_v2::relay::capture::CaptureManager;
+    use bitdex_v2::relay::channel::RelayEvent;
+    use bitdex_v2::relay::config::FsyncPolicy;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut channels = BTreeMap::new();
+    channels.insert(
+        "ops".into(),
+        ChannelConfig { capacity: 32, keep_alive_seconds: 5 },
+    );
+    let cfg = RelayConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        metrics_path: "/metrics".into(),
+        admin_token_env: "T".into(),
+        max_body_bytes: 1024,
+        channels,
+        routes: vec![],
+        capture: CaptureConfig {
+            enabled: true,
+            dir: tmp.path().to_string_lossy().to_string(),
+            rotate_bytes: 1024 * 1024, // big — no rotation in this test
+            gzip_after_rotate: false,
+            max_total_bytes: 0,
+            fsync: FsyncPolicy::PerRotation,
+            file_mode: 0o640,
+        },
+    };
+    let registry = ChannelRegistry::from_config(&cfg);
+    let _mgr = CaptureManager::start(cfg.capture.clone(), &registry).unwrap();
+
+    // Allow the writer task to subscribe.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let handle = registry.get("ops").unwrap();
+    for i in 1..=5u64 {
+        let _ = handle.sender.send(RelayEvent {
+            seq_id: i,
+            ts_ms: 1_700_000_000_000 + i,
+            channel: "ops".into(),
+            payload: format!(r#"{{"i":{i},"name":"event-{i}"}}"#),
+        });
+    }
+
+    // Drain.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    drop(_mgr);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Read all .log files in dir, parse lines.
+    let mut total_lines = 0usize;
+    for entry in std::fs::read_dir(tmp.path()).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("log") {
+            let data = std::fs::read_to_string(&path).unwrap();
+            for line in data.lines() {
+                let v: serde_json::Value = serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("non-JSON line {line:?}: {e}"));
+                assert_eq!(v["channel"].as_str(), Some("ops"));
+                assert!(v["seq_id"].as_u64().is_some());
+                assert!(v["payload"].is_object());
+                total_lines += 1;
+            }
+        }
+    }
+    assert_eq!(total_lines, 5);
+}
+
+#[tokio::test]
 async fn caller_compat_loopback_or_bearer_external_denied() {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
@@ -358,6 +430,7 @@ async fn caller_compat_loopback_or_bearer_external_denied() {
         channels: channels_reg,
         admin_token: Some("the-token".into()),
         metrics,
+        _capture: None,
     });
     let router = build_router(state).into_service::<Body>();
 

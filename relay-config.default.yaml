@@ -1,0 +1,77 @@
+# Default relay-mode config shipped with the bitdex-v2 image.
+#
+# At container startup, when BITDEX_MODE=relay, this file is loaded from
+# /etc/bitdex/relay-config.yaml (override path with BITDEX_RELAY_CONFIG).
+#
+# Routes mirror the bitdex-server HTTP surface so existing callers
+# (PG-sync sidecar, model-share comparator, K8s probes) keep working.
+#
+# Design ref: docs/_in/relay-system-design.md
+
+listen: 0.0.0.0:3000
+metrics_path: /metrics
+admin_token_env: BITDEX_ADMIN_TOKEN
+max_body_bytes: 4194304   # 4 MiB default; per-route override below
+
+channels:
+  queries:
+    capacity: 10000
+    keep_alive_seconds: 15
+  ops:
+    capacity: 50000
+    keep_alive_seconds: 15
+
+routes:
+  # Query route — public-equivalent today, no auth on bitdex-server either.
+  # Returns the tee_mode:true stub the model-share comparator must skip on.
+  - path: /api/indexes/{index}/query
+    methods: [POST]
+    auth: none
+    emit:
+      channel: queries
+      payload: |
+        {"seq_id":{seq_id},"ts_ms":{ts_ms},"index":"{path.index}","body":{body|json}}
+    response:
+      status: 200
+      headers:
+        Content-Type: application/json
+      body: '{"ids":[],"total_matched":0,"cursor":null,"tee_mode":true}'
+
+  # Ops route — pg-sync sidecar over loopback bypasses; external requires bearer.
+  # 32 MiB body limit because pg-sync can batch large at 10K ops/sec.
+  - path: /api/indexes/{index}/ops
+    methods: [POST]
+    auth: loopback_or_bearer
+    max_body_bytes: 33554432
+    emit:
+      channel: ops
+      payload: |
+        {"seq_id":{seq_id},"ts_ms":{ts_ms},"index":"{path.index}","body":{body|json}}
+    # No `response` block → empty 200 OK by default. pg-sync's
+    # bitdex_client only checks status().is_success() (Donovan verified).
+
+  # Health probe — K8s reads {"status":"ok"} shape.
+  - path: /api/health
+    methods: [GET]
+    auth: none
+    response:
+      status: 200
+      headers:
+        Content-Type: application/json
+      body: '{"status":"ok","mode":"relay"}'
+
+# Capture is OFF by default. Operators enable per relay window if they need
+# guaranteed durable record. When enabled:
+#   - Subscribes to each channel's broadcast (counts toward receiver_count
+#     so the emit gate fires even with zero SSE subscribers).
+#   - Writes one NDJSON line per event under `dir`.
+#   - Rotates on `rotate_bytes`; gzips the rotated file in a background task.
+#   - Enforces `max_total_bytes` by deleting oldest .gz files.
+capture:
+  enabled: false
+  dir: /var/lib/bitdex-relay
+  rotate_bytes: 268435456       # 256 MiB
+  gzip_after_rotate: true
+  max_total_bytes: 21474836480  # 20 GiB hard cap on capture dir
+  fsync: per_rotation
+  file_mode: 0o640

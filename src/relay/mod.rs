@@ -33,6 +33,9 @@ pub struct RelayState {
     pub channels: ChannelRegistry,
     pub admin_token: Option<String>,
     pub metrics: metrics::RelayMetrics,
+    /// Held to keep capture writer tasks alive for the relay lifetime.
+    /// `None` when `capture.enabled = false`.
+    pub _capture: Option<Arc<capture::CaptureManager>>,
 }
 
 pub type SharedRelayState = Arc<RelayState>;
@@ -52,11 +55,25 @@ pub async fn run(config_path: PathBuf, listen_override: Option<SocketAddr>) -> R
     let metrics = metrics::RelayMetrics::new();
     let channels = ChannelRegistry::from_config(&config);
 
+    // Start capture writers if enabled. They subscribe to each channel's
+    // broadcast — that subscriber counts toward `receiver_count()`, so
+    // route.rs's emit gate fires automatically when capture is on, even
+    // with zero SSE subscribers.
+    let capture_handle = if config.capture.enabled {
+        Some(
+            capture::CaptureManager::start(config.capture.clone(), &channels)
+                .map_err(RelayError::Capture)?,
+        )
+    } else {
+        None
+    };
+
     let state = Arc::new(RelayState {
         config: config.clone(),
         channels,
         admin_token,
         metrics,
+        _capture: capture_handle,
     });
 
     let app = route::build_router(state.clone());
@@ -87,4 +104,6 @@ pub enum RelayError {
     Bind(std::io::Error),
     #[error("serve error: {0}")]
     Serve(std::io::Error),
+    #[error("capture init error: {0}")]
+    Capture(std::io::Error),
 }
