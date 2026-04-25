@@ -23,6 +23,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// Test-only sync failure injection
+// ---------------------------------------------------------------------------
+//
+// Set SYNC_INJECT_FAIL to `true` in a test to make `sync_all_opslogs` return
+// an error immediately, simulating an OS-level fsync failure.  Always reset to
+// `false` after the assertion so other tests are not affected.
+//
+// Compiled unconditionally so integration tests (which link the lib in
+// non-`#[cfg(test)]` mode) can reach it.  In production it is always `false`
+// and the AtomicBool load on the fast path will be eliminated by the optimizer.
+#[doc(hidden)]
+pub static SYNC_INJECT_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
 // Codec traits
 // ---------------------------------------------------------------------------
 
@@ -913,6 +928,71 @@ where
     #[inline]
     pub fn list_current_shards(&self) -> io::Result<Vec<Sh::Key>> {
         self.list_shards()
+    }
+
+    /// Fsync every shard file in this store.
+    ///
+    /// Called by the merge thread before persisting the WAL cursor to ensure
+    /// all opslog entries appended with `fsync=false` by the flush thread are
+    /// durable on disk.  Without this, an OS crash (not a process crash) between
+    /// opslog append and cursor persist could advance the cursor past mutations
+    /// that exist only in page cache, causing those WAL ops to be silently
+    /// skipped on restart.
+    ///
+    /// Cost: one `sync_all()` per existing shard file, called once per merge
+    /// interval (~60 s default).  Off the per-flush hot path.
+    ///
+    /// Returns the count of shards successfully synced.  On any failure the
+    /// last error is returned so the caller can suppress cursor persistence.
+    pub fn sync_all_opslogs(&self) -> io::Result<usize> {
+        if SYNC_INJECT_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "test: sync_all_opslogs injected failure",
+            ));
+        }
+        let keys = self.list_shards()?;
+        let mut synced = 0usize;
+        let mut last_err: Option<io::Error> = None;
+        for key in &keys {
+            let shard_path = self.shard_path(key);
+            // Acquire the shared shard lock BEFORE opening.  Do NOT call
+            // shard_path.exists() first — that creates a classic TOCTOU race:
+            // compaction holds the write lock to rename/replace the shard file,
+            // and a gap between exists() and lock/open lets us see the old name
+            // but open the post-rename file (or a NotFound).  By locking first
+            // we ensure compaction has fully committed before we open.
+            let lock = self.shard_lock(key);
+            let _guard = lock.read();
+            match fs::OpenOptions::new().read(true).write(true).open(&shard_path) {
+                Ok(f) => {
+                    if let Err(e) = f.sync_all() {
+                        eprintln!(
+                            "shard_store: sync_all_opslogs: fsync failed for {}: {e}",
+                            shard_path.display()
+                        );
+                        last_err = Some(e);
+                    } else {
+                        synced += 1;
+                    }
+                }
+                // File not found: shard key was listed but file was subsequently
+                // removed (e.g. the shard was a placeholder with no content).
+                // This is safe to skip — no opslog data to sync.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    eprintln!(
+                        "shard_store: sync_all_opslogs: open failed for {}: {e}",
+                        shard_path.display()
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+        Ok(synced)
     }
 
     /// Check if a shard exists.

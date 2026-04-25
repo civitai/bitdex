@@ -2806,11 +2806,69 @@ impl ConcurrentEngine {
                     // ── Named cursor persistence ───────────────────────────
                     //
                     // Write the cursor snapshot taken at the START of this cycle.
-                    // Only written if data was persisted AND no write failures
-                    // occurred. A partial persist with errors means some state
-                    // didn't make it to disk — advancing the cursor would skip
-                    // the WAL ops needed to reconstruct that state on restart.
+                    //
+                    // Durability invariant (Codex follow-up, 2026-04-25):
+                    //   Every mutation up to the persisted WAL cursor must be durable
+                    //   in either (a) the source BitDex WAL replay window OR (b)
+                    //   fsynced bitmap/docstore state.
+                    //
+                    // The flush thread appends bitmap ops with fsync=false for
+                    // throughput. The merge thread compacts shards (which fsyncs)
+                    // only when a shard's ops count exceeds the threshold (~1000).
+                    // Without an explicit sync step, a cycle that only writes
+                    // slot_counter or time_bucket (satisfying `did_persist_data`)
+                    // can advance the cursor past mutations that are still only in
+                    // the OS page cache — an OS crash in that window silently skips
+                    // those WAL ops on restart.
+                    //
+                    // Fix: before writing the cursor, fsync all bitmap shard opslogs
+                    // (alive + filter + sort).  This converts any page-cache-only
+                    // opslog entries to durable state, closing the gap regardless of
+                    // whether compaction fired this cycle.  Cost: one sync_all() per
+                    // shard file once per merge interval (~60 s default) — not on the
+                    // per-flush hot path.
+                    // Sync whichever bitmap stores are actually configured.
+                    // Using `if let (Some, Some, Some)` would fall into an
+                    // "else → bitmaps_synced=true" branch whenever only a subset
+                    // of stores are present, incorrectly skipping syncs for the
+                    // stores that DO exist.  Instead, sync each store independently.
+                    let mut bitmaps_synced = true; // true until proven otherwise
+                    let mut any_bitmap_store = false;
                     if did_persist_data && !persist_had_errors {
+                        if let Some(ref as_) = merge_alive_store {
+                            any_bitmap_store = true;
+                            if as_.sync_all_opslogs()
+                                .map_err(|e| eprintln!("merge: alive opslog sync failed: {e}"))
+                                .is_err()
+                            {
+                                bitmaps_synced = false;
+                            }
+                        }
+                        if let Some(ref fs_) = merge_filter_store {
+                            any_bitmap_store = true;
+                            if fs_.sync_all_opslogs()
+                                .map_err(|e| eprintln!("merge: filter opslog sync failed: {e}"))
+                                .is_err()
+                            {
+                                bitmaps_synced = false;
+                            }
+                        }
+                        if let Some(ref ss_) = merge_sort_store {
+                            any_bitmap_store = true;
+                            if ss_.sync_all_opslogs()
+                                .map_err(|e| eprintln!("merge: sort opslog sync failed: {e}"))
+                                .is_err()
+                            {
+                                bitmaps_synced = false;
+                            }
+                        }
+                        // If no bitmap stores exist (pure in-memory mode), there is
+                        // nothing to sync — cursor advance is inherently safe.
+                        if !any_bitmap_store {
+                            bitmaps_synced = true;
+                        }
+                    }
+                    if did_persist_data && !persist_had_errors && bitmaps_synced {
                         if let Some(ref ms_) = merge_meta_store {
                             for (name, value) in &cursor_snapshot_for_persist {
                                 if let Err(e) = ms_.write_cursor(name, value) {

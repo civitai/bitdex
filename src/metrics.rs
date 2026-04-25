@@ -170,6 +170,8 @@ pub struct Metrics {
     // -- WAL write-side observability --
     pub wal_ops_written_total: IntCounter,
     pub wal_last_applied_timestamp_seconds: IntGauge,
+    /// End-to-end latency of POST /ops WAL append (lock acquisition + write + fsync).
+    pub wal_append_duration_seconds: Histogram,
 
     // -- Boot phase breakdown --
     pub boot_phase_seconds: IntGaugeVec,
@@ -847,6 +849,15 @@ impl Metrics {
         let wal_last_applied_timestamp_seconds = IntGauge::new(
             "bitdex_wal_last_applied_timestamp_seconds", "Unix epoch of last successful WAL op application",
         ).unwrap();
+        let wal_append_buckets = vec![0.00001, 0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0];
+        let wal_append_duration_seconds = Histogram::with_opts(
+            HistogramOpts::new(
+                "bitdex_wal_append_duration_seconds",
+                "End-to-end duration of POST /ops WAL append (lock + write + fsync)",
+            )
+            .buckets(wal_append_buckets),
+        )
+        .unwrap();
 
         // Boot phase breakdown
         let boot_phase_seconds = IntGaugeVec::new(
@@ -993,6 +1004,7 @@ impl Metrics {
         registry.register(Box::new(wal_read_cursor_bytes.clone())).unwrap();
         registry.register(Box::new(wal_ops_written_total.clone())).unwrap();
         registry.register(Box::new(wal_last_applied_timestamp_seconds.clone())).unwrap();
+        registry.register(Box::new(wal_append_duration_seconds.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
 
         Self {
@@ -1107,6 +1119,7 @@ impl Metrics {
             wal_read_cursor_bytes,
             wal_ops_written_total,
             wal_last_applied_timestamp_seconds,
+            wal_append_duration_seconds,
             boot_phase_seconds,
         }
     }
