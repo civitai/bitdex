@@ -952,11 +952,27 @@ impl FilterBitmapStore {
         }
 
         let mut file = File::open(&path)?;
+        let file_len = file.metadata()?.len();
 
         // Header (28 bytes).
         let mut header_buf = [0u8; crate::shard_store::HEADER_SIZE];
         file.read_exact(&mut header_buf)?;
         let header = crate::shard_store::ShardHeader::decode(&header_buf)?;
+
+        // Bound declared section sizes against actual file size to keep a
+        // corrupted header from triggering a multi-gigabyte allocation in
+        // `vec![0u8; index_size]` before the read fails.
+        let snapshot_end_declared =
+            (crate::shard_store::HEADER_SIZE as u64) + (header.snapshot_len as u64);
+        if snapshot_end_declared > file_len
+            || header.ops_section_offset > file_len
+            || header.ops_section_offset < snapshot_end_declared
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shard header section ranges exceed file length",
+            ));
+        }
 
         let mut result: HashMap<u64, RoaringBitmap> = HashMap::new();
         let wanted_set: HashSet<u64> = wanted.iter().copied().collect();
@@ -1058,9 +1074,7 @@ impl FilterBitmapStore {
                     }
                     FilterOp::BatchSet { value, bits } => {
                         let bm = result.entry(value).or_insert_with(RoaringBitmap::new);
-                        for b in bits {
-                            bm.insert(b);
-                        }
+                        bm.extend(bits.iter().copied());
                     }
                     FilterOp::BatchClear { value, bits } => {
                         if let Some(bm) = result.get_mut(&value) {
@@ -1579,6 +1593,40 @@ mod tests {
 
         let res = store.load_field_values("postId", &[2]).unwrap();
         assert!(res[&2].contains(30));
+    }
+
+    #[test]
+    fn test_load_field_values_clears_to_empty_keep_entry() {
+        // Snapshot has a value, ops clear all bits. The slow path keeps an empty
+        // bitmap entry in the result (because FilterOpCodec::apply uses
+        // get_mut + remove and never deletes). The fast path must do the same.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+        let key = FilterBucketKey { field: "postId".into(), bucket: 0x00 };
+
+        store.append_op(&key, &FilterOp::BatchSet { value: 1, bits: vec![10, 11] }).unwrap();
+        store.compact_current(&key).unwrap();
+
+        store.append_op(&key, &FilterOp::BatchClear { value: 1, bits: vec![10, 11] }).unwrap();
+
+        let res = store.load_field_values("postId", &[1]).unwrap();
+        assert!(res.contains_key(&1), "value 1 should remain in result map even after all bits cleared");
+        assert!(res[&1].is_empty(), "value 1 bitmap should be empty");
+    }
+
+    #[test]
+    fn test_load_field_values_clear_only_no_insert() {
+        // ClearBit on a value that's neither in snapshot nor introduced by an
+        // earlier set op must not insert an entry into the result.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+        let key = FilterBucketKey { field: "postId".into(), bucket: 0x00 };
+
+        store.append_op(&key, &FilterOp::SetBit { value: 1, bit: 100 }).unwrap();
+        store.append_op(&key, &FilterOp::ClearBit { value: 99, bit: 9 }).unwrap();
+
+        let res = store.load_field_values("postId", &[99]).unwrap();
+        assert!(!res.contains_key(&99), "ClearBit on absent value must not insert entry");
     }
 
     #[test]

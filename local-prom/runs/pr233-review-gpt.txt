@@ -1,0 +1,179 @@
+- **MAJOR — Fast-path state transition appears bit-exact to the slow path for the four current `FilterOp` variants, with one caveat: this relies on `read_op_entries_pub::<FilterOpCodec>` yielding the same op stream/order as the legacy `self.read()` path.**
+  - Assuming the slow path does:
+    1. decode snapshot map,
+    2. iterate ops in file order,
+    3. call `FilterOpCodec::apply`,
+    then the fast path is semantically equivalent for any `wanted` value because it reconstructs exactly the same per-value initial state and applies the same per-value mutations in the same order.
+  - Variant-by-variant:
+    - `SetBit { value, bit }`
+      - Slow path: inserts empty bitmap if absent, then inserts `bit`.
+      - Fast path: `result.entry(value).or_insert_with(RoaringBitmap::new).insert(bit)`.
+      - Equivalent, including **value present only in ops**.
+    - `BatchSet { value, bits }`
+      - Slow path: inserts empty bitmap if absent, then inserts each bit.
+      - Fast path: identical via `entry(...).or_insert_with(...)` then loop over `bits`.
+      - Equivalent, including **value present only in ops**.
+    - `ClearBit { value, bit }`
+      - Slow path behavior you described: mutate only if map entry exists; no insertion on miss.
+      - Fast path: `if let Some(bm) = result.get_mut(&value) { bm.remove(bit); }`
+      - Equivalent for:
+        - snapshot-present value,
+        - op-introduced value after prior set op,
+        - **value not in snapshot and not added by earlier op** → no-op, no insert.
+      - Also equivalent for **value present in snapshot and all bits removed**: bitmap remains in map as an empty bitmap because the code mutates in place and never deletes the entry.
+    - `BatchClear { value, bits }`
+      - Same reasoning as `ClearBit`, just repeated.
+      - Equivalent for all cases above, including preserving an empty bitmap entry if it existed before clears.
+  - Wanted values absent everywhere:
+    - Slow path caller does `snap.values.get(&v).cloned()`, so absent values are omitted.
+    - Fast path only inserts on matching snapshot index hit or set-like op hit.
+    - Equivalent: omitted from result map.
+  - Duplicate `wanted` inputs:
+    - Fast path dedupes for filtering via `wanted_set`, then ultimately inserts by key into `result`.
+    - Slow path loops duplicate values and repeatedly overwrites the same map key with the same cloned bitmap.
+    - Equivalent final map.
+
+- **MINOR — Good handling of the listed edge cases; behavior matches requested semantics.**
+  - `wanted.is_empty()`:
+    - Explicit `Ok(empty)` short-circuit. Good.
+  - `header.snapshot_len == 0`:
+    - `if header.snapshot_len >= 4` is skipped; only ops are applied. Matches requested behavior.
+  - `header.snapshot_len < 4`:
+    - Also skips snapshot parsing and still applies ops. Matches requested behavior.
+  - `count == 0` with `ops_count > 0`:
+    - Reads count, does not read index/data, proceeds to ops. Good.
+  - Index entry extending beyond snapshot:
+    - `abs_end > snapshot_end` returns error. Good and necessary.
+  - Duplicate values in input:
+    - De-duped by `wanted_set`; final result semantics unchanged. Good.
+  - Missing/invalid shard:
+    - Returns empty map, matching `self.read() -> Ok(None)` filtered by caller.
+  - One subtle positive:
+    - Sorting `found` by absolute offset changes read order, but not logical result, because snapshot entries are independent and ops are still applied in file order afterward.
+
+- **MINOR — Partial-fill fallback safety reasoning is correct.**
+  - In `load_field_values`, `read_bucket_values_indexed` returns a local `map`.
+  - On `Ok(map)`, entries are copied into outer `result`.
+  - On `Err(_)`, that local `map` is dropped; no partial indexed-path state is ever merged into outer `result`.
+  - The fallback then performs a fresh `self.read(&key)?` and writes only this bucket’s wanted values into outer `result`.
+  - Existing outer `result` entries from prior buckets remain intact.
+  - Given bucket partitioning by value-bucket-byte, those prior entries are disjoint from the current bucket’s keys, so no corruption/aliasing issue.
+  - This part looks safe.
+
+- **MINOR — Concurrency/locking looks consistent with the existing design; no new deadlock risk apparent.**
+  - `read_bucket_values_indexed` acquires `shard_lock(key).read()` for the full duration, same as the legacy read path.
+  - Compaction takes write side, so readers are serialized with compaction on the same shard and concurrent across different shards.
+  - Two readers on same shard can proceed concurrently, which is expected.
+  - I do not see a deadlock introduced here because:
+    - only one lock is acquired,
+    - it is not upgraded,
+    - no nested shard locks are taken.
+  - On `parking_lot::RwLock` starvation:
+    - `parking_lot` generally has fair/unfair heuristics that are better than std’s bare semantics, and this PR doesn’t worsen anything relative to existing `read()`.
+    - If write starvation under heavy read load is already a theoretical concern, it pre-exists; this PR is neutral.
+  - One practical note: the fast path likely shortens read lock hold times dramatically on the hot case, which is actually a concurrency improvement.
+
+- **MINOR — Failure mode behavior is mostly good, but swallowing the indexed-path error entirely may reduce diagnosability.**
+  - The fallback-on-any-error policy is safe for correctness and availability.
+  - However, because `Err(_)` is ignored, corrupted index/snapshot-range bugs may silently route to slow path forever.
+  - Suggest at least debug/warn-level logging or a metric counter for indexed-path fallback reasons (`invalid_header`, `index_oob`, `bitmap_decode`, `io`, etc.).
+  - Not a correctness blocker because fallback preserves caller semantics.
+
+- **NIT — `path.exists()` before `File::open` is redundant and slightly racy, though harmless under the lock.**
+  - `!path.exists() || !is_valid_shard_file(&path)` does two metadata-ish checks before opening.
+  - You could rely on `is_valid_shard_file` alone, since it already does `metadata(...).map(...).unwrap_or(false)`.
+  - Even that check is just a fast prefilter; `File::open` remains the real authority.
+  - Given shard lock + current patterns, this is just cleanup.
+
+- **MINOR — API visibility widening to `pub(crate)` is acceptable but not ideal if only needed for one sibling helper module.**
+  - `pub(crate) fn shard_lock`:
+    - Exposes locking internals more broadly than necessary.
+    - Increases chance of future callers taking the raw lock and accidentally violating intended access patterns.
+  - `pub(crate) fn is_valid_shard_file`:
+    - Lower risk; this is a pure helper.
+  - Preferable alternative:
+    - a narrowly-scoped helper like `with_shard_read_lock(key, |path| { ... })` or `with_read_lock<F, T>(&self, key, f: F) -> T`.
+    - That keeps lock acquisition policy centralized and avoids exporting raw lock handles.
+  - I would not block the PR on this alone, but I’d lean toward tightening `shard_lock` if easy.
+
+- **MINOR — Positioned read follow-up is worth doing, especially on Windows.**
+  - Current implementation uses `seek` + `read_exact` on a single `File`.
+  - On Unix, `FileExt::read_at`; on Windows, `FileExt::seek_read` avoids mutable file cursor movement.
+  - Benefits:
+    - less syscall/state churn,
+    - easier future concurrent bitmap reads from one handle,
+    - cleaner semantics for random-access reads.
+  - Not required for the correctness/perf win here, but a good next step.
+
+- **MINOR — Reading the full ops tail is reasonable; “stop early when all wanted touched” is not generally sound.**
+  - Agree with your note: ops for the same wanted value can appear anywhere later in the log, interleaved with irrelevant values.
+  - Therefore the scan must continue to EOF unless you add stronger indexing or ordering guarantees.
+  - Current approach is correct.
+  - Potential follow-up is not “stop early”, but “stream op-entry decode directly from file” to avoid materializing the whole tail when ops sections become large. Separate PR, not needed here.
+
+- **NIT — Index buffer pooling is a nice-to-have, not urgent.**
+  - The major win is already from avoiding full snapshot decode.
+  - Pooling `index_buf` and bitmap scratch buffers may shave allocator churn for repeated lookups, especially in the same large bucket.
+  - Worth benchmarking before adding complexity.
+
+- **MINOR — Microbench demonstrates a real likely win, but the headline speedup is confounded by workload shape and cache warmth.**
+  - Confounds:
+    - **Page-cache-warm** means it excludes disk cold-start effects; the absolute latency numbers won’t match production cold-path tails.
+    - 200 lookups against the **same bucket** repeatedly benefits:
+      - repeated path/file metadata warmth,
+      - repeated index re-read from cache,
+      - branch predictor / allocator warmup,
+      - maybe lock/map/path locality.
+    - Single-value lookups are the best-case target workload for this optimization.
+    - NTFS/Windows specifics may differ from Linux production behavior if prod is Linux.
+  - Despite that, the benchmark still strongly supports the intended algorithmic improvement:
+    - old path scales with full bucket cardinality / full snapshot decode,
+    - new path scales with `wanted` count plus ops scan.
+  - Measurements that would corroborate better:
+    - cold page-cache runs (or as cold as feasible),
+    - mixed buckets / varying bucket sizes,
+    - varying wanted cardinality: 1, 2, 8, 32, 128,
+    - ops-heavy vs compacted buckets,
+    - end-to-end query latency deltas on representative traffic,
+    - CPU profiles showing eliminated `BucketSnapshotCodec::decode`,
+    - bytes-read/syscall counts per lookup,
+    - fallback rate metric in staging/shadow traffic.
+  - Also the “bit-count parity assertion” is weaker than full equality; your in-tree property test does the stronger check, which is better.
+
+- **MAJOR — Test coverage is good, but one targeted parity test is still missing: preserving an empty bitmap entry after clears.**
+  - You explicitly called this requirement out, and the implementation looks correct.
+  - But none of the added tests appears to assert the exact “snapshot-present value becomes empty and must still be returned” behavior.
+  - Suggested test:
+    1. create snapshot with value `v` having one or more bits,
+    2. compact,
+    3. append `ClearBit`/`BatchClear` removing all bits for `v`,
+    4. `load_field_values(field, &[v])`,
+    5. assert `res.contains_key(&v)` and `res[&v].is_empty()`.
+  - Also worth adding the pure miss clear case:
+    - append `ClearBit` for a wanted value absent in snapshot and absent from prior ops,
+    - assert result omits that value.
+  - I don’t think the code is wrong here; I’m flagging this because these semantics are subtle and central to your correctness claim.
+
+- **NIT — Another useful explicit test would be malformed-index fallback behavior.**
+  - Today the correctness story on corruption depends on fallback.
+  - An integration-ish test that writes a shard with an out-of-bounds bitmap range and verifies:
+    - indexed path errors internally,
+    - `load_field_values` still returns the same result as `self.read()` if legacy path can read it, or propagates the same error if both fail,
+    would lock in the intended safety net.
+  - Probably easier if there are existing raw-shard-writing test helpers.
+
+- **MINOR — One more correctness assumption to document: no duplicate `value_id` entries in the snapshot index.**
+  - The code would simply read both and keep the later one after `result.insert(value, bm)`.
+  - If the format invariant is “one index entry per value”, that’s fine.
+  - Worth documenting in the function comment or relying on encoder invariant.
+  - Not a blocker if format already guarantees uniqueness.
+
+- **NIT — `found` capacity could use `wanted_set.len()` instead of `wanted.len()`.**
+  - Slightly more accurate after dedupe.
+  - Tiny.
+
+- **NIT — Consider naming the fallback branch comment more precisely.**
+  - “legacy full-bucket read on any indexed-path error” is accurate.
+  - If you add logging/metrics, mention “best-effort fast path; correctness delegated to legacy path on failure.”
+
+**Verdict: APPROVE, with a strong recommendation to add the empty-bitmap-after-clear parity test and indexed-fallback instrumentation in this or a near-follow-up PR.**
