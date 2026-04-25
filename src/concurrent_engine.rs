@@ -6547,7 +6547,12 @@ impl ConcurrentEngine {
             // per entry instead of milliseconds. Writers can resume promptly
             // after the merge cycle.
             let mut by_bucket: HashMap<u8, Vec<(u64, Arc<RoaringBitmap>)>> = HashMap::new();
-            field.for_each_versioned(|value, vb| {
+            // Chunked iteration releases the read lock between batches so
+            // writers (apply path) can interleave instead of waiting the full
+            // 1-2 s window high-cardinality fields would otherwise hold.
+            // Chunk size 16 K → ~1-2 ms max continuous lock-hold per chunk
+            // at the per-entry Arc::clone + HashMap::insert cost (~110 ns).
+            field.for_each_versioned_chunked(16_384, |value, vb| {
                 let bucket = (value >> 8) as u8;
                 if vb.is_dirty() {
                     by_bucket
