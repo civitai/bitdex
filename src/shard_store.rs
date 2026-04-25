@@ -23,6 +23,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// Test-only sync failure injection
+// ---------------------------------------------------------------------------
+//
+// Set SYNC_INJECT_FAIL to `true` in a test to make `sync_all_opslogs` return
+// an error immediately, simulating an OS-level fsync failure.  Always reset to
+// `false` after the assertion so other tests are not affected.
+//
+// Compiled unconditionally so integration tests (which link the lib in
+// non-`#[cfg(test)]` mode) can reach it.  In production it is always `false`
+// and the AtomicBool load on the fast path will be eliminated by the optimizer.
+#[doc(hidden)]
+pub static SYNC_INJECT_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
 // Codec traits
 // ---------------------------------------------------------------------------
 
@@ -930,6 +945,12 @@ where
     /// Returns the count of shards successfully synced.  On any failure the
     /// last error is returned so the caller can suppress cursor persistence.
     pub fn sync_all_opslogs(&self) -> io::Result<usize> {
+        if SYNC_INJECT_FAIL.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "test: sync_all_opslogs injected failure",
+            ));
+        }
         let keys = self.list_shards()?;
         let mut synced = 0usize;
         let mut last_err: Option<io::Error> = None;

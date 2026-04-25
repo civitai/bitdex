@@ -628,3 +628,75 @@ fn test_cursor_written_after_bitmap_sync() {
         "all 5 alive bits must be durable when cursor is persisted — no cursor/bitmap divergence"
     );
 }
+// ===========================================================================
+// Test 9: cursor is NOT written when bitmap sync fails (negative gate test)
+//
+// This is the negative counterpart to Test 8.  It proves the `bitmaps_synced`
+// gate in the merge thread actually suppresses cursor writes when
+// `sync_all_opslogs` returns an error.
+//
+// Without this test a future regression that breaks the gate check (e.g.
+// setting `bitmaps_synced = true` unconditionally) would silently re-open the
+// durability gap and only Test 8 would remain, which would still pass.
+//
+// Injection: `SYNC_INJECT_FAIL` AtomicBool in shard_store (cfg(test) only).
+// When true, `sync_all_opslogs` returns Err immediately.  The merge thread
+// must therefore skip `write_cursor`, leaving the on-disk cursor absent.
+// ===========================================================================
+#[test]
+fn test_cursor_NOT_written_when_bitmap_sync_fails() {
+    use bitdex_v2::shard_store::SYNC_INJECT_FAIL;
+    use bitdex_v2::shard_store_meta::MetaStore;
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let docstore_path = dir.path().join("docs");
+    let bitmap_path = dir.path().join("bitmaps");
+    let mut config = opslog_config(&bitmap_path);
+    config.merge_interval_ms = 80;
+
+    let engine = ConcurrentEngine::new_with_path(config.clone(), docstore_path.as_path()).unwrap();
+
+    // Insert documents so the flush thread has real bitmap ops to persist.
+    for i in 1..=5u32 {
+        engine
+            .put(
+                i,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(i as i64))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 100))),
+                ]),
+            )
+            .unwrap();
+    }
+
+    // Arm the injector BEFORE the merge thread can pick up the cursor so that
+    // every sync attempt during this test fails.
+    SYNC_INJECT_FAIL.store(true, Ordering::SeqCst);
+
+    // Set the cursor that must NOT reach disk.
+    engine.set_cursor("wal-reader".to_string(), "gen=0,offset=2048".to_string());
+
+    wait_for_flush(&engine, 5, 2000);
+
+    // Let several merge cycles run — none should write the cursor because sync fails.
+    thread::sleep(Duration::from_millis(500));
+
+    // Disarm before drop so the clean-shutdown merge cycle is not blocked.
+    SYNC_INJECT_FAIL.store(false, Ordering::SeqCst);
+    drop(engine);
+
+    // Reload MetaStore from disk and assert the cursor was never written.
+    let ss_root = bitmap_path.join("shardstore");
+    let meta_store = MetaStore::new(ss_root.clone()).unwrap();
+    let cursor = meta_store.load_cursor("wal-reader").unwrap();
+    assert!(
+        cursor.is_none(),
+        "cursor must NOT be written when bitmap sync fails; got {cursor:?}"
+    );
+
+    // Bitmap data itself must still be intact (flush thread wrote it regardless).
+    let alive_store = AliveBitmapStore::new(ss_root.join("alive"), SingletonShard).unwrap();
+    let bm = alive_store.read(&AliveShardKey).unwrap().unwrap();
+    assert_eq!(bm.len(), 5, "bitmap data must be intact even when cursor is suppressed");
+}
