@@ -607,12 +607,16 @@ If `BITDEX_ADMIN_TOKEN` is unset and any route requires bearer, relay refuses to
 
 1. ✅ V3 design doc reflects Justin's env-var clarification + GPT/Gemini must-fix lists.
 2. ✅ ≥2 design reviews complete (GPT + Gemini). Verbatim outputs preserved at `docs/_in/relay-review-gpt.md` and `docs/_in/relay-review-gemini.md` for audit.
-3. **Mail Scarlet** with V3 doc + review summaries.
-4. **Coordinate** with Aidan (toggle pattern, probes, reseed) and Donovan (entrypoint, caller compat).
-5. Open `feat/relay` branch. Implement on the locked design.
-6. Local smoke (containerized) + caller-compat smoke.
-7. Aidan ships image. Operator pre-flip checklist + relay window. Mandatory reseed on flip-back.
-8. Mail Justin when V1 is live.
+3. ✅ `feat/relay` branch open, design committed (5128c3d).
+4. ✅ Donovan acked entrypoint dispatch + pg-sync compat + SSE header lift (`tee_mode` skip-path PR for model-share is the remaining hard blocker).
+5. ✅ Code scaffold (17ccfc3): config, template, channel, route, sse, auth, metrics, capture-stub.
+6. ✅ Caller-compat smoke + SubscriberGuard RAII (61e719f). 7/7 tests pass.
+7. ✅ NDJSON capture writer + default config YAML (0e73ff6). 8/8 tests pass.
+8. ✅ Dockerfile draft — `deploy/docker/Dockerfile` adds `BITDEX_MODE=server` env, ships `relay-config.default.yaml` at `/etc/bitdex/relay-config.yaml`, adds `HEALTHCHECK` against `/api/health`.
+9. **Aidan §15 answers** — Aidan offline. Deploy-relief sub-agent (Infrastructure Engineer) spawned to draft K8s manifest patch + flip runbook + answer §15 from existing patterns. Apply still gates on Aidan return / Justin sign-off / Tom executing.
+10. **Model-share `tee_mode` skip-path PR** — pending. Hard blocker for prod flip; needs owner.
+11. Aidan ships image. Operator pre-flip checklist + relay window. Mandatory reseed on flip-back.
+12. Mail Justin when V1 is live.
 
 ---
 
