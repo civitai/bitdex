@@ -296,19 +296,42 @@ impl FilterField {
     }
     /// Return the serialized byte size of all bitmaps in this field.
     ///
-    /// Holds the read lock for the duration of the iteration. For
-    /// high-cardinality fields (postId at 22.5M entries) this can take
-    /// ~1-2 seconds. **DO NOT call this on the hot path** — it's
-    /// intended for rare metrics scrapes only. The earlier chunked
-    /// per-key-lock variant was abandoned because 22.5M brief lock
-    /// acquisitions starved concurrent writers (`load_field_complete`)
-    /// indefinitely under heavy reader load.
+    /// Walks the field in 16K-key chunks, releasing the read lock between
+    /// chunks so the apply path's writers can interleave. Previous
+    /// single-lock impl held the read lock for ~50 ms on userId
+    /// (769K entries) and ~1-2 s on postId (22.5M), which under sustained
+    /// scanner activity (every memory-cache stale flag triggers a re-read)
+    /// stalled apply's `remove_bulk` write-lock acquire by the full
+    /// scan window. Observed locally as `[remove_bulk_slow] lock=80-235ms`
+    /// after the merge thread's `mark_stale` calls became reachable.
+    ///
+    /// The 16K chunk size keeps each continuous lock-hold under ~10 ms
+    /// at the per-VB `bitmap_bytes()` cost, while avoiding the
+    /// unbounded per-key-lock pattern that earlier writer-starved
+    /// `load_field_complete` under heavy reader concurrency.
+    ///
+    /// Wall-clock is roughly the same as the single-lock impl
+    /// (sum of per-VB byte calls is unchanged) — the win is bounded
+    /// max-continuous-lock-hold for queued writers.
     ///
     /// TODO: cache the value with a TTL or update incrementally on
     /// mutation rather than recomputing on every metric scrape.
     pub fn bitmap_bytes(&self) -> usize {
-        let r = self.bitmaps.read();
-        r.values().map(|vb| vb.bitmap_bytes()).sum()
+        const CHUNK: usize = 16_384;
+        let keys: Vec<u64> = {
+            let r = self.bitmaps.read();
+            r.keys().copied().collect()
+        };
+        let mut total: usize = 0;
+        for chunk in keys.chunks(CHUNK) {
+            let r = self.bitmaps.read();
+            for &k in chunk {
+                if let Some(vb) = r.get(&k) {
+                    total += vb.bitmap_bytes();
+                }
+            }
+        }
+        total
     }
     /// Drop all base bitmaps and mark every value as unloaded.
     /// The diff layers are preserved so mutations can accumulate
