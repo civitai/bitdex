@@ -874,9 +874,12 @@ mod tests {
         batch.group_and_sort();
         batch.apply(&mut slots, &mut filters, &mut sorts);
         let sf = sorts.get_field("reactionCount").unwrap();
-        assert!(sf.layer(0).unwrap().contains(10));
-        assert!(!sf.layer(1).unwrap().contains(10));
-        assert!(sf.layer(2).unwrap().contains(10));
+        // batch.apply no longer eagerly merges sort diffs — the merge thread
+        // promotes diffs into bases on its persist cycle, and queries fuse
+        // base+diff at read time. Assert against layer_fused (read view).
+        assert!(sf.layer_fused(0).unwrap().contains(10));
+        assert!(!sf.layer_fused(1).unwrap().contains(10));
+        assert!(sf.layer_fused(2).unwrap().contains(10));
         assert_eq!(sf.reconstruct_value(10), 5);
         // Now clear bit 0, so value becomes 4 (binary: 100)
         let mut batch2 = WriteBatch::new();
@@ -888,8 +891,8 @@ mod tests {
         batch2.group_and_sort();
         batch2.apply(&mut slots, &mut filters, &mut sorts);
         let sf = sorts.get_field("reactionCount").unwrap();
-        assert!(!sf.layer(0).unwrap().contains(10));
-        assert!(sf.layer(2).unwrap().contains(10));
+        assert!(!sf.layer_fused(0).unwrap().contains(10));
+        assert!(sf.layer_fused(2).unwrap().contains(10));
         assert_eq!(sf.reconstruct_value(10), 4);
     }
     #[test]
@@ -1274,7 +1277,14 @@ mod tests {
         assert!(vb.diff().sets.contains(20));
     }
     #[test]
-    fn test_apply_sort_diffs_merged() {
+    fn test_apply_sort_diffs_lazy_fused() {
+        // Replaces the old `test_apply_sort_diffs_merged`. Sort diffs are no
+        // longer eagerly merged in `batch.apply` (the eager merge triggered an
+        // Arc::make_mut deep-clone of every dirty layer base — ~500ms for
+        // sortAt at 109M scale). Diffs now live in the per-layer VersionedBitmap
+        // until the merge thread's persist cycle promotes them into the base.
+        // Read paths fuse base + diff via `fused_cow` on demand. This test
+        // asserts the fused view sees the bit immediately after apply.
         let mut slots = SlotAllocator::new();
         let mut filters = setup_filter_index();
         let mut sorts = setup_sort_index();
@@ -1286,11 +1296,8 @@ mod tests {
         });
         batch.group_and_sort();
         batch.apply(&mut slots, &mut filters, &mut sorts);
-        // Sort diffs MUST be merged eagerly (per architecture-risk-review issue 4)
-        // layer() returns the base bitmap — the debug_assert inside layer() verifies
-        // the diff is empty. If sort diffs weren't merged, layer() would panic.
         let sf = sorts.get_field("reactionCount").unwrap();
-        assert!(sf.layer(0).unwrap().contains(10));
+        assert!(sf.layer_fused(0).unwrap().contains(10));
     }
     #[test]
     fn test_apply_alive_merged() {

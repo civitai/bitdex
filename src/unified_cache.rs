@@ -2738,7 +2738,9 @@ mod tests {
                 per_value_lazy: false,
     
             });
-            let field = fi.get_field_mut(name).unwrap();
+            // FilterField uses interior mutability via RwLock; mutating
+            // through the immutable `&FilterField` works.
+            let field = fi.get_field(name).unwrap();
             for (value, slots) in *values {
                 field.insert_bulk(*value, slots.iter().copied());
             }
@@ -3517,7 +3519,7 @@ mod tests {
                 "reactionCount",
                 SortDirection::Desc,
             );
-            cache.form_and_store(key, &slots, true, 100_000, |s| 1000u64.saturating_sub(s as u64));
+            cache.form_and_store(key, &slots, true, 100_000, |s| 1000u32.saturating_sub(s));
         }
         println!("[bench] populated {} entries in {:.2}s",
                  cache.len(), t_populate.elapsed().as_secs_f64());

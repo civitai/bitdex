@@ -817,13 +817,16 @@ mod tests {
         index.add_field(make_single_value_config("nsfwLevel"));
         index.add_field(make_multi_value_config("tagIds"));
         index.add_field(make_bool_config("onSite"));
-        // Insert some data
-        index.get_field_mut("nsfwLevel").unwrap().insert(1, 100);
-        index.get_field_mut("tagIds").unwrap().insert(456, 100);
-        index.get_field_mut("tagIds").unwrap().insert(789, 100);
-        index.get_field_mut("onSite").unwrap().insert(1, 100);
+        // FilterField uses interior mutability via parking_lot::RwLock so we
+        // can mutate through the immutable `&FilterField` returned by
+        // `get_field` / `fields()`. There is no `_mut` accessor — see the
+        // note in `FilterIndex::get_field`.
+        index.get_field("nsfwLevel").unwrap().insert(1, 100);
+        index.get_field("tagIds").unwrap().insert(456, 100);
+        index.get_field("tagIds").unwrap().insert(789, 100);
+        index.get_field("onSite").unwrap().insert(1, 100);
         // Merge before reading
-        for (_name, field) in index.fields_mut() {
+        for (_name, field) in index.fields() {
             field.merge_all();
         }
         // Verify
@@ -834,7 +837,7 @@ mod tests {
     #[test]
     fn test_filter_and_alive_gate() {
         // Simulate the query pattern: filter bitmap AND alive bitmap
-        let mut field = FilterField::new(make_single_value_config("status"));
+        let field = FilterField::new(make_single_value_config("status"));
         field.insert(1, 10);
         field.insert(1, 20);
         field.insert(1, 30);
@@ -844,7 +847,9 @@ mod tests {
         alive.insert(20);
         // Slot 30 is deleted (not in alive)
         let filter_result = field.get(1).unwrap();
-        let gated = filter_result & &alive;
+        // FilterField::get returns Arc<RoaringBitmap>; deref to &RoaringBitmap
+        // for the BitAnd operator overload.
+        let gated = &*filter_result & &alive;
         assert_eq!(gated.len(), 2);
         assert!(gated.contains(10));
         assert!(gated.contains(20));
