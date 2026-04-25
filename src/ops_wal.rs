@@ -270,6 +270,7 @@ impl WalReader {
                 break;
             }
 
+            let cursor_before = self.cursor.offset;
             let b = self.read_file(&fp, max_records - all.len())?;
             total_bytes += b.bytes_read;
             total_crc += b.crc_failures;
@@ -281,6 +282,24 @@ impl WalReader {
             let flen = fs::metadata(&fp).map(|m| m.len()).unwrap_or(0);
             if self.cursor.offset >= flen {
                 if let Some(g) = self.next_gen() {
+                    self.delete_consumed();
+                    self.cursor = WalCursor::new(g, 0);
+                    continue;
+                }
+            } else if self.cursor.offset == cursor_before {
+                // No progress made on a closed gen — file has trailing bytes the
+                // reader can't decode (corrupt header, truncated tail, partial
+                // write that never completed). If a higher gen exists, the
+                // writer has moved on and these bytes are unrecoverable. Skip
+                // to next gen so the reader doesn't stall.
+                if let Some(g) = self.next_gen() {
+                    eprintln!(
+                        "WAL reader: skipping unreadable tail of gen {} at offset {} ({} bytes); advancing to gen {}",
+                        self.cursor.generation,
+                        self.cursor.offset,
+                        flen.saturating_sub(self.cursor.offset),
+                        g,
+                    );
                     self.delete_consumed();
                     self.cursor = WalCursor::new(g, 0);
                     continue;
@@ -534,6 +553,120 @@ mod tests {
         let mut r = WalReader::new(d.path(), WalCursor::new(w.current_generation(), 0));
         let res = r.read_batch(100).unwrap();
         assert_eq!(res.entries.len(), 1);
+    }
+
+    #[test]
+    fn skips_unreadable_tail_when_higher_gen_exists() {
+        // Reproduces the prod stall: gen N has a record with a header that
+        // decodes a plausible payload_len but the rest of the record never
+        // arrived (truncated tail / partial write). Writer has rotated to
+        // gen N+1 and added more records. Reader at gen N must skip the
+        // unreadable tail and pick up gen N+1.
+        let d = TempDir::new().unwrap();
+
+        let g1_path = d.path().join(wal_filename(1));
+        {
+            let mut f = OpenOptions::new().create(true).append(true).open(&g1_path).unwrap();
+            // Valid record
+            let oj = serde_json::to_vec(&vec![Op::Set {
+                field: "a".into(), value: json!(1),
+            }]).unwrap();
+            let plen = oj.len() as u32;
+            let eid: i64 = 1;
+            let eb = eid.to_le_bytes();
+            let flags: u8 = 0;
+            let mut ci = Vec::new();
+            ci.extend_from_slice(&eb);
+            ci.push(flags);
+            ci.extend_from_slice(&oj);
+            let crc = crc32fast::hash(&ci);
+            f.write_all(&plen.to_le_bytes()).unwrap();
+            f.write_all(&eb).unwrap();
+            f.write_all(&[flags]).unwrap();
+            f.write_all(&oj).unwrap();
+            f.write_all(&crc.to_le_bytes()).unwrap();
+            // Truncated tail: header that decodes a huge payload_len but no
+            // payload follows. Inner read loop will hit `end > data.len()`
+            // and break without advancing pos.
+            f.write_all(&999_999u32.to_le_bytes()).unwrap();
+            f.write_all(&7777i64.to_le_bytes()).unwrap();
+            f.write_all(&[0u8]).unwrap();
+        }
+
+        // Write a separate gen 2 with a valid record
+        let g2_path = d.path().join(wal_filename(2));
+        {
+            let mut f = OpenOptions::new().create(true).append(true).open(&g2_path).unwrap();
+            let oj = serde_json::to_vec(&vec![Op::Set {
+                field: "b".into(), value: json!(2),
+            }]).unwrap();
+            let plen = oj.len() as u32;
+            let eid: i64 = 2;
+            let eb = eid.to_le_bytes();
+            let flags: u8 = 0;
+            let mut ci = Vec::new();
+            ci.extend_from_slice(&eb);
+            ci.push(flags);
+            ci.extend_from_slice(&oj);
+            let crc = crc32fast::hash(&ci);
+            f.write_all(&plen.to_le_bytes()).unwrap();
+            f.write_all(&eb).unwrap();
+            f.write_all(&[flags]).unwrap();
+            f.write_all(&oj).unwrap();
+            f.write_all(&crc.to_le_bytes()).unwrap();
+        }
+
+        let mut r = WalReader::new(d.path(), WalCursor::new(1, 0));
+        let res = r.read_batch(100).unwrap();
+
+        // Reader should: read entity 1 from gen 1, skip the truncated tail,
+        // advance to gen 2, read entity 2.
+        let ids: Vec<i64> = res.entries.iter().map(|e| e.entity_id).collect();
+        assert_eq!(ids, vec![1, 2], "should read both records across gens");
+        assert_eq!(r.cursor().generation, 2, "cursor should be on gen 2");
+
+        // Gen 1 should be cleaned up after consumption.
+        assert!(!g1_path.exists(), "consumed gen 1 should be deleted");
+    }
+
+    #[test]
+    fn no_skip_when_only_one_gen_exists() {
+        // If there's no higher gen, a truncated tail must NOT be skipped —
+        // the writer might still be writing to it. Reader holds at the
+        // unreadable offset until either more bytes arrive or rotation.
+        let d = TempDir::new().unwrap();
+        let path = d.path().join(wal_filename(1));
+        {
+            let mut f = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+            // Valid record
+            let oj = serde_json::to_vec(&vec![Op::Set { field: "a".into(), value: json!(1) }]).unwrap();
+            let plen = oj.len() as u32;
+            let eb = 1i64.to_le_bytes();
+            let flags: u8 = 0;
+            let mut ci = Vec::new();
+            ci.extend_from_slice(&eb);
+            ci.push(flags);
+            ci.extend_from_slice(&oj);
+            let crc = crc32fast::hash(&ci);
+            f.write_all(&plen.to_le_bytes()).unwrap();
+            f.write_all(&eb).unwrap();
+            f.write_all(&[flags]).unwrap();
+            f.write_all(&oj).unwrap();
+            f.write_all(&crc.to_le_bytes()).unwrap();
+            // Truncated header with no following payload
+            f.write_all(&999_999u32.to_le_bytes()).unwrap();
+            f.write_all(&7777i64.to_le_bytes()).unwrap();
+            f.write_all(&[0u8]).unwrap();
+        }
+
+        let cursor_before = WalCursor::new(1, 0);
+        let mut r = WalReader::new(d.path(), cursor_before);
+        let res = r.read_batch(100).unwrap();
+
+        assert_eq!(res.entries.len(), 1, "should read the valid record only");
+        assert_eq!(r.cursor().generation, 1, "stays on gen 1 — no higher gen to skip to");
+        // Cursor advanced past the valid record but stops at the truncated tail.
+        assert!(path.exists(), "gen 1 must NOT be deleted while it's the only file");
     }
 
     #[test]
