@@ -2,16 +2,22 @@
 
 **For review only. Apply gates on Aidan / Justin sign-off / Tom executing.**
 
-> **🟡 Tom validation gate:** PodSecurity sets `runAsUser: 65532` on the
-> pg-sync sidecar. Tom is validating that UID 65532 has write access to
-> the existing `data-bitdex-0` PVC (current data is owned by some other
-> UID — likely root from prior deploys). If the chown isn't compatible,
-> either: (a) add an `initContainer` that chowns `/data` to 65532 on
-> first boot, (b) use `securityContext.fsGroup: 65532` to apply group
-> ownership at mount time, or (c) leave pg-sync running as a different
-> UID. **Do not apply this patch until Tom clears the PVC permission
-> question** — apply otherwise risks pg-sync sidecar crashloop on
-> startup.
+> **✅ Tom-cleared PVC permission gate (2026-04-25):** existing `data-bitdex-0`
+> PVC has `/data/wal/` and `/data/indexes/` as 755 root-owned from prior
+> deploys; UID 65532 can't write without intervention. Mitigation chosen
+> (option b from prior list): pod-template `securityContext.fsGroup:
+> 65532` + `fsGroupChangePolicy: OnRootMismatch`. Kubelet chowns the
+> volume to GID 65532 on first mount only; subsequent mounts are no-ops.
+> Manifest below includes the fsGroup block. Tom standing by to
+> re-validate the patched manifest before apply.
+>
+> **PVC adoption invariants (do not change on re-create):**
+> - `volumeClaimTemplates[0].metadata.name: data`
+> - `spec.storageClassName: openebs-hostpath-bitdex-nvme`
+> - `spec.accessModes: [ReadWriteOnce]`
+>
+> Changing any of these breaks adoption of the existing
+> `data-bitdex-0` PVC and forces a new PVC + lost data.
 
 Target file in talos-infra: `clusters/production/apps/bitdex/deployment.yaml`
 
@@ -39,7 +45,9 @@ Target file in talos-infra: `clusters/production/apps/bitdex/deployment.yaml`
 2. Add `BITDEX_RELAY_CONFIG` env var (optional override) to the `bitdex` container.
 3. Add `BITDEX_ADMIN_TOKEN` secret-ref to the `bitdex` container — relay reuses the existing secret.
 4. Add PodSecurity block (pod-level + per-container) to fix Tom's flagged warnings.
-5. Keep `requests.memory: 14Gi` — scheduling-trap mitigation per Gemini review.
+5. Add `fsGroup: 65532` + `fsGroupChangePolicy: OnRootMismatch` at pod-template level so kubelet chowns the existing `data-bitdex-0` PVC on first mount (Tom-cleared mitigation).
+6. Keep `requests.memory: 14Gi` — scheduling-trap mitigation per Gemini review.
+7. Preserve `volumeClaimTemplates` invariants (name `data`, storageClass `openebs-hostpath-bitdex-nvme`, accessMode `ReadWriteOnce`) so the existing PVC is adopted, not replaced.
 
 ---
 
@@ -64,14 +72,20 @@ Surrounding context lines included for safe patch application.
  spec:
    template:
      spec:
-+      # PodSecurity — Tom's flagged warnings, same-commit as relay rollout
++      # PodSecurity — Tom's flagged warnings, same-commit as relay rollout.
++      # fsGroup + OnRootMismatch chowns the PVC to GID 65532 on first
++      # mount (existing /data/wal /data/indexes are 755 root-owned).
++      # Subsequent mounts skip the chown, so cost is one-time.
 +      securityContext:
 +        runAsNonRoot: true
++        fsGroup: 65532
++        fsGroupChangePolicy: OnRootMismatch
        containers:
          - name: bitdex
 +          securityContext:
 +            runAsNonRoot: true
 +            runAsUser: 65532
++            runAsGroup: 65532
 +            allowPrivilegeEscalation: false
 +            capabilities:
 +              drop: ["ALL"]
@@ -114,6 +128,7 @@ Surrounding context lines included for safe patch application.
 +          securityContext:
 +            runAsNonRoot: true
 +            runAsUser: 65532
++            runAsGroup: 65532
 +            allowPrivilegeEscalation: false
 +            capabilities:
 +              drop: ["ALL"]
