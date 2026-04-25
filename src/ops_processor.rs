@@ -899,8 +899,13 @@ pub fn apply_ops_batch<S: BitmapSink>(
                             crate::config::ComputedOp::Greatest => *new_values.iter().max().unwrap_or(&0),
                             crate::config::ComputedOp::Least => *new_values.iter().min().unwrap_or(&0),
                         };
-                        eprintln!(
-                            "  computed sort recomp: target={} slot={} old_vals={:?}→{} new_vals={:?}→{} stored={:?}",
+                        // Per-op diagnostic at trace level — was eprintln, ~100µs/op
+                        // stderr allocation + flush dominated the inner loop under
+                        // computed-sort bursts. Matches the conversion pattern at
+                        // :644 and :825 per `docs/_in/core-path-review-2026-04-25.md`
+                        // drift-hygiene-audit.
+                        tracing::trace!(
+                            "computed sort recomp: target={} slot={} old_vals={:?}→{} new_vals={:?}→{} stored={:?}",
                             dep.target, slot, old_values, old_computed, new_values, new_computed,
                             stored_sort_values.keys().collect::<Vec<_>>(),
                         );
