@@ -2,6 +2,17 @@
 
 **For review only. Apply gates on Aidan / Justin sign-off / Tom executing.**
 
+> **🟡 Tom validation gate:** PodSecurity sets `runAsUser: 65532` on the
+> pg-sync sidecar. Tom is validating that UID 65532 has write access to
+> the existing `data-bitdex-0` PVC (current data is owned by some other
+> UID — likely root from prior deploys). If the chown isn't compatible,
+> either: (a) add an `initContainer` that chowns `/data` to 65532 on
+> first boot, (b) use `securityContext.fsGroup: 65532` to apply group
+> ownership at mount time, or (c) leave pg-sync running as a different
+> UID. **Do not apply this patch until Tom clears the PVC permission
+> question** — apply otherwise risks pg-sync sidecar crashloop on
+> startup.
+
 Target file in talos-infra: `clusters/production/apps/bitdex/deployment.yaml`
 
 > **Important — re-create, not patch.** As of 2026-04-25 Aidan reports
