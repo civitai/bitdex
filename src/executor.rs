@@ -685,11 +685,11 @@ impl<'a> QueryExecutor<'a> {
                 }
             }
             // C3 (Lt/Lte): Mirror Gt/Gte bucket snapping for the time-bucket field.
-            // Lt(field, T) = "items older than T" = alive − Gte(T) bucket.
-            // Lte(field, T) = "items at or older than T" = alive − Gt(T) bucket.
+            // Lt(field, T) = "items older than T" ≈ alive − bucket(now−T).
+            // Lte(field, T) = same approximation (bucket boundary subsumes the extra point).
             //
-            // The snapping tolerance is 10% (same as Gt/Gte). If no bucket matches,
-            // fall through to range_scan.
+            // Snapping is approximate (10% tolerance, same as Gt/Gte). If no bucket
+            // matches within tolerance, fall through to range_scan.
             //
             // NEW FINDING (perf-paths-audit, not in original review): Lt/Lte had
             // zero bucket snapping — even sortAtUnix went straight to range_scan.
@@ -698,18 +698,23 @@ impl<'a> QueryExecutor<'a> {
                 if let Some(tb) = &self.time_buckets {
                     if field == tb.field_name() {
                         if let Some(threshold) = value_to_bitmap_key(value) {
+                            // Fast path: threshold in the future → all alive slots satisfy
+                            // Lt/Lte because every stored timestamp is ≤ now < threshold.
+                            if threshold >= self.now_unix {
+                                return Ok(self.slots.alive_bitmap().clone());
+                            }
                             // duration_secs = now - threshold (same as Gt/Gte side).
                             // The bucket for duration D covers [now-D, now].
-                            // Lt(threshold) wants timestamps < threshold, i.e., NOT in [threshold, now].
-                            // If threshold ≈ now - D, then Lt(threshold) ≈ alive - bucket(D).
+                            // Lt(threshold) wants timestamps < threshold, i.e., NOT in
+                            // the recent [threshold, now] window ≈ alive - bucket(D).
                             let duration = self.now_unix.saturating_sub(threshold);
                             if let Some(bucket_name) = tb.snap_duration(duration, 0.10) {
                                 if let Some(bucket) = tb.get_bucket(bucket_name) {
-                                    // alive - bucket = items older than threshold.
-                                    // For Lt: strict less-than — subtract the whole bucket.
-                                    // For Lte: items at or older than threshold — same bitmap
-                                    //   (bucket boundary is already snapped; the extra point T
-                                    //   is subsumed by the snap tolerance).
+                                    // alive - bucket = items older than (approximately) threshold.
+                                    // Dead slots in bucket are harmless: subtracting them from
+                                    // alive_bitmap is a no-op (they're not in alive).
+                                    // Lt vs Lte boundary distinction is subsumed by the 10%
+                                    // snap tolerance — both use the same snapped complement.
                                     let mut result = self.slots.alive_bitmap().clone();
                                     result -= bucket.bitmap().as_ref();
                                     return Ok(result);
@@ -771,11 +776,14 @@ impl<'a> QueryExecutor<'a> {
             .ok_or_else(|| BitdexError::FieldNotFound(field.to_string()))?;
 
         // Enforce max_range_scan_values guardrail before doing any bitmap work.
-        // Uses the loaded value count, which is conservative for per_value_lazy
-        // fields (won't reject if only a slice is loaded).
+        // Uses the in-memory loaded value count. Note: for per_value_lazy fields
+        // this may be less than the total on-disk cardinality — the guardrail is
+        // best-effort for such fields (it won't reject when only a slice is loaded).
+        // For fully-loaded fields (eager_load or after first scan) this is exact.
+        // Set max_range_scan_values conservatively for per_value_lazy fields.
         if let Some(cap) = filter_field.config().max_range_scan_values {
-            let scanned = filter_field.loaded_value_count();
-            if scanned > cap {
+            let field_loaded_values = filter_field.loaded_value_count();
+            if field_loaded_values > cap {
                 #[cfg(feature = "server")]
                 if let Some(ref m) = self.metrics {
                     m.range_scan_rejected_total
@@ -784,7 +792,7 @@ impl<'a> QueryExecutor<'a> {
                 }
                 return Err(BitdexError::QueryTooExpensive {
                     field: field.to_string(),
-                    scanned,
+                    field_loaded_values,
                     cap,
                 });
             }
@@ -1689,9 +1697,9 @@ mod tests {
         let result = executor.evaluate_clause(&clause);
         assert!(result.is_err(), "expected QueryTooExpensive, got {:?}", result);
         match result.unwrap_err() {
-            BitdexError::QueryTooExpensive { field, scanned, cap } => {
+            BitdexError::QueryTooExpensive { field, field_loaded_values, cap } => {
                 assert_eq!(field, "postId");
-                assert_eq!(scanned, 10);
+                assert_eq!(field_loaded_values, 10);
                 assert_eq!(cap, 5);
             }
             other => panic!("unexpected error: {:?}", other),
@@ -1823,6 +1831,46 @@ mod tests {
         assert!(result.contains(1)); // slot 1, value 1 < 3 ✓
         assert!(result.contains(2)); // slot 2, value 2 < 3 ✓
         assert!(!result.contains(3)); // slot 3, value 3 = 3, not < 3 ✗
+    }
+
+    #[test]
+    fn test_lt_future_threshold_returns_all_alive() {
+        // Lt(now + 3600) = "all items older than the future" = all alive slots.
+        // saturating_sub would give 0 duration without the fast path, which could
+        // snap to the wrong bucket. With the fast path, we return alive directly.
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "sortAt".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false, max_range_scan_values: None,
+        });
+
+        let mut slots = SlotAllocator::new();
+        slots.alive_insert_bulk(1u32..=7);
+        slots.merge_alive();
+
+        let sorts = SortIndex::new();
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100)
+            .with_time_buckets(&mgr, now);
+
+        // future threshold = now + 3600 (1 hour from now)
+        let future_threshold = (now + 3600) as i64;
+        let lt_result = executor.evaluate_clause(
+            &FilterClause::Lt("sortAt".to_string(), Value::Integer(future_threshold))
+        ).unwrap();
+        // All alive slots satisfy Lt(future) — every stored timestamp is < future
+        assert_eq!(lt_result.len(), 7, "Lt(future) should return all alive slots");
+
+        let lte_result = executor.evaluate_clause(
+            &FilterClause::Lte("sortAt".to_string(), Value::Integer(future_threshold))
+        ).unwrap();
+        assert_eq!(lte_result.len(), 7, "Lte(future) should return all alive slots");
     }
 
     #[test]

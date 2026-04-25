@@ -604,16 +604,20 @@ pub struct FilterFieldConfig {
     /// specific values needed by each query are loaded from disk.
     #[serde(default)]
     pub per_value_lazy: bool,
-    /// Maximum number of distinct values to scan in a range query (Gt/Gte/Lt/Lte).
+    /// Maximum number of distinct values allowed in a range query (Gt/Gte/Lt/Lte).
     /// `None` = unbounded (default, backwards compatible).
-    /// `Some(N)` = reject the query with `QueryTooExpensive` if the field's
-    /// loaded value count exceeds N. Use this to protect against accidental
-    /// or adversarial range scans on high-cardinality fields like postId
-    /// (22.5M entries, ~2s CPU per query).
+    /// `Some(N)` = reject the query with `QueryTooExpensive` when the field's
+    /// in-memory loaded value count exceeds N.
     ///
-    /// The check uses the loaded value count at query time. For per_value_lazy
-    /// fields the loaded count may be smaller than the total on-disk count —
-    /// this is conservative (won't reject if only a slice is loaded).
+    /// Use to protect against accidental or adversarial range scans on
+    /// high-cardinality fields like postId (22.5M entries, ~2s CPU per query).
+    ///
+    /// **Semantics:** The check uses the in-memory loaded value count.
+    /// - For `eager_load` fields: exact — count equals total distinct values.
+    /// - For `per_value_lazy` fields: best-effort — count may be less than
+    ///   total on-disk cardinality when only a slice is cached. The guardrail
+    ///   will not fire on a cold/evicted lazy field. Set the cap conservatively
+    ///   (lower than expected lazy-load batch sizes) for these fields.
     #[serde(default)]
     pub max_range_scan_values: Option<usize>,
 }
