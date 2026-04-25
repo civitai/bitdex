@@ -1690,6 +1690,14 @@ impl ConcurrentEngine {
                             // snapshot — `cache_worker` calls `inner.load()` to obtain
                             // the index handle, which would return the previous
                             // snapshot if the send happened before `inner.store`.
+                            //
+                            // Coalescer reads below are safe: `inner.store(...)` does
+                            // not touch the coalescer, and the same coalescer is read
+                            // again later in this cycle for ops-log append, so its
+                            // grouped output is still the current cycle's immutable
+                            // view. A future refactor that clears or rotates the
+                            // coalescer immediately after publish must update the
+                            // ops-log append site at the same time.
                             if let (Some(ref work_tx), Some(work_item)) =
                                 (&flush_cache_work_tx, pending_async_work.take())
                             {
@@ -1697,7 +1705,12 @@ impl ConcurrentEngine {
                                     // Worker channel full — fall back to conservative
                                     // invalidation that mirrors the inline path's
                                     // tombstone work for unloaded persistent entries
-                                    // and the alive-change rebuild marking.
+                                    // and the alive-change rebuild marking. The
+                                    // tombstones run post-publish here; cache meta
+                                    // is owned by `flush_unified_cache` and is not
+                                    // swapped by `inner.store`, so this is
+                                    // semantically equivalent to the inline path
+                                    // running under the same cache lock pre-publish.
                                     flush_cache_worker_metrics
                                         .backpressure_invalidations_total
                                         .fetch_add(1, Ordering::Relaxed);

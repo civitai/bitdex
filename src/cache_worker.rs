@@ -34,9 +34,19 @@ use crate::write_coalescer::FilterGroupKey;
 /// it to this worker. The post-publish send order is load-bearing: the worker
 /// calls `inner.load()` at dequeue time to obtain the index handle, so an
 /// enqueue before publish would let the worker evaluate maintenance work
-/// against the previous published snapshot. The worker consumes these items,
-/// coalesces across adjacent ones, and evaluates against the published
-/// snapshot's filter and sort indexes.
+/// against the previous published snapshot.
+///
+/// **Snapshot-monotonicity contract:** a work item may be processed by the
+/// worker against a snapshot *newer* than the one whose coalesced mutations
+/// produced it (e.g. when items N and N+1 are queued before the worker
+/// dequeues N). This is safe and intended — the inserts/removes carried in
+/// `filter_inserts` / `filter_removes` / `sort_mutations` act as **triggers**
+/// that point the worker at the affected (key, value) buckets and sort
+/// fields. Final cache membership is re-derived against the loaded
+/// snapshot's filter/sort indexes via `evaluate_filter_work` /
+/// `evaluate_sort_work`, not from the deltas themselves. Future refactors
+/// MUST preserve this re-derivation; treating the deltas as authoritative
+/// "apply blindly" patches would reintroduce stale-snapshot bugs.
 #[derive(Debug)]
 pub struct CacheWorkItem {
     /// Slots newly added to (field, value) buckets this cycle.

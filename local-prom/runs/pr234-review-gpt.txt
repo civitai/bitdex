@@ -1,0 +1,101 @@
+- **[BLOCKER] Ordering correctness is fixed for the original stale-snapshot bug, but only if worker evaluation is monotone in “newer snapshot than described.”**
+  - Moving `try_send` to immediately after `inner.store(...)` does fix the specific race described: the worker can no longer dequeue an item and `inner.load()` a snapshot *older* than the flush cycle that produced that item.
+  - The remaining possibility is that the worker dequeues item **N** after **N+1** (or later) has already published, so `inner.load()` returns a newer snapshot than the one the item was derived from.
+  - That is usually the right contract for async maintenance: decisions should be made against “current truth,” not historical truth. Given your description that the worker “coalesces across adjacent items” and evaluates filter/sort maintenance against the loaded snapshot’s bitmap state, this seems intentional and sound.
+  - The key invariant required is: **work items must describe “which cache entries/fields/sorts might need reevaluation,” not “the exact membership deltas to apply blindly.”** If worker apply logic re-checks membership/sort presence against the loaded snapshot before mutating cache entries, then newer is safe and actually preferable.
+  - I don’t see the worker code here, so I can’t fully prove that. But based on the stated architecture (“evaluate against that snapshot's bitmap state”), this PR is aligned with that model.
+  - If there is *any* place in worker apply logic that treats the work item’s insert/remove sets as authoritative deltas rather than reevaluation triggers, then newer-than-produced could still be wrong. I’d recommend an explicit code comment either in `CacheWorkItem` or worker dequeue path stating the contract: **items may be evaluated against any snapshot published after the producing flush; worker must derive final membership from loaded snapshot, not from item-relative historical assumptions.**
+
+- **[MAJOR] Coalescer lifetime/use-after-scope looks logically fine, but this patch now depends on a subtle lifetime/immutability contract that should be documented.**
+  - The new post-publish fallback reads:
+    - `coalescer.mutated_filter_fields()`
+    - `coalescer.mutated_sort_slots()`
+    - `coalescer.has_alive_mutations()`
+    - `coalescer.alive_removes()`
+  - From your note, the flush thread later also reads coalescer for ops-log append, so yes, this strongly implies the coalescer remains valid and semantically unchanged at this point in the cycle.
+  - I agree with the assumption: if coalescer were mutated/cleared between the pre-publish build and this post-publish fallback, the existing later users would already be suspect.
+  - That said, this fallback now makes correctness depend on **coalescer data remaining stable across publish**. Since that’s a non-obvious coupling, I’d add a short comment right above the fallback like:
+    - “Safe to read coalescer here: it is still the current flush cycle’s immutable grouped output and is consumed later in the same cycle as well.”
+  - Without that, a future refactor that clears/rotates coalescer immediately after publish could silently break the fallback path only.
+
+- **[MINOR] Lock ordering / interleaving with worker appears acceptable; I don’t see a deadlock risk from the diff alone.**
+  - The post-publish backpressure fallback now acquires `flush_unified_cache.lock()` after publish.
+  - The worker also locks unified cache during apply.
+  - So yes, the flush thread can now block briefly behind a worker apply in the fallback path.
+  - I think this is acceptable for the reason you gave: this only happens on `try_send` failure, i.e. bounded backpressure / degraded mode, not the normal async fast path.
+  - Importantly, this does **not** reintroduce the old inline maintenance cost in the common case; it only reintroduces some cache-lock stall in the exceptional path.
+  - I don’t see an obvious lock-order inversion in the shown code. The worker takes `inner.load()` and later cache lock; this path has already published and then only takes cache lock. If elsewhere there is a path that holds cache lock and waits on something involving flush progress, that’d be worth checking, but nothing in this diff raises a new deadlock pattern by itself.
+  - If you want to be extra defensive, a comment noting “fallback may briefly block behind worker apply; acceptable because channel-full is exceptional” would help reviewers/operators.
+
+- **[MINOR] `pending_async_work.take()` logic is correct.**
+  - Behavior after the patch:
+    - `flush_cache_work_tx.is_none()` → skip async build entirely; inline path runs unchanged.
+    - `Some(tx)` + empty work item → `pending_async_work` remains `None`; post-publish block no-ops.
+    - `Some(tx)` + non-empty work item → `pending_async_work = Some(work_item)`; post-publish attempts `try_send`.
+  - The pattern:
+    ```rust
+    if let (Some(ref work_tx), Some(work_item)) =
+        (&flush_cache_work_tx, pending_async_work.take())
+    ```
+    is correct and avoids double-send.
+  - This is a good shape because it also re-checks the sender presence at send time without needing to hold a borrow across publish.
+
+- **[MAJOR] Backpressure fallback semantics look materially closer to inline, but I would not call them fully “mirrored” without checking exact inline ordering and conditions.**
+  - The new fallback now includes:
+    - `tombstone_unloaded_for_filter`
+    - `tombstone_unloaded_for_sort`
+    - `tombstone_all_unloaded` when alive removes occurred
+    - `remove_slots_from_all_batch` for alive removes
+    - `maintain_alive_changes`
+  - This definitely closes the previously described correctness gap for paged-out persistent entries.
+  - I agree with your core claim that pre/post publish should be equivalent for `UnifiedCache` tombstoning because the cache metadata lives outside the engine snapshot and doesn’t get swapped by `inner.store(...)`.
+  - Two caveats:
+    1. **Equivalence depends on no other side effects between old inline point and new fallback point mutating unified cache metadata.**
+       - From the diff, publish happens before fallback, then stale field marking happens after fallback. That seems okay.
+       - If there are no other writes to `flush_unified_cache` in between, semantics should match.
+    2. **You say inline on alive removes “tombstones the entire unloaded set.”** The fallback conditions use:
+       ```rust
+       if coalescer.has_alive_mutations() && !coalescer.alive_removes().is_empty()
+       ```
+       - The `has_alive_mutations()` conjunct looks redundant if `alive_removes()` being non-empty already implies alive mutation activity.
+       - Not wrong, but worth sanity-checking against inline path for exact condition parity. If inline keys solely on `alive_removes().is_empty()`, I’d match that exactly for readability and future drift prevention.
+  - Net: I think the semantic fix is right, but I’d avoid overstating it as “mirrors inline” unless the exact branch conditions were mechanically matched.
+
+- **[MINOR] Metrics look mostly consistent; one thing to watch is whether `flush_cache_ns` intentionally excludes fallback work.**
+  - Good:
+    - `backpressure_invalidations_total` still increments once per fallback event.
+    - `flush_tombstones_created` now increments in this fallback too, which fixes the prior observability gap.
+  - Questionable-but-probably-intentional:
+    - `flush_cache_ns` still measures only work-item build time, not post-publish send/fallback invalidation time.
+    - Your commit message explicitly says that’s unchanged and intentional.
+  - That’s okay if `flush_cache_ns` is defined as “flush-thread maintenance-prep time.” If operators expect it to reflect all flush-thread cache-maintenance cost, fallback lock/tombstone time will remain invisible there.
+  - Not necessarily a bug, just a metric-definition issue. If this fallback becomes non-rare, current metrics may understate flush-thread latency attributable to cache maintenance.
+
+- **[MINOR] Inline path appears unchanged from the diff shown.**
+  - The `else { /* inline */ }` block is untouched.
+  - The only change before publish in the async arm is replacing immediate `try_send`/fallback with `pending_async_work = Some(work_item)`.
+  - So yes: for `async_maintenance = false`, behavior looks byte-for-byte identical based on this diff.
+  - I’d still run a focused diff or test around the surrounding scope to ensure no moved declarations (`pending_async_work`, timing var placement) altered any compile-time borrow shaping, but semantically the inline branch is unchanged.
+
+- **[MINOR] Fallback steady-state cost is probably acceptable, but it’s worth calling out that degraded mode is now intentionally more expensive.**
+  - If the worker is persistently slow and channel-full becomes common, the fallback path now does more under the cache lock than before.
+  - That is the correct tradeoff for correctness: the previous behavior was cheaper because it was incomplete.
+  - Since the channel is intended to absorb ordinary bursts, this should remain rare in healthy operation.
+  - If it doesn’t remain rare, the right fix is capacity/throughput tuning, not weakening fallback semantics again.
+  - Operationally, this makes `backpressure_invalidations_total` more important as an alerting signal; if that counter climbs, you’re effectively running a more synchronous invalidation mode.
+
+- **[NIT] Comment/doc wording could more explicitly encode the “newer snapshot is allowed” contract.**
+  - Current docstring fix accurately documents “send after publish.”
+  - I’d add one more sentence, somewhere near worker dequeue or `CacheWorkItem`:
+    - “A work item may be evaluated against a snapshot newer than the one whose coalesced mutations produced it; worker logic must derive final cache membership from the loaded snapshot.”
+  - That would make the intended monotonicity explicit and prevent future reviewers from “optimizing” back toward historical-delta semantics.
+
+- **[NIT] Small readability cleanup: eliminate redundant `has_alive_mutations()` check if `alive_removes()` suffices.**
+  - This is not a correctness issue if both are consistent.
+  - But if the real condition for `tombstone_all_unloaded` is “there were alive removes,” then:
+    ```rust
+    if !coalescer.alive_removes().is_empty() { ... }
+    ```
+    is simpler and better matches your prose.
+
+**Verdict: REQUEST-CHANGES** — fix/document the worker contract around evaluating items against newer snapshots (or point to the code proving it), then this looks good.
