@@ -231,6 +231,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "dashmap",
+ "flate2",
  "futures-core",
  "futures-util",
  "memmap2",

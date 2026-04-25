@@ -145,7 +145,12 @@ The relay binds the same port the bitdex-server container does (3000). It passes
    - Subscribes a fresh receiver. Streams events as `id: {seq_id}\ndata: {json}\n\n`.
    - On `RecvError::Lagged(n)`: emit `: lagged {n}\n\n` (SSE comment), keep looping. **Do not panic, do not exit the task.**
    - On client disconnect: drop receiver, decrement `relay_sse_subscribers` gauge.
-   - Headers: `X-Accel-Buffering: no`, `Cache-Control: no-cache`.
+   - Headers (explicit, do not rely on axum defaults; reverse proxy may override):
+     - `X-Accel-Buffering: no` (Cloudflare/Traefik buffer otherwise; events arrive in ~60s bursts)
+     - `Cache-Control: no-cache`
+     - `Content-Type: text/event-stream`
+   - `KeepAlive::default()` matches existing `bitdex-server` `handle_query_stream` (keeps connection open across idle gaps).
+   - Lift verbatim from `bitdex-server` `handle_query_stream` (`src/server.rs:5510-5555`); only addition is the `:lagged N` SSE comment + `id:` line per event.
 
 9. **Probes**:
    - `GET /api/health` (matches existing bitdex-server probe path) — always 200 once bound. Returns `{"status":"ok","mode":"relay"}`.
@@ -274,9 +279,9 @@ GPT review flagged the V2 doc's "no XFF = internal" bypass as unsafe. V3 splits 
 
 Stub responses must match what current callers parse. Smoke before prod flip:
 
-- **PG-sync `bitdex_client.rs`** — confirm it accepts arbitrary `accepted` value (or any 200) and doesn't fail on `{"accepted":0}` literally. If it does parse the count, switch the relay to template `{"accepted":{body.ops|length}}` (V2 templating) or just return raw 200 without body.
+- **PG-sync `bitdex_client.rs`** — verified safe by Donovan (2026-04-25). `BitdexClient::post_ops` (`src/pg_sync/bitdex_client.rs:268-283`) only checks `resp.status().is_success()`; doesn't deserialize body. `{"accepted": 0}` is fine; empty 200 is fine. No retry-forever risk.
 - **`/api/health`** — match the current shape `{"status":"ok"}` plus added `mode` field. Verify K8s probes don't enforce a strict schema.
-- **Model-share / shadow-mode query callers** — verify they tolerate empty `ids: []` + `total_matched: 0` without alarming. Shadow-mode comparison may treat empty-vs-Meili-non-empty as a divergence and spam alerts. Coordinate with Donovan.
+- **Model-share / shadow-mode query callers** — **HARD BLOCKER for prod flip.** Per Donovan (2026-04-25), the comparator at `src/server/bitdex/{client.ts,compare.ts}` in the model-share repo has **no existing `tee_mode` handling**. When relay flips on, every query returns `{"ids":[],"total_matched":0,"tee_mode":true}` while Meili returns real results → 100% divergence on every query → alert spam. **Fix required before relay window:** model-share's `compare.ts` checks `response.tee_mode === true` early and skips comparator path entirely (no record, no divergence count, no alert). Owner: needs assignment (Donovan offline on model-share; coordinate with Aidan or Justin to land the model-share PR).
 
 If any caller breaks on the stub shape, surface as a blocker before prod flip.
 
@@ -320,8 +325,9 @@ Per Justin's clarification 2026-04-25: env-var-dispatch lean. Single image, `BIT
    - Local rig connected to `https://bitdex.civitai.com/events/{channel}` BEFORE flip (else first window of events lost).
    - Capture enabled if any data must be guaranteed durable.
    - Operator acknowledges PG-sync divergence invariant (see §12.1).
-   - Resource requests **NOT** lowered (see §9.6 scheduling trap).
-   - Shadow-mode comparison muted or accepting tee-mode shape.
+   - Resource requests **NOT** lowered (see §9.6 scheduling trap), unless aggressive mode opt-in (§9.6.1).
+   - **Model-share `compare.ts` lands `tee_mode === true` skip path BEFORE flip** (hard blocker — see §7.5 + §12.7).
+   - WAL retention window confirmed > expected relay window (for cheap WAL-replay reseed on flip-back).
 8. Prod flip — `kubectl set env statefulset/bitdex BITDEX_MODE=relay`. Pod restarts on relay mode at the same image tag.
 9. Local rig consumes events. Verifier runs.
 10. Flip back when done — `kubectl set env statefulset/bitdex BITDEX_MODE=server`. Pod restarts on server mode.
@@ -589,11 +595,11 @@ If `BITDEX_ADMIN_TOKEN` is unset and any route requires bearer, relay refuses to
 6. PodSecurity housekeeping: same commit as relay rollout, or separate?
 7. Reseed runbook (§9.7) — does the existing `.claude/skills/deploy/` cover the post-flip-back wipe + dump path, or do we need a new skill?
 
-### Donovan
-1. `src/bin/server.rs` entrypoint dispatch — happy with `if env("BITDEX_MODE") == "relay" { run_relay_main() }` early in `main()`, before any heavy bootstrap?
-2. PG-sync `bitdex_client.rs` ops POST — confirm it tolerates `{"accepted":0}` literally and doesn't fail on a constant zero count.
-3. Shadow-mode comparison side: any pre-existing path that surfaces "tee_mode" responses gracefully, or do we need to add muting?
-4. SSE `BroadcastStream` patterns from your `handle_query_stream` (`src/server.rs`) — relay copies your `X-Accel-Buffering: no` header pattern. OK to lift?
+### Donovan (answered 2026-04-25)
+1. ✅ Entrypoint dispatch hook — branch right after `parse_config()` in `src/bin/server.rs:264-310`, before `BitdexServer::new`. Mirror panic_hook + tracing init in the relay branch.
+2. ✅ PG-sync `bitdex_client.rs` `accepted` tolerance — doesn't deserialize body; only checks `status().is_success()`. `{"accepted":0}` safe.
+3. ⚠️ Model-share shadow comparator — **no existing `tee_mode` handling**. Hard blocker; needs PR to model-share's `compare.ts` to skip comparator on `response.tee_mode === true` BEFORE relay flip. See §7.5 + §12.7.
+4. ✅ SSE pattern — lift `handle_query_stream` verbatim. Add `Cache-Control: no-cache` + explicit `Content-Type: text/event-stream` (axum sets but reverse proxy may override). `KeepAlive::default()` keeps connection open across idle gaps.
 
 ---
 

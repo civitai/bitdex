@@ -279,6 +279,25 @@ async fn main() {
         .compact()
         .init();
 
+    // Mode dispatch: BITDEX_MODE=relay swaps in the relay surface and
+    // skips the bitmap-engine bootstrap entirely. Default = server.
+    let mode = std::env::var("BITDEX_MODE").unwrap_or_else(|_| "server".into());
+    if mode == "relay" {
+        let cfg_path = std::env::var("BITDEX_RELAY_CONFIG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/etc/bitdex/relay-config.yaml"));
+        let listen = Some(std::net::SocketAddr::from(([0, 0, 0, 0], config.port)));
+        eprintln!("BitDex (mode=relay) — config: {}", cfg_path.display());
+        if let Err(e) = bitdex_v2::relay::run(cfg_path, listen).await {
+            eprintln!("Relay failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    } else if mode != "server" {
+        eprintln!("Unknown BITDEX_MODE='{mode}'; expected 'server' or 'relay'.");
+        std::process::exit(1);
+    }
+
     // Ensure data directory exists
     if !config.data_dir.exists() {
         std::fs::create_dir_all(&config.data_dir).expect("Failed to create data directory");
