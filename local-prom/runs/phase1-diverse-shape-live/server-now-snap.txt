@@ -1,0 +1,609 @@
+# HELP bitdex_alive_documents Number of live documents
+# TYPE bitdex_alive_documents gauge
+bitdex_alive_documents{index="civitai"} 110575690
+# HELP bitdex_boot_phase_seconds Duration of each boot phase in seconds
+# TYPE bitdex_boot_phase_seconds gauge
+bitdex_boot_phase_seconds{phase="auto_warm"} 0
+bitdex_boot_phase_seconds{phase="bound_cache"} 0
+bitdex_boot_phase_seconds{phase="config_load"} 0
+bitdex_boot_phase_seconds{phase="dictionary_load"} 0
+bitdex_boot_phase_seconds{phase="eager_fields"} 0
+bitdex_boot_phase_seconds{phase="engine_create"} 149
+bitdex_boot_phase_seconds{phase="metrics_bridge"} 0
+# HELP bitdex_boundstore_bytes_read_total Cumulative bytes read from bounds
+# TYPE bitdex_boundstore_bytes_read_total gauge
+bitdex_boundstore_bytes_read_total{index="civitai"} 0
+# HELP bitdex_boundstore_bytes_written_total Cumulative bytes written to bounds
+# TYPE bitdex_boundstore_bytes_written_total gauge
+bitdex_boundstore_bytes_written_total{index="civitai"} 0
+# HELP bitdex_boundstore_disk_bytes Total bounds directory size on disk
+# TYPE bitdex_boundstore_disk_bytes gauge
+bitdex_boundstore_disk_bytes{index="civitai"} 314545979
+# HELP bitdex_boundstore_entries_restored_total Cumulative entries loaded from shard
+# TYPE bitdex_boundstore_entries_restored_total gauge
+bitdex_boundstore_entries_restored_total{index="civitai"} 62886
+# HELP bitdex_boundstore_meta_entries Cache entries registered in meta-index
+# TYPE bitdex_boundstore_meta_entries gauge
+bitdex_boundstore_meta_entries{index="civitai"} 75618
+# HELP bitdex_boundstore_pending_shards Shards awaiting lazy load
+# TYPE bitdex_boundstore_pending_shards gauge
+bitdex_boundstore_pending_shards{index="civitai"} 0
+# HELP bitdex_boundstore_shard_loads_total Cumulative shard load events
+# TYPE bitdex_boundstore_shard_loads_total gauge
+bitdex_boundstore_shard_loads_total{index="civitai"} 5
+# HELP bitdex_boundstore_tombstones Current tombstone count
+# TYPE bitdex_boundstore_tombstones gauge
+bitdex_boundstore_tombstones{index="civitai"} 11
+# HELP bitdex_boundstore_tombstones_cleaned_total Cumulative tombstones cleaned
+# TYPE bitdex_boundstore_tombstones_cleaned_total gauge
+bitdex_boundstore_tombstones_cleaned_total{index="civitai"} 0
+# HELP bitdex_boundstore_tombstones_created_total Cumulative tombstones created
+# TYPE bitdex_boundstore_tombstones_created_total gauge
+bitdex_boundstore_tombstones_created_total{index="civitai"} 0
+# HELP bitdex_cache_backpressure_invalidations_total Number of times the flush thread's try_send to the cache worker failed (channel full) and fell back to invalidation.
+# TYPE bitdex_cache_backpressure_invalidations_total gauge
+bitdex_cache_backpressure_invalidations_total{index="civitai"} 0
+# HELP bitdex_cache_bytes Unified cache memory bytes
+# TYPE bitdex_cache_bytes gauge
+bitdex_cache_bytes{index="civitai"} 249100786
+# HELP bitdex_cache_entries Unified cache entry count
+# TYPE bitdex_cache_entries gauge
+bitdex_cache_entries{index="civitai"} 75622
+# HELP bitdex_cache_entries_expanded Cache entries at expanded capacity (radix)
+# TYPE bitdex_cache_entries_expanded gauge
+bitdex_cache_entries_expanded{index="civitai"} 19
+# HELP bitdex_cache_entries_initial Cache entries at initial capacity (sorted vec)
+# TYPE bitdex_cache_entries_initial gauge
+bitdex_cache_entries_initial{index="civitai"} 75603
+# HELP bitdex_cache_evictions_total Cache entries evicted by LRU
+# TYPE bitdex_cache_evictions_total gauge
+bitdex_cache_evictions_total{index="civitai"} 0
+# HELP bitdex_cache_extensions_total Cumulative cache entry expansions from initial to expanded
+# TYPE bitdex_cache_extensions_total gauge
+bitdex_cache_extensions_total{index="civitai"} 0
+# HELP bitdex_cache_hits_total Unified cache cumulative hits
+# TYPE bitdex_cache_hits_total gauge
+bitdex_cache_hits_total{index="civitai"} 580199
+# HELP bitdex_cache_inserts_total Cache entries created
+# TYPE bitdex_cache_inserts_total gauge
+bitdex_cache_inserts_total{index="civitai"} 18448
+# HELP bitdex_cache_invalidations_total Cache entries invalidated by field changes
+# TYPE bitdex_cache_invalidations_total gauge
+bitdex_cache_invalidations_total{index="civitai"} 0
+# HELP bitdex_cache_maint_sort_work_items Number of sort-maintenance work items collected in the most recent cache-maintenance cycle. Denominator for the filter-shape collapse ratio (see cache_maint_unique_filter_shapes).
+# TYPE bitdex_cache_maint_sort_work_items gauge
+bitdex_cache_maint_sort_work_items{index="civitai"} 0
+# HELP bitdex_cache_maint_sort_work_items_max Maximum observed sort-maintenance work item count in a single cache-maintenance cycle since boot. Denominator for the burst-time filter-shape collapse ratio.
+# TYPE bitdex_cache_maint_sort_work_items_max gauge
+bitdex_cache_maint_sort_work_items_max{index="civitai"} 0
+# HELP bitdex_cache_maint_unique_filter_shapes Number of unique canonical filter-clause vectors across sort-maintenance work items in the most recent cache-maintenance cycle. Compare to cache_maint_sort_work_items to get the collapse factor (shapes/items). Low collapse = many entries share filters, filter-shape grouping in Phase B would pay off. High collapse = filters are diverse.
+# TYPE bitdex_cache_maint_unique_filter_shapes gauge
+bitdex_cache_maint_unique_filter_shapes{index="civitai"} 0
+# HELP bitdex_cache_maint_unique_filter_shapes_max Maximum observed unique canonical filter-clause vectors in a single cache-maintenance cycle since boot. Captures burst-time peaks that the last-cycle gauge can miss on quiet samples.
+# TYPE bitdex_cache_maint_unique_filter_shapes_max gauge
+bitdex_cache_maint_unique_filter_shapes_max{index="civitai"} 0
+# HELP bitdex_cache_misses_total Unified cache cumulative misses
+# TYPE bitdex_cache_misses_total gauge
+bitdex_cache_misses_total{index="civitai"} 36896
+# HELP bitdex_cache_prefetch_total Cumulative prefetch triggers for background expansion
+# TYPE bitdex_cache_prefetch_total gauge
+bitdex_cache_prefetch_total{index="civitai"} 0
+# HELP bitdex_cache_updates_total Cache entries updated by maintenance
+# TYPE bitdex_cache_updates_total gauge
+bitdex_cache_updates_total{index="civitai"} 0
+# HELP bitdex_cache_wall_hits_total Cumulative cache wall hits (cursor past cached entries)
+# TYPE bitdex_cache_wall_hits_total gauge
+bitdex_cache_wall_hits_total{index="civitai"} 0
+# HELP bitdex_cache_worker_cycle_nanos Duration of the most recent async cache worker cycle in nanoseconds.
+# TYPE bitdex_cache_worker_cycle_nanos gauge
+bitdex_cache_worker_cycle_nanos{index="civitai"} 401829000
+# HELP bitdex_cache_worker_cycles_total Total number of completed async cache worker cycles.
+# TYPE bitdex_cache_worker_cycles_total gauge
+bitdex_cache_worker_cycles_total{index="civitai"} 39
+# HELP bitdex_cache_worker_drops_total Number of times the cache worker backlog exceeded the drop limit and fell back to invalidation.
+# TYPE bitdex_cache_worker_drops_total gauge
+bitdex_cache_worker_drops_total{index="civitai"} 0
+# HELP bitdex_cache_worker_items_coalesced_total Cumulative count of CacheWorkItems merged by the coalescing step. Coalescing ratio = items_coalesced / cycles.
+# TYPE bitdex_cache_worker_items_coalesced_total gauge
+bitdex_cache_worker_items_coalesced_total{index="civitai"} 39
+# HELP bitdex_cache_worker_over_budget_total Number of cache entries that timed out during worker evaluation and were marked for rebuild.
+# TYPE bitdex_cache_worker_over_budget_total gauge
+bitdex_cache_worker_over_budget_total{index="civitai"} 63073
+# HELP bitdex_cache_worker_queue_depth Number of pending CacheWorkItems in the async cache worker channel.
+# TYPE bitdex_cache_worker_queue_depth gauge
+bitdex_cache_worker_queue_depth{index="civitai"} 0
+# HELP bitdex_compact_duration_seconds Compact endpoint total duration
+# TYPE bitdex_compact_duration_seconds histogram
+bitdex_compact_duration_seconds_bucket{le="1"} 0
+bitdex_compact_duration_seconds_bucket{le="5"} 0
+bitdex_compact_duration_seconds_bucket{le="10"} 0
+bitdex_compact_duration_seconds_bucket{le="30"} 0
+bitdex_compact_duration_seconds_bucket{le="60"} 0
+bitdex_compact_duration_seconds_bucket{le="120"} 0
+bitdex_compact_duration_seconds_bucket{le="300"} 0
+bitdex_compact_duration_seconds_bucket{le="600"} 0
+bitdex_compact_duration_seconds_bucket{le="+Inf"} 0
+bitdex_compact_duration_seconds_sum 0
+bitdex_compact_duration_seconds_count 0
+# HELP bitdex_compact_running Whether a compact endpoint task is currently running (0 or 1)
+# TYPE bitdex_compact_running gauge
+bitdex_compact_running 0
+# HELP bitdex_compact_runs_total Total compact endpoint invocations
+# TYPE bitdex_compact_runs_total counter
+bitdex_compact_runs_total 0
+# HELP bitdex_compact_shards_compacted Shards actually compacted in current/last compact run
+# TYPE bitdex_compact_shards_compacted gauge
+bitdex_compact_shards_compacted 0
+# HELP bitdex_compact_shards_scanned Shards scanned in current/last compact run
+# TYPE bitdex_compact_shards_scanned gauge
+bitdex_compact_shards_scanned 0
+# HELP bitdex_compact_shards_skipped Shards skipped (already clean) in current/last compact run
+# TYPE bitdex_compact_shards_skipped gauge
+bitdex_compact_shards_skipped 0
+# HELP bitdex_compaction_skipped_total Compactions skipped (channel full)
+# TYPE bitdex_compaction_skipped_total gauge
+bitdex_compaction_skipped_total{index="civitai"} 0
+# HELP bitdex_doc_cache_bytes Document cache memory bytes
+# TYPE bitdex_doc_cache_bytes gauge
+bitdex_doc_cache_bytes{index="civitai"} 978655968
+# HELP bitdex_doc_cache_entries Document cache entry count
+# TYPE bitdex_doc_cache_entries gauge
+bitdex_doc_cache_entries{index="civitai"} 207500
+# HELP bitdex_doc_cache_evictions_total Document cache cumulative evictions
+# TYPE bitdex_doc_cache_evictions_total gauge
+bitdex_doc_cache_evictions_total{index="civitai"} 143146
+# HELP bitdex_doc_cache_generations Document cache active generation count
+# TYPE bitdex_doc_cache_generations gauge
+bitdex_doc_cache_generations{index="civitai"} 5
+# HELP bitdex_doc_cache_hit_total Document cache cumulative hits
+# TYPE bitdex_doc_cache_hit_total gauge
+bitdex_doc_cache_hit_total{index="civitai"} 8861585
+# HELP bitdex_doc_cache_miss_total Document cache cumulative misses
+# TYPE bitdex_doc_cache_miss_total gauge
+bitdex_doc_cache_miss_total{index="civitai"} 354317
+# HELP bitdex_docstore_concurrent_reads Number of concurrent docstore reads in progress
+# TYPE bitdex_docstore_concurrent_reads gauge
+bitdex_docstore_concurrent_reads 13
+# HELP bitdex_docstore_put_batch_fast_path_total Cumulative count of DocStoreV3::put_batch_known_fields invocations that took the concurrent-read fast path (field dict already contained all batch fields). Ratio with slow_path tells us how often we avoid the outer RwLock write guard.
+# TYPE bitdex_docstore_put_batch_fast_path_total gauge
+bitdex_docstore_put_batch_fast_path_total{index="civitai"} 0
+# HELP bitdex_docstore_put_batch_slow_path_total Cumulative count of DocStoreV3::put_batch calls (write-lock path), either from dict-update fallback or direct calls that bypass the fast path.
+# TYPE bitdex_docstore_put_batch_slow_path_total gauge
+bitdex_docstore_put_batch_slow_path_total{index="civitai"} 38
+# HELP bitdex_docstore_read_seconds Individual document read latency from disk
+# TYPE bitdex_docstore_read_seconds histogram
+bitdex_docstore_read_seconds_bucket{index="civitai",le="0.00001"} 7757073
+bitdex_docstore_read_seconds_bucket{index="civitai",le="0.0001"} 8858437
+bitdex_docstore_read_seconds_bucket{index="civitai",le="0.0005"} 8861009
+bitdex_docstore_read_seconds_bucket{index="civitai",le="0.001"} 8871347
+bitdex_docstore_read_seconds_bucket{index="civitai",le="0.005"} 9003971
+bitdex_docstore_read_seconds_bucket{index="civitai",le="0.01"} 9075933
+bitdex_docstore_read_seconds_bucket{index="civitai",le="0.05"} 9201142
+bitdex_docstore_read_seconds_bucket{index="civitai",le="0.1"} 9210936
+bitdex_docstore_read_seconds_bucket{index="civitai",le="0.5"} 9215886
+bitdex_docstore_read_seconds_bucket{index="civitai",le="1"} 9215889
+bitdex_docstore_read_seconds_bucket{index="civitai",le="+Inf"} 9215889
+bitdex_docstore_read_seconds_sum{index="civitai"} 4995.539144600396
+bitdex_docstore_read_seconds_count{index="civitai"} 9215889
+# HELP bitdex_filter_bitmap_bytes Filter bitmap memory per field
+# TYPE bitdex_filter_bitmap_bytes gauge
+bitdex_filter_bitmap_bytes{field="blockedFor",index="civitai"} 2645478
+bitdex_filter_bitmap_bytes{field="hasMeta",index="civitai"} 31953148
+bitdex_filter_bitmap_bytes{field="isPublished",index="civitai"} 28471962
+bitdex_filter_bitmap_bytes{field="isRemix",index="civitai"} 55814
+bitdex_filter_bitmap_bytes{field="minor",index="civitai"} 17086566
+bitdex_filter_bitmap_bytes{field="modelVersionIds",index="civitai"} 24723692
+bitdex_filter_bitmap_bytes{field="modelVersionIdsManual",index="civitai"} 84444
+bitdex_filter_bitmap_bytes{field="nsfwLevel",index="civitai"} 77379690
+bitdex_filter_bitmap_bytes{field="onSite",index="civitai"} 31661032
+bitdex_filter_bitmap_bytes{field="poi",index="civitai"} 17647468
+bitdex_filter_bitmap_bytes{field="postId",index="civitai"} 908100
+bitdex_filter_bitmap_bytes{field="postedToId",index="civitai"} 703886
+bitdex_filter_bitmap_bytes{field="tagIds",index="civitai"} 509160772
+bitdex_filter_bitmap_bytes{field="toolIds",index="civitai"} 4694418
+bitdex_filter_bitmap_bytes{field="userId",index="civitai"} 309707262
+# HELP bitdex_filter_bitmap_count Number of distinct bitmaps per filter field
+# TYPE bitdex_filter_bitmap_count gauge
+bitdex_filter_bitmap_count{field="blockedFor",index="civitai"} 84
+bitdex_filter_bitmap_count{field="hasMeta",index="civitai"} 2
+bitdex_filter_bitmap_count{field="isPublished",index="civitai"} 2
+bitdex_filter_bitmap_count{field="isRemix",index="civitai"} 1
+bitdex_filter_bitmap_count{field="minor",index="civitai"} 2
+bitdex_filter_bitmap_count{field="modelVersionIds",index="civitai"} 3058
+bitdex_filter_bitmap_count{field="modelVersionIdsManual",index="civitai"} 785
+bitdex_filter_bitmap_count{field="nsfwLevel",index="civitai"} 7
+bitdex_filter_bitmap_count{field="onSite",index="civitai"} 2
+bitdex_filter_bitmap_count{field="poi",index="civitai"} 2
+bitdex_filter_bitmap_count{field="postId",index="civitai"} 25094
+bitdex_filter_bitmap_count{field="postedToId",index="civitai"} 20216
+bitdex_filter_bitmap_count{field="tagIds",index="civitai"} 5602
+bitdex_filter_bitmap_count{field="toolIds",index="civitai"} 7
+bitdex_filter_bitmap_count{field="userId",index="civitai"} 769225
+# HELP bitdex_flush_apply_nanos Last flush apply_prepared duration in nanoseconds
+# TYPE bitdex_flush_apply_nanos gauge
+bitdex_flush_apply_nanos{index="civitai"} 11729100
+# HELP bitdex_flush_cache_nanos Last flush cache maintenance duration in nanoseconds
+# TYPE bitdex_flush_cache_nanos gauge
+bitdex_flush_cache_nanos{index="civitai"} 138200
+# HELP bitdex_flush_compact_nanos Last flush diff compaction duration in nanoseconds
+# TYPE bitdex_flush_compact_nanos gauge
+bitdex_flush_compact_nanos{index="civitai"} 200
+# HELP bitdex_flush_last_duration_nanos Most recent flush loop duration in nanoseconds
+# TYPE bitdex_flush_last_duration_nanos gauge
+bitdex_flush_last_duration_nanos{index="civitai"} 13470900
+# HELP bitdex_flush_opslog_nanos Last flush ops-log append duration in nanoseconds (runs after publish, not included in flush_last_duration_nanos)
+# TYPE bitdex_flush_opslog_nanos gauge
+bitdex_flush_opslog_nanos{index="civitai"} 33422000
+# HELP bitdex_flush_publish_nanos Last flush staging clone + ArcSwap publish duration in nanoseconds
+# TYPE bitdex_flush_publish_nanos gauge
+bitdex_flush_publish_nanos{index="civitai"} 1067200
+# HELP bitdex_flush_queue_depth Pending MutationOps in the write coalescer channel
+# TYPE bitdex_flush_queue_depth gauge
+bitdex_flush_queue_depth 0
+# HELP bitdex_flush_sort_promote_nanos Duration of the most recent sort-layer promote pass (merge_dirty across dirty sort fields) in nanoseconds. Sort-promote runs inside the flush thread but only fires every ~5s, so this gauge updates on promote cycles, NOT on every flush. A value of 0 means no promote has run since boot. Contributes to flush_last_duration_nanos on the cycle it fires.
+# TYPE bitdex_flush_sort_promote_nanos gauge
+bitdex_flush_sort_promote_nanos{index="civitai"} 342199000
+# HELP bitdex_flush_timebucket_nanos Last flush time bucket maintenance duration in nanoseconds
+# TYPE bitdex_flush_timebucket_nanos gauge
+bitdex_flush_timebucket_nanos{index="civitai"} 333500
+# HELP bitdex_http_response_seconds Full HTTP round-trip time from request arrival to response sent
+# TYPE bitdex_http_response_seconds histogram
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="0.001"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="0.005"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="0.01"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="0.025"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="0.05"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="0.1"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="0.25"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="0.5"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="1"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="2.5"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="5"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="10"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/config",le="+Inf"} 1
+bitdex_http_response_seconds_sum{method="GET",path="/api/config"} 0.0000433
+bitdex_http_response_seconds_count{method="GET",path="/api/config"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="0.001"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="0.005"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="0.01"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="0.025"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="0.05"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="0.1"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="0.25"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="0.5"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="1"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="2.5"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="5"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="10"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes",le="+Inf"} 4
+bitdex_http_response_seconds_sum{method="GET",path="/api/indexes"} 0.0002996
+bitdex_http_response_seconds_count{method="GET",path="/api/indexes"} 4
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="0.001"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="0.005"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="0.01"} 1
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="0.025"} 3
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="0.05"} 7
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="0.1"} 12
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="0.25"} 12
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="0.5"} 12
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="1"} 16
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="2.5"} 20
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="5"} 20
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="10"} 20
+bitdex_http_response_seconds_bucket{method="GET",path="/api/indexes/*/civitai",le="+Inf"} 20
+bitdex_http_response_seconds_sum{method="GET",path="/api/indexes/*/civitai"} 8.7095516
+bitdex_http_response_seconds_count{method="GET",path="/api/indexes/*/civitai"} 20
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="0.001"} 0
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="0.005"} 72
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="0.01"} 180
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="0.025"} 305
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="0.05"} 319
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="0.1"} 341
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="0.25"} 351
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="0.5"} 356
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="1"} 360
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="2.5"} 369
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="5"} 369
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="10"} 369
+bitdex_http_response_seconds_bucket{method="GET",path="/metrics",le="+Inf"} 369
+bitdex_http_response_seconds_sum{method="GET",path="/metrics"} 24.8564425
+bitdex_http_response_seconds_count{method="GET",path="/metrics"} 369
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="0.001"} 0
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="0.005"} 0
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="0.01"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="0.025"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="0.05"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="0.1"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="0.25"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="0.5"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="1"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="2.5"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="5"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="10"} 1
+bitdex_http_response_seconds_bucket{method="PATCH",path="/api/indexes/*/civitai",le="+Inf"} 1
+bitdex_http_response_seconds_sum{method="PATCH",path="/api/indexes/*/civitai"} 0.0093356
+bitdex_http_response_seconds_count{method="PATCH",path="/api/indexes/*/civitai"} 1
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="0.001"} 424997
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="0.005"} 539782
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="0.01"} 558148
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="0.025"} 566603
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="0.05"} 571961
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="0.1"} 576604
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="0.25"} 580612
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="0.5"} 582494
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="1"} 583765
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="2.5"} 585046
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="5"} 585533
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="10"} 585608
+bitdex_http_response_seconds_bucket{method="POST",path="/api/indexes/*/civitai",le="+Inf"} 585619
+bitdex_http_response_seconds_sum{method="POST",path="/api/indexes/*/civitai"} 7712.575090399967
+bitdex_http_response_seconds_count{method="POST",path="/api/indexes/*/civitai"} 585619
+# HELP bitdex_jemalloc_allocated_bytes Jemalloc stats.allocated — total bytes allocated by the application
+# TYPE bitdex_jemalloc_allocated_bytes gauge
+bitdex_jemalloc_allocated_bytes 0
+# HELP bitdex_jemalloc_resident_bytes Jemalloc stats.resident — RSS bytes accounted for by jemalloc
+# TYPE bitdex_jemalloc_resident_bytes gauge
+bitdex_jemalloc_resident_bytes 0
+# HELP bitdex_lazy_load_duration_seconds Time to lazy-load field bitmaps on first query
+# TYPE bitdex_lazy_load_duration_seconds histogram
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="0.001"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="0.01"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="0.05"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="0.1"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="0.5"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="1"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="5"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="10"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="30"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="isRemix",index="civitai",le="+Inf"} 1
+bitdex_lazy_load_duration_seconds_sum{field="isRemix",index="civitai"} 0.0156414
+bitdex_lazy_load_duration_seconds_count{field="isRemix",index="civitai"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="0.001"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="0.01"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="0.05"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="0.1"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="0.5"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="1"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="5"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="10"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="30"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="minor",index="civitai",le="+Inf"} 1
+bitdex_lazy_load_duration_seconds_sum{field="minor",index="civitai"} 0.0262307
+bitdex_lazy_load_duration_seconds_count{field="minor",index="civitai"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="0.001"} 490
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="0.01"} 1816
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="0.05"} 2315
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="0.1"} 2345
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="0.5"} 2361
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="1"} 2361
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="5"} 2361
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="10"} 2361
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="30"} 2361
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIds",index="civitai",le="+Inf"} 2361
+bitdex_lazy_load_duration_seconds_sum{field="modelVersionIds",index="civitai"} 19.361345299999964
+bitdex_lazy_load_duration_seconds_count{field="modelVersionIds",index="civitai"} 2361
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="0.001"} 244
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="0.01"} 413
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="0.05"} 438
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="0.1"} 439
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="0.5"} 439
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="1"} 439
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="5"} 439
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="10"} 439
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="30"} 439
+bitdex_lazy_load_duration_seconds_bucket{field="modelVersionIdsManual",index="civitai",le="+Inf"} 439
+bitdex_lazy_load_duration_seconds_sum{field="modelVersionIdsManual",index="civitai"} 1.1909054000000001
+bitdex_lazy_load_duration_seconds_count{field="modelVersionIdsManual",index="civitai"} 439
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="0.001"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="0.01"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="0.05"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="0.1"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="0.5"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="1"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="5"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="10"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="30"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="poi",index="civitai",le="+Inf"} 1
+bitdex_lazy_load_duration_seconds_sum{field="poi",index="civitai"} 0.0611508
+bitdex_lazy_load_duration_seconds_count{field="poi",index="civitai"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="0.001"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="0.01"} 5779
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="0.05"} 7080
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="0.1"} 7161
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="0.5"} 7180
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="1"} 7180
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="5"} 7180
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="10"} 7180
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="30"} 7180
+bitdex_lazy_load_duration_seconds_bucket{field="postId",index="civitai",le="+Inf"} 7180
+bitdex_lazy_load_duration_seconds_sum{field="postId",index="civitai"} 52.79274239999998
+bitdex_lazy_load_duration_seconds_count{field="postId",index="civitai"} 7180
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="0.001"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="0.01"} 1498
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="0.05"} 2229
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="0.1"} 2285
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="0.5"} 2308
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="1"} 2308
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="5"} 2308
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="10"} 2308
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="30"} 2308
+bitdex_lazy_load_duration_seconds_bucket{field="postedToId",index="civitai",le="+Inf"} 2308
+bitdex_lazy_load_duration_seconds_sum{field="postedToId",index="civitai"} 27.357006099999946
+bitdex_lazy_load_duration_seconds_count{field="postedToId",index="civitai"} 2308
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="0.001"} 14
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="0.01"} 52
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="0.05"} 116
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="0.1"} 117
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="0.5"} 118
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="1"} 118
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="5"} 118
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="10"} 118
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="30"} 118
+bitdex_lazy_load_duration_seconds_bucket{field="tagIds",index="civitai",le="+Inf"} 118
+bitdex_lazy_load_duration_seconds_sum{field="tagIds",index="civitai"} 1.7459509999999998
+bitdex_lazy_load_duration_seconds_count{field="tagIds",index="civitai"} 118
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="0.001"} 0
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="0.01"} 1
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="0.05"} 3
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="0.1"} 3
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="0.5"} 3
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="1"} 3
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="5"} 3
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="10"} 3
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="30"} 3
+bitdex_lazy_load_duration_seconds_bucket{field="techniqueIds",index="civitai",le="+Inf"} 3
+bitdex_lazy_load_duration_seconds_sum{field="techniqueIds",index="civitai"} 0.0367398
+bitdex_lazy_load_duration_seconds_count{field="techniqueIds",index="civitai"} 3
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="0.001"} 2
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="0.01"} 8
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="0.05"} 10
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="0.1"} 10
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="0.5"} 10
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="1"} 10
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="5"} 10
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="10"} 10
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="30"} 10
+bitdex_lazy_load_duration_seconds_bucket{field="toolIds",index="civitai",le="+Inf"} 10
+bitdex_lazy_load_duration_seconds_sum{field="toolIds",index="civitai"} 0.0561716
+bitdex_lazy_load_duration_seconds_count{field="toolIds",index="civitai"} 10
+# HELP bitdex_pending_fields Filter+sort fields not yet loaded into memory
+# TYPE bitdex_pending_fields gauge
+bitdex_pending_fields{index="civitai"} 4
+# HELP bitdex_process_rss_bytes Process resident set size in bytes
+# TYPE bitdex_process_rss_bytes gauge
+bitdex_process_rss_bytes 0
+# HELP bitdex_process_rss_peak_bytes Peak process RSS in bytes since startup
+# TYPE bitdex_process_rss_peak_bytes gauge
+bitdex_process_rss_peak_bytes 0
+# HELP bitdex_queries_in_flight Queries currently executing
+# TYPE bitdex_queries_in_flight gauge
+bitdex_queries_in_flight 16
+# HELP bitdex_queries_in_flight_peak Peak concurrent queries since startup
+# TYPE bitdex_queries_in_flight_peak gauge
+bitdex_queries_in_flight_peak 16
+# HELP bitdex_queries_rejected_total Queries rejected by backpressure
+# TYPE bitdex_queries_rejected_total counter
+bitdex_queries_rejected_total 0
+# HELP bitdex_query_docs_seconds Document fetch from disk time
+# TYPE bitdex_query_docs_seconds histogram
+bitdex_query_docs_seconds_bucket{index="civitai",le="0.00001"} 5
+bitdex_query_docs_seconds_bucket{index="civitai",le="0.0001"} 389200
+bitdex_query_docs_seconds_bucket{index="civitai",le="0.0005"} 449873
+bitdex_query_docs_seconds_bucket{index="civitai",le="0.001"} 499594
+bitdex_query_docs_seconds_bucket{index="civitai",le="0.005"} 573749
+bitdex_query_docs_seconds_bucket{index="civitai",le="0.01"} 575335
+bitdex_query_docs_seconds_bucket{index="civitai",le="0.05"} 578582
+bitdex_query_docs_seconds_bucket{index="civitai",le="0.1"} 579792
+bitdex_query_docs_seconds_bucket{index="civitai",le="0.5"} 582922
+bitdex_query_docs_seconds_bucket{index="civitai",le="1"} 583950
+bitdex_query_docs_seconds_bucket{index="civitai",le="5"} 585374
+bitdex_query_docs_seconds_bucket{index="civitai",le="+Inf"} 585417
+bitdex_query_docs_seconds_sum{index="civitai"} 5113.615758999978
+bitdex_query_docs_seconds_count{index="civitai"} 585417
+# HELP bitdex_query_duration_seconds Query latency distribution
+# TYPE bitdex_query_duration_seconds histogram
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.00005"} 489819
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.0001"} 541259
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.00025"} 550743
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.0005"} 552241
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.001"} 553344
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.002"} 554792
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.005"} 557900
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.01"} 562776
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.025"} 570834
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.05"} 577135
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.1"} 582301
+bitdex_query_duration_seconds_bucket{index="civitai",le="0.5"} 585178
+bitdex_query_duration_seconds_bucket{index="civitai",le="1"} 585283
+bitdex_query_duration_seconds_bucket{index="civitai",le="5"} 585427
+bitdex_query_duration_seconds_bucket{index="civitai",le="10"} 585430
+bitdex_query_duration_seconds_bucket{index="civitai",le="+Inf"} 585430
+bitdex_query_duration_seconds_sum{index="civitai"} 1614.6572939000089
+bitdex_query_duration_seconds_count{index="civitai"} 585430
+# HELP bitdex_query_filter_clause_count Number of filter clauses (ANDs) per query
+# TYPE bitdex_query_filter_clause_count histogram
+bitdex_query_filter_clause_count_bucket{le="0"} 0
+bitdex_query_filter_clause_count_bucket{le="1"} 118659
+bitdex_query_filter_clause_count_bucket{le="2"} 163003
+bitdex_query_filter_clause_count_bucket{le="3"} 435473
+bitdex_query_filter_clause_count_bucket{le="4"} 438595
+bitdex_query_filter_clause_count_bucket{le="5"} 441092
+bitdex_query_filter_clause_count_bucket{le="6"} 454429
+bitdex_query_filter_clause_count_bucket{le="8"} 524176
+bitdex_query_filter_clause_count_bucket{le="10"} 580391
+bitdex_query_filter_clause_count_bucket{le="15"} 585431
+bitdex_query_filter_clause_count_bucket{le="20"} 585431
+bitdex_query_filter_clause_count_bucket{le="+Inf"} 585431
+bitdex_query_filter_clause_count_sum 2247863
+bitdex_query_filter_clause_count_count 585431
+# HELP bitdex_query_filter_seconds Bitmap filter evaluation time
+# TYPE bitdex_query_filter_seconds histogram
+bitdex_query_filter_seconds_bucket{index="civitai",le="0.00001"} 567395
+bitdex_query_filter_seconds_bucket{index="civitai",le="0.0001"} 578230
+bitdex_query_filter_seconds_bucket{index="civitai",le="0.0005"} 580212
+bitdex_query_filter_seconds_bucket{index="civitai",le="0.001"} 580396
+bitdex_query_filter_seconds_bucket{index="civitai",le="0.005"} 581042
+bitdex_query_filter_seconds_bucket{index="civitai",le="0.01"} 582924
+bitdex_query_filter_seconds_bucket{index="civitai",le="0.05"} 584818
+bitdex_query_filter_seconds_bucket{index="civitai",le="0.1"} 585335
+bitdex_query_filter_seconds_bucket{index="civitai",le="0.5"} 585416
+bitdex_query_filter_seconds_bucket{index="civitai",le="1"} 585417
+bitdex_query_filter_seconds_bucket{index="civitai",le="5"} 585417
+bitdex_query_filter_seconds_bucket{index="civitai",le="+Inf"} 585417
+bitdex_query_filter_seconds_sum{index="civitai"} 106.52421600000021
+bitdex_query_filter_seconds_count{index="civitai"} 585417
+# HELP bitdex_query_sort_seconds Bitmap sort traversal time
+# TYPE bitdex_query_sort_seconds histogram
+bitdex_query_sort_seconds_bucket{index="civitai",le="0.00001"} 567088
+bitdex_query_sort_seconds_bucket{index="civitai",le="0.0001"} 579275
+bitdex_query_sort_seconds_bucket{index="civitai",le="0.0005"} 581956
+bitdex_query_sort_seconds_bucket{index="civitai",le="0.001"} 582566
+bitdex_query_sort_seconds_bucket{index="civitai",le="0.005"} 583624
+bitdex_query_sort_seconds_bucket{index="civitai",le="0.01"} 584035
+bitdex_query_sort_seconds_bucket{index="civitai",le="0.05"} 585203
+bitdex_query_sort_seconds_bucket{index="civitai",le="0.1"} 585350
+bitdex_query_sort_seconds_bucket{index="civitai",le="0.5"} 585414
+bitdex_query_sort_seconds_bucket{index="civitai",le="1"} 585416
+bitdex_query_sort_seconds_bucket{index="civitai",le="5"} 585417
+bitdex_query_sort_seconds_bucket{index="civitai",le="+Inf"} 585417
+bitdex_query_sort_seconds_sum{index="civitai"} 57.94433099999382
+bitdex_query_sort_seconds_count{index="civitai"} 585417
+# HELP bitdex_query_total Total queries served
+# TYPE bitdex_query_total counter
+bitdex_query_total{index="civitai"} 585430
+# HELP bitdex_slot_bitmap_bytes Alive/slot bitmap memory
+# TYPE bitdex_slot_bitmap_bytes gauge
+bitdex_slot_bitmap_bytes{index="civitai"} 15998380
+# HELP bitdex_slot_high_water High-water slot counter
+# TYPE bitdex_slot_high_water gauge
+bitdex_slot_high_water{index="civitai"} 128612164
+# HELP bitdex_snapshot_publish_total Total ArcSwap snapshot publishes
+# TYPE bitdex_snapshot_publish_total gauge
+bitdex_snapshot_publish_total{index="civitai"} 39
+# HELP bitdex_sort_bitmap_bytes Sort bitmap memory per field
+# TYPE bitdex_sort_bitmap_bytes gauge
+bitdex_sort_bitmap_bytes{field="collectedCount",index="civitai"} 40737176
+bitdex_sort_bitmap_bytes{field="commentCount",index="civitai"} 1782948
+bitdex_sort_bitmap_bytes{field="existedAt",index="civitai"} 314274
+bitdex_sort_bitmap_bytes{field="id",index="civitai"} 280110
+bitdex_sort_bitmap_bytes{field="publishedAt",index="civitai"} 301080
+bitdex_sort_bitmap_bytes{field="reactionCount",index="civitai"} 79527492
+bitdex_sort_bitmap_bytes{field="sortAt",index="civitai"} 409268014
+# HELP bitdex_startup_duration_seconds Time spent loading bitmap indexes at startup
+# TYPE bitdex_startup_duration_seconds gauge
+bitdex_startup_duration_seconds 153
+# HELP bitdex_upsert_total Total upsert operations
+# TYPE bitdex_upsert_total counter
+bitdex_upsert_total{index="civitai"} 21201
+# HELP bitdex_wal_last_applied_timestamp_seconds Unix epoch of last successful WAL op application
+# TYPE bitdex_wal_last_applied_timestamp_seconds gauge
+bitdex_wal_last_applied_timestamp_seconds 0
+# HELP bitdex_wal_ops_processed_total Total ops successfully applied from WAL reader
+# TYPE bitdex_wal_ops_processed_total counter
+bitdex_wal_ops_processed_total 0
+# HELP bitdex_wal_ops_written_total Total ops written to WAL via POST /ops
+# TYPE bitdex_wal_ops_written_total counter
+bitdex_wal_ops_written_total 0
+# HELP bitdex_wal_read_cursor_bytes WAL reader cursor position in bytes
+# TYPE bitdex_wal_read_cursor_bytes gauge
+bitdex_wal_read_cursor_bytes 0

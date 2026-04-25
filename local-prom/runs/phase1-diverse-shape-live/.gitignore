@@ -1,0 +1,5 @@
+# stats.ndjson grows ~300MB per 25-min run (one snapshot per interval x
+# stats response body) and exceeds GitHub's 100MB hard limit. summary.json
+# captures the per-interval aggregates that matter; raw stats are kept
+# locally for ad-hoc analysis.
+stats.ndjson

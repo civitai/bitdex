@@ -1,0 +1,19 @@
+{
+  "label": "phase1-diverse-shape-live",
+  "started_at": "2026-04-25T19:37:04.610Z",
+  "duration_min": 25,
+  "interval_sec": 5,
+  "target": "http://localhost:3002",
+  "index": "civitai",
+  "baseline": null,
+  "probe": "none",
+  "gates": [
+    "always",
+    "doc_path",
+    "phase_1_async_cache"
+  ],
+  "git_rev": "6c7e6028c75abed02d4ce4c1a1c4b3b4a90c525a",
+  "server_config": {
+    "error": "Error: http://localhost:3002/api/config: 404"
+  }
+}

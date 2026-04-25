@@ -122,6 +122,23 @@ spec:
             summary: "BitDex lazy load p95 exceeds 5 seconds"
             description: "Field loading is taking {{ $value | humanizeDuration }} at p95. First queries after startup will stall."
 
+        # Async cache worker backpressure — flush thread fell back to
+        # conservative invalidation because the worker channel was full.
+        # Fires on any sustained occurrence: per the PR-#234 (post-publish
+        # enqueue + tombstone-mirror) ship gate, the fallback path is not
+        # exercised on local rigs because the 1024-deep channel + sub-second
+        # worker drain put it out of reach at sustainable rates. If this
+        # alert fires in prod, the worker is actually saturated — investigate
+        # write burst patterns, worker cycle_nanos, or `cache_worker_drops_total`.
+        - alert: BitdexCacheBackpressureFiring
+          expr: increase(bitdex_cache_backpressure_invalidations_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Async cache worker backpressure path is firing"
+            description: "Flush thread fell back to conservative invalidation {{ $value }} time(s) in the last 5m. Worker drain is not keeping up with flush cycle output. Check `bitdex_cache_worker_cycle_nanos`, `bitdex_cache_worker_queue_depth`, and write rate."
+
     - name: bitdex.wal
       rules:
         # WAL reader dead — processing zero ops when there's pending data

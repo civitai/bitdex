@@ -1,0 +1,20 @@
+Here is a critical review of the PR based on your requested points:
+
+*   **1. Ordering correctness**
+    *   **[MAJOR] Correct.** The post-publish `try_send` guarantees the worker loads a snapshot $\ge$ the one the work item was built against. If the worker is slow and loads a newer snapshot (e.g., N+1 for work item N), it evaluates the additions/removals against that newer state. This is safe and idempotent; the cache simply converges to the N+1 state for those items. This monotonicity directly fixes the stale-evaluation bug.
+*   **2. Coalescer borrow lifetime**
+    *   **[MINOR] Correct.** `inner.store()` does not mutate the `coalescer`. Because the coalescer is read later for the ops-log append, it remains in scope, valid, and immutable. The fallback block will read the exact same data as it would have pre-publish.
+*   **3. Lock ordering / interleaving with the worker**
+    *   **[MINOR] Acceptable.** If the worker is mid-apply, the flush thread will briefly block on `unified_cache.lock()` during fallback. This reintroduces a slight stall, but *only* under backpressure. This is actually a desirable natural throttle: it prevents the flush thread from running infinitely far ahead of a struggling worker, bounding the desync.
+*   **4. `pending_async_work.take()` correctness**
+    *   **[NIT] Correct.** `pending_async_work` is only populated if `flush_cache_work_tx` is `Some` and the work item is non-empty. The post-publish `if let (Some(_), Some(_))` cleanly requires both, ensuring the fallback only runs when async mode is active and there is actual work to send.
+*   **5. Backpressure fallback semantics**
+    *   **[MAJOR] Correct.** The inline path tombstones *before* publish (strict consistency). The async fallback tombstones *after* publish. This creates a tiny window where a reader could see the new snapshot but page in a stale entry before the fallback tombstones it. However, this is semantically identical to the async worker's own eventual-consistency window (where cache maintenance is applied post-publish). It perfectly aligns with the async mode's existing guarantees.
+*   **6. Metrics consistency**
+    *   **[NIT] Consistent, but watch for type mismatches.** The metrics logic matches the inline path. However, if your `uc.tombstone_*` methods return `usize` and `flush_tombstones_created` is an `AtomicU64`, `fetch_add(n, ...)` will cause a compilation error. You may need to cast it: `fetch_add(n as u64, Ordering::Relaxed)`.
+*   **7. Risk of regression on the inline path**
+    *   **[MINOR] No regression risk.** Changing `if let Some(ref work_tx) = flush_cache_work_tx` to `if flush_cache_work_tx.is_some()` preserves the control flow perfectly. The implicit `else` block for the inline path will execute under the exact same conditions, ensuring byte-for-byte identical behavior for the default path.
+*   **8. Worker rate / starvation**
+    *   **[MINOR] Acceptable.** If fallback becomes the steady state, the flush thread does more work than before (tombstoning). However, tombstoning is a fast metadata operation, unlike the worker's heavy bitmap evaluation. Shedding the heavy evaluation load by degrading to fast invalidations (forcing cache misses) is the correct and safe way to handle backpressure.
+
+**Verdict:** Approve.

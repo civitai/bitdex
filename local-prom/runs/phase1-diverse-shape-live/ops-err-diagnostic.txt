@@ -1,0 +1,23 @@
+ops err=N (consumer-side) diagnostic captured 2026-04-25 ~19:39 UTC.
+
+Root cause: local server :3002 was built `--features server` only (no
+`pg-sync`). The /api/indexes/civitai/ops endpoint is gated behind
+`#[cfg(feature = "pg-sync")]` per src/server.rs:5071. Without that
+feature the route is not registered, and the relay consumer's POSTs
+of /events/ops payloads to the local /api/indexes/civitai/ops endpoint
+return 404 "pg-sync feature not enabled".
+
+Probe:
+  curl -s -m 3 -i -X POST "http://localhost:3002/api/indexes/civitai/ops" \
+    -H "Content-Type: application/json" \
+    -d '{"ops":[],"meta":{"source":"test"}}'
+  =>
+    HTTP/1.1 404 Not Found
+    content-type: application/json
+    {"error":"pg-sync feature not enabled"}
+
+Public relay /events/ops itself is healthy (200 + text/event-stream +
+real ClickHouse-metrics ops payloads). Confirmed via direct curl.
+
+Not blocking the query-coverage gate. To exercise ops path locally,
+rebuild with `--features server,pg-sync` and re-run the rig.
