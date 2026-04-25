@@ -41,6 +41,8 @@ pub mod shard_store_meta;
 #[cfg(feature = "server")]
 pub mod metrics;
 #[cfg(feature = "server")]
+pub mod relay;
+#[cfg(feature = "server")]
 pub mod server;
 pub mod slot;
 pub mod sort;

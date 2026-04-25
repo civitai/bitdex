@@ -12,7 +12,7 @@ keywords = ["bitmap", "index", "database", "search", "roaring"]
 
 [features]
 default = []
-server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus", "dep:serde_yaml", "dep:tokio-stream"]
+server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:tokio", "dep:tokio-util", "dep:prometheus", "dep:serde_yaml", "dep:tokio-stream", "dep:flate2"]
 loadtest = ["ureq"]
 replay = ["ureq"]
 pg-sync = ["dep:sqlx", "dep:clap", "dep:reqwest", "dep:chrono", "dep:tokio", "dep:axum", "dep:tower-http", "dep:futures-core", "dep:futures-util", "dep:bytes", "dep:serde_yaml"]
@@ -97,6 +97,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_yaml = { version = "0.9.34", optional = true }
 
+# Gzip post-rotation for relay capture files
+flate2 = { version = "1", optional = true }
+
 [dev-dependencies]
 # Property-based testing
 proptest = "1"
@@ -108,6 +111,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 tempfile = "3"
 memmap2 = "0.9"
+# axum router oneshot testing pattern (relay smoke tests)
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 
 # Fast release builds for development — `cargo build --profile fast`
