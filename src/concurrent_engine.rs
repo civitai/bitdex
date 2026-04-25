@@ -1383,14 +1383,20 @@ impl ConcurrentEngine {
                             // Unified cache live maintenance.
                             //
                             // When async_maintenance=true: build a CacheWorkItem and
-                            // try_send to the cache worker. The flush thread is
-                            // unblocked immediately regardless of how long maintenance takes.
+                            // queue it to the cache worker — but only AFTER the new
+                            // snapshot has been published below, so the worker cannot
+                            // dequeue and evaluate against the previous published
+                            // snapshot. The work item is built here (while coalescer
+                            // state is in scope) and stored in `pending_async_work`;
+                            // the actual `try_send` runs post-publish (see below).
                             //
                             // When async_maintenance=false (default): run inline Phases A/B/C
                             // as before. Zero change to existing behavior.
                             let t_cache = Instant::now();
-                            if let Some(ref work_tx) = flush_cache_work_tx {
-                                // Async path: build work item from coalescer output.
+                            let mut pending_async_work: Option<crate::cache_worker::CacheWorkItem> = None;
+                            if flush_cache_work_tx.is_some() {
+                                // Async path: build work item from coalescer output. The
+                                // post-publish send block re-checks `flush_cache_work_tx`.
                                 use crate::cache_worker::CacheWorkItem;
                                 use ahash::{AHashMap, AHashSet};
                                 let filter_inserts: AHashMap<_, _> = coalescer
@@ -1424,15 +1430,7 @@ impl ConcurrentEngine {
                                     has_alive_mutations,
                                 };
                                 if !work_item.is_empty() {
-                                    if work_tx.try_send(work_item).is_err() {
-                                        // Worker channel full — fall back to conservative
-                                        // invalidation to keep cache consistent.
-                                        flush_cache_worker_metrics
-                                            .backpressure_invalidations_total
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        let mut uc = flush_unified_cache.lock();
-                                        uc.maintain_alive_changes();
-                                    }
+                                    pending_async_work = Some(work_item);
                                 }
                                 flush_cache_ns.store(
                                     t_cache.elapsed().as_nanos() as u64,
@@ -1687,6 +1685,61 @@ impl ConcurrentEngine {
                             inner.store(Arc::new(staging.clone()));
                             flush_publish_ns.store(t_publish.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             staging_dirty = false;
+                            // Async cache worker enqueue MUST happen after publish so
+                            // the worker cannot dequeue + evaluate against a stale
+                            // snapshot — `cache_worker` calls `inner.load()` to obtain
+                            // the index handle, which would return the previous
+                            // snapshot if the send happened before `inner.store`.
+                            if let (Some(ref work_tx), Some(work_item)) =
+                                (&flush_cache_work_tx, pending_async_work.take())
+                            {
+                                if work_tx.try_send(work_item).is_err() {
+                                    // Worker channel full — fall back to conservative
+                                    // invalidation that mirrors the inline path's
+                                    // tombstone work for unloaded persistent entries
+                                    // and the alive-change rebuild marking.
+                                    flush_cache_worker_metrics
+                                        .backpressure_invalidations_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    let mut uc = flush_unified_cache.lock();
+                                    if uc.persistence_enabled() {
+                                        let filter_fields: Vec<&str> = coalescer
+                                            .mutated_filter_fields()
+                                            .iter()
+                                            .copied()
+                                            .collect();
+                                        if !filter_fields.is_empty() {
+                                            let n = uc.tombstone_unloaded_for_filter(&filter_fields);
+                                            if n > 0 {
+                                                flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
+                                            }
+                                        }
+                                        let sort_mutations = coalescer.mutated_sort_slots();
+                                        let sort_fields: Vec<&str> = sort_mutations
+                                            .keys()
+                                            .copied()
+                                            .collect();
+                                        if !sort_fields.is_empty() {
+                                            let n = uc.tombstone_unloaded_for_sort(&sort_fields);
+                                            if n > 0 {
+                                                flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
+                                            }
+                                        }
+                                        if coalescer.has_alive_mutations()
+                                            && !coalescer.alive_removes().is_empty()
+                                        {
+                                            let n = uc.tombstone_all_unloaded();
+                                            if n > 0 {
+                                                flush_tombstones_created.fetch_add(n, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                    if !uc.is_empty() && !coalescer.alive_removes().is_empty() {
+                                        uc.remove_slots_from_all_batch(coalescer.alive_removes());
+                                    }
+                                    uc.maintain_alive_changes();
+                                }
+                            }
                             // Mark fields touched by mutations or lazy loads as stale
                             // in the bitmap memory cache so the scanner re-measures them.
                             if !stale_fields.is_empty() {

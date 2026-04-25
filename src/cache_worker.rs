@@ -29,9 +29,14 @@ use crate::write_coalescer::FilterGroupKey;
 /// A unit of cache maintenance work produced by one flush cycle.
 ///
 /// Built from `WriteCoalescer`'s grouped output after the flush thread has
-/// applied the batch to staging + published the new snapshot. The worker
-/// consumes these, coalesces across adjacent items, and evaluates against
-/// the published snapshot's filter/sort indexes.
+/// applied the batch to staging. The flush thread holds the constructed item,
+/// publishes the new snapshot via `inner.store(...)`, and only then `try_send`s
+/// it to this worker. The post-publish send order is load-bearing: the worker
+/// calls `inner.load()` at dequeue time to obtain the index handle, so an
+/// enqueue before publish would let the worker evaluate maintenance work
+/// against the previous published snapshot. The worker consumes these items,
+/// coalesces across adjacent ones, and evaluates against the published
+/// snapshot's filter and sort indexes.
 #[derive(Debug)]
 pub struct CacheWorkItem {
     /// Slots newly added to (field, value) buckets this cycle.
