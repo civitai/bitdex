@@ -715,11 +715,16 @@ mod tests {
         assert_eq!(hashbrown_backing_bytes(0, 40), 0);
         // 1 entry -> 4-bucket minimum
         assert!(hashbrown_backing_bytes(1, 40) >= 4 * 40);
-        // 10 entries -> capacity 16
+        // 10 entries -> capacity 16 (target = ceil(10*8/7) = 12, next_pow2 = 16)
         let b10 = hashbrown_backing_bytes(10, 40);
         assert!(b10 >= 16 * 40, "10-entry backing too small: {}", b10);
-        // Doubles across the boundary
-        assert!(hashbrown_backing_bytes(15, 40) < hashbrown_backing_bytes(20, 40));
+        // Doubles across the load-factor boundary at ~87.5%:
+        //   len=14: target = (14*8)/7 = 16 → 16-bucket
+        //   len=15: target = (15*8)/7 = 17 → 32-bucket (next power of two)
+        // 15→20 would have stayed inside the same 32-bucket band, hence the
+        // earlier assertion of 15 < 20 was a no-op (equal at the jemalloc
+        // size class). Use the actual transition point.
+        assert!(hashbrown_backing_bytes(14, 40) < hashbrown_backing_bytes(15, 40));
     }
 
     #[test]

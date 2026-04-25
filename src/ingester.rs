@@ -388,7 +388,7 @@ mod tests {
         let _bw = store.prepare_bulk_load(&["val".to_string()]).unwrap();
         let val_idx: u16 = 0;
 
-        let store = Arc::new(parking_lot::Mutex::new(store));
+        let store = Arc::new(parking_lot::RwLock::new(store));
         let sink = DocSink::new(Arc::clone(&store));
 
         // Append a tuple via DocSink
@@ -396,7 +396,7 @@ mod tests {
         sink.append(5, val_idx, &packed).unwrap();
 
         // Read via get and verify
-        let doc = store.lock().get(5).unwrap().unwrap();
+        let doc = store.read().get(5).unwrap().unwrap();
         match &doc.fields["val"] {
             crate::mutation::FieldValue::Single(crate::query::Value::Integer(42)) => {}
             other => panic!("expected val=42, got: {:?}", other),
@@ -416,7 +416,7 @@ mod tests {
         let _bw = store.prepare_bulk_load(&["color".to_string()]).unwrap();
         let color_idx: u16 = 0;
 
-        let store = Arc::new(parking_lot::Mutex::new(store));
+        let store = Arc::new(parking_lot::RwLock::new(store));
         let doc_sink = DocSink::new(Arc::clone(&store));
         let bitmap_sink = RecordingSink::new();
 
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(ingester.bitmap_sink.sort_sets[0], ("reactionCount".to_string(), 3, 100));
         assert_eq!(ingester.bitmap_sink.alive_inserts, vec![100]);
 
-        let doc = store.lock().get(100).unwrap().unwrap();
+        let doc = store.read().get(100).unwrap().unwrap();
         match &doc.fields["color"] {
             crate::mutation::FieldValue::Single(crate::query::Value::Integer(7)) => {}
             other => panic!("expected color=7, got: {:?}", other),
