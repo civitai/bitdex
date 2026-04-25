@@ -1,0 +1,19 @@
+Loaded 232 unique queries from 3 file(s)
+Target: http://localhost:3002
+Duration: 2 min, max concurrency: 8
+
+[10s] 25892 queries 2583.8 QPS | P50=1ms P90=5ms P95=7ms P99=14ms | <1ms=52% errs=0 inflight=8
+[20s] 62035 queries 3099.1 QPS | P50=1ms P90=5ms P95=7ms P99=13ms | <1ms=56% errs=0 inflight=8
+[30s] 93838 queries 3125.4 QPS | P50=1ms P90=5ms P95=7ms P99=12ms | <1ms=56% errs=0 inflight=8
+[40s] 137252 queries 3428.5 QPS | P50=1ms P90=5ms P95=7ms P99=11ms | <1ms=59% errs=0 inflight=8
+[50s] 178194 queries 3560.2 QPS | P50=1ms P90=5ms P95=6ms P99=11ms | <1ms=60% errs=0 inflight=8
+[60s] 220262 queries 3665.3 QPS | P50=1ms P90=5ms P95=6ms P99=10ms | <1ms=60% errs=0 inflight=8
+[70s] 258176 queries 3678.0 QPS | P50=1ms P90=5ms P95=6ms P99=10ms | <1ms=60% errs=0 inflight=8
+[80s] 293931 queries 3666.5 QPS | P50=1ms P90=5ms P95=6ms P99=10ms | <1ms=60% errs=0 inflight=8
+[90s] 328812 queries 3649.9 QPS | P50=1ms P90=5ms P95=6ms P99=11ms | <1ms=60% errs=0 inflight=8
+[100s] 361647 queries 3612.4 QPS | P50=1ms P90=5ms P95=7ms P99=11ms | <1ms=59% errs=0 inflight=8
+[110s] 399149 queries 3623.3 QPS | P50=1ms P90=5ms P95=7ms P99=11ms | <1ms=60% errs=0 inflight=8
+[121s] 436570 queries 3620.9 QPS | P50=1ms P90=5ms P95=7ms P99=11ms | <1ms=59% errs=0 inflight=0
+
+=== Final ===
+[121s] 436570 queries 3610.3 QPS | P50=1ms P90=5ms P95=7ms P99=11ms | <1ms=59% errs=0 inflight=0
