@@ -60,6 +60,72 @@ routes:
         Content-Type: application/json
       body: '{"status":"ok","mode":"relay"}'
 
+  # ── pg-sync dump-pipeline stubs ─────────────────────────────────────────
+  # pg-sync sidecar calls these during boot to register/track CSV dump
+  # progress. In relay mode there's no real bitmap-engine to load into;
+  # we return shapes that make pg-sync skip the dump phase entirely and
+  # advance to the steady-state ops poller (which is the actual source
+  # of /api/indexes/{index}/ops POSTs we want to capture).
+  #
+  # `bitdex_client::register_dump` parses the body as `serde_json::Value`
+  # and only logs it on success (no field access). Returning `{}` is
+  # enough to satisfy the parser. `get_dumps` calls
+  # `.get("all_complete").as_bool()` — returning `true` makes pg-sync
+  # treat all phases as already done. `signal_dump_loaded` ignores body
+  # entirely; just needs status 2xx.
+
+  - path: /api/indexes/{index}/dumps
+    methods: [PUT]
+    auth: loopback_or_bearer
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{"name":"relay-stub","status":"complete"}'
+
+  - path: /api/indexes/{index}/dumps
+    methods: [GET]
+    auth: loopback_or_bearer
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{"dumps":[],"all_complete":true}'
+
+  - path: /api/indexes/{index}/dumps/{dump_name}/loaded
+    methods: [POST]
+    auth: loopback_or_bearer
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{}'
+
+  # `/stats` is hit by pg-sync's healthcheck loop. Empty stats body
+  # parses fine.
+  - path: /api/indexes/{index}/stats
+    methods: [GET]
+    auth: none
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{"alive_count":0,"slot_counter":0,"docstore_size_bytes":0}'
+
+  # Cursor read/write — pg-sync's ops poller reads its own cursor on
+  # boot and writes after each batch. Read returns 0; write accepts.
+  - path: /api/indexes/{index}/cursors/{cursor_name}
+    methods: [GET]
+    auth: loopback_or_bearer
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{"value":0}'
+
+  - path: /api/indexes/{index}/cursors/{cursor_name}
+    methods: [PUT]
+    auth: loopback_or_bearer
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{}'
+
 # Capture is OFF by default. Operators enable per relay window if they need
 # guaranteed durable record. When enabled:
 #   - Subscribes to each channel's broadcast (counts toward receiver_count
