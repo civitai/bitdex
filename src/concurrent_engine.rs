@@ -2832,6 +2832,22 @@ impl ConcurrentEngine {
                                 Ok(bitmap) => {
                                     let ms = start.elapsed().as_millis();
                                     let card = bitmap.len();
+                                    // Skip 0-cardinality results: a prefilter that
+                                    // matches zero slots can never substitute a real
+                                    // query, so registering it just wastes a registry
+                                    // slot (capped, default 32) and adds another stale
+                                    // entry to the prefilter-refresh loop. Observed in
+                                    // the wild: registry filling with "→ 0 slots"
+                                    // entries within minutes of post-#224 startup,
+                                    // evicting useful candidates and producing 80-180 ms
+                                    // read-lock holds per cycle on every refresh.
+                                    if card == 0 {
+                                        tracing::debug!(
+                                            "auto-prefilter: skipped '{}' — 0 slots match (freq={})",
+                                            name, hfs.total_frequency,
+                                        );
+                                        continue;
+                                    }
                                     match merge_prefilter_registry.insert(
                                         name.clone(),
                                         hfs.filters.clone(),
