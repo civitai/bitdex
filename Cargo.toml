@@ -111,6 +111,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 tempfile = "3"
 memmap2 = "0.9"
+# Serialize tests that share global state (flush/merge thread pools, file
+# system tempdirs racing under heavy parallelism). Use `#[serial]` on
+# concurrent_engine save/restore tests to avoid wait_for_flush timeouts
+# under default `--test-threads`.
+serial_test = "3"
 # axum router oneshot testing pattern (relay smoke tests)
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
