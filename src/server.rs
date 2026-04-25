@@ -2778,6 +2778,15 @@ async fn handle_query(
         })).into_response();
     }
 
+    // Capture the user-input filter clauses BEFORE prefilter substitution so
+    // the warm registry records the shape that was actually requested rather
+    // than the post-substitution form. Substitution can prepend a
+    // `FilterClause::BucketBitmap { bitmap: Arc<RoaringBitmap>, .. }` which
+    // is `#[serde(skip)]` and panics serde when persist tries to write
+    // warm.json — silently dropping every diverse-shape persist on the
+    // floor and leaving the cold-restart auto-warm to a stale 1-entry file.
+    let original_filters_for_warm = query.filters.clone();
+
     // Prefilter substitution: replace common clause subsets with a single
     // precomputed BucketBitmap AND. This turns e.g. the 7-clause Civitai
     // safety prefix into one cheap bitmap intersection.
@@ -2809,12 +2818,15 @@ async fn handle_query(
                 .observe(elapsed.as_secs_f64());
 
             // Record query shape for auto-warm on next boot.
+            // Use `original_filters_for_warm` (captured pre-substitution) so the
+            // recorded shape is JSON-serializable. The substituted form may
+            // contain `FilterClause::BucketBitmap` which serde rejects.
             if let Some(ref sort) = query.sort {
-                let canonical: Vec<crate::cache::CanonicalClause> = query.filters.iter()
+                let canonical: Vec<crate::cache::CanonicalClause> = original_filters_for_warm.iter()
                     .filter_map(crate::cache::CanonicalClause::from_filter)
                     .collect();
                 engine.warm_registry().record(
-                    &query.filters,
+                    &original_filters_for_warm,
                     &canonical,
                     &sort.field,
                     sort.direction,
