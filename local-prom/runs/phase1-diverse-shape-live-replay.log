@@ -1,0 +1,114 @@
+Replay: https://bitdex.civitai.com/events/{queries,ops} → http://localhost:3002
+Duration 25 min; conc=q:16/o:4; queue=q:2000/o:5000
+[queries] connecting → https://bitdex.civitai.com/events/queries
+[ops] connecting → https://bitdex.civitai.com/events/ops
+[ops] connected
+[queries] connected
+[20s] q recv=1737 done=1735 err=0 drop=0 lag=0 gap=87/88 qd=0 p50=67 p99=1131 | o recv=4 done=4 err=4 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=2
+[40s] q recv=3434 done=3418 err=0 drop=0 lag=0 gap=167/171 qd=0 p50=46 p99=1039 | o recv=8 done=8 err=8 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=2
+[60s] q recv=5049 done=5048 err=0 drop=0 lag=0 gap=275/282 qd=0 p50=40 p99=1096 | o recv=12 done=12 err=12 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=2
+[80s] q recv=6460 done=6459 err=0 drop=0 lag=0 gap=353/364 qd=0 p50=35 p99=1122 | o recv=16 done=16 err=16 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=2
+[100s] q recv=7798 done=7613 err=0 drop=0 lag=0 gap=429/444 qd=169 p50=33 p99=1170 | o recv=20 done=20 err=20 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[120s] q recv=9810 done=9495 err=0 drop=0 lag=0 gap=541/562 qd=299 p50=30 p99=1356 | o recv=24 done=24 err=24 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[140s] q recv=11590 done=11585 err=0 drop=0 lag=0 gap=616/642 qd=0 p50=31 p99=1478 | o recv=28 done=28 err=28 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[160s] q recv=13315 done=12959 err=0 drop=0 lag=0 gap=724/755 qd=340 p50=29 p99=1664 | o recv=32 done=32 err=32 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[180s] q recv=14958 done=14905 err=0 drop=0 lag=0 gap=840/877 qd=37 p50=27 p99=1783 | o recv=36 done=36 err=36 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[200s] q recv=16785 done=16028 err=0 drop=0 lag=0 gap=963/1009 qd=741 p50=27 p99=1892 | o recv=40 done=40 err=40 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[220s] q recv=18615 done=17850 err=0 drop=0 lag=0 gap=1103/1150 qd=749 p50=26 p99=1980 | o recv=44 done=44 err=44 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[240s] q recv=20329 done=19837 err=0 drop=0 lag=0 gap=1208/1264 qd=476 p50=25 p99=2002 | o recv=48 done=48 err=48 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[260s] q recv=22023 done=20978 err=0 drop=0 lag=0 gap=1304/1368 qd=1029 p50=25 p99=2154 | o recv=52 done=52 err=52 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[280s] q recv=23522 done=23503 err=0 drop=0 lag=0 gap=1382/1449 qd=3 p50=24 p99=2150 | o recv=56 done=56 err=56 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[300s] q recv=24970 done=24460 err=0 drop=0 lag=0 gap=1473/1543 qd=494 p50=24 p99=2244 | o recv=60 done=60 err=60 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[320s] q recv=26512 done=25168 err=0 drop=0 lag=0 gap=1566/1640 qd=1328 p50=25 p99=2404 | o recv=64 done=64 err=64 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[340s] q recv=28188 done=27879 err=0 drop=0 lag=0 gap=1654/1730 qd=293 p50=24 p99=2393 | o recv=68 done=68 err=68 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[360s] q recv=29898 done=29188 err=0 drop=0 lag=0 gap=1735/1815 qd=694 p50=24 p99=2465 | o recv=72 done=72 err=72 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[380s] q recv=31816 done=29927 err=0 drop=0 lag=0 gap=1750/1831 qd=1873 p50=25 p99=2577 | o recv=76 done=76 err=76 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[400s] q recv=33633 done=30789 err=0 drop=828 lag=0 gap=1754/1835 qd=2000 p50=25 p99=2663 | o recv=80 done=80 err=80 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=3
+[420s] q recv=35501 done=31141 err=0 drop=2344 lag=0 gap=1768/1849 qd=2000 p50=25 p99=2703 | o recv=84 done=84 err=84 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[440s] q recv=37446 done=32639 err=0 drop=3450 lag=0 gap=1803/1885 qd=1341 p50=25 p99=2741 | o recv=88 done=88 err=88 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[460s] q recv=39248 done=35566 err=0 drop=3450 lag=0 gap=1863/1945 qd=216 p50=25 p99=2702 | o recv=92 done=92 err=92 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[480s] q recv=41502 done=36447 err=0 drop=3450 lag=0 gap=1920/2004 qd=1589 p50=25 p99=2745 | o recv=96 done=96 err=96 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[500s] q recv=43240 done=37386 err=0 drop=3838 lag=0 gap=1973/2058 qd=2000 p50=26 p99=2849 | o recv=100 done=100 err=100 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[520s] q recv=45005 done=38288 err=0 drop=4709 lag=0 gap=2025/2110 qd=1992 p50=26 p99=2935 | o recv=104 done=104 err=104 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[540s] q recv=46795 done=40316 err=0 drop=5432 lag=0 gap=2076/2164 qd=1031 p50=26 p99=2928 | o recv=108 done=108 err=108 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[560s] q recv=48644 done=42971 err=0 drop=5432 lag=0 gap=2119/2209 qd=225 p50=25 p99=2880 | o recv=112 done=112 err=112 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[580s] q recv=50540 done=43924 err=0 drop=5432 lag=0 gap=2165/2256 qd=1168 p50=26 p99=2898 | o recv=116 done=116 err=116 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[600s] q recv=52478 done=44861 err=0 drop=5609 lag=0 gap=2242/2338 qd=1992 p50=26 p99=2955 | o recv=120 done=120 err=120 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[620s] q recv=54392 done=45799 err=0 drop=6577 lag=0 gap=2304/2402 qd=2000 p50=26 p99=3029 | o recv=124 done=124 err=124 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[640s] q recv=56226 done=49374 err=0 drop=6778 lag=0 gap=2390/2496 qd=58 p50=25 p99=2924 | o recv=128 done=128 err=128 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[660s] q recv=58021 done=50182 err=0 drop=6778 lag=0 gap=2459/2572 qd=1045 p50=25 p99=2971 | o recv=132 done=132 err=132 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[680s] q recv=59805 done=51074 err=0 drop=6778 lag=0 gap=2529/2643 qd=1937 p50=25 p99=3031 | o recv=136 done=136 err=136 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[700s] q recv=61599 done=51909 err=0 drop=7680 lag=0 gap=2619/2734 qd=1994 p50=26 p99=3089 | o recv=140 done=140 err=140 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[720s] q recv=63341 done=52828 err=0 drop=8651 lag=0 gap=2704/2826 qd=1846 p50=26 p99=3114 | o recv=144 done=144 err=144 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[740s] q recv=64997 done=56255 err=0 drop=8651 lag=0 gap=2805/2933 qd=75 p50=25 p99=3037 | o recv=148 done=148 err=148 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[760s] q recv=66540 done=57008 err=0 drop=8651 lag=0 gap=2903/3040 qd=865 p50=25 p99=3070 | o recv=152 done=152 err=152 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[780s] q recv=68246 done=57736 err=0 drop=8651 lag=0 gap=3010/3152 qd=1843 p50=25 p99=3116 | o recv=156 done=156 err=156 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[800s] q recv=69897 done=58561 err=0 drop=9320 lag=0 gap=3115/3260 qd=2000 p50=26 p99=3167 | o recv=160 done=160 err=160 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[820s] q recv=71561 done=59776 err=0 drop=10125 lag=0 gap=3209/3358 qd=1644 p50=26 p99=3216 | o recv=164 done=164 err=164 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[840s] q recv=73222 done=63092 err=0 drop=10125 lag=0 gap=3280/3430 qd=0 p50=25 p99=3133 | o recv=168 done=168 err=168 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[860s] q recv=74746 done=64066 err=0 drop=10125 lag=0 gap=3386/3539 qd=539 p50=25 p99=3158 | o recv=172 done=172 err=172 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[880s] q recv=76330 done=64601 err=0 drop=10125 lag=0 gap=3491/3651 qd=1588 p50=25 p99=3199 | o recv=176 done=176 err=176 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[900s] q recv=77955 done=65267 err=0 drop=10677 lag=0 gap=3570/3735 qd=1995 p50=25 p99=3269 | o recv=180 done=180 err=180 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[920s] q recv=79478 done=65891 err=0 drop=11571 lag=0 gap=3649/3816 qd=2000 p50=25 p99=3327 | o recv=184 done=184 err=184 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[940s] q recv=80944 done=66707 err=0 drop=12319 lag=0 gap=3748/3921 qd=1902 p50=26 p99=3352 | o recv=188 done=188 err=188 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[960s] q recv=82619 done=70295 err=0 drop=12319 lag=0 gap=3853/4034 qd=0 p50=25 p99=3285 | o recv=192 done=192 err=192 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[980s] q recv=84262 done=71287 err=0 drop=12319 lag=0 gap=3973/4165 qd=640 p50=25 p99=3304 | o recv=196 done=196 err=196 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[1000s] q recv=85915 done=72138 err=0 drop=12319 lag=0 gap=4088/4294 qd=1442 p50=25 p99=3311 | o recv=200 done=200 err=200 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[1020s] q recv=87491 done=72913 err=0 drop=12563 lag=0 gap=4209/4418 qd=1999 p50=25 p99=3339 | o recv=204 done=204 err=204 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[1040s] q recv=89112 done=73574 err=0 drop=13524 lag=0 gap=4314/4532 qd=1998 p50=25 p99=3369 | o recv=208 done=208 err=208 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[1060s] q recv=90957 done=74580 err=0 drop=14710 lag=0 gap=4427/4651 qd=1651 p50=25 p99=3411 | o recv=212 done=212 err=212 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[1080s] q recv=92534 done=77816 err=0 drop=14710 lag=0 gap=4508/4735 qd=0 p50=25 p99=3353 | o recv=216 done=216 err=216 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[1100s] q recv=94189 done=78815 err=0 drop=14710 lag=0 gap=4602/4838 qd=648 p50=25 p99=3353 | o recv=220 done=220 err=220 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[1120s] q recv=95687 done=79608 err=0 drop=14710 lag=0 gap=4703/4945 qd=1353 p50=26 p99=3373 | o recv=224 done=224 err=224 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=8
+[1140s] q recv=97325 done=80322 err=0 drop=14993 lag=0 gap=4792/5036 qd=1994 p50=26 p99=3417 | o recv=228 done=228 err=228 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=23
+[1160s] q recv=98930 done=81057 err=0 drop=15857 lag=0 gap=4854/5101 qd=2000 p50=26 p99=3448 | o recv=232 done=232 err=232 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=23
+[1180s] q recv=100417 done=81738 err=0 drop=16664 lag=0 gap=4904/5151 qd=1999 p50=26 p99=3486 | o recv=236 done=236 err=236 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[1200s] q recv=102186 done=84420 err=0 drop=17020 lag=0 gap=4984/5237 qd=730 p50=26 p99=3448 | o recv=240 done=240 err=240 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[1220s] q recv=104144 done=86867 err=0 drop=17020 lag=0 gap=5086/5344 qd=241 p50=26 p99=3405 | o recv=244 done=244 err=244 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[1240s] q recv=105829 done=87663 err=0 drop=17020 lag=0 gap=5160/5424 qd=1130 p50=26 p99=3446 | o recv=248 done=248 err=248 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[1260s] q recv=107587 done=88060 err=0 drop=17513 lag=0 gap=5225/5491 qd=1998 p50=26 p99=3502 | o recv=252 done=252 err=252 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=27
+[1280s] q recv=109145 done=88450 err=0 drop=18685 lag=0 gap=5280/5547 qd=1994 p50=26 p99=3550 | o recv=256 done=256 err=256 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1300s] q recv=110807 done=88988 err=0 drop=19803 lag=0 gap=5349/5621 qd=2000 p50=26 p99=3587 | o recv=260 done=260 err=260 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1320s] q recv=112382 done=89562 err=0 drop=20821 lag=0 gap=5436/5711 qd=1983 p50=26 p99=3622 | o recv=264 done=264 err=264 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1340s] q recv=113977 done=90323 err=0 drop=21639 lag=0 gap=5521/5797 qd=1999 p50=26 p99=3644 | o recv=268 done=268 err=268 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1360s] q recv=115595 done=93065 err=0 drop=22081 lag=0 gap=5618/5898 qd=433 p50=26 p99=3617 | o recv=272 done=272 err=272 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1380s] q recv=117310 done=94815 err=0 drop=22081 lag=0 gap=5695/5976 qd=398 p50=26 p99=3604 | o recv=276 done=276 err=276 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1400s] q recv=118981 done=95390 err=0 drop=22081 lag=0 gap=5773/6062 qd=1494 p50=26 p99=3628 | o recv=280 done=280 err=280 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1420s] q recv=120577 done=95966 err=0 drop=22595 lag=0 gap=5857/6148 qd=2000 p50=26 p99=3655 | o recv=284 done=284 err=284 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1440s] q recv=122094 done=96399 err=0 drop=23680 lag=0 gap=5935/6227 qd=1999 p50=26 p99=3697 | o recv=288 done=288 err=288 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1460s] q recv=123023 done=96869 err=0 drop=24146 lag=0 gap=6008/6303 qd=1992 p50=26 p99=3753 | o recv=292 done=292 err=292 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+[1480s] q recv=123861 done=97325 err=0 drop=24532 lag=0 gap=6068/6365 qd=1988 p50=27 p99=3786 | o recv=296 done=296 err=296 drop=0 lag=0 gap=0/0 qd=0 p50=1 p99=31
+
+=== FINAL ===
+queries: {
+  "channel": "queries",
+  "received": 124533,
+  "replayed": 97653,
+  "errors": 0,
+  "drops": 24865,
+  "lagged_dropped": 0,
+  "gaps": 6116,
+  "gap_total": 6415,
+  "in_flight": 16,
+  "queued": 1999,
+  "p50": 27,
+  "p90": 461,
+  "p95": 1283,
+  "p99": 3830
+}
+ops:     {
+  "channel": "ops",
+  "received": 300,
+  "replayed": 300,
+  "errors": 300,
+  "drops": 0,
+  "lagged_dropped": 0,
+  "gaps": 0,
+  "gap_total": 0,
+  "in_flight": 0,
+  "queued": 0,
+  "p50": 1,
+  "p90": 1,
+  "p95": 2,
+  "p99": 31
+}
