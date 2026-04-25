@@ -1337,7 +1337,7 @@ mod tests {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "type".into(),
@@ -1345,7 +1345,7 @@ mod tests {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "tagIds".into(),
@@ -1353,7 +1353,7 @@ mod tests {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             },
             FilterFieldConfig {
                 name: "hasMeta".into(),
@@ -1361,7 +1361,7 @@ mod tests {
                 behaviors: None,
                 eviction: None,
                 eager_load: false,
-                per_value_lazy: false,
+                per_value_lazy: false, max_range_scan_values: None,
             },
         ];
         config.sort_fields = vec![SortFieldConfig {
@@ -2204,7 +2204,7 @@ mod tests {
             behaviors: None,
             eviction: None,
             eager_load: false,
-            per_value_lazy: false,
+            per_value_lazy: false, max_range_scan_values: None,
         });
         // Mark blockedFor as nullable via data_schema FieldMapping so that
         // null Set/Remove ops are no-ops rather than mapping to zero.

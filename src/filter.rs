@@ -670,7 +670,7 @@ mod tests {
             behaviors: None,
             eviction: None,
             eager_load: false,
-            per_value_lazy: false,
+            per_value_lazy: false, max_range_scan_values: None,
         }
     }
     fn make_multi_value_config(name: &str) -> FilterFieldConfig {
@@ -680,7 +680,7 @@ mod tests {
             behaviors: None,
             eviction: None,
             eager_load: false,
-            per_value_lazy: false,
+            per_value_lazy: false, max_range_scan_values: None,
         }
     }
     fn make_bool_config(name: &str) -> FilterFieldConfig {
@@ -690,7 +690,7 @@ mod tests {
             behaviors: None,
             eviction: None,
             eager_load: false,
-            per_value_lazy: false,
+            per_value_lazy: false, max_range_scan_values: None,
         }
     }
     #[test]

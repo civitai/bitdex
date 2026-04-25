@@ -46,6 +46,22 @@ pub struct ClauseTrace {
     pub eval_us: u64,
     pub and_us: u64,
     pub mode: String,
+    /// Range-scan specific telemetry. `None` for non-range clauses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range_scan: Option<RangeScanTrace>,
+}
+
+/// Per-clause telemetry emitted when a range predicate is evaluated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeScanTrace {
+    /// Number of distinct values scanned in the field's bitmap map.
+    pub values_scanned: usize,
+    /// Number of per-value bitmaps OR'd into the result.
+    pub bitmaps_ored: usize,
+    /// Wall-clock time for the full scan, in microseconds.
+    pub scan_us: u64,
+    /// Whether a time-bucket snap was used instead of a raw range scan.
+    pub snap_used: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +338,7 @@ mod tests {
             eval_us: 100,
             and_us: 0,
             mode: "first".into(),
+            range_scan: None,
         });
         collector.filter_us = 200;
         let trace = collector.finalize("test-index", 100);

@@ -112,6 +112,8 @@ pub struct Metrics {
     pub queries_in_flight: IntGauge,
     pub queries_in_flight_peak: IntGauge,
     pub queries_rejected_total: IntCounter,
+    /// Counts range scans rejected by max_range_scan_values cap, labeled by field name.
+    pub range_scan_rejected_total: IntCounterVec,
 
     // -- BoundStore (cache persistence) --
     pub boundstore_meta_entries: IntGaugeVec,
@@ -651,6 +653,13 @@ impl Metrics {
         let queries_rejected_total = IntCounter::new(
             "bitdex_queries_rejected_total", "Queries rejected by backpressure",
         ).unwrap();
+        let range_scan_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_range_scan_rejected_total",
+                "Range scan queries rejected by max_range_scan_values cap",
+            ),
+            &["field"],
+        ).unwrap();
 
         // BoundStore metrics
         let boundstore_meta_entries = IntGaugeVec::new(
@@ -965,6 +974,7 @@ impl Metrics {
         registry.register(Box::new(queries_in_flight.clone())).unwrap();
         registry.register(Box::new(queries_in_flight_peak.clone())).unwrap();
         registry.register(Box::new(queries_rejected_total.clone())).unwrap();
+        registry.register(Box::new(range_scan_rejected_total.clone())).unwrap();
         registry.register(Box::new(boundstore_meta_entries.clone())).unwrap();
         registry.register(Box::new(boundstore_tombstones.clone())).unwrap();
         registry.register(Box::new(boundstore_pending_shards.clone())).unwrap();
@@ -1080,6 +1090,7 @@ impl Metrics {
             queries_in_flight,
             queries_in_flight_peak,
             queries_rejected_total,
+            range_scan_rejected_total,
             boundstore_meta_entries,
             boundstore_tombstones,
             boundstore_pending_shards,

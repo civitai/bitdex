@@ -30,4 +30,21 @@ pub enum BitdexError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Returned when a range scan exceeds the configured value-count cap.
+    /// field: the filter field name.
+    /// field_loaded_values: number of distinct values currently loaded in memory
+    ///   for the field (may be less than total on-disk for per_value_lazy fields).
+    /// cap: the configured limit (FilterFieldConfig::max_range_scan_values).
+    #[error(
+        "query too expensive: range scan on '{field}' has {field_loaded_values} loaded values \
+         (cap: {cap}). Set max_range_scan_values in config to adjust or disable."
+    )]
+    QueryTooExpensive {
+        field: String,
+        /// In-memory loaded distinct value count at query time.
+        /// Best-effort for per_value_lazy fields; exact for eager-loaded fields.
+        field_loaded_values: usize,
+        cap: usize,
+    },
 }

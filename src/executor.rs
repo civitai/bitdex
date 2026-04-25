@@ -3,12 +3,16 @@ use roaring::RoaringBitmap;
 use crate::dictionary::FieldDictionary;
 use crate::error::{BitdexError, Result};
 use crate::filter::FilterIndex;
+#[cfg(feature = "server")]
+use crate::metrics::Metrics;
 use crate::planner;
 use crate::query::{FilterClause, SortClause, SortDirection, Value};
 use crate::query_metrics::{ClauseTrace, QueryTraceCollector};
 use crate::slot::SlotAllocator;
 use crate::sort::SortIndex;
 use crate::types::QueryResult;
+#[cfg(feature = "server")]
+use std::sync::Arc;
 /// Convert a Value to a u64 bitmap key for filter indexing.
 /// For MappedString fields, call `resolve_value_key` instead which consults the string_map.
 fn value_to_bitmap_key(val: &Value) -> Option<u64> {
@@ -39,6 +43,10 @@ pub struct QueryExecutor<'a> {
     /// Live dictionaries for LowCardinalityString fields — used as fallback
     /// when string_maps snapshot doesn't have a recently-added value.
     dictionaries: Option<&'a HashMap<String, FieldDictionary>>,
+    /// Optional Prometheus metrics handle. When set, range_scan rejections
+    /// increment `range_scan_rejected_total{field}`.
+    #[cfg(feature = "server")]
+    metrics: Option<Arc<Metrics>>,
 }
 impl<'a> QueryExecutor<'a> {
     pub fn new(
@@ -57,6 +65,8 @@ impl<'a> QueryExecutor<'a> {
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: None,
+            #[cfg(feature = "server")]
+            metrics: None,
         }
     }
     /// Attach string maps for MappedString field reverse lookup.
@@ -74,6 +84,12 @@ impl<'a> QueryExecutor<'a> {
     /// Used as fallback when the string_maps snapshot doesn't have a recently-added value.
     pub fn with_dictionaries(mut self, dicts: &'a HashMap<String, FieldDictionary>) -> Self {
         self.dictionaries = Some(dicts);
+        self
+    }
+    /// Attach a Prometheus metrics handle for range_scan rejection counting.
+    #[cfg(feature = "server")]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
     /// Attach a time bucket manager for in-executor bucket snapping (C3).
@@ -324,6 +340,7 @@ impl<'a> QueryExecutor<'a> {
                             eval_us: 0,
                             and_us: elapsed.as_micros() as u64,
                             mode: "by_ref".to_string(),
+                            range_scan: None,
                         });
                     }
                     if let Err(e) = applied {
@@ -375,6 +392,7 @@ impl<'a> QueryExecutor<'a> {
                     eval_us: eval_elapsed.as_micros() as u64,
                     and_us: and_elapsed.as_micros() as u64,
                     mode: if is_first { "first" } else { "eval_and" }.to_string(),
+                    range_scan: None,
                 });
             }
         }
@@ -666,7 +684,45 @@ impl<'a> QueryExecutor<'a> {
                     _ => unreachable!(),
                 }
             }
+            // C3 (Lt/Lte): Mirror Gt/Gte bucket snapping for the time-bucket field.
+            // Lt(field, T) = "items older than T" ≈ alive − bucket(now−T).
+            // Lte(field, T) = same approximation (bucket boundary subsumes the extra point).
+            //
+            // Snapping is approximate (10% tolerance, same as Gt/Gte). If no bucket
+            // matches within tolerance, fall through to range_scan.
+            //
+            // NEW FINDING (perf-paths-audit, not in original review): Lt/Lte had
+            // zero bucket snapping — even sortAtUnix went straight to range_scan.
+            // This is asymmetric to Gt/Gte. Fixed here.
             FilterClause::Lt(field, value) | FilterClause::Lte(field, value) => {
+                if let Some(tb) = &self.time_buckets {
+                    if field == tb.field_name() {
+                        if let Some(threshold) = value_to_bitmap_key(value) {
+                            // Fast path: threshold in the future → all alive slots satisfy
+                            // Lt/Lte because every stored timestamp is ≤ now < threshold.
+                            if threshold >= self.now_unix {
+                                return Ok(self.slots.alive_bitmap().clone());
+                            }
+                            // duration_secs = now - threshold (same as Gt/Gte side).
+                            // The bucket for duration D covers [now-D, now].
+                            // Lt(threshold) wants timestamps < threshold, i.e., NOT in
+                            // the recent [threshold, now] window ≈ alive - bucket(D).
+                            let duration = self.now_unix.saturating_sub(threshold);
+                            if let Some(bucket_name) = tb.snap_duration(duration, 0.10) {
+                                if let Some(bucket) = tb.get_bucket(bucket_name) {
+                                    // alive - bucket = items older than (approximately) threshold.
+                                    // Dead slots in bucket are harmless: subtracting them from
+                                    // alive_bitmap is a no-op (they're not in alive).
+                                    // Lt vs Lte boundary distinction is subsumed by the 10%
+                                    // snap tolerance — both use the same snapped complement.
+                                    let mut result = self.slots.alive_bitmap().clone();
+                                    result -= bucket.bitmap().as_ref();
+                                    return Ok(result);
+                                }
+                            }
+                        }
+                    }
+                }
                 match clause {
                     FilterClause::Lt(..) => self.range_scan(field, value, |k, t| k < t),
                     FilterClause::Lte(..) => self.range_scan(field, value, |k, t| k <= t),
@@ -701,6 +757,10 @@ impl<'a> QueryExecutor<'a> {
     }
     /// Evaluate a range filter by scanning the filter field's bitmaps.
     /// Uses diff-aware iteration to handle dirty VersionedBitmaps.
+    ///
+    /// Enforces `FilterFieldConfig::max_range_scan_values` if set: returns
+    /// `QueryTooExpensive` before any bitmap work when the field's loaded
+    /// value count exceeds the cap.
     fn range_scan<F>(
         &self,
         field: &str,
@@ -714,6 +774,30 @@ impl<'a> QueryExecutor<'a> {
             .filters
             .get_field(field)
             .ok_or_else(|| BitdexError::FieldNotFound(field.to_string()))?;
+
+        // Enforce max_range_scan_values guardrail before doing any bitmap work.
+        // Uses the in-memory loaded value count. Note: for per_value_lazy fields
+        // this may be less than the total on-disk cardinality — the guardrail is
+        // best-effort for such fields (it won't reject when only a slice is loaded).
+        // For fully-loaded fields (eager_load or after first scan) this is exact.
+        // Set max_range_scan_values conservatively for per_value_lazy fields.
+        if let Some(cap) = filter_field.config().max_range_scan_values {
+            let field_loaded_values = filter_field.loaded_value_count();
+            if field_loaded_values > cap {
+                #[cfg(feature = "server")]
+                if let Some(ref m) = self.metrics {
+                    m.range_scan_rejected_total
+                        .with_label_values(&[field])
+                        .inc();
+                }
+                return Err(BitdexError::QueryTooExpensive {
+                    field: field.to_string(),
+                    field_loaded_values,
+                    cap,
+                });
+            }
+        }
+
         let target = value_to_bitmap_key(value)
             .ok_or_else(|| BitdexError::InvalidValue {
                 field: field.to_string(),
@@ -1011,7 +1095,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
                 FilterFieldConfig {
                     name: "tagIds".to_string(),
@@ -1019,7 +1103,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
                 FilterFieldConfig {
                     name: "onSite".to_string(),
@@ -1027,7 +1111,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
                 FilterFieldConfig {
                     name: "userId".to_string(),
@@ -1035,7 +1119,7 @@ mod tests {
                     behaviors: None,
                     eviction: None,
                     eager_load: false,
-                    per_value_lazy: false,
+                    per_value_lazy: false, max_range_scan_values: None,
                 },
             ],
             sort_fields: vec![
@@ -1448,7 +1532,7 @@ mod tests {
             behaviors: None,
             eviction: None,
             eager_load: false,
-            per_value_lazy: false,
+            per_value_lazy: false, max_range_scan_values: None,
         });
         let executor = QueryExecutor::new(
             &h.slots,
@@ -1572,5 +1656,268 @@ mod tests {
         assert_eq!(ids, vec![42]);
         assert!(cursor.is_some());
         assert_eq!(cursor.unwrap().slot_id, 42);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task #13: range_scan guardrail + Lt/Lte bucket snapping tests
+    // ---------------------------------------------------------------------------
+
+    /// Build a test filter index with the given field and `max_range_scan_values`.
+    fn make_guarded_filter_index(cap: Option<usize>) -> FilterIndex {
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "postId".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false, max_range_scan_values: cap,
+        });
+        filters
+    }
+
+    #[test]
+    fn test_range_scan_guardrail_rejects_when_over_cap() {
+        // Field with cap of 5, but we'll insert 10 distinct values (slots 0-9).
+        let mut filters = make_guarded_filter_index(Some(5));
+        let field = filters.get_field("postId").unwrap();
+        // Insert 10 distinct values (value k → slot k) to exceed the cap.
+        for k in 0u64..10 {
+            field.insert(k, k as u32);
+        }
+        // Merge to move diffs to base so loaded_value_count is accurate.
+        field.merge_dirty();
+
+        let h = TestHarness::new();
+        let slots = SlotAllocator::new();
+        let sorts = SortIndex::new();
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100);
+
+        let clause = FilterClause::Gt("postId".to_string(), Value::Integer(3));
+        let result = executor.evaluate_clause(&clause);
+        assert!(result.is_err(), "expected QueryTooExpensive, got {:?}", result);
+        match result.unwrap_err() {
+            BitdexError::QueryTooExpensive { field, field_loaded_values, cap } => {
+                assert_eq!(field, "postId");
+                assert_eq!(field_loaded_values, 10);
+                assert_eq!(cap, 5);
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_range_scan_guardrail_allows_when_under_cap() {
+        // Field with cap of 100; we insert only 5 distinct values — under cap.
+        let mut filters = make_guarded_filter_index(Some(100));
+        let field = filters.get_field("postId").unwrap();
+        for k in 1u64..=5 {
+            field.insert(k, k as u32);
+        }
+        field.merge_dirty();
+
+        let h = TestHarness::new();
+        let slots = SlotAllocator::new();
+        let sorts = SortIndex::new();
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100);
+
+        // Should succeed and return slots 4 and 5 (value > 3)
+        let clause = FilterClause::Gt("postId".to_string(), Value::Integer(3));
+        let result = executor.evaluate_clause(&clause);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        let bm = result.unwrap();
+        // slot 4 has value 4, slot 5 has value 5 — both > 3
+        assert!(bm.contains(4));
+        assert!(bm.contains(5));
+        // slot 3 has value 3 — not strictly greater than 3
+        assert!(!bm.contains(3));
+    }
+
+    #[test]
+    fn test_range_scan_guardrail_none_means_unbounded() {
+        // Field with no cap (None = default, backwards compatible).
+        let mut filters = make_guarded_filter_index(None);
+        let field = filters.get_field("postId").unwrap();
+        // Insert 1000 distinct values — would fail with a cap of 500.
+        for k in 0u64..1000 {
+            field.insert(k, k as u32);
+        }
+        field.merge_dirty();
+
+        let h = TestHarness::new();
+        let slots = SlotAllocator::new();
+        let sorts = SortIndex::new();
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100);
+
+        // Should succeed even with 1000 values loaded.
+        let clause = FilterClause::Gte("postId".to_string(), Value::Integer(990));
+        let result = executor.evaluate_clause(&clause);
+        assert!(result.is_ok(), "expected Ok (unbounded), got {:?}", result);
+    }
+
+    #[test]
+    fn test_lt_lte_bucket_snap_on_time_bucket_field() {
+        // Verify that Lt/Lte on the time-bucket field snaps to alive - bucket
+        // rather than falling through to range_scan.
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+
+        // Build a FilterIndex with "sortAt" so range_scan fallback doesn't error.
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "sortAt".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false, max_range_scan_values: None,
+        });
+
+        let mut slots = SlotAllocator::new();
+        // Insert 5 slots into the alive bitmap so the complement has something.
+        slots.alive_insert_bulk(1u32..=5);
+        slots.merge_alive();
+
+        let sorts = SortIndex::new();
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100)
+            .with_time_buckets(&mgr, now);
+
+        // Lt(now - 86400) = items older than 24h ago → alive - bucket(24h).
+        // The 24h bucket in make_time_bucket_manager contains slots 1,2,3
+        // (timestamps within 24h). Alive = {1,2,3,4,5}.
+        // alive - bucket(24h) = {4, 5} (slots older than 24h).
+        let threshold = (now - 86400) as i64;
+        let clause = FilterClause::Lt("sortAt".to_string(), Value::Integer(threshold));
+        let result = executor.evaluate_clause(&clause).unwrap();
+        // Slots 4 and 5 are older than 24h (in alive but not in 24h bucket).
+        assert!(!result.contains(1), "slot 1 is within 24h, should not appear in Lt result");
+        assert!(!result.contains(2), "slot 2 is within 24h, should not appear in Lt result");
+        assert!(!result.contains(3), "slot 3 is within 24h, should not appear in Lt result");
+        assert!(result.contains(4), "slot 4 is older than 24h, should appear in Lt result");
+        assert!(result.contains(5), "slot 5 is older than 24h, should appear in Lt result");
+    }
+
+    #[test]
+    fn test_lt_falls_through_to_range_scan_for_non_bucket_field() {
+        // Lt on a non-time-bucket field should fall through to range_scan.
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "nsfwLevel".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false, max_range_scan_values: None,
+        });
+
+        // Insert values 1,2,3 so range_scan has something to scan.
+        let field = filters.get_field("nsfwLevel").unwrap();
+        for v in [1u64, 2, 3] {
+            field.insert(v, v as u32);
+        }
+        field.merge_dirty();
+
+        let slots = SlotAllocator::new();
+        let sorts = SortIndex::new();
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100)
+            .with_time_buckets(&mgr, now);
+
+        // Lt(3): should get values 1 and 2 from range_scan.
+        let clause = FilterClause::Lt("nsfwLevel".to_string(), Value::Integer(3));
+        let result = executor.evaluate_clause(&clause).unwrap();
+        assert!(result.contains(1)); // slot 1, value 1 < 3 ✓
+        assert!(result.contains(2)); // slot 2, value 2 < 3 ✓
+        assert!(!result.contains(3)); // slot 3, value 3 = 3, not < 3 ✗
+    }
+
+    #[test]
+    fn test_lt_future_threshold_returns_all_alive() {
+        // Lt(now + 3600) = "all items older than the future" = all alive slots.
+        // saturating_sub would give 0 duration without the fast path, which could
+        // snap to the wrong bucket. With the fast path, we return alive directly.
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "sortAt".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false, max_range_scan_values: None,
+        });
+
+        let mut slots = SlotAllocator::new();
+        slots.alive_insert_bulk(1u32..=7);
+        slots.merge_alive();
+
+        let sorts = SortIndex::new();
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100)
+            .with_time_buckets(&mgr, now);
+
+        // future threshold = now + 3600 (1 hour from now)
+        let future_threshold = (now + 3600) as i64;
+        let lt_result = executor.evaluate_clause(
+            &FilterClause::Lt("sortAt".to_string(), Value::Integer(future_threshold))
+        ).unwrap();
+        // All alive slots satisfy Lt(future) — every stored timestamp is < future
+        assert_eq!(lt_result.len(), 7, "Lt(future) should return all alive slots");
+
+        let lte_result = executor.evaluate_clause(
+            &FilterClause::Lte("sortAt".to_string(), Value::Integer(future_threshold))
+        ).unwrap();
+        assert_eq!(lte_result.len(), 7, "Lte(future) should return all alive slots");
+    }
+
+    #[test]
+    fn test_lt_lte_boundary_at_bucket_threshold() {
+        // Verify boundary semantics: Gt(T) and Lt(T) are complements via snapping.
+        let now: u64 = 1_700_000_000;
+        let mgr = make_time_bucket_manager(now);
+
+        let mut filters = FilterIndex::new();
+        filters.add_field(FilterFieldConfig {
+            name: "sortAt".to_string(),
+            field_type: FilterFieldType::SingleValue,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false, max_range_scan_values: None,
+        });
+
+        let mut slots = SlotAllocator::new();
+        slots.alive_insert_bulk(1u32..=10);
+        slots.merge_alive();
+
+        let sorts = SortIndex::new();
+        let executor = QueryExecutor::new(&slots, &filters, &sorts, 100)
+            .with_time_buckets(&mgr, now);
+
+        // Both Gt and Lt snap with tolerance=10%, so nearby thresholds both snap.
+        let threshold_24h = (now - 86400) as i64;
+
+        // Gt(threshold_24h) → snaps to bucket(24h) = {slots with timestamp > now-86400}
+        // make_time_bucket_manager: 24h bucket has slots 1,2,3 (within 24h).
+        let gt_result = executor.evaluate_clause(
+            &FilterClause::Gt("sortAt".to_string(), Value::Integer(threshold_24h))
+        ).unwrap();
+
+        // Lt(threshold_24h) → alive - bucket(24h) = {1..10} - {1,2,3} = {4..10}
+        let lt_result = executor.evaluate_clause(
+            &FilterClause::Lt("sortAt".to_string(), Value::Integer(threshold_24h))
+        ).unwrap();
+
+        // Together they cover all 10 alive slots (no overlap since bucket is a clean partition).
+        // gt_result has 3 slots (1,2,3 from 24h bucket).
+        // lt_result has 7 slots (4-10 = alive - 24h bucket).
+        assert_eq!(gt_result.len(), 3, "Gt should return 24h bucket (slots 1,2,3)");
+        assert_eq!(lt_result.len(), 7, "Lt should return alive minus 24h bucket");
+        // Union covers all 10 alive slots
+        let union = &gt_result | &lt_result;
+        assert_eq!(union.len(), 10, "Gt union Lt should cover all alive slots");
     }
 }
