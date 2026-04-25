@@ -1,7 +1,7 @@
-use ahash::AHashMap as HashMap;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::sync::Arc;
 use roaring::RoaringBitmap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use crate::config::FilterFieldConfig;
 use crate::versioned_bitmap::VersionedBitmap;
 
@@ -48,6 +48,25 @@ pub struct FilterField {
     /// One bitmap per distinct value. Key is the u64 bitmap key.
     /// Wrapped in RwLock for interior mutability — see struct doc.
     bitmaps: RwLock<HashMap<u64, VersionedBitmap>>,
+    /// Side index of values whose VersionedBitmap has been mutated since
+    /// the last successful merge. `merge_dirty()` walks only these values
+    /// instead of iterating the full HashMap (769K entries for userId,
+    /// 22.5M for postId) under the write lock.
+    ///
+    /// Without this set, every merge cycle held the bitmaps write lock
+    /// long enough to walk the entire field — measured at 100 ms wait
+    /// time on `remove_bulk` calls trying to acquire the lock during a
+    /// merge cycle, which dominated flush apply on userId and produced
+    /// the 142 ms apply-phase bottleneck observed in prod.
+    ///
+    /// Mutation paths (insert / remove / insert_bulk / remove_bulk /
+    /// remove_from_all / insert_versioned-when-dirty) push values into
+    /// this set. `merge_dirty()` drains the set, takes the write lock,
+    /// and merges only the listed values. Unloaded-with-diff values
+    /// (lazy fields where the base isn't in memory yet) get re-queued
+    /// — `merge()` is a no-op until lazy-load brings the base in, but
+    /// they must stay tracked so the diff isn't lost.
+    dirty_values: Mutex<HashSet<u64>>,
     /// Field configuration.
     config: FilterFieldConfig,
 }
@@ -60,8 +79,10 @@ pub struct FilterField {
 impl Clone for FilterField {
     fn clone(&self) -> Self {
         let r = self.bitmaps.read();
+        let cloned_dirty = self.dirty_values.lock().clone();
         Self {
             bitmaps: RwLock::new(r.clone()),
+            dirty_values: Mutex::new(cloned_dirty),
             config: self.config.clone(),
         }
     }
@@ -70,8 +91,15 @@ impl FilterField {
     pub fn new(config: FilterFieldConfig) -> Self {
         Self {
             bitmaps: RwLock::new(HashMap::new()),
+            dirty_values: Mutex::new(HashSet::new()),
             config,
         }
+    }
+    /// Mark a value's VersionedBitmap as dirty so the next `merge_dirty()`
+    /// cycle will pick it up. Cheap — single hash insert under a brief mutex.
+    #[inline]
+    fn mark_dirty(&self, value: u64) {
+        self.dirty_values.lock().insert(value);
     }
     /// Bulk-load bitmaps from a map of (value -> bitmap).
     /// Used during startup to restore Tier 1 filter state from redb.
@@ -100,6 +128,8 @@ impl FilterField {
         w.entry(value)
             .or_insert_with(VersionedBitmap::new_empty)
             .insert(slot);
+        drop(w);
+        self.mark_dirty(value);
     }
     /// Clear a slot's bit from the bitmap for the given value.
     /// Always records the diff, even if the value is unloaded — creates a diff-only
@@ -109,6 +139,8 @@ impl FilterField {
         w.entry(value)
             .or_insert_with(VersionedBitmap::new_unloaded)
             .remove(slot);
+        drop(w);
+        self.mark_dirty(value);
     }
     /// Bulk-insert multiple slots into the bitmap for the given value.
     /// Slots should be sorted for maximum roaring-rs `extend()` performance.
@@ -122,6 +154,8 @@ impl FilterField {
         let t_insert = std::time::Instant::now();
         entry.insert_bulk(slots);
         let insert_us = t_insert.elapsed().as_micros();
+        drop(w);
+        self.mark_dirty(value);
         // Only log unusually slow calls (>5ms total) so we don't drown the logs.
         let total_us = lock_us + entry_us + insert_us;
         if total_us > 5_000 {
@@ -139,6 +173,9 @@ impl FilterField {
         w.entry(value)
             .or_insert_with(VersionedBitmap::new_empty)
             .or_into_base(bitmap);
+        // or_into_base writes the base directly, leaving the diff
+        // untouched, so the resulting VB is not "dirty" in the
+        // diff sense. Don't mark it.
     }
     /// Bulk-remove multiple slots from the bitmap for the given value.
     /// If the value isn't in memory (lazy-loaded field), creates an unloaded
@@ -151,13 +188,23 @@ impl FilterField {
         for &slot in slots {
             vb.remove(slot);
         }
+        drop(w);
+        self.mark_dirty(value);
     }
     /// Clear a slot's bit from ALL bitmaps in this field.
     /// Used by autovac to clean dead slots from filter bitmaps.
     pub fn remove_from_all(&self, slot: u32) {
-        let mut w = self.bitmaps.write();
-        for vb in w.values_mut() {
-            vb.remove(slot);
+        let mut touched: Vec<u64> = Vec::new();
+        {
+            let mut w = self.bitmaps.write();
+            for (k, vb) in w.iter_mut() {
+                vb.remove(slot);
+                touched.push(*k);
+            }
+        }
+        let mut set = self.dirty_values.lock();
+        for v in touched {
+            set.insert(v);
         }
     }
     /// Get the base bitmap for a specific value as an owned `Arc` clone.
@@ -198,6 +245,8 @@ impl FilterField {
     pub fn remove_value(&self, value: u64) {
         let mut w = self.bitmaps.write();
         w.remove(&value);
+        drop(w);
+        self.dirty_values.lock().remove(&value);
     }
     /// Number of distinct values currently loaded in memory.
     pub fn loaded_value_count(&self) -> usize {
@@ -366,46 +415,115 @@ impl FilterField {
         }
     }
     /// Merge all dirty VersionedBitmaps in this field.
+    ///
+    /// Walks the dirty side-set, not the full HashMap. See `dirty_values`
+    /// doc on `FilterField` for why.
     pub fn merge_all(&self) {
-        let mut w = self.bitmaps.write();
-        for vb in w.values_mut() {
-            vb.merge();
-        }
+        self.merge_dirty();
     }
-    /// Merge only dirty VersionedBitmaps.
     /// Returns true if any bitmap in this field has unmerged diffs.
     pub fn has_dirty(&self) -> bool {
-        self.bitmaps.read().values().any(|vb| vb.is_dirty())
+        !self.dirty_values.lock().is_empty()
     }
     /// Returns true only if a *loaded* bitmap has an unmerged diff.
     /// Unloaded-but-dirty entries can't be compacted (merge() short-circuits on
     /// !is_loaded), so idle compaction must ignore them to avoid a hot loop
     /// where has_dirty stays true and merge is a no-op.
     pub fn has_loaded_dirty(&self) -> bool {
-        self.bitmaps.read().values().any(|vb| vb.is_loaded() && vb.is_dirty())
+        let dirty: Vec<u64> = self.dirty_values.lock().iter().copied().collect();
+        if dirty.is_empty() {
+            return false;
+        }
+        let r = self.bitmaps.read();
+        dirty.iter().any(|v| {
+            r.get(v).map_or(false, |vb| vb.is_loaded() && vb.is_dirty())
+        })
     }
+    /// Merge dirty VersionedBitmaps, walking only the side dirty-set.
+    ///
+    /// Drains `dirty_values` first, then takes the bitmaps write lock once.
+    /// Per-value work is `vb.merge()` — single-digit microseconds. Lock-hold
+    /// scales with the number of dirty values per cycle, not the size of
+    /// the field.
+    ///
+    /// Unloaded-with-diff values can't be merged (their base isn't in
+    /// memory), so they get re-queued for the next cycle. They'll be
+    /// merged when lazy-load brings the base in.
     pub fn merge_dirty(&self) {
-        let mut w = self.bitmaps.write();
-        for vb in w.values_mut() {
-            if vb.is_dirty() {
-                vb.merge();
+        let dirty: Vec<u64> = {
+            let mut set = self.dirty_values.lock();
+            set.drain().collect()
+        };
+        if dirty.is_empty() {
+            return;
+        }
+        let mut requeue: Vec<u64> = Vec::new();
+        {
+            let mut w = self.bitmaps.write();
+            for value in dirty {
+                if let Some(vb) = w.get_mut(&value) {
+                    if !vb.is_dirty() {
+                        continue; // already clean — drop from set
+                    }
+                    if vb.is_loaded() {
+                        vb.merge();
+                    } else {
+                        // Diff exists but base isn't loaded; merge would
+                        // be a no-op. Keep tracked so we don't lose it.
+                        requeue.push(value);
+                    }
+                }
+                // Missing key (evicted) — drop from set silently.
+            }
+        }
+        if !requeue.is_empty() {
+            let mut set = self.dirty_values.lock();
+            for v in requeue {
+                set.insert(v);
             }
         }
     }
     /// Merge a specific value's VersionedBitmap if it exists and is dirty.
     pub fn merge_field(&self, value: u64) {
-        let mut w = self.bitmaps.write();
-        if let Some(vb) = w.get_mut(&value) {
-            if vb.is_dirty() {
-                vb.merge();
+        let mut merged_clean = false;
+        let mut still_dirty_unloaded = false;
+        {
+            let mut w = self.bitmaps.write();
+            if let Some(vb) = w.get_mut(&value) {
+                if vb.is_dirty() {
+                    if vb.is_loaded() {
+                        vb.merge();
+                        merged_clean = true;
+                    } else {
+                        still_dirty_unloaded = true;
+                    }
+                } else {
+                    merged_clean = true;
+                }
             }
+        }
+        let mut set = self.dirty_values.lock();
+        if merged_clean {
+            set.remove(&value);
+        } else if still_dirty_unloaded {
+            // Make sure it stays tracked even if a caller of merge_field
+            // expected it to handle the dirty-set bookkeeping.
+            set.insert(value);
         }
     }
     /// Insert a single (value, VersionedBitmap) pair directly into the map.
     /// Used by FilterIndex internal helpers (`unload_field`, `unload_from`)
     /// that build new fields from diff-only clones. Acquires the write lock.
     pub(crate) fn insert_versioned(&self, value: u64, vb: VersionedBitmap) {
+        let dirty = vb.is_dirty();
         self.bitmaps.write().insert(value, vb);
+        if dirty {
+            self.mark_dirty(value);
+        } else {
+            // A clean VB replaces whatever was there — drop any stale
+            // dirty-set entry for this value.
+            self.dirty_values.lock().remove(&value);
+        }
     }
 }
 /// The type of a filter field, determining how values map to bitmaps.
