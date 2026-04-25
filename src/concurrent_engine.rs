@@ -2753,7 +2753,6 @@ impl ConcurrentEngine {
                             }
                         }
                     }
-                }
                     // ── Prefilter refresh ──────────────────────────────────────
                     // Refresh any stale prefilters against the current snapshot.
                     // This runs every merge cycle (~60s default), so prefilter
@@ -2926,6 +2925,7 @@ impl ConcurrentEngine {
                             }
                         }
                     }
+                } // while !shutdown
             })
         };
         // Prefetch worker: background cache expansion when cursor nears boundary.
