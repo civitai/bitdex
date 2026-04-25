@@ -32,6 +32,21 @@ pub struct QueryTrace {
     pub docs_count: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
+    /// Wall-clock time from handler entry to returning the HTTP response.
+    /// Includes admission check, request parsing, engine call, doc fetch, and
+    /// serialization. Compare to `total_us` (engine-only) to see wrapper overhead.
+    pub total_handler_us: u64,
+    /// Time from handler entry to the point where the engine call begins.
+    /// Covers the admission/concurrency check, JSON parsing, index lookup, and
+    /// prefilter substitution. With `max_query_concurrency` implemented as a
+    /// shed (503), there is no queue wait — rejected requests never reach this
+    /// field. If this is large it means pre-engine setup is the bottleneck.
+    pub admission_wait_us: u64,
+    /// Time from the `spawn_blocking` call site to the closure body beginning
+    /// execution. Only populated for the doc-fetch `spawn_blocking`; the
+    /// primary bitmap query runs via `block_in_place` (zero dispatch cost).
+    /// Zero when no docs were fetched.
+    pub dispatch_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +126,9 @@ impl QueryTraceCollector {
             docs_count: 0,
             clauses: self.clauses,
             sort: self.sort,
+            total_handler_us: 0,
+            admission_wait_us: 0,
+            dispatch_us: 0,
         }
     }
 }
@@ -361,6 +379,9 @@ mod tests {
             clauses: vec![],
             sort: None,
             lazy_load_us: 0,
+            total_handler_us: 0,
+            admission_wait_us: 0,
+            dispatch_us: 0,
         };
 
         buf.push(make_trace(1));
@@ -388,7 +409,8 @@ mod tests {
             ts: String::new(), index: "t".into(), total_us: n, plan_us: 0,
             filter_us: 0, sort_us: 0, result_count: n, docs_us: 0,
             docs_count: 0, cache_hit: false, clauses: vec![], sort: None,
-            lazy_load_us: 0,
+            lazy_load_us: 0, total_handler_us: 0, admission_wait_us: 0,
+            dispatch_us: 0,
         };
 
         buf.push(make_trace(1));
@@ -413,7 +435,8 @@ mod tests {
             ts: String::new(), index: "t".into(), total_us: n, plan_us: 0,
             filter_us: 0, sort_us: 0, result_count: n, docs_us: 0,
             docs_count: 0, cache_hit: false, clauses: vec![], sort: None,
-            lazy_load_us: 0,
+            lazy_load_us: 0, total_handler_us: 0, admission_wait_us: 0,
+            dispatch_us: 0,
         };
 
         for i in 1..=5 {

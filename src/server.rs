@@ -2659,6 +2659,9 @@ async fn handle_query(
     AxumQuery(params): AxumQuery<QueryParams>,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Capture handler entry time for total_handler_us and admission_wait_us.
+    let t_handler_start = Instant::now();
+
     // -- Backpressure: track in-flight queries and enforce concurrency limit --
     let in_flight = state.queries_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
     state.metrics.queries_in_flight.inc();
@@ -2797,6 +2800,11 @@ async fn handle_query(
     }
 
     state.metrics.query_filter_clause_count.observe(query.filters.len() as f64);
+    // Time from handler entry to here: admission check + JSON parse + index
+    // lookup + prefilter substitution. With max_query_concurrency as a shed
+    // (503 reject, no queue), this is pure setup overhead, not queue wait.
+    let admission_wait_us = t_handler_start.elapsed().as_micros() as u64;
+
     let start = Instant::now();
     let m = &state.metrics;
     // Execute bitmap query via block_in_place. This converts the current
@@ -2839,6 +2847,7 @@ async fn handle_query(
             // Doc reads can hit disk (cache miss) — sync I/O on the async
             // runtime causes 4s+ response times under load.
             let doc_start = Instant::now();
+            let mut dispatch_us: u64 = 0;
             let documents = if !include_docs.is_none() {
                 let engine_docs = Arc::clone(&engine);
                 let ids = result.ids.clone();
@@ -2848,12 +2857,18 @@ async fn handle_query(
                 let schema_registry_docs = Arc::clone(&schema_registry);
                 let docstore_hist = m.docstore_read_seconds.clone();
                 let name_docs = name.clone();
+                // Capture timestamp immediately before spawn_blocking to
+                // measure how long tokio takes to schedule the closure onto a
+                // blocking thread.
+                let t_before_spawn = Instant::now();
 
                 // RAII guard replaces the old inc()/dec() bookend that
                 // leaked on `.await` cancellation (HTTP client disconnect).
                 // Dropped unconditionally when the async stack frame unwinds.
                 let _read_guard = ConcurrentReadGuard::new(&m.docstore_concurrent_reads);
                 let docs = tokio::task::spawn_blocking(move || {
+                    // First instruction inside the closure: measure dispatch lag.
+                    let closure_dispatch_us = t_before_spawn.elapsed().as_micros() as u64;
                     let mut docs = Vec::with_capacity(ids.len());
                     for &id in &ids {
                         let read_start = Instant::now();
@@ -2874,19 +2889,24 @@ async fn handle_query(
                             }
                         });
                     }
-                    docs
+                    (docs, closure_dispatch_us)
                 }).await.unwrap();
-                Some(docs)
+                dispatch_us = docs.1;
+                Some(docs.0)
             } else {
                 None
             };
             let docs_us = doc_start.elapsed().as_micros() as u64;
             let docs_count = documents.as_ref().map_or(0, |d| d.len()) as u64;
 
-            // Update trace with doc fetch timing
+            // Update trace with doc fetch timing and handler-level timing.
+            let total_handler_us = t_handler_start.elapsed().as_micros() as u64;
             let mut trace = trace;
             trace.docs_us = docs_us;
             trace.docs_count = docs_count;
+            trace.admission_wait_us = admission_wait_us;
+            trace.dispatch_us = dispatch_us;
+            trace.total_handler_us = total_handler_us;
 
             // Observe query phase histograms
             m.query_filter_seconds
