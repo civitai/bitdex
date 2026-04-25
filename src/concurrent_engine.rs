@@ -6562,11 +6562,17 @@ impl ConcurrentEngine {
                 }
             });
             let num_buckets = by_bucket.len();
+            // Buckets are independent — each bucket maps to a separate shard
+            // file on disk. Parallelize per-bucket I/O so a hot field like
+            // postId (138 buckets at 22.8M values) doesn't serialize 65 seconds
+            // of disk writes on a single thread. Same pattern as
+            // dump_processor's filter save loop.
+            let bucket_items: Vec<(u8, Vec<(u64, Arc<RoaringBitmap>)>)> = by_bucket.into_iter().collect();
             if is_lazy {
                 // Merge-on-save: for each bucket with in-memory entries, read the
                 // existing data from disk, merge in-memory data on top, write back.
                 // Buckets with no in-memory changes are left untouched on disk.
-                for (bucket, mem_entries) in by_bucket {
+                bucket_items.into_par_iter().try_for_each(|(bucket, mem_entries)| -> Result<()> {
                     // Read existing disk entries for this bucket
                     let disk_entries = filter_store.read_filter_bucket(name, bucket)
                         .unwrap_or_default();
@@ -6582,17 +6588,19 @@ impl ConcurrentEngine {
                         .collect();
                     filter_store.write_filter_bucket(name, bucket, &refs)
                         .map_err(|e| crate::error::BitdexError::Storage(format!("write filter {name}/{bucket:02x}: {e}")))?;
-                }
+                    Ok(())
+                })?;
             } else {
                 // Non-lazy fields: write in-memory state directly (fully loaded)
-                for (bucket, entries) in by_bucket {
+                bucket_items.into_par_iter().try_for_each(|(bucket, entries)| -> Result<()> {
                     let refs: Vec<(u64, &RoaringBitmap)> = entries
                         .iter()
                         .map(|(v, bm)| (*v, bm.as_ref()))
                         .collect();
                     filter_store.write_filter_bucket(name, bucket, &refs)
                         .map_err(|e| crate::error::BitdexError::Storage(format!("write filter {name}/{bucket:02x}: {e}")))?;
-                }
+                    Ok(())
+                })?;
             }
             eprintln!("  save: filter {} ({} values, {} buckets{}) in {:.1}ms",
                 name, num_values, num_buckets,
