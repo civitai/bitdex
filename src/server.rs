@@ -5130,32 +5130,40 @@ async fn handle_ops(
         }
     }
 
-    // Write to WAL using the shared writer (supports generational rotation)
-    let wal_guard = state.ops_wal.lock();
-    let writer = wal_guard.as_ref().unwrap();
-    let result = writer.append_batch(&batch.ops);
-    drop(wal_guard);
-    // Wrap to match the old spawn_blocking Result<Result<..>> pattern
-    let result: Result<Result<u64, std::io::Error>, tokio::task::JoinError> = Ok(result);
+    // Write to WAL using the shared writer (supports generational rotation).
+    //
+    // block_in_place wraps BOTH the Mutex acquisition AND append_batch.
+    // This is intentional: a contending request would otherwise block a Tokio
+    // worker on the synchronous parking_lot::Mutex *before* reaching
+    // block_in_place, starving the runtime.  Wrapping both gives Tokio
+    // visibility into the full blocking section so it spawns a replacement
+    // worker for the duration of the lock + fsync.  Matches the pattern used
+    // for query execution (see handle_query / block_in_place there).
+    //
+    // Commit 63662af removed the previous spawn_blocking to fix per-request
+    // WalWriter instantiation (which bypassed generational rotation).  That fix
+    // was correct but accidentally dropped the blocking offload; this restores
+    // it via block_in_place (no JoinHandle overhead, no pool exhaustion risk).
+    let t_wal_start = std::time::Instant::now();
+    let result = tokio::task::block_in_place(|| {
+        let wal_guard = state.ops_wal.lock();
+        wal_guard.as_ref().unwrap().append_batch(&batch.ops)
+    });
+    state.metrics.wal_append_duration_seconds
+        .observe(t_wal_start.elapsed().as_secs_f64());
 
     match result {
-        Ok(Ok(bytes)) => {
+        Ok(bytes) => {
             state.metrics.wal_ops_written_total.inc_by(ops_count as u64);
             (StatusCode::OK, Json(serde_json::json!({
                 "accepted": ops_count,
                 "bytes_written": bytes,
             }))).into_response()
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             eprintln!("WAL write error: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "error": format!("WAL write failed: {e}"),
-            }))).into_response()
-        }
-        Err(e) => {
-            eprintln!("WAL write task panicked: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": "Internal error",
             }))).into_response()
         }
     }

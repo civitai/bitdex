@@ -189,6 +189,7 @@ required-features = ["replay"]
 [[bin]]
 name = "rebuild_bench"
 path = "src/bin/rebuild_bench.rs"
+required-features = ["server"]
 
 [[example]]
 name = "load_from_csv"

@@ -915,6 +915,60 @@ where
         self.list_shards()
     }
 
+    /// Fsync every shard file in this store.
+    ///
+    /// Called by the merge thread before persisting the WAL cursor to ensure
+    /// all opslog entries appended with `fsync=false` by the flush thread are
+    /// durable on disk.  Without this, an OS crash (not a process crash) between
+    /// opslog append and cursor persist could advance the cursor past mutations
+    /// that exist only in page cache, causing those WAL ops to be silently
+    /// skipped on restart.
+    ///
+    /// Cost: one `sync_all()` per existing shard file, called once per merge
+    /// interval (~60 s default).  Off the per-flush hot path.
+    ///
+    /// Returns the count of shards successfully synced.  On any failure the
+    /// last error is returned so the caller can suppress cursor persistence.
+    pub fn sync_all_opslogs(&self) -> io::Result<usize> {
+        let keys = self.list_shards()?;
+        let mut synced = 0usize;
+        let mut last_err: Option<io::Error> = None;
+        for key in &keys {
+            let shard_path = self.shard_path(key);
+            if !shard_path.exists() {
+                continue;
+            }
+            // Hold the shared shard lock so we do not race with a concurrent
+            // compaction that might rename the file underneath us.
+            let lock = self.shard_lock(key);
+            let _guard = lock.read();
+            match fs::OpenOptions::new().read(true).write(true).open(&shard_path) {
+                Ok(f) => {
+                    if let Err(e) = f.sync_all() {
+                        eprintln!(
+                            "shard_store: sync_all_opslogs: fsync failed for {}: {e}",
+                            shard_path.display()
+                        );
+                        last_err = Some(e);
+                    } else {
+                        synced += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "shard_store: sync_all_opslogs: open failed for {}: {e}",
+                        shard_path.display()
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+        Ok(synced)
+    }
+
     /// Check if a shard exists.
     pub fn shard_exists(&self, key: &Sh::Key) -> bool {
         self.shard_path(key).exists()

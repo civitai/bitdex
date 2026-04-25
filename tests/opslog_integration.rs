@@ -509,3 +509,119 @@ fn test_opslog_delete_clears_all_stores() {
     assert_eq!(filter_bm.len(), 2, "remaining 2 slots should be in filter bitmap");
     drop(engine);
 }
+// ===========================================================================
+// Test 7: sync_all_opslogs — unit test for ShardStore::sync_all_opslogs
+//
+// Verifies that:
+// (a) sync_all_opslogs succeeds on stores with ops-log entries
+// (b) after the call, shard files remain readable with correct content
+//
+// This is the mechanism gating cursor persistence in the merge thread
+// (Task #18, 2026-04-25 durability fix).
+// ===========================================================================
+#[test]
+fn test_sync_all_opslogs_durability_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let ss_root = dir.path().join("bitmaps").join("shardstore");
+
+    // Build an alive store and append some ops WITHOUT fsync
+    // (simulates what the flush thread does for throughput)
+    let alive_store = AliveBitmapStore::new(ss_root.join("alive"), SingletonShard).unwrap();
+    let op1 = BitmapOp::SetBit { bit: 1 };
+    let op2 = BitmapOp::SetBit { bit: 2 };
+    alive_store.append_op_opts(&AliveShardKey, &op1, false).unwrap();
+    alive_store.append_op_opts(&AliveShardKey, &op2, false).unwrap();
+
+    // Verify ops are present in the shard file (may still be in page cache)
+    let ops_before = alive_store.ops_count(&AliveShardKey).unwrap();
+    assert!(
+        ops_before.is_some() && ops_before.unwrap() >= 2,
+        "ops should be present before sync, got {ops_before:?}"
+    );
+
+    // sync_all_opslogs should succeed and return the number of shards synced
+    let synced = alive_store
+        .sync_all_opslogs()
+        .expect("sync_all_opslogs should not fail on a valid store");
+    assert_eq!(synced, 1, "exactly one alive shard should have been synced");
+
+    // After sync, the shard must still be readable with correct content
+    let bm = alive_store.read(&AliveShardKey).unwrap().unwrap();
+    assert!(bm.contains(1), "slot 1 should be set after sync");
+    assert!(bm.contains(2), "slot 2 should be set after sync");
+    assert_eq!(bm.len(), 2, "exactly 2 bits should be set");
+}
+// ===========================================================================
+// Test 8: WAL cursor is written only after bitmap sync in merge thread
+//
+// Integration test for the cursor durability invariant (Task #18).
+//
+// After the fix, the merge thread only writes the on-disk cursor when
+// did_persist_data && !persist_had_errors && bitmaps_synced.
+//
+// We verify the positive case: after inserts + merge cycle, the cursor IS
+// written AND the bitmap state is consistent (no cursor/bitmap divergence).
+// ===========================================================================
+#[test]
+fn test_cursor_written_after_bitmap_sync() {
+    use bitdex_v2::shard_store_meta::MetaStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let docstore_path = dir.path().join("docs");
+    let bitmap_path = dir.path().join("bitmaps");
+    // Use a fast merge interval so the test completes quickly
+    let mut config = opslog_config(&bitmap_path);
+    config.merge_interval_ms = 80;
+    let engine = ConcurrentEngine::new_with_path(
+        config.clone(),
+        docstore_path.as_path(),
+    ).unwrap();
+
+    // Insert documents so the flush thread has bitmap ops to write
+    for i in 1..=5u32 {
+        engine
+            .put(
+                i,
+                &make_doc(vec![
+                    ("nsfwLevel", FieldValue::Single(Value::Integer(i as i64))),
+                    ("reactionCount", FieldValue::Single(Value::Integer(i as i64 * 100))),
+                ]),
+            )
+            .unwrap();
+    }
+    wait_for_flush(&engine, 5, 2000);
+
+    // Set a named cursor simulating the WAL reader advancing its position
+    engine.set_cursor("wal-reader".to_string(), "gen=0,offset=1024".to_string());
+
+    // Wait for at least two full merge cycles (flush + merge at 80ms each)
+    // The cursor should land in the first merge cycle where bitmaps are synced.
+    thread::sleep(Duration::from_millis(500));
+
+    // Drop engine — triggers clean shutdown, merge thread flushes
+    drop(engine);
+
+    // After engine shutdown, verify cursor was written to disk.
+    // MetaStore root is bitmap_path/shardstore (not a "meta" sub-directory).
+    let ss_root = bitmap_path.join("shardstore");
+    let meta_store = MetaStore::new(ss_root.clone()).unwrap();
+    let cursor = meta_store.load_cursor("wal-reader").unwrap();
+    assert!(
+        cursor.is_some(),
+        "WAL cursor should have been written to disk by the merge thread"
+    );
+    assert_eq!(
+        cursor.unwrap(),
+        "gen=0,offset=1024",
+        "persisted cursor value should match what was set"
+    );
+
+    // Verify bitmap state is also durable — no divergence between cursor and bitmaps
+    let alive_store = AliveBitmapStore::new(ss_root.join("alive"), SingletonShard).unwrap();
+    let bm = alive_store.read(&AliveShardKey).unwrap().unwrap();
+    assert_eq!(
+        bm.len(),
+        5,
+        "all 5 alive bits must be durable when cursor is persisted — no cursor/bitmap divergence"
+    );
+}
