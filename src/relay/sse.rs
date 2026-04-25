@@ -66,39 +66,45 @@ pub async fn handle_events(
         .with_label_values(&[&channel_name])
         .inc();
 
-    let metrics_for_sub_drop = metrics.clone();
-    let chan_for_sub_drop = channel_name.clone();
+    // RAII gauge guard. Captured into the stream's filter_map closure via
+    // `move`; lives as long as the stream itself. When the client
+    // disconnects (or the response is dropped server-side), axum drops
+    // the response → the Sse body drops → BroadcastStream drops → the
+    // closure drops → SubscriberGuard::drop fires → gauge decrements.
+    let gauge_guard = SubscriberGuard {
+        metrics: metrics.clone(),
+        channel: channel_name.clone(),
+    };
     let metrics_for_lag = metrics.clone();
     let chan_for_lag = channel_name.clone();
 
-    let stream = BroadcastStream::new(rx).filter_map(move |msg| match msg {
-        Ok(event) => {
-            let sse = Event::default()
-                .id(event.seq_id.to_string())
-                .data(event.payload);
-            Some(Ok::<Event, Infallible>(sse))
-        }
-        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-            metrics_for_lag
-                .sse_lagged_events
-                .with_label_values(&[&chan_for_lag])
-                .inc_by(n as f64);
-            metrics_for_lag
-                .drops_total
-                .with_label_values(&[&chan_for_lag, "lagged"])
-                .inc_by(n as f64);
-            Some(Ok::<Event, Infallible>(
-                Event::default().comment(format!("lagged {n}")),
-            ))
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
+        // Force-capture the guard into the closure environment without
+        // dropping it on each call. The `&` borrows for the duration of
+        // this match arm; the owning binding lives in the closure state.
+        let _ = &gauge_guard;
+        match msg {
+            Ok(event) => {
+                let sse = Event::default()
+                    .id(event.seq_id.to_string())
+                    .data(event.payload);
+                Some(Ok::<Event, Infallible>(sse))
+            }
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                metrics_for_lag
+                    .sse_lagged_events
+                    .with_label_values(&[&chan_for_lag])
+                    .inc_by(n as f64);
+                metrics_for_lag
+                    .drops_total
+                    .with_label_values(&[&chan_for_lag, "lagged"])
+                    .inc_by(n as f64);
+                Some(Ok::<Event, Infallible>(
+                    Event::default().comment(format!("lagged {n}")),
+                ))
+            }
         }
     });
-
-    // Decrement the gauge when the response is dropped.
-    // We wire this through a custom Drop guard owned by the stream's state.
-    let _gauge_guard = SubscriberGuard {
-        metrics: metrics_for_sub_drop,
-        channel: chan_for_sub_drop,
-    };
 
     let mut response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
 
@@ -108,29 +114,17 @@ pub async fn handle_events(
     h.insert("Cache-Control", HeaderValue::from_static("no-cache"));
     h.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
 
-    // The guard would ordinarily dec the gauge on Drop, but axum eats the
-    // value here and we lose the lifetime hook. For V1, accept that the
-    // gauge tracks lifetime-of-connection only via inc on subscribe; the
-    // dec happens on the BroadcastStream task ending, which we wire via
-    // the response future drop in a follow-up commit.
-    //
-    // TODO follow-up: thread the SubscriberGuard through the stream so the
-    // gauge dec is guaranteed.
-
     response
 }
 
-#[allow(dead_code)]
 struct SubscriberGuard {
     metrics: crate::relay::metrics::RelayMetrics,
     channel: String,
 }
 
-#[allow(dead_code)]
 impl Drop for SubscriberGuard {
     fn drop(&mut self) {
-        let _ = self
-            .metrics
+        self.metrics
             .sse_subscribers
             .with_label_values(&[&self.channel])
             .dec();

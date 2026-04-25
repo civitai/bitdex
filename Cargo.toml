@@ -111,6 +111,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 tempfile = "3"
 memmap2 = "0.9"
+# axum router oneshot testing pattern (relay smoke tests)
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 
 # Fast release builds for development — `cargo build --profile fast`

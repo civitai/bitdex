@@ -234,6 +234,7 @@ dependencies = [
  "flate2",
  "futures-core",
  "futures-util",
+ "http-body-util",
  "memmap2",
  "parking_lot",
  "prometheus",
