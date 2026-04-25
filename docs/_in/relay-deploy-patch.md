@@ -1,8 +1,24 @@
 # Relay V1 — K8s Manifest Patch
 
-**For review only. Do NOT apply to cluster until Aidan returns, Justin signs off, or Tom executes.**
+**For review only. Apply gates on Aidan / Justin sign-off / Tom executing.**
 
 Target file in talos-infra: `clusters/production/apps/bitdex/deployment.yaml`
+
+> **Important — re-create, not patch.** As of 2026-04-25 Aidan reports
+> `kubectl get sts -n bitdex` returns `No resources found`; the
+> StatefulSet is not currently in the cluster (PVCs intact). The first
+> apply of this manifest **re-creates** the StatefulSet from scratch
+> rather than patching an existing object. Confirm cluster state before
+> apply.
+>
+> **Flux is suspended.** Tom suspended the `bitdex` Kustomization on
+> Apr 12 (per `clusters/production/apps/bitdex/README.md`). Verify with
+> `flux get kustomization bitdex`. Resume only after the canary checks
+> in the flip runbook pass on flip-back.
+>
+> **Single replica.** V1 production runs one pod (`bitdex-0`).
+> `data-bitdex-1` PVC exists but is unused. Manifest below assumes
+> `replicas: 1`.
 
 ---
 

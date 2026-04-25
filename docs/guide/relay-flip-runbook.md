@@ -25,28 +25,30 @@ Complete ALL of these before issuing the flip command. If any item is not met, d
 - [ ] **Capture decision made.** If the relay window data must be guaranteed durable (e.g. for offline replay or verifier), enable capture in the relay config by mounting a ConfigMap with `capture.enabled: true`. If iteration-only with no replay need, capture can stay off — but accept that SSE lag = data loss.
 - [ ] **WAL retention confirmed > planned relay window.** The cheap reseed path on flip-back (WAL replay) only works if the relay window duration is less than the WAL retention window. Confirm WAL retention from PG before flipping. If the window might exceed retention, plan for full bulk reload from the start.
 - [ ] **Relay image confirmed built and deployed.** The running image must include the `feat/relay` code (mode dispatch in `src/bin/server.rs`, `src/relay/` module). Verify: `node .claude/skills/deploy/cli.mjs status` shows the expected image tag.
-- [ ] **Record the current PG-sync cursor values.** Before flip, capture the cursor positions for both replicas. These are the values you reset to for WAL replay on flip-back.
+- [ ] **Record the current PG-sync cursor value.** Before flip, capture the cursor position for the running pod. This is the value you reset to for WAL replay on flip-back.
   ```bash
   kubectl --context civit-datapacket exec -n bitdex bitdex-0 -c bitdex -- \
     curl -s localhost:3000/api/indexes/civitai/cursors/pg-sync-bitdex-0
-  kubectl --context civit-datapacket exec -n bitdex bitdex-1 -c bitdex -- \
-    curl -s localhost:3000/api/indexes/civitai/cursors/pg-sync-bitdex-1
   ```
-  Record both cursor values in your ops notes. You need these for the WAL replay path on flip-back.
+  Record the cursor value in your ops notes. You need this for the WAL replay path on flip-back. (V1 = single replica; if scaled to two later, also capture `pg-sync-bitdex-1`.)
 - [ ] **Resource requests NOT lowered (default-safe mode).** `requests.memory: 14Gi` must remain in the StatefulSet during the relay window. Do NOT lower it unless you are explicitly opting into aggressive mode (see §Resource Budget below). The scheduling trap on flip-back will cause a production outage.
 - [ ] **Operator acknowledges PG-sync divergence invariant.** During the relay window, PG-sync advances its cursor but the BitDex WAL receives nothing. Flip-back requires a mandatory reseed before BitDex is authoritative. Confirm this is understood and the reseed plan is selected (WAL replay vs full bulk reload).
-- [ ] **Both replicas will flip together.** Never flip one replica at a time — the Service round-robins between pods, producing inconsistent results (real responses from one, relay stubs from the other). The `kubectl set env statefulset/...` command changes the template and triggers rolling restart of all replicas.
+- [ ] **Single replica (V1).** Production runs one pod (`bitdex-0`); `data-bitdex-1` PVC exists but is unused. The `kubectl set env statefulset/...` command flips the single pod via rolling restart. If V1 ever scales to two replicas (Justin coordinates), revisit this checklist for the multi-replica invariant: both flip together, never split modes across replicas.
+- [ ] **Flux Kustomization for `bitdex` already suspended.** Tom suspended on Apr 12; documented in `clusters/production/apps/bitdex/README.md`. Verify with `flux get kustomization bitdex`. Resume only after the canary checks pass on flip-back, not before.
+- [ ] **StatefulSet may not currently exist in cluster.** As of Apr 25, `kubectl get sts -n bitdex` returned `No resources found` (PVCs intact). The manifest patch is a re-create on first apply, not a patch on an existing object. Confirm before apply via `kubectl get sts -n bitdex`; if absent, the apply seeds from scratch.
 
 ---
 
 ## Flip Command
 
 ```bash
-# Flip both replicas to relay mode.
-# This changes the StatefulSet template and triggers a rolling pod restart.
+# Flip the single pod to relay mode.
+# Changes the StatefulSet template and triggers a rolling pod restart.
 kubectl --context civit-datapacket set env statefulset/bitdex \
   BITDEX_MODE=relay -n bitdex
 ```
+
+Note: V1 production is a single replica (`bitdex-0`). If the StatefulSet does not exist in the cluster (see precondition checklist), the apply path is `flux get kustomization bitdex` → resume → push talos-infra → reconcile re-creates from manifest. `kubectl set env` against a non-existent StatefulSet returns an error; either (a) apply the manifest patch first to seed the StatefulSet, then `set env`, or (b) include `BITDEX_MODE` directly in the manifest patch and skip `set env`.
 
 **Note on Flux:** Flux CD manages this StatefulSet and will revert `kubectl` changes within 30s–5min unless the env change is also committed to talos-infra. For a temporary relay window, you have a choice:
 
@@ -61,7 +63,7 @@ For relay windows, the talos-infra commit path is safer — Flux reversion mid-w
 # Watch pods restart
 kubectl --context civit-datapacket get pods -n bitdex -w
 
-# After both pods are Running+Ready, check health response includes mode=relay
+# After the pod is Running+Ready, check health response includes mode=relay
 curl -s https://bitdex.civitai.com/api/health | jq .
 # Expected: {"status":"ok","mode":"relay"}
 ```
@@ -104,7 +106,7 @@ PG-sync continues polling and advancing its cursor during the relay window. Conf
 
 ```bash
 node .claude/skills/deploy/cli.mjs pg-sync-logs bitdex-0 50
-node .claude/skills/deploy/cli.mjs pg-sync-logs bitdex-1 50
+# If V1 ever scales to two replicas, also: pg-sync-logs bitdex-1 50
 ```
 
 The sidecar should show periodic poll cycles. Cursor advancement is expected and is what creates the reseed requirement on flip-back.
@@ -114,14 +116,14 @@ The sidecar should show periodic poll cycles. Cursor advancement is expected and
 ## Flip-back Command
 
 ```bash
-# Return both replicas to server mode.
+# Return the pod to server mode.
 kubectl --context civit-datapacket set env statefulset/bitdex \
   BITDEX_MODE=server -n bitdex
 ```
 
 If you used the talos-infra commit path to flip in, revert the commit and push.
 
-**Wait for both pods to be Running+Ready before proceeding to the reseed step.**
+**Wait for the pod to be Running+Ready before proceeding to the reseed step.**
 
 ```bash
 kubectl --context civit-datapacket rollout status statefulset/bitdex -n bitdex
@@ -140,14 +142,14 @@ Choose the cheapest applicable path:
 Use this when: `(relay window duration) < (WAL retention window)`.
 
 1. Stop the pg-sync sidecar temporarily (scale PG-sync out, or patch sidecar env to stop polling — Aidan's call on the cleanest mechanism without disrupting the StatefulSet).
-2. Reset the PG-sync cursor for each replica to the pre-flip-in value you recorded in the preconditions step:
+2. Reset the PG-sync cursor to the pre-flip-in value you recorded in the preconditions step:
    ```bash
    # Replace <cursor_value_before_flip> with the recorded cursor
    curl -X PUT https://bitdex.civitai.com/api/indexes/civitai/cursors/pg-sync-bitdex-0 \
      -H "Authorization: Bearer $BITDEX_ADMIN_TOKEN" \
      -H "Content-Type: application/json" \
      -d '{"value": <cursor_value_before_flip>}'
-   # Repeat for pg-sync-bitdex-1
+   # If V1 ever scales to two replicas, repeat for pg-sync-bitdex-1
    ```
 3. Restart pg-sync (or re-enable polling). WAL reader replays from the reset cursor. Monitor with `pg-sync-logs` until the cursor advances past the flip-back point and stabilizes.
 4. WAL replay is complete when `bitdex_wal_ops_processed_total` metric matches the current PG-sync cursor (or is within a small batch tolerance).
@@ -200,7 +202,7 @@ Run these checks after flip-back + reseed completes. Do not declare the window c
    kubectl --context civit-datapacket get pods -n bitdex
    ```
 
-   Both `bitdex-0` and `bitdex-1` must show `Running` status and `1/1` or `2/2` ready containers (server + pg-sync sidecar both healthy).
+   `bitdex-0` must show `Running` status and `1/1` or `2/2` ready containers (server + pg-sync sidecar both healthy). V1 = single replica.
 
 2. **WAL reader caught up — ops processed matches PG cursor**
 
@@ -308,7 +310,7 @@ If the node was backfilled and 14 GiB is unavailable, the pod goes `Pending`. Op
 ## Known Pitfalls
 
 - **Flux reversion:** Flux reconciles every 30s–5min. A `kubectl set env` flip will be reverted unless you also commit to talos-infra or suspend Flux. Mid-window Flux reversion puts the pod back in server mode while your rig is still subscribed — data your rig received is not in BitDex. Coordinate with Arabella.
-- **Mixed-mode replicas:** Never let one replica be in server mode while the other is in relay mode. The Service round-robins, producing inconsistent responses (real query results from one pod, relay stubs from the other). The `kubectl set env statefulset/bitdex` command changes the pod template and triggers rolling restart of all replicas together — verify both pods have restarted before consuming from the SSE stream.
+- **Mixed-mode replicas (V1: not applicable, single replica).** If V1 scales to two replicas later, never let one replica be in server mode while the other is in relay mode. The Service would round-robin, producing inconsistent responses (real query results from one pod, relay stubs from the other). The `kubectl set env statefulset/bitdex` command changes the pod template and triggers rolling restart of all replicas together — verify all pods have restarted before consuming from the SSE stream.
 - **BITDEX_ADMIN_TOKEN required:** The relay refuses to start if the admin token is unset and any route requires bearer auth (SSE egress always does). Confirm the `bitdex-secrets` secret is populated. If the pod is crash-looping on relay mode, check logs for `admin bearer required`.
 - **PVC contention:** The relay pod does not access the PVC (no bitmap engine), so PVC contention is not an issue during the relay window itself. It becomes relevant again on flip-back when the server restarts and loads from disk.
 - **SSE subscriber required for emit gate:** If no SSE subscriber is connected and capture is disabled, route handlers skip the emit step entirely (`receiver_count() == 0` gate). Events are not buffered — they are dropped. Your local rig must be subscribed before the flip completes.
