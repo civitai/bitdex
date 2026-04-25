@@ -935,11 +935,12 @@ where
         let mut last_err: Option<io::Error> = None;
         for key in &keys {
             let shard_path = self.shard_path(key);
-            if !shard_path.exists() {
-                continue;
-            }
-            // Hold the shared shard lock so we do not race with a concurrent
-            // compaction that might rename the file underneath us.
+            // Acquire the shared shard lock BEFORE opening.  Do NOT call
+            // shard_path.exists() first — that creates a classic TOCTOU race:
+            // compaction holds the write lock to rename/replace the shard file,
+            // and a gap between exists() and lock/open lets us see the old name
+            // but open the post-rename file (or a NotFound).  By locking first
+            // we ensure compaction has fully committed before we open.
             let lock = self.shard_lock(key);
             let _guard = lock.read();
             match fs::OpenOptions::new().read(true).write(true).open(&shard_path) {
@@ -954,6 +955,10 @@ where
                         synced += 1;
                     }
                 }
+                // File not found: shard key was listed but file was subsequently
+                // removed (e.g. the shard was a placeholder with no content).
+                // This is safe to skip — no opslog data to sync.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
                     eprintln!(
                         "shard_store: sync_all_opslogs: open failed for {}: {e}",

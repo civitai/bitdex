@@ -589,10 +589,13 @@ fn test_cursor_written_after_bitmap_sync() {
             )
             .unwrap();
     }
-    wait_for_flush(&engine, 5, 2000);
-
-    // Set a named cursor simulating the WAL reader advancing its position
+    // Set cursor BEFORE wait_for_flush so the merge thread is guaranteed to
+    // see it alongside the bitmap ops in the same persist cycle.  Setting it
+    // after the flush+merge cycle risks the merge thread running and clearing
+    // did_persist_data before set_cursor is called.
     engine.set_cursor("wal-reader".to_string(), "gen=0,offset=1024".to_string());
+
+    wait_for_flush(&engine, 5, 2000);
 
     // Wait for at least two full merge cycles (flush + merge at 80ms each)
     // The cursor should land in the first merge cycle where bitmaps are synced.

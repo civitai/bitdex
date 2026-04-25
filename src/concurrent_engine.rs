@@ -2827,24 +2827,44 @@ impl ConcurrentEngine {
                     // whether compaction fired this cycle.  Cost: one sync_all() per
                     // shard file once per merge interval (~60 s default) — not on the
                     // per-flush hot path.
-                    let mut bitmaps_synced = false;
+                    // Sync whichever bitmap stores are actually configured.
+                    // Using `if let (Some, Some, Some)` would fall into an
+                    // "else → bitmaps_synced=true" branch whenever only a subset
+                    // of stores are present, incorrectly skipping syncs for the
+                    // stores that DO exist.  Instead, sync each store independently.
+                    let mut bitmaps_synced = true; // true until proven otherwise
+                    let mut any_bitmap_store = false;
                     if did_persist_data && !persist_had_errors {
-                        if let (Some(ref as_), Some(ref fs_), Some(ref ss_)) =
-                            (&merge_alive_store, &merge_filter_store, &merge_sort_store)
-                        {
-                            let alive_ok = as_.sync_all_opslogs()
+                        if let Some(ref as_) = merge_alive_store {
+                            any_bitmap_store = true;
+                            if as_.sync_all_opslogs()
                                 .map_err(|e| eprintln!("merge: alive opslog sync failed: {e}"))
-                                .is_ok();
-                            let filter_ok = fs_.sync_all_opslogs()
+                                .is_err()
+                            {
+                                bitmaps_synced = false;
+                            }
+                        }
+                        if let Some(ref fs_) = merge_filter_store {
+                            any_bitmap_store = true;
+                            if fs_.sync_all_opslogs()
                                 .map_err(|e| eprintln!("merge: filter opslog sync failed: {e}"))
-                                .is_ok();
-                            let sort_ok = ss_.sync_all_opslogs()
+                                .is_err()
+                            {
+                                bitmaps_synced = false;
+                            }
+                        }
+                        if let Some(ref ss_) = merge_sort_store {
+                            any_bitmap_store = true;
+                            if ss_.sync_all_opslogs()
                                 .map_err(|e| eprintln!("merge: sort opslog sync failed: {e}"))
-                                .is_ok();
-                            bitmaps_synced = alive_ok && filter_ok && sort_ok;
-                        } else {
-                            // No bitmap stores configured (e.g. in-memory-only mode) —
-                            // no opslog entries to sync; cursor advance is safe.
+                                .is_err()
+                            {
+                                bitmaps_synced = false;
+                            }
+                        }
+                        // If no bitmap stores exist (pure in-memory mode), there is
+                        // nothing to sync — cursor advance is inherently safe.
+                        if !any_bitmap_store {
                             bitmaps_synced = true;
                         }
                     }
