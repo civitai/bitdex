@@ -281,7 +281,7 @@ Stub responses must match what current callers parse. Smoke before prod flip:
 
 - **PG-sync `bitdex_client.rs`** — verified safe by Donovan (2026-04-25). `BitdexClient::post_ops` (`src/pg_sync/bitdex_client.rs:268-283`) only checks `resp.status().is_success()`; doesn't deserialize body. `{"accepted": 0}` is fine; empty 200 is fine. No retry-forever risk.
 - **`/api/health`** — match the current shape `{"status":"ok"}` plus added `mode` field. Verify K8s probes don't enforce a strict schema.
-- **Model-share / shadow-mode query callers** — **HARD BLOCKER for prod flip.** Per Donovan (2026-04-25), the comparator at `src/server/bitdex/{client.ts,compare.ts}` in the model-share repo has **no existing `tee_mode` handling**. When relay flips on, every query returns `{"ids":[],"total_matched":0,"tee_mode":true}` while Meili returns real results → 100% divergence on every query → alert spam. **Fix required before relay window:** model-share's `compare.ts` checks `response.tee_mode === true` early and skips comparator path entirely (no record, no divergence count, no alert). Owner: needs assignment (Donovan offline on model-share; coordinate with Aidan or Justin to land the model-share PR).
+- **Model-share / shadow-mode query callers** — **V1 mitigation: shadow OFF during relay window.** Per Justin's standing rule ("shadow ON only, not primary") + V1 runbook precondition, shadow-mode comparison is disabled for the duration of any relay window. With shadow off, the comparator at `src/server/bitdex/compare.ts` never runs against the `tee_mode:true` stub → no divergence alert spam. **No model-share PR is required for V1.** A `tee_mode` skip path becomes a prerequisite for V2 alongside-mode (relay + real BitDex coexist + shadow on); design captured at `docs/_in/v2-model-share-tee-skip-spec.md` for that work.
 
 If any caller breaks on the stub shape, surface as a blocker before prod flip.
 
@@ -613,8 +613,8 @@ If `BITDEX_ADMIN_TOKEN` is unset and any route requires bearer, relay refuses to
 6. ✅ Caller-compat smoke + SubscriberGuard RAII (61e719f). 7/7 tests pass.
 7. ✅ NDJSON capture writer + default config YAML (0e73ff6). 8/8 tests pass.
 8. ✅ Dockerfile draft — `deploy/docker/Dockerfile` adds `BITDEX_MODE=server` env, ships `relay-config.default.yaml` at `/etc/bitdex/relay-config.yaml`, adds `HEALTHCHECK` against `/api/health`.
-9. **Aidan §15 answers** — Aidan offline. Deploy-relief sub-agent (Infrastructure Engineer) spawned to draft K8s manifest patch + flip runbook + answer §15 from existing patterns. Apply still gates on Aidan return / Justin sign-off / Tom executing.
-10. **Model-share `tee_mode` skip-path PR** — pending. Hard blocker for prod flip; needs owner.
+9. **Aidan §15 answers** — Aidan offline. Deploy-relief sub-agent (Infrastructure Engineer) drafted manifest patch (`docs/_in/relay-deploy-patch.md`) + flip runbook (`docs/guide/relay-flip-runbook.md`) + answered §15 from existing patterns. Apply still gates on Aidan return / Justin sign-off / Tom executing.
+10. **Model-share `tee_mode` skip-path** — NOT a V1 blocker. V1 runbook precondition: shadow OFF during relay window → comparator doesn't run → no divergence alert. The skip path is a V2 prerequisite (alongside-mode); preserved at `docs/_in/v2-model-share-tee-skip-spec.md` if drafted.
 11. Aidan ships image. Operator pre-flip checklist + relay window. Mandatory reseed on flip-back.
 12. Mail Justin when V1 is live.
 

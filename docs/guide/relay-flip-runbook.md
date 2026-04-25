@@ -20,7 +20,7 @@ This runbook covers the full relay window lifecycle: pre-flip preconditions, fli
 
 Complete ALL of these before issuing the flip command. If any item is not met, do not flip.
 
-- [ ] **model-share `tee_mode` skip landed.** The comparator at `src/server/bitdex/compare.ts` in the model-share repo must return early when `response.tee_mode === true` (skips comparison, no alert, no divergence record). This is a hard blocker — without it, every query during the relay window registers 100% divergence and fires alerts. Owner: coordinate with whoever is standing in for Donovan.
+- [ ] **Shadow-mode comparator OFF.** Per Justin's standing rule for model-share ("shadow ON only, not primary") + V1 runbook constraint, the shadow-mode comparator (`src/server/bitdex/compare.ts` in model-share) must be **disabled** for the duration of the relay window. With shadow off, the comparator never sees the `tee_mode:true` stub, so no divergence alerts fire. Confirm via the model-share feature flag dashboard that shadow comparison is disabled before flipping. (V2 alongside-mode will need a model-share `tee_mode` skip path so comparator + relay can coexist; tracked as `docs/_in/v2-model-share-tee-skip-spec.md` if drafted.)
 - [ ] **Local rig connected BEFORE flip.** Subscribe to `https://bitdex.civitai.com/events/queries` and `/events/ops` with a valid bearer token before issuing `kubectl set env`. Events emitted between the flip and your subscribe are lost (no replay). Confirm the SSE stream is receiving events.
 - [ ] **Capture decision made.** If the relay window data must be guaranteed durable (e.g. for offline replay or verifier), enable capture in the relay config by mounting a ConfigMap with `capture.enabled: true`. If iteration-only with no replay need, capture can stay off — but accept that SSE lag = data loss.
 - [ ] **WAL retention confirmed > planned relay window.** The cheap reseed path on flip-back (WAL replay) only works if the relay window duration is less than the WAL retention window. Confirm WAL retention from PG before flipping. If the window might exceed retention, plan for full bulk reload from the start.
@@ -172,6 +172,19 @@ node .claude/skills/deploy/reload.mjs resume      # Unsuspend Flux
 See `docs/HANDOFF.md §Bulk Reload` and the reload script's inline help for details. The critical pitfall: the bulk loader seeds the cursor at the current outbox head, not CSV dump time. `cursor-reset` step handles this.
 
 **The deploy skill reload path covers the full wipe-and-reload procedure.** No new skill is needed for relay flip-back. Path A (WAL replay) requires only cursor reset via the HTTP admin API, which the deploy CLI's `config` commands can handle.
+
+---
+
+## Re-enabling Shadow Comparison After Flip-back
+
+Once flip-back + reseed + canary checks all pass, shadow-mode comparison can be re-enabled. **Do not** re-enable shadow before the canary checks pass — the comparator would run against potentially stale BitDex output and produce divergence noise that obscures the actual reseed status.
+
+Re-enable steps:
+1. Confirm all four canary checks below pass.
+2. Flip the model-share shadow-comparison feature flag back ON via the model-share dashboard.
+3. Watch divergence rate for 5 minutes. If rate is at or below the pre-window baseline, leave shadow ON. If higher, flip shadow back OFF and investigate (likely an incomplete reseed).
+
+V2 alongside-mode will require a model-share `compare.ts` skip path so shadow can stay ON during a relay window — tracked separately. V1 just toggles shadow OFF for the window.
 
 ---
 
