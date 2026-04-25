@@ -1,0 +1,5 @@
+firing 2000 postId-in-single queries (cold-path, distinct postIds across 22.5M space) — concurrency 8
+done in 9.8s, 2000 ok / 0 err
+P50=24.6ms  P90=70.0ms  P95=87.8ms  P99=138.6ms  P99.9=1700.0ms  max=1833.6ms
+>500ms: 8 (0.40%)
+>1000ms: 8 (0.40%)

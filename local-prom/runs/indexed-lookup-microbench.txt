@@ -1,0 +1,12 @@
+     Running `target\release\bench_indexed_lookup.exe`
+=== indexed-lookup microbench ===
+bucket population: 89000 values × ~32 bits/bitmap
+lookups: 200
+
+populating ... bucket written (raw) in 221.8104ms
+
+indexed path:    total 278.1002ms, mean 1390.50 µs/lookup, total_bits 6399
+full-bucket:     total 71.6198848s, mean 358099.42 µs/lookup, total_bits 6399
+
+speedup: 257.5×
+✓ ≥30× target met

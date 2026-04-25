@@ -362,7 +362,7 @@ fn fsync_parent_dir(path: &Path) -> io::Result<()> {
 
 /// Check if a shard file has at least a full header (28 bytes).
 /// Returns false for undersized stubs (e.g., 4-byte PreCreator placeholders).
-fn is_valid_shard_file(path: &Path) -> bool {
+pub(crate) fn is_valid_shard_file(path: &Path) -> bool {
     fs::metadata(path)
         .map(|m| m.len() >= HEADER_SIZE as u64)
         .unwrap_or(false)
@@ -470,7 +470,7 @@ where
     /// Shared lock — for readers and writers (concurrent across different shards, but
     /// serialized with the compactor on the same shard).
     /// Exclusive lock — for compactors (blocks all other accessors on this shard).
-    fn shard_lock(&self, key: &Sh::Key) -> Arc<RwLock<()>> {
+    pub(crate) fn shard_lock(&self, key: &Sh::Key) -> Arc<RwLock<()>> {
         if let Some(existing) = self.shard_locks.get(key) {
             return Arc::clone(&*existing);
         }
