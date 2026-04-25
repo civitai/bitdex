@@ -15,6 +15,9 @@
 > - `volumeClaimTemplates[0].metadata.name: data`
 > - `spec.storageClassName: openebs-hostpath-bitdex-nvme`
 > - `spec.accessModes: [ReadWriteOnce]`
+> - `spec.resources.requests.storage: 200Gi` (downsizing fails adoption — K8s
+>   requires existing PVC ≥ requested; growing is OK with a manual edit
+>   but breaks immutability of the spec field on most StatefulSets)
 >
 > Changing any of these breaks adoption of the existing
 > `data-bitdex-0` PVC and forces a new PVC + lost data.
