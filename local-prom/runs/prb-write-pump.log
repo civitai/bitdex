@@ -1,0 +1,16 @@
+pumping upserts: batch=200 concurrency=8 for 60s
+[5s] batches=8 upserted=1600 (319/s) errs=0
+[10s] batches=16 upserted=3200 (320/s) errs=0
+[15s] batches=24 upserted=4800 (320/s) errs=0
+[20s] batches=32 upserted=6400 (319/s) errs=0
+[25s] batches=43 upserted=8600 (343/s) errs=0
+[30s] batches=54 upserted=10800 (359/s) errs=0
+[35s] batches=58 upserted=11600 (331/s) errs=0
+[40s] batches=62 upserted=12400 (309/s) errs=0
+[45s] batches=70 upserted=14000 (311/s) errs=0
+[50s] batches=78 upserted=15600 (312/s) errs=0
+[55s] batches=90 upserted=18000 (327/s) errs=0
+[60s] batches=98 upserted=19600 (326/s) errs=0
+
+=== final ===
+elapsed=63.1s batches=106 upserted=21200 (336/s) errs=0
