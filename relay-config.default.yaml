@@ -98,8 +98,7 @@ routes:
       headers: { Content-Type: application/json }
       body: '{}'
 
-  # `/stats` is hit by pg-sync's healthcheck loop. Empty stats body
-  # parses fine.
+  # `/stats` — pg-sync's `get_alive_count` reads `.alive_count` u64.
   - path: /api/indexes/{index}/stats
     methods: [GET]
     auth: none
@@ -108,19 +107,86 @@ routes:
       headers: { Content-Type: application/json }
       body: '{"alive_count":0,"slot_counter":0,"docstore_size_bytes":0}'
 
-  # Cursor read/write — pg-sync's ops poller reads its own cursor on
-  # boot and writes after each batch. Read returns 0; write accepts.
+  # Cursor read — return 404 so pg-sync's `get_cursor` resolves to
+  # `Ok(None)` and the metrics-poller / ops-poller takes the cold-start
+  # path. This is the right semantic in relay mode (no real persistence).
+  # Returning 200 with a typed `CursorResponse { name, value:String }`
+  # was the v1.0.174 metrics-poller crash: `value:"0"` parses to 0,
+  # fails `ts > 0`, returns "unparseable" Err. 404 sidesteps the typed
+  # parse entirely.
   - path: /api/indexes/{index}/cursors/{cursor_name}
     methods: [GET]
     auth: loopback_or_bearer
     response:
-      status: 200
+      status: 404
       headers: { Content-Type: application/json }
-      body: '{"value":0}'
+      body: '{"error":"cursor not found in relay mode"}'
 
+  # Cursor write — admin-gated by pg-sync (sends bearer). Body is
+  # ignored; we just need 2xx so pg-sync proceeds.
   - path: /api/indexes/{index}/cursors/{cursor_name}
     methods: [PUT]
     auth: loopback_or_bearer
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{}'
+
+  # ── pg-sync document mutation stubs ─────────────────────────────────────
+  # `bin/pg_sync.rs` and the backfill code path call these. None of
+  # them parse the body; they only check `status().is_success()`. So
+  # an empty 200 OK satisfies all of them.
+
+  - path: /api/indexes/{index}/documents/upsert
+    methods: [POST]
+    auth: loopback_or_bearer
+    max_body_bytes: 33554432
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{}'
+
+  - path: /api/indexes/{index}/documents/patch
+    methods: [PATCH]
+    auth: loopback_or_bearer
+    max_body_bytes: 33554432
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{}'
+
+  - path: /api/indexes/{index}/documents
+    methods: [DELETE]
+    auth: loopback_or_bearer
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{}'
+
+  # `filter_sync` does parse the body — needs `.errors` array.
+  - path: /api/indexes/{index}/documents/filter-sync
+    methods: [POST]
+    auth: loopback_or_bearer
+    max_body_bytes: 33554432
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{"errors":[]}'
+
+  - path: /api/indexes/{index}/fields/{field_name}/reload
+    methods: [POST]
+    auth: loopback_or_bearer
+    response:
+      status: 200
+      headers: { Content-Type: application/json }
+      body: '{}'
+
+  # Fire-and-forget metrics endpoint. pg-sync ignores the response
+  # entirely (`let _ = client.post()...`), but a clean 200 keeps the
+  # logs quiet.
+  - path: /api/internal/pgsync-metrics
+    methods: [POST]
+    auth: none
     response:
       status: 200
       headers: { Content-Type: application/json }

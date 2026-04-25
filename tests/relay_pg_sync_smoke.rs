@@ -122,6 +122,127 @@ async fn pg_sync_dump_pipeline_against_default_config() {
     );
 }
 
+/// Drives every method of `BitdexClient` against the relay built from
+/// `relay-config.default.yaml`. Each method must return its expected
+/// `Result<_,_>` variant — Ok where the relay should accept the call,
+/// `Ok(None)` where pg-sync expects "no persisted state", and explicit
+/// Err where the protocol mandates failure.
+///
+/// This test is the closing of the "stub one method, miss the next"
+/// regression cycle: v1.0.172 missed `register_dump`, v1.0.174 missed
+/// `get_cursor`. After this lands, the next stub miss surfaces here in
+/// CI, not in a prod CrashLoopBackOff.
+#[tokio::test]
+async fn pg_sync_full_method_matrix_against_default_config() {
+    use bitdex_v2::pg_sync::ops::{EntityOps, Op, OpsBatch};
+
+    std::env::set_var("BITDEX_ADMIN_TOKEN", "test-token");
+
+    let config = load_default_config();
+    let addr = bind_relay(config).await;
+    let client = BitdexClient::with_index(&format!("http://{addr}"), Some("civitai"));
+
+    // ── Status-only group (no body parse). Each must return Ok. ──────────
+
+    assert!(client.is_healthy().await, "is_healthy");
+
+    client
+        .upsert_batch(
+            &[serde_json::json!({"id": 1, "nsfwLevel": 1})],
+            None,
+        )
+        .await
+        .expect("upsert_batch");
+
+    client
+        .patch_batch(
+            &[serde_json::json!({"id": 1, "nsfwLevel": 2})],
+            None,
+        )
+        .await
+        .expect("patch_batch");
+
+    client
+        .delete_batch(&[1i64], None)
+        .await
+        .expect("delete_batch");
+
+    client
+        .reload_field("nsfwLevel")
+        .await
+        .expect("reload_field");
+
+    // Fire-and-forget: returns no Result, just must not panic.
+    client
+        .report_pgsync_metrics("pg-sync-test", 1.0, 0, 0)
+        .await;
+
+    let batch = OpsBatch {
+        ops: vec![EntityOps::with_alive(
+            42,
+            vec![Op::Set {
+                field: "nsfwLevel".into(),
+                value: serde_json::json!(1),
+            }],
+        )],
+        meta: None,
+    };
+    client
+        .post_ops(&batch)
+        .await
+        .expect("post_ops");
+
+    client
+        .signal_dump_loaded("smoke-dump", 0)
+        .await
+        .expect("signal_dump_loaded");
+
+    client
+        .set_cursor("pg-sync-bitdex-0", "12345")
+        .await
+        .expect("set_cursor");
+
+    // ── Body-shape group: each method's parse path must land cleanly. ────
+
+    let alive = client.get_alive_count().await;
+    assert_eq!(alive, 0, "get_alive_count must parse stub `alive_count: 0`");
+
+    client
+        .filter_sync(
+            "tagIds",
+            &[(1i64, vec![100i64, 200i64])],
+        )
+        .await
+        .expect("filter_sync must succeed against stub `errors: []`");
+
+    let dump_request = serde_json::json!({
+        "name": "matrix-dump",
+        "csv_path": "/tmp/matrix.csv",
+        "row_count": 0,
+    });
+    client
+        .register_dump(&dump_request)
+        .await
+        .expect("register_dump");
+
+    let dumps = client.get_dumps().await.expect("get_dumps");
+    assert_eq!(
+        dumps.get("all_complete").and_then(|v| v.as_bool()),
+        Some(true),
+    );
+
+    // ── 404 → Ok(None) path on get_cursor (relay mode = no persistence). ─
+    let cursor = client
+        .get_cursor("metrics-poller-civitai")
+        .await
+        .expect("get_cursor must return Ok in relay mode (404 → None)");
+    assert!(
+        cursor.is_none(),
+        "relay's 404 stub must surface as Ok(None) so pg-sync takes cold-start path; got {:?}",
+        cursor,
+    );
+}
+
 #[tokio::test]
 async fn pg_sync_register_dump_fails_loudly_when_stub_missing() {
     // Regression guard: if a future config change drops the dump stub
