@@ -1,7 +1,7 @@
 //! Route registry — turns the configured routes + channels into an axum
 //! `Router`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,12 +10,12 @@ use axum::body::Bytes;
 use axum::extract::{ConnectInfo, MatchedPath, Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, MethodRouter};
+use axum::routing::{get, MethodFilter, MethodRouter};
 use axum::Router;
 
 use crate::relay::auth::{check, AuthDecision};
 use crate::relay::channel::RelayEvent;
-use crate::relay::config::{RouteConfig, AuthMode};
+use crate::relay::config::RouteConfig;
 use crate::relay::sse;
 use crate::relay::template::{render, RenderOutcome, TemplateContext};
 use crate::relay::SharedRelayState;
@@ -30,49 +30,78 @@ pub fn build_router(state: SharedRelayState) -> Router {
     let metrics_path = state.config.metrics_path.clone();
     router = router.route(&metrics_path, get(handle_metrics));
 
-    // Configured ingress routes.
+    // Group configured routes by path so multiple (method, handler) pairs
+    // at the same path merge into a single MethodRouter. Without this,
+    // `Router::route(path, MethodRouter)` panics with "Cannot merge two
+    // MethodRouters that both have a fallback" when two configs share a
+    // path (e.g. `GET /dumps` + `PUT /dumps`). axum 0.8 disallows two
+    // wildcard MethodRouters at one path, so we register specific method
+    // filters instead and let axum dispatch.
+    let mut by_path: BTreeMap<String, Vec<RouteConfig>> = BTreeMap::new();
     for route in state.config.routes.clone() {
-        let path = route.path.clone();
-        let method_router = build_method_router(route);
-        router = router.route(&path, method_router);
+        by_path.entry(route.path.clone()).or_default().push(route);
+    }
+    for (path, configs) in by_path {
+        let mr = build_method_router(configs);
+        router = router.route(&path, mr);
     }
 
     router.with_state(state)
 }
 
-fn build_method_router(route: RouteConfig) -> MethodRouter<SharedRelayState> {
-    // axum's MethodRouter dispatches one closure per (method, path);
-    // use `any` and filter by configured methods inside the handler.
-    let methods: Vec<Method> = route
-        .methods
-        .iter()
-        .filter_map(|m| Method::from_bytes(m.to_uppercase().as_bytes()).ok())
-        .collect();
+fn build_method_router(configs: Vec<RouteConfig>) -> MethodRouter<SharedRelayState> {
+    let mut mr: MethodRouter<SharedRelayState> = MethodRouter::new();
 
-    let route_arc = Arc::new(route);
+    for config in configs {
+        let route_arc = Arc::new(config);
+        let method_strings: Vec<String> = route_arc.methods.clone();
+        for method_str in method_strings {
+            let Some(filter) = parse_method_filter(&method_str) else { continue };
+            let route_for_handler = Arc::clone(&route_arc);
+            mr = mr.on(
+                filter,
+                move |
+                    State(state): State<SharedRelayState>,
+                    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+                    method: Method,
+                    Path(path_params): Path<HashMap<String, String>>,
+                    matched: MatchedPath,
+                    headers: HeaderMap,
+                    body: Bytes,
+                | {
+                    let route = Arc::clone(&route_for_handler);
+                    async move {
+                        dispatch(route, state, peer, method, path_params, matched, headers, body)
+                            .await
+                    }
+                },
+            );
+        }
+    }
 
-    any(move |
-        State(state): State<SharedRelayState>,
-        ConnectInfo(peer): ConnectInfo<SocketAddr>,
-        method: Method,
-        Path(path_params): Path<HashMap<String, String>>,
-        matched: MatchedPath,
-        headers: HeaderMap,
-        body: Bytes,
-    | {
-        let route = route_arc.clone();
-        let methods = methods.clone();
-        async move { dispatch(route, methods, state, peer, method, path_params, matched, headers, body).await }
-    })
+    mr
+}
+
+fn parse_method_filter(s: &str) -> Option<MethodFilter> {
+    match s.to_uppercase().as_str() {
+        "GET" => Some(MethodFilter::GET),
+        "POST" => Some(MethodFilter::POST),
+        "PUT" => Some(MethodFilter::PUT),
+        "DELETE" => Some(MethodFilter::DELETE),
+        "PATCH" => Some(MethodFilter::PATCH),
+        "HEAD" => Some(MethodFilter::HEAD),
+        "OPTIONS" => Some(MethodFilter::OPTIONS),
+        "TRACE" => Some(MethodFilter::TRACE),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     route: Arc<RouteConfig>,
-    methods: Vec<Method>,
     state: SharedRelayState,
     peer: SocketAddr,
-    method: Method,
+    _method: Method,
     path_params: HashMap<String, String>,
     matched: MatchedPath,
     headers: HeaderMap,
@@ -82,13 +111,8 @@ async fn dispatch(
     let route_label = matched.as_str().to_string();
     let timer = m.request_duration.with_label_values(&[&route_label]).start_timer();
 
-    // Method check
-    if !methods.is_empty() && !methods.contains(&method) {
-        timer.observe_duration();
-        return (StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
-    }
-
-    // Auth
+    // Auth (method check is now in axum's MethodRouter — only matching
+    // methods reach this handler, so no inner method gate is needed).
     let decision = check(route.auth, &headers, peer, state.admin_token.as_deref());
     if let AuthDecision::Deny(reason) = decision {
         timer.observe_duration();
