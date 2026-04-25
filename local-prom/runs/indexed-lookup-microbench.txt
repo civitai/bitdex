@@ -1,0 +1,20 @@
+   = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+   |
+78 |     pub fn to_csv_row(&self) -> CsvRow<'_> {
+   |                                       ++++
+
+warning: `bitdex-v2` (lib) generated 25 warnings (run `cargo fix --lib -p bitdex-v2` to apply 12 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.52s
+     Running `target\release\bench_indexed_lookup.exe`
+=== indexed-lookup microbench ===
+bucket population: 89000 values × ~32 bits/bitmap
+lookups: 200
+
+populating ... bucket written (raw) in 319.9433ms
+
+indexed path:    total 164.8778ms, mean 824.38 µs/lookup, total_bits 6399
+full-bucket:     total 75.8621234s, mean 379310.61 µs/lookup, total_bits 6399
+
+speedup: 460.1×
+✓ ≥30× target met

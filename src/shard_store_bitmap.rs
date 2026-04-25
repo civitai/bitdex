@@ -21,7 +21,8 @@
 
 use std::collections::BTreeMap;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use std::io;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use roaring::RoaringBitmap;
@@ -887,6 +888,13 @@ impl FilterBitmapStore {
     /// Load specific values for a field. Only reads the bucket shards that
     /// contain the requested values, then extracts just those entries.
     ///
+    /// Uses a positioned-read fast path that exploits the in-shard index
+    /// (`[u32 count][N × (u64 value, u32 offset, u32 length)][packed bitmaps]`)
+    /// to read only the wanted values' bytes — instead of deserializing every
+    /// bitmap in the bucket via `ShardStore::read()`. On any I/O or decode
+    /// failure the call falls back to the legacy full-bucket read so callers
+    /// never see a regression.
+    ///
     /// Replaces legacy BitmapFs::load_field_values().
     pub fn load_field_values(&self, field: &str, values: &[u64]) -> io::Result<HashMap<u64, RoaringBitmap>> {
         // Group requested values by bucket
@@ -899,10 +907,167 @@ impl FilterBitmapStore {
         let mut result = HashMap::new();
         for (bucket, wanted) in by_bucket {
             let key = FilterBucketKey { field: field.to_string(), bucket };
-            if let Some(snap) = self.read(&key)? {
-                for v in wanted {
-                    if let Some(bm) = snap.values.get(&v) {
-                        result.insert(v, bm.clone());
+            match self.read_bucket_values_indexed(&key, &wanted) {
+                Ok(map) => {
+                    for (v, bm) in map { result.insert(v, bm); }
+                }
+                Err(_) => {
+                    // Fallback: legacy full-bucket read on any indexed-path error.
+                    if let Some(snap) = self.read(&key)? {
+                        for v in &wanted {
+                            if let Some(bm) = snap.values.get(v) {
+                                result.insert(*v, bm.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Indexed-read fast path: reads the in-shard index, seeks to the requested
+    /// values' bitmap byte ranges, and applies only the value-tagged ops that
+    /// touch the wanted set. Avoids the O(bucket_size) full-snapshot decode.
+    ///
+    /// Reads on a missing or invalid shard return an empty map (matches the
+    /// `self.read() == None` semantics). Any other error propagates so the
+    /// caller can fall back to `self.read()`.
+    fn read_bucket_values_indexed(
+        &self,
+        key: &FilterBucketKey,
+        wanted: &[u64],
+    ) -> io::Result<HashMap<u64, RoaringBitmap>> {
+        if wanted.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let lock = self.shard_lock(key);
+        let _guard = lock.read();
+
+        let path = self.shard_path(key);
+        if !path.exists() || !crate::shard_store::is_valid_shard_file(&path) {
+            return Ok(HashMap::new());
+        }
+
+        let mut file = File::open(&path)?;
+
+        // Header (28 bytes).
+        let mut header_buf = [0u8; crate::shard_store::HEADER_SIZE];
+        file.read_exact(&mut header_buf)?;
+        let header = crate::shard_store::ShardHeader::decode(&header_buf)?;
+
+        let mut result: HashMap<u64, RoaringBitmap> = HashMap::new();
+        let wanted_set: HashSet<u64> = wanted.iter().copied().collect();
+
+        // Snapshot section: [u32 count][N × 16-byte index][packed bitmaps].
+        if header.snapshot_len >= 4 {
+            let mut count_buf = [0u8; 4];
+            file.read_exact(&mut count_buf)?;
+            let count = u32::from_le_bytes(count_buf) as usize;
+
+            if count > 0 {
+                let index_size = count.checked_mul(16).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "shard index size overflow")
+                })?;
+                if 4 + index_size > header.snapshot_len as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "shard index size exceeds snapshot_len",
+                    ));
+                }
+
+                let mut index_buf = vec![0u8; index_size];
+                file.read_exact(&mut index_buf)?;
+
+                let data_section_start =
+                    crate::shard_store::HEADER_SIZE as u64 + 4 + index_size as u64;
+                let snapshot_end =
+                    crate::shard_store::HEADER_SIZE as u64 + header.snapshot_len as u64;
+
+                // Walk the index, collect (value, abs_offset, len) for wanted entries.
+                let mut found: Vec<(u64, u64, u64)> = Vec::with_capacity(wanted.len());
+                for i in 0..count {
+                    let off = i * 16;
+                    let value_id = u64::from_le_bytes(
+                        index_buf[off..off + 8].try_into().unwrap(),
+                    );
+                    if !wanted_set.contains(&value_id) {
+                        continue;
+                    }
+                    let bm_offset = u32::from_le_bytes(
+                        index_buf[off + 8..off + 12].try_into().unwrap(),
+                    ) as u64;
+                    let bm_length = u32::from_le_bytes(
+                        index_buf[off + 12..off + 16].try_into().unwrap(),
+                    ) as u64;
+                    let abs = data_section_start
+                        .checked_add(bm_offset)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bm offset overflow"))?;
+                    let abs_end = abs
+                        .checked_add(bm_length)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bm length overflow"))?;
+                    if abs_end > snapshot_end {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "bucket bitmap extends past snapshot section",
+                        ));
+                    }
+                    found.push((value_id, abs, bm_length));
+                }
+
+                // Sort by file offset for sequential I/O.
+                found.sort_by_key(|&(_, abs, _)| abs);
+
+                for (value, abs, len) in found {
+                    file.seek(SeekFrom::Start(abs))?;
+                    let mut bm_buf = vec![0u8; len as usize];
+                    file.read_exact(&mut bm_buf)?;
+                    let bm = RoaringBitmap::deserialize_from(&bm_buf[..]).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("bitmap: {e}"))
+                    })?;
+                    result.insert(value, bm);
+                }
+            }
+        }
+
+        // Apply ops, but only the ones tagged with a wanted value.
+        if header.ops_count > 0 {
+            file.seek(SeekFrom::Start(header.ops_section_offset))?;
+            let mut ops_buf = Vec::new();
+            file.read_to_end(&mut ops_buf)?;
+            for op in crate::shard_store::read_op_entries_pub::<FilterOpCodec>(&ops_buf) {
+                let op_value = match &op {
+                    FilterOp::SetBit { value, .. }
+                    | FilterOp::ClearBit { value, .. }
+                    | FilterOp::BatchSet { value, .. }
+                    | FilterOp::BatchClear { value, .. } => *value,
+                };
+                if !wanted_set.contains(&op_value) {
+                    continue;
+                }
+                match op {
+                    FilterOp::SetBit { value, bit } => {
+                        result.entry(value).or_insert_with(RoaringBitmap::new).insert(bit);
+                    }
+                    FilterOp::ClearBit { value, bit } => {
+                        if let Some(bm) = result.get_mut(&value) {
+                            bm.remove(bit);
+                        }
+                    }
+                    FilterOp::BatchSet { value, bits } => {
+                        let bm = result.entry(value).or_insert_with(RoaringBitmap::new);
+                        for b in bits {
+                            bm.insert(b);
+                        }
+                    }
+                    FilterOp::BatchClear { value, bits } => {
+                        if let Some(bm) = result.get_mut(&value) {
+                            for b in bits {
+                                bm.remove(b);
+                            }
+                        }
                     }
                 }
             }
@@ -1341,6 +1506,155 @@ mod tests {
         assert!(!snap.values[&0x0100].contains(2));
         assert!(snap.values[&0x0142].contains(2));
         assert!(!snap.values[&0x0142].contains(1));
+    }
+
+    #[test]
+    fn test_load_field_values_after_compact_indexed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+        let key = FilterBucketKey { field: "postId".into(), bucket: 0x00 };
+
+        for v in [1u64, 2, 4, 7, 100] {
+            store
+                .append_op(
+                    &key,
+                    &FilterOp::BatchSet { value: v, bits: vec![v as u32 * 10, v as u32 * 10 + 1] },
+                )
+                .unwrap();
+        }
+        store.compact_current(&key).unwrap();
+        assert_eq!(store.ops_count(&key).unwrap(), Some(0));
+
+        let res = store.load_field_values("postId", &[4]).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[&4].len(), 2);
+        assert!(res[&4].contains(40));
+        assert!(res[&4].contains(41));
+
+        let res = store.load_field_values("postId", &[1, 100]).unwrap();
+        assert_eq!(res.len(), 2);
+        assert!(res[&1].contains(10));
+        assert!(res[&100].contains(1000));
+
+        let res = store.load_field_values("postId", &[999]).unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn test_load_field_values_op_only_indexed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+        let key = FilterBucketKey { field: "postId".into(), bucket: 0x00 };
+
+        store.append_op(&key, &FilterOp::SetBit { value: 1, bit: 100 }).unwrap();
+        store.append_op(&key, &FilterOp::SetBit { value: 2, bit: 200 }).unwrap();
+        store.append_op(&key, &FilterOp::SetBit { value: 3, bit: 300 }).unwrap();
+
+        let res = store.load_field_values("postId", &[2]).unwrap();
+        assert_eq!(res.len(), 1);
+        assert!(res[&2].contains(200));
+        assert!(!res[&2].contains(100));
+    }
+
+    #[test]
+    fn test_load_field_values_snapshot_plus_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+        let key = FilterBucketKey { field: "postId".into(), bucket: 0x00 };
+
+        store.append_op(&key, &FilterOp::BatchSet { value: 1, bits: vec![10, 20] }).unwrap();
+        store.append_op(&key, &FilterOp::BatchSet { value: 2, bits: vec![30] }).unwrap();
+        store.compact_current(&key).unwrap();
+
+        store.append_op(&key, &FilterOp::SetBit { value: 1, bit: 30 }).unwrap();
+        store.append_op(&key, &FilterOp::ClearBit { value: 1, bit: 10 }).unwrap();
+        store.append_op(&key, &FilterOp::SetBit { value: 3, bit: 40 }).unwrap();
+
+        let res = store.load_field_values("postId", &[1, 3]).unwrap();
+        assert_eq!(res.len(), 2);
+        assert!(!res[&1].contains(10));
+        assert!(res[&1].contains(20));
+        assert!(res[&1].contains(30));
+        assert!(res[&3].contains(40));
+
+        let res = store.load_field_values("postId", &[2]).unwrap();
+        assert!(res[&2].contains(30));
+    }
+
+    #[test]
+    fn test_load_field_values_missing_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+        let res = store.load_field_values("nonexistent", &[1, 2, 3]).unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn test_load_field_values_indexed_matches_full_read() {
+        // Property: indexed result must equal a filtered full-bucket read.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+        let key = FilterBucketKey { field: "postId".into(), bucket: 0x00 };
+
+        for v in 0u64..50 {
+            store
+                .append_op(
+                    &key,
+                    &FilterOp::BatchSet { value: v, bits: vec![v as u32, v as u32 + 1000] },
+                )
+                .unwrap();
+        }
+        store.compact_current(&key).unwrap();
+        for v in 0u64..50 {
+            if v % 3 == 0 {
+                store.append_op(&key, &FilterOp::ClearBit { value: v, bit: v as u32 }).unwrap();
+            }
+            if v % 5 == 0 {
+                store.append_op(&key, &FilterOp::SetBit { value: v, bit: 9999 }).unwrap();
+            }
+        }
+
+        let wanted: Vec<u64> = vec![0, 3, 5, 7, 15, 30, 49];
+        let indexed = store.load_field_values("postId", &wanted).unwrap();
+
+        let full = store.read(&key).unwrap().unwrap();
+        let mut expected: HashMap<u64, RoaringBitmap> = HashMap::new();
+        for &v in &wanted {
+            if let Some(bm) = full.values.get(&v) {
+                expected.insert(v, bm.clone());
+            }
+        }
+
+        assert_eq!(indexed.len(), expected.len());
+        for (k, v) in &expected {
+            assert_eq!(&indexed[k], v, "value {} mismatch", k);
+        }
+    }
+
+    #[test]
+    fn test_load_field_values_multiple_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FilterBitmapStore::new(dir.path().to_path_buf(), FieldValueBucketShard).unwrap();
+
+        let v_a = 0x0100u64;
+        let v_b = 0x0200u64;
+        let v_c = 0x0300u64;
+
+        let key_a = FilterBucketKey::from_value("postId".into(), v_a);
+        let key_b = FilterBucketKey::from_value("postId".into(), v_b);
+        let key_c = FilterBucketKey::from_value("postId".into(), v_c);
+
+        store.append_op(&key_a, &FilterOp::SetBit { value: v_a, bit: 1 }).unwrap();
+        store.append_op(&key_b, &FilterOp::SetBit { value: v_b, bit: 2 }).unwrap();
+        store.append_op(&key_c, &FilterOp::SetBit { value: v_c, bit: 3 }).unwrap();
+        store.compact_current(&key_a).unwrap();
+        store.compact_current(&key_b).unwrap();
+
+        let res = store.load_field_values("postId", &[v_a, v_b, v_c]).unwrap();
+        assert_eq!(res.len(), 3);
+        assert!(res[&v_a].contains(1));
+        assert!(res[&v_b].contains(2));
+        assert!(res[&v_c].contains(3));
     }
 
     #[test]

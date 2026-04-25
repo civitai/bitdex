@@ -24,3 +24,6 @@ parking_lot = "0.12"
 rand = "0.8"
 rayon = "1"
 memmap2 = "0.9"
+ahash = "0.8"
+tempfile = "3"
+bitdex-v2 = { path = ".." }
