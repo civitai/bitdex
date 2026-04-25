@@ -2853,28 +2853,27 @@ async fn handle_query(
                 // leaked on `.await` cancellation (HTTP client disconnect).
                 // Dropped unconditionally when the async stack frame unwinds.
                 let _read_guard = ConcurrentReadGuard::new(&m.docstore_concurrent_reads);
-                let docs = tokio::task::spawn_blocking(move || {
-                    let mut docs = Vec::with_capacity(ids.len());
-                    for &id in &ids {
-                        let read_start = Instant::now();
-                        let doc = engine_docs.get_document(id as u32);
-                        docstore_hist
-                            .with_label_values(&[&name_docs])
-                            .observe(read_start.elapsed().as_secs_f64());
-                        docs.push(match doc {
-                            Ok(Some(stored)) => {
-                                format_document(&stored, &schema_docs, &reverse_maps_docs, &include_docs_docs, &schema_registry_docs)
-                            }
-                            Ok(None) => {
-                                serde_json::json!({ "id": id })
-                            }
-                            Err(e) => {
-                                tracing::warn!("doc read error for slot {}: {e}", id);
-                                serde_json::json!({ "id": id })
-                            }
-                        });
+                let docs: Vec<serde_json::Value> = tokio::task::spawn_blocking(move || {
+                    let slots: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
+                    let batch_start = Instant::now();
+                    let fetched = engine_docs.get_documents(&slots);
+                    docstore_hist
+                        .with_label_values(&[&name_docs])
+                        .observe(batch_start.elapsed().as_secs_f64());
+                    match fetched {
+                        Ok(stored_docs) => {
+                            ids.iter().zip(stored_docs).map(|(&id, doc_opt)| {
+                                match doc_opt {
+                                    Some(stored) => format_document(&stored, &schema_docs, &reverse_maps_docs, &include_docs_docs, &schema_registry_docs),
+                                    None => serde_json::json!({ "id": id }),
+                                }
+                            }).collect()
+                        }
+                        Err(e) => {
+                            tracing::warn!("get_documents batch error: {e}");
+                            ids.iter().map(|&id| serde_json::json!({ "id": id })).collect()
+                        }
                     }
-                    docs
                 }).await.unwrap();
                 Some(docs)
             } else {
@@ -3071,14 +3070,24 @@ async fn handle_documents_batch(
         }
     };
 
-    let mut docs = Vec::with_capacity(req.slot_ids.len());
-    for slot_id in &req.slot_ids {
-        match engine.get_document(*slot_id) {
-            Ok(Some(doc)) => docs.push(format_document(&doc, &schema, &reverse_maps, &req.fields, &schema_registry)),
-            Ok(None) => docs.push(serde_json::json!({"id": slot_id})),
-            Err(_) => docs.push(serde_json::json!({"id": slot_id})),
+    // Move disk I/O off the async runtime — doc reads are blocking sync I/O
+    // that will starve Tokio workers if run inline on the async task.
+    let slot_ids = req.slot_ids.clone();
+    let docs = tokio::task::spawn_blocking(move || {
+        match engine.get_documents(&slot_ids) {
+            Ok(stored_docs) => {
+                slot_ids.iter().zip(stored_docs).map(|(&slot_id, doc_opt)| {
+                    match doc_opt {
+                        Some(doc) => format_document(&doc, &schema, &reverse_maps, &req.fields, &schema_registry),
+                        None => serde_json::json!({"id": slot_id}),
+                    }
+                }).collect::<Vec<_>>()
+            }
+            Err(_) => {
+                slot_ids.iter().map(|&slot_id| serde_json::json!({"id": slot_id})).collect()
+            }
         }
-    }
+    }).await.unwrap_or_default();
     Json(serde_json::json!({"documents": docs})).into_response()
 }
 

@@ -171,9 +171,35 @@ impl DocCache {
     }
 
     /// Insert a batch of documents into the cache.
+    ///
+    /// Amortizes `generations.load()` across the whole batch — one ArcSwap
+    /// load instead of one per slot. Identical semantics to calling `insert`
+    /// in a loop but significantly cheaper for large batches.
     pub fn insert_batch(&self, docs: &[(u32, StoredDoc)]) {
+        if docs.is_empty() {
+            return;
+        }
+        // Single ArcSwap load for the entire batch.
+        let gens = self.generations.load();
+        let current = match gens.first() {
+            Some(g) => g,
+            None => return,
+        };
+
         for (slot_id, doc) in docs {
-            self.insert(*slot_id, doc.clone());
+            let size = estimate_doc_size(doc);
+
+            // Remove any existing entry in any generation first (dedup).
+            for gen in gens.iter() {
+                if let Some((_, old)) = gen.entries.remove(slot_id) {
+                    gen.size_bytes.fetch_sub(old.size_bytes, Ordering::Relaxed);
+                    break;
+                }
+            }
+
+            // Insert into current generation.
+            current.entries.insert(*slot_id, CachedEntry { doc: doc.clone(), size_bytes: size });
+            current.size_bytes.fetch_add(size, Ordering::Relaxed);
         }
     }
 
