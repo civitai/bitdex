@@ -88,7 +88,7 @@ mod tests {
         addr.parse().unwrap()
     }
 
-    fn hdr(key: &str, value: &str) -> HeaderMap {
+    fn hdr(key: &'static str, value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(key, HeaderValue::from_str(value).unwrap());
         h
