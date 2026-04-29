@@ -1744,13 +1744,13 @@ mod tests {
         let mut store = DocStoreV3::open(&docs_dir).unwrap();
         store.ensure_field_index("nsfwLevel").unwrap();
         store.ensure_field_index("userId").unwrap();
-        let store = Arc::new(parking_lot::Mutex::new(store));
+        let store = Arc::new(parking_lot::RwLock::new(store));
         let mut dw = DocWriter::new(Arc::clone(&store));
         dw.write_set(10, "nsfwLevel", &json!(16));
         dw.write_set(10, "userId", &json!(42));
         dw.flush();
 
-        let doc = store.lock().get(10).unwrap().unwrap();
+        let doc = store.read().get(10).unwrap().unwrap();
         match &doc.fields["nsfwLevel"] {
             crate::mutation::FieldValue::Single(crate::query::Value::Integer(16)) => {}
             other => panic!("expected nsfwLevel=16, got: {:?}", other),
@@ -1769,13 +1769,13 @@ mod tests {
         let docs_dir = dir.path().join("docs");
         let mut store = DocStoreV3::open(&docs_dir).unwrap();
         store.ensure_field_index("tagIds").unwrap();
-        let store = Arc::new(parking_lot::Mutex::new(store));
+        let store = Arc::new(parking_lot::RwLock::new(store));
         // First write an initial value
         {
             let _dw = DocWriter::new(Arc::clone(&store));
             let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100, 200])).unwrap();
-            let idx = store.lock().field_index("tagIds").unwrap();
-            store.lock().append_tuple(5, idx, &initial).unwrap();
+            let idx = store.read().field_index("tagIds").unwrap();
+            store.write().append_tuple(5, idx, &initial).unwrap();
         }
         // Add a value
         {
@@ -1784,7 +1784,7 @@ mod tests {
             dw.flush();
         }
 
-        let doc = store.lock().get(5).unwrap().unwrap();
+        let doc = store.read().get(5).unwrap().unwrap();
         match &doc.fields["tagIds"] {
             crate::mutation::FieldValue::Multi(vals) => {
                 let ints: Vec<i64> = vals.iter().filter_map(|v| {
@@ -1803,7 +1803,7 @@ mod tests {
             dw.flush();
         }
 
-        let doc = store.lock().get(5).unwrap().unwrap();
+        let doc = store.read().get(5).unwrap().unwrap();
         match &doc.fields["tagIds"] {
             crate::mutation::FieldValue::Multi(vals) => {
                 let ints: Vec<i64> = vals.iter().filter_map(|v| {
@@ -1826,13 +1826,13 @@ mod tests {
         let docs_dir = dir.path().join("docs");
         let mut store = DocStoreV3::open(&docs_dir).unwrap();
         store.ensure_field_index("tagIds").unwrap();
-        let store = Arc::new(parking_lot::Mutex::new(store));
+        let store = Arc::new(parking_lot::RwLock::new(store));
 
         // Initial value
         {
             let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100, 200])).unwrap();
-            let idx = store.lock().field_index("tagIds").unwrap();
-            store.lock().append_tuple(5, idx, &initial).unwrap();
+            let idx = store.read().field_index("tagIds").unwrap();
+            store.write().append_tuple(5, idx, &initial).unwrap();
         }
 
         // Two adds for the same slot in ONE DocWriter batch (the race scenario).
@@ -1841,7 +1841,7 @@ mod tests {
         dw.write_add(5, "tagIds", &json!(400));
         dw.flush();
 
-        let doc = store.lock().get(5).unwrap().unwrap();
+        let doc = store.read().get(5).unwrap().unwrap();
         match &doc.fields["tagIds"] {
             crate::mutation::FieldValue::Multi(vals) => {
                 let ints: Vec<i64> = vals.iter().filter_map(|v| {
@@ -1865,12 +1865,12 @@ mod tests {
         let docs_dir = dir.path().join("docs");
         let mut store = DocStoreV3::open(&docs_dir).unwrap();
         store.ensure_field_index("tagIds").unwrap();
-        let store = Arc::new(parking_lot::Mutex::new(store));
+        let store = Arc::new(parking_lot::RwLock::new(store));
 
         {
             let initial = rmp_serde::to_vec(&PackedValue::Mi(vec![100])).unwrap();
-            let idx = store.lock().field_index("tagIds").unwrap();
-            store.lock().append_tuple(5, idx, &initial).unwrap();
+            let idx = store.read().field_index("tagIds").unwrap();
+            store.write().append_tuple(5, idx, &initial).unwrap();
         }
 
         let mut dw = DocWriter::new(Arc::clone(&store));
@@ -1878,7 +1878,7 @@ mod tests {
         dw.write_add(5, "tagIds", &json!(200)); // add new
         dw.flush();
 
-        let doc = store.lock().get(5).unwrap().unwrap();
+        let doc = store.read().get(5).unwrap().unwrap();
         match &doc.fields["tagIds"] {
             crate::mutation::FieldValue::Multi(vals) => {
                 let ints: Vec<i64> = vals.iter().filter_map(|v| {
@@ -1904,7 +1904,7 @@ mod tests {
         store.ensure_field_index("sortAt").unwrap();
         store.ensure_field_index("nsfwLevel").unwrap();
 
-        let store = Arc::new(parking_lot::Mutex::new(store));
+        let store = Arc::new(parking_lot::RwLock::new(store));
         let mut dw = DocWriter::new(Arc::clone(&store));
 
         // Write scalar fields via DocWriter (simulates WAL ops processor path)
@@ -1913,7 +1913,7 @@ mod tests {
         dw.flush();
 
         // Read back via DocStoreV3 and verify
-        let doc = store.lock().get(100).unwrap();
+        let doc = store.read().get(100).unwrap();
         assert!(doc.is_some(), "doc should exist after DocWriter writes");
         let doc = doc.unwrap();
         match &doc.fields["sortAt"] {
