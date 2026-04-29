@@ -10216,6 +10216,130 @@ mod tests {
 
         engine.shutdown();
     }
+    /// Full integration test for the WAL reader gate. Exercises the real
+    /// `WalWriter` + `WalReader` + `apply_ops_batch` path that the
+    /// production server.rs:1238 thread runs. Promised as fast-follow in
+    /// PR #244 review; unblocked by PR #245's `pg-sync` lib-test rot fix.
+    ///
+    /// Sequence:
+    /// 1. enter_loading_mode
+    /// 2. WalWriter.append_batch(ops)
+    /// 3. mirror server.rs:1238 gate-loop iteration: gate skips, ops not applied
+    /// 4. exit_loading_mode
+    /// 5. mirror gate-loop iteration: gate permits, ops drain
+    /// 6. assert engine state reflects the applied op
+    ///
+    /// Gate is best-effort by design — a batch already inside
+    /// `apply_ops_batch` when `enter_loading_mode` fires will finish on
+    /// top of partial state. This test asserts the steady-state behavior
+    /// at iteration boundaries; mid-flight is bounded by `read_batch`
+    /// size (10k ops) per Scarlet 2026-04-29 review.
+    #[cfg(feature = "pg-sync")]
+    #[test]
+    #[serial]
+    fn test_wal_apply_gated_by_loading_mode() {
+        use crate::ingester::CoalescerSink;
+        use crate::ops_processor::{apply_ops_batch, DocWriter, FieldMeta};
+        use crate::ops_wal::{WalCursor, WalReader, WalWriter};
+        use crate::pg_sync::ops::{EntityOps, Op};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let config = test_config_with_bitmap_path(bitmap_path);
+        let mut engine =
+            ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+
+        let writer = WalWriter::new(&wal_dir);
+        let cursor = WalCursor::new(0, 0);
+        let mut reader = WalReader::new(&wal_dir, cursor);
+
+        // Phase 1: enter loading_mode → queue an op → mirror server.rs:1238
+        // gate-loop iteration. Gate must skip apply.
+        engine.enter_loading_mode();
+        let queued = vec![EntityOps {
+            entity_id: 1,
+            creates_slot: true,
+            ops: vec![Op::Set {
+                field: "nsfwLevel".into(),
+                value: json!(8),
+            }],
+        }];
+        writer.append_batch(&queued).unwrap();
+
+        let did_apply_phase_1 = if engine.is_loading_mode() {
+            // Mirror server.rs:1238 — gate fires, skip apply this iteration.
+            false
+        } else {
+            let meta = FieldMeta::from_config(engine.config());
+            let sender = engine.mutation_sender();
+            let mut sink = CoalescerSink::new(sender);
+            let mut doc_writer = DocWriter::new(engine.docstore_arc());
+            let batch = reader.read_batch(100).unwrap();
+            let mut entries = batch.entries;
+            let (applied, _, _) = apply_ops_batch(
+                &mut sink,
+                &meta,
+                &mut entries,
+                Some(&engine),
+                Some(&mut doc_writer),
+            );
+            doc_writer.flush();
+            applied > 0
+        };
+        assert!(
+            !did_apply_phase_1,
+            "gate must skip apply while engine.is_loading_mode() is true"
+        );
+        // WAL still holds the op; cursor unchanged because apply never ran.
+        assert_eq!(reader.cursor().offset, 0, "cursor should not advance during loading");
+
+        // Phase 2: exit loading_mode → run reader iteration again. Same
+        // queued op should now apply.
+        engine.exit_loading_mode();
+        assert!(!engine.is_loading_mode());
+
+        let did_apply_phase_2 = if engine.is_loading_mode() {
+            false
+        } else {
+            let meta = FieldMeta::from_config(engine.config());
+            let sender = engine.mutation_sender();
+            let mut sink = CoalescerSink::new(sender);
+            let mut doc_writer = DocWriter::new(engine.docstore_arc());
+            let batch = reader.read_batch(100).unwrap();
+            let mut entries = batch.entries;
+            let (applied, _, _) = apply_ops_batch(
+                &mut sink,
+                &meta,
+                &mut entries,
+                Some(&engine),
+                Some(&mut doc_writer),
+            );
+            doc_writer.flush();
+            applied > 0
+        };
+        assert!(
+            did_apply_phase_2,
+            "post-exit, gate must permit apply — batch should drain"
+        );
+
+        // Allow flush thread to publish the snapshot containing the applied op.
+        wait_for_flush(&engine, 1, 5000);
+        let snap = engine.snapshot();
+        let nsfw_field = snap.filters.get_field("nsfwLevel").unwrap();
+        let bm = nsfw_field
+            .get(8)
+            .expect("nsfwLevel=8 bitmap should exist post-apply");
+        assert!(
+            bm.contains(1),
+            "slot 1 should be in nsfwLevel=8 bitmap after gated apply drains"
+        );
+
+        engine.shutdown();
+    }
     /// `is_loading_mode()` getter must reflect `enter_loading_mode` /
     /// `exit_loading_mode` toggles. Consumed by the WAL reader thread to
     /// gate op-apply during bulk-load — the load-bearing surface for
