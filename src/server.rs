@@ -1236,6 +1236,26 @@ impl BitdexServer {
 
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     while !wal_state.shutting_down.load(Ordering::Relaxed) {
+                        // Pause WAL apply while the engine is in bulk-load mode.
+                        // /ops POSTs continue to accept + write to WAL; this
+                        // thread resumes apply once `exit_loading_mode` flips
+                        // the flag back. Without this gate, ops applied on top
+                        // of partial bulk-load state inflate per-bucket
+                        // `ops_count`, which forces PR-#233's
+                        // `read_bucket_values_indexed` fast-path to walk the
+                        // ops section to filter ops where `op.value ∈ wanted`
+                        // — observed cold-path lazy_load → 5 s timeout cluster
+                        // on 2026-04-29 flip-back canary, recovered only after
+                        // compaction merged ops back into the snapshot.
+                        let in_loading = {
+                            let guard = wal_state.index.lock();
+                            guard.as_ref().map(|idx| idx.engine.is_loading_mode()).unwrap_or(false)
+                        };
+                        if in_loading {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            continue;
+                        }
+
                         // Read a batch from the WAL
                         match reader.read_batch(10_000) {
                             Ok(batch) if !batch.entries.is_empty() => {
