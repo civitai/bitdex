@@ -175,6 +175,21 @@ pub struct Metrics {
     /// End-to-end latency of POST /ops WAL append (lock acquisition + write + fsync).
     pub wal_append_duration_seconds: Histogram,
 
+    // -- queryOpSet fan-out cost (issue #60) --
+    /// Histogram of result.ids size per apply_query_op_set call. Buckets cover the
+    /// full observed range from postId-eq narrow matches (1) to wide nsfwLevel-style
+    /// matches (10M+). Used to size the BITDEX_QUERY_OP_SET_MAX_FANOUT cap from real
+    /// prod data instead of guessing.
+    pub query_op_set_fanout_size: HistogramVec,
+    /// Counter incremented when a queryOpSet is rejected for exceeding the fan-out
+    /// cap. Label `reason="fanout_too_wide"`. Alert when rate > 0 — every rejection
+    /// is a missed mutation (data drift) until #62 (paginate-instead-of-skip) lands.
+    pub query_op_set_rejected_total: IntCounterVec,
+    /// Counter of total slot mutations applied via queryOpSet fan-out. Lets us
+    /// distinguish narrow (postId-eq, ~1 slot) from wide (nsfwLevel-eq, millions)
+    /// at the work-unit level rather than the API-call level.
+    pub query_op_set_applied_slots_total: IntCounterVec,
+
     // -- Boot phase breakdown --
     pub boot_phase_seconds: IntGaugeVec,
 }
@@ -868,6 +883,40 @@ impl Metrics {
         )
         .unwrap();
 
+        // queryOpSet fan-out cost (issue #60).
+        // Histogram buckets span the full observed range:
+        // narrow (postId-eq, ~1 slot) → moderate (modelVersionIds, 1K-100K) → wide
+        // (nsfwLevel-eq, 10M+). Powers of 10 with a 22.9M anchor for the local
+        // nsfwLevel=1 size we measured during the OOM repro work.
+        let query_op_set_fanout_buckets = vec![
+            1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0,
+        ];
+        let query_op_set_fanout_size = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_op_set_fanout_size",
+                "Number of slots matched by a queryOpSet's filter, observed before per-slot apply",
+            )
+            .buckets(query_op_set_fanout_buckets),
+            &["index"],
+        )
+        .unwrap();
+        let query_op_set_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_query_op_set_rejected_total",
+                "queryOpSet ops rejected before per-slot apply (e.g. fan-out exceeded cap)",
+            ),
+            &["index", "reason"],
+        )
+        .unwrap();
+        let query_op_set_applied_slots_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_query_op_set_applied_slots_total",
+                "Total slot mutations applied via queryOpSet fan-out (sum of result.ids sizes)",
+            ),
+            &["index"],
+        )
+        .unwrap();
+
         // Boot phase breakdown
         let boot_phase_seconds = IntGaugeVec::new(
             Opts::new("bitdex_boot_phase_seconds", "Duration of each boot phase in seconds"),
@@ -1015,6 +1064,9 @@ impl Metrics {
         registry.register(Box::new(wal_ops_written_total.clone())).unwrap();
         registry.register(Box::new(wal_last_applied_timestamp_seconds.clone())).unwrap();
         registry.register(Box::new(wal_append_duration_seconds.clone())).unwrap();
+        registry.register(Box::new(query_op_set_fanout_size.clone())).unwrap();
+        registry.register(Box::new(query_op_set_rejected_total.clone())).unwrap();
+        registry.register(Box::new(query_op_set_applied_slots_total.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
 
         Self {
@@ -1131,6 +1183,9 @@ impl Metrics {
             wal_ops_written_total,
             wal_last_applied_timestamp_seconds,
             wal_append_duration_seconds,
+            query_op_set_fanout_size,
+            query_op_set_rejected_total,
+            query_op_set_applied_slots_total,
             boot_phase_seconds,
         }
     }

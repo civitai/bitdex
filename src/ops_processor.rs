@@ -23,6 +23,22 @@ use crate::shard_store_doc::PackedValue;
 use crate::shard_store_doc::DocStoreV3;
 use crate::filter::{FilterFieldType, NULL_BITMAP_KEY};
 use crate::ingester::BitmapSink;
+
+/// queryOpSet fan-out cap (issue #60).
+///
+/// Default `usize::MAX` (effectively no cap) — ships first so the new
+/// `bitdex_query_op_set_fanout_size` histogram gathers prod data. Once we have
+/// a fan-out distribution from real traffic, set a finite cap via the
+/// `BITDEX_QUERY_OP_SET_MAX_FANOUT` env var. Reads on every apply (microsecond
+/// cost dwarfed by `execute_query`'s ms-scale work) so operators can tune
+/// without restart by editing the manifest and rolling pods.
+const DEFAULT_MAX_FANOUT: usize = usize::MAX;
+fn max_fanout() -> usize {
+    std::env::var("BITDEX_QUERY_OP_SET_MAX_FANOUT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_FANOUT)
+}
 use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
 use crate::pg_sync::op_dedup::dedup_ops;
 use crate::pg_sync::ops::{EntityOps, Op};
@@ -1094,6 +1110,39 @@ fn apply_query_op_set<S: BitmapSink>(
         .execute_query(&query)
         .map_err(|e| format!("queryOpSet query failed: {e}"))?;
     let slot_ids = &result.ids;
+
+    // Issue #60: observe fan-out size BEFORE the cap check so the histogram captures
+    // the would-be-rejected upper tail too. The bridge handle is `None` in tests
+    // and dump-only contexts — observation is best-effort.
+    #[cfg(feature = "server")]
+    let metrics = engine.metrics_bridge_handle();
+    #[cfg(feature = "server")]
+    if let Some(ref bridge) = metrics {
+        bridge
+            .query_op_set_fanout_size
+            .with_label_values(&[&bridge.index_name])
+            .observe(slot_ids.len() as f64);
+    }
+
+    let cap = max_fanout();
+    if slot_ids.len() > cap {
+        tracing::warn!(
+            target: "ops_processor",
+            "queryOpSet '{}' matches {} slots, exceeds cap {} — op skipped (data drift)",
+            query_str,
+            slot_ids.len(),
+            cap,
+        );
+        #[cfg(feature = "server")]
+        if let Some(ref bridge) = metrics {
+            bridge
+                .query_op_set_rejected_total
+                .with_label_values(&[&bridge.index_name, "fanout_too_wide"])
+                .inc();
+        }
+        return Ok(0);
+    }
+
     if slot_ids.is_empty() {
         return Ok(0);
     }
@@ -1128,6 +1177,15 @@ fn apply_query_op_set<S: BitmapSink>(
         }
         applied += 1;
     }
+
+    #[cfg(feature = "server")]
+    if let Some(ref bridge) = metrics {
+        bridge
+            .query_op_set_applied_slots_total
+            .with_label_values(&[&bridge.index_name])
+            .inc_by(applied as u64);
+    }
+
     Ok(applied)
 }
 /// Parse a simple filter string like "modelVersionIds eq 456" or "postId eq 789"
@@ -2364,5 +2422,41 @@ mod tests {
             sink.filter_inserts.iter().all(|(f, _, _)| f != "blockedFor"),
             "null add on nullable field should not insert any bitmap bit"
         );
+    }
+
+    // ── #60: queryOpSet fan-out cap ─────────────────────────────────────────
+    //
+    // Env-mutating tests must be `#[serial]` because `BITDEX_QUERY_OP_SET_MAX_FANOUT`
+    // is process-global. Each test sets its own value, asserts, restores prior state.
+
+    #[test]
+    #[serial_test::serial]
+    fn test_max_fanout_default_is_usize_max() {
+        std::env::remove_var("BITDEX_QUERY_OP_SET_MAX_FANOUT");
+        assert_eq!(
+            max_fanout(),
+            usize::MAX,
+            "unset env should yield DEFAULT_MAX_FANOUT (usize::MAX)"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_max_fanout_env_override_parses() {
+        std::env::set_var("BITDEX_QUERY_OP_SET_MAX_FANOUT", "100000");
+        assert_eq!(max_fanout(), 100_000);
+        std::env::remove_var("BITDEX_QUERY_OP_SET_MAX_FANOUT");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_max_fanout_invalid_env_falls_back_to_default() {
+        std::env::set_var("BITDEX_QUERY_OP_SET_MAX_FANOUT", "not-a-number");
+        assert_eq!(
+            max_fanout(),
+            usize::MAX,
+            "non-numeric env value should fall back to DEFAULT_MAX_FANOUT"
+        );
+        std::env::remove_var("BITDEX_QUERY_OP_SET_MAX_FANOUT");
     }
 }
