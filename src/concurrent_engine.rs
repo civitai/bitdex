@@ -6541,6 +6541,18 @@ impl ConcurrentEngine {
     pub fn enter_loading_mode(&self) {
         self.loading_mode.store(true, Ordering::Release);
     }
+    /// Whether the engine is currently in bulk-load mode.
+    ///
+    /// Consumed by the WAL reader thread so it can pause op-apply while
+    /// bulk-load is active — applying ops on top of partial bulk-load state
+    /// inflates per-bucket `ops_count` and forces PR-#233's
+    /// `read_bucket_values_indexed` fast-path to walk the entire ops section
+    /// before returning the wanted values. /ops POSTs continue to accept +
+    /// write to WAL; the reader resumes apply once `exit_loading_mode` flips
+    /// the flag back.
+    pub fn is_loading_mode(&self) -> bool {
+        self.loading_mode.load(Ordering::Acquire)
+    }
     /// Exit loading mode: publish the current staging state and resume normal operation.
     ///
     /// Invalidates all caches (stale from loading) and triggers a snapshot publish
@@ -10151,6 +10163,24 @@ mod tests {
         for id in 1..=num_docs as i64 {
             assert!(!all_found.contains(&id), "deleted slot {} found in filter query", id);
         }
+    }
+    /// `is_loading_mode()` getter must reflect `enter_loading_mode` /
+    /// `exit_loading_mode` toggles. Consumed by the WAL reader thread to
+    /// gate op-apply during bulk-load — the load-bearing surface for
+    /// task #43 (PR-#233 ops-walk pile-up post-canary).
+    #[test]
+    fn test_is_loading_mode_getter() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+        let config = test_config_with_bitmap_path(bitmap_path.clone());
+        let mut engine = ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+        assert!(!engine.is_loading_mode(), "fresh engine should not be in loading mode");
+        engine.enter_loading_mode();
+        assert!(engine.is_loading_mode(), "after enter, should report loading");
+        engine.exit_loading_mode();
+        assert!(!engine.is_loading_mode(), "after exit, should report not loading");
+        engine.shutdown();
     }
     /// Regression test: lazy field loading via rcu() must not clobber
     /// concurrent flush thread mutations.
