@@ -39,6 +39,16 @@ pub struct MetricsBridge {
     pub lazy_load_duration: prometheus::HistogramVec,
     pub compaction_total: prometheus::IntCounterVec,
     pub compaction_duration: prometheus::HistogramVec,
+    /// queryOpSet fan-out size histogram (issue #60). Observed pre-cap so we can
+    /// see what we'd reject if cap were lower.
+    pub query_op_set_fanout_size: prometheus::HistogramVec,
+    /// queryOpSet rejection counter (issue #60). Label `reason="fanout_too_wide"`
+    /// when fan-out exceeds `BITDEX_QUERY_OP_SET_MAX_FANOUT`.
+    pub query_op_set_rejected_total: prometheus::IntCounterVec,
+    /// Cumulative slot mutations from queryOpSet fan-outs. Sums to total work
+    /// the WAL reader has done across all queryOpSets; not the same as the
+    /// `applied` count returned per call.
+    pub query_op_set_applied_slots_total: prometheus::IntCounterVec,
     pub index_name: String,
 }
 /// Commands sent to the flush thread for state transitions that must
@@ -3386,6 +3396,14 @@ impl ConcurrentEngine {
     #[cfg(feature = "server")]
     pub fn set_metrics_bridge(&self, bridge: MetricsBridge) {
         self.metrics_bridge.store(Arc::new(Some(Arc::new(bridge))));
+    }
+    /// Read-only handle to the metrics bridge for code paths outside the engine
+    /// (e.g. `ops_processor::apply_query_op_set`). Returns `None` when the server
+    /// layer hasn't wired the bridge yet (boot-time and dump-only test contexts).
+    #[cfg(feature = "server")]
+    pub fn metrics_bridge_handle(&self) -> Option<Arc<MetricsBridge>> {
+        let guard = self.metrics_bridge.load();
+        (**guard).as_ref().map(Arc::clone)
     }
     /// Get a reference to the bitmap memory cache (for metrics scraping).
     pub fn bitmap_memory_cache(&self) -> &crate::bitmap_memory_cache::BitmapMemoryCache {
