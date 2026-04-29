@@ -10164,6 +10164,58 @@ mod tests {
             assert!(!all_found.contains(&id), "deleted slot {} found in filter query", id);
         }
     }
+    /// Gate-decision unit test mirroring the WAL reader's hot-loop check.
+    /// Demonstrates the same `if engine.is_loading_mode()` branch that
+    /// `src/server.rs:1238` runs every iteration — when the flag is set,
+    /// the gate body is skipped entirely; once the flag clears, the body
+    /// proceeds. Pairs with `test_is_loading_mode_getter` to lock in the
+    /// gate's visible contract.
+    ///
+    /// The gate IS best-effort, not a hard barrier — a batch already
+    /// inside `apply_ops_batch` when `enter_loading_mode` fires will
+    /// finish on top of partial state. The mid-flight-batch case is
+    /// bounded by `read_batch` size (10,000 ops) and acceptable per
+    /// the design (Scarlet 2026-04-29 review).
+    ///
+    /// A full WAL writer + reader + apply integration is staged as a
+    /// fast-follow PR — exercising the real apply path requires the
+    /// `pg-sync` feature, whose existing test surface has separate
+    /// `DocStoreV3 Mutex → RwLock` rot blocking `cargo test --lib
+    /// --features pg-sync`. That cleanup is task #45 (filed).
+    #[test]
+    #[serial]
+    fn test_wal_gate_decision_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        let bitmap_path = dir.path().join("bitmaps");
+        let docstore_path = dir.path().join("docs");
+        let config = test_config_with_bitmap_path(bitmap_path);
+        let mut engine =
+            ConcurrentEngine::new_with_path(config, &docstore_path).unwrap();
+
+        // Phase 1: in loading mode, the gate should block the body.
+        engine.enter_loading_mode();
+        let mut body_ran_phase_1 = false;
+        if !engine.is_loading_mode() {
+            body_ran_phase_1 = true;
+        }
+        assert!(
+            !body_ran_phase_1,
+            "gate must skip body while engine.is_loading_mode() is true"
+        );
+
+        // Phase 2: out of loading mode, the body should run.
+        engine.exit_loading_mode();
+        let mut body_ran_phase_2 = false;
+        if !engine.is_loading_mode() {
+            body_ran_phase_2 = true;
+        }
+        assert!(
+            body_ran_phase_2,
+            "gate must permit body once exit_loading_mode flips the flag"
+        );
+
+        engine.shutdown();
+    }
     /// `is_loading_mode()` getter must reflect `enter_loading_mode` /
     /// `exit_loading_mode` toggles. Consumed by the WAL reader thread to
     /// gate op-apply during bulk-load — the load-bearing surface for
