@@ -4292,8 +4292,13 @@ impl ConcurrentEngine {
             let (done_tx, done_rx) = crossbeam_channel::bounded(1);
             let flush_alive = self.cmd_tx.send(FlushCommand::ForcePublish { done: done_tx }).is_ok();
             if flush_alive {
-                // Block until flush thread publishes (typically <1ms).
-                let _ = done_rx.recv_timeout(Duration::from_secs(5));
+                // Cap the wait at 100ms so a back-pressured flush thread can't
+                // turn lazy_load into a 5-second tail across every concurrent
+                // query. Real loads complete in <10ms (postId per-value avg
+                // 4.9ms). On timeout the query proceeds against the current
+                // snapshot — the next query picks up the freshly-published
+                // data once the flush thread drains its lazy_rx queue.
+                let _ = done_rx.recv_timeout(Duration::from_millis(100));
             } else {
                 // Flush thread is dead (shutdown called). Publish directly —
                 // no concurrent publisher to race with.
