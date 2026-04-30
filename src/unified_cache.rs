@@ -1756,6 +1756,13 @@ impl UnifiedCache {
     }
     /// Phase C: Apply computed maintenance results under brief lock.
     pub fn apply_maintenance_results(&mut self, results: &[CacheMaintenanceResult]) {
+        // Use the bulk variants — both `add_slot` and `remove_slot` call
+        // `Arc::make_mut` per slot on the entry's bitmap and radix, which
+        // forces a deep clone every cycle when readers hold a snapshot
+        // (every cycle in prod). The bulk methods hoist the make_mut so
+        // each entry's bitmap is cloned at most once per call.
+        // Locally measured: cache_worker Phase C lock-hold drops from
+        // double-digit ms to sub-ms on busy cycles.
         for result in results {
             let Some(entry) = self.entries.get_mut(&result.key) else {
                 continue;
@@ -1763,11 +1770,11 @@ impl UnifiedCache {
             if entry.needs_rebuild {
                 continue;
             }
-            for &(slot, sort_value) in &result.adds {
-                entry.add_slot(slot, sort_value);
+            if !result.adds.is_empty() {
+                entry.add_slots_bulk(&result.adds);
             }
-            for &(slot, sort_value) in &result.removes {
-                entry.remove_slot(slot, sort_value);
+            if !result.removes.is_empty() {
+                entry.remove_slots_bulk(&result.removes);
             }
         }
     }
