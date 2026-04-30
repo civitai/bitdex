@@ -92,7 +92,7 @@ These are set once at startup and cannot be changed without restarting the proce
 
 | Setting | Default | What It Controls |
 |---------|---------|-----------------|
-| `doc_cache.max_bytes` | `1 GB` | Doc cache size, LRU eviction trigger |
+| `doc_cache.max_bytes` | `10 GB` | Doc cache size, LRU eviction trigger. Tune down for pods with <12 GB RAM. |
 | `doc_cache.generation_interval_secs` | `60` | Rotate to new generation every N seconds |
 | `doc_cache.max_generations` | `30` | Max generations before merging oldest |
 

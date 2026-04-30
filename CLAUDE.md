@@ -50,7 +50,7 @@ These are non-negotiable. Any agent working on this project MUST follow these ru
 
 - Custom sharded filesystem store (`src/docstore.rs`) keyed by slot ID
 - **DocStore V2 (production):** append-only tuple logs, no compression, LIFO scan for reads (2.6x faster than V1). Field dictionary encoding for low-cardinality strings.
-- **DocCache** (`src/doc_cache.rs`): DashMap-based in-memory cache. Cache-on-read (first query populates), write-through (flush thread populates on writes), LRU eviction at 1GB. Drops doc reads from 16ms/doc (disk) to <1μs/doc (memory).
+- **DocCache** (`src/doc_cache.rs`): DashMap-based in-memory cache. Cache-on-read (first query populates), write-through (flush thread populates on writes), LRU eviction at 10GB default. Drops doc reads from 16ms/doc (disk) to <1μs/doc (memory).
 - Hex-nested directory structure keeps each dir under ~1000 files at 105M+ scale
 - On PUT upsert: read old doc from disk (or cache), diff old vs new, update only changed bitmaps
 - On fresh insert (slot not alive): write doc to disk + cache, set bitmaps directly — no diff needed

@@ -522,7 +522,7 @@ impl Default for StorageConfig {
     }
 }
 fn default_doc_cache_max_bytes() -> u64 {
-    1_073_741_824 // 1 GB — matches DocCacheConfig::default()
+    10_737_418_240 // 10 GB — matches DocCacheConfig::default()
 }
 fn default_doc_cache_generation_interval() -> u64 {
     60
@@ -533,7 +533,7 @@ fn default_doc_cache_max_generations() -> usize {
 /// Document cache configuration (generational eviction with lock-free reads).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocCacheConfigEntry {
-    /// Maximum cache size in bytes. Eviction drops oldest generations when exceeded. Default 1 GB.
+    /// Maximum cache size in bytes. Eviction drops oldest generations when exceeded. Default 10 GB.
     #[serde(default = "default_doc_cache_max_bytes")]
     pub max_bytes: u64,
     /// How often (in seconds) to rotate to a new generation. Default: 60.
@@ -888,7 +888,7 @@ mod tests {
         assert_eq!(config.cache.max_capacity, 64_000);
         assert_eq!(config.cache.min_filter_size, 0);
         assert_eq!(config.cache.decay_rate, 0.95);
-        assert_eq!(config.doc_cache.max_bytes, 1_073_741_824);
+        assert_eq!(config.doc_cache.max_bytes, 10_737_418_240);
         assert_eq!(config.autovac_interval_secs, 3600);
         assert_eq!(config.merge_interval_ms, 5000);
         assert_eq!(config.prometheus_port, 9090);

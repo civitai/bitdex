@@ -37,7 +37,7 @@ pub struct DocCacheConfig {
 impl Default for DocCacheConfig {
     fn default() -> Self {
         DocCacheConfig {
-            max_bytes: 1_073_741_824, // 1 GB
+            max_bytes: 10_737_418_240, // 10 GB
             generation_interval_secs: 60,
             max_generations: 30,
         }
