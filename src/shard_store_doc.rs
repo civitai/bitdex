@@ -751,6 +751,11 @@ pub struct DocStoreV3 {
     /// holds the outer write lock, which is already mutually exclusive
     /// with fast-path read guards.
     fast_path_writer_lock: Arc<parking_lot::Mutex<()>>,
+    /// Hot-reloadable par_iter min-task threshold, shared with the engine
+    /// flush thread. Read on each `append_*_batch` call to gate rayon dispatch.
+    /// Defaults to a stub Arc with value 8; engine wires its own handle in
+    /// after construction via `set_par_iter_min_threshold`.
+    par_iter_min_threshold: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DocStoreV3 {
@@ -783,7 +788,14 @@ impl DocStoreV3 {
             put_batch_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             put_batch_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_path_writer_lock: Arc::new(parking_lot::Mutex::new(())),
+            par_iter_min_threshold: Arc::new(std::sync::atomic::AtomicUsize::new(8)),
         })
+    }
+
+    /// Wire a shared par_iter min-task threshold from the engine. Engine calls
+    /// this once after construction so PATCH /config updates propagate here too.
+    pub fn set_par_iter_min_threshold_handle(&mut self, handle: Arc<std::sync::atomic::AtomicUsize>) {
+        self.par_iter_min_threshold = handle;
     }
 
     /// Open an in-memory DocStoreV3 (for testing).
@@ -810,6 +822,7 @@ impl DocStoreV3 {
             put_batch_fast_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             put_batch_slow_path_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_path_writer_lock: Arc::new(parking_lot::Mutex::new(())),
+            par_iter_min_threshold: Arc::new(std::sync::atomic::AtomicUsize::new(8)),
         })
     }
 
@@ -1217,7 +1230,8 @@ impl DocStoreV3 {
         // batches (typical doc writer flush touches 1-N shards). Threshold=8
         // matches flush thread (concurrent_engine.rs:1874). Investigation
         // 2026-04-30 attributed 13c CPU floor to rayon spin on small batches.
-        if items.len() >= 8 {
+        let par_iter_min = self.par_iter_min_threshold.load(std::sync::atomic::Ordering::Relaxed);
+        if items.len() >= par_iter_min {
             items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
                 store.append_ops(&shard_key, &ops)?;
                 dirty_shards.insert(shard_key);
@@ -1254,7 +1268,8 @@ impl DocStoreV3 {
         let store = Arc::clone(&self.store);
         let dirty_shards = Arc::clone(&self.dirty_shards);
         let items: Vec<(u32, Vec<DocOp>)> = by_shard.into_iter().collect();
-        if items.len() >= 8 {
+        let par_iter_min = self.par_iter_min_threshold.load(std::sync::atomic::Ordering::Relaxed);
+        if items.len() >= par_iter_min {
             items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
                 store.append_ops(&shard_key, &ops)?;
                 dirty_shards.insert(shard_key);
@@ -1305,7 +1320,8 @@ impl DocStoreV3 {
         let store = Arc::clone(&self.store);
         let dirty_shards = Arc::clone(&self.dirty_shards);
         let items: Vec<(u32, Vec<DocOp>)> = by_shard.into_iter().collect();
-        if items.len() >= 8 {
+        let par_iter_min = self.par_iter_min_threshold.load(std::sync::atomic::Ordering::Relaxed);
+        if items.len() >= par_iter_min {
             items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
                 store.append_ops(&shard_key, &ops)?;
                 dirty_shards.insert(shard_key);

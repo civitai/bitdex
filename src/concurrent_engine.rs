@@ -1,6 +1,6 @@
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -332,6 +332,12 @@ pub struct ConcurrentEngine {
     bitmap_memory_cache: Arc<crate::bitmap_memory_cache::BitmapMemoryCache>,
     /// In-memory document cache (DashMap, cache-on-read, write-through, LRU eviction).
     doc_cache: Option<Arc<crate::doc_cache::DocCache>>,
+    /// Minimum task count to engage rayon par_iter on the steady-state hot
+    /// path (flush filter+sort fan-out, doc writer shard fan-out). Set huge
+    /// (e.g. usize::MAX) to disable par_iter entirely — useful for isolating
+    /// pool overhead from real work during perf experiments. Hot-reloadable
+    /// via PATCH /api/indexes/{name}/config { "par_iter_min_threshold": N }.
+    par_iter_min_threshold: Arc<AtomicUsize>,
     /// Compaction skip counter (incremented by DocStore when channel is full).
     compaction_skipped: Arc<AtomicU64>,
     /// Compaction channel sender — held here so we can drop it in shutdown()
@@ -891,6 +897,13 @@ impl ConcurrentEngine {
         if config.compact_threshold_pct > 0 {
             docstore.set_compact_threshold(config.compact_threshold_pct as u32);
         }
+        // par_iter min-task threshold — hot-reloadable via PATCH /config.
+        // Default 8: skip rayon dispatch for tiny batches where pool overhead
+        // exceeds work. Set huge to disable par_iter entirely (perf experiment).
+        let par_iter_min_threshold = Arc::new(AtomicUsize::new(8));
+        // Wire the threshold into the docstore so its append_*_batch paths
+        // observe the same hot-reload as the engine flush thread.
+        docstore.set_par_iter_min_threshold_handle(Arc::clone(&par_iter_min_threshold));
         let (compact_tx, compact_handle): (Option<Sender<(u32, Vec<u8>)>>, Option<JoinHandle<()>>) = (None, None);
 
         let docstore_root = Arc::new(docstore.path().to_path_buf());
@@ -1092,6 +1105,7 @@ impl ConcurrentEngine {
                 metrics_bridge: Arc::new(ArcSwap::from_pointee(None)),
                 bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
                 doc_cache: doc_cache.clone(),
+                par_iter_min_threshold: Arc::clone(&par_iter_min_threshold),
                 compaction_skipped: Arc::new(AtomicU64::new(0)),
                 compact_handle: None,
                 compact_tx: None,
@@ -1145,6 +1159,7 @@ impl ConcurrentEngine {
             let flush_cycle_clone = Arc::clone(&flush_cycle);
             let _flush_bitmap_store = bitmap_store.clone();
             let flush_doc_cache = doc_cache.clone();
+            let flush_par_iter_min = Arc::clone(&par_iter_min_threshold);
             let flush_alive_store = alive_store.clone();
             let flush_filter_store = filter_store.clone();
             let flush_sort_store = sort_store.clone();
@@ -1874,12 +1889,11 @@ impl ConcurrentEngine {
                                 // Sub-ms task work + sub-ms flush interval keeps rayon workers
                                 // in their spin window and never lets them park cleanly. Skip
                                 // par_iter for small batches — the global pool dispatch
-                                // overhead exceeds the sequential cost. Threshold=8 chosen so
-                                // bursts (modelVersionIds writes touching dozens of buckets)
-                                // still parallelize. Investigation 2026-04-30 attributed 13c
-                                // CPU floor to this pattern.
-                                const PAR_ITER_MIN: usize = 8;
-                                if filter_buckets.len() >= PAR_ITER_MIN {
+                                // overhead exceeds the sequential cost. Threshold hot-reloadable
+                                // via PATCH /config { "par_iter_min_threshold": N }; set huge
+                                // to disable par_iter entirely for perf experiments.
+                                let par_iter_min = flush_par_iter_min.load(Ordering::Relaxed);
+                                if filter_buckets.len() >= par_iter_min {
                                     filter_buckets.into_par_iter().for_each(
                                         |(bucket_key, ops)| {
                                             if let Err(e) = fs_.append_ops_opts(&bucket_key, &ops, false) {
@@ -1912,7 +1926,7 @@ impl ConcurrentEngine {
                                     ))
                                     .collect();
                                 let sort_total = sort_set.len() + sort_clr.len();
-                                if sort_total >= PAR_ITER_MIN {
+                                if sort_total >= par_iter_min {
                                     sort_set.into_par_iter().chain(sort_clr.into_par_iter()).for_each(
                                         |(shard_key, op)| {
                                             if let Err(e) = ss_.append_op_opts(&shard_key, &op, false) {
@@ -3367,6 +3381,7 @@ impl ConcurrentEngine {
             metrics_bridge,
             bitmap_memory_cache: Arc::clone(&bitmap_memory_cache),
             doc_cache: doc_cache.clone(),
+            par_iter_min_threshold: Arc::clone(&par_iter_min_threshold),
             compaction_skipped,
             compact_tx,
             compact_handle,
@@ -3452,6 +3467,21 @@ impl ConcurrentEngine {
     pub fn metrics_bridge_handle(&self) -> Option<Arc<MetricsBridge>> {
         let guard = self.metrics_bridge.load();
         (**guard).as_ref().map(Arc::clone)
+    }
+    /// Read-only handle to the par_iter min-threshold (Arc<AtomicUsize>).
+    /// Doc writer paths use this to gate their own par_iter calls so the
+    /// PATCH /config knob applies uniformly across the steady-state hot
+    /// path, not just the flush thread.
+    pub fn par_iter_min_threshold_handle(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.par_iter_min_threshold)
+    }
+    /// Set the par_iter min-task threshold. Called by PATCH /config handler.
+    pub fn set_par_iter_min_threshold(&self, n: usize) {
+        self.par_iter_min_threshold.store(n, Ordering::Relaxed);
+    }
+    /// Read the current par_iter min-task threshold (for /config GET).
+    pub fn par_iter_min_threshold(&self) -> usize {
+        self.par_iter_min_threshold.load(Ordering::Relaxed)
     }
     /// Get a reference to the bitmap memory cache (for metrics scraping).
     pub fn bitmap_memory_cache(&self) -> &crate::bitmap_memory_cache::BitmapMemoryCache {

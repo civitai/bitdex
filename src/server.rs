@@ -965,6 +965,13 @@ struct ConfigPatch {
     /// Prod stays responsive while local SSE mirror gets real query traffic.
     #[serde(default)]
     query_tee_mode: Option<bool>,
+    /// Hot-reload knob for the par_iter min-task threshold on the steady-state
+    /// hot path (flush filter+sort fan-out, doc writer shard fan-out). Set huge
+    /// (e.g. 10_000_000) to disable par_iter entirely — useful for isolating
+    /// rayon pool overhead from real work during perf experiments.
+    /// Default 8.
+    #[serde(default)]
+    par_iter_min_threshold: Option<usize>,
 }
 
 /// Patchable fields for a filter field.
@@ -2363,6 +2370,10 @@ async fn handle_patch_config(
                 if let Some(v) = patch.query_tee_mode {
                     state.query_tee_mode.store(v, Ordering::Relaxed);
                     eprintln!("Config patch: query_tee_mode set to {v}");
+                }
+                if let Some(v) = patch.par_iter_min_threshold {
+                    idx.engine.set_par_iter_min_threshold(v);
+                    eprintln!("Config patch: par_iter_min_threshold set to {v}");
                 }
 
                 // Toggle trace collection (server-wide, not persisted with index config)
