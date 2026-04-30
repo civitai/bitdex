@@ -30,6 +30,15 @@ pub struct QueryTrace {
     pub lazy_load_us: u64,
     pub docs_us: u64,
     pub docs_count: u64,
+    /// Cumulative time spent waiting to acquire `Mutex<UnifiedCache>` across
+    /// all `unified_cache.lock()` calls in the query path. Trace data on
+    /// v1.0.183 showed ~700-1000 ms of total query time unattributed to any
+    /// existing sub-span — this counter exists to prove the cache mutex is
+    /// where that time is going (cache_worker Phase A holds the lock during
+    /// `remove_slots_from_all_batch` + `collect_filter_work` over up to 64 K
+    /// cache entries, blocking every concurrent reader).
+    #[serde(default)]
+    pub cache_lock_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -84,6 +93,7 @@ pub struct QueryTraceCollector {
     pub filter_us: u64,
     pub sort_us: u64,
     pub cache_hit: bool,
+    pub cache_lock_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -97,9 +107,21 @@ impl QueryTraceCollector {
             filter_us: 0,
             sort_us: 0,
             cache_hit: false,
+            cache_lock_us: 0,
             clauses: Vec::new(),
             sort: None,
         }
+    }
+
+    /// Acquire `unified_cache.lock()` while charging the wait time to
+    /// `cache_lock_us`. Wraps `parking_lot::Mutex::lock()` — caller still
+    /// gets a normal lock guard.
+    #[inline]
+    pub fn timed_cache_lock<'a, T>(&mut self, m: &'a parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'a, T> {
+        let t0 = Instant::now();
+        let g = m.lock();
+        self.cache_lock_us = self.cache_lock_us.saturating_add(t0.elapsed().as_micros() as u64);
+        g
     }
 
     pub fn record_clause(&mut self, trace: ClauseTrace) {
@@ -125,6 +147,7 @@ impl QueryTraceCollector {
             lazy_load_us: self.lazy_load_us,
             docs_us: 0,
             docs_count: 0,
+            cache_lock_us: self.cache_lock_us,
             clauses: self.clauses,
             sort: self.sort,
         }

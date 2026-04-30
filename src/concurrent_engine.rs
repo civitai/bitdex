@@ -4923,7 +4923,7 @@ impl ConcurrentEngine {
                     direction: sort_clause.direction,
                 };
                 let cache_data = {
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = collector.timed_cache_lock(&self.unified_cache);
                     let pending = self.pending_bucket_diffs.load();
                     uc.lookup(&ukey).map(|entry| {
                         // Apply pending bucket diffs lazily before reading
@@ -5143,7 +5143,7 @@ impl ConcurrentEngine {
         } else if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
             (Some(ukey), Some((bm, has_more, min_val, cap)))
         } else if let Some(sort_clause) = query.sort.as_ref() {
-            let mut uc = self.unified_cache.lock();
+            let mut uc = collector.timed_cache_lock(&self.unified_cache);
             let min_size = uc.config().min_filter_size as u64;
             if full_total_matched >= min_size {
                 if let Some(clauses) = cache::canonicalize(snapped_filters) {
