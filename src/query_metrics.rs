@@ -47,6 +47,13 @@ pub struct QueryTrace {
     /// trace path).
     #[serde(default)]
     pub setup_us: u64,
+    /// Time spent inside `ensure_cache_shard_loaded` specifically — the
+    /// bound-store shard pre-load step that takes the unified-cache mutex
+    /// just to call `is_shard_pending`. Split out from `setup_us` so we
+    /// can tell whether the warm-path mutex acquire (this) vs. the
+    /// snapshot/executor-build cost (the rest of setup) dominates.
+    #[serde(default)]
+    pub shard_load_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -103,6 +110,7 @@ pub struct QueryTraceCollector {
     pub cache_hit: bool,
     pub cache_lock_us: u64,
     pub setup_us: u64,
+    pub shard_load_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -118,6 +126,7 @@ impl QueryTraceCollector {
             cache_hit: false,
             cache_lock_us: 0,
             setup_us: 0,
+            shard_load_us: 0,
             clauses: Vec::new(),
             sort: None,
         }
@@ -159,6 +168,7 @@ impl QueryTraceCollector {
             docs_count: 0,
             cache_lock_us: self.cache_lock_us,
             setup_us: self.setup_us,
+            shard_load_us: self.shard_load_us,
             clauses: self.clauses,
             sort: self.sort,
         }

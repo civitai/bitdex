@@ -4423,7 +4423,20 @@ impl ConcurrentEngine {
     /// The query proceeds via slow path; next query after loading gets cache hit.
     fn ensure_cache_shard_loaded(&self, sort_field: &str, direction: crate::query::SortDirection) {
         if let Some(ref bs) = self.bound_store {
-            let mut uc = self.unified_cache.lock();
+            // try_lock: if cache_worker / another thread holds the mutex,
+            // skip this call and let the next query pick up the work. This
+            // turns the warm-path "is_shard_pending check" from a guaranteed
+            // mutex acquire (blocking on cache_worker Phase A holds for up
+            // to ~1s) into a free-run for the common case (no pending).
+            // Trade-off: under heavy contention with genuinely-pending
+            // shards, pre-load is delayed by N query attempts until we
+            // happen to win the lock — but the explicit cache lookup later
+            // in the query path will still take the lock, so correctness
+            // is unaffected.
+            let mut uc = match self.unified_cache.try_lock() {
+                Some(g) => g,
+                None => return,
+            };
             if !uc.is_shard_pending(sort_field, direction) {
                 return;
             }
@@ -4866,7 +4879,9 @@ impl ConcurrentEngine {
         let setup_start = Instant::now();
         // Lazy-load cached shard from disk if pending
         if let Some(sort_clause) = query.sort.as_ref() {
+            let shard_t0 = Instant::now();
             self.ensure_cache_shard_loaded(&sort_clause.field, sort_clause.direction);
+            collector.shard_load_us = shard_t0.elapsed().as_micros() as u64;
         }
         let snap = self.snapshot();
         let tb_guard = self.time_buckets.as_ref().map(|tb| tb.load_full());
