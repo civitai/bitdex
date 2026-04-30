@@ -9,9 +9,21 @@
 //! or deleted, the meta-index identifies affected entries, and each entry's bitmap is updated
 //! via per-slot contains() checks against the engine's field bitmaps.
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Wall-clock millis since UNIX_EPOCH. Used as the LRU timestamp baseline so
+/// `last_used` can live in an `AtomicU64` and be updated from `&self` (no
+/// write lock). Approximate LRU only — wall clock can drift but eviction
+/// quality is unaffected at the resolution we care about.
+#[inline]
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 use roaring::RoaringBitmap;
 use crate::bound_store::ShardKey;
 use crate::cache::CanonicalClause;
@@ -110,13 +122,15 @@ pub struct UnifiedEntry {
     /// Total documents matching the filter (for returning total_matched without recomputing filters).
     total_matched: u64,
     /// Bloat control: flagged when cardinality exceeds 2 * capacity.
-    needs_rebuild: bool,
+    /// `AtomicBool` so readers can check it via `&self` from the RwLock read path.
+    needs_rebuild: AtomicBool,
     /// Guard to prevent concurrent rebuilds.
     rebuilding: AtomicBool,
     /// Guard to prevent concurrent prefetch expansions.
     prefetching: AtomicBool,
-    /// LRU timestamp.
-    last_used: Instant,
+    /// LRU timestamp as ms since UNIX_EPOCH. Atomic so readers can `touch()`
+    /// the entry from the RwLock read path without taking a write lock.
+    last_used: AtomicU64,
     /// Meta-index entry ID for this cache entry.
     meta_id: CacheEntryId,
     /// Dirty flag for persistence: set when bitmap modified by live maintenance,
@@ -179,10 +193,10 @@ impl UnifiedEntry {
             max_capacity,
             has_more,
             total_matched,
-            needs_rebuild: false,
+            needs_rebuild: AtomicBool::new(false),
             rebuilding: AtomicBool::new(false),
             prefetching: AtomicBool::new(false),
-            last_used: Instant::now(),
+            last_used: AtomicU64::new(now_ms()),
             meta_id,
             persist_dirty: true, // New entries need persisting
             sorted_keys,
@@ -244,10 +258,10 @@ impl UnifiedEntry {
             max_capacity,
             has_more,
             total_matched,
-            needs_rebuild: false,
+            needs_rebuild: AtomicBool::new(false),
             rebuilding: AtomicBool::new(false),
             prefetching: AtomicBool::new(false),
-            last_used: Instant::now(),
+            last_used: AtomicU64::new(now_ms()),
             meta_id,
             persist_dirty: false, // Just loaded from disk — clean
             sorted_keys,
@@ -311,19 +325,24 @@ impl UnifiedEntry {
         self.total_matched
     }
     pub fn needs_rebuild(&self) -> bool {
-        self.needs_rebuild
+        self.needs_rebuild.load(Ordering::Acquire)
     }
-    pub fn mark_for_rebuild(&mut self) {
-        self.needs_rebuild = true;
+    /// Mark this entry for rebuild. `&self` so the read path can flag stale
+    /// entries (e.g. expired bucket cutoff) without escalating to a write lock.
+    pub fn mark_for_rebuild(&self) {
+        self.needs_rebuild.store(true, Ordering::Release);
     }
     pub fn meta_id(&self) -> CacheEntryId {
         self.meta_id
     }
-    pub fn touch(&mut self) {
-        self.last_used = Instant::now();
+    /// Update the LRU timestamp. `&self` so the read path can touch entries
+    /// from the RwLock read lock.
+    pub fn touch(&self) {
+        self.last_used.store(now_ms(), Ordering::Relaxed);
     }
-    pub fn last_used(&self) -> Instant {
-        self.last_used
+    /// LRU timestamp in ms-since-UNIX-epoch.
+    pub fn last_used_ms(&self) -> u64 {
+        self.last_used.load(Ordering::Relaxed)
     }
     pub fn cardinality(&self) -> u64 {
         self.bitmap.len()
@@ -343,7 +362,7 @@ impl UnifiedEntry {
         }
         let bloat_threshold = self.capacity * 2;
         if self.bitmap.len() as usize > bloat_threshold {
-            self.needs_rebuild = true;
+            self.needs_rebuild.store(true, Ordering::Release);
             true
         } else {
             false
@@ -378,7 +397,7 @@ impl UnifiedEntry {
         }
         let bloat_threshold = self.capacity * 2;
         if self.bitmap.len() as usize > bloat_threshold {
-            self.needs_rebuild = true;
+            self.needs_rebuild.store(true, Ordering::Release);
             true
         } else {
             false
@@ -497,7 +516,7 @@ impl UnifiedEntry {
             };
             self.radix = None;
         }
-        self.needs_rebuild = false;
+        self.needs_rebuild.store(false, Ordering::Release);
         self.rebuilding.store(false, Ordering::Release);
     }
     /// Try to acquire the rebuild guard. Returns true if this caller should do the rebuild.
@@ -599,18 +618,22 @@ pub struct UnifiedEntryDetail {
     pub min_tracked_value: u32,
 }
 /// The unified cache: flat HashMap keyed by (filters, sort, direction).
+///
+/// Stat counters are `AtomicU64` so the read path (RwLock read lock) can
+/// increment hits/misses without escalating to a write lock. Same rationale
+/// as `UnifiedEntry::last_used` and `needs_rebuild`.
 pub struct UnifiedCache {
     entries: HashMap<UnifiedKey, UnifiedEntry>,
     /// Reverse index: meta_id → key, for O(1) lookup from MetaIndex results.
     meta_id_to_key: HashMap<CacheEntryId, UnifiedKey>,
     meta: MetaIndex,
     config: UnifiedCacheConfig,
-    hits: u64,
-    misses: u64,
-    inserts: u64,
-    updates: u64,
-    evictions: u64,
-    invalidations: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+    updates: AtomicU64,
+    evictions: AtomicU64,
+    invalidations: AtomicU64,
     /// Running total of entry memory (bitmap + sorted_keys + radix bytes).
     total_bytes: usize,
     // ── Persistence State ──────────────────────────────────────────────
@@ -631,11 +654,11 @@ pub struct UnifiedCache {
     /// Consumed during shard restore to get the real total instead of bitmap cardinality.
     meta_total_matched: HashMap<CacheEntryId, u64>,
     /// Cumulative count of entry expansions from initial to expanded capacity.
-    extensions: u64,
+    extensions: AtomicU64,
     /// Cumulative count of cache wall hits (cursor past cached entries, triggering slow path).
-    wall_hits: u64,
+    wall_hits: AtomicU64,
     /// Cumulative count of prefetch triggers (background expansion requests).
-    prefetches: u64,
+    prefetches: AtomicU64,
     /// True during shard restore — skips per-insert eviction.
     restoring: bool,
     /// Reverse index: ShardKey → set of UnifiedKeys in that shard.
@@ -649,12 +672,12 @@ impl UnifiedCache {
             meta_id_to_key: HashMap::new(),
             meta: MetaIndex::new(),
             config,
-            hits: 0,
-            misses: 0,
-            inserts: 0,
-            updates: 0,
-            evictions: 0,
-            invalidations: 0,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+            updates: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            invalidations: AtomicU64::new(0),
             total_bytes: 0,
             pending_shards: HashSet::new(),
             loading_shards: HashSet::new(),
@@ -663,9 +686,9 @@ impl UnifiedCache {
             persistence_enabled: false,
             meta_has_more: HashMap::new(),
             meta_total_matched: HashMap::new(),
-            extensions: 0,
-            wall_hits: 0,
-            prefetches: 0,
+            extensions: AtomicU64::new(0),
+            wall_hits: AtomicU64::new(0),
+            prefetches: AtomicU64::new(0),
             restoring: false,
             shard_to_keys: HashMap::new(),
         }
@@ -689,20 +712,50 @@ impl UnifiedCache {
         self.meta_total_matched.get(&entry_id).copied().unwrap_or(0)
     }
     /// Look up a cache entry by key. Returns None on miss.
-    /// Increments hit/miss counters.
+    /// Increments hit/miss counters and refreshes LRU.
+    ///
+    /// `&mut self` form for callers that already hold a write lock (e.g. the
+    /// expansion path needs `&mut UnifiedEntry` to mutate the entry). The
+    /// hot fast-path uses `lookup_for_read` instead, which works from a read
+    /// lock.
     pub fn lookup(&mut self, key: &UnifiedKey) -> Option<&mut UnifiedEntry> {
         if let Some(entry) = self.entries.get_mut(key) {
-            if entry.needs_rebuild {
+            if entry.needs_rebuild() {
                 // Entry is stale (alive/filter change) — treat as miss.
                 // The caller will do a full traversal and re-form the entry.
-                self.misses += 1;
+                self.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
-            self.hits += 1;
+            self.hits.fetch_add(1, Ordering::Relaxed);
             entry.touch();
             Some(entry)
         } else {
-            self.misses += 1;
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+    /// Look up a cache entry without taking the write lock. Returns
+    /// `Option<&UnifiedEntry>` — the read-only counterpart of `lookup`.
+    ///
+    /// Increments hits/misses via atomics and touches the entry's LRU
+    /// timestamp via atomic store. No mutation of the cache map itself, so
+    /// safe to call from a `RwLock` read guard. This is the hot path: many
+    /// concurrent readers can call this in parallel and never block on
+    /// cache_worker writes (or each other).
+    ///
+    /// Callers that need to mutate the entry (apply_bucket_diff, expand,
+    /// mark_for_rebuild) should fall back to the write-lock `lookup`.
+    pub fn lookup_for_read(&self, key: &UnifiedKey) -> Option<&UnifiedEntry> {
+        if let Some(entry) = self.entries.get(key) {
+            if entry.needs_rebuild() {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            entry.touch();
+            Some(entry)
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
@@ -751,7 +804,7 @@ impl UnifiedCache {
         let sk = ShardKey::new(key.sort_field.clone(), key.direction);
         self.shard_to_keys.entry(sk).or_default().insert(key.clone());
         self.entries.insert(key, entry);
-        self.inserts += 1;
+        self.inserts.fetch_add(1, Ordering::Relaxed);
         meta_id
     }
     /// Register a new entry with the meta-index and create the entry.
@@ -832,19 +885,19 @@ impl UnifiedCache {
             self.entries
                 .iter()
                 .filter(|(_, entry)| !entry.persist_dirty)
-                .min_by_key(|(_, entry)| entry.last_used)
+                .min_by_key(|(_, entry)| entry.last_used_ms())
                 .map(|(key, _)| key.clone())
                 .or_else(|| {
                     // All entries dirty — fall back to oldest regardless
                     self.entries
                         .iter()
-                        .min_by_key(|(_, entry)| entry.last_used)
+                        .min_by_key(|(_, entry)| entry.last_used_ms())
                         .map(|(key, _)| key.clone())
                 })
         } else {
             self.entries
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
+                .min_by_key(|(_, entry)| entry.last_used_ms())
                 .map(|(key, _)| key.clone())
         }?;
         if let Some(evicted) = self.entries.remove(&lru_key) {
@@ -860,7 +913,7 @@ impl UnifiedCache {
             if let Some(set) = self.shard_to_keys.get_mut(&sk) {
                 set.remove(&lru_key);
             }
-            self.evictions += 1;
+            self.evictions.fetch_add(1, Ordering::Relaxed);
             if !self.persistence_enabled {
                 // Without persistence, deregister fully (original behavior)
                 self.meta.deregister(evicted.meta_id);
@@ -906,19 +959,20 @@ impl UnifiedCache {
             // randomized; rotating the start by `hash(tick)` gives us a
             // different sample each iteration.
             let mut h = hb.build_hasher();
-            h.write_u64((self.evictions as u64).wrapping_add(tick as u64));
+            h.write_u64(self.evictions.load(Ordering::Relaxed).wrapping_add(tick as u64));
             let skip = (h.finish() as usize) % self.entries.len().max(1);
-            let mut best: Option<(Instant, UnifiedKey)> = None;
+            let mut best: Option<(u64, UnifiedKey)> = None;
             let mut all_dirty_seen = true;
             for (k, e) in self.entries.iter().skip(skip).take(SAMPLE_SIZE) {
                 if prefer_non_dirty && e.persist_dirty {
                     continue;
                 }
                 all_dirty_seen = false;
+                let lu = e.last_used_ms();
                 match best.as_ref() {
-                    None => best = Some((e.last_used, k.clone())),
-                    Some((t, _)) if e.last_used < *t => {
-                        best = Some((e.last_used, k.clone()));
+                    None => best = Some((lu, k.clone())),
+                    Some((t, _)) if lu < *t => {
+                        best = Some((lu, k.clone()));
                     }
                     _ => {}
                 }
@@ -928,7 +982,7 @@ impl UnifiedCache {
             // bound_store will skip its persist on next cycle.
             if best.is_none() && prefer_non_dirty && all_dirty_seen {
                 if let Some((k, e)) = self.entries.iter().skip(skip).take(SAMPLE_SIZE).next() {
-                    best = Some((e.last_used, k.clone()));
+                    best = Some((e.last_used_ms(), k.clone()));
                 }
             }
             let Some((_, key)) = best else { break };
@@ -939,7 +993,7 @@ impl UnifiedCache {
                 if let Some(set) = self.shard_to_keys.get_mut(&sk) {
                     set.remove(&key);
                 }
-                self.evictions += 1;
+                self.evictions.fetch_add(1, Ordering::Relaxed);
                 if !self.persistence_enabled {
                     self.meta.deregister(entry.meta_id);
                 }
@@ -985,8 +1039,8 @@ impl UnifiedCache {
         self.meta_id_to_key.clear();
         self.shard_to_keys.clear();
         self.meta = MetaIndex::new();
-        self.hits = 0;
-        self.misses = 0;
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
         self.total_bytes = 0;
         self.pending_shards.clear();
         self.loading_shards.clear();
@@ -1008,12 +1062,12 @@ impl UnifiedCache {
         }
         UnifiedCacheStats {
             entries: self.entries.len(),
-            hits: self.hits,
-            misses: self.misses,
-            inserts: self.inserts,
-            updates: self.updates,
-            evictions: self.evictions,
-            invalidations: self.invalidations,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            updates: self.updates.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            invalidations: self.invalidations.load(Ordering::Relaxed),
             memory_bytes: self.total_memory_bytes(),
             meta_index_entries: self.meta.entry_count(),
             meta_index_bytes: self.meta.memory_bytes(),
@@ -1024,9 +1078,9 @@ impl UnifiedCache {
             meta_dirty: self.meta_dirty,
             entries_initial,
             entries_expanded,
-            extensions: self.extensions,
-            wall_hits: self.wall_hits,
-            prefetches: self.prefetches,
+            extensions: self.extensions.load(Ordering::Relaxed),
+            wall_hits: self.wall_hits.load(Ordering::Relaxed),
+            prefetches: self.prefetches.load(Ordering::Relaxed),
         }
     }
     /// Return per-entry detail for diagnostics/testing.
@@ -1045,25 +1099,27 @@ impl UnifiedCache {
         }).collect()
     }
     /// Reset hit/miss counters without clearing entries.
-    pub fn reset_counters(&mut self) {
-        self.hits = 0;
-        self.misses = 0;
+    pub fn reset_counters(&self) {
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
     }
     /// Record a cache entry update (called by flush thread during maintenance).
-    pub fn record_update(&mut self) {
-        self.updates += 1;
+    /// `&self` so the read path can record stat events without escalating to
+    /// a write lock — counters are atomic.
+    pub fn record_update(&self) {
+        self.updates.fetch_add(1, Ordering::Relaxed);
     }
     /// Record a cache entry expansion from initial to expanded capacity.
-    pub fn record_extension(&mut self) {
-        self.extensions += 1;
+    pub fn record_extension(&self) {
+        self.extensions.fetch_add(1, Ordering::Relaxed);
     }
     /// Record a cache wall hit (cursor went past cached entries, triggering expansion/slow path).
-    pub fn record_wall_hit(&mut self) {
-        self.wall_hits += 1;
+    pub fn record_wall_hit(&self) {
+        self.wall_hits.fetch_add(1, Ordering::Relaxed);
     }
     /// Record a prefetch trigger (background expansion request sent).
-    pub fn record_prefetch(&mut self) {
-        self.prefetches += 1;
+    pub fn record_prefetch(&self) {
+        self.prefetches.fetch_add(1, Ordering::Relaxed);
     }
     /// Get the cache config.
     pub fn config(&self) -> &UnifiedCacheConfig {
@@ -1167,21 +1223,21 @@ impl UnifiedCache {
             return;
         }
         // Collect all entries sorted by last_used (oldest first)
-        let mut candidates: Vec<(Instant, UnifiedKey)> = if self.persistence_enabled {
+        let mut candidates: Vec<(u64, UnifiedKey)> = if self.persistence_enabled {
             let non_dirty: Vec<_> = self.entries.iter()
                 .filter(|(_, e)| !e.persist_dirty)
-                .map(|(k, e)| (e.last_used, k.clone()))
+                .map(|(k, e)| (e.last_used_ms(), k.clone()))
                 .collect();
             if non_dirty.is_empty() {
                 self.entries.iter()
-                    .map(|(k, e)| (e.last_used, k.clone()))
+                    .map(|(k, e)| (e.last_used_ms(), k.clone()))
                     .collect()
             } else {
                 non_dirty
             }
         } else {
             self.entries.iter()
-                .map(|(k, e)| (e.last_used, k.clone()))
+                .map(|(k, e)| (e.last_used_ms(), k.clone()))
                 .collect()
         };
         candidates.sort_unstable_by_key(|(t, _)| *t);
@@ -1200,7 +1256,7 @@ impl UnifiedCache {
                 if let Some(set) = self.shard_to_keys.get_mut(&sk) {
                     set.remove(key);
                 }
-                self.evictions += 1;
+                self.evictions.fetch_add(1, Ordering::Relaxed);
                 if !self.persistence_enabled {
                     self.meta.deregister(entry.meta_id);
                 }
@@ -1485,7 +1541,7 @@ impl UnifiedCache {
             let Some(entry) = self.entries.get_mut(key) else {
                 continue;
             };
-            if entry.needs_rebuild {
+            if entry.needs_rebuild() {
                 continue;
             }
             // Collect slots to check: union of changed slots from the entry's referenced fields
@@ -1578,7 +1634,7 @@ impl UnifiedCache {
             let Some(entry) = self.entries.get_mut(key) else {
                 continue;
             };
-            if entry.needs_rebuild {
+            if entry.needs_rebuild() {
                 continue;
             }
             let sort_slots = match sort_mutations.get(key.sort_field.as_str()) {
@@ -1732,7 +1788,7 @@ impl UnifiedCache {
             .filter_map(|meta_id| {
                 let key = self.meta_id_to_key.get(&meta_id)?;
                 let entry = self.entries.get(key)?;
-                if entry.needs_rebuild {
+                if entry.needs_rebuild() {
                     return None;
                 }
                 let mut slots = Vec::new();
@@ -1789,7 +1845,7 @@ impl UnifiedCache {
             .filter_map(|meta_id| {
                 let key = self.meta_id_to_key.get(&meta_id)?;
                 let entry = self.entries.get(key)?;
-                if entry.needs_rebuild {
+                if entry.needs_rebuild() {
                     return None;
                 }
                 let sort_slots = sort_mutations.get(key.sort_field.as_str())?;
@@ -1820,7 +1876,7 @@ impl UnifiedCache {
             let Some(entry) = self.entries.get_mut(&result.key) else {
                 continue;
             };
-            if entry.needs_rebuild {
+            if entry.needs_rebuild() {
                 continue;
             }
             if !result.adds.is_empty() {
@@ -1860,7 +1916,7 @@ impl UnifiedCache {
                 count += 1;
             }
         }
-        self.invalidations += count;
+        self.invalidations.fetch_add(count, Ordering::Relaxed);
     }
     // ── Time Bucket Diff Integration (Phase 4) ─────────────────────────────
     /// Maintain cache entries when a time bucket is rebuilt.
@@ -1884,7 +1940,7 @@ impl UnifiedCache {
             return;
         }
         for (key, entry) in self.entries.iter_mut() {
-            if entry.needs_rebuild {
+            if entry.needs_rebuild() {
                 continue;
             }
             // Check if this entry has a bucket clause matching this bucket
@@ -3562,7 +3618,7 @@ mod tests {
         // finish_restore should evict down to max_entries=5
         cache.finish_restore();
         assert_eq!(cache.len(), 5, "Should evict down to max_entries");
-        assert_eq!(cache.evictions, 5, "Should have evicted exactly 5");
+        assert_eq!(cache.evictions.load(Ordering::Relaxed), 5, "Should have evicted exactly 5");
     }
     /// Microbench: time Phase A collect_sort_work with many cache entries
     /// sorting by the same field, simulating the metrics_poller workload.

@@ -250,7 +250,7 @@ pub struct ConcurrentEngine {
     /// Per-field dictionaries for LowCardinalityString fields.
     dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
     /// Unified cache: primary query result cache.
-    unified_cache: Arc<parking_lot::Mutex<UnifiedCache>>,
+    unified_cache: Arc<parking_lot::RwLock<UnifiedCache>>,
     /// BoundStore for unified cache persistence (None if no bitmap_path).
     bound_store: Option<Arc<crate::bound_store::BoundStore>>,
     /// Flush loop stats: total snapshot publishes (monotonic counter).
@@ -709,7 +709,7 @@ impl ConcurrentEngine {
         } else {
             None
         };
-        let unified_cache = Arc::new(parking_lot::Mutex::new(uc));
+        let unified_cache = Arc::new(parking_lot::RwLock::new(uc));
         let loading_mode = Arc::new(AtomicBool::new(false));
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
         let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
@@ -1484,7 +1484,7 @@ impl ConcurrentEngine {
                             let mut ct_sort_over_budget: usize = 0;
                             // Phase A: Brief lock — collect work items and do cheap ops
                             let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
-                                let mut uc = flush_unified_cache.lock();
+                                let mut uc = flush_unified_cache.write();
                                 ct_uc_entries = uc.len();
                                 // Targeted alive removal (fast: O(1) per entry per remove)
                                 if !uc.is_empty() {
@@ -1649,7 +1649,7 @@ impl ConcurrentEngine {
                                 || !filter_over_budget.is_empty() || !sort_over_budget.is_empty()
                                 || !filter_timed_out.is_empty() || !sort_timed_out.is_empty()
                             {
-                                let mut uc = flush_unified_cache.lock();
+                                let mut uc = flush_unified_cache.write();
                                 uc.apply_maintenance_results(&filter_results);
                                 uc.apply_maintenance_results(&sort_results);
                                 uc.mark_for_rebuild_batch(&filter_over_budget);
@@ -1751,7 +1751,7 @@ impl ConcurrentEngine {
                                     flush_cache_worker_metrics
                                         .backpressure_invalidations_total
                                         .fetch_add(1, Ordering::Relaxed);
-                                    let mut uc = flush_unified_cache.lock();
+                                    let mut uc = flush_unified_cache.write();
                                     if uc.persistence_enabled() {
                                         let filter_fields: Vec<&str> = coalescer
                                             .mutated_filter_fields()
@@ -2068,7 +2068,7 @@ impl ConcurrentEngine {
                             field.merge_dirty();
                         }
                         // Invalidate unified cache — may be stale from the loading period
-                        flush_unified_cache.lock().clear();
+                        flush_unified_cache.write().clear();
                         inner.store(Arc::new(staging.clone()));
                         staging_dirty = false;
                         // All fields changed during loading — mark everything stale.
@@ -2175,7 +2175,7 @@ impl ConcurrentEngine {
                                         &mut staging.sorts,
                                     );
                                 }
-                                flush_unified_cache.lock().clear();
+                                flush_unified_cache.write().clear();
                                 inner.store(Arc::new(staging.clone()));
                                 staging_dirty = false;
                                 let _ = done.send(());
@@ -2276,7 +2276,7 @@ impl ConcurrentEngine {
                                     filters: new_filters,
                                     sorts: new_sorts,
                                 };
-                                flush_unified_cache.lock().clear();
+                                flush_unified_cache.write().clear();
                                 inner.store(Arc::new(staging.clone()));
                                 staging_dirty = false;
                                 eprintln!("  flush: ExitLoadingSaveUnload complete");
@@ -2684,7 +2684,7 @@ impl ConcurrentEngine {
                     if let Some(ref bs) = merge_bound_store {
                         // Phase 1: Brief lock — check dirty flags + collect ALL data
                         let persist_data = {
-                            let mut uc = merge_unified_cache.lock();
+                            let mut uc = merge_unified_cache.write();
                             let meta_dirty = uc.is_meta_dirty();
                             let dirty_shards: Vec<crate::bound_store::ShardKey> =
                                 uc.dirty_shards().iter().cloned().collect();
@@ -2861,7 +2861,7 @@ impl ConcurrentEngine {
                             }
                             // Phase 3: Brief lock — finalize tombstones
                             if !all_cleaned.is_empty() {
-                                let mut uc = merge_unified_cache.lock();
+                                let mut uc = merge_unified_cache.write();
                                 uc.finalize_shard_write(&all_cleaned);
                             }
                             did_persist_data = true;
@@ -3091,7 +3091,7 @@ impl ConcurrentEngine {
                             let mut rounds = 0u32;
                             loop {
                                 {
-                                    let mut uc = merge_unified_cache.lock();
+                                    let mut uc = merge_unified_cache.write();
                                     if uc.len() == 0 { break; }
                                     uc.evict_batch();
                                 }
@@ -3132,7 +3132,7 @@ impl ConcurrentEngine {
                     while let Ok(ukey) = prefetch_rx.recv() {
                         // Read entry state under lock, then drop lock before doing work
                         let work = {
-                            let uc = pf_cache.lock();
+                            let uc = pf_cache.read();
                             if let Some(entry) = uc.get(&ukey) {
                                 if entry.is_prefetching() || !entry.has_more()
                                     || entry.capacity() >= entry.max_capacity()
@@ -3187,7 +3187,7 @@ impl ConcurrentEngine {
                             Ok(bm) => Arc::new(bm),
                             Err(e) => {
                                 tracing::debug!("Prefetch: filter resolution failed: {e}");
-                                let uc = pf_cache.lock();
+                                let uc = pf_cache.read();
                                 if let Some(entry) = uc.get(&ukey) {
                                     entry.set_prefetching(false);
                                 }
@@ -3219,7 +3219,7 @@ impl ConcurrentEngine {
                                 let value_fn = |slot: u32| -> u32 {
                                     sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                                 };
-                                let mut uc = pf_cache.lock();
+                                let mut uc = pf_cache.write();
                                 if let Some(entry) = uc.get_mut(&ukey) {
                                     entry.expand(&sorted_slots, value_fn);
                                     entry.set_prefetching(false);
@@ -3232,14 +3232,14 @@ impl ConcurrentEngine {
                             }
                             Ok(_) => {
                                 // No results — nothing to expand
-                                let uc = pf_cache.lock();
+                                let uc = pf_cache.read();
                                 if let Some(entry) = uc.get(&ukey) {
                                     entry.set_prefetching(false);
                                 }
                             }
                             Err(e) => {
                                 tracing::debug!("Prefetch: sort traversal failed: {e}");
-                                let uc = pf_cache.lock();
+                                let uc = pf_cache.read();
                                 if let Some(entry) = uc.get(&ukey) {
                                     entry.set_prefetching(false);
                                 }
@@ -4433,7 +4433,7 @@ impl ConcurrentEngine {
             // happen to win the lock — but the explicit cache lookup later
             // in the query path will still take the lock, so correctness
             // is unaffected.
-            let mut uc = match self.unified_cache.try_lock() {
+            let mut uc = match self.unified_cache.try_write() {
                 Some(g) => g,
                 None => return,
             };
@@ -4473,7 +4473,7 @@ impl ConcurrentEngine {
     /// Background shard loading. Called from a spawned thread.
     fn load_shard_background(
         bs: &crate::bound_store::BoundStore,
-        uc_arc: &Arc<parking_lot::Mutex<UnifiedCache>>,
+        uc_arc: &Arc<parking_lot::RwLock<UnifiedCache>>,
         inner: &Arc<ArcSwap<InnerEngine>>,
         sort_field: &str,
         direction: crate::query::SortDirection,
@@ -4491,7 +4491,7 @@ impl ConcurrentEngine {
                     let disk_elapsed = t0.elapsed();
                     let snap = inner.load();
                     let sf = snap.sorts.get_field(sort_field);
-                    let mut uc = uc_arc.lock();
+                    let mut uc = uc_arc.write();
                     let mut loaded = 0usize;
                     let mut skipped = 0usize;
                     uc.begin_restore(); // Skip per-insert eviction during shard restore
@@ -4550,12 +4550,12 @@ impl ConcurrentEngine {
                 }
                 Ok(None) => {
                     // Shard file doesn't exist — mark as loaded
-                    let mut uc = uc_arc.lock();
+                    let mut uc = uc_arc.write();
                     uc.mark_shard_loaded(sort_field, direction);
                 }
                 Err(e) => {
                     eprintln!("BoundStore: failed to load shard {}_{:?}: {e}", sort_field, direction);
-                    let mut uc = uc_arc.lock();
+                    let mut uc = uc_arc.write();
                     uc.mark_shard_loaded(sort_field, direction);
                 }
             }
@@ -4642,7 +4642,7 @@ impl ConcurrentEngine {
                     direction: sort_clause.direction,
                 };
                 let cache_data = {
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = self.unified_cache.write();
                     let pending = self.pending_bucket_diffs.load();
                     uc.lookup(&ukey).map(|entry| {
                         // Apply pending bucket diffs lazily before reading
@@ -4726,7 +4726,7 @@ impl ConcurrentEngine {
                             let (filter_arc, use_simple_sort) = self.resolve_filters(
                                 &executor, effective_filters, tb_guard.as_deref(), now_unix,
                             )?;
-                            let max_cap = self.unified_cache.lock().config().max_capacity;
+                            let max_cap = self.unified_cache.read().config().max_capacity;
                             let expand_limit = max_cap.saturating_sub(capacity);
                             let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
                             let expand_result = executor.execute_from_bitmap_unclamped(
@@ -4740,16 +4740,16 @@ impl ConcurrentEngine {
                                 let value_fn = |slot: u32| -> u32 {
                                     sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                                 };
-                                let mut uc = self.unified_cache.lock();
+                                let mut uc = self.unified_cache.write();
                                 if let Some(entry) = uc.lookup(&ukey) {
                                     entry.expand(&sorted_slots, value_fn);
                                     uc.record_extension();
                                 }
                             }
-                            self.unified_cache.lock().record_wall_hit();
+                            self.unified_cache.read().record_wall_hit();
                             // Re-query from expanded entry (now has radix)
                             let expanded_data = {
-                                let mut uc = self.unified_cache.lock();
+                                let mut uc = self.unified_cache.write();
                                 uc.lookup(&ukey).map(|e| {
                                     let radix = e.radix().cloned();
                                     let bm = Arc::clone(e.bitmap());
@@ -4795,7 +4795,7 @@ impl ConcurrentEngine {
                         }
                         // Prefetch proximity detection: if cursor is near the cache
                         // boundary, fire a background expansion request.
-                        if has_more && capacity < self.unified_cache.lock().config().max_capacity {
+                        if has_more && capacity < self.unified_cache.read().config().max_capacity {
                             if let Some(ref tx) = self.prefetch_tx {
                                 if let Some(ref keys) = cached_sorted_keys {
                                     if let Some(ref cursor) = result.cursor {
@@ -4805,10 +4805,10 @@ impl ConcurrentEngine {
                                             SortDirection::Desc => keys.partition_point(|&k| k >= cursor_key),
                                             SortDirection::Asc => keys.partition_point(|&k| k <= cursor_key),
                                         };
-                                        let threshold = self.unified_cache.lock().config().prefetch_threshold;
+                                        let threshold = self.unified_cache.read().config().prefetch_threshold;
                                         if keys.len() > 0 && pos as f64 / keys.len() as f64 >= threshold {
                                             let _ = tx.try_send(ukey.clone());
-                                            self.unified_cache.lock().record_prefetch();
+                                            self.unified_cache.read().record_prefetch();
                                         }
                                     }
                                 }
@@ -4819,7 +4819,7 @@ impl ConcurrentEngine {
                         return Ok(result);
                     }
                     // Expansion needed — fall through to slow path with pre-fetched cache data.
-                    self.unified_cache.lock().record_wall_hit();
+                    self.unified_cache.read().record_wall_hit();
                     return self.execute_query_slow_path(
                         query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix,
                         Some((ukey, unified_bm, has_more, min_val, capacity, cached_total)),
@@ -4871,7 +4871,7 @@ impl ConcurrentEngine {
         )?;
         collector.lazy_load_us = lazy_start.elapsed().as_micros() as u64;
         // Setup phase: cache shard load + snapshot + tb_guard + executor build.
-        // Includes the unified_cache.lock() inside ensure_cache_shard_loaded —
+        // Includes the unified_cache.write() inside ensure_cache_shard_loaded —
         // not covered by the explicit `timed_cache_lock` wrapping at the cache
         // lookup site. v1.0.184 evidence: cache-hit + no-filter slow queries
         // showed cache_lock_us = 0-6 ms but total = 500-840 ms, so the
@@ -4946,30 +4946,56 @@ impl ConcurrentEngine {
                     direction: sort_clause.direction,
                 };
                 let cache_data = {
-                    let mut uc = collector.timed_cache_lock(&self.unified_cache);
                     let pending = self.pending_bucket_diffs.load();
-                    uc.lookup(&ukey).map(|entry| {
-                        // Apply pending bucket diffs lazily before reading
-                        if pending.current_cutoff() > 0
-                            && entry.uses_bucket()
-                            && entry.bucket_cutoff() < pending.current_cutoff()
-                        {
-                            if entry.bucket_cutoff() >= pending.oldest_cutoff() {
-                                entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
-                            } else {
-                                entry.mark_for_rebuild();
+                    let needs_diff = pending.current_cutoff() > 0;
+                    if needs_diff {
+                        // Bucket diff may need to mutate the entry (apply or
+                        // mark-for-rebuild). Take the write lock so we can
+                        // call `lookup()` which returns `&mut UnifiedEntry`.
+                        // mark_for_rebuild itself is now `&self` (atomic
+                        // bool) but apply_bucket_diff still mutates the
+                        // bitmap via `Arc::make_mut` and needs `&mut`.
+                        let mut uc = collector.timed_cache_write(&self.unified_cache);
+                        uc.lookup(&ukey).map(|entry| {
+                            if entry.uses_bucket()
+                                && entry.bucket_cutoff() < pending.current_cutoff()
+                            {
+                                if entry.bucket_cutoff() >= pending.oldest_cutoff() {
+                                    entry.apply_bucket_diff(pending.merged_expired(), pending.current_cutoff());
+                                } else {
+                                    entry.mark_for_rebuild();
+                                }
                             }
-                        }
-                        let bm = Arc::clone(entry.bitmap());
-                        let has_more = entry.has_more();
-                        let min_val = entry.min_tracked_value();
-                        let cap = entry.capacity();
-                        let total = entry.total_matched();
-                        let radix = entry.radix().cloned();
-                        let direction = entry.direction();
-                        let sorted_keys = entry.sorted_keys().map(Arc::clone);
-                        (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
-                    })
+                            let bm = Arc::clone(entry.bitmap());
+                            let has_more = entry.has_more();
+                            let min_val = entry.min_tracked_value();
+                            let cap = entry.capacity();
+                            let total = entry.total_matched();
+                            let radix = entry.radix().cloned();
+                            let direction = entry.direction();
+                            let sorted_keys = entry.sorted_keys().map(Arc::clone);
+                            (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
+                        })
+                    } else {
+                        // Hot fast path: no bucket diff to apply. Take the
+                        // RwLock READ lock — many concurrent queries can
+                        // share this without serializing on the cache mutex
+                        // or being blocked by cache_worker writes. This is
+                        // the architectural fix that v1.0.190's lock-hold
+                        // reductions could not deliver: concurrent reads.
+                        let uc = collector.timed_cache_read(&self.unified_cache);
+                        uc.lookup_for_read(&ukey).map(|entry| {
+                            let bm = Arc::clone(entry.bitmap());
+                            let has_more = entry.has_more();
+                            let min_val = entry.min_tracked_value();
+                            let cap = entry.capacity();
+                            let total = entry.total_matched();
+                            let radix = entry.radix().cloned();
+                            let direction = entry.direction();
+                            let sorted_keys = entry.sorted_keys().map(Arc::clone);
+                            (bm, has_more, min_val, cap, total, radix, direction, sorted_keys)
+                        })
+                    }
                 };
                 if let Some((unified_bm, has_more, min_val, capacity, cached_total, cached_radix, _cached_direction, cached_sorted_keys)) = cache_data {
                     let needs_expansion = if let Some(cursor) = query.cursor.as_ref() {
@@ -5032,7 +5058,7 @@ impl ConcurrentEngine {
                             )?;
                             collector.filter_us = filter_start.elapsed().as_micros() as u64;
                             collector.cache_hit = false; // expansion needed filters
-                            let max_cap = self.unified_cache.lock().config().max_capacity;
+                            let max_cap = self.unified_cache.read().config().max_capacity;
                             let expand_limit = max_cap.saturating_sub(capacity);
                             let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
                             let expand_result = executor.execute_from_bitmap_unclamped(
@@ -5046,15 +5072,15 @@ impl ConcurrentEngine {
                                 let value_fn = |slot: u32| -> u32 {
                                     sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                                 };
-                                let mut uc = self.unified_cache.lock();
+                                let mut uc = self.unified_cache.write();
                                 if let Some(entry) = uc.lookup(&ukey) {
                                     entry.expand(&sorted_slots, value_fn);
                                     uc.record_extension();
                                 }
                             }
-                            self.unified_cache.lock().record_wall_hit();
+                            self.unified_cache.read().record_wall_hit();
                             let expanded_data = {
-                                let mut uc = self.unified_cache.lock();
+                                let mut uc = self.unified_cache.write();
                                 uc.lookup(&ukey).map(|e| {
                                     let radix = e.radix().cloned();
                                     let bm = Arc::clone(e.bitmap());
@@ -5100,7 +5126,7 @@ impl ConcurrentEngine {
                             }
                         }
                         // Prefetch proximity detection (traced path)
-                        if has_more && capacity < self.unified_cache.lock().config().max_capacity {
+                        if has_more && capacity < self.unified_cache.read().config().max_capacity {
                             if let Some(ref tx) = self.prefetch_tx {
                                 if let Some(ref keys) = cached_sorted_keys {
                                     if let Some(ref cursor) = result.cursor {
@@ -5110,10 +5136,10 @@ impl ConcurrentEngine {
                                             SortDirection::Desc => keys.partition_point(|&k| k >= cursor_key),
                                             SortDirection::Asc => keys.partition_point(|&k| k <= cursor_key),
                                         };
-                                        let threshold = self.unified_cache.lock().config().prefetch_threshold;
+                                        let threshold = self.unified_cache.read().config().prefetch_threshold;
                                         if keys.len() > 0 && pos as f64 / keys.len() as f64 >= threshold {
                                             let _ = tx.try_send(ukey.clone());
-                                            self.unified_cache.lock().record_prefetch();
+                                            self.unified_cache.read().record_prefetch();
                                         }
                                     }
                                 }
@@ -5123,7 +5149,7 @@ impl ConcurrentEngine {
                         return Ok(result);
                     }
                     // Expansion needed — fall through to slow path
-                    self.unified_cache.lock().record_wall_hit();
+                    self.unified_cache.read().record_wall_hit();
                     return self.execute_query_slow_path_traced(
                         query, effective_filters, &snap, &executor, tb_guard.as_deref(), now_unix,
                         Some((ukey, unified_bm, has_more, min_val, capacity, cached_total)),
@@ -5166,7 +5192,9 @@ impl ConcurrentEngine {
         } else if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
             (Some(ukey), Some((bm, has_more, min_val, cap)))
         } else if let Some(sort_clause) = query.sort.as_ref() {
-            let mut uc = collector.timed_cache_lock(&self.unified_cache);
+            // Slow path lookup: only checking for an existing cache entry to
+            // shortcut the work below. No mutation needed → read lock.
+            let uc = collector.timed_cache_read(&self.unified_cache);
             let min_size = uc.config().min_filter_size as u64;
             if full_total_matched >= min_size {
                 if let Some(clauses) = cache::canonicalize(snapped_filters) {
@@ -5175,7 +5203,7 @@ impl ConcurrentEngine {
                         sort_field: sort_clause.field.clone(),
                         direction: sort_clause.direction,
                     };
-                    let hit = uc.lookup(&ukey).map(|entry| {
+                    let hit = uc.lookup_for_read(&ukey).map(|entry| {
                         let bm = Arc::clone(entry.bitmap());
                         let has_more = entry.has_more();
                         let min_val = entry.min_tracked_value();
@@ -5213,7 +5241,7 @@ impl ConcurrentEngine {
         let (effective_bitmap, use_simple) = if needs_expansion {
             if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
                 if *has_more {
-                    let max_cap = self.unified_cache.lock().config().max_capacity;
+                    let max_cap = self.unified_cache.read().config().max_capacity;
                     let expand_limit = max_cap.saturating_sub(*capacity);
                     let expand_result = executor.execute_from_bitmap_unclamped(
                         &filter_arc,
@@ -5229,13 +5257,13 @@ impl ConcurrentEngine {
                         let value_fn = |slot: u32| -> u32 {
                             sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                         };
-                        let mut uc = self.unified_cache.lock();
+                        let mut uc = self.unified_cache.write();
                         if let Some(entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
                             uc.record_extension();
                         }
                     }
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = self.unified_cache.write();
                     if let Some(entry) = uc.lookup(ukey) {
                         let bm = Arc::clone(entry.bitmap());
                         let use_simple = bm.len() < 10_000;
@@ -5273,7 +5301,7 @@ impl ConcurrentEngine {
             let sort_clause = query.sort.as_ref().unwrap();
             if full_total_matched == 0 {
                 let value_fn = |_slot: u32| -> u32 { 0 };
-                self.unified_cache.lock().form_and_store(
+                self.unified_cache.write().form_and_store(
                     ukey,
                     &[],
                     false,
@@ -5289,7 +5317,7 @@ impl ConcurrentEngine {
                 self.post_validate(&mut result, &query.filters, executor)?;
                 return Ok(result);
             }
-            let initial_cap = self.unified_cache.lock().config().initial_capacity;
+            let initial_cap = self.unified_cache.read().config().initial_capacity;
             let seed_result = executor.execute_from_bitmap_unclamped(
                 &filter_arc,
                 query.sort.as_ref(),
@@ -5313,7 +5341,7 @@ impl ConcurrentEngine {
             let uses_bucket = ukey.filter_clauses.iter().any(|c| c.op == "bucket");
             // Brief lock 1: read capacity config + allocate meta_id.
             let (initial_cap, max_cap, meta_id) = {
-                let mut uc = self.unified_cache.lock();
+                let mut uc = self.unified_cache.write();
                 let (i, m) = uc.capacity_config();
                 let id = uc.allocate_meta_id(&ukey);
                 (i, m, id)
@@ -5340,7 +5368,7 @@ impl ConcurrentEngine {
             // Brief lock 2: insert prebuilt entry + grab sorted_keys for
             // the immediate read.
             let cached_keys = {
-                let mut uc = self.unified_cache.lock();
+                let mut uc = self.unified_cache.write();
                 uc.store(ukey.clone(), new_entry);
                 uc.lookup(&ukey).and_then(|entry| entry.sorted_keys().map(Arc::clone))
             };
@@ -5351,7 +5379,7 @@ impl ConcurrentEngine {
                 )?
             } else {
                 let cached_bm = {
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = self.unified_cache.write();
                     uc.lookup(&ukey).map(|entry| Arc::clone(entry.bitmap()))
                 };
                 if let Some(ref bm) = cached_bm {
@@ -5403,7 +5431,7 @@ impl ConcurrentEngine {
         if result.ids.len() < fetch_limit && query.cursor.is_some() && bound_was_applied {
             let did_expand = if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
                 if *has_more {
-                    let max_cap = self.unified_cache.lock().config().max_capacity;
+                    let max_cap = self.unified_cache.read().config().max_capacity;
                     let expand_limit = max_cap.saturating_sub(*capacity);
                     let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
                     let expand_result = executor.execute_from_bitmap_unclamped(
@@ -5420,7 +5448,7 @@ impl ConcurrentEngine {
                         let value_fn = |slot: u32| -> u32 {
                             sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                         };
-                        let mut uc = self.unified_cache.lock();
+                        let mut uc = self.unified_cache.write();
                         if let Some(entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
                             uc.record_extension();
@@ -5431,7 +5459,7 @@ impl ConcurrentEngine {
             } else { false };
             let re_data = if did_expand {
                 if let Some(ref ukey) = unified_key {
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = self.unified_cache.write();
                     uc.lookup(ukey).map(|e| {
                         let radix = e.radix().cloned();
                         let bm = Arc::clone(e.bitmap());
@@ -5516,7 +5544,7 @@ impl ConcurrentEngine {
         } else if let Some((ukey, bm, has_more, min_val, cap, _total)) = cached {
             (Some(ukey), Some((bm, has_more, min_val, cap)))
         } else if let Some(sort_clause) = query.sort.as_ref() {
-            let mut uc = self.unified_cache.lock();
+            let mut uc = self.unified_cache.write();
             let min_size = uc.config().min_filter_size as u64;
             if full_total_matched >= min_size {
                 if let Some(clauses) = cache::canonicalize(snapped_filters) {
@@ -5564,7 +5592,7 @@ impl ConcurrentEngine {
         let (effective_bitmap, use_simple) = if needs_expansion {
             if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
                 if *has_more {
-                    let max_cap = self.unified_cache.lock().config().max_capacity;
+                    let max_cap = self.unified_cache.read().config().max_capacity;
                     let expand_limit = max_cap.saturating_sub(*capacity);
                     let expand_result = executor.execute_from_bitmap_unclamped(
                         &filter_arc,
@@ -5580,13 +5608,13 @@ impl ConcurrentEngine {
                         let value_fn = |slot: u32| -> u32 {
                             sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                         };
-                        let mut uc = self.unified_cache.lock();
+                        let mut uc = self.unified_cache.write();
                         if let Some(entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
                             uc.record_extension();
                         }
                     }
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = self.unified_cache.write();
                     if let Some(entry) = uc.lookup(ukey) {
                         let bm = Arc::clone(entry.bitmap());
                         let use_simple = bm.len() < 10_000;
@@ -5626,7 +5654,7 @@ impl ConcurrentEngine {
             if full_total_matched == 0 {
                 // Zero-result cache: empty bitmap, no sort traversal needed.
                 let value_fn = |_slot: u32| -> u32 { 0 };
-                self.unified_cache.lock().form_and_store(
+                self.unified_cache.write().form_and_store(
                     ukey,
                     &[],
                     false,
@@ -5644,7 +5672,7 @@ impl ConcurrentEngine {
                 return Ok(result);
             }
             // Seed the cache with initial_capacity (4K) results — single sort traversal.
-            let initial_cap = self.unified_cache.lock().config().initial_capacity;
+            let initial_cap = self.unified_cache.read().config().initial_capacity;
             let t0 = std::time::Instant::now();
             let seed_result = executor.execute_from_bitmap_unclamped(
                 &filter_arc,
@@ -5665,7 +5693,7 @@ impl ConcurrentEngine {
                 sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
             };
             let t0 = std::time::Instant::now();
-            self.unified_cache.lock().form_and_store(
+            self.unified_cache.write().form_and_store(
                 ukey.clone(),
                 &sorted_slots,
                 has_more,
@@ -5680,7 +5708,7 @@ impl ConcurrentEngine {
             );
             // Serve the user's results from the freshly seeded cache.
             let cached_keys = {
-                let mut uc = self.unified_cache.lock();
+                let mut uc = self.unified_cache.write();
                 uc.lookup(&ukey).and_then(|entry| entry.sorted_keys().map(Arc::clone))
             };
             let mut result = if let Some(ref keys) = cached_keys {
@@ -5691,7 +5719,7 @@ impl ConcurrentEngine {
             } else {
                 // sorted_keys not available (shouldn't happen for fresh seed), fall back to bitmap
                 let cached_bm = {
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = self.unified_cache.write();
                     uc.lookup(&ukey).map(|entry| Arc::clone(entry.bitmap()))
                 };
                 if let Some(ref bm) = cached_bm {
@@ -5744,7 +5772,7 @@ impl ConcurrentEngine {
         if result.ids.len() < fetch_limit && query.cursor.is_some() && bound_was_applied {
             let did_expand = if let (Some(ref ukey), Some((_, has_more, _, capacity))) = (&unified_key, &unified_hit) {
                 if *has_more {
-                    let max_cap = self.unified_cache.lock().config().max_capacity;
+                    let max_cap = self.unified_cache.read().config().max_capacity;
                     let expand_limit = max_cap.saturating_sub(*capacity);
                     let expand_cursor = result.cursor.as_ref().or(query.cursor.as_ref());
                     let expand_result = executor.execute_from_bitmap_unclamped(
@@ -5761,7 +5789,7 @@ impl ConcurrentEngine {
                         let value_fn = |slot: u32| -> u32 {
                             sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                         };
-                        let mut uc = self.unified_cache.lock();
+                        let mut uc = self.unified_cache.write();
                         if let Some(entry) = uc.lookup(ukey) {
                             entry.expand(&sorted_slots, value_fn);
                             uc.record_extension();
@@ -5773,7 +5801,7 @@ impl ConcurrentEngine {
             // Re-query from expanded entry (use radix if available)
             let re_data = if did_expand {
                 if let Some(ref ukey) = unified_key {
-                    let mut uc = self.unified_cache.lock();
+                    let mut uc = self.unified_cache.write();
                     uc.lookup(ukey).map(|e| {
                         let radix = e.radix().cloned();
                         let bm = Arc::clone(e.bitmap());
@@ -6511,7 +6539,7 @@ impl ConcurrentEngine {
         let slot_bytes = snap.slots.bitmap_bytes();
         let filter_bytes = snap.filters.bitmap_bytes();
         let sort_bytes = snap.sorts.bitmap_bytes();
-        let uc = self.unified_cache.lock();
+        let uc = self.unified_cache.write();
         let cache_entries = uc.stats().entries;
         let cache_bytes = uc.stats().memory_bytes;
         drop(uc);
@@ -6554,44 +6582,44 @@ impl ConcurrentEngine {
         }).unwrap_or(0)
     }
     pub fn unified_cache_stats(&self) -> crate::unified_cache::UnifiedCacheStats {
-        self.unified_cache.lock().stats()
+        self.unified_cache.read().stats()
     }
     /// Return per-entry cache details for diagnostics.
     pub fn unified_cache_entry_details(&self) -> Vec<crate::unified_cache::UnifiedEntryDetail> {
-        self.unified_cache.lock().entry_details()
+        self.unified_cache.read().entry_details()
     }
     /// Update the max_maintenance_work budget on the live unified cache.
     pub fn set_max_maintenance_work(&self, v: usize) {
-        self.unified_cache.lock().config_mut().max_maintenance_work = v;
+        self.unified_cache.write().config_mut().max_maintenance_work = v;
     }
     /// Update the max_maintenance_ms time budget on the live unified cache and
     /// the async cache worker (if running). Takes effect on the worker's next
     /// cycle. `0` = unlimited (no deadline).
     pub fn set_max_maintenance_ms(&self, v: u64) {
-        self.unified_cache.lock().config_mut().max_maintenance_ms = v;
+        self.unified_cache.write().config_mut().max_maintenance_ms = v;
         if let Some(ref ms_arc) = self.cache_worker_ms {
             ms_arc.store(v, Ordering::Relaxed);
         }
     }
     /// Update the max_entries cap on the live unified cache.
     pub fn set_cache_max_entries(&self, v: usize) {
-        self.unified_cache.lock().config_mut().max_entries = v;
+        self.unified_cache.write().config_mut().max_entries = v;
     }
     /// Update the max_bytes cap on the live unified cache.
     pub fn set_cache_max_bytes(&self, v: usize) {
-        self.unified_cache.lock().config_mut().max_bytes = v;
+        self.unified_cache.write().config_mut().max_bytes = v;
     }
     /// Update the initial_capacity on the live unified cache.
     pub fn set_cache_initial_capacity(&self, v: usize) {
-        self.unified_cache.lock().config_mut().initial_capacity = v;
+        self.unified_cache.write().config_mut().initial_capacity = v;
     }
     /// Update the max_capacity on the live unified cache.
     pub fn set_cache_max_capacity(&self, v: usize) {
-        self.unified_cache.lock().config_mut().max_capacity = v;
+        self.unified_cache.write().config_mut().max_capacity = v;
     }
     /// Update the min_filter_size on the live unified cache.
     pub fn set_cache_min_filter_size(&self, v: usize) {
-        self.unified_cache.lock().config_mut().min_filter_size = v;
+        self.unified_cache.write().config_mut().min_filter_size = v;
     }
     /// Update the refresh interval for a named time bucket.
     /// Returns true if the bucket was found and updated, false if no time bucket
@@ -6639,7 +6667,7 @@ impl ConcurrentEngine {
         let bucket_count = bucket_names.len();
         tb_arc.store(Arc::new(tb));
         self.dirty_since_snapshot.store(true, std::sync::atomic::Ordering::Release);
-        self.unified_cache.lock().clear();
+        self.unified_cache.write().clear();
         eprintln!(
             "rebuild_time_buckets: rebuilt {} buckets from {} alive slots in sort field '{}'",
             bucket_count, slot_count, sort_field_name
@@ -6669,7 +6697,7 @@ impl ConcurrentEngine {
 
     /// Clear unified cache entries and reset counters (RAM only).
     pub fn clear_unified_cache(&self) {
-        self.unified_cache.lock().clear();
+        self.unified_cache.write().clear();
     }
     /// Purge the entire BoundStore: disk first, then memory.
     /// Order matters: wipe disk before clearing RAM to prevent stale shard loads.
@@ -6683,7 +6711,7 @@ impl ConcurrentEngine {
         }
         // Step 2: Clear RAM cache + meta-index (after disk is gone)
         {
-            let mut uc = self.unified_cache.lock();
+            let mut uc = self.unified_cache.write();
             uc.clear();
             // Re-enable persistence so new entries get persisted
             if self.bound_store.is_some() {
@@ -7514,7 +7542,7 @@ impl ConcurrentEngine {
         (*snap).clone()
     }
     fn invalidate_all_caches(&self) {
-        self.unified_cache.lock().clear();
+        self.unified_cache.write().clear();
     }
     /// Persist documents to the docstore on a background thread.
     /// Returns a JoinHandle to wait for completion. The docs Vec is consumed.
@@ -10754,7 +10782,7 @@ mod tests {
                 let _ = engine.execute_query(&bq).unwrap();
                 // Verify cache is populated
                 {
-                    let uc = engine.unified_cache.lock();
+                    let uc = engine.unified_cache.write();
                     assert!(uc.len() > 0, "cache should have entries after query");
                 }
                 // Save bitmap snapshot (triggers merge thread persistence)
@@ -10774,7 +10802,7 @@ mod tests {
                 let mut engine = ConcurrentEngine::new_with_path(config, &doc_path).unwrap();
                 // Verify BoundStore loaded meta
                 {
-                    let uc = engine.unified_cache.lock();
+                    let uc = engine.unified_cache.write();
                     assert!(uc.persistence_enabled(), "persistence should be enabled");
                     assert!(uc.meta().entry_count() > 0, "meta-index should have restored entries");
                 }

@@ -14,7 +14,7 @@
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -237,7 +237,7 @@ fn symmetric_difference_sorted(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
 /// Runs in its own thread. Owns the receive side of the work-item channel.
 pub struct CacheWorker {
     rx: crossbeam_channel::Receiver<CacheWorkItem>,
-    cache: Arc<Mutex<UnifiedCache>>,
+    cache: Arc<RwLock<UnifiedCache>>,
     engine: Arc<ArcSwap<InnerEngine>>,
     config: CacheWorkerConfig,
     metrics: Arc<CacheWorkerMetrics>,
@@ -249,7 +249,7 @@ pub struct CacheWorker {
 impl CacheWorker {
     pub fn new(
         rx: crossbeam_channel::Receiver<CacheWorkItem>,
-        cache: Arc<Mutex<UnifiedCache>>,
+        cache: Arc<RwLock<UnifiedCache>>,
         engine: Arc<ArcSwap<InnerEngine>>,
         config: CacheWorkerConfig,
         metrics: Arc<CacheWorkerMetrics>,
@@ -328,7 +328,7 @@ impl CacheWorker {
             };
 
             let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
-                let mut uc = self.cache.lock();
+                let mut uc = self.cache.write();
 
                 // Batched alive removal.
                 if !uc.is_empty() && !merged.alive_removes.is_empty() {
@@ -404,7 +404,7 @@ impl CacheWorker {
                 || !filter_timed_out.is_empty()
                 || !sort_timed_out.is_empty()
             {
-                let mut uc = self.cache.lock();
+                let mut uc = self.cache.write();
                 uc.apply_maintenance_results(&filter_results);
                 uc.apply_maintenance_results(&sort_results);
                 uc.mark_for_rebuild_batch(&filter_over_budget);
@@ -456,7 +456,7 @@ impl CacheWorker {
     /// affect filter eligibility globally, so precise invalidation isn't
     /// cheaper than a full sweep.
     fn invalidate_and_drop(&self, pending: &VecDeque<CacheWorkItem>) {
-        let mut uc = self.cache.lock();
+        let mut uc = self.cache.write();
         let mut any_alive = false;
         let mut affected_filter_fields: HashSet<Arc<str>> = HashSet::new();
         for item in pending {

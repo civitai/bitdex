@@ -132,13 +132,24 @@ impl QueryTraceCollector {
         }
     }
 
-    /// Acquire `unified_cache.lock()` while charging the wait time to
-    /// `cache_lock_us`. Wraps `parking_lot::Mutex::lock()` — caller still
-    /// gets a normal lock guard.
+    /// Acquire `unified_cache.write()` while charging the wait time to
+    /// `cache_lock_us`. Wraps `parking_lot::RwLock::write()` — caller still
+    /// gets a normal write guard.
     #[inline]
-    pub fn timed_cache_lock<'a, T>(&mut self, m: &'a parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'a, T> {
+    pub fn timed_cache_write<'a, T>(&mut self, m: &'a parking_lot::RwLock<T>) -> parking_lot::RwLockWriteGuard<'a, T> {
         let t0 = Instant::now();
-        let g = m.lock();
+        let g = m.write();
+        self.cache_lock_us = self.cache_lock_us.saturating_add(t0.elapsed().as_micros() as u64);
+        g
+    }
+
+    /// Acquire `unified_cache.read()` while charging the wait time to
+    /// `cache_lock_us`. Hot path — used by the fast-path lookup so concurrent
+    /// readers don't serialize on the cache mutex.
+    #[inline]
+    pub fn timed_cache_read<'a, T>(&mut self, m: &'a parking_lot::RwLock<T>) -> parking_lot::RwLockReadGuard<'a, T> {
+        let t0 = Instant::now();
+        let g = m.read();
         self.cache_lock_us = self.cache_lock_us.saturating_add(t0.elapsed().as_micros() as u64);
         g
     }
