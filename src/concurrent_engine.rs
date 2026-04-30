@@ -1871,13 +1871,29 @@ impl ConcurrentEngine {
                                 }
                                 let filter_buckets: Vec<(FilterBucketKey, Vec<FilterOp>)> =
                                     filter_by_bucket.into_iter().collect();
-                                filter_buckets.into_par_iter().for_each(
-                                    |(bucket_key, ops)| {
+                                // Sub-ms task work + sub-ms flush interval keeps rayon workers
+                                // in their spin window and never lets them park cleanly. Skip
+                                // par_iter for small batches — the global pool dispatch
+                                // overhead exceeds the sequential cost. Threshold=8 chosen so
+                                // bursts (modelVersionIds writes touching dozens of buckets)
+                                // still parallelize. Investigation 2026-04-30 attributed 13c
+                                // CPU floor to this pattern.
+                                const PAR_ITER_MIN: usize = 8;
+                                if filter_buckets.len() >= PAR_ITER_MIN {
+                                    filter_buckets.into_par_iter().for_each(
+                                        |(bucket_key, ops)| {
+                                            if let Err(e) = fs_.append_ops_opts(&bucket_key, &ops, false) {
+                                                eprintln!("flush: filter op failed: {e}");
+                                            }
+                                        },
+                                    );
+                                } else {
+                                    for (bucket_key, ops) in filter_buckets {
                                         if let Err(e) = fs_.append_ops_opts(&bucket_key, &ops, false) {
                                             eprintln!("flush: filter op failed: {e}");
                                         }
-                                    },
-                                );
+                                    }
+                                }
 
                                 let sort_set: Vec<(SortLayerShardKey, BitmapOp)> = coalescer
                                     .sort_set_entries()
@@ -1895,13 +1911,22 @@ impl ConcurrentEngine {
                                         BitmapOp::BatchClear { bits: slots.clone() },
                                     ))
                                     .collect();
-                                sort_set.into_par_iter().chain(sort_clr.into_par_iter()).for_each(
-                                    |(shard_key, op)| {
+                                let sort_total = sort_set.len() + sort_clr.len();
+                                if sort_total >= PAR_ITER_MIN {
+                                    sort_set.into_par_iter().chain(sort_clr.into_par_iter()).for_each(
+                                        |(shard_key, op)| {
+                                            if let Err(e) = ss_.append_op_opts(&shard_key, &op, false) {
+                                                eprintln!("flush: sort op failed: {e}");
+                                            }
+                                        },
+                                    );
+                                } else {
+                                    for (shard_key, op) in sort_set.into_iter().chain(sort_clr.into_iter()) {
                                         if let Err(e) = ss_.append_op_opts(&shard_key, &op, false) {
                                             eprintln!("flush: sort op failed: {e}");
                                         }
-                                    },
-                                );
+                                    }
+                                }
                             }
                             flush_opslog_ns.store(t_opslog.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }

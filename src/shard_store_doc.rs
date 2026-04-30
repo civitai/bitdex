@@ -1213,11 +1213,22 @@ impl DocStoreV3 {
         let store = Arc::clone(&self.store);
         let dirty_shards = Arc::clone(&self.dirty_shards);
         let items: Vec<(u32, Vec<DocOp>)> = by_shard.into_iter().collect();
-        items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
-            store.append_ops(&shard_key, &ops)?;
-            dirty_shards.insert(shard_key);
-            Ok(())
-        })?;
+        // par_iter pool dispatch overhead exceeds sequential cost for small
+        // batches (typical doc writer flush touches 1-N shards). Threshold=8
+        // matches flush thread (concurrent_engine.rs:1874). Investigation
+        // 2026-04-30 attributed 13c CPU floor to rayon spin on small batches.
+        if items.len() >= 8 {
+            items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
+                store.append_ops(&shard_key, &ops)?;
+                dirty_shards.insert(shard_key);
+                Ok(())
+            })?;
+        } else {
+            for (shard_key, ops) in items {
+                store.append_ops(&shard_key, &ops)?;
+                dirty_shards.insert(shard_key);
+            }
+        }
         Ok(())
     }
 
@@ -1243,11 +1254,18 @@ impl DocStoreV3 {
         let store = Arc::clone(&self.store);
         let dirty_shards = Arc::clone(&self.dirty_shards);
         let items: Vec<(u32, Vec<DocOp>)> = by_shard.into_iter().collect();
-        items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
-            store.append_ops(&shard_key, &ops)?;
-            dirty_shards.insert(shard_key);
-            Ok(())
-        })?;
+        if items.len() >= 8 {
+            items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
+                store.append_ops(&shard_key, &ops)?;
+                dirty_shards.insert(shard_key);
+                Ok(())
+            })?;
+        } else {
+            for (shard_key, ops) in items {
+                store.append_ops(&shard_key, &ops)?;
+                dirty_shards.insert(shard_key);
+            }
+        }
         Ok(())
     }
 
@@ -1287,11 +1305,18 @@ impl DocStoreV3 {
         let store = Arc::clone(&self.store);
         let dirty_shards = Arc::clone(&self.dirty_shards);
         let items: Vec<(u32, Vec<DocOp>)> = by_shard.into_iter().collect();
-        items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
-            store.append_ops(&shard_key, &ops)?;
-            dirty_shards.insert(shard_key);
-            Ok(())
-        })?;
+        if items.len() >= 8 {
+            items.into_par_iter().try_for_each(|(shard_key, ops)| -> io::Result<()> {
+                store.append_ops(&shard_key, &ops)?;
+                dirty_shards.insert(shard_key);
+                Ok(())
+            })?;
+        } else {
+            for (shard_key, ops) in items {
+                store.append_ops(&shard_key, &ops)?;
+                dirty_shards.insert(shard_key);
+            }
+        }
         Ok(())
     }
 
