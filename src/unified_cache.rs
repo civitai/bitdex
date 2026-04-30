@@ -794,6 +794,33 @@ impl UnifiedCache {
         }
         self.store(key, entry)
     }
+
+    /// Read the cache config in a single brief lock acquisition.
+    /// Used by `form_and_store_split` callers to build entries outside the
+    /// cache mutex, then re-acquire it to register + insert.
+    pub fn capacity_config(&self) -> (usize, usize) {
+        (self.config.initial_capacity, self.config.max_capacity)
+    }
+
+    /// Register a meta-index id without building or inserting an entry.
+    /// Pairs with `store` to split form_and_store into three phases:
+    ///   1. Brief lock: allocate meta_id (this method).
+    ///   2. Unlocked: build UnifiedEntry — the expensive
+    ///      `build_sorted_keys` walk happens off the cache mutex.
+    ///   3. Brief lock: `store` the prebuilt entry.
+    ///
+    /// Trace data on prod showed the cache mutex held for hundreds of ms
+    /// while the slow-path query thread ran `UnifiedEntry::new` which
+    /// does up to 4000 × 32 bitmap.contains calls inside `build_sorted_keys`
+    /// (one per slot × bit-layer). Splitting this out drops the locked
+    /// portion of slow-path inserts to two HashMap operations.
+    pub fn allocate_meta_id(&mut self, key: &UnifiedKey) -> CacheEntryId {
+        self.meta.register(
+            &key.filter_clauses,
+            Some(&key.sort_field),
+            Some(key.direction),
+        )
+    }
     /// Evict the least-recently-used entry. Returns the evicted key, if any.
     ///
     /// When persistence is enabled:

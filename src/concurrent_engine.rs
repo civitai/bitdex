@@ -5303,15 +5303,45 @@ impl ConcurrentEngine {
             let value_fn = |slot: u32| -> u32 {
                 sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
             };
-            self.unified_cache.lock().form_and_store(
-                ukey.clone(),
+            // Split form_and_store across two brief locks so the
+            // expensive UnifiedEntry::new (build_sorted_keys runs ~4000
+            // reconstruct_value calls × 32 bit-layers each) happens
+            // OUTSIDE the cache mutex. Steady-state slow-path inserts
+            // were the dominant remaining cache_lock_us contributor on
+            // v1.0.189 (LOCK p99 ~1-2 s under load).
+            let direction = ukey.direction;
+            let uses_bucket = ukey.filter_clauses.iter().any(|c| c.op == "bucket");
+            // Brief lock 1: read capacity config + allocate meta_id.
+            let (initial_cap, max_cap, meta_id) = {
+                let mut uc = self.unified_cache.lock();
+                let (i, m) = uc.capacity_config();
+                let id = uc.allocate_meta_id(&ukey);
+                (i, m, id)
+            };
+            // Unlocked: build the entry (the expensive part).
+            let mut new_entry = UnifiedEntry::new(
                 &sorted_slots,
+                initial_cap,
+                max_cap,
                 has_more,
                 full_total_matched,
+                meta_id,
+                direction,
                 value_fn,
             );
+            new_entry.set_uses_bucket(uses_bucket);
+            if uses_bucket {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                new_entry.set_bucket_cutoff(now);
+            }
+            // Brief lock 2: insert prebuilt entry + grab sorted_keys for
+            // the immediate read.
             let cached_keys = {
                 let mut uc = self.unified_cache.lock();
+                uc.store(ukey.clone(), new_entry);
                 uc.lookup(&ukey).and_then(|entry| entry.sorted_keys().map(Arc::clone))
             };
             let mut result = if let Some(ref keys) = cached_keys {
