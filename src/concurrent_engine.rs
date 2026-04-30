@@ -1176,7 +1176,9 @@ impl ConcurrentEngine {
             let flush_mem_cache = Arc::clone(&bitmap_memory_cache);
             let flush_cache_work_tx = cache_work_tx.clone();
             let flush_cache_worker_metrics = Arc::clone(&cache_worker_metrics);
-            thread::spawn(move || {
+            thread::Builder::new()
+                .name("bitdex-flush".to_string())
+                .spawn(move || {
                 let min_sleep = Duration::from_micros(flush_interval_us);
                 let max_sleep = Duration::from_micros(flush_interval_us * 10);
                 let mut current_sleep = min_sleep;
@@ -2536,6 +2538,7 @@ impl ConcurrentEngine {
                     }
                 }
             })
+            .expect("failed to spawn bitdex-flush thread")
         };
         let prefilter_registry = Arc::new(crate::prefilter::PrefilterRegistry::new());
         let warm_persist_path = config.storage.bitmap_path.as_ref()
@@ -2566,7 +2569,9 @@ impl ConcurrentEngine {
             let merge_prefilter_registry = Arc::clone(&prefilter_registry);
             let merge_warm_registry = Arc::clone(&warm_registry);
 
-            thread::spawn(move || {
+            thread::Builder::new()
+                .name("bitdex-merge".to_string())
+                .spawn(move || {
                 let sleep_duration = Duration::from_millis(merge_interval_ms);
                 while !shutdown.load(Ordering::Relaxed) {
                     thread::sleep(sleep_duration);
@@ -3110,6 +3115,7 @@ impl ConcurrentEngine {
                     }
                 } // while !shutdown
             })
+            .expect("failed to spawn bitdex-merge thread")
         };
         // Prefetch worker: background cache expansion when cursor nears boundary.
         // Disabled when threshold is 0.0 or 1.0.
