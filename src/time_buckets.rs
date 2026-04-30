@@ -6,6 +6,7 @@ use roaring::RoaringBitmap;
 use crate::config::BucketConfig;
 
 /// A single time range bucket with its pre-computed bitmap.
+#[derive(Clone)]
 pub struct TimeBucket {
     /// Human-readable name (e.g., "24h", "7d", "30d").
     pub name: String,
@@ -84,6 +85,7 @@ impl TimeBucket {
 }
 
 /// Manages all time buckets for a single timestamp field.
+#[derive(Clone)]
 pub struct TimeBucketManager {
     /// The filter field name this manager is associated with (e.g., "sortAtUnix").
     /// Used to match Gte filter clauses for snapping.
