@@ -1566,9 +1566,32 @@ impl UnifiedCache {
         if slots.is_empty() || self.entries.is_empty() {
             return;
         }
+        // Hot path on the unified-cache mutex: cache_worker calls this once
+        // per cycle while holding the lock, so the inner loop is the lock-hold
+        // time queries see. The previous implementation called
+        // `entry.remove_slot_blind(slot)` per slot, which calls
+        // `Arc::make_mut(&mut entry.bitmap)` and `Arc::make_mut(&mut radix)`
+        // *per slot* — and `make_mut` clones the underlying bitmap whenever
+        // refcount > 1 (every cycle when readers hold snapshots). At
+        // 100 K cache entries × 100 alive_removes that's 10 M make_mut calls
+        // per worker cycle — observed locally as ~700 ms-1 s P99 query
+        // latency spikes when the lock-held time hits its peak.
+        //
+        // Hoist make_mut out of the per-slot loop so each entry's bitmap is
+        // cloned at most once per worker cycle. Net change: same correctness,
+        // ~M× less make_mut work, much shorter lock hold.
         for (_, entry) in self.entries.iter_mut() {
+            let bm = Arc::make_mut(&mut entry.bitmap);
             for &slot in slots {
-                entry.remove_slot_blind(slot);
+                bm.remove(slot);
+            }
+            entry.persist_dirty = true;
+            entry.sorted_keys = None;
+            if let Some(ref mut radix) = entry.radix {
+                let r = Arc::make_mut(radix);
+                for &slot in slots {
+                    r.remove_blind(slot);
+                }
             }
         }
     }
