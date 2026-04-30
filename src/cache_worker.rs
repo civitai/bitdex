@@ -242,6 +242,8 @@ pub struct CacheWorker {
     config: CacheWorkerConfig,
     metrics: Arc<CacheWorkerMetrics>,
     shutdown: Arc<AtomicBool>,
+    /// Counter for periodic `reconcile_bytes` calls — see Phase C in `run`.
+    cycles_since_reconcile: u32,
 }
 
 impl CacheWorker {
@@ -260,6 +262,7 @@ impl CacheWorker {
             config,
             metrics,
             shutdown,
+            cycles_since_reconcile: 0,
         }
     }
 
@@ -408,7 +411,20 @@ impl CacheWorker {
                 uc.mark_for_rebuild_batch(&sort_over_budget);
                 uc.mark_for_rebuild_batch(&filter_timed_out);
                 uc.mark_for_rebuild_batch(&sort_timed_out);
-                uc.reconcile_bytes();
+                // Reconcile total_bytes every 30th cycle instead of every
+                // cycle. reconcile_bytes scans all entries calling
+                // bitmap.serialized_size() — observed locally as ~tens of
+                // ms under the cache mutex on a full 100 K cache. The
+                // store/evict paths track total_bytes incrementally; only
+                // bulk ops (add_slots_bulk / remove_slots_bulk) drift it,
+                // and the drift is small per cycle. Reconciling
+                // periodically keeps eviction-budget decisions honest
+                // without paying the scan cost on every cycle.
+                self.cycles_since_reconcile += 1;
+                if self.cycles_since_reconcile >= 30 {
+                    uc.reconcile_bytes();
+                    self.cycles_since_reconcile = 0;
+                }
             }
 
             let over_budget = (filter_over_budget.len()
