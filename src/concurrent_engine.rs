@@ -4857,6 +4857,13 @@ impl ConcurrentEngine {
             query.sort.as_ref().map(|s| s.field.as_str()),
         )?;
         collector.lazy_load_us = lazy_start.elapsed().as_micros() as u64;
+        // Setup phase: cache shard load + snapshot + tb_guard + executor build.
+        // Includes the unified_cache.lock() inside ensure_cache_shard_loaded —
+        // not covered by the explicit `timed_cache_lock` wrapping at the cache
+        // lookup site. v1.0.184 evidence: cache-hit + no-filter slow queries
+        // showed cache_lock_us = 0-6 ms but total = 500-840 ms, so the
+        // contention is here, not the explicit lookup.
+        let setup_start = Instant::now();
         // Lazy-load cached shard from disk if pending
         if let Some(sort_clause) = query.sort.as_ref() {
             self.ensure_cache_shard_loaded(&sort_clause.field, sort_clause.direction);
@@ -4906,6 +4913,7 @@ impl ConcurrentEngine {
         } else {
             &query.filters[..]
         };
+        collector.setup_us = setup_start.elapsed().as_micros() as u64;
         // ── skip_cache bypass: go straight to slow path without cache ──
         if query.skip_cache {
             tracing::info!("skip_cache=true: bypassing unified cache (traced)");

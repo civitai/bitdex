@@ -39,6 +39,14 @@ pub struct QueryTrace {
     /// cache entries, blocking every concurrent reader).
     #[serde(default)]
     pub cache_lock_us: u64,
+    /// Per-query setup time: `ensure_cache_shard_loaded` + `snapshot` +
+    /// `tb_guard.load` + executor build + `snap_range_clauses`. Runs once
+    /// per query before any cache lookup. Catches mutex contention inside
+    /// `ensure_cache_shard_loaded` that the per-acquire `cache_lock_us`
+    /// counter misses (it only wraps the explicit lock sites in the
+    /// trace path).
+    #[serde(default)]
+    pub setup_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -94,6 +102,7 @@ pub struct QueryTraceCollector {
     pub sort_us: u64,
     pub cache_hit: bool,
     pub cache_lock_us: u64,
+    pub setup_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -108,6 +117,7 @@ impl QueryTraceCollector {
             sort_us: 0,
             cache_hit: false,
             cache_lock_us: 0,
+            setup_us: 0,
             clauses: Vec::new(),
             sort: None,
         }
@@ -148,6 +158,7 @@ impl QueryTraceCollector {
             docs_us: 0,
             docs_count: 0,
             cache_lock_us: self.cache_lock_us,
+            setup_us: self.setup_us,
             clauses: self.clauses,
             sort: self.sort,
         }
