@@ -3214,6 +3214,7 @@ impl ConcurrentEngine {
             let loading_flag = Arc::clone(&loading_mode);
             let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
             let sort_names: Vec<String> = config.sort_fields.iter().map(|f| f.name.clone()).collect();
+            #[cfg(feature = "server")]
             let bridge_for_scanner = Arc::clone(&metrics_bridge);
             std::thread::Builder::new()
                 .name("bitdex-mem-scanner".into())
@@ -3223,12 +3224,15 @@ impl ConcurrentEngine {
                         std::thread::sleep(std::time::Duration::from_millis(interval));
                         let t = std::time::Instant::now();
                         mem_cache.scan_tick(&inner_ref, &loading_flag, &filter_names, &sort_names);
-                        let elapsed = t.elapsed();
-                        let guard = bridge_for_scanner.load();
-                        if let Some(b) = (**guard).as_ref() {
-                            b.bitmap_mem_scan_tick_seconds
-                                .with_label_values(&[&b.index_name])
-                                .observe(elapsed.as_secs_f64());
+                        let _elapsed = t.elapsed();
+                        #[cfg(feature = "server")]
+                        {
+                            let guard = bridge_for_scanner.load();
+                            if let Some(b) = (**guard).as_ref() {
+                                b.bitmap_mem_scan_tick_seconds
+                                    .with_label_values(&[&b.index_name])
+                                    .observe(_elapsed.as_secs_f64());
+                            }
                         }
                     }
                 })

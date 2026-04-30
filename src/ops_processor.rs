@@ -658,7 +658,9 @@ pub fn apply_ops_batch<S: BitmapSink>(
 ) -> (usize, usize, usize) {
     // 11c CPU floor attribution (2026-04-30): time the apply path so we can
     // attribute the WAL reader's contribution. Bridge handle is None in tests
-    // and dump-only contexts — observation is best-effort.
+    // and dump-only contexts — observation is best-effort. Server-feature
+    // gated because metrics_bridge_handle is server-only.
+    #[cfg(feature = "server")]
     let _apply_timer = engine.and_then(|e| e.metrics_bridge_handle()).map(|b| {
         b.wal_apply_batch_seconds
             .with_label_values(&[&b.index_name])
