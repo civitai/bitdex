@@ -1699,6 +1699,9 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             query_op_set_fanout_size: state.metrics.query_op_set_fanout_size.clone(),
             query_op_set_rejected_total: state.metrics.query_op_set_rejected_total.clone(),
             query_op_set_applied_slots_total: state.metrics.query_op_set_applied_slots_total.clone(),
+            wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
+            bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
+            query_total: state.metrics.query_total.clone(),
             index_name: def.name.clone(),
         });
         let phase4_elapsed = phase_start.elapsed();
@@ -2018,6 +2021,9 @@ async fn handle_create_index(
         query_op_set_fanout_size: state.metrics.query_op_set_fanout_size.clone(),
         query_op_set_rejected_total: state.metrics.query_op_set_rejected_total.clone(),
         query_op_set_applied_slots_total: state.metrics.query_op_set_applied_slots_total.clone(),
+        wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
+        bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
+        query_total: state.metrics.query_total.clone(),
         index_name: definition.name.clone(),
     });
 

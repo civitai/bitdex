@@ -190,6 +190,17 @@ pub struct Metrics {
     /// at the work-unit level rather than the API-call level.
     pub query_op_set_applied_slots_total: IntCounterVec,
 
+    // -- 11c CPU floor attribution (2026-04-30) --
+    /// Wall-clock duration of `apply_ops_batch` per WAL-reader batch. Sum × rate
+    /// = CPU spent in op apply. Mission status v1.0.178 cites 11c steady-state
+    /// floor in server mode; this metric attributes the WAL reader's contribution.
+    pub wal_apply_batch_seconds: HistogramVec,
+    /// Wall-clock duration of one `BitmapMemoryCache::scan_tick`. Background
+    /// scanner thread runs every interval_ms; this histogram shows how much CPU
+    /// each tick consumes (postId full-walk at 23M distinct values is the
+    /// suspected ~1c contributor).
+    pub bitmap_mem_scan_tick_seconds: HistogramVec,
+
     // -- Boot phase breakdown --
     pub boot_phase_seconds: IntGaugeVec,
 }
@@ -917,6 +928,31 @@ impl Metrics {
         )
         .unwrap();
 
+        // 11c CPU floor attribution (2026-04-30): WAL apply per-batch + mem-scanner tick.
+        // Buckets cover sub-ms (WAL batch fast path) through multi-second (postId
+        // full-walk on the 23M-distinct-value bitmap).
+        let apply_seconds_buckets = vec![
+            0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+        ];
+        let wal_apply_batch_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_wal_apply_batch_seconds",
+                "Wall-clock duration of apply_ops_batch per WAL-reader batch",
+            )
+            .buckets(apply_seconds_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let bitmap_mem_scan_tick_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_bitmap_mem_scan_tick_seconds",
+                "Wall-clock duration of one BitmapMemoryCache::scan_tick (background scanner thread)",
+            )
+            .buckets(apply_seconds_buckets),
+            &["index"],
+        )
+        .unwrap();
+
         // Boot phase breakdown
         let boot_phase_seconds = IntGaugeVec::new(
             Opts::new("bitdex_boot_phase_seconds", "Duration of each boot phase in seconds"),
@@ -1065,6 +1101,8 @@ impl Metrics {
         registry.register(Box::new(wal_last_applied_timestamp_seconds.clone())).unwrap();
         registry.register(Box::new(wal_append_duration_seconds.clone())).unwrap();
         registry.register(Box::new(query_op_set_fanout_size.clone())).unwrap();
+        registry.register(Box::new(wal_apply_batch_seconds.clone())).unwrap();
+        registry.register(Box::new(bitmap_mem_scan_tick_seconds.clone())).unwrap();
         registry.register(Box::new(query_op_set_rejected_total.clone())).unwrap();
         registry.register(Box::new(query_op_set_applied_slots_total.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
@@ -1186,6 +1224,8 @@ impl Metrics {
             query_op_set_fanout_size,
             query_op_set_rejected_total,
             query_op_set_applied_slots_total,
+            wal_apply_batch_seconds,
+            bitmap_mem_scan_tick_seconds,
             boot_phase_seconds,
         }
     }

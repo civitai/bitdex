@@ -49,6 +49,13 @@ pub struct MetricsBridge {
     /// the WAL reader has done across all queryOpSets; not the same as the
     /// `applied` count returned per call.
     pub query_op_set_applied_slots_total: prometheus::IntCounterVec,
+    /// 11c CPU floor attribution: WAL apply per-batch duration.
+    pub wal_apply_batch_seconds: prometheus::HistogramVec,
+    /// 11c CPU floor attribution: bitmap memory scanner tick duration.
+    pub bitmap_mem_scan_tick_seconds: prometheus::HistogramVec,
+    /// Existing query counter; bridged so apply_query_op_set can bump it on the
+    /// QueryOpSet path (mission #77).
+    pub query_total: prometheus::IntCounterVec,
     pub index_name: String,
 }
 /// Commands sent to the flush thread for state transitions that must
@@ -3207,13 +3214,22 @@ impl ConcurrentEngine {
             let loading_flag = Arc::clone(&loading_mode);
             let filter_names: Vec<String> = config.filter_fields.iter().map(|f| f.name.clone()).collect();
             let sort_names: Vec<String> = config.sort_fields.iter().map(|f| f.name.clone()).collect();
+            let bridge_for_scanner = Arc::clone(&metrics_bridge);
             std::thread::Builder::new()
                 .name("bitdex-mem-scanner".into())
                 .spawn(move || {
                     loop {
                         let interval = mem_cache.interval_ms();
                         std::thread::sleep(std::time::Duration::from_millis(interval));
+                        let t = std::time::Instant::now();
                         mem_cache.scan_tick(&inner_ref, &loading_flag, &filter_names, &sort_names);
+                        let elapsed = t.elapsed();
+                        let guard = bridge_for_scanner.load();
+                        if let Some(b) = (**guard).as_ref() {
+                            b.bitmap_mem_scan_tick_seconds
+                                .with_label_values(&[&b.index_name])
+                                .observe(elapsed.as_secs_f64());
+                        }
                     }
                 })
                 .expect("failed to spawn memory scanner thread");

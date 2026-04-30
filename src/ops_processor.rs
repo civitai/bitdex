@@ -656,6 +656,14 @@ pub fn apply_ops_batch<S: BitmapSink>(
     engine: Option<&ConcurrentEngine>,
     mut doc_writer: Option<&mut DocWriter>,
 ) -> (usize, usize, usize) {
+    // 11c CPU floor attribution (2026-04-30): time the apply path so we can
+    // attribute the WAL reader's contribution. Bridge handle is None in tests
+    // and dump-only contexts — observation is best-effort.
+    let _apply_timer = engine.and_then(|e| e.metrics_bridge_handle()).map(|b| {
+        b.wal_apply_batch_seconds
+            .with_label_values(&[&b.index_name])
+            .start_timer()
+    });
     dedup_ops(batch);
     // Per-batch diagnostic at trace level (was eprintln, hot-path cost).
     if !batch.is_empty() {
@@ -1106,6 +1114,18 @@ fn apply_query_op_set<S: BitmapSink>(
         cursor: None,
         skip_cache: true,
     };
+    // Mission #77: bump query_total so the existing query-rate dashboard reflects
+    // the WAL-reader's queryOpSet fan-out queries, not just /api/.../query.
+    #[cfg(feature = "server")]
+    let metrics = engine.metrics_bridge_handle();
+    #[cfg(feature = "server")]
+    if let Some(ref bridge) = metrics {
+        bridge
+            .query_total
+            .with_label_values(&[&bridge.index_name])
+            .inc();
+    }
+
     let result = engine
         .execute_query(&query)
         .map_err(|e| format!("queryOpSet query failed: {e}"))?;
@@ -1114,8 +1134,6 @@ fn apply_query_op_set<S: BitmapSink>(
     // Issue #60: observe fan-out size BEFORE the cap check so the histogram captures
     // the would-be-rejected upper tail too. The bridge handle is `None` in tests
     // and dump-only contexts — observation is best-effort.
-    #[cfg(feature = "server")]
-    let metrics = engine.metrics_bridge_handle();
     #[cfg(feature = "server")]
     if let Some(ref bridge) = metrics {
         bridge
