@@ -1394,21 +1394,53 @@ impl ConcurrentEngine {
                         // This avoids the expensive staging.clone() → Arc::make_mut clone
                         // cascade that dominates write cost at scale.
                         if !flush_loading_mode.load(Ordering::Relaxed) {
-                            // Live maintenance for time buckets: add newly-alive slots to
-                            // qualifying buckets, remove deleted slots from all buckets.
+                            // Live maintenance for time buckets:
+                            //   1. add newly-alive slots to qualifying buckets,
+                            //   2. remove deleted slots from all buckets,
+                            //   3. re-evaluate bucket membership for slots whose
+                            //      tracked sort field value changed in this batch
+                            //      (e.g., sortAt = greatest(existedAt, publishedAt)
+                            //      regressing when a Post is unpublished).
+                            //
+                            // Step 3 closes the long-standing leak where slots
+                            // stayed in the 24h bucket after their sortAt aged
+                            // out — `subtract_expired` only catches slots whose
+                            // sortAt falls in `[old_cutoff, new_cutoff)`, so a
+                            // slot whose sortAt jumped from "now" to "two days
+                            // ago" in a single update was invisible to the
+                            // periodic refresh forever.
                             let t_tb = Instant::now();
                             if let Some(ref tb_arc) = flush_time_buckets {
                                 let alive_inserts = coalescer.alive_inserts();
                                 let alive_removes = coalescer.alive_removes();
-                                if !alive_inserts.is_empty() || !alive_removes.is_empty() {
+                                let mutated_slots = coalescer.mutated_sort_slots();
+                                let sort_field_name = tb_arc.load().sort_field_name().to_string();
+                                let sort_value_changed: Vec<u32> = mutated_slots
+                                    .get(sort_field_name.as_str())
+                                    .map(|set| {
+                                        // alive_inserts already get a fresh insert_slot below,
+                                        // and alive_removes get a remove_slot — skip those
+                                        // here so we don't redo the same work.
+                                        let alive_set: HashSet<u32> = alive_inserts
+                                            .iter()
+                                            .chain(alive_removes.iter())
+                                            .copied()
+                                            .collect();
+                                        set.iter().filter(|s| !alive_set.contains(s)).copied().collect()
+                                    })
+                                    .unwrap_or_default();
+                                if !alive_inserts.is_empty()
+                                    || !alive_removes.is_empty()
+                                    || !sort_value_changed.is_empty()
+                                {
                                     let now_secs = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
                                         .as_secs();
                                     let mut tb = (*tb_arc.load_full()).clone();
+                                    let sort_field = staging.sorts.get_field(&sort_field_name);
                                     if !alive_inserts.is_empty() {
-                                        let sort_field_name = tb.sort_field_name().to_string();
-                                        if let Some(sort_field) = staging.sorts.get_field(&sort_field_name) {
+                                        if let Some(sort_field) = sort_field {
                                             for &slot in alive_inserts {
                                                 let ts = sort_field.reconstruct_value(slot) as u64;
                                                 tb.insert_slot(slot, ts, now_secs);
@@ -1417,6 +1449,20 @@ impl ConcurrentEngine {
                                     }
                                     for &slot in alive_removes {
                                         tb.remove_slot(slot);
+                                    }
+                                    if !sort_value_changed.is_empty() {
+                                        if let Some(sort_field) = sort_field {
+                                            for slot in sort_value_changed {
+                                                // Drop prior membership (whatever bucket it was
+                                                // in for the old value) and re-evaluate against
+                                                // the new value's bucket eligibility. insert_slot
+                                                // is a no-op for buckets where the new ts is out
+                                                // of window, so this also handles aging-out.
+                                                let ts = sort_field.reconstruct_value(slot) as u64;
+                                                tb.remove_slot(slot);
+                                                tb.insert_slot(slot, ts, now_secs);
+                                            }
+                                        }
                                     }
                                     tb_arc.store(Arc::new(tb));
                                 }

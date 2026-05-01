@@ -578,4 +578,46 @@ mod tests {
         mgr.set_refresh_interval("24h", 100);
         assert!(mgr.get_bucket("24h").unwrap().needs_refresh(now + 200));
     }
+
+    /// Regression: the flush thread re-evaluates bucket membership when a
+    /// slot's tracked sort field value changes. The pattern is `remove_slot`
+    /// then `insert_slot(slot, new_ts, now)` — `remove_slot` drops prior
+    /// membership across all buckets and `insert_slot` only re-adds when
+    /// the new ts is in window. Without this, a slot whose sortAt regressed
+    /// from "now" to "two days ago" stayed stuck in the 24h bucket forever
+    /// because the periodic `subtract_expired` only catches values in
+    /// `[old_cutoff, new_cutoff)`.
+    #[test]
+    fn test_remove_then_insert_handles_sort_regression() {
+        let mut mgr = make_manager(vec![
+            ("24h", 86400, 300),
+            ("7d", 604800, 3600),
+        ]);
+        let now: u64 = 1_700_000_000;
+
+        // Initial insert: slot 42 with sortAt = 1h ago. Lands in 24h + 7d.
+        mgr.insert_slot(42, now - 3600, now);
+        assert!(mgr.get_bucket("24h").unwrap().bitmap().contains(42));
+        assert!(mgr.get_bucket("7d").unwrap().bitmap().contains(42));
+
+        // Sort field regresses to 2 days ago (e.g., publishedAt cleared via
+        // Post unpublish, sortAt = greatest(existedAt=2d, 0) = 2d). The
+        // flush-thread fix calls remove_slot + insert_slot with the new ts.
+        mgr.remove_slot(42);
+        mgr.insert_slot(42, now - 2 * 86400, now);
+
+        // 24h bucket no longer contains the slot — the bug fix.
+        assert!(!mgr.get_bucket("24h").unwrap().bitmap().contains(42),
+            "slot must drop from 24h bucket after sortAt regression");
+        // 7d bucket still has it (sortAt is 2d ago, within 7d window).
+        assert!(mgr.get_bucket("7d").unwrap().bitmap().contains(42),
+            "slot must remain in 7d bucket because new ts is still in window");
+
+        // Further regression past every bucket window: slot is fully evicted.
+        mgr.remove_slot(42);
+        mgr.insert_slot(42, now - 30 * 86400, now);
+        assert!(!mgr.get_bucket("24h").unwrap().bitmap().contains(42));
+        assert!(!mgr.get_bucket("7d").unwrap().bitmap().contains(42),
+            "slot must drop from 7d once new ts is out of window");
+    }
 }
