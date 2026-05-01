@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
+use axum::extract::{Extension, Path as AxumPath, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -448,16 +448,61 @@ async fn require_admin(
     }
 }
 
+/// Per-request handler-stage timing data. Threaded from the outer middleware
+/// (which captures T0 = arrival) through the request extensions to the
+/// `handle_query` body (which records T1-T4). Read back by the middleware on
+/// response to attribute time across phases:
+///
+/// - `to_handler_us`  = T1 - T0   (middleware overhead + tokio task scheduling)
+/// - `to_engine_us`   = T2 - T1   (body parse + JSON deserialize + index lookup)
+/// - `engine_us`      = T3 - T2   (block_in_place engine call duration)
+/// - `doc_fetch_us`   = T4 - T3   (spawn_blocking doc fetch duration)
+/// - `to_response_us` = T5 - T4   (response build + serialize + write)
+///
+/// All offsets are nanoseconds since `t0` so the writers can use lock-free
+/// `AtomicU64` stores. A zero offset means the stage was never reached — the
+/// reader skips emitting that phase.
+#[derive(Clone)]
+struct HttpStageData {
+    t0: std::time::Instant,
+    t1_handler_entered_ns: Arc<AtomicU64>,
+    t2_engine_started_ns: Arc<AtomicU64>,
+    t3_engine_done_ns: Arc<AtomicU64>,
+    t4_docs_done_ns: Arc<AtomicU64>,
+}
+
+impl HttpStageData {
+    fn new() -> Self {
+        Self {
+            t0: std::time::Instant::now(),
+            t1_handler_entered_ns: Arc::new(AtomicU64::new(0)),
+            t2_engine_started_ns: Arc::new(AtomicU64::new(0)),
+            t3_engine_done_ns: Arc::new(AtomicU64::new(0)),
+            t4_docs_done_ns: Arc::new(AtomicU64::new(0)),
+        }
+    }
+    /// Stash the elapsed time since `t0` into the slot. Called by the handler.
+    #[inline]
+    fn record(&self, slot: &AtomicU64) {
+        let ns = self.t0.elapsed().as_nanos() as u64;
+        // Use store; only one writer per slot per request, so no contention.
+        slot.store(ns, Ordering::Relaxed);
+    }
+}
+
 /// Middleware: record requests/responses to the caplog when capture is active.
 ///
 /// Fast path: if not recording, `is_recording()` is a single mutex check (~ns)
 /// Outermost middleware: measures wall-clock time from HTTP request arrival
 /// to response sent. This captures the full round-trip including tokio scheduling,
 /// handler execution, response serialization, and any CPU contention delays.
-/// Records into bitdex_http_response_seconds histogram.
+/// Records into bitdex_http_response_seconds histogram. For paths that opt in
+/// (currently only POST query handler), the middleware also threads a
+/// `HttpStageData` cell through request extensions so per-stage timings (T0–T5)
+/// can be reassembled here and emitted into `bitdex_http_handler_phase_seconds`.
 async fn measure_http_roundtrip(
     State(state): State<SharedState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let method = req.method().to_string();
@@ -474,12 +519,60 @@ async fn measure_http_roundtrip(
     } else {
         path.clone()
     };
+    // Only emit per-stage phase timing for the query path; other endpoints
+    // skip the extension overhead.
+    let is_query = method == "POST" && path.contains("/query");
+    let stage = if is_query {
+        let s = HttpStageData::new();
+        req.extensions_mut().insert(s.clone());
+        Some(s)
+    } else {
+        None
+    };
     let start = std::time::Instant::now();
     let response = next.run(req).await;
-    let elapsed = start.elapsed().as_secs_f64();
+    let elapsed = start.elapsed();
     state.metrics.http_response_seconds
         .with_label_values(&[&method, &path_label])
-        .observe(elapsed);
+        .observe(elapsed.as_secs_f64());
+
+    if let Some(s) = stage {
+        let total_ns = s.t0.elapsed().as_nanos() as u64;
+        let t1 = s.t1_handler_entered_ns.load(Ordering::Relaxed);
+        let t2 = s.t2_engine_started_ns.load(Ordering::Relaxed);
+        let t3 = s.t3_engine_done_ns.load(Ordering::Relaxed);
+        let t4 = s.t4_docs_done_ns.load(Ordering::Relaxed);
+
+        let phase_hist = &state.metrics.http_handler_phase_seconds;
+        let observe_phase = |name: &str, ns: u64| {
+            phase_hist
+                .with_label_values(&[name])
+                .observe(ns as f64 / 1_000_000_000.0);
+        };
+
+        // to_handler: T0 → T1. Always emitted when handler ran.
+        if t1 > 0 {
+            observe_phase("to_handler", t1);
+        }
+        // to_engine: T1 → T2.
+        if t2 > t1 && t1 > 0 {
+            observe_phase("to_engine", t2 - t1);
+        }
+        // engine: T2 → T3.
+        if t3 > t2 && t2 > 0 {
+            observe_phase("engine", t3 - t2);
+        }
+        // doc_fetch: T3 → T4. Optional — only present when include_docs.
+        if t4 > t3 && t3 > 0 {
+            observe_phase("doc_fetch", t4 - t3);
+        }
+        // to_response: last-stage-reached → T5.
+        let last = t4.max(t3).max(t2).max(t1);
+        if total_ns > last && last > 0 {
+            observe_phase("to_response", total_ns - last);
+        }
+    }
+
     response
 }
 
@@ -2709,10 +2802,15 @@ impl Drop for ConcurrentReadGuard<'_> {
 
 async fn handle_query(
     State(state): State<SharedState>,
+    Extension(stage): Extension<HttpStageData>,
     AxumPath(name): AxumPath<String>,
     AxumQuery(params): AxumQuery<QueryParams>,
     body: Bytes,
 ) -> impl IntoResponse {
+    // T1: handler entered. Captured before any work — measures middleware
+    // chain overhead + tokio task scheduling delay.
+    stage.record(&stage.t1_handler_entered_ns);
+
     // -- Backpressure: track in-flight queries and enforce concurrency limit --
     let in_flight = state.queries_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
     state.metrics.queries_in_flight.inc();
@@ -2859,9 +2957,14 @@ async fn handle_query(
     // NOT park an async thread on a JoinHandle — the thread itself does
     // the work and returns. At 70+ QPS this prevents async thread
     // exhaustion that makes the main listener unresponsive.
+    // T2: just before block_in_place enter. T1 → T2 covers body parse,
+    // JSON deserialize, index lookup, prefilter substitution.
+    stage.record(&stage.t2_engine_started_ns);
     let query_result = tokio::task::block_in_place(|| {
         engine.execute_query_traced(&query, &name)
     });
+    // T3: block_in_place returned. T2 → T3 = engine wall-clock.
+    stage.record(&stage.t3_engine_done_ns);
     match query_result {
         Ok((result, trace)) => {
             let elapsed = start.elapsed();
@@ -2936,10 +3039,25 @@ async fn handle_query(
             let docs_us = doc_start.elapsed().as_micros() as u64;
             let docs_count = documents.as_ref().map_or(0, |d| d.len()) as u64;
 
-            // Update trace with doc fetch timing
+            // T4: doc fetch returned (includes spawn_blocking enqueue wait).
+            // T3 → T4 = doc_fetch wall-clock as observed from the handler;
+            // matches the existing `docs_us` trace field. The middleware will
+            // record T4 → T5 as `to_response`.
+            stage.record(&stage.t4_docs_done_ns);
+
+            // Update trace with doc fetch timing + handler-stage attribution.
             let mut trace = trace;
             trace.docs_us = docs_us;
             trace.docs_count = docs_count;
+            // Stage timestamps: load atomics back as ns offsets from t0,
+            // convert to µs for the trace (matches existing _us fields).
+            let t1_ns = stage.t1_handler_entered_ns.load(Ordering::Relaxed);
+            let t2_ns = stage.t2_engine_started_ns.load(Ordering::Relaxed);
+            trace.to_handler_us = t1_ns / 1_000;
+            trace.to_engine_us = t2_ns.saturating_sub(t1_ns) / 1_000;
+            // to_response_us / http_total_us cannot be filled in from here —
+            // the response hasn't been written yet. They stay 0 in the trace
+            // ring buffer; the middleware emits them into the histogram.
 
             // Observe query phase histograms
             m.query_filter_seconds

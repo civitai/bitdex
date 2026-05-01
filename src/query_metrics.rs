@@ -54,6 +54,27 @@ pub struct QueryTrace {
     /// snapshot/executor-build cost (the rest of setup) dominates.
     #[serde(default)]
     pub shard_load_us: u64,
+    /// Wall-clock from outer middleware enter (T0) to handler body entered (T1).
+    /// Captures middleware overhead + tokio task scheduling delay. Large values
+    /// here when `engine_us`/`docs_us` are small indicate tokio worker starvation
+    /// (block_in_place consuming async workers, request stuck in queue).
+    #[serde(default)]
+    pub to_handler_us: u64,
+    /// Handler entered (T1) → just before `block_in_place` engine call (T2).
+    /// Body parse, JSON deserialize, index lookup, prefilter substitution.
+    #[serde(default)]
+    pub to_engine_us: u64,
+    /// Doc fetch done (T4) → middleware exit (T5). Response build + JSON
+    /// serialize + axum writer. Large values here = response body too big or
+    /// client backpressure.
+    #[serde(default)]
+    pub to_response_us: u64,
+    /// Full HTTP roundtrip from outer middleware (T0 → T5). Mirrors what the
+    /// `bitdex_http_response_seconds` histogram observes; recorded on the
+    /// trace so individual slow requests can be correlated against the
+    /// histogram tail.
+    #[serde(default)]
+    pub http_total_us: u64,
     pub clauses: Vec<ClauseTrace>,
     pub sort: Option<SortTrace>,
 }
@@ -158,6 +179,10 @@ impl QueryTraceCollector {
             cache_lock_us: self.cache_lock_us,
             setup_us: self.setup_us,
             shard_load_us: self.shard_load_us,
+            to_handler_us: 0,
+            to_engine_us: 0,
+            to_response_us: 0,
+            http_total_us: 0,
             clauses: self.clauses,
             sort: self.sort,
         }
@@ -411,6 +436,10 @@ mod tests {
             cache_lock_us: 0,
             setup_us: 0,
             shard_load_us: 0,
+            to_handler_us: 0,
+            to_engine_us: 0,
+            to_response_us: 0,
+            http_total_us: 0,
             clauses: vec![],
             sort: None,
             lazy_load_us: 0,
@@ -441,7 +470,9 @@ mod tests {
             ts: String::new(), index: "t".into(), total_us: n, plan_us: 0,
             filter_us: 0, sort_us: 0, result_count: n, docs_us: 0,
             docs_count: 0, cache_hit: false, cache_lock_us: 0, setup_us: 0,
-            shard_load_us: 0, clauses: vec![], sort: None, lazy_load_us: 0,
+            shard_load_us: 0, to_handler_us: 0, to_engine_us: 0,
+            to_response_us: 0, http_total_us: 0,
+            clauses: vec![], sort: None, lazy_load_us: 0,
         };
 
         buf.push(make_trace(1));
@@ -466,7 +497,9 @@ mod tests {
             ts: String::new(), index: "t".into(), total_us: n, plan_us: 0,
             filter_us: 0, sort_us: 0, result_count: n, docs_us: 0,
             docs_count: 0, cache_hit: false, cache_lock_us: 0, setup_us: 0,
-            shard_load_us: 0, clauses: vec![], sort: None, lazy_load_us: 0,
+            shard_load_us: 0, to_handler_us: 0, to_engine_us: 0,
+            to_response_us: 0, http_total_us: 0,
+            clauses: vec![], sort: None, lazy_load_us: 0,
         };
 
         for i in 1..=5 {

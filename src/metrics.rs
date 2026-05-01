@@ -142,6 +142,13 @@ pub struct Metrics {
 
     // -- HTTP round-trip (wall-clock from request arrival to response sent) --
     pub http_response_seconds: HistogramVec,
+    /// Per-phase timing inside the query handler. Phases:
+    ///   to_handler  — middleware enter → handler entered (tokio task scheduling)
+    ///   to_engine   — handler entered → engine block_in_place enter
+    ///   engine      — engine block_in_place duration
+    ///   doc_fetch   — engine done → spawn_blocking doc fetch return
+    ///   to_response — doc fetch done → middleware exit
+    pub http_handler_phase_seconds: HistogramVec,
 
     // -- Phase 2.5: DocStore I/O observability --
     pub docstore_read_seconds: HistogramVec,
@@ -277,8 +284,21 @@ impl Metrics {
                 "bitdex_http_response_seconds",
                 "Full HTTP round-trip time from request arrival to response sent",
             )
-            .buckets(http_buckets),
+            .buckets(http_buckets.clone()),
             &["method", "path"],
+        )
+        .unwrap();
+
+        let http_handler_phase_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_http_handler_phase_seconds",
+                "Per-phase wall-clock inside the query handler. Phase label: to_handler|to_engine|engine|doc_fetch|to_response",
+            )
+            .buckets(vec![
+                0.000005, 0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005,
+                0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0,
+            ]),
+            &["phase"],
         )
         .unwrap();
 
@@ -1017,6 +1037,9 @@ impl Metrics {
         registry
             .register(Box::new(http_response_seconds.clone()))
             .unwrap();
+        registry
+            .register(Box::new(http_handler_phase_seconds.clone()))
+            .unwrap();
         registry.register(Box::new(query_filter_seconds.clone())).unwrap();
         registry.register(Box::new(query_sort_seconds.clone())).unwrap();
         registry.register(Box::new(query_docs_seconds.clone())).unwrap();
@@ -1166,6 +1189,7 @@ impl Metrics {
             query_total,
             query_duration_seconds,
             http_response_seconds,
+            http_handler_phase_seconds,
             query_filter_seconds,
             query_sort_seconds,
             query_docs_seconds,
