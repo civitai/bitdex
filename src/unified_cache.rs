@@ -1827,6 +1827,10 @@ impl UnifiedCache {
             if !added_slots.is_empty() {
                 for slot in added_slots.iter() {
                     // Check all OTHER clauses (we already know bucket matches)
+                    // TODO: pass bucket_mgr through here so multi-bucket-clause entries
+                    // (e.g. AND(Bucket=24h, Bucket=7d)) evaluate correctly. UI doesn't
+                    // emit these today, but a future caller could. Conservative true
+                    // admits invalid slots into the cache entry on rebuild.
                     let other_clauses_match = key.filter_clauses.iter().all(|c| {
                         if c.field == field && c.op == "bucket" && c.value_repr == bucket_name {
                             true // skip the bucket clause itself
@@ -1982,6 +1986,81 @@ fn slot_matches_clause(
         _ => true, // Unknown op — conservative
     }
 }
+/// Pre-resolve bucket clause bitmaps for one work item's filter clauses.
+///
+/// Returns a `SmallVec`-style Vec of (clause_index, Option<Arc<RoaringBitmap>>)
+/// for every clause whose `op == "bucket"`.  Callers pass this into
+/// `slot_matches_filter_resolved` so the per-slot loop never re-enters the
+/// `TimeBucketManager` HashMap.
+///
+/// Cost: one HashMap lookup per *distinct bucket name* per work item —
+/// independent of `item.slots.len()`.  At 10K slots per batch this eliminates
+/// 10K redundant lookups per bucket clause per item.
+fn resolve_bucket_bitmaps<'a>(
+    clauses: &[CanonicalClause],
+    bucket_mgr: Option<&'a crate::time_buckets::TimeBucketManager>,
+) -> Vec<(usize, Option<std::sync::Arc<roaring::RoaringBitmap>>)> {
+    clauses
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.op == "bucket")
+        .map(|(idx, c)| {
+            let bm = bucket_mgr
+                .and_then(|m| m.get_bucket(&c.value_repr))
+                .map(|b| std::sync::Arc::clone(b.bitmap()));
+            (idx, bm)
+        })
+        .collect()
+}
+
+/// Like `slot_matches_filter`, but uses pre-resolved bucket bitmaps (from
+/// `resolve_bucket_bitmaps`) instead of going through the HashMap per slot.
+///
+/// For non-bucket clauses the evaluation is identical to `slot_matches_clause`.
+/// For bucket clauses:
+///   - `Some(bitmap)` → check `bitmap.contains(slot)` (authoritative).
+///   - `None`         → conservative `true` (bucket_mgr unavailable, or unknown name returns false).
+///
+/// Wait — `None` from `resolve_bucket_bitmaps` means either (a) no bucket_mgr
+/// was provided (conservative true) OR (b) the bucket name was unknown (should
+/// be false, matching `slot_matches_clause`'s `.unwrap_or(false)`).
+/// We preserve the distinction: if `bucket_mgr` was `None` entirely we still
+/// return true; if `bucket_mgr` was `Some` but the bucket wasn't found we
+/// store a sentinel. To keep this simple we re-check the `bucket_mgr` presence
+/// via the `has_mgr` flag threaded in.
+fn slot_matches_filter_resolved(
+    slot: u32,
+    clauses: &[CanonicalClause],
+    filters: &FilterIndex,
+    sorts: &SortIndex,
+    bucket_mgr_present: bool,
+    resolved_buckets: &[(usize, Option<std::sync::Arc<roaring::RoaringBitmap>>)],
+) -> bool {
+    // Build a quick lookup: clause_index → resolved bitmap.
+    // Bucket clauses are rare (typically 1 per query), so a linear scan is fine.
+    clauses.iter().enumerate().all(|(idx, clause)| {
+        if clause.op == "bucket" {
+            // Find the pre-resolved bitmap for this clause index.
+            if let Some((_, ref opt_bm)) = resolved_buckets.iter().find(|(i, _)| *i == idx) {
+                match opt_bm {
+                    Some(bm) => bm.contains(slot),
+                    // None means either no manager (conservative true) or unknown
+                    // bucket name (false). Distinguish via bucket_mgr_present.
+                    None => !bucket_mgr_present, // mgr absent → true; mgr present but unknown → false
+                }
+            } else {
+                // Should not happen (all bucket clauses are in resolved_buckets),
+                // but be conservative.
+                true
+            }
+        } else {
+            // All other ops: use the standard per-clause evaluator.
+            // bucket_mgr is not needed here since we only hit this for non-bucket ops.
+            slot_matches_clause(slot, clause, filters, sorts, None)
+        }
+    })
+}
+
 // ── Phase B: Lock-Free Evaluation Functions ──────────────────────────────
 //
 // These functions evaluate slot eligibility against staging filters/sorts
@@ -2005,6 +2084,7 @@ pub fn evaluate_filter_work(
     // 10M reconstruct_value calls (316ns each) into ~200 calls, saving
     // ~3 seconds of redundant CPU per flush cycle.
     let reconstructed = precompute_sort_values(work, sorts);
+    let bucket_mgr_present = bucket_mgr.is_some();
     let mut results = Vec::with_capacity(work.len());
     let mut timed_out = Vec::new();
     for (i, item) in work.iter().enumerate() {
@@ -2017,6 +2097,12 @@ pub fn evaluate_filter_work(
                 break;
             }
         }
+        // Hoist bucket-clause bitmap lookups out of the per-slot loop.
+        // At 10K slots/batch this eliminates 10K identical HashMap lookups
+        // for the same bucket name — replaced by one lookup per bucket clause
+        // per work item. Result: ~150ns × 10K = ~1.5ms saved per batch.
+        let resolved_buckets = resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr);
+        let use_resolved = !resolved_buckets.is_empty();
         let mut adds = Vec::new();
         let mut removes = Vec::new();
         for &slot in &item.slots {
@@ -2024,7 +2110,18 @@ pub fn evaluate_filter_work(
                 .get(&(item.key.sort_field.as_str(), slot))
                 .copied()
                 .unwrap_or(0);
-            let matches = slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts, bucket_mgr);
+            let matches = if use_resolved {
+                slot_matches_filter_resolved(
+                    slot,
+                    &item.key.filter_clauses,
+                    filters,
+                    sorts,
+                    bucket_mgr_present,
+                    &resolved_buckets,
+                )
+            } else {
+                slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts, bucket_mgr)
+            };
             if matches {
                 let qualifies = match item.direction {
                     SortDirection::Desc => sort_value > item.min_tracked_value,
@@ -2078,6 +2175,7 @@ pub fn evaluate_sort_work(
     // cycle — skip it entirely without touching slots.
     let max_per_field = compute_max_per_field(&reconstructed);
     let min_per_field = compute_min_per_field(&reconstructed);
+    let bucket_mgr_present = bucket_mgr.is_some();
     let mut results = Vec::with_capacity(work.len());
     let mut timed_out = Vec::new();
     for (i, item) in work.iter().enumerate() {
@@ -2112,6 +2210,11 @@ pub fn evaluate_sort_work(
         if !can_possibly_qualify {
             continue;
         }
+        // Hoist bucket-clause bitmap lookups out of the per-slot loop.
+        // Same optimisation as in evaluate_filter_work — one HashMap lookup
+        // per bucket clause per item instead of one per slot.
+        let resolved_buckets = resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr);
+        let use_resolved = !resolved_buckets.is_empty();
         let mut adds = Vec::new();
         for &slot in &item.slots {
             let sort_value = reconstructed
@@ -2129,7 +2232,19 @@ pub fn evaluate_sort_work(
             // Sort qualifies — only now pay filter match cost. Preserves the
             // full slot_matches_filter semantics (Eq, NotEq, In, Gt, Lt,
             // bucket, compound) — no signature-based shortcut.
-            if slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts, bucket_mgr) {
+            let filter_matches = if use_resolved {
+                slot_matches_filter_resolved(
+                    slot,
+                    &item.key.filter_clauses,
+                    filters,
+                    sorts,
+                    bucket_mgr_present,
+                    &resolved_buckets,
+                )
+            } else {
+                slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts, bucket_mgr)
+            };
+            if filter_matches {
                 adds.push((slot, sort_value));
             }
         }
@@ -3828,6 +3943,146 @@ mod tests {
         assert!(
             entry.bitmap().contains(20),
             "slot 20 (in 24h bucket, nsfwLevel=1) should be added to the 24h cache entry"
+        );
+    }
+
+    // ── Fast-follow review feedback tests (PR #251) ─────────────────────────
+
+    #[test]
+    fn test_slot_matches_clause_bucket_unknown_name_returns_false() {
+        // A bucket manager exists but the clause references a bucket name that
+        // was never registered. Should return false (not conservative true).
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        // Manager only knows "24h"; clause asks for "999d" (not registered).
+        let mgr = make_bucket_manager("24h", &[42]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "999d".to_string(), // unknown name
+        };
+        assert!(
+            !slot_matches_clause(42, &clause, &filters, &sorts, Some(&mgr)),
+            "unknown bucket name with manager present should return false"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_clause_bucket_empty_bucket_returns_false() {
+        // The "24h" bucket exists in the manager but has zero slots in it.
+        // Any slot lookup should return false.
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+
+        let mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: "24h".to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        // No rebuild_bucket call — bitmap stays empty.
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "24h".to_string(),
+        };
+        assert!(
+            !slot_matches_clause(42, &clause, &filters, &sorts, Some(&mgr)),
+            "slot not in empty bucket should return false"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_sort_work_bucket_clause_no_pollution() {
+        // Mirror of test_evaluate_filter_work_bucket_clause_no_pollution but
+        // exercises evaluate_sort_work. A slot that is NOT in the "24h" bucket
+        // must not be admitted to the cache entry even if its sort value qualifies.
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+
+        let now: u64 = 1_000_000_000;
+
+        // Bucket manager: 24h window contains only slot 1.
+        let mut mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: "24h".to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        mgr.rebuild_bucket(
+            "24h",
+            vec![(1u32, now - 3600)].into_iter(), // only slot 1
+            now,
+        );
+
+        // nsfwLevel=1 for slots 1 and 7; sort values: slot 7 > slot 1 (Desc qualifies).
+        let ts_slot1: u32 = (now - 7200) as u32;
+        let ts_slot7: u32 = (now - 1800) as u32; // higher sort value than slot 1
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[1, 7])])]);
+        let sorts = make_sort_index(&[("sortAt", &[
+            (1, ts_slot1),
+            (7, ts_slot7),
+        ])]);
+
+        // Cache entry: bucket("24h") AND nsfwLevel=1, sort by sortAt Desc.
+        // Initially contains slot 1 (min_tracked = ts_slot1).
+        // Slot 7 has a higher sort value → it would qualify by sort alone,
+        // but it is NOT in the bucket and must be rejected.
+        let key = make_key(
+            &[
+                ("sortAtUnix", "bucket", "24h"),
+                ("nsfwLevel", "eq", "1"),
+            ],
+            "sortAt",
+            SortDirection::Desc,
+        );
+        let initial_slots: Vec<u32> = vec![1];
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 200,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 100,
+            max_capacity: 1600,
+            min_filter_size: 0,
+            max_maintenance_work: 1_000_000,
+            max_maintenance_ms: 1000,
+            prefetch_threshold: 0.95,
+        });
+        cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
+            if s == 1 { ts_slot1 } else { 0 }
+        });
+
+        // Simulate: slot 7 is mutated on nsfwLevel=1. Collect sort work items.
+        // Sort maintenance fires when a slot's sort value changes and the entry
+        // might need updating.
+        let mut sort_mutations: HashMap<&str, HashSet<u32>> = HashMap::new();
+        sort_mutations.insert("sortAt", [7u32].into_iter().collect());
+        let (sort_work, _over_budget) = cache.collect_sort_work(&sort_mutations);
+        // The cache entry has filter_clauses so it may appear in sort_work.
+        // evaluate_sort_work must reject slot 7 because it fails the bucket clause.
+        let (results, timed_out) = evaluate_sort_work(
+            &sort_work,
+            &filters,
+            &sorts,
+            None,
+            Some(&mgr),
+        );
+        assert!(timed_out.is_empty());
+        cache.apply_maintenance_results(&results);
+
+        let entry = cache.get(&key).expect("cache entry should still exist");
+        assert!(
+            !entry.bitmap().contains(7),
+            "slot 7 (not in 24h bucket) must NOT be added by sort-work maintenance"
+        );
+        assert!(
+            entry.bitmap().contains(1),
+            "slot 1 (in 24h bucket) must remain in the cache entry"
         );
     }
 }
