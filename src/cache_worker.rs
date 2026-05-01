@@ -112,6 +112,11 @@ pub struct CacheWorkerMetrics {
     /// Histogram for per-cycle wall-clock time. Installed post-engine-construction
     /// by `set_metrics_bridge` so the worker can see the prom-bound `Histogram`.
     /// Optional — the worker no-ops when unset.
+    ///
+    /// Gated on the `server` feature: `prometheus` is a server-only dep, but
+    /// `cache_worker` is part of the lib and is compiled for the pg-sync
+    /// binary too (which doesn't link prometheus).
+    #[cfg(feature = "server")]
     pub cycle_histogram: OnceLock<prometheus::Histogram>,
 }
 
@@ -476,6 +481,7 @@ impl CacheWorker {
             self.metrics
                 .cycle_nanos
                 .store(elapsed.as_nanos() as u64, Ordering::Relaxed);
+            #[cfg(feature = "server")]
             if let Some(h) = self.metrics.cycle_histogram.get() {
                 h.observe(elapsed.as_secs_f64());
             }
