@@ -43,6 +43,38 @@ use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
 use crate::pg_sync::op_dedup::dedup_ops;
 use crate::pg_sync::ops::{EntityOps, Op};
 use crate::query::{BitdexQuery, FilterClause, Value as QValue};
+
+/// Resolve a Value to a u64 filter bitmap key, consulting the per-field
+/// `FieldDictionary` for `LowCardinalityString` values when the direct
+/// integer/bool conversion fails.
+///
+/// `for_set` controls dictionary write behavior:
+/// - `true` (set/add path): unknown strings are auto-assigned a new key via
+///   `get_or_insert`. Required so newly-seen LCS values written through the
+///   steady-state ops path get queryable bitmap entries.
+/// - `false` (remove path): unknown strings return `None` so the clear is a
+///   no-op. Removing a string that was never inserted is harmless.
+fn resolve_filter_key(
+    qval: &QValue,
+    field: &str,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
+    for_set: bool,
+) -> Option<u64> {
+    if let Some(key) = value_to_bitmap_key(qval) {
+        return Some(key);
+    }
+    if let QValue::String(s) = qval {
+        if let Some(dicts) = dictionaries {
+            if let Some(dict) = dicts.get(field) {
+                if for_set {
+                    return Some(dict.get_or_insert(s) as u64);
+                }
+                return dict.get(s).map(|v| v as u64);
+            }
+        }
+    }
+    None
+}
 // ---------------------------------------------------------------------------
 // DocWriter — writes field values to docstore alongside bitmap mutations
 // ---------------------------------------------------------------------------
@@ -675,6 +707,13 @@ pub fn apply_ops_batch<S: BitmapSink>(
             meta.computed_deps.len(),
         );
     }
+    // LowCardinalityString filter ops carry their value as JSON string
+    // (e.g. {"field":"type","value":"image"}). Without dictionary resolution
+    // the filter bitmap update silently no-ops because `value_to_bitmap_key`
+    // returns `None` for `Value::String`. The engine owns the live per-field
+    // FieldDictionary; dump callers pass `None` here and rely on the
+    // dump_processor's own dictionary resolution path.
+    let dictionaries = engine.map(|e| e.dictionaries());
     let mut applied = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
@@ -803,7 +842,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
         for op in &entry.ops {
             match op {
                 Op::Set { field, value } => {
-                    process_set_op(sink, meta, slot, field, value);
+                    process_set_op(sink, meta, slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_set(slot, field, value);
                     }
@@ -817,7 +856,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     has_any_ops = true;
                 }
                 Op::Remove { field, value } => {
-                    process_remove_op(sink, meta, slot, field, value);
+                    process_remove_op(sink, meta, slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_remove(slot, field, value);
                     }
@@ -831,7 +870,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     has_any_ops = true;
                 }
                 Op::Add { field, value } => {
-                    process_add_op(sink, meta, slot, field, value);
+                    process_add_op(sink, meta, slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_add(slot, field, value);
                     }
@@ -977,6 +1016,7 @@ fn process_set_op<S: BitmapSink>(
     slot: u32,
     field: &str,
     value: &JsonValue,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
 ) {
     let is_nullable = meta.nullable_fields.contains(field);
     let is_null = value.is_null();
@@ -991,7 +1031,7 @@ fn process_set_op<S: BitmapSink>(
                 // Non-null value on nullable field: clear the null bitmap key
                 sink.filter_remove(arc_name.clone(), NULL_BITMAP_KEY, slot);
             }
-            if let Some(key) = value_to_bitmap_key(&qval) {
+            if let Some(key) = resolve_filter_key(&qval, field, dictionaries, true) {
                 sink.filter_insert(arc_name.clone(), key, slot);
             }
         }
@@ -1019,6 +1059,7 @@ fn process_remove_op<S: BitmapSink>(
     slot: u32,
     field: &str,
     value: &JsonValue,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
 ) {
     let is_null = value.is_null();
     let is_nullable = meta.nullable_fields.contains(field);
@@ -1031,7 +1072,8 @@ fn process_remove_op<S: BitmapSink>(
         } else {
             // Non-null remove, or null on non-nullable (null→0 via json_to_qvalue).
             // Must clear the 0 bit that was set when the null was originally stored.
-            if let Some(key) = value_to_bitmap_key(&qval) {
+            // for_set=false: unknown LCS strings return None so the clear becomes a no-op.
+            if let Some(key) = resolve_filter_key(&qval, field, dictionaries, false) {
                 sink.filter_remove(arc_name.clone(), key, slot);
             }
         }
@@ -1055,6 +1097,7 @@ fn process_add_op<S: BitmapSink>(
     slot: u32,
     field: &str,
     value: &JsonValue,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
 ) {
     // Nullable fields: null value = no-op
     if value.is_null() && meta.nullable_fields.contains(field) {
@@ -1062,7 +1105,7 @@ fn process_add_op<S: BitmapSink>(
     }
     let qval = json_to_qvalue(value);
     if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
-        if let Some(key) = value_to_bitmap_key(&qval) {
+        if let Some(key) = resolve_filter_key(&qval, field, dictionaries, true) {
             sink.filter_insert(arc_name.clone(), key, slot);
         }
     }
@@ -1166,6 +1209,7 @@ fn apply_query_op_set<S: BitmapSink>(
     if slot_ids.is_empty() {
         return Ok(0);
     }
+    let dictionaries = Some(engine.dictionaries());
     // Apply nested ops to each matching slot
     let mut applied = 0;
     for &slot_id in slot_ids {
@@ -1176,13 +1220,13 @@ fn apply_query_op_set<S: BitmapSink>(
         for op in ops {
             match op {
                 Op::Set { field, value } => {
-                    process_set_op(sink, meta, slot, field, value);
+                    process_set_op(sink, meta, slot, field, value, dictionaries);
                 }
                 Op::Remove { field, value } => {
-                    process_remove_op(sink, meta, slot, field, value);
+                    process_remove_op(sink, meta, slot, field, value, dictionaries);
                 }
                 Op::Add { field, value } => {
-                    process_add_op(sink, meta, slot, field, value);
+                    process_add_op(sink, meta, slot, field, value, dictionaries);
                 }
                 Op::Delete => {
                     // Delete within queryOpSet clears alive for each matched slot
@@ -1600,6 +1644,80 @@ mod tests {
         assert_eq!(sink.filter_inserts.len(), 1);
         assert_eq!(sink.filter_inserts[0], ("hasMeta".to_string(), 1, 50));
     }
+    /// Regression: LCS string values must be dictionary-resolved before
+    /// `filter_insert`. Prior to this fix, `Set type="image"` (the shape
+    /// emitted by the Image steady-state trigger) silently dropped the
+    /// bitmap update because `value_to_bitmap_key(Value::String(_))` returns
+    /// `None`. The Image filter bitmap diverged from the docstore, so any
+    /// `Eq("type", "image")` query that AND'd with a small candidate set
+    /// (e.g. a time bucket) collapsed to zero results.
+    #[test]
+    fn test_set_op_lcs_string_resolves_via_dictionary() {
+        let config = test_config();
+        // The production schema registers `type` as `single_value` at the
+        // filter level; the LCS-ness lives in `data_schema.value_type` and
+        // surfaces at query time via the per-field `FieldDictionary`. The
+        // resolver in `process_set_op` consults the dictionary regardless of
+        // FilterFieldType, so we can use the existing `type` SingleValue
+        // entry from `test_config()` and just inject a dictionary.
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        let mut dictionaries: HashMap<String, FieldDictionary> = HashMap::new();
+        dictionaries.insert("type".to_string(), FieldDictionary::new());
+
+        process_set_op(
+            &mut sink,
+            &meta,
+            42,
+            "type",
+            &json!("image"),
+            Some(&dictionaries),
+        );
+
+        // First write of "image" auto-assigns key 1 (FieldDictionary starts at 1).
+        let dict_key = dictionaries.get("type").unwrap().get("image").unwrap() as u64;
+        assert_eq!(dict_key, 1);
+        assert_eq!(sink.filter_inserts.len(), 1, "Set type=\"image\" must emit a filter_insert");
+        assert_eq!(sink.filter_inserts[0], ("type".to_string(), dict_key, 42));
+    }
+
+    /// Companion to the LCS-set test: removing a previously-inserted LCS
+    /// value must resolve through the dictionary too. Unknown strings are
+    /// no-ops on the remove path (no key was ever assigned, nothing to clear).
+    #[test]
+    fn test_remove_op_lcs_string_resolves_via_dictionary() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut dictionaries: HashMap<String, FieldDictionary> = HashMap::new();
+        let dict = FieldDictionary::new();
+        let image_key = dict.get_or_insert("image") as u64;
+        dictionaries.insert("type".to_string(), dict);
+
+        let mut sink = RecordingSink::new();
+        process_remove_op(
+            &mut sink,
+            &meta,
+            42,
+            "type",
+            &json!("image"),
+            Some(&dictionaries),
+        );
+        assert_eq!(sink.filter_removes.len(), 1);
+        assert_eq!(sink.filter_removes[0], ("type".to_string(), image_key, 42));
+
+        // Unknown string on remove → no-op (no key was assigned for "video").
+        let mut sink2 = RecordingSink::new();
+        process_remove_op(
+            &mut sink2,
+            &meta,
+            42,
+            "type",
+            &json!("video"),
+            Some(&dictionaries),
+        );
+        assert!(sink2.filter_removes.is_empty(), "remove of unseen LCS value must be a no-op");
+    }
+
     #[test]
     fn test_unknown_field_ignored() {
         let config = test_config();
