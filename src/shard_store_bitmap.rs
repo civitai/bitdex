@@ -1179,7 +1179,7 @@ impl FilterBitmapStore {
             ops_count: 0,
             flags: 0,
         };
-        crate::shard_store::write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])
+        crate::shard_store::write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[], crate::shard_store::ShardRewriteSource::Snapshot)
     }
 
     /// Pre-create shard directories for a field's filter buckets.
@@ -1282,7 +1282,7 @@ impl SortBitmapStore {
             ops_count: 0,
             flags: 0,
         };
-        crate::shard_store::write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])
+        crate::shard_store::write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[], crate::shard_store::ShardRewriteSource::Snapshot)
     }
 
     /// Pre-create the sort directory.

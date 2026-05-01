@@ -168,6 +168,9 @@ pub struct Metrics {
     // -- Phase 2.5: ShardStore ops (stub — wired when Phase 1 lands) --
     pub shardstore_ops_count: IntGaugeVec,
 
+    // -- Shard rewrite attribution (sourced from shard_store atomics at scrape time) --
+    pub shard_rewrites_total: IntGaugeVec,
+
     // -- Phase 2.5: PG-Sync observability --
     pub pgsync_cycle_seconds: HistogramVec,
     pub pgsync_rows_fetched_total: IntCounterVec,
@@ -871,6 +874,17 @@ impl Metrics {
         )
         .unwrap();
 
+        // Shard rewrite attribution — sourced from shard_store atomics at scrape time.
+        // Labels: source = "compact" | "cold_create" | "snapshot"
+        let shard_rewrites_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_shard_rewrites_total",
+                "Total atomic shard file rewrites by source (compact/cold_create/snapshot)",
+            ),
+            &["source"],
+        )
+        .unwrap();
+
         // Phase 2.5: PG-Sync observability
         let pgsync_cycle_buckets = vec![0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
         let pgsync_cycle_seconds = HistogramVec::new(
@@ -1156,6 +1170,7 @@ impl Metrics {
         registry.register(Box::new(doc_cache_generations.clone())).unwrap();
         registry.register(Box::new(doc_cache_backlog.clone())).unwrap();
         registry.register(Box::new(shardstore_ops_count.clone())).unwrap();
+        registry.register(Box::new(shard_rewrites_total.clone())).unwrap();
         registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
         registry.register(Box::new(pgsync_rows_fetched_total.clone())).unwrap();
         registry.register(Box::new(pgsync_cursor_position.clone())).unwrap();
@@ -1282,6 +1297,7 @@ impl Metrics {
             doc_cache_generations,
             doc_cache_backlog,
             shardstore_ops_count,
+            shard_rewrites_total,
             pgsync_cycle_seconds,
             pgsync_rows_fetched_total,
             pgsync_cursor_position,
@@ -1310,6 +1326,19 @@ impl Metrics {
 
     /// Render all metrics in Prometheus text exposition format.
     pub fn gather(&self) -> String {
+        // Sync shard rewrite atomics into gauges at scrape time.
+        // These are global monotonic counters written by write_shard_file_atomic().
+        use std::sync::atomic::Ordering::Relaxed;
+        self.shard_rewrites_total
+            .with_label_values(&["compact"])
+            .set(crate::shard_store::SHARD_REWRITES_COMPACT.load(Relaxed) as i64);
+        self.shard_rewrites_total
+            .with_label_values(&["cold_create"])
+            .set(crate::shard_store::SHARD_REWRITES_COLD.load(Relaxed) as i64);
+        self.shard_rewrites_total
+            .with_label_values(&["snapshot"])
+            .set(crate::shard_store::SHARD_REWRITES_SNAPSHOT.load(Relaxed) as i64);
+
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();

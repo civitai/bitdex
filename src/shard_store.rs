@@ -39,6 +39,38 @@ pub static SYNC_INJECT_FAIL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
+// Shard rewrite counters (diagnostic instrumentation, 2026-05-01)
+//
+// Every call to write_shard_file_atomic increments one of these counters based
+// on the caller's intent:
+//   SHARD_REWRITES_COMPACT    — merge-thread compaction (compact_shard)
+//   SHARD_REWRITES_COLD       — first-write cold-path (shard file absent/invalid)
+//   SHARD_REWRITES_SNAPSHOT   — full snapshot write (write_snapshot, write_filter_bucket*, write_sort_layers, etc.)
+//
+// Exposed via GET /metrics as `bitdex_shard_rewrites_total{source="compact|cold_create|snapshot"}`.
+// These are global (not per-store) so they capture rewrites from all callers —
+// the merge thread, the flush thread, dump processor, backfill, and save_snapshot.
+// ---------------------------------------------------------------------------
+pub static SHARD_REWRITES_COMPACT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SHARD_REWRITES_COLD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static SHARD_REWRITES_SNAPSHOT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Source label for `write_shard_file_atomic` — used to distinguish callers
+/// in the `bitdex_shard_rewrites_total` Prometheus counter.
+#[derive(Copy, Clone, Debug)]
+pub enum ShardRewriteSource {
+    /// merge-thread per-shard compaction (`compact_shard`)
+    Compact,
+    /// cold-path first write (shard file absent or invalid header)
+    ColdCreate,
+    /// explicit full snapshot write (save_snapshot, write_filter_bucket, dump, etc.)
+    Snapshot,
+}
+
+// ---------------------------------------------------------------------------
 // Codec traits
 // ---------------------------------------------------------------------------
 
@@ -340,7 +372,20 @@ pub(crate) fn write_shard_file_atomic(
     header: &ShardHeader,
     snapshot_bytes: &[u8],
     ops_bytes: &[u8],
+    source: ShardRewriteSource,
 ) -> io::Result<()> {
+    // Increment per-source rewrite counter for production observability.
+    match source {
+        ShardRewriteSource::Compact => {
+            SHARD_REWRITES_COMPACT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        ShardRewriteSource::ColdCreate => {
+            SHARD_REWRITES_COLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        ShardRewriteSource::Snapshot => {
+            SHARD_REWRITES_SNAPSHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     let new_path = path.with_extension("new");
 
     // Ensure parent directory exists
@@ -738,7 +783,7 @@ where
                 ops_count: 1,
                 flags: 0,
             };
-            write_shard_file_atomic(&shard_path, &header, &[], &ops_buf)?;
+            write_shard_file_atomic(&shard_path, &header, &[], &ops_buf, ShardRewriteSource::ColdCreate)?;
         }
 
         Ok(())
@@ -787,7 +832,7 @@ where
                 ops_count: count,
                 flags: 0,
             };
-            write_shard_file_atomic(&shard_path, &header, &[], &ops_buf)?;
+            write_shard_file_atomic(&shard_path, &header, &[], &ops_buf, ShardRewriteSource::ColdCreate)?;
         }
 
         Ok(())
@@ -817,7 +862,7 @@ where
             flags: 0,
         };
 
-        write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])?;
+        write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[], ShardRewriteSource::Snapshot)?;
         Ok(())
     }
 
@@ -903,7 +948,7 @@ where
         };
 
         // Atomic: write .new, fsync, rename, fsync parent. All under the exclusive lock.
-        write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[])?;
+        write_shard_file_atomic(&shard_path, &header, &snapshot_bytes, &[], ShardRewriteSource::Compact)?;
         Ok(true)
     }
 
