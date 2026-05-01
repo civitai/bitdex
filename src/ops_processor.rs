@@ -436,6 +436,20 @@ pub struct FieldMeta {
     /// Reverse map: source_field → computed sort fields that depend on it.
     /// When a source field is set, all computed fields referencing it must be recomputed.
     computed_deps: HashMap<String, Vec<ComputedSortInfo>>,
+    /// `data_schema`-driven shadow updates for `exists_boolean` filter targets.
+    ///
+    /// Key: a field name that the steady-state trigger may emit ops for. Value:
+    /// the `exists_boolean` filter targets that share the same `data_schema`
+    /// source as that field, paired with the Arc'd field name used by the sink.
+    ///
+    /// Example: data_schema declares `publishedAtUnix → publishedAt` (sort) and
+    /// `publishedAtUnix → isPublished` (exists_boolean filter). The Post fan-out
+    /// trigger emits ops keyed by the sort target name (`publishedAt`). The
+    /// shadow map fans `Set publishedAt` out to also write the `isPublished`
+    /// bitmap so the trigger config doesn't have to declare every derived
+    /// target manually. The source name (`publishedAtUnix`) is also keyed in
+    /// case a trigger ever emits source-named ops.
+    exists_boolean_shadows: HashMap<String, Vec<Arc<str>>>,
     /// Deferred alive config: if present, the source_field name whose future timestamps
     /// trigger deferred alive instead of immediate alive. ms_to_seconds indicates
     /// whether the field value is in milliseconds (needs /1000 for epoch comparison).
@@ -488,6 +502,42 @@ impl FieldMeta {
                 }
             }
         }
+        // Build the exists_boolean shadow map. For each `exists_boolean`
+        // filter target, the underlying source feeds one or more other
+        // targets (typically a sort field or a same-named filter). When the
+        // trigger emits ops for any of those siblings, the exists_boolean
+        // target needs to flip true/false based on whether the new value is
+        // null. Without this, the steady-state path leaves the
+        // exists_boolean bitmap stuck at whatever the dump computed.
+        let mut exists_boolean_shadows: HashMap<String, Vec<Arc<str>>> = HashMap::new();
+        for fm in &config.data_schema.fields {
+            if !matches!(fm.value_type, crate::config::FieldValueType::ExistsBoolean) {
+                continue;
+            }
+            // The exists_boolean target must be a registered filter field —
+            // otherwise the bitmap update has nowhere to go.
+            let (eb_arc, _) = match filter_fields.get(&fm.target) {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let eb_arc = eb_arc.clone();
+            // Add a shadow trigger keyed by the source name (covers triggers
+            // that ever emit source-keyed ops) and by every sibling target
+            // that shares the same source (covers the common case where the
+            // trigger emits target-keyed ops, e.g. `publishedAt`).
+            let mut keys: Vec<String> = vec![fm.source.clone()];
+            for sibling in &config.data_schema.fields {
+                if sibling.source == fm.source && sibling.target != fm.target {
+                    keys.push(sibling.target.clone());
+                }
+            }
+            for k in keys {
+                let entry = exists_boolean_shadows.entry(k).or_default();
+                if !entry.iter().any(|a| Arc::ptr_eq(a, &eb_arc)) {
+                    entry.push(eb_arc.clone());
+                }
+            }
+        }
         // Deferred alive config
         let deferred_alive_field = config.deferred_alive.as_ref().map(|da| {
             (da.source_field.clone(), da.ms_to_seconds)
@@ -497,6 +547,7 @@ impl FieldMeta {
             nullable_fields,
             sort_fields,
             computed_deps,
+            exists_boolean_shadows,
             deferred_alive_field,
             registry,
         }
@@ -1049,6 +1100,24 @@ fn process_set_op<S: BitmapSink>(
                     sink.sort_clear(arc_name.clone(), bit, slot);
                 }
             }
+        }
+    }
+    // Shadow updates for `exists_boolean` filter targets that share a
+    // data_schema source with this field. The trigger emits ops keyed by
+    // sort/filter target name; the exists_boolean target gets derived here
+    // from the value's null-ness so the trigger config doesn't have to
+    // declare every derived target manually.
+    //
+    // Boolean filters use bitmap key 0 (false) and 1 (true). We always clear
+    // the opposite bit before inserting the new bit so the bitmap state is
+    // consistent on transitions (slot was previously stored under the old
+    // boolean, no companion Remove op is emitted for shadow updates).
+    if let Some(shadows) = meta.exists_boolean_shadows.get(field) {
+        let exists_key: u64 = if is_null { 0 } else { 1 };
+        let opposite_key: u64 = 1 - exists_key;
+        for arc_name in shadows {
+            sink.filter_remove(arc_name.clone(), opposite_key, slot);
+            sink.filter_insert(arc_name.clone(), exists_key, slot);
         }
     }
 }
@@ -1679,6 +1748,126 @@ mod tests {
         assert_eq!(dict_key, 1);
         assert_eq!(sink.filter_inserts.len(), 1, "Set type=\"image\" must emit a filter_insert");
         assert_eq!(sink.filter_inserts[0], ("type".to_string(), dict_key, 42));
+    }
+
+    /// Build a config that mirrors the production Civitai relationship
+    /// between `publishedAtUnix → publishedAt` (sort target) and
+    /// `publishedAtUnix → isPublished` (exists_boolean filter target).
+    /// Used by the shadow-update tests to verify ops keyed by the sort
+    /// target name fan out to the filter target.
+    fn shadow_config() -> Config {
+        let mut config = Config::default();
+        config.filter_fields = vec![FilterFieldConfig {
+            name: "isPublished".into(),
+            field_type: FilterFieldType::Boolean,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        }];
+        config.sort_fields = vec![SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        }];
+        config.data_schema.fields = vec![
+            FieldMapping {
+                source: "publishedAtUnix".into(),
+                target: "publishedAt".into(),
+                value_type: FieldValueType::Integer,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                filter_only: false,
+                ms_to_seconds: true,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+                nullable: false,
+            },
+            FieldMapping {
+                source: "publishedAtUnix".into(),
+                target: "isPublished".into(),
+                value_type: FieldValueType::ExistsBoolean,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                filter_only: false,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+                nullable: false,
+            },
+        ];
+        config
+    }
+
+    /// Regression: an `exists_boolean` filter target must flip true on a
+    /// non-null Set op for any sibling target sharing the same data_schema
+    /// source. This is the root cause of doc 129087101 reading
+    /// `isPublished=false` in prod — the Post fan-out trigger emits ops
+    /// keyed by `publishedAt` (sort target) and the data_schema-driven
+    /// `isPublished` derivation never fired in steady state.
+    #[test]
+    fn test_set_op_shadows_exists_boolean_target() {
+        let config = shadow_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        // Trigger emits Set publishedAt=<seconds> when a Post is published.
+        process_set_op(&mut sink, &meta, 42, "publishedAt", &json!(1_777_581_167i64), None);
+
+        // Sort field gets the standard bit decomposition (existence-agnostic).
+        assert!(!sink.sort_sets.is_empty(), "publishedAt sort bits must still be written");
+        // Shadow flips isPublished=true: removes the false bit, inserts true.
+        let removes: Vec<&(String, u64, u32)> = sink.filter_removes.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        assert_eq!(removes, vec![&("isPublished".to_string(), 0u64, 42)],
+            "shadow must clear the false bit so prior state doesn't linger");
+        assert_eq!(inserts, vec![&("isPublished".to_string(), 1u64, 42)],
+            "shadow must insert the true bit on non-null Set");
+    }
+
+    /// Regression: a null Set op (Post unpublished) must flip the shadow
+    /// `exists_boolean` target to false. Without the shadow, isPublished
+    /// stays true even after the publishedAt clears.
+    #[test]
+    fn test_set_op_shadows_exists_boolean_null_to_false() {
+        let config = shadow_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        process_set_op(&mut sink, &meta, 42, "publishedAt", &json!(null), None);
+
+        let removes: Vec<&(String, u64, u32)> = sink.filter_removes.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        assert_eq!(removes, vec![&("isPublished".to_string(), 1u64, 42)],
+            "shadow must clear the true bit on null Set");
+        assert_eq!(inserts, vec![&("isPublished".to_string(), 0u64, 42)],
+            "shadow must insert the false bit on null Set");
+    }
+
+    /// Source-name and target-name shadow keys both fire. A trigger that
+    /// (hypothetically) emits ops keyed by the data_schema source name
+    /// (`publishedAtUnix`) must produce the same shadow as one that emits
+    /// ops keyed by the sibling target (`publishedAt`).
+    #[test]
+    fn test_shadow_triggers_on_source_name_too() {
+        let config = shadow_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        process_set_op(&mut sink, &meta, 42, "publishedAtUnix", &json!(1_777_581_167_000i64), None);
+
+        let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        assert_eq!(inserts, vec![&("isPublished".to_string(), 1u64, 42)]);
     }
 
     /// Companion to the LCS-set test: removing a previously-inserted LCS
