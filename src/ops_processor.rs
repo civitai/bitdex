@@ -43,6 +43,38 @@ use crate::mutation::{value_to_bitmap_key, value_to_sort_u32, FieldRegistry};
 use crate::pg_sync::op_dedup::dedup_ops;
 use crate::pg_sync::ops::{EntityOps, Op};
 use crate::query::{BitdexQuery, FilterClause, Value as QValue};
+
+/// Resolve a Value to a u64 filter bitmap key, consulting the per-field
+/// `FieldDictionary` for `LowCardinalityString` values when the direct
+/// integer/bool conversion fails.
+///
+/// `for_set` controls dictionary write behavior:
+/// - `true` (set/add path): unknown strings are auto-assigned a new key via
+///   `get_or_insert`. Required so newly-seen LCS values written through the
+///   steady-state ops path get queryable bitmap entries.
+/// - `false` (remove path): unknown strings return `None` so the clear is a
+///   no-op. Removing a string that was never inserted is harmless.
+fn resolve_filter_key(
+    qval: &QValue,
+    field: &str,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
+    for_set: bool,
+) -> Option<u64> {
+    if let Some(key) = value_to_bitmap_key(qval) {
+        return Some(key);
+    }
+    if let QValue::String(s) = qval {
+        if let Some(dicts) = dictionaries {
+            if let Some(dict) = dicts.get(field) {
+                if for_set {
+                    return Some(dict.get_or_insert(s) as u64);
+                }
+                return dict.get(s).map(|v| v as u64);
+            }
+        }
+    }
+    None
+}
 // ---------------------------------------------------------------------------
 // DocWriter — writes field values to docstore alongside bitmap mutations
 // ---------------------------------------------------------------------------
@@ -404,6 +436,20 @@ pub struct FieldMeta {
     /// Reverse map: source_field → computed sort fields that depend on it.
     /// When a source field is set, all computed fields referencing it must be recomputed.
     computed_deps: HashMap<String, Vec<ComputedSortInfo>>,
+    /// `data_schema`-driven shadow updates for `exists_boolean` filter targets.
+    ///
+    /// Key: a field name that the steady-state trigger may emit ops for. Value:
+    /// the `exists_boolean` filter targets that share the same `data_schema`
+    /// source as that field, paired with the Arc'd field name used by the sink.
+    ///
+    /// Example: data_schema declares `publishedAtUnix → publishedAt` (sort) and
+    /// `publishedAtUnix → isPublished` (exists_boolean filter). The Post fan-out
+    /// trigger emits ops keyed by the sort target name (`publishedAt`). The
+    /// shadow map fans `Set publishedAt` out to also write the `isPublished`
+    /// bitmap so the trigger config doesn't have to declare every derived
+    /// target manually. The source name (`publishedAtUnix`) is also keyed in
+    /// case a trigger ever emits source-named ops.
+    exists_boolean_shadows: HashMap<String, Vec<Arc<str>>>,
     /// Deferred alive config: if present, the source_field name whose future timestamps
     /// trigger deferred alive instead of immediate alive. ms_to_seconds indicates
     /// whether the field value is in milliseconds (needs /1000 for epoch comparison).
@@ -456,6 +502,42 @@ impl FieldMeta {
                 }
             }
         }
+        // Build the exists_boolean shadow map. For each `exists_boolean`
+        // filter target, the underlying source feeds one or more other
+        // targets (typically a sort field or a same-named filter). When the
+        // trigger emits ops for any of those siblings, the exists_boolean
+        // target needs to flip true/false based on whether the new value is
+        // null. Without this, the steady-state path leaves the
+        // exists_boolean bitmap stuck at whatever the dump computed.
+        let mut exists_boolean_shadows: HashMap<String, Vec<Arc<str>>> = HashMap::new();
+        for fm in &config.data_schema.fields {
+            if !matches!(fm.value_type, crate::config::FieldValueType::ExistsBoolean) {
+                continue;
+            }
+            // The exists_boolean target must be a registered filter field —
+            // otherwise the bitmap update has nowhere to go.
+            let (eb_arc, _) = match filter_fields.get(&fm.target) {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let eb_arc = eb_arc.clone();
+            // Add a shadow trigger keyed by the source name (covers triggers
+            // that ever emit source-keyed ops) and by every sibling target
+            // that shares the same source (covers the common case where the
+            // trigger emits target-keyed ops, e.g. `publishedAt`).
+            let mut keys: Vec<String> = vec![fm.source.clone()];
+            for sibling in &config.data_schema.fields {
+                if sibling.source == fm.source && sibling.target != fm.target {
+                    keys.push(sibling.target.clone());
+                }
+            }
+            for k in keys {
+                let entry = exists_boolean_shadows.entry(k).or_default();
+                if !entry.iter().any(|a| Arc::ptr_eq(a, &eb_arc)) {
+                    entry.push(eb_arc.clone());
+                }
+            }
+        }
         // Deferred alive config
         let deferred_alive_field = config.deferred_alive.as_ref().map(|da| {
             (da.source_field.clone(), da.ms_to_seconds)
@@ -465,6 +547,7 @@ impl FieldMeta {
             nullable_fields,
             sort_fields,
             computed_deps,
+            exists_boolean_shadows,
             deferred_alive_field,
             registry,
         }
@@ -675,6 +758,13 @@ pub fn apply_ops_batch<S: BitmapSink>(
             meta.computed_deps.len(),
         );
     }
+    // LowCardinalityString filter ops carry their value as JSON string
+    // (e.g. {"field":"type","value":"image"}). Without dictionary resolution
+    // the filter bitmap update silently no-ops because `value_to_bitmap_key`
+    // returns `None` for `Value::String`. The engine owns the live per-field
+    // FieldDictionary; dump callers pass `None` here and rely on the
+    // dump_processor's own dictionary resolution path.
+    let dictionaries = engine.map(|e| e.dictionaries());
     let mut applied = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
@@ -803,7 +893,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
         for op in &entry.ops {
             match op {
                 Op::Set { field, value } => {
-                    process_set_op(sink, meta, slot, field, value);
+                    process_set_op(sink, meta, slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_set(slot, field, value);
                     }
@@ -817,7 +907,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     has_any_ops = true;
                 }
                 Op::Remove { field, value } => {
-                    process_remove_op(sink, meta, slot, field, value);
+                    process_remove_op(sink, meta, slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_remove(slot, field, value);
                     }
@@ -831,7 +921,7 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     has_any_ops = true;
                 }
                 Op::Add { field, value } => {
-                    process_add_op(sink, meta, slot, field, value);
+                    process_add_op(sink, meta, slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_add(slot, field, value);
                     }
@@ -977,6 +1067,7 @@ fn process_set_op<S: BitmapSink>(
     slot: u32,
     field: &str,
     value: &JsonValue,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
 ) {
     let is_nullable = meta.nullable_fields.contains(field);
     let is_null = value.is_null();
@@ -991,7 +1082,7 @@ fn process_set_op<S: BitmapSink>(
                 // Non-null value on nullable field: clear the null bitmap key
                 sink.filter_remove(arc_name.clone(), NULL_BITMAP_KEY, slot);
             }
-            if let Some(key) = value_to_bitmap_key(&qval) {
+            if let Some(key) = resolve_filter_key(&qval, field, dictionaries, true) {
                 sink.filter_insert(arc_name.clone(), key, slot);
             }
         }
@@ -1011,6 +1102,24 @@ fn process_set_op<S: BitmapSink>(
             }
         }
     }
+    // Shadow updates for `exists_boolean` filter targets that share a
+    // data_schema source with this field. The trigger emits ops keyed by
+    // sort/filter target name; the exists_boolean target gets derived here
+    // from the value's null-ness so the trigger config doesn't have to
+    // declare every derived target manually.
+    //
+    // Boolean filters use bitmap key 0 (false) and 1 (true). We always clear
+    // the opposite bit before inserting the new bit so the bitmap state is
+    // consistent on transitions (slot was previously stored under the old
+    // boolean, no companion Remove op is emitted for shadow updates).
+    if let Some(shadows) = meta.exists_boolean_shadows.get(field) {
+        let exists_key: u64 = if is_null { 0 } else { 1 };
+        let opposite_key: u64 = 1 - exists_key;
+        for arc_name in shadows {
+            sink.filter_remove(arc_name.clone(), opposite_key, slot);
+            sink.filter_insert(arc_name.clone(), exists_key, slot);
+        }
+    }
 }
 /// Process a `remove` op: clear the old value's bitmap bit for this slot.
 fn process_remove_op<S: BitmapSink>(
@@ -1019,6 +1128,7 @@ fn process_remove_op<S: BitmapSink>(
     slot: u32,
     field: &str,
     value: &JsonValue,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
 ) {
     let is_null = value.is_null();
     let is_nullable = meta.nullable_fields.contains(field);
@@ -1031,7 +1141,8 @@ fn process_remove_op<S: BitmapSink>(
         } else {
             // Non-null remove, or null on non-nullable (null→0 via json_to_qvalue).
             // Must clear the 0 bit that was set when the null was originally stored.
-            if let Some(key) = value_to_bitmap_key(&qval) {
+            // for_set=false: unknown LCS strings return None so the clear becomes a no-op.
+            if let Some(key) = resolve_filter_key(&qval, field, dictionaries, false) {
                 sink.filter_remove(arc_name.clone(), key, slot);
             }
         }
@@ -1046,6 +1157,19 @@ fn process_remove_op<S: BitmapSink>(
             }
         }
     }
+    // Mirror of the `process_set_op` shadow: a Remove op signals that the
+    // sibling source no longer holds a value, so any `exists_boolean` filter
+    // target derived from that source must flip to false. The Set that
+    // typically follows in an UPDATE pair (Remove(old) + Set(new)) overrides
+    // this back to true if the new value is non-null. Without this, a bare
+    // Remove (or any path that emits Remove without a paired Set) would
+    // leave the exists_boolean bitmap stuck at its previous true state.
+    if let Some(shadows) = meta.exists_boolean_shadows.get(field) {
+        for arc_name in shadows {
+            sink.filter_remove(arc_name.clone(), 1, slot);
+            sink.filter_insert(arc_name.clone(), 0, slot);
+        }
+    }
 }
 /// Process an `add` op: set a multi-value bitmap bit.
 /// Same as `set` for bitmap purposes — adds the value's bit.
@@ -1055,6 +1179,7 @@ fn process_add_op<S: BitmapSink>(
     slot: u32,
     field: &str,
     value: &JsonValue,
+    dictionaries: Option<&HashMap<String, FieldDictionary>>,
 ) {
     // Nullable fields: null value = no-op
     if value.is_null() && meta.nullable_fields.contains(field) {
@@ -1062,7 +1187,7 @@ fn process_add_op<S: BitmapSink>(
     }
     let qval = json_to_qvalue(value);
     if let Some((arc_name, _field_type)) = meta.filter_fields.get(field) {
-        if let Some(key) = value_to_bitmap_key(&qval) {
+        if let Some(key) = resolve_filter_key(&qval, field, dictionaries, true) {
             sink.filter_insert(arc_name.clone(), key, slot);
         }
     }
@@ -1166,6 +1291,7 @@ fn apply_query_op_set<S: BitmapSink>(
     if slot_ids.is_empty() {
         return Ok(0);
     }
+    let dictionaries = Some(engine.dictionaries());
     // Apply nested ops to each matching slot
     let mut applied = 0;
     for &slot_id in slot_ids {
@@ -1176,13 +1302,13 @@ fn apply_query_op_set<S: BitmapSink>(
         for op in ops {
             match op {
                 Op::Set { field, value } => {
-                    process_set_op(sink, meta, slot, field, value);
+                    process_set_op(sink, meta, slot, field, value, dictionaries);
                 }
                 Op::Remove { field, value } => {
-                    process_remove_op(sink, meta, slot, field, value);
+                    process_remove_op(sink, meta, slot, field, value, dictionaries);
                 }
                 Op::Add { field, value } => {
-                    process_add_op(sink, meta, slot, field, value);
+                    process_add_op(sink, meta, slot, field, value, dictionaries);
                 }
                 Op::Delete => {
                     // Delete within queryOpSet clears alive for each matched slot
@@ -1600,6 +1726,303 @@ mod tests {
         assert_eq!(sink.filter_inserts.len(), 1);
         assert_eq!(sink.filter_inserts[0], ("hasMeta".to_string(), 1, 50));
     }
+    /// Regression: LCS string values must be dictionary-resolved before
+    /// `filter_insert`. Prior to this fix, `Set type="image"` (the shape
+    /// emitted by the Image steady-state trigger) silently dropped the
+    /// bitmap update because `value_to_bitmap_key(Value::String(_))` returns
+    /// `None`. The Image filter bitmap diverged from the docstore, so any
+    /// `Eq("type", "image")` query that AND'd with a small candidate set
+    /// (e.g. a time bucket) collapsed to zero results.
+    #[test]
+    fn test_set_op_lcs_string_resolves_via_dictionary() {
+        let config = test_config();
+        // The production schema registers `type` as `single_value` at the
+        // filter level; the LCS-ness lives in `data_schema.value_type` and
+        // surfaces at query time via the per-field `FieldDictionary`. The
+        // resolver in `process_set_op` consults the dictionary regardless of
+        // FilterFieldType, so we can use the existing `type` SingleValue
+        // entry from `test_config()` and just inject a dictionary.
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        let mut dictionaries: HashMap<String, FieldDictionary> = HashMap::new();
+        dictionaries.insert("type".to_string(), FieldDictionary::new());
+
+        process_set_op(
+            &mut sink,
+            &meta,
+            42,
+            "type",
+            &json!("image"),
+            Some(&dictionaries),
+        );
+
+        // First write of "image" auto-assigns key 1 (FieldDictionary starts at 1).
+        let dict_key = dictionaries.get("type").unwrap().get("image").unwrap() as u64;
+        assert_eq!(dict_key, 1);
+        assert_eq!(sink.filter_inserts.len(), 1, "Set type=\"image\" must emit a filter_insert");
+        assert_eq!(sink.filter_inserts[0], ("type".to_string(), dict_key, 42));
+    }
+
+    /// Build a config that mirrors the production Civitai relationship
+    /// between `publishedAtUnix → publishedAt` (sort target) and
+    /// `publishedAtUnix → isPublished` (exists_boolean filter target).
+    /// Used by the shadow-update tests to verify ops keyed by the sort
+    /// target name fan out to the filter target.
+    fn shadow_config() -> Config {
+        let mut config = Config::default();
+        config.filter_fields = vec![FilterFieldConfig {
+            name: "isPublished".into(),
+            field_type: FilterFieldType::Boolean,
+            behaviors: None,
+            eviction: None,
+            eager_load: false,
+            per_value_lazy: false,
+            max_range_scan_values: None,
+        }];
+        config.sort_fields = vec![SortFieldConfig {
+            name: "publishedAt".into(),
+            source_type: "uint32".into(),
+            encoding: "linear".into(),
+            bits: 32,
+            eager_load: false,
+            computed: None,
+        }];
+        config.data_schema.fields = vec![
+            FieldMapping {
+                source: "publishedAtUnix".into(),
+                target: "publishedAt".into(),
+                value_type: FieldValueType::Integer,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                filter_only: false,
+                ms_to_seconds: true,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+                nullable: false,
+            },
+            FieldMapping {
+                source: "publishedAtUnix".into(),
+                target: "isPublished".into(),
+                value_type: FieldValueType::ExistsBoolean,
+                fallback: None,
+                string_map: None,
+                doc_only: false,
+                filter_only: false,
+                ms_to_seconds: false,
+                truncate_u32: false,
+                case_sensitive: false,
+                default_value: None,
+                nullable: false,
+            },
+        ];
+        config
+    }
+
+    /// Regression: an `exists_boolean` filter target must flip true on a
+    /// non-null Set op for any sibling target sharing the same data_schema
+    /// source. This is the root cause of doc 129087101 reading
+    /// `isPublished=false` in prod — the Post fan-out trigger emits ops
+    /// keyed by `publishedAt` (sort target) and the data_schema-driven
+    /// `isPublished` derivation never fired in steady state.
+    #[test]
+    fn test_set_op_shadows_exists_boolean_target() {
+        let config = shadow_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        // Trigger emits Set publishedAt=<seconds> when a Post is published.
+        process_set_op(&mut sink, &meta, 42, "publishedAt", &json!(1_777_581_167i64), None);
+
+        // Sort field gets the standard bit decomposition (existence-agnostic).
+        assert!(!sink.sort_sets.is_empty(), "publishedAt sort bits must still be written");
+        // Shadow flips isPublished=true: removes the false bit, inserts true.
+        let removes: Vec<&(String, u64, u32)> = sink.filter_removes.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        assert_eq!(removes, vec![&("isPublished".to_string(), 0u64, 42)],
+            "shadow must clear the false bit so prior state doesn't linger");
+        assert_eq!(inserts, vec![&("isPublished".to_string(), 1u64, 42)],
+            "shadow must insert the true bit on non-null Set");
+    }
+
+    /// Regression: a null Set op (Post unpublished) must flip the shadow
+    /// `exists_boolean` target to false. Without the shadow, isPublished
+    /// stays true even after the publishedAt clears.
+    #[test]
+    fn test_set_op_shadows_exists_boolean_null_to_false() {
+        let config = shadow_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        process_set_op(&mut sink, &meta, 42, "publishedAt", &json!(null), None);
+
+        let removes: Vec<&(String, u64, u32)> = sink.filter_removes.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        assert_eq!(removes, vec![&("isPublished".to_string(), 1u64, 42)],
+            "shadow must clear the true bit on null Set");
+        assert_eq!(inserts, vec![&("isPublished".to_string(), 0u64, 42)],
+            "shadow must insert the false bit on null Set");
+    }
+
+    /// Regression: a Remove op on the sibling source must also flip the
+    /// exists_boolean shadow target to false. UPDATE pairs (Remove(old) +
+    /// Set(new)) still end up correct because the Set that follows
+    /// overrides this when the new value is non-null. The case this guards
+    /// is bare Remove without a companion Set — flagged by external review
+    /// as a defensive gap in the original Set-only design.
+    #[test]
+    fn test_remove_op_shadows_exists_boolean_to_false() {
+        let config = shadow_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        process_remove_op(&mut sink, &meta, 42, "publishedAt", &json!(1_777_581_167i64), None);
+
+        let removes: Vec<&(String, u64, u32)> = sink.filter_removes.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        assert_eq!(removes, vec![&("isPublished".to_string(), 1u64, 42)],
+            "Remove must clear the true bit on the shadow target");
+        assert_eq!(inserts, vec![&("isPublished".to_string(), 0u64, 42)],
+            "Remove must insert the false bit on the shadow target");
+    }
+
+    /// Source-name and target-name shadow keys both fire. A trigger that
+    /// (hypothetically) emits ops keyed by the data_schema source name
+    /// (`publishedAtUnix`) must produce the same shadow as one that emits
+    /// ops keyed by the sibling target (`publishedAt`).
+    #[test]
+    fn test_shadow_triggers_on_source_name_too() {
+        let config = shadow_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        process_set_op(&mut sink, &meta, 42, "publishedAtUnix", &json!(1_777_581_167_000i64), None);
+
+        let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        assert_eq!(inserts, vec![&("isPublished".to_string(), 1u64, 42)]);
+    }
+
+    /// Regression: the time-bucket leak fix in concurrent_engine reads
+    /// `coalescer.mutated_sort_slots()` keyed by the bucket's tracked sort
+    /// field name (e.g., `sortAt`). External review questioned whether
+    /// computed sort recomputation actually populates that map for the
+    /// computed target — the fix only works if it does.
+    ///
+    /// Verify here by emitting `Set publishedAt=<seconds>` and asserting
+    /// the sink sees `sort_set` / `sort_clear` calls keyed by the
+    /// COMPUTED target Arc (`sortAt`), not just by `publishedAt`. The
+    /// coalescer's `mutated_sort_slots()` aggregates sort_sets+sort_clears
+    /// per field, so as long as the recompute path emits sink calls with
+    /// the computed-target field name, the time-bucket fix downstream
+    /// will see the slot under the right key.
+    #[test]
+    fn test_computed_sort_recompute_emits_target_field_sort_ops() {
+        // sortAt = greatest(existedAt, publishedAt). publishedAt acts as
+        // both a tracked sort source AND the trigger-emitted op field;
+        // recompute should produce sort_set/sort_clear on `sortAt`.
+        let mut config = Config::default();
+        config.filter_fields = Vec::new();
+        config.sort_fields = vec![
+            SortFieldConfig {
+                name: "publishedAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            },
+            SortFieldConfig {
+                name: "existedAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            },
+            SortFieldConfig {
+                name: "sortAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: Some(crate::config::ComputedField {
+                    op: crate::config::ComputedOp::Greatest,
+                    source_fields: vec!["existedAt".into(), "publishedAt".into()],
+                }),
+            },
+        ];
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![
+                Op::Remove { field: "publishedAt".into(), value: json!(1_000_000i64) },
+                Op::Set { field: "publishedAt".into(), value: json!(2_000_000i64) },
+            ],
+        }];
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // The computed-sort recompute path must emit sink ops keyed by
+        // the computed target name `sortAt` — not just by the source
+        // `publishedAt`. This is the property the time-bucket leak fix
+        // relies on via `coalescer.mutated_sort_slots()`.
+        let sort_at_writes: Vec<&(String, usize, u32)> = sink.sort_sets.iter()
+            .chain(sink.sort_clears.iter())
+            .filter(|(f, _, _)| f == "sortAt").collect();
+        assert!(!sort_at_writes.is_empty(),
+            "computed-sort recompute must emit sink ops on the `sortAt` target \
+             so coalescer.mutated_sort_slots() picks up the slot for time-bucket re-eval");
+        // And of course the source field gets its own sort writes.
+        let published_at_writes: Vec<&(String, usize, u32)> = sink.sort_sets.iter()
+            .chain(sink.sort_clears.iter())
+            .filter(|(f, _, _)| f == "publishedAt").collect();
+        assert!(!published_at_writes.is_empty(), "source sort field writes must still happen");
+    }
+
+    /// Companion to the LCS-set test: removing a previously-inserted LCS
+    /// value must resolve through the dictionary too. Unknown strings are
+    /// no-ops on the remove path (no key was ever assigned, nothing to clear).
+    #[test]
+    fn test_remove_op_lcs_string_resolves_via_dictionary() {
+        let config = test_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut dictionaries: HashMap<String, FieldDictionary> = HashMap::new();
+        let dict = FieldDictionary::new();
+        let image_key = dict.get_or_insert("image") as u64;
+        dictionaries.insert("type".to_string(), dict);
+
+        let mut sink = RecordingSink::new();
+        process_remove_op(
+            &mut sink,
+            &meta,
+            42,
+            "type",
+            &json!("image"),
+            Some(&dictionaries),
+        );
+        assert_eq!(sink.filter_removes.len(), 1);
+        assert_eq!(sink.filter_removes[0], ("type".to_string(), image_key, 42));
+
+        // Unknown string on remove → no-op (no key was assigned for "video").
+        let mut sink2 = RecordingSink::new();
+        process_remove_op(
+            &mut sink2,
+            &meta,
+            42,
+            "type",
+            &json!("video"),
+            Some(&dictionaries),
+        );
+        assert!(sink2.filter_removes.is_empty(), "remove of unseen LCS value must be a no-op");
+    }
+
     #[test]
     fn test_unknown_field_ignored() {
         let config = test_config();
