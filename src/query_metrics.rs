@@ -132,28 +132,6 @@ impl QueryTraceCollector {
         }
     }
 
-    /// Acquire `unified_cache.write()` while charging the wait time to
-    /// `cache_lock_us`. Wraps `parking_lot::RwLock::write()` — caller still
-    /// gets a normal write guard.
-    #[inline]
-    pub fn timed_cache_write<'a, T>(&mut self, m: &'a parking_lot::RwLock<T>) -> parking_lot::RwLockWriteGuard<'a, T> {
-        let t0 = Instant::now();
-        let g = m.write();
-        self.cache_lock_us = self.cache_lock_us.saturating_add(t0.elapsed().as_micros() as u64);
-        g
-    }
-
-    /// Acquire `unified_cache.read()` while charging the wait time to
-    /// `cache_lock_us`. Hot path — used by the fast-path lookup so concurrent
-    /// readers don't serialize on the cache mutex.
-    #[inline]
-    pub fn timed_cache_read<'a, T>(&mut self, m: &'a parking_lot::RwLock<T>) -> parking_lot::RwLockReadGuard<'a, T> {
-        let t0 = Instant::now();
-        let g = m.read();
-        self.cache_lock_us = self.cache_lock_us.saturating_add(t0.elapsed().as_micros() as u64);
-        g
-    }
-
     pub fn record_clause(&mut self, trace: ClauseTrace) {
         self.clauses.push(trace);
     }
@@ -430,6 +408,9 @@ mod tests {
             docs_us: 0,
             docs_count: 0,
             cache_hit: false,
+            cache_lock_us: 0,
+            setup_us: 0,
+            shard_load_us: 0,
             clauses: vec![],
             sort: None,
             lazy_load_us: 0,
@@ -459,8 +440,8 @@ mod tests {
         let make_trace = |n: u64| QueryTrace {
             ts: String::new(), index: "t".into(), total_us: n, plan_us: 0,
             filter_us: 0, sort_us: 0, result_count: n, docs_us: 0,
-            docs_count: 0, cache_hit: false, clauses: vec![], sort: None,
-            lazy_load_us: 0,
+            docs_count: 0, cache_hit: false, cache_lock_us: 0, setup_us: 0,
+            shard_load_us: 0, clauses: vec![], sort: None, lazy_load_us: 0,
         };
 
         buf.push(make_trace(1));
@@ -484,8 +465,8 @@ mod tests {
         let make_trace = |n: u64| QueryTrace {
             ts: String::new(), index: "t".into(), total_us: n, plan_us: 0,
             filter_us: 0, sort_us: 0, result_count: n, docs_us: 0,
-            docs_count: 0, cache_hit: false, clauses: vec![], sort: None,
-            lazy_load_us: 0,
+            docs_count: 0, cache_hit: false, cache_lock_us: 0, setup_us: 0,
+            shard_load_us: 0, clauses: vec![], sort: None, lazy_load_us: 0,
         };
 
         for i in 1..=5 {

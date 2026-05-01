@@ -14,7 +14,6 @@
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -237,7 +236,7 @@ fn symmetric_difference_sorted(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
 /// Runs in its own thread. Owns the receive side of the work-item channel.
 pub struct CacheWorker {
     rx: crossbeam_channel::Receiver<CacheWorkItem>,
-    cache: Arc<RwLock<UnifiedCache>>,
+    cache: Arc<UnifiedCache>,
     engine: Arc<ArcSwap<InnerEngine>>,
     config: CacheWorkerConfig,
     metrics: Arc<CacheWorkerMetrics>,
@@ -249,7 +248,7 @@ pub struct CacheWorker {
 impl CacheWorker {
     pub fn new(
         rx: crossbeam_channel::Receiver<CacheWorkItem>,
-        cache: Arc<RwLock<UnifiedCache>>,
+        cache: Arc<UnifiedCache>,
         engine: Arc<ArcSwap<InnerEngine>>,
         config: CacheWorkerConfig,
         metrics: Arc<CacheWorkerMetrics>,
@@ -327,56 +326,54 @@ impl CacheWorker {
                 None
             };
 
-            let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
-                let mut uc = self.cache.write();
+            // No outer lock — UnifiedCache is interior-mutable. Each method
+            // call acquires the per-shard / per-field locks it needs and
+            // releases them immediately. Concurrent queries on other shards
+            // are not blocked while we run.
+            let uc = &self.cache;
 
-                // Batched alive removal.
-                if !uc.is_empty() && !merged.alive_removes.is_empty() {
-                    uc.remove_slots_from_all_batch(&merged.alive_removes);
-                }
+            // Batched alive removal.
+            if !uc.is_empty() && !merged.alive_removes.is_empty() {
+                uc.remove_slots_from_all_batch(&merged.alive_removes);
+            }
 
-                // Tombstone bookkeeping for persistence-enabled caches.
-                if uc.persistence_enabled() {
-                    let filter_fields: Vec<&str> = merged
-                        .mutated_filter_fields
-                        .iter()
-                        .map(|s| s.as_ref())
-                        .collect();
-                    if !filter_fields.is_empty() {
-                        let _ = uc.tombstone_unloaded_for_filter(&filter_fields);
-                    }
-                    let sort_fields: Vec<&str> = merged
-                        .sort_mutations
-                        .keys()
-                        .map(|s| s.as_ref())
-                        .collect();
-                    if !sort_fields.is_empty() {
-                        let _ = uc.tombstone_unloaded_for_sort(&sort_fields);
-                    }
-                    if merged.has_alive_mutations && !merged.alive_removes.is_empty() {
-                        let _ = uc.tombstone_all_unloaded();
-                    }
-                }
-
-                let (fw, fob) = if !merged.mutated_filter_fields.is_empty() {
-                    uc.collect_filter_work(&merged.filter_inserts, &merged.filter_removes)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-                // Sort work needs `HashMap<&str, HashSet<u32>>` — build it
-                // from the owned Arc<str> keys. The &str refs borrow from
-                // `merged` so they live as long as this scope.
-                let sort_mutations_borrowed: HashMap<&str, HashSet<u32>> = merged
-                    .sort_mutations
+            // Tombstone bookkeeping for persistence-enabled caches.
+            if uc.persistence_enabled() {
+                let filter_fields: Vec<&str> = merged
+                    .mutated_filter_fields
                     .iter()
-                    .map(|(k, v)| (k.as_ref(), v.clone()))
+                    .map(|s| s.as_ref())
                     .collect();
-                let (sw, sob) = if !sort_mutations_borrowed.is_empty() {
-                    uc.collect_sort_work(&sort_mutations_borrowed)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-                (fw, fob, sw, sob)
+                if !filter_fields.is_empty() {
+                    let _ = uc.tombstone_unloaded_for_filter(&filter_fields);
+                }
+                let sort_fields: Vec<&str> = merged
+                    .sort_mutations
+                    .keys()
+                    .map(|s| s.as_ref())
+                    .collect();
+                if !sort_fields.is_empty() {
+                    let _ = uc.tombstone_unloaded_for_sort(&sort_fields);
+                }
+                if merged.has_alive_mutations && !merged.alive_removes.is_empty() {
+                    let _ = uc.tombstone_all_unloaded();
+                }
+            }
+
+            let (filter_work, filter_over_budget) = if !merged.mutated_filter_fields.is_empty() {
+                uc.collect_filter_work(&merged.filter_inserts, &merged.filter_removes)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let sort_mutations_borrowed: HashMap<&str, HashSet<u32>> = merged
+                .sort_mutations
+                .iter()
+                .map(|(k, v)| (k.as_ref(), v.clone()))
+                .collect();
+            let (sort_work, sort_over_budget) = if !sort_mutations_borrowed.is_empty() {
+                uc.collect_sort_work(&sort_mutations_borrowed)
+            } else {
+                (Vec::new(), Vec::new())
             };
 
             // Phase B analogue — lock-free eval against the published snapshot.
@@ -404,22 +401,16 @@ impl CacheWorker {
                 || !filter_timed_out.is_empty()
                 || !sort_timed_out.is_empty()
             {
-                let mut uc = self.cache.write();
                 uc.apply_maintenance_results(&filter_results);
                 uc.apply_maintenance_results(&sort_results);
                 uc.mark_for_rebuild_batch(&filter_over_budget);
                 uc.mark_for_rebuild_batch(&sort_over_budget);
                 uc.mark_for_rebuild_batch(&filter_timed_out);
                 uc.mark_for_rebuild_batch(&sort_timed_out);
-                // Reconcile total_bytes every 30th cycle instead of every
-                // cycle. reconcile_bytes scans all entries calling
-                // bitmap.serialized_size() — observed locally as ~tens of
-                // ms under the cache mutex on a full 100 K cache. The
-                // store/evict paths track total_bytes incrementally; only
-                // bulk ops (add_slots_bulk / remove_slots_bulk) drift it,
-                // and the drift is small per cycle. Reconciling
-                // periodically keeps eviction-budget decisions honest
-                // without paying the scan cost on every cycle.
+                // Reconcile total_bytes every 30th cycle. The store/evict
+                // paths track total_bytes incrementally; only bulk ops drift
+                // it, so periodic reconcile is enough to keep eviction-budget
+                // decisions honest without paying the scan cost every cycle.
                 self.cycles_since_reconcile += 1;
                 if self.cycles_since_reconcile >= 30 {
                     uc.reconcile_bytes();
@@ -456,7 +447,7 @@ impl CacheWorker {
     /// affect filter eligibility globally, so precise invalidation isn't
     /// cheaper than a full sweep.
     fn invalidate_and_drop(&self, pending: &VecDeque<CacheWorkItem>) {
-        let mut uc = self.cache.write();
+        let uc = &self.cache;
         let mut any_alive = false;
         let mut affected_filter_fields: HashSet<Arc<str>> = HashSet::new();
         for item in pending {
@@ -470,10 +461,6 @@ impl CacheWorker {
         for field in &affected_filter_fields {
             uc.invalidate_filter_field(field);
         }
-        // Sort mutations without alive changes: mark entries referencing any
-        // mutated sort field for rebuild. Done via maintain_alive_changes
-        // equivalent — too coarse for the fast path, but this is the fallback
-        // path for backlog saturation so conservative invalidation is fine.
         let any_sort = pending.iter().any(|it| !it.sort_mutations.is_empty());
         if any_sort {
             uc.maintain_alive_changes();

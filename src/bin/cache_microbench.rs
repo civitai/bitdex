@@ -108,7 +108,7 @@ fn test_bulk_vs_individual(batch_sizes: &[usize], iters: usize) {
             };
             // Measure just the mutation time, not setup
             let t = Instant::now();
-            if let Some(entry) = cache.get_mut(&key) {
+            if let Some(mut entry) = cache.get_mut(&key) {
                 for &(slot, val) in &adds {
                     entry.add_slot(slot, val);
                 }
@@ -130,7 +130,7 @@ fn test_bulk_vs_individual(batch_sizes: &[usize], iters: usize) {
                 direction: SortDirection::Desc,
             };
             let t = Instant::now();
-            if let Some(entry) = cache.get_mut(&key) {
+            if let Some(mut entry) = cache.get_mut(&key) {
                 entry.add_slots_bulk(&adds);
             }
             bulk_samples.push(t.elapsed().as_nanos());
