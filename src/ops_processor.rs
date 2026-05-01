@@ -1157,6 +1157,19 @@ fn process_remove_op<S: BitmapSink>(
             }
         }
     }
+    // Mirror of the `process_set_op` shadow: a Remove op signals that the
+    // sibling source no longer holds a value, so any `exists_boolean` filter
+    // target derived from that source must flip to false. The Set that
+    // typically follows in an UPDATE pair (Remove(old) + Set(new)) overrides
+    // this back to true if the new value is non-null. Without this, a bare
+    // Remove (or any path that emits Remove without a paired Set) would
+    // leave the exists_boolean bitmap stuck at its previous true state.
+    if let Some(shadows) = meta.exists_boolean_shadows.get(field) {
+        for arc_name in shadows {
+            sink.filter_remove(arc_name.clone(), 1, slot);
+            sink.filter_insert(arc_name.clone(), 0, slot);
+        }
+    }
 }
 /// Process an `add` op: set a multi-value bitmap bit.
 /// Same as `set` for bitmap purposes — adds the value's bit.
@@ -1854,6 +1867,29 @@ mod tests {
             "shadow must insert the false bit on null Set");
     }
 
+    /// Regression: a Remove op on the sibling source must also flip the
+    /// exists_boolean shadow target to false. UPDATE pairs (Remove(old) +
+    /// Set(new)) still end up correct because the Set that follows
+    /// overrides this when the new value is non-null. The case this guards
+    /// is bare Remove without a companion Set — flagged by external review
+    /// as a defensive gap in the original Set-only design.
+    #[test]
+    fn test_remove_op_shadows_exists_boolean_to_false() {
+        let config = shadow_config();
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        process_remove_op(&mut sink, &meta, 42, "publishedAt", &json!(1_777_581_167i64), None);
+
+        let removes: Vec<&(String, u64, u32)> = sink.filter_removes.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
+            .filter(|(f, _, _)| f == "isPublished").collect();
+        assert_eq!(removes, vec![&("isPublished".to_string(), 1u64, 42)],
+            "Remove must clear the true bit on the shadow target");
+        assert_eq!(inserts, vec![&("isPublished".to_string(), 0u64, 42)],
+            "Remove must insert the false bit on the shadow target");
+    }
+
     /// Source-name and target-name shadow keys both fire. A trigger that
     /// (hypothetically) emits ops keyed by the data_schema source name
     /// (`publishedAtUnix`) must produce the same shadow as one that emits
@@ -1868,6 +1904,86 @@ mod tests {
         let inserts: Vec<&(String, u64, u32)> = sink.filter_inserts.iter()
             .filter(|(f, _, _)| f == "isPublished").collect();
         assert_eq!(inserts, vec![&("isPublished".to_string(), 1u64, 42)]);
+    }
+
+    /// Regression: the time-bucket leak fix in concurrent_engine reads
+    /// `coalescer.mutated_sort_slots()` keyed by the bucket's tracked sort
+    /// field name (e.g., `sortAt`). External review questioned whether
+    /// computed sort recomputation actually populates that map for the
+    /// computed target — the fix only works if it does.
+    ///
+    /// Verify here by emitting `Set publishedAt=<seconds>` and asserting
+    /// the sink sees `sort_set` / `sort_clear` calls keyed by the
+    /// COMPUTED target Arc (`sortAt`), not just by `publishedAt`. The
+    /// coalescer's `mutated_sort_slots()` aggregates sort_sets+sort_clears
+    /// per field, so as long as the recompute path emits sink calls with
+    /// the computed-target field name, the time-bucket fix downstream
+    /// will see the slot under the right key.
+    #[test]
+    fn test_computed_sort_recompute_emits_target_field_sort_ops() {
+        // sortAt = greatest(existedAt, publishedAt). publishedAt acts as
+        // both a tracked sort source AND the trigger-emitted op field;
+        // recompute should produce sort_set/sort_clear on `sortAt`.
+        let mut config = Config::default();
+        config.filter_fields = Vec::new();
+        config.sort_fields = vec![
+            SortFieldConfig {
+                name: "publishedAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            },
+            SortFieldConfig {
+                name: "existedAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            },
+            SortFieldConfig {
+                name: "sortAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: Some(crate::config::ComputedField {
+                    op: crate::config::ComputedOp::Greatest,
+                    source_fields: vec!["existedAt".into(), "publishedAt".into()],
+                }),
+            },
+        ];
+        let meta = FieldMeta::from_config(&config);
+        let mut sink = RecordingSink::new();
+        let mut batch = vec![EntityOps {
+            entity_id: 42,
+            creates_slot: true,
+            ops: vec![
+                Op::Remove { field: "publishedAt".into(), value: json!(1_000_000i64) },
+                Op::Set { field: "publishedAt".into(), value: json!(2_000_000i64) },
+            ],
+        }];
+        let (applied, _, errors) = apply_ops_batch(&mut sink, &meta, &mut batch, None, None);
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+
+        // The computed-sort recompute path must emit sink ops keyed by
+        // the computed target name `sortAt` — not just by the source
+        // `publishedAt`. This is the property the time-bucket leak fix
+        // relies on via `coalescer.mutated_sort_slots()`.
+        let sort_at_writes: Vec<&(String, usize, u32)> = sink.sort_sets.iter()
+            .chain(sink.sort_clears.iter())
+            .filter(|(f, _, _)| f == "sortAt").collect();
+        assert!(!sort_at_writes.is_empty(),
+            "computed-sort recompute must emit sink ops on the `sortAt` target \
+             so coalescer.mutated_sort_slots() picks up the slot for time-bucket re-eval");
+        // And of course the source field gets its own sort writes.
+        let published_at_writes: Vec<&(String, usize, u32)> = sink.sort_sets.iter()
+            .chain(sink.sort_clears.iter())
+            .filter(|(f, _, _)| f == "publishedAt").collect();
+        assert!(!published_at_writes.is_empty(), "source sort field writes must still happen");
     }
 
     /// Companion to the LCS-set test: removing a previously-inserted LCS
