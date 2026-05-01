@@ -4,7 +4,7 @@ default-members = ["."]
 
 [package]
 name = "bitdex-v2"
-version = "1.0.177-jemalloc"
+version = "1.0.200-jemalloc"
 edition = "2021"
 license = "MIT"
 description = "Purpose-built in-memory bitmap index engine"

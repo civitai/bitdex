@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
+use axum::extract::{Extension, Path as AxumPath, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -448,16 +448,61 @@ async fn require_admin(
     }
 }
 
+/// Per-request handler-stage timing data. Threaded from the outer middleware
+/// (which captures T0 = arrival) through the request extensions to the
+/// `handle_query` body (which records T1-T4). Read back by the middleware on
+/// response to attribute time across phases:
+///
+/// - `to_handler_us`  = T1 - T0   (middleware overhead + tokio task scheduling)
+/// - `to_engine_us`   = T2 - T1   (body parse + JSON deserialize + index lookup)
+/// - `engine_us`      = T3 - T2   (block_in_place engine call duration)
+/// - `doc_fetch_us`   = T4 - T3   (spawn_blocking doc fetch duration)
+/// - `to_response_us` = T5 - T4   (response build + serialize + write)
+///
+/// All offsets are nanoseconds since `t0` so the writers can use lock-free
+/// `AtomicU64` stores. A zero offset means the stage was never reached — the
+/// reader skips emitting that phase.
+#[derive(Clone)]
+struct HttpStageData {
+    t0: std::time::Instant,
+    t1_handler_entered_ns: Arc<AtomicU64>,
+    t2_engine_started_ns: Arc<AtomicU64>,
+    t3_engine_done_ns: Arc<AtomicU64>,
+    t4_docs_done_ns: Arc<AtomicU64>,
+}
+
+impl HttpStageData {
+    fn new() -> Self {
+        Self {
+            t0: std::time::Instant::now(),
+            t1_handler_entered_ns: Arc::new(AtomicU64::new(0)),
+            t2_engine_started_ns: Arc::new(AtomicU64::new(0)),
+            t3_engine_done_ns: Arc::new(AtomicU64::new(0)),
+            t4_docs_done_ns: Arc::new(AtomicU64::new(0)),
+        }
+    }
+    /// Stash the elapsed time since `t0` into the slot. Called by the handler.
+    #[inline]
+    fn record(&self, slot: &AtomicU64) {
+        let ns = self.t0.elapsed().as_nanos() as u64;
+        // Use store; only one writer per slot per request, so no contention.
+        slot.store(ns, Ordering::Relaxed);
+    }
+}
+
 /// Middleware: record requests/responses to the caplog when capture is active.
 ///
 /// Fast path: if not recording, `is_recording()` is a single mutex check (~ns)
 /// Outermost middleware: measures wall-clock time from HTTP request arrival
 /// to response sent. This captures the full round-trip including tokio scheduling,
 /// handler execution, response serialization, and any CPU contention delays.
-/// Records into bitdex_http_response_seconds histogram.
+/// Records into bitdex_http_response_seconds histogram. For paths that opt in
+/// (currently only POST query handler), the middleware also threads a
+/// `HttpStageData` cell through request extensions so per-stage timings (T0–T5)
+/// can be reassembled here and emitted into `bitdex_http_handler_phase_seconds`.
 async fn measure_http_roundtrip(
     State(state): State<SharedState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let method = req.method().to_string();
@@ -474,12 +519,60 @@ async fn measure_http_roundtrip(
     } else {
         path.clone()
     };
+    // Only emit per-stage phase timing for the query path; other endpoints
+    // skip the extension overhead.
+    let is_query = method == "POST" && path.contains("/query");
+    let stage = if is_query {
+        let s = HttpStageData::new();
+        req.extensions_mut().insert(s.clone());
+        Some(s)
+    } else {
+        None
+    };
     let start = std::time::Instant::now();
     let response = next.run(req).await;
-    let elapsed = start.elapsed().as_secs_f64();
+    let elapsed = start.elapsed();
     state.metrics.http_response_seconds
         .with_label_values(&[&method, &path_label])
-        .observe(elapsed);
+        .observe(elapsed.as_secs_f64());
+
+    if let Some(s) = stage {
+        let total_ns = s.t0.elapsed().as_nanos() as u64;
+        let t1 = s.t1_handler_entered_ns.load(Ordering::Relaxed);
+        let t2 = s.t2_engine_started_ns.load(Ordering::Relaxed);
+        let t3 = s.t3_engine_done_ns.load(Ordering::Relaxed);
+        let t4 = s.t4_docs_done_ns.load(Ordering::Relaxed);
+
+        let phase_hist = &state.metrics.http_handler_phase_seconds;
+        let observe_phase = |name: &str, ns: u64| {
+            phase_hist
+                .with_label_values(&[name])
+                .observe(ns as f64 / 1_000_000_000.0);
+        };
+
+        // to_handler: T0 → T1. Always emitted when handler ran.
+        if t1 > 0 {
+            observe_phase("to_handler", t1);
+        }
+        // to_engine: T1 → T2.
+        if t2 > t1 && t1 > 0 {
+            observe_phase("to_engine", t2 - t1);
+        }
+        // engine: T2 → T3.
+        if t3 > t2 && t2 > 0 {
+            observe_phase("engine", t3 - t2);
+        }
+        // doc_fetch: T3 → T4. Optional — only present when include_docs.
+        if t4 > t3 && t3 > 0 {
+            observe_phase("doc_fetch", t4 - t3);
+        }
+        // to_response: last-stage-reached → T5.
+        let last = t4.max(t3).max(t2).max(t1);
+        if total_ns > last && last > 0 {
+            observe_phase("to_response", total_ns - last);
+        }
+    }
+
     response
 }
 
@@ -965,6 +1058,21 @@ struct ConfigPatch {
     /// Prod stays responsive while local SSE mirror gets real query traffic.
     #[serde(default)]
     query_tee_mode: Option<bool>,
+    /// Hot-reload knob for the par_iter min-task threshold on the steady-state
+    /// hot path (flush filter+sort fan-out, doc writer shard fan-out). Set huge
+    /// (e.g. 10_000_000) to disable par_iter entirely — useful for isolating
+    /// rayon pool overhead from real work during perf experiments.
+    /// Default 8.
+    #[serde(default)]
+    par_iter_min_threshold: Option<usize>,
+    /// Hot-reload knob for the bitmap shard compaction threshold (ops_count
+    /// above which a shard's ops-log is compacted into a fresh snapshot at
+    /// the next merge cycle). Applies to alive/filter/sort bitmap stores.
+    /// Default `DEFAULT_COMPACT_THRESHOLD = 100_000`. Bump higher (e.g. 500_000)
+    /// when hot tagIds shards are rewriting too aggressively; drop lower for
+    /// faster ops-replay on read at cost of more rewrite I/O.
+    #[serde(default)]
+    bitmap_compact_threshold: Option<u32>,
 }
 
 /// Patchable fields for a filter field.
@@ -1696,8 +1804,25 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
             compaction_total: state.metrics.compaction_total.clone(),
             compaction_duration: state.metrics.compaction_duration_seconds.clone(),
+            query_op_set_fanout_size: state.metrics.query_op_set_fanout_size.clone(),
+            query_op_set_rejected_total: state.metrics.query_op_set_rejected_total.clone(),
+            query_op_set_applied_slots_total: state.metrics.query_op_set_applied_slots_total.clone(),
+            wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
+            bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
+            query_total: state.metrics.query_total.clone(),
             index_name: def.name.clone(),
         });
+        // Install the cache-worker cycle-time histogram so the worker can
+        // observe per cycle. OnceLock — first set wins; idempotent on retries.
+        let _ = engine
+            .cache_worker_metrics()
+            .cycle_histogram
+            .set(
+                state
+                    .metrics
+                    .cache_worker_cycle_seconds
+                    .with_label_values(&[&def.name]),
+            );
         let phase4_elapsed = phase_start.elapsed();
         eprintln!("  Boot phase: metrics_bridge completed in {}ms", phase4_elapsed.as_millis());
         state.metrics.boot_phase_seconds
@@ -2012,6 +2137,12 @@ async fn handle_create_index(
         lazy_load_duration: state.metrics.lazy_load_duration_seconds.clone(),
         compaction_total: state.metrics.compaction_total.clone(),
         compaction_duration: state.metrics.compaction_duration_seconds.clone(),
+        query_op_set_fanout_size: state.metrics.query_op_set_fanout_size.clone(),
+        query_op_set_rejected_total: state.metrics.query_op_set_rejected_total.clone(),
+        query_op_set_applied_slots_total: state.metrics.query_op_set_applied_slots_total.clone(),
+        wal_apply_batch_seconds: state.metrics.wal_apply_batch_seconds.clone(),
+        bitmap_mem_scan_tick_seconds: state.metrics.bitmap_mem_scan_tick_seconds.clone(),
+        query_total: state.metrics.query_total.clone(),
         index_name: definition.name.clone(),
     });
 
@@ -2352,6 +2483,14 @@ async fn handle_patch_config(
                     state.query_tee_mode.store(v, Ordering::Relaxed);
                     eprintln!("Config patch: query_tee_mode set to {v}");
                 }
+                if let Some(v) = patch.par_iter_min_threshold {
+                    idx.engine.set_par_iter_min_threshold(v);
+                    eprintln!("Config patch: par_iter_min_threshold set to {v}");
+                }
+                if let Some(v) = patch.bitmap_compact_threshold {
+                    idx.engine.set_bitmap_compact_threshold(v);
+                    eprintln!("Config patch: bitmap_compact_threshold set to {v}");
+                }
 
                 // Toggle trace collection (server-wide, not persisted with index config)
                 if let Some(v) = patch.enable_traces {
@@ -2675,10 +2814,15 @@ impl Drop for ConcurrentReadGuard<'_> {
 
 async fn handle_query(
     State(state): State<SharedState>,
+    Extension(stage): Extension<HttpStageData>,
     AxumPath(name): AxumPath<String>,
     AxumQuery(params): AxumQuery<QueryParams>,
     body: Bytes,
 ) -> impl IntoResponse {
+    // T1: handler entered. Captured before any work — measures middleware
+    // chain overhead + tokio task scheduling delay.
+    stage.record(&stage.t1_handler_entered_ns);
+
     // -- Backpressure: track in-flight queries and enforce concurrency limit --
     let in_flight = state.queries_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
     state.metrics.queries_in_flight.inc();
@@ -2825,9 +2969,14 @@ async fn handle_query(
     // NOT park an async thread on a JoinHandle — the thread itself does
     // the work and returns. At 70+ QPS this prevents async thread
     // exhaustion that makes the main listener unresponsive.
+    // T2: just before block_in_place enter. T1 → T2 covers body parse,
+    // JSON deserialize, index lookup, prefilter substitution.
+    stage.record(&stage.t2_engine_started_ns);
     let query_result = tokio::task::block_in_place(|| {
         engine.execute_query_traced(&query, &name)
     });
+    // T3: block_in_place returned. T2 → T3 = engine wall-clock.
+    stage.record(&stage.t3_engine_done_ns);
     match query_result {
         Ok((result, trace)) => {
             let elapsed = start.elapsed();
@@ -2902,10 +3051,25 @@ async fn handle_query(
             let docs_us = doc_start.elapsed().as_micros() as u64;
             let docs_count = documents.as_ref().map_or(0, |d| d.len()) as u64;
 
-            // Update trace with doc fetch timing
+            // T4: doc fetch returned (includes spawn_blocking enqueue wait).
+            // T3 → T4 = doc_fetch wall-clock as observed from the handler;
+            // matches the existing `docs_us` trace field. The middleware will
+            // record T4 → T5 as `to_response`.
+            stage.record(&stage.t4_docs_done_ns);
+
+            // Update trace with doc fetch timing + handler-stage attribution.
             let mut trace = trace;
             trace.docs_us = docs_us;
             trace.docs_count = docs_count;
+            // Stage timestamps: load atomics back as ns offsets from t0,
+            // convert to µs for the trace (matches existing _us fields).
+            let t1_ns = stage.t1_handler_entered_ns.load(Ordering::Relaxed);
+            let t2_ns = stage.t2_engine_started_ns.load(Ordering::Relaxed);
+            trace.to_handler_us = t1_ns / 1_000;
+            trace.to_engine_us = t2_ns.saturating_sub(t1_ns) / 1_000;
+            // to_response_us / http_total_us cannot be filled in from here —
+            // the response hasn't been written yet. They stay 0 in the trace
+            // ring buffer; the middleware emits them into the histogram.
 
             // Observe query phase histograms
             m.query_filter_seconds
@@ -4565,11 +4729,16 @@ async fn handle_set_cursor(
         }
     };
 
-    engine.set_cursor(cursor_name.clone(), value.clone());
-
-    // Force persist to disk so the value survives restarts
-    if let Err(e) = engine.save_snapshot() {
-        eprintln!("Warning: cursor set but snapshot save failed: {e}");
+    // Persist the cursor synchronously via a small atomic file write to
+    // MetaStore. The previous code called `engine.save_snapshot()` here,
+    // which rewrote every bitmap shard (~10 GB, 14-20 s) on every cursor
+    // PATCH and was the dominant source of pod-wide IO-pressure freezes
+    // observed in v196-v198. The merge thread also batch-persists cursors
+    // every 5 s (concurrent_engine.rs flush loop), so even a transient
+    // MetaStore write failure here doesn't lose the cursor — it just
+    // delays durability by one merge cycle.
+    if let Err(e) = engine.persist_cursor(cursor_name.clone(), value.clone()) {
+        eprintln!("Warning: cursor set but persist failed: {e}");
     }
 
     Json(serde_json::json!({
@@ -4966,6 +5135,29 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.cache_worker_over_budget_total.with_label_values(&[name]).set(cw_over_budget as i64);
             m.cache_backpressure_invalidations_total.with_label_values(&[name]).set(cw_backpressure as i64);
             m.cache_worker_cycles_total.with_label_values(&[name]).set(cw_cycles as i64);
+            // Reason-attributed rebuild counters + needs_rebuild backlog gauge.
+            let cwm = engine.cache_worker_metrics();
+            m.cache_entries_needs_rebuild
+                .with_label_values(&[name])
+                .set(engine.unified_cache_needs_rebuild_count() as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "deadline"])
+                .set(cwm.marked_for_rebuild_deadline_total.load(Ordering::Relaxed) as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "count_budget"])
+                .set(cwm.marked_for_rebuild_count_budget_total.load(Ordering::Relaxed) as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "backlog_drop"])
+                .set(cwm.marked_for_rebuild_backlog_drop_total.load(Ordering::Relaxed) as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "alive_change"])
+                .set(cwm.marked_for_rebuild_alive_change_total.load(Ordering::Relaxed) as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "filter_invalidation"])
+                .set(cwm.marked_for_rebuild_filter_invalidation_total.load(Ordering::Relaxed) as i64);
+            m.cache_rebuild_completed_total
+                .with_label_values(&[name])
+                .set(cwm.rebuild_completed_total.load(Ordering::Relaxed) as i64);
             // Iter 6 — put_batch fast/slow path counters
             let (fast_path, slow_path) = engine.docstore_put_batch_path_stats();
             m.docstore_put_batch_fast_path_total

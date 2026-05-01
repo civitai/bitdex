@@ -261,12 +261,25 @@ fn parse_config() -> Config {
     Config { port, data_dir, index: cli_index, index_dir, rebuild, default_query_format, log_level, enable_traces, admin_token, max_query_concurrency, trace_buffer_size }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("FATAL PANIC: {info}");
         eprintln!("Backtrace: {:?}", std::backtrace::Backtrace::force_capture());
     }));
+
+    // Name rayon global pool workers so per-thread CPU samples can
+    // disambiguate them from other unnamed threads (which inherit the
+    // binary name "bitdex-server" via prctl). Without this, a /proc
+    // sample shows N "bitdex-server" entries that could be rayon,
+    // tokio blocking pool, or anything else — useless for attribution.
+    // Linux comm length limit is 15 chars; "bitdex-rayon-NN" fits.
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("bitdex-rayon-{i}"))
+        .build_global()
+    {
+        eprintln!("WARNING: rayon global pool already initialized: {e}");
+    }
 
     let config = parse_config();
 

@@ -78,11 +78,24 @@ pub struct Metrics {
     // -- Async cache worker (Phase 1a) --
     pub cache_worker_queue_depth: IntGaugeVec,
     pub cache_worker_cycle_nanos: IntGaugeVec,
+    pub cache_worker_cycle_seconds: HistogramVec,
     pub cache_worker_items_coalesced_total: IntGaugeVec,
     pub cache_worker_drops_total: IntGaugeVec,
     pub cache_worker_over_budget_total: IntGaugeVec,
     pub cache_backpressure_invalidations_total: IntGaugeVec,
     pub cache_worker_cycles_total: IntGaugeVec,
+    /// Number of cache entries currently flagged `needs_rebuild=true`. Sampled
+    /// at scrape time. Gives Justin the live "shed backlog" depth the cache
+    /// is carrying — matching `marked_for_rebuild_total` minus
+    /// `rebuild_completed_total` (approximately, modulo evictions).
+    pub cache_entries_needs_rebuild: IntGaugeVec,
+    /// Cumulative count of cache entries marked for rebuild, attributed by
+    /// reason. Replaces the single-bucket semantics of `over_budget_total`
+    /// with reason labels so we can see WHY entries are being shed.
+    pub cache_marked_for_rebuild_total: IntGaugeVec,
+    /// Cumulative count of cache rebuilds that completed (entry replaced via
+    /// `store()` while the prior entry had `needs_rebuild=true`).
+    pub cache_rebuild_completed_total: IntGaugeVec,
 
     pub docstore_put_batch_fast_path_total: IntGaugeVec,
     pub docstore_put_batch_slow_path_total: IntGaugeVec,
@@ -129,6 +142,13 @@ pub struct Metrics {
 
     // -- HTTP round-trip (wall-clock from request arrival to response sent) --
     pub http_response_seconds: HistogramVec,
+    /// Per-phase timing inside the query handler. Phases:
+    ///   to_handler  — middleware enter → handler entered (tokio task scheduling)
+    ///   to_engine   — handler entered → engine block_in_place enter
+    ///   engine      — engine block_in_place duration
+    ///   doc_fetch   — engine done → spawn_blocking doc fetch return
+    ///   to_response — doc fetch done → middleware exit
+    pub http_handler_phase_seconds: HistogramVec,
 
     // -- Phase 2.5: DocStore I/O observability --
     pub docstore_read_seconds: HistogramVec,
@@ -147,6 +167,9 @@ pub struct Metrics {
 
     // -- Phase 2.5: ShardStore ops (stub — wired when Phase 1 lands) --
     pub shardstore_ops_count: IntGaugeVec,
+
+    // -- Shard rewrite attribution (sourced from shard_store atomics at scrape time) --
+    pub shard_rewrites_total: IntGaugeVec,
 
     // -- Phase 2.5: PG-Sync observability --
     pub pgsync_cycle_seconds: HistogramVec,
@@ -174,6 +197,32 @@ pub struct Metrics {
     pub wal_last_applied_timestamp_seconds: IntGauge,
     /// End-to-end latency of POST /ops WAL append (lock acquisition + write + fsync).
     pub wal_append_duration_seconds: Histogram,
+
+    // -- queryOpSet fan-out cost (issue #60) --
+    /// Histogram of result.ids size per apply_query_op_set call. Buckets cover the
+    /// full observed range from postId-eq narrow matches (1) to wide nsfwLevel-style
+    /// matches (10M+). Used to size the BITDEX_QUERY_OP_SET_MAX_FANOUT cap from real
+    /// prod data instead of guessing.
+    pub query_op_set_fanout_size: HistogramVec,
+    /// Counter incremented when a queryOpSet is rejected for exceeding the fan-out
+    /// cap. Label `reason="fanout_too_wide"`. Alert when rate > 0 — every rejection
+    /// is a missed mutation (data drift) until #62 (paginate-instead-of-skip) lands.
+    pub query_op_set_rejected_total: IntCounterVec,
+    /// Counter of total slot mutations applied via queryOpSet fan-out. Lets us
+    /// distinguish narrow (postId-eq, ~1 slot) from wide (nsfwLevel-eq, millions)
+    /// at the work-unit level rather than the API-call level.
+    pub query_op_set_applied_slots_total: IntCounterVec,
+
+    // -- 11c CPU floor attribution (2026-04-30) --
+    /// Wall-clock duration of `apply_ops_batch` per WAL-reader batch. Sum × rate
+    /// = CPU spent in op apply. Mission status v1.0.178 cites 11c steady-state
+    /// floor in server mode; this metric attributes the WAL reader's contribution.
+    pub wal_apply_batch_seconds: HistogramVec,
+    /// Wall-clock duration of one `BitmapMemoryCache::scan_tick`. Background
+    /// scanner thread runs every interval_ms; this histogram shows how much CPU
+    /// each tick consumes (postId full-walk at 23M distinct values is the
+    /// suspected ~1c contributor).
+    pub bitmap_mem_scan_tick_seconds: HistogramVec,
 
     // -- Boot phase breakdown --
     pub boot_phase_seconds: IntGaugeVec,
@@ -238,8 +287,21 @@ impl Metrics {
                 "bitdex_http_response_seconds",
                 "Full HTTP round-trip time from request arrival to response sent",
             )
-            .buckets(http_buckets),
+            .buckets(http_buckets.clone()),
             &["method", "path"],
+        )
+        .unwrap();
+
+        let http_handler_phase_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_http_handler_phase_seconds",
+                "Per-phase wall-clock inside the query handler. Phase label: to_handler|to_engine|engine|doc_fetch|to_response",
+            )
+            .buckets(vec![
+                0.000005, 0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005,
+                0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0,
+            ]),
+            &["phase"],
         )
         .unwrap();
 
@@ -504,6 +566,15 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let cache_worker_cycle_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_cache_worker_cycle_seconds",
+                "Wall-clock duration of each async cache worker cycle, in seconds.",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
+            &["index"],
+        )
+        .unwrap();
         let cache_worker_items_coalesced_total = IntGaugeVec::new(
             Opts::new(
                 "bitdex_cache_worker_items_coalesced_total",
@@ -540,6 +611,30 @@ impl Metrics {
             Opts::new(
                 "bitdex_cache_worker_cycles_total",
                 "Total number of completed async cache worker cycles.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_entries_needs_rebuild = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_entries_needs_rebuild",
+                "Number of UnifiedCache entries currently flagged needs_rebuild=true. Live backlog of stale entries that next access will treat as a miss.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_marked_for_rebuild_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_marked_for_rebuild_total",
+                "Cumulative count of cache entries marked for rebuild, labeled by the proximate reason.",
+            ),
+            &["index", "reason"],
+        )
+        .unwrap();
+        let cache_rebuild_completed_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_rebuild_completed_total",
+                "Cumulative count of cache rebuilds that completed (stale entry replaced via store()).",
             ),
             &["index"],
         )
@@ -779,6 +874,17 @@ impl Metrics {
         )
         .unwrap();
 
+        // Shard rewrite attribution — sourced from shard_store atomics at scrape time.
+        // Labels: source = "compact" | "cold_create" | "snapshot"
+        let shard_rewrites_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_shard_rewrites_total",
+                "Total atomic shard file rewrites by source (compact/cold_create/snapshot)",
+            ),
+            &["source"],
+        )
+        .unwrap();
+
         // Phase 2.5: PG-Sync observability
         let pgsync_cycle_buckets = vec![0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
         let pgsync_cycle_seconds = HistogramVec::new(
@@ -868,6 +974,65 @@ impl Metrics {
         )
         .unwrap();
 
+        // queryOpSet fan-out cost (issue #60).
+        // Histogram buckets span the full observed range:
+        // narrow (postId-eq, ~1 slot) → moderate (modelVersionIds, 1K-100K) → wide
+        // (nsfwLevel-eq, 10M+). Powers of 10 with a 22.9M anchor for the local
+        // nsfwLevel=1 size we measured during the OOM repro work.
+        let query_op_set_fanout_buckets = vec![
+            1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0,
+        ];
+        let query_op_set_fanout_size = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_query_op_set_fanout_size",
+                "Number of slots matched by a queryOpSet's filter, observed before per-slot apply",
+            )
+            .buckets(query_op_set_fanout_buckets),
+            &["index"],
+        )
+        .unwrap();
+        let query_op_set_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_query_op_set_rejected_total",
+                "queryOpSet ops rejected before per-slot apply (e.g. fan-out exceeded cap)",
+            ),
+            &["index", "reason"],
+        )
+        .unwrap();
+        let query_op_set_applied_slots_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_query_op_set_applied_slots_total",
+                "Total slot mutations applied via queryOpSet fan-out (sum of result.ids sizes)",
+            ),
+            &["index"],
+        )
+        .unwrap();
+
+        // 11c CPU floor attribution (2026-04-30): WAL apply per-batch + mem-scanner tick.
+        // Buckets cover sub-ms (WAL batch fast path) through multi-second (postId
+        // full-walk on the 23M-distinct-value bitmap).
+        let apply_seconds_buckets = vec![
+            0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+        ];
+        let wal_apply_batch_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_wal_apply_batch_seconds",
+                "Wall-clock duration of apply_ops_batch per WAL-reader batch",
+            )
+            .buckets(apply_seconds_buckets.clone()),
+            &["index"],
+        )
+        .unwrap();
+        let bitmap_mem_scan_tick_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_bitmap_mem_scan_tick_seconds",
+                "Wall-clock duration of one BitmapMemoryCache::scan_tick (background scanner thread)",
+            )
+            .buckets(apply_seconds_buckets),
+            &["index"],
+        )
+        .unwrap();
+
         // Boot phase breakdown
         let boot_phase_seconds = IntGaugeVec::new(
             Opts::new("bitdex_boot_phase_seconds", "Duration of each boot phase in seconds"),
@@ -885,6 +1050,9 @@ impl Metrics {
             .unwrap();
         registry
             .register(Box::new(http_response_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(http_handler_phase_seconds.clone()))
             .unwrap();
         registry.register(Box::new(query_filter_seconds.clone())).unwrap();
         registry.register(Box::new(query_sort_seconds.clone())).unwrap();
@@ -943,11 +1111,15 @@ impl Metrics {
         registry.register(Box::new(cache_maint_sort_work_items_max.clone())).unwrap();
         registry.register(Box::new(cache_worker_queue_depth.clone())).unwrap();
         registry.register(Box::new(cache_worker_cycle_nanos.clone())).unwrap();
+        registry.register(Box::new(cache_worker_cycle_seconds.clone())).unwrap();
         registry.register(Box::new(cache_worker_items_coalesced_total.clone())).unwrap();
         registry.register(Box::new(cache_worker_drops_total.clone())).unwrap();
         registry.register(Box::new(cache_worker_over_budget_total.clone())).unwrap();
         registry.register(Box::new(cache_backpressure_invalidations_total.clone())).unwrap();
         registry.register(Box::new(cache_worker_cycles_total.clone())).unwrap();
+        registry.register(Box::new(cache_entries_needs_rebuild.clone())).unwrap();
+        registry.register(Box::new(cache_marked_for_rebuild_total.clone())).unwrap();
+        registry.register(Box::new(cache_rebuild_completed_total.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_fast_path_total.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_slow_path_total.clone())).unwrap();
         registry
@@ -998,6 +1170,7 @@ impl Metrics {
         registry.register(Box::new(doc_cache_generations.clone())).unwrap();
         registry.register(Box::new(doc_cache_backlog.clone())).unwrap();
         registry.register(Box::new(shardstore_ops_count.clone())).unwrap();
+        registry.register(Box::new(shard_rewrites_total.clone())).unwrap();
         registry.register(Box::new(pgsync_cycle_seconds.clone())).unwrap();
         registry.register(Box::new(pgsync_rows_fetched_total.clone())).unwrap();
         registry.register(Box::new(pgsync_cursor_position.clone())).unwrap();
@@ -1015,6 +1188,11 @@ impl Metrics {
         registry.register(Box::new(wal_ops_written_total.clone())).unwrap();
         registry.register(Box::new(wal_last_applied_timestamp_seconds.clone())).unwrap();
         registry.register(Box::new(wal_append_duration_seconds.clone())).unwrap();
+        registry.register(Box::new(query_op_set_fanout_size.clone())).unwrap();
+        registry.register(Box::new(wal_apply_batch_seconds.clone())).unwrap();
+        registry.register(Box::new(bitmap_mem_scan_tick_seconds.clone())).unwrap();
+        registry.register(Box::new(query_op_set_rejected_total.clone())).unwrap();
+        registry.register(Box::new(query_op_set_applied_slots_total.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
 
         Self {
@@ -1026,6 +1204,7 @@ impl Metrics {
             query_total,
             query_duration_seconds,
             http_response_seconds,
+            http_handler_phase_seconds,
             query_filter_seconds,
             query_sort_seconds,
             query_docs_seconds,
@@ -1067,11 +1246,15 @@ impl Metrics {
             cache_maint_sort_work_items_max,
             cache_worker_queue_depth,
             cache_worker_cycle_nanos,
+            cache_worker_cycle_seconds,
             cache_worker_items_coalesced_total,
             cache_worker_drops_total,
             cache_worker_over_budget_total,
             cache_backpressure_invalidations_total,
             cache_worker_cycles_total,
+            cache_entries_needs_rebuild,
+            cache_marked_for_rebuild_total,
+            cache_rebuild_completed_total,
             docstore_put_batch_fast_path_total,
             docstore_put_batch_slow_path_total,
             lazy_load_duration_seconds,
@@ -1114,6 +1297,7 @@ impl Metrics {
             doc_cache_generations,
             doc_cache_backlog,
             shardstore_ops_count,
+            shard_rewrites_total,
             pgsync_cycle_seconds,
             pgsync_rows_fetched_total,
             pgsync_cursor_position,
@@ -1131,12 +1315,30 @@ impl Metrics {
             wal_ops_written_total,
             wal_last_applied_timestamp_seconds,
             wal_append_duration_seconds,
+            query_op_set_fanout_size,
+            query_op_set_rejected_total,
+            query_op_set_applied_slots_total,
+            wal_apply_batch_seconds,
+            bitmap_mem_scan_tick_seconds,
             boot_phase_seconds,
         }
     }
 
     /// Render all metrics in Prometheus text exposition format.
     pub fn gather(&self) -> String {
+        // Sync shard rewrite atomics into gauges at scrape time.
+        // These are global monotonic counters written by write_shard_file_atomic().
+        use std::sync::atomic::Ordering::Relaxed;
+        self.shard_rewrites_total
+            .with_label_values(&["compact"])
+            .set(crate::shard_store::SHARD_REWRITES_COMPACT.load(Relaxed) as i64);
+        self.shard_rewrites_total
+            .with_label_values(&["cold_create"])
+            .set(crate::shard_store::SHARD_REWRITES_COLD.load(Relaxed) as i64);
+        self.shard_rewrites_total
+            .with_label_values(&["snapshot"])
+            .set(crate::shard_store::SHARD_REWRITES_SNAPSHOT.load(Relaxed) as i64);
+
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
         let mut buffer = Vec::new();

@@ -14,10 +14,9 @@
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::concurrent_engine::InnerEngine;
@@ -76,6 +75,11 @@ impl CacheWorkItem {
 
 /// Metrics exposed by the cache worker. Owned by the engine, referenced by
 /// both the worker thread and the Prometheus metrics bridge.
+///
+/// The reason-attributed `marked_*_total` counters and the `rebuild_completed_total`
+/// counter are also incremented from `UnifiedCache` (the cache holds an Arc to this
+/// struct for those updates). The single shared struct keeps the prom-export side
+/// simple while letting both the worker and the cache contribute to the same totals.
 #[derive(Default)]
 pub struct CacheWorkerMetrics {
     pub queue_depth: AtomicU64,
@@ -85,6 +89,35 @@ pub struct CacheWorkerMetrics {
     pub over_budget_total: AtomicU64,
     pub backpressure_invalidations_total: AtomicU64,
     pub cycles_total: AtomicU64,
+    /// Cache entries marked for rebuild because the time deadline was hit
+    /// (`max_maintenance_ms` exceeded mid-cycle).
+    pub marked_for_rebuild_deadline_total: AtomicU64,
+    /// Cache entries marked for rebuild because the count budget was hit
+    /// (`max_maintenance_work` exceeded before evaluation started).
+    pub marked_for_rebuild_count_budget_total: AtomicU64,
+    /// Cache entries marked for rebuild because the worker backlog overflowed
+    /// `backlog_drop_limit` and we fell back to coarse invalidation.
+    pub marked_for_rebuild_backlog_drop_total: AtomicU64,
+    /// Cache entries marked for rebuild as a consequence of an alive-bitmap
+    /// mutation (delete) — every entry is invalidated since negation operators
+    /// bake alive into the result.
+    pub marked_for_rebuild_alive_change_total: AtomicU64,
+    /// Cache entries marked for rebuild via `invalidate_filter_field` (compound
+    /// or otherwise un-narrowable filter mutations).
+    pub marked_for_rebuild_filter_invalidation_total: AtomicU64,
+    /// Cache entries that successfully completed a rebuild — either via
+    /// `UnifiedEntry::rebuild` directly or by being replaced in `store()` when
+    /// the prior entry had `needs_rebuild=true`.
+    pub rebuild_completed_total: AtomicU64,
+    /// Histogram for per-cycle wall-clock time. Installed post-engine-construction
+    /// by `set_metrics_bridge` so the worker can see the prom-bound `Histogram`.
+    /// Optional — the worker no-ops when unset.
+    ///
+    /// Gated on the `server` feature: `prometheus` is a server-only dep, but
+    /// `cache_worker` is part of the lib and is compiled for the pg-sync
+    /// binary too (which doesn't link prometheus).
+    #[cfg(feature = "server")]
+    pub cycle_histogram: OnceLock<prometheus::Histogram>,
 }
 
 /// Cache worker configuration. Derived from `CacheConfig` + engine state.
@@ -237,17 +270,23 @@ fn symmetric_difference_sorted(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
 /// Runs in its own thread. Owns the receive side of the work-item channel.
 pub struct CacheWorker {
     rx: crossbeam_channel::Receiver<CacheWorkItem>,
-    cache: Arc<Mutex<UnifiedCache>>,
+    cache: Arc<UnifiedCache>,
     engine: Arc<ArcSwap<InnerEngine>>,
     config: CacheWorkerConfig,
     metrics: Arc<CacheWorkerMetrics>,
     shutdown: Arc<AtomicBool>,
+    /// Counter for periodic `reconcile_bytes` calls — see Phase C in `run`.
+    cycles_since_reconcile: u32,
+    /// Time bucket manager, if time buckets are configured. Used to evaluate
+    /// `bucket` clauses during cache maintenance — the bitmap.contains(slot)
+    /// check replaces the old always-true conservative fallback.
+    time_buckets: Option<Arc<arc_swap::ArcSwap<crate::time_buckets::TimeBucketManager>>>,
 }
 
 impl CacheWorker {
     pub fn new(
         rx: crossbeam_channel::Receiver<CacheWorkItem>,
-        cache: Arc<Mutex<UnifiedCache>>,
+        cache: Arc<UnifiedCache>,
         engine: Arc<ArcSwap<InnerEngine>>,
         config: CacheWorkerConfig,
         metrics: Arc<CacheWorkerMetrics>,
@@ -260,7 +299,19 @@ impl CacheWorker {
             config,
             metrics,
             shutdown,
+            cycles_since_reconcile: 0,
+            time_buckets: None,
         }
+    }
+
+    /// Attach a time bucket manager so bucket clauses are evaluated precisely.
+    /// Call this before `run()`.
+    pub fn with_time_buckets(
+        mut self,
+        tb: Arc<arc_swap::ArcSwap<crate::time_buckets::TimeBucketManager>>,
+    ) -> Self {
+        self.time_buckets = Some(tb);
+        self
     }
 
     /// Main loop. Exits when the channel disconnects or `shutdown` is set.
@@ -324,61 +375,67 @@ impl CacheWorker {
                 None
             };
 
-            let (filter_work, filter_over_budget, sort_work, sort_over_budget) = {
-                let mut uc = self.cache.lock();
+            // No outer lock — UnifiedCache is interior-mutable. Each method
+            // call acquires the per-shard / per-field locks it needs and
+            // releases them immediately. Concurrent queries on other shards
+            // are not blocked while we run.
+            let uc = &self.cache;
 
-                // Batched alive removal.
-                if !uc.is_empty() && !merged.alive_removes.is_empty() {
-                    uc.remove_slots_from_all_batch(&merged.alive_removes);
-                }
+            // Batched alive removal.
+            if !uc.is_empty() && !merged.alive_removes.is_empty() {
+                uc.remove_slots_from_all_batch(&merged.alive_removes);
+            }
 
-                // Tombstone bookkeeping for persistence-enabled caches.
-                if uc.persistence_enabled() {
-                    let filter_fields: Vec<&str> = merged
-                        .mutated_filter_fields
-                        .iter()
-                        .map(|s| s.as_ref())
-                        .collect();
-                    if !filter_fields.is_empty() {
-                        let _ = uc.tombstone_unloaded_for_filter(&filter_fields);
-                    }
-                    let sort_fields: Vec<&str> = merged
-                        .sort_mutations
-                        .keys()
-                        .map(|s| s.as_ref())
-                        .collect();
-                    if !sort_fields.is_empty() {
-                        let _ = uc.tombstone_unloaded_for_sort(&sort_fields);
-                    }
-                    if merged.has_alive_mutations && !merged.alive_removes.is_empty() {
-                        let _ = uc.tombstone_all_unloaded();
-                    }
-                }
-
-                let (fw, fob) = if !merged.mutated_filter_fields.is_empty() {
-                    uc.collect_filter_work(&merged.filter_inserts, &merged.filter_removes)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-                // Sort work needs `HashMap<&str, HashSet<u32>>` — build it
-                // from the owned Arc<str> keys. The &str refs borrow from
-                // `merged` so they live as long as this scope.
-                let sort_mutations_borrowed: HashMap<&str, HashSet<u32>> = merged
-                    .sort_mutations
+            // Tombstone bookkeeping for persistence-enabled caches.
+            if uc.persistence_enabled() {
+                let filter_fields: Vec<&str> = merged
+                    .mutated_filter_fields
                     .iter()
-                    .map(|(k, v)| (k.as_ref(), v.clone()))
+                    .map(|s| s.as_ref())
                     .collect();
-                let (sw, sob) = if !sort_mutations_borrowed.is_empty() {
-                    uc.collect_sort_work(&sort_mutations_borrowed)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-                (fw, fob, sw, sob)
+                if !filter_fields.is_empty() {
+                    let _ = uc.tombstone_unloaded_for_filter(&filter_fields);
+                }
+                let sort_fields: Vec<&str> = merged
+                    .sort_mutations
+                    .keys()
+                    .map(|s| s.as_ref())
+                    .collect();
+                if !sort_fields.is_empty() {
+                    let _ = uc.tombstone_unloaded_for_sort(&sort_fields);
+                }
+                if merged.has_alive_mutations && !merged.alive_removes.is_empty() {
+                    let _ = uc.tombstone_all_unloaded();
+                }
+            }
+
+            let (filter_work, filter_over_budget) = if !merged.mutated_filter_fields.is_empty() {
+                uc.collect_filter_work(&merged.filter_inserts, &merged.filter_removes)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let sort_mutations_borrowed: HashMap<&str, HashSet<u32>> = merged
+                .sort_mutations
+                .iter()
+                .map(|(k, v)| (k.as_ref(), v.clone()))
+                .collect();
+            let (sort_work, sort_over_budget) = if !sort_mutations_borrowed.is_empty() {
+                uc.collect_sort_work(&sort_mutations_borrowed)
+            } else {
+                (Vec::new(), Vec::new())
             };
 
             // Phase B analogue — lock-free eval against the published snapshot.
+            // Load the time bucket manager snapshot once per cycle; the flush
+            // thread already ran insert_slot/remove_slot before enqueuing this
+            // work item, so the bucket bitmaps are authoritative.
+            let tb_guard = self
+                .time_buckets
+                .as_ref()
+                .map(|arc| arc.load_full());
+            let tb_ref = tb_guard.as_deref();
             let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
-                evaluate_filter_work(&filter_work, &snap.filters, &snap.sorts, deadline)
+                evaluate_filter_work(&filter_work, &snap.filters, &snap.sorts, deadline, tb_ref)
             } else {
                 (Vec::new(), Vec::new())
             };
@@ -389,6 +446,7 @@ impl CacheWorker {
                     &snap.filters,
                     &snap.sorts,
                     deadline,
+                    tb_ref,
                 )
             } else {
                 (Vec::new(), Vec::new())
@@ -401,14 +459,37 @@ impl CacheWorker {
                 || !filter_timed_out.is_empty()
                 || !sort_timed_out.is_empty()
             {
-                let mut uc = self.cache.lock();
                 uc.apply_maintenance_results(&filter_results);
                 uc.apply_maintenance_results(&sort_results);
+                // Attribute the batch-mark calls by reason. `over_budget` keys
+                // come from `collect_*_work` (count-budget bail before eval);
+                // `timed_out` keys come from `evaluate_*_work` hitting the time
+                // deadline.
+                let cb = (filter_over_budget.len() + sort_over_budget.len()) as u64;
+                let dl = (filter_timed_out.len() + sort_timed_out.len()) as u64;
+                if cb > 0 {
+                    self.metrics
+                        .marked_for_rebuild_count_budget_total
+                        .fetch_add(cb, Ordering::Relaxed);
+                }
+                if dl > 0 {
+                    self.metrics
+                        .marked_for_rebuild_deadline_total
+                        .fetch_add(dl, Ordering::Relaxed);
+                }
                 uc.mark_for_rebuild_batch(&filter_over_budget);
                 uc.mark_for_rebuild_batch(&sort_over_budget);
                 uc.mark_for_rebuild_batch(&filter_timed_out);
                 uc.mark_for_rebuild_batch(&sort_timed_out);
-                uc.reconcile_bytes();
+                // Reconcile total_bytes every 30th cycle. The store/evict
+                // paths track total_bytes incrementally; only bulk ops drift
+                // it, so periodic reconcile is enough to keep eviction-budget
+                // decisions honest without paying the scan cost every cycle.
+                self.cycles_since_reconcile += 1;
+                if self.cycles_since_reconcile >= 30 {
+                    uc.reconcile_bytes();
+                    self.cycles_since_reconcile = 0;
+                }
             }
 
             let over_budget = (filter_over_budget.len()
@@ -420,9 +501,14 @@ impl CacheWorker {
                     .over_budget_total
                     .fetch_add(over_budget, Ordering::Relaxed);
             }
+            let elapsed = t.elapsed();
             self.metrics
                 .cycle_nanos
-                .store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                .store(elapsed.as_nanos() as u64, Ordering::Relaxed);
+            #[cfg(feature = "server")]
+            if let Some(h) = self.metrics.cycle_histogram.get() {
+                h.observe(elapsed.as_secs_f64());
+            }
             self.metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .queue_depth
@@ -440,7 +526,7 @@ impl CacheWorker {
     /// affect filter eligibility globally, so precise invalidation isn't
     /// cheaper than a full sweep.
     fn invalidate_and_drop(&self, pending: &VecDeque<CacheWorkItem>) {
-        let mut uc = self.cache.lock();
+        let uc = &self.cache;
         let mut any_alive = false;
         let mut affected_filter_fields: HashSet<Arc<str>> = HashSet::new();
         for item in pending {
@@ -448,19 +534,30 @@ impl CacheWorker {
             any_alive |= item.has_alive_mutations;
         }
         if any_alive {
-            uc.maintain_alive_changes();
+            let n = uc.maintain_alive_changes();
+            if n > 0 {
+                self.metrics
+                    .marked_for_rebuild_backlog_drop_total
+                    .fetch_add(n, Ordering::Relaxed);
+            }
             return;
         }
         for field in &affected_filter_fields {
-            uc.invalidate_filter_field(field);
+            let n = uc.invalidate_filter_field(field);
+            if n > 0 {
+                self.metrics
+                    .marked_for_rebuild_backlog_drop_total
+                    .fetch_add(n, Ordering::Relaxed);
+            }
         }
-        // Sort mutations without alive changes: mark entries referencing any
-        // mutated sort field for rebuild. Done via maintain_alive_changes
-        // equivalent — too coarse for the fast path, but this is the fallback
-        // path for backlog saturation so conservative invalidation is fine.
         let any_sort = pending.iter().any(|it| !it.sort_mutations.is_empty());
         if any_sort {
-            uc.maintain_alive_changes();
+            let n = uc.maintain_alive_changes();
+            if n > 0 {
+                self.metrics
+                    .marked_for_rebuild_backlog_drop_total
+                    .fetch_add(n, Ordering::Relaxed);
+            }
         }
     }
 }

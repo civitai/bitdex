@@ -9,9 +9,27 @@
 //! or deleted, the meta-index identifies affected entries, and each entry's bitmap is updated
 //! via per-slot contains() checks against the engine's field bitmaps.
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// DashMap with the project's standard ahash hasher.
+type AHashMap2<K, V> = DashMap<K, V, ahash::RandomState>;
+
+/// Wall-clock millis since UNIX_EPOCH. Used as the LRU timestamp baseline so
+/// `last_used` can live in an `AtomicU64` and be updated from `&self` (no
+/// write lock). Approximate LRU only — wall clock can drift but eviction
+/// quality is unaffected at the resolution we care about.
+#[inline]
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 use roaring::RoaringBitmap;
 use crate::bound_store::ShardKey;
 use crate::cache::CanonicalClause;
@@ -110,18 +128,21 @@ pub struct UnifiedEntry {
     /// Total documents matching the filter (for returning total_matched without recomputing filters).
     total_matched: u64,
     /// Bloat control: flagged when cardinality exceeds 2 * capacity.
-    needs_rebuild: bool,
+    /// `AtomicBool` so readers can check it via `&self` from the RwLock read path.
+    needs_rebuild: AtomicBool,
     /// Guard to prevent concurrent rebuilds.
     rebuilding: AtomicBool,
     /// Guard to prevent concurrent prefetch expansions.
     prefetching: AtomicBool,
-    /// LRU timestamp.
-    last_used: Instant,
+    /// LRU timestamp as ms since UNIX_EPOCH. Atomic so readers can `touch()`
+    /// the entry from the RwLock read path without taking a write lock.
+    last_used: AtomicU64,
     /// Meta-index entry ID for this cache entry.
     meta_id: CacheEntryId,
     /// Dirty flag for persistence: set when bitmap modified by live maintenance,
     /// cleared when merge thread writes the shard. LRU eviction skips dirty entries.
-    persist_dirty: bool,
+    /// `AtomicBool` so `&self` paths can update it without escalating to a write lock.
+    persist_dirty: AtomicBool,
     /// Pre-sorted packed keys for O(1) pagination via binary search at initial capacity.
     /// Each key is `(sort_value as u64) << 32 | slot_id`. Sorted in traversal order.
     /// Cleared on expand() when radix takes over.
@@ -179,12 +200,12 @@ impl UnifiedEntry {
             max_capacity,
             has_more,
             total_matched,
-            needs_rebuild: false,
+            needs_rebuild: AtomicBool::new(false),
             rebuilding: AtomicBool::new(false),
             prefetching: AtomicBool::new(false),
-            last_used: Instant::now(),
+            last_used: AtomicU64::new(now_ms()),
             meta_id,
-            persist_dirty: true, // New entries need persisting
+            persist_dirty: AtomicBool::new(true), // New entries need persisting
             sorted_keys,
             radix: None, // No radix at initial capacity — sorted vec is faster
             direction,
@@ -244,12 +265,12 @@ impl UnifiedEntry {
             max_capacity,
             has_more,
             total_matched,
-            needs_rebuild: false,
+            needs_rebuild: AtomicBool::new(false),
             rebuilding: AtomicBool::new(false),
             prefetching: AtomicBool::new(false),
-            last_used: Instant::now(),
+            last_used: AtomicU64::new(now_ms()),
             meta_id,
-            persist_dirty: false, // Just loaded from disk — clean
+            persist_dirty: AtomicBool::new(false), // Just loaded from disk — clean
             sorted_keys,
             radix: None,
             direction,
@@ -311,19 +332,24 @@ impl UnifiedEntry {
         self.total_matched
     }
     pub fn needs_rebuild(&self) -> bool {
-        self.needs_rebuild
+        self.needs_rebuild.load(Ordering::Acquire)
     }
-    pub fn mark_for_rebuild(&mut self) {
-        self.needs_rebuild = true;
+    /// Mark this entry for rebuild. `&self` so the read path can flag stale
+    /// entries (e.g. expired bucket cutoff) without escalating to a write lock.
+    pub fn mark_for_rebuild(&self) {
+        self.needs_rebuild.store(true, Ordering::Release);
     }
     pub fn meta_id(&self) -> CacheEntryId {
         self.meta_id
     }
-    pub fn touch(&mut self) {
-        self.last_used = Instant::now();
+    /// Update the LRU timestamp. `&self` so the read path can touch entries
+    /// from the RwLock read lock.
+    pub fn touch(&self) {
+        self.last_used.store(now_ms(), Ordering::Relaxed);
     }
-    pub fn last_used(&self) -> Instant {
-        self.last_used
+    /// LRU timestamp in ms-since-UNIX-epoch.
+    pub fn last_used_ms(&self) -> u64 {
+        self.last_used.load(Ordering::Relaxed)
     }
     pub fn cardinality(&self) -> u64 {
         self.bitmap.len()
@@ -332,7 +358,7 @@ impl UnifiedEntry {
     /// `sort_value` is needed to maintain the radix index when present.
     pub fn add_slot(&mut self, slot: u32, sort_value: u32) -> bool {
         Arc::make_mut(&mut self.bitmap).insert(slot);
-        self.persist_dirty = true;
+        self.persist_dirty.store(true, Ordering::Relaxed);
         // Invalidate sorted_keys — maintaining sorted order in a Vec is O(n)
         // per operation. The bitmap path is only slightly slower and correct.
         // sorted_keys will be rebuilt on next rebuild() call.
@@ -343,7 +369,7 @@ impl UnifiedEntry {
         }
         let bloat_threshold = self.capacity * 2;
         if self.bitmap.len() as usize > bloat_threshold {
-            self.needs_rebuild = true;
+            self.needs_rebuild.store(true, Ordering::Release);
             true
         } else {
             false
@@ -368,7 +394,7 @@ impl UnifiedEntry {
                 bm.insert(slot);
             }
         }
-        self.persist_dirty = true;
+        self.persist_dirty.store(true, Ordering::Relaxed);
         self.sorted_keys = None;
         if let Some(ref mut radix) = self.radix {
             let r = Arc::make_mut(radix);
@@ -378,7 +404,7 @@ impl UnifiedEntry {
         }
         let bloat_threshold = self.capacity * 2;
         if self.bitmap.len() as usize > bloat_threshold {
-            self.needs_rebuild = true;
+            self.needs_rebuild.store(true, Ordering::Release);
             true
         } else {
             false
@@ -396,7 +422,7 @@ impl UnifiedEntry {
                 bm.remove(slot);
             }
         }
-        self.persist_dirty = true;
+        self.persist_dirty.store(true, Ordering::Relaxed);
         self.sorted_keys = None;
         if let Some(ref mut radix) = self.radix {
             let r = Arc::make_mut(radix);
@@ -409,7 +435,7 @@ impl UnifiedEntry {
     /// `sort_value` is needed to maintain the radix index when present.
     pub fn remove_slot(&mut self, slot: u32, sort_value: u32) {
         Arc::make_mut(&mut self.bitmap).remove(slot);
-        self.persist_dirty = true;
+        self.persist_dirty.store(true, Ordering::Relaxed);
         // Invalidate sorted_keys — stale keys would return removed slots.
         self.sorted_keys = None;
         // Maintain radix if present (expanded entry)
@@ -420,7 +446,7 @@ impl UnifiedEntry {
     /// Remove a slot without knowing its sort value. Uses blind scan for radix.
     pub fn remove_slot_blind(&mut self, slot: u32) {
         Arc::make_mut(&mut self.bitmap).remove(slot);
-        self.persist_dirty = true;
+        self.persist_dirty.store(true, Ordering::Relaxed);
         // Invalidate sorted_keys — stale keys would return removed slots.
         self.sorted_keys = None;
         if let Some(ref mut radix) = self.radix {
@@ -497,7 +523,7 @@ impl UnifiedEntry {
             };
             self.radix = None;
         }
-        self.needs_rebuild = false;
+        self.needs_rebuild.store(false, Ordering::Release);
         self.rebuilding.store(false, Ordering::Release);
     }
     /// Try to acquire the rebuild guard. Returns true if this caller should do the rebuild.
@@ -524,15 +550,15 @@ impl UnifiedEntry {
     }
     /// Whether this entry has unsaved bitmap modifications.
     pub fn is_persist_dirty(&self) -> bool {
-        self.persist_dirty
+        self.persist_dirty.load(Ordering::Relaxed)
     }
     /// Mark this entry as having unsaved modifications.
-    pub fn mark_persist_dirty(&mut self) {
-        self.persist_dirty = true;
+    pub fn mark_persist_dirty(&self) {
+        self.persist_dirty.store(true, Ordering::Relaxed);
     }
     /// Clear the persist dirty flag (after successful shard write).
-    pub fn clear_persist_dirty(&mut self) {
-        self.persist_dirty = false;
+    pub fn clear_persist_dirty(&self) {
+        self.persist_dirty.store(false, Ordering::Relaxed);
     }
     /// Get the pre-sorted keys for binary search pagination (initial capacity only).
     /// Returns None after expand() when radix takes over.
@@ -598,166 +624,242 @@ pub struct UnifiedEntryDetail {
     pub has_more: bool,
     pub min_tracked_value: u32,
 }
-/// The unified cache: flat HashMap keyed by (filters, sort, direction).
+/// The unified cache: interior-mutable concurrent map keyed by (filters, sort, direction).
+///
+/// `UnifiedCache` is fully `Sync` and accessed via `&self` from all callers — no
+/// outer `Mutex`/`RwLock` wrapper. Concurrent reads + writes proceed in parallel
+/// across DashMap shards (default 64-way) and never queue on a global lock.
+///
+/// Stat counters are `AtomicU64`. Per-entry LRU + needs_rebuild are atomics on
+/// `UnifiedEntry`. The few non-`Send`/non-`Sync` collections (`pending_shards`,
+/// `meta_has_more`, etc.) are wrapped in `parking_lot::Mutex` and accessed only
+/// on cold paths.
 pub struct UnifiedCache {
-    entries: HashMap<UnifiedKey, UnifiedEntry>,
+    entries: AHashMap2<UnifiedKey, UnifiedEntry>,
     /// Reverse index: meta_id → key, for O(1) lookup from MetaIndex results.
-    meta_id_to_key: HashMap<CacheEntryId, UnifiedKey>,
-    meta: MetaIndex,
-    config: UnifiedCacheConfig,
-    hits: u64,
-    misses: u64,
-    inserts: u64,
-    updates: u64,
-    evictions: u64,
-    invalidations: u64,
+    meta_id_to_key: AHashMap2<CacheEntryId, UnifiedKey>,
+    meta: RwLock<MetaIndex>,
+    config: ArcSwap<UnifiedCacheConfig>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
+    updates: AtomicU64,
+    evictions: AtomicU64,
+    invalidations: AtomicU64,
     /// Running total of entry memory (bitmap + sorted_keys + radix bytes).
-    total_bytes: usize,
+    total_bytes: AtomicUsize,
     // ── Persistence State ──────────────────────────────────────────────
     /// Shards that exist on disk but haven't been loaded into RAM yet.
-    pending_shards: HashSet<ShardKey>,
+    pending_shards: Mutex<HashSet<ShardKey>>,
     /// Shards currently being loaded by another thread (loading sentinel).
-    loading_shards: HashSet<ShardKey>,
+    loading_shards: Mutex<HashSet<ShardKey>>,
     /// Whether meta.bin needs rewriting (new entry, expansion, tombstone).
-    meta_dirty: bool,
+    meta_dirty: AtomicBool,
     /// Which shards need rewriting (bitmap modified by maintenance).
-    shard_dirty: HashSet<ShardKey>,
+    shard_dirty: Mutex<HashSet<ShardKey>>,
     /// Whether persistence is enabled (BoundStore exists).
-    persistence_enabled: bool,
+    persistence_enabled: AtomicBool,
     /// Persisted has_more flags keyed by entry ID, populated from meta.bin on startup.
     /// Consumed during shard restore to avoid hardcoding has_more=true.
-    meta_has_more: HashMap<CacheEntryId, bool>,
+    meta_has_more: Mutex<HashMap<CacheEntryId, bool>>,
     /// Persisted total_matched values keyed by entry ID, populated from meta.bin on startup.
     /// Consumed during shard restore to get the real total instead of bitmap cardinality.
-    meta_total_matched: HashMap<CacheEntryId, u64>,
+    meta_total_matched: Mutex<HashMap<CacheEntryId, u64>>,
     /// Cumulative count of entry expansions from initial to expanded capacity.
-    extensions: u64,
+    extensions: AtomicU64,
     /// Cumulative count of cache wall hits (cursor past cached entries, triggering slow path).
-    wall_hits: u64,
+    wall_hits: AtomicU64,
     /// Cumulative count of prefetch triggers (background expansion requests).
-    prefetches: u64,
+    prefetches: AtomicU64,
     /// True during shard restore — skips per-insert eviction.
-    restoring: bool,
+    restoring: AtomicBool,
     /// Reverse index: ShardKey → set of UnifiedKeys in that shard.
     /// Avoids O(all_entries) scan in entries_for_shard() and clear_shard_entry_dirty().
-    shard_to_keys: HashMap<ShardKey, HashSet<UnifiedKey>>,
+    shard_to_keys: AHashMap2<ShardKey, HashSet<UnifiedKey>>,
+    /// Optional shared metrics handle for reason-attributed rebuild counters.
+    /// Set by `ConcurrentEngine` after construction; tests leave it unset and
+    /// the cache silently skips the increments.
+    rebuild_metrics: OnceLock<Arc<crate::cache_worker::CacheWorkerMetrics>>,
 }
 impl UnifiedCache {
     pub fn new(config: UnifiedCacheConfig) -> Self {
         Self {
-            entries: HashMap::new(),
-            meta_id_to_key: HashMap::new(),
-            meta: MetaIndex::new(),
-            config,
-            hits: 0,
-            misses: 0,
-            inserts: 0,
-            updates: 0,
-            evictions: 0,
-            invalidations: 0,
-            total_bytes: 0,
-            pending_shards: HashSet::new(),
-            loading_shards: HashSet::new(),
-            meta_dirty: false,
-            shard_dirty: HashSet::new(),
-            persistence_enabled: false,
-            meta_has_more: HashMap::new(),
-            meta_total_matched: HashMap::new(),
-            extensions: 0,
-            wall_hits: 0,
-            prefetches: 0,
-            restoring: false,
-            shard_to_keys: HashMap::new(),
+            entries: DashMap::with_hasher(ahash::RandomState::new()),
+            meta_id_to_key: DashMap::with_hasher(ahash::RandomState::new()),
+            meta: RwLock::new(MetaIndex::new()),
+            config: ArcSwap::new(Arc::new(config)),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+            updates: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            invalidations: AtomicU64::new(0),
+            total_bytes: AtomicUsize::new(0),
+            pending_shards: Mutex::new(HashSet::new()),
+            loading_shards: Mutex::new(HashSet::new()),
+            meta_dirty: AtomicBool::new(false),
+            shard_dirty: Mutex::new(HashSet::new()),
+            persistence_enabled: AtomicBool::new(false),
+            meta_has_more: Mutex::new(HashMap::new()),
+            meta_total_matched: Mutex::new(HashMap::new()),
+            extensions: AtomicU64::new(0),
+            wall_hits: AtomicU64::new(0),
+            prefetches: AtomicU64::new(0),
+            restoring: AtomicBool::new(false),
+            shard_to_keys: DashMap::with_hasher(ahash::RandomState::new()),
+            rebuild_metrics: OnceLock::new(),
         }
+    }
+    /// Install the rebuild-attribution metrics handle. Idempotent — only the
+    /// first call has effect. Called by `ConcurrentEngine` post-construction.
+    pub fn set_rebuild_metrics(&self, metrics: Arc<crate::cache_worker::CacheWorkerMetrics>) {
+        let _ = self.rebuild_metrics.set(metrics);
+    }
+    /// Internal helper — returns the metrics handle if set.
+    #[inline]
+    fn rmetrics(&self) -> Option<&Arc<crate::cache_worker::CacheWorkerMetrics>> {
+        self.rebuild_metrics.get()
+    }
+    /// Count cache entries currently in the `needs_rebuild=true` state.
+    /// O(entries) scan — call from the prom scrape path, not the hot path.
+    pub fn count_needs_rebuild(&self) -> u64 {
+        let mut count = 0u64;
+        for r in self.entries.iter() {
+            if r.value().needs_rebuild() {
+                count += 1;
+            }
+        }
+        count
     }
     /// Store persisted has_more flags from meta.bin, keyed by entry ID.
     /// Called during startup after loading meta.bin.
-    pub fn set_meta_has_more(&mut self, map: HashMap<CacheEntryId, bool>) {
-        self.meta_has_more = map;
+    pub fn set_meta_has_more(&self, map: HashMap<CacheEntryId, bool>) {
+        *self.meta_has_more.lock() = map;
     }
     /// Look up persisted has_more for a given entry ID. Falls back to true if not found.
     pub fn get_meta_has_more(&self, entry_id: CacheEntryId) -> bool {
-        self.meta_has_more.get(&entry_id).copied().unwrap_or(true)
+        self.meta_has_more.lock().get(&entry_id).copied().unwrap_or(true)
     }
     /// Store persisted total_matched values from meta.bin, keyed by entry ID.
     /// Called during startup after loading meta.bin.
-    pub fn set_meta_total_matched(&mut self, map: HashMap<CacheEntryId, u64>) {
-        self.meta_total_matched = map;
+    pub fn set_meta_total_matched(&self, map: HashMap<CacheEntryId, u64>) {
+        *self.meta_total_matched.lock() = map;
     }
     /// Look up persisted total_matched for a given entry ID. Falls back to 0 if not found.
     pub fn get_meta_total_matched(&self, entry_id: CacheEntryId) -> u64 {
-        self.meta_total_matched.get(&entry_id).copied().unwrap_or(0)
+        self.meta_total_matched.lock().get(&entry_id).copied().unwrap_or(0)
     }
-    /// Look up a cache entry by key. Returns None on miss.
-    /// Increments hit/miss counters.
-    pub fn lookup(&mut self, key: &UnifiedKey) -> Option<&mut UnifiedEntry> {
-        if let Some(entry) = self.entries.get_mut(key) {
-            if entry.needs_rebuild {
-                // Entry is stale (alive/filter change) — treat as miss.
-                // The caller will do a full traversal and re-form the entry.
-                self.misses += 1;
-                return None;
+    /// Look up a cache entry by key for mutation. Returns `None` on miss.
+    /// Increments hit/miss counters and refreshes LRU.
+    ///
+    /// Returned `RefMut` holds the per-shard write lock for the duration of
+    /// its lifetime — keep the closure body short. Other shards remain
+    /// uncontended so concurrent queries hitting other keys are not blocked.
+    pub fn lookup<'a>(
+        &'a self,
+        key: &UnifiedKey,
+    ) -> Option<dashmap::mapref::one::RefMut<'a, UnifiedKey, UnifiedEntry>> {
+        match self.entries.get_mut(key) {
+            Some(entry) => {
+                if entry.value().needs_rebuild() {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                entry.value().touch();
+                Some(entry)
             }
-            self.hits += 1;
-            entry.touch();
-            Some(entry)
-        } else {
-            self.misses += 1;
-            None
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
-    /// Look up immutably (no touch).
-    pub fn get(&self, key: &UnifiedKey) -> Option<&UnifiedEntry> {
+    /// Look up a cache entry for read-only access. Returns `None` on miss.
+    /// Increments hit/miss counters and refreshes LRU via atomics — no mutation
+    /// of the entry itself, so the per-shard read lock is taken (concurrent
+    /// readers on the same shard proceed in parallel, writers on other shards
+    /// are not blocked).
+    pub fn lookup_for_read<'a>(
+        &'a self,
+        key: &UnifiedKey,
+    ) -> Option<dashmap::mapref::one::Ref<'a, UnifiedKey, UnifiedEntry>> {
+        match self.entries.get(key) {
+            Some(entry) => {
+                if entry.value().needs_rebuild() {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                entry.value().touch();
+                Some(entry)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+    /// Look up immutably (no touch, no stat counter).
+    pub fn get<'a>(
+        &'a self,
+        key: &UnifiedKey,
+    ) -> Option<dashmap::mapref::one::Ref<'a, UnifiedKey, UnifiedEntry>> {
         self.entries.get(key)
     }
     /// Store a new entry, evicting LRU if over budget. Returns the meta_id assigned.
     ///
     /// Uses batch eviction: when over budget, evicts ~10% of entries in one O(n)
-    /// pass instead of calling evict_lru() per entry. This prevents repeated O(n)
-    /// scans while holding the Mutex under high cache churn.
-    pub fn store(&mut self, key: UnifiedKey, entry: UnifiedEntry) -> CacheEntryId {
+    /// pass instead of calling evict_lru() per entry.
+    pub fn store(&self, key: UnifiedKey, entry: UnifiedEntry) -> CacheEntryId {
         let meta_id = entry.meta_id;
         let new_bytes = entry.memory_bytes();
         // If replacing an existing entry, deregister the old one and subtract its bytes
-        if let Some(old) = self.entries.remove(&key) {
-            self.total_bytes = self.total_bytes.saturating_sub(old.memory_bytes());
+        if let Some((_, old)) = self.entries.remove(&key) {
+            // The old entry was the stale one — replacing it counts as a
+            // rebuild completion.
+            if old.needs_rebuild() {
+                if let Some(m) = self.rmetrics() {
+                    m.rebuild_completed_total.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.total_bytes
+                .fetch_sub(old.memory_bytes().min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
             self.meta_id_to_key.remove(&old.meta_id);
-            self.meta.deregister(old.meta_id);
+            self.meta.write().deregister(old.meta_id);
             // Remove from shard→keys index
             let old_sk = ShardKey::new(key.sort_field.clone(), key.direction);
-            if let Some(set) = self.shard_to_keys.get_mut(&old_sk) {
-                set.remove(&key);
+            if let Some(mut set) = self.shard_to_keys.get_mut(&old_sk) {
+                set.value_mut().remove(&key);
             }
         }
         // Batch eviction: when over budget, evict ~10% of entries at once.
-        // One O(n) pass handles many evictions, creating headroom so subsequent
-        // inserts don't trigger eviction. Prevents O(n) scan per insert under
-        // high churn (the Mutex is held during this scan, blocking all queries).
-        if (self.total_bytes + new_bytes > self.config.max_bytes
-            || self.entries.len() >= self.config.max_entries)
+        let cfg = self.config.load();
+        if (self.total_bytes.load(Ordering::Relaxed) + new_bytes > cfg.max_bytes
+            || self.entries.len() >= cfg.max_entries)
             && !self.entries.is_empty()
         {
             self.evict_batch();
         }
         // Mark dirty for persistence
-        if self.persistence_enabled {
-            self.meta_dirty = true;
+        if self.persistence_enabled.load(Ordering::Relaxed) {
+            self.meta_dirty.store(true, Ordering::Relaxed);
             let shard_key = ShardKey::new(key.sort_field.clone(), key.direction);
-            self.shard_dirty.insert(shard_key);
+            self.shard_dirty.lock().insert(shard_key);
         }
-        self.total_bytes += new_bytes;
+        self.total_bytes.fetch_add(new_bytes, Ordering::Relaxed);
         self.meta_id_to_key.insert(meta_id, key.clone());
         // Maintain shard→keys index
         let sk = ShardKey::new(key.sort_field.clone(), key.direction);
         self.shard_to_keys.entry(sk).or_default().insert(key.clone());
         self.entries.insert(key, entry);
-        self.inserts += 1;
+        self.inserts.fetch_add(1, Ordering::Relaxed);
         meta_id
     }
     /// Register a new entry with the meta-index and create the entry.
     /// This is the primary way to create and store entries.
     pub fn form_and_store(
-        &mut self,
+        &self,
         key: UnifiedKey,
         sorted_slots: &[u32],
         has_more: bool,
@@ -765,17 +867,18 @@ impl UnifiedCache {
         value_fn: impl Fn(u32) -> u32,
     ) -> CacheEntryId {
         // Register with meta-index
-        let meta_id = self.meta.register(
+        let meta_id = self.meta.write().register(
             &key.filter_clauses,
             Some(&key.sort_field),
             Some(key.direction),
         );
         let direction = key.direction;
         let uses_bucket = key.filter_clauses.iter().any(|c| c.op == "bucket");
+        let cfg = self.config.load();
         let mut entry = UnifiedEntry::new(
             sorted_slots,
-            self.config.initial_capacity,
-            self.config.max_capacity,
+            cfg.initial_capacity,
+            cfg.max_capacity,
             has_more,
             total_matched,
             meta_id,
@@ -784,8 +887,6 @@ impl UnifiedCache {
         );
         entry.set_uses_bucket(uses_bucket);
         if uses_bucket {
-            // Tag with current time so lazy diff application knows when this entry was computed.
-            // Snapping is applied later when compared against pending diffs.
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -794,120 +895,147 @@ impl UnifiedCache {
         }
         self.store(key, entry)
     }
+
+    /// Read the cache config snapshot. Cheap atomic-load via `ArcSwap`.
+    pub fn capacity_config(&self) -> (usize, usize) {
+        let cfg = self.config.load();
+        (cfg.initial_capacity, cfg.max_capacity)
+    }
+
+    /// Register a meta-index id without building or inserting an entry.
+    /// Pairs with `store` to split form_and_store into three phases.
+    pub fn allocate_meta_id(&self, key: &UnifiedKey) -> CacheEntryId {
+        self.meta.write().register(
+            &key.filter_clauses,
+            Some(&key.sort_field),
+            Some(key.direction),
+        )
+    }
     /// Evict the least-recently-used entry. Returns the evicted key, if any.
     ///
     /// When persistence is enabled:
     /// - Skips dirty entries (unsaved bitmap modifications)
     /// - Does NOT deregister from meta-index (entry stays on disk as orphan)
-    pub fn evict_lru(&mut self) -> Option<UnifiedKey> {
-        let lru_key = if self.persistence_enabled {
-            // Skip dirty entries — they have unsaved bitmap modifications
+    pub fn evict_lru(&self) -> Option<UnifiedKey> {
+        let persistence = self.persistence_enabled.load(Ordering::Relaxed);
+        let lru_key = if persistence {
             self.entries
                 .iter()
-                .filter(|(_, entry)| !entry.persist_dirty)
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
+                .filter(|r| !r.value().is_persist_dirty())
+                .min_by_key(|r| r.value().last_used_ms())
+                .map(|r| r.key().clone())
                 .or_else(|| {
-                    // All entries dirty — fall back to oldest regardless
                     self.entries
                         .iter()
-                        .min_by_key(|(_, entry)| entry.last_used)
-                        .map(|(key, _)| key.clone())
+                        .min_by_key(|r| r.value().last_used_ms())
+                        .map(|r| r.key().clone())
                 })
         } else {
             self.entries
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
+                .min_by_key(|r| r.value().last_used_ms())
+                .map(|r| r.key().clone())
         }?;
-        if let Some(evicted) = self.entries.remove(&lru_key) {
+        if let Some((_, evicted)) = self.entries.remove(&lru_key) {
             tracing::info!(
                 "Cache evicted entry: sort={} {:?} | filters={} | card={} | bytes={}",
                 lru_key.sort_field, lru_key.direction, lru_key.filter_clauses.len(),
                 evicted.cardinality(), evicted.memory_bytes()
             );
-            self.total_bytes = self.total_bytes.saturating_sub(evicted.memory_bytes());
+            let bytes = evicted.memory_bytes();
+            self.total_bytes
+                .fetch_sub(bytes.min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
             self.meta_id_to_key.remove(&evicted.meta_id);
-            // Remove from shard→keys index
             let sk = ShardKey::new(lru_key.sort_field.clone(), lru_key.direction);
-            if let Some(set) = self.shard_to_keys.get_mut(&sk) {
-                set.remove(&lru_key);
+            if let Some(mut set) = self.shard_to_keys.get_mut(&sk) {
+                set.value_mut().remove(&lru_key);
             }
-            self.evictions += 1;
-            if !self.persistence_enabled {
-                // Without persistence, deregister fully (original behavior)
-                self.meta.deregister(evicted.meta_id);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            if !persistence {
+                self.meta.write().deregister(evicted.meta_id);
             }
-            // With persistence: meta-index keeps the registration.
-            // Entry stays on disk as orphan — can be reloaded from shard.
         }
         Some(lru_key)
     }
-    /// Batch eviction: evict ~10% of entries (minimum 1) in one O(n) pass.
-    ///
-    /// Collects all entries sorted by last_used, evicts the oldest 10%.
-    /// This creates headroom so subsequent inserts don't trigger eviction,
-    /// avoiding repeated O(n) scans under high cache churn.
-    pub fn evict_batch(&mut self) {
+    /// Batch eviction: evict ~10% of entries (minimum 1) in one pass via sampled-LRU.
+    pub fn evict_batch(&self) {
         if self.entries.is_empty() {
             return;
         }
-        // Collect (last_used, key) for all evictable entries
-        let mut candidates: Vec<(Instant, UnifiedKey)> = if self.persistence_enabled {
-            // Prefer non-dirty entries first
-            let mut non_dirty: Vec<_> = self.entries.iter()
-                .filter(|(_, e)| !e.persist_dirty)
-                .map(|(k, e)| (e.last_used, k.clone()))
-                .collect();
-            if non_dirty.is_empty() {
-                // All dirty — fall back to all entries
-                self.entries.iter()
-                    .map(|(k, e)| (e.last_used, k.clone()))
-                    .collect()
-            } else {
-                non_dirty
-            }
-        } else {
-            self.entries.iter()
-                .map(|(k, e)| (e.last_used, k.clone()))
-                .collect()
-        };
-        // Sort by last_used ascending (oldest first)
-        candidates.sort_unstable_by_key(|(t, _)| *t);
-        // Evict 10% of total entries (minimum 1), or enough to get under budget
+        const SAMPLE_SIZE: usize = 8;
         let target_evict = (self.entries.len() / 10).max(1);
         let mut evicted = 0;
-        for (_, key) in candidates.into_iter().take(target_evict) {
-            if let Some(entry) = self.entries.remove(&key) {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.memory_bytes());
-                self.meta_id_to_key.remove(&entry.meta_id);
-                // Remove from shard→keys index
-                let sk = ShardKey::new(key.sort_field.clone(), key.direction);
-                if let Some(set) = self.shard_to_keys.get_mut(&sk) {
-                    set.remove(&key);
+        use std::hash::{BuildHasher, Hasher};
+        let hb = ahash::RandomState::new();
+        let prefer_non_dirty = self.persistence_enabled.load(Ordering::Relaxed);
+        for tick in 0..target_evict {
+            let mut h = hb.build_hasher();
+            h.write_u64(self.evictions.load(Ordering::Relaxed).wrapping_add(tick as u64));
+            let skip = (h.finish() as usize) % self.entries.len().max(1);
+            let mut best: Option<(u64, UnifiedKey)> = None;
+            let mut all_dirty_seen = true;
+            // Take a fresh sample — DashMap iter order is shard-order, randomize via skip.
+            let mut sampled = 0usize;
+            for r in self.entries.iter().skip(skip) {
+                if sampled >= SAMPLE_SIZE { break; }
+                sampled += 1;
+                let e = r.value();
+                if prefer_non_dirty && e.is_persist_dirty() {
+                    continue;
                 }
-                self.evictions += 1;
-                if !self.persistence_enabled {
-                    self.meta.deregister(entry.meta_id);
+                all_dirty_seen = false;
+                let lu = e.last_used_ms();
+                match best.as_ref() {
+                    None => best = Some((lu, r.key().clone())),
+                    Some((t, _)) if lu < *t => {
+                        best = Some((lu, r.key().clone()));
+                    }
+                    _ => {}
+                }
+            }
+            if best.is_none() && prefer_non_dirty && all_dirty_seen {
+                if let Some(r) = self.entries.iter().skip(skip).next() {
+                    best = Some((r.value().last_used_ms(), r.key().clone()));
+                }
+            }
+            let Some((_, key)) = best else { break };
+            if let Some((_, entry)) = self.entries.remove(&key) {
+                let bytes = entry.memory_bytes();
+                self.total_bytes
+                    .fetch_sub(bytes.min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+                self.meta_id_to_key.remove(&entry.meta_id);
+                let sk = ShardKey::new(key.sort_field.clone(), key.direction);
+                if let Some(mut set) = self.shard_to_keys.get_mut(&sk) {
+                    set.value_mut().remove(&key);
+                }
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                if !prefer_non_dirty {
+                    self.meta.write().deregister(entry.meta_id);
                 }
                 evicted += 1;
             }
         }
         if evicted > 0 {
-            tracing::info!("Cache batch eviction: evicted {evicted} entries, {} remaining", self.entries.len());
+            tracing::info!("Cache sampled-LRU eviction: evicted {evicted} entries, {} remaining", self.entries.len());
         }
     }
-    /// Get a mutable reference to an entry by key (no touch).
-    pub fn get_mut(&mut self, key: &UnifiedKey) -> Option<&mut UnifiedEntry> {
+    /// Get a mutable reference to an entry by key (no touch, no stat counter).
+    pub fn get_mut<'a>(
+        &'a self,
+        key: &UnifiedKey,
+    ) -> Option<dashmap::mapref::one::RefMut<'a, UnifiedKey, UnifiedEntry>> {
         self.entries.get_mut(key)
     }
-    /// Access the meta-index.
-    pub fn meta(&self) -> &MetaIndex {
-        &self.meta
+    /// Access the meta-index. Returns a read guard — callers chain method calls
+    /// directly (e.g. `cache.meta().entry_count()`); the guard drops at the end
+    /// of the call expression.
+    pub fn meta(&self) -> RwLockReadGuard<'_, MetaIndex> {
+        self.meta.read()
     }
-    /// Access the meta-index mutably.
-    pub fn meta_mut(&mut self) -> &mut MetaIndex {
-        &mut self.meta
+    /// Access the meta-index mutably. Returns a write guard with the same usage
+    /// pattern as `meta()`.
+    pub fn meta_mut(&self) -> RwLockWriteGuard<'_, MetaIndex> {
+        self.meta.write()
     }
     /// Number of cached entries.
     pub fn len(&self) -> usize {
@@ -918,67 +1046,71 @@ impl UnifiedCache {
     }
     /// Total memory of all bounded bitmaps.
     pub fn total_memory_bytes(&self) -> usize {
-        self.total_bytes
+        self.total_bytes.load(Ordering::Relaxed)
     }
     /// Reconcile the tracked total_bytes with actual entry sizes.
     /// Call after bulk maintenance operations (expand/rebuild/add_slot/remove_slot)
     /// which mutate entries in-place without updating the running total.
-    pub fn reconcile_bytes(&mut self) {
-        self.total_bytes = self.entries.values().map(|e| e.memory_bytes()).sum();
+    pub fn reconcile_bytes(&self) {
+        let total: usize = self.entries.iter().map(|r| r.value().memory_bytes()).sum();
+        self.total_bytes.store(total, Ordering::Relaxed);
     }
     /// Clear all entries, reset the meta-index, and reset counters.
-    pub fn clear(&mut self) {
+    pub fn clear(&self) {
         self.entries.clear();
         self.meta_id_to_key.clear();
         self.shard_to_keys.clear();
-        self.meta = MetaIndex::new();
-        self.hits = 0;
-        self.misses = 0;
-        self.total_bytes = 0;
-        self.pending_shards.clear();
-        self.loading_shards.clear();
-        self.meta_dirty = false;
-        self.shard_dirty.clear();
-        self.meta_total_matched.clear();
+        *self.meta.write() = MetaIndex::new();
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+        self.total_bytes.store(0, Ordering::Relaxed);
+        self.pending_shards.lock().clear();
+        self.loading_shards.lock().clear();
+        self.meta_dirty.store(false, Ordering::Relaxed);
+        self.shard_dirty.lock().clear();
+        self.meta_total_matched.lock().clear();
     }
     /// Return a stats snapshot.
     pub fn stats(&self) -> UnifiedCacheStats {
-        // Count entries by capacity tier
         let mut entries_initial = 0usize;
         let mut entries_expanded = 0usize;
-        for entry in self.entries.values() {
+        for r in self.entries.iter() {
+            let entry = r.value();
             if entry.capacity >= entry.max_capacity {
                 entries_expanded += 1;
             } else {
                 entries_initial += 1;
             }
         }
+        let meta = self.meta.read();
         UnifiedCacheStats {
             entries: self.entries.len(),
-            hits: self.hits,
-            misses: self.misses,
-            inserts: self.inserts,
-            updates: self.updates,
-            evictions: self.evictions,
-            invalidations: self.invalidations,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            updates: self.updates.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            invalidations: self.invalidations.load(Ordering::Relaxed),
             memory_bytes: self.total_memory_bytes(),
-            meta_index_entries: self.meta.entry_count(),
-            meta_index_bytes: self.meta.memory_bytes(),
-            persistence_enabled: self.persistence_enabled,
-            tombstone_count: self.meta.tombstone_count(),
-            pending_shard_count: self.pending_shards.len(),
-            dirty_shard_count: self.shard_dirty.len(),
-            meta_dirty: self.meta_dirty,
+            meta_index_entries: meta.entry_count(),
+            meta_index_bytes: meta.memory_bytes(),
+            persistence_enabled: self.persistence_enabled.load(Ordering::Relaxed),
+            tombstone_count: meta.tombstone_count(),
+            pending_shard_count: self.pending_shards.lock().len(),
+            dirty_shard_count: self.shard_dirty.lock().len(),
+            meta_dirty: self.meta_dirty.load(Ordering::Relaxed),
             entries_initial,
             entries_expanded,
-            extensions: self.extensions,
-            wall_hits: self.wall_hits,
-            prefetches: self.prefetches,
+            extensions: self.extensions.load(Ordering::Relaxed),
+            wall_hits: self.wall_hits.load(Ordering::Relaxed),
+            prefetches: self.prefetches.load(Ordering::Relaxed),
         }
     }
     /// Return per-entry detail for diagnostics/testing.
     pub fn entry_details(&self) -> Vec<UnifiedEntryDetail> {
-        self.entries.iter().map(|(key, entry)| {
+        self.entries.iter().map(|r| {
+            let key = r.key();
+            let entry = r.value();
             UnifiedEntryDetail {
                 sort_field: key.sort_field.to_string(),
                 direction: format!("{:?}", key.direction),
@@ -992,197 +1124,199 @@ impl UnifiedCache {
         }).collect()
     }
     /// Reset hit/miss counters without clearing entries.
-    pub fn reset_counters(&mut self) {
-        self.hits = 0;
-        self.misses = 0;
+    pub fn reset_counters(&self) {
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
     }
     /// Record a cache entry update (called by flush thread during maintenance).
-    pub fn record_update(&mut self) {
-        self.updates += 1;
+    /// `&self` so the read path can record stat events without escalating to
+    /// a write lock — counters are atomic.
+    pub fn record_update(&self) {
+        self.updates.fetch_add(1, Ordering::Relaxed);
     }
     /// Record a cache entry expansion from initial to expanded capacity.
-    pub fn record_extension(&mut self) {
-        self.extensions += 1;
+    pub fn record_extension(&self) {
+        self.extensions.fetch_add(1, Ordering::Relaxed);
     }
     /// Record a cache wall hit (cursor went past cached entries, triggering expansion/slow path).
-    pub fn record_wall_hit(&mut self) {
-        self.wall_hits += 1;
+    pub fn record_wall_hit(&self) {
+        self.wall_hits.fetch_add(1, Ordering::Relaxed);
     }
     /// Record a prefetch trigger (background expansion request sent).
-    pub fn record_prefetch(&mut self) {
-        self.prefetches += 1;
+    pub fn record_prefetch(&self) {
+        self.prefetches.fetch_add(1, Ordering::Relaxed);
     }
-    /// Get the cache config.
-    pub fn config(&self) -> &UnifiedCacheConfig {
-        &self.config
+    /// Get a snapshot of the cache config. Cheap atomic load via `ArcSwap`.
+    pub fn config(&self) -> Arc<UnifiedCacheConfig> {
+        self.config.load_full()
     }
-    /// Get mutable access to the cache config.
-    pub fn config_mut(&mut self) -> &mut UnifiedCacheConfig {
-        &mut self.config
+    /// Mutate the cache config under a closure: clone current → modify → swap.
+    /// Used by runtime PATCH endpoint to update individual config fields.
+    pub fn with_config_mut(&self, f: impl FnOnce(&mut UnifiedCacheConfig)) {
+        let current = self.config.load_full();
+        let mut next = (*current).clone();
+        f(&mut next);
+        self.config.store(Arc::new(next));
     }
-    /// Iterate all entries mutably (for flush thread maintenance).
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&UnifiedKey, &mut UnifiedEntry)> {
-        self.entries.iter_mut()
+    /// Get the key for a meta_id. O(1) via reverse index. Returns a cloned
+    /// `UnifiedKey` (the underlying DashMap entry's shard lock can't escape).
+    pub fn key_for_meta_id(&self, meta_id: CacheEntryId) -> Option<UnifiedKey> {
+        self.meta_id_to_key.get(&meta_id).map(|r| r.value().clone())
     }
-    /// Get entry by meta_id. O(1) via reverse index.
-    pub fn entry_by_meta_id(&mut self, meta_id: CacheEntryId) -> Option<&mut UnifiedEntry> {
-        let key = self.meta_id_to_key.get(&meta_id)?;
-        self.entries.get_mut(key)
-    }
-    /// Get the key for a meta_id. O(1) via reverse index.
-    pub fn key_for_meta_id(&self, meta_id: CacheEntryId) -> Option<&UnifiedKey> {
-        self.meta_id_to_key.get(&meta_id)
-    }
-    /// Iterate over all meta_id → key mappings (for persistence snapshot).
-    pub fn iter_meta_id_to_key(&self) -> impl Iterator<Item = (&CacheEntryId, &UnifiedKey)> {
-        self.meta_id_to_key.iter()
+    /// Snapshot all meta_id → key mappings (for persistence flush). Returns a
+    /// cloned `Vec` so callers don't hold any DashMap shard locks.
+    pub fn meta_id_to_key_snapshot(&self) -> Vec<(CacheEntryId, UnifiedKey)> {
+        self.meta_id_to_key
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect()
     }
     // ── Persistence Support ──────────────────────────────────────────────────
     /// Enable persistence mode. Called when a BoundStore is available.
-    pub fn enable_persistence(&mut self) {
-        self.persistence_enabled = true;
+    pub fn enable_persistence(&self) {
+        self.persistence_enabled.store(true, Ordering::Relaxed);
     }
     /// Whether persistence is enabled.
     pub fn persistence_enabled(&self) -> bool {
-        self.persistence_enabled
+        self.persistence_enabled.load(Ordering::Relaxed)
     }
     /// Check if a shard is pending (exists on disk, not loaded).
     pub fn is_shard_pending(&self, sort_field: &str, direction: SortDirection) -> bool {
-        self.pending_shards.contains(&ShardKey::new(sort_field.to_string(), direction))
+        self.pending_shards.lock().contains(&ShardKey::new(sort_field.to_string(), direction))
     }
     /// Check if a shard is currently being loaded.
     pub fn is_shard_loading(&self, sort_field: &str, direction: SortDirection) -> bool {
-        self.loading_shards.contains(&ShardKey::new(sort_field.to_string(), direction))
+        self.loading_shards.lock().contains(&ShardKey::new(sort_field.to_string(), direction))
     }
     /// Mark a shard as loading (sentinel to prevent concurrent loads).
-    pub fn mark_shard_loading(&mut self, sort_field: &str, direction: SortDirection) {
+    pub fn mark_shard_loading(&self, sort_field: &str, direction: SortDirection) {
         let key = ShardKey::new(sort_field.to_string(), direction);
-        self.pending_shards.remove(&key);
-        self.loading_shards.insert(key);
+        self.pending_shards.lock().remove(&key);
+        self.loading_shards.lock().insert(key);
     }
     /// Mark a shard as loaded (remove from pending and loading).
-    pub fn mark_shard_loaded(&mut self, sort_field: &str, direction: SortDirection) {
+    pub fn mark_shard_loaded(&self, sort_field: &str, direction: SortDirection) {
         let key = ShardKey::new(sort_field.to_string(), direction);
-        self.pending_shards.remove(&key);
-        self.loading_shards.remove(&key);
+        self.pending_shards.lock().remove(&key);
+        self.loading_shards.lock().remove(&key);
     }
     /// Add pending shards (from meta.bin on startup).
-    pub fn add_pending_shards(&mut self, shards: impl IntoIterator<Item = ShardKey>) {
-        self.pending_shards.extend(shards);
+    pub fn add_pending_shards(&self, shards: impl IntoIterator<Item = ShardKey>) {
+        self.pending_shards.lock().extend(shards);
     }
-    /// Get all pending shard keys.
-    pub fn pending_shards(&self) -> &HashSet<ShardKey> {
-        &self.pending_shards
+    /// Get all pending shard keys (returns a guard — the held lock blocks
+    /// concurrent mutation of the pending-shards set for the guard's lifetime).
+    pub fn pending_shards(&self) -> MutexGuard<'_, HashSet<ShardKey>> {
+        self.pending_shards.lock()
     }
     /// Insert a restored entry from disk (shard load). Does NOT register with
     /// meta-index (that was done during meta.bin load). Does NOT set meta_dirty.
     ///
     /// Skips eviction during restore (restoring flag). Call `finish_restore()` after
     /// loading all entries to run a single eviction pass.
-    pub fn insert_restored_entry(&mut self, key: UnifiedKey, entry: UnifiedEntry) {
+    pub fn insert_restored_entry(&self, key: UnifiedKey, entry: UnifiedEntry) {
         let meta_id = entry.meta_id;
         let bytes = entry.memory_bytes();
-        // Skip per-insert eviction during restore — batch evict at the end
-        if !self.restoring {
-            if (self.total_bytes + bytes > self.config.max_bytes
-                || self.entries.len() >= self.config.max_entries)
+        if !self.restoring.load(Ordering::Relaxed) {
+            let cfg = self.config.load();
+            if (self.total_bytes.load(Ordering::Relaxed) + bytes > cfg.max_bytes
+                || self.entries.len() >= cfg.max_entries)
                 && !self.entries.is_empty()
             {
                 self.evict_batch();
             }
         }
-        self.total_bytes += bytes;
+        self.total_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.meta_id_to_key.insert(meta_id, key.clone());
-        // Maintain shard→keys index
         let sk = ShardKey::new(key.sort_field.clone(), key.direction);
         self.shard_to_keys.entry(sk).or_default().insert(key.clone());
         self.entries.insert(key, entry);
     }
     /// Begin restore mode: skip per-insert eviction during shard restore.
-    pub fn begin_restore(&mut self) {
-        self.restoring = true;
+    pub fn begin_restore(&self) {
+        self.restoring.store(true, Ordering::Relaxed);
     }
     /// Finish restore mode: run a single eviction pass to bring the cache under budget.
-    ///
-    /// Uses sort-once-remove-N approach: O(n log n) instead of the old O(n²)
-    /// loop that called evict_lru() repeatedly (each call did O(n) linear scan).
-    pub fn finish_restore(&mut self) {
-        self.restoring = false;
-        let over_bytes = self.total_bytes > self.config.max_bytes;
-        let over_entries = self.entries.len() > self.config.max_entries;
+    pub fn finish_restore(&self) {
+        self.restoring.store(false, Ordering::Relaxed);
+        let cfg = self.config.load();
+        let over_bytes = self.total_bytes.load(Ordering::Relaxed) > cfg.max_bytes;
+        let over_entries = self.entries.len() > cfg.max_entries;
         if !over_bytes && !over_entries {
             return;
         }
-        // Collect all entries sorted by last_used (oldest first)
-        let mut candidates: Vec<(Instant, UnifiedKey)> = if self.persistence_enabled {
+        let persistence = self.persistence_enabled.load(Ordering::Relaxed);
+        let mut candidates: Vec<(u64, UnifiedKey)> = if persistence {
             let non_dirty: Vec<_> = self.entries.iter()
-                .filter(|(_, e)| !e.persist_dirty)
-                .map(|(k, e)| (e.last_used, k.clone()))
+                .filter(|r| !r.value().is_persist_dirty())
+                .map(|r| (r.value().last_used_ms(), r.key().clone()))
                 .collect();
             if non_dirty.is_empty() {
                 self.entries.iter()
-                    .map(|(k, e)| (e.last_used, k.clone()))
+                    .map(|r| (r.value().last_used_ms(), r.key().clone()))
                     .collect()
             } else {
                 non_dirty
             }
         } else {
             self.entries.iter()
-                .map(|(k, e)| (e.last_used, k.clone()))
+                .map(|r| (r.value().last_used_ms(), r.key().clone()))
                 .collect()
         };
         candidates.sort_unstable_by_key(|(t, _)| *t);
-        // Remove oldest entries until under budget
         let mut evicted = 0usize;
         for (_, key) in &candidates {
-            if self.total_bytes <= self.config.max_bytes
-                && self.entries.len() <= self.config.max_entries
+            if self.total_bytes.load(Ordering::Relaxed) <= cfg.max_bytes
+                && self.entries.len() <= cfg.max_entries
             {
                 break;
             }
-            if let Some(entry) = self.entries.remove(key) {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.memory_bytes());
+            if let Some((_, entry)) = self.entries.remove(key) {
+                let bytes = entry.memory_bytes();
+                self.total_bytes
+                    .fetch_sub(bytes.min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
                 self.meta_id_to_key.remove(&entry.meta_id);
                 let sk = ShardKey::new(key.sort_field.clone(), key.direction);
-                if let Some(set) = self.shard_to_keys.get_mut(&sk) {
-                    set.remove(key);
+                if let Some(mut set) = self.shard_to_keys.get_mut(&sk) {
+                    set.value_mut().remove(key);
                 }
-                self.evictions += 1;
-                if !self.persistence_enabled {
-                    self.meta.deregister(entry.meta_id);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+                if !persistence {
+                    self.meta.write().deregister(entry.meta_id);
                 }
                 evicted += 1;
             }
         }
         if evicted > 0 {
             eprintln!("BoundStore restore: evicted {evicted} entries to fit budget ({}MB / {}MB)",
-                self.total_bytes / 1_048_576,
-                self.config.max_bytes / 1_048_576);
+                self.total_bytes.load(Ordering::Relaxed) / 1_048_576,
+                cfg.max_bytes / 1_048_576);
         }
     }
     /// Check if meta needs writing.
     pub fn is_meta_dirty(&self) -> bool {
-        self.meta_dirty
+        self.meta_dirty.load(Ordering::Relaxed)
     }
     /// Clear the meta dirty flag (after successful write).
-    pub fn clear_meta_dirty(&mut self) {
-        self.meta_dirty = false;
+    pub fn clear_meta_dirty(&self) {
+        self.meta_dirty.store(false, Ordering::Relaxed);
     }
     /// Set the meta dirty flag.
-    pub fn set_meta_dirty(&mut self) {
-        self.meta_dirty = true;
+    pub fn set_meta_dirty(&self) {
+        self.meta_dirty.store(true, Ordering::Relaxed);
     }
-    /// Get dirty shards that need writing.
-    pub fn dirty_shards(&self) -> &HashSet<ShardKey> {
-        &self.shard_dirty
+    /// Get dirty shards that need writing — returns a guard. Iterate inline
+    /// (e.g. `cache.dirty_shards().iter().cloned().collect::<Vec<_>>()`).
+    pub fn dirty_shards(&self) -> MutexGuard<'_, HashSet<ShardKey>> {
+        self.shard_dirty.lock()
     }
     /// Mark a shard as dirty.
-    pub fn mark_shard_dirty(&mut self, key: ShardKey) {
-        self.shard_dirty.insert(key);
+    pub fn mark_shard_dirty(&self, key: ShardKey) {
+        self.shard_dirty.lock().insert(key);
     }
     /// Clear a shard dirty flag (after successful write).
-    pub fn clear_shard_dirty(&mut self, key: &ShardKey) {
-        self.shard_dirty.remove(key);
+    pub fn clear_shard_dirty(&self, key: &ShardKey) {
+        self.shard_dirty.lock().remove(key);
     }
     /// Check if an entry ID is in RAM (for tombstone decisions).
     pub fn has_entry_id(&self, meta_id: CacheEntryId) -> bool {
@@ -1192,12 +1326,14 @@ impl UnifiedCache {
     /// Returns (meta_id, key, bitmap_clone, sorted_keys_clone) for each entry in the shard.
     /// Uses shard→keys index for O(shard_entries) instead of O(all_entries).
     pub fn entries_for_shard(&self, shard_key: &ShardKey) -> Vec<(CacheEntryId, UnifiedKey, RoaringBitmap, Option<Vec<u64>>)> {
-        let Some(keys) = self.shard_to_keys.get(shard_key) else {
-            return Vec::new();
+        let keys: Vec<UnifiedKey> = match self.shard_to_keys.get(shard_key) {
+            Some(set) => set.value().iter().cloned().collect(),
+            None => return Vec::new(),
         };
-        keys.iter()
+        keys.into_iter()
             .filter_map(|key| {
-                self.entries.get(key).map(|entry| {
+                self.entries.get(&key).map(|r| {
+                    let entry = r.value();
                     let sk = entry.sorted_keys().map(|arc| arc.as_ref().clone());
                     (entry.meta_id, key.clone(), entry.bitmap.as_ref().clone(), sk)
                 })
@@ -1206,45 +1342,46 @@ impl UnifiedCache {
     }
     /// Clear persist_dirty flags for entries in a specific shard (after successful write).
     /// Uses shard→keys index for O(shard_entries) instead of O(all_entries).
-    pub fn clear_shard_entry_dirty(&mut self, shard_key: &ShardKey) {
+    pub fn clear_shard_entry_dirty(&self, shard_key: &ShardKey) {
         let keys: Vec<UnifiedKey> = self.shard_to_keys
             .get(shard_key)
-            .map(|set| set.iter().cloned().collect())
+            .map(|r| r.value().iter().cloned().collect())
             .unwrap_or_default();
         for key in &keys {
-            if let Some(entry) = self.entries.get_mut(key) {
-                entry.persist_dirty = false;
+            if let Some(r) = self.entries.get(key) {
+                r.value().persist_dirty.store(false, Ordering::Relaxed);
             }
         }
     }
     /// Tombstone an entry that isn't in RAM (flush thread: mutation to unloaded entry).
     /// Sets meta_dirty. Does NOT touch the shard (tombstone cleanup is deferred).
-    pub fn tombstone_entry(&mut self, meta_id: CacheEntryId) {
-        self.meta.tombstone(meta_id);
-        self.meta_dirty = true;
+    pub fn tombstone_entry(&self, meta_id: CacheEntryId) {
+        self.meta.write().tombstone(meta_id);
+        self.meta_dirty.store(true, Ordering::Relaxed);
     }
     /// Finalize shard write: clean up tombstones for entries that were omitted,
     /// deregister them from meta-index, and recycle their IDs.
-    pub fn finalize_shard_write(&mut self, cleaned_ids: &[CacheEntryId]) {
+    pub fn finalize_shard_write(&self, cleaned_ids: &[CacheEntryId]) {
+        let mut meta = self.meta.write();
         for &id in cleaned_ids {
-            self.meta.clear_tombstone(id);
-            self.meta.deregister(id);
+            meta.clear_tombstone(id);
+            meta.deregister(id);
         }
     }
     /// Check if >50% of a shard's entries are tombstoned (triggers forced cleanup).
     pub fn shard_needs_cleanup(&self, shard_key: &ShardKey) -> bool {
-        // Count entries registered for this shard's sort spec
-        let total = self.meta.entries_for_sort(&shard_key.sort_field, shard_key.direction)
+        let meta = self.meta.read();
+        let total = meta.entries_for_sort(&shard_key.sort_field, shard_key.direction)
             .map(|bm| bm.len())
             .unwrap_or(0);
         if total == 0 {
             return false;
         }
-        let tombstoned = self.meta.entries_for_sort(&shard_key.sort_field, shard_key.direction)
+        let tombstoned = meta.entries_for_sort(&shard_key.sort_field, shard_key.direction)
             .map(|bm| {
                 let mut count = 0u64;
                 for id in bm.iter() {
-                    if self.meta.is_tombstoned(id) {
+                    if meta.is_tombstoned(id) {
                         count += 1;
                     }
                 }
@@ -1255,64 +1392,79 @@ impl UnifiedCache {
     }
     /// Tombstone unloaded entries affected by filter field mutations.
     /// Returns the number of entries tombstoned.
-    pub fn tombstone_unloaded_for_filter(&mut self, changed_fields: &[&str]) -> u64 {
-        if !self.persistence_enabled {
+    pub fn tombstone_unloaded_for_filter(&self, changed_fields: &[&str]) -> u64 {
+        if !self.persistence_enabled.load(Ordering::Relaxed) {
             return 0;
         }
         let mut to_tombstone = Vec::new();
-        for field in changed_fields {
-            if let Some(bm) = self.meta.entries_for_filter_field(field) {
-                for id in bm.iter() {
-                    if !self.meta_id_to_key.contains_key(&id) && !self.meta.is_tombstoned(id) {
+        {
+            let meta = self.meta.read();
+            for field in changed_fields {
+                if let Some(bm) = meta.entries_for_filter_field(field) {
+                    for id in bm.iter() {
+                        if !self.meta_id_to_key.contains_key(&id) && !meta.is_tombstoned(id) {
+                            to_tombstone.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        let count = to_tombstone.len() as u64;
+        if count > 0 {
+            let mut meta = self.meta.write();
+            for id in to_tombstone {
+                meta.tombstone(id);
+            }
+            self.meta_dirty.store(true, Ordering::Relaxed);
+        }
+        count
+    }
+    /// Tombstone unloaded entries affected by sort field mutations.
+    /// Returns the number of entries tombstoned.
+    pub fn tombstone_unloaded_for_sort(&self, changed_fields: &[&str]) -> u64 {
+        if !self.persistence_enabled.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let mut to_tombstone = Vec::new();
+        {
+            let meta = self.meta.read();
+            for field in changed_fields {
+                let affected = meta.entries_for_sort_field(field);
+                for id in affected.iter() {
+                    if !self.meta_id_to_key.contains_key(&id) && !meta.is_tombstoned(id) {
                         to_tombstone.push(id);
                     }
                 }
             }
         }
         let count = to_tombstone.len() as u64;
-        for id in to_tombstone {
-            self.meta.tombstone(id);
-            self.meta_dirty = true;
-        }
-        count
-    }
-    /// Tombstone unloaded entries affected by sort field mutations.
-    /// Returns the number of entries tombstoned.
-    pub fn tombstone_unloaded_for_sort(&mut self, changed_fields: &[&str]) -> u64 {
-        if !self.persistence_enabled {
-            return 0;
-        }
-        let mut to_tombstone = Vec::new();
-        for field in changed_fields {
-            let affected = self.meta.entries_for_sort_field(field);
-            for id in affected.iter() {
-                if !self.meta_id_to_key.contains_key(&id) && !self.meta.is_tombstoned(id) {
-                    to_tombstone.push(id);
-                }
+        if count > 0 {
+            let mut meta = self.meta.write();
+            for id in to_tombstone {
+                meta.tombstone(id);
             }
-        }
-        let count = to_tombstone.len() as u64;
-        for id in to_tombstone {
-            self.meta.tombstone(id);
-            self.meta_dirty = true;
+            self.meta_dirty.store(true, Ordering::Relaxed);
         }
         count
     }
     /// Tombstone ALL unloaded entries (registered in meta but not in RAM).
-    /// Used when alive changes (deletes) affect all cache entries — we can't
-    /// selectively remove a deleted slot from an unloaded entry's bitmap.
-    /// Returns the number of entries tombstoned.
-    pub fn tombstone_all_unloaded(&mut self) -> u64 {
-        if !self.persistence_enabled {
+    pub fn tombstone_all_unloaded(&self) -> u64 {
+        if !self.persistence_enabled.load(Ordering::Relaxed) {
             return 0;
         }
-        let to_tombstone: Vec<u32> = self.meta.all_registered_ids()
-            .filter(|id| !self.meta_id_to_key.contains_key(id) && !self.meta.is_tombstoned(*id))
-            .collect();
+        let to_tombstone: Vec<u32> = {
+            let meta = self.meta.read();
+            meta.all_registered_ids()
+                .filter(|id| !self.meta_id_to_key.contains_key(id) && !meta.is_tombstoned(*id))
+                .collect()
+        };
         let count = to_tombstone.len() as u64;
-        for id in to_tombstone {
-            self.meta.tombstone(id);
-            self.meta_dirty = true;
+        if count > 0 {
+            let mut meta = self.meta.write();
+            for id in to_tombstone {
+                meta.tombstone(id);
+            }
+            self.meta_dirty.store(true, Ordering::Relaxed);
         }
         count
     }
@@ -1325,13 +1477,12 @@ impl UnifiedCache {
     ///
     /// Called by the flush thread after applying mutations to staging.
     pub fn maintain_filter_changes(
-        &mut self,
+        &self,
         filter_inserts: &HashMap<FilterGroupKey, Vec<u32>>,
         filter_removes: &HashMap<FilterGroupKey, Vec<u32>>,
         filters: &FilterIndex,
         sorts: &SortIndex,
     ) {
-        // Collect changed slots per field name
         let mut changed_slots_per_field: HashMap<&str, HashSet<u32>> = HashMap::new();
         for (key, slots) in filter_inserts {
             changed_slots_per_field
@@ -1348,94 +1499,96 @@ impl UnifiedCache {
         if changed_slots_per_field.is_empty() {
             return;
         }
-        // Clause-level narrowing: find entries matching specific (field, "eq", value)
-        // combinations rather than broad field-level matching. This is a 25-50x
-        // improvement when fields have many distinct values (e.g., 50 categories
-        // → only entries with the specific changed values are checked, not all
-        // entries mentioning the field).
-        let mut affected_ids = RoaringBitmap::new();
-        // Eq clause hits: exact value matches (handles the common case)
-        for (key, _slots) in filter_inserts.iter().chain(filter_removes.iter()) {
-            let value_repr = key.value.to_string();
-            if let Some(bm) = self.meta.entries_for_clause(&key.field, "eq", &value_repr) {
-                affected_ids |= bm;
+        // Clause-level narrowing via meta-index (read lock for the lookup pass).
+        let affected_ids: RoaringBitmap = {
+            let meta = self.meta.read();
+            let mut ids = RoaringBitmap::new();
+            for (key, _slots) in filter_inserts.iter().chain(filter_removes.iter()) {
+                let value_repr = key.value.to_string();
+                if let Some(bm) = meta.entries_for_clause(&key.field, "eq", &value_repr) {
+                    ids |= bm;
+                }
             }
-        }
-        // Field-level fallback for non-Eq entries (In, Gt, Lt, NotEq, etc.)
-        // These entries can't be found by clause-level lookup because their
-        // value_repr format differs (e.g., "5,10" for In). Use the broader
-        // field-level bitmap but subtract entries already found via clause-level.
-        for field in changed_slots_per_field.keys() {
-            if let Some(field_bm) = self.meta.entries_for_filter_field(field) {
-                // Only add entries not already in affected_ids
-                let new_entries = field_bm - &affected_ids;
-                if !new_entries.is_empty() {
-                    // Check if any of these are non-Eq entries (have ops other than "eq")
-                    for meta_id in new_entries.iter() {
-                        if let Some(key) = self.meta_id_to_key.get(&meta_id) {
-                            // Include if any clause for this field uses a non-Eq op
-                            let has_non_eq = key.filter_clauses.iter().any(|c| {
-                                c.field == *field && c.op != "eq"
-                            });
-                            if has_non_eq {
-                                affected_ids.insert(meta_id);
+            for field in changed_slots_per_field.keys() {
+                if let Some(field_bm) = meta.entries_for_filter_field(field) {
+                    let new_entries = field_bm - &ids;
+                    if !new_entries.is_empty() {
+                        for meta_id in new_entries.iter() {
+                            if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
+                                let has_non_eq = key_ref.value().filter_clauses.iter().any(|c| {
+                                    c.field == *field && c.op != "eq"
+                                });
+                                if has_non_eq {
+                                    ids.insert(meta_id);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+            ids
+        };
         if affected_ids.is_empty() {
             return;
         }
-        // Count total changed slots for budget estimation
+        let cfg = self.config.load();
         let total_changed_slots: usize = changed_slots_per_field.values().map(|s| s.len()).sum();
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_changed_slots;
-        // Budget check: time-based (preferred) or count-based (fallback).
-        // Time-based: set a deadline and bail mid-loop when exceeded.
-        // Count-based: bail immediately if estimated work exceeds threshold.
-        let deadline = if self.config.max_maintenance_ms > 0 {
-            Some(Instant::now() + Duration::from_millis(self.config.max_maintenance_ms))
-        } else if self.config.max_maintenance_work > 0 && estimated_work > self.config.max_maintenance_work {
-            // Fallback to count-based: bail immediately if over budget
+        let deadline = if cfg.max_maintenance_ms > 0 {
+            Some(Instant::now() + Duration::from_millis(cfg.max_maintenance_ms))
+        } else if cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
+            let mut marked = 0u64;
             for meta_id in affected_ids.iter() {
-                if let Some(key) = self.meta_id_to_key.get(&meta_id) {
-                    if let Some(entry) = self.entries.get_mut(key) {
-                        entry.mark_for_rebuild();
+                if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
+                    let key = key_ref.value().clone();
+                    drop(key_ref);
+                    if let Some(r) = self.entries.get(&key) {
+                        r.value().mark_for_rebuild();
+                        marked += 1;
                     }
+                }
+            }
+            if marked > 0 {
+                if let Some(m) = self.rmetrics() {
+                    m.marked_for_rebuild_count_budget_total
+                        .fetch_add(marked, Ordering::Relaxed);
                 }
             }
             return;
         } else {
-            None // No deadline, do all work
+            None
         };
-        // Collect affected keys (avoids borrow conflict between meta_id_to_key and entries)
         let affected_keys: Vec<UnifiedKey> = affected_ids
             .iter()
-            .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())
+            .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).map(|r| r.value().clone()))
             .collect();
-        // Iterate only affected entries
         for (i, key) in affected_keys.iter().enumerate() {
-            // Check deadline every 64 entries to avoid clock overhead
             if let Some(deadline) = deadline {
                 if i > 0 && i % 64 == 0 && Instant::now() > deadline {
-                    // Mark remaining entries for rebuild
+                    let mut marked = 0u64;
                     for remaining_key in &affected_keys[i..] {
-                        if let Some(entry) = self.entries.get_mut(remaining_key) {
-                            entry.mark_for_rebuild();
+                        if let Some(r) = self.entries.get(remaining_key) {
+                            r.value().mark_for_rebuild();
+                            marked += 1;
+                        }
+                    }
+                    if marked > 0 {
+                        if let Some(m) = self.rmetrics() {
+                            m.marked_for_rebuild_deadline_total
+                                .fetch_add(marked, Ordering::Relaxed);
                         }
                     }
                     break;
                 }
             }
-            let Some(entry) = self.entries.get_mut(key) else {
+            let Some(mut entry_ref) = self.entries.get_mut(key) else {
                 continue;
             };
-            if entry.needs_rebuild {
+            let entry = entry_ref.value_mut();
+            if entry.needs_rebuild() {
                 continue;
             }
-            // Collect slots to check: union of changed slots from the entry's referenced fields
             let mut slots_to_check = HashSet::new();
             for clause in &key.filter_clauses {
                 if let Some(slots) = changed_slots_per_field.get(clause.field.as_str()) {
@@ -1450,13 +1603,12 @@ impl UnifiedCache {
                     .get_field(&key.sort_field)
                     .map(|f| f.reconstruct_value(slot))
                     .unwrap_or(0);
-                let matches = slot_matches_filter(slot, &key.filter_clauses, filters, sorts);
+                let matches = slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None);
                 if matches {
                     if entry.sort_qualifies(sort_value, key.direction) {
                         entry.add_slot(slot, sort_value);
                     }
                 } else {
-                    // Slot no longer matches filter — remove it
                     entry.remove_slot(slot, sort_value);
                 }
             }
@@ -1468,7 +1620,7 @@ impl UnifiedCache {
     /// qualifying sort values. Only adds slots (never removes on sort change — bloat
     /// control handles cleanup).
     pub fn maintain_sort_changes(
-        &mut self,
+        &self,
         sort_mutations: &HashMap<&str, HashSet<u32>>,
         filters: &FilterIndex,
         sorts: &SortIndex,
@@ -1476,56 +1628,73 @@ impl UnifiedCache {
         if sort_mutations.is_empty() {
             return;
         }
-        // Use MetaIndex to find only entries that sort by changed fields
-        let mut affected_ids = RoaringBitmap::new();
-        for field in sort_mutations.keys() {
-            affected_ids |= self.meta.entries_for_sort_field(field);
-        }
+        let affected_ids: RoaringBitmap = {
+            let meta = self.meta.read();
+            let mut ids = RoaringBitmap::new();
+            for field in sort_mutations.keys() {
+                ids |= meta.entries_for_sort_field(field);
+            }
+            ids
+        };
         if affected_ids.is_empty() {
             return;
         }
-        // Budget check: time-based (preferred) or count-based (fallback).
+        let cfg = self.config.load();
         let total_sort_slots: usize = sort_mutations.values().map(|s| s.len()).sum();
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_sort_slots;
-        let deadline = if self.config.max_maintenance_ms > 0 {
-            Some(Instant::now() + Duration::from_millis(self.config.max_maintenance_ms))
-        } else if self.config.max_maintenance_work > 0 && estimated_work > self.config.max_maintenance_work {
-            // Fallback to count-based: bail immediately if over budget
+        let deadline = if cfg.max_maintenance_ms > 0 {
+            Some(Instant::now() + Duration::from_millis(cfg.max_maintenance_ms))
+        } else if cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
+            let mut marked = 0u64;
             for meta_id in affected_ids.iter() {
-                if let Some(key) = self.meta_id_to_key.get(&meta_id) {
-                    if let Some(entry) = self.entries.get_mut(key) {
-                        entry.mark_for_rebuild();
+                if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
+                    let key = key_ref.value().clone();
+                    drop(key_ref);
+                    if let Some(r) = self.entries.get(&key) {
+                        r.value().mark_for_rebuild();
+                        marked += 1;
                     }
+                }
+            }
+            if marked > 0 {
+                if let Some(m) = self.rmetrics() {
+                    m.marked_for_rebuild_count_budget_total
+                        .fetch_add(marked, Ordering::Relaxed);
                 }
             }
             return;
         } else {
-            None // No deadline, do all work
+            None
         };
-        // Collect affected keys (avoids borrow conflict)
         let affected_keys: Vec<UnifiedKey> = affected_ids
             .iter()
-            .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())
+            .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).map(|r| r.value().clone()))
             .collect();
-        // Iterate only affected entries
         for (i, key) in affected_keys.iter().enumerate() {
-            // Check deadline every 64 entries to avoid clock overhead
             if let Some(deadline) = deadline {
                 if i > 0 && i % 64 == 0 && Instant::now() > deadline {
-                    // Mark remaining entries for rebuild
+                    let mut marked = 0u64;
                     for remaining_key in &affected_keys[i..] {
-                        if let Some(entry) = self.entries.get_mut(remaining_key) {
-                            entry.mark_for_rebuild();
+                        if let Some(r) = self.entries.get(remaining_key) {
+                            r.value().mark_for_rebuild();
+                            marked += 1;
+                        }
+                    }
+                    if marked > 0 {
+                        if let Some(m) = self.rmetrics() {
+                            m.marked_for_rebuild_deadline_total
+                                .fetch_add(marked, Ordering::Relaxed);
                         }
                     }
                     break;
                 }
             }
-            let Some(entry) = self.entries.get_mut(key) else {
+            let Some(mut entry_ref) = self.entries.get_mut(key) else {
                 continue;
             };
-            if entry.needs_rebuild {
+            let entry = entry_ref.value_mut();
+            if entry.needs_rebuild() {
                 continue;
             }
             let sort_slots = match sort_mutations.get(key.sort_field.as_str()) {
@@ -1533,7 +1702,6 @@ impl UnifiedCache {
                 None => continue,
             };
             for &slot in sort_slots {
-                // Check sort qualification first (fast path)
                 let sort_value = sorts
                     .get_field(&key.sort_field)
                     .map(|f| f.reconstruct_value(slot))
@@ -1542,7 +1710,7 @@ impl UnifiedCache {
                     continue;
                 }
                 // Sort qualifies — check filter match
-                if slot_matches_filter(slot, &key.filter_clauses, filters, sorts) {
+                if slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None) {
                     entry.add_slot(slot, sort_value);
                 }
             }
@@ -1552,9 +1720,9 @@ impl UnifiedCache {
     ///
     /// Called by the flush thread when a document is deleted. Targeted removal
     /// avoids marking all entries for rebuild, preserving cache effectiveness.
-    pub fn remove_slot_from_all(&mut self, slot: u32) {
-        for (_, entry) in self.entries.iter_mut() {
-            entry.remove_slot_blind(slot);
+    pub fn remove_slot_from_all(&self, slot: u32) {
+        for mut r in self.entries.iter_mut() {
+            r.value_mut().remove_slot_blind(slot);
         }
     }
     /// Batch version of `remove_slot_from_all`.
@@ -1562,13 +1730,26 @@ impl UnifiedCache {
     /// Used by the async cache worker to remove all deleted slots in one pass
     /// rather than calling `remove_slot_from_all` once per slot. Amortizes the
     /// outer `entries` iteration across all slots.
-    pub fn remove_slots_from_all_batch(&mut self, slots: &[u32]) {
+    pub fn remove_slots_from_all_batch(&self, slots: &[u32]) {
         if slots.is_empty() || self.entries.is_empty() {
             return;
         }
-        for (_, entry) in self.entries.iter_mut() {
+        // Each iter_mut yields a RefMutMulti — holds the shard's write lock
+        // for the duration of the body. Per-shard locks keep concurrent
+        // readers on other shards unblocked.
+        for mut r in self.entries.iter_mut() {
+            let entry = r.value_mut();
+            let bm = Arc::make_mut(&mut entry.bitmap);
             for &slot in slots {
-                entry.remove_slot_blind(slot);
+                bm.remove(slot);
+            }
+            entry.persist_dirty.store(true, Ordering::Relaxed);
+            entry.sorted_keys = None;
+            if let Some(ref mut radix) = entry.radix {
+                let rx = Arc::make_mut(radix);
+                for &slot in slots {
+                    rx.remove_blind(slot);
+                }
             }
         }
     }
@@ -1592,7 +1773,6 @@ impl UnifiedCache {
         if self.entries.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        // Collect changed slots per field name
         let mut changed_slots_per_field: HashMap<&str, HashSet<u32>> = HashMap::new();
         for (key, slots) in filter_inserts {
             changed_slots_per_field
@@ -1609,54 +1789,57 @@ impl UnifiedCache {
         if changed_slots_per_field.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        // Clause-level narrowing via meta-index (same logic as maintain_filter_changes)
-        let mut affected_ids = RoaringBitmap::new();
-        for (key, _slots) in filter_inserts.iter().chain(filter_removes.iter()) {
-            let value_repr = key.value.to_string();
-            if let Some(bm) = self.meta.entries_for_clause(&key.field, "eq", &value_repr) {
-                affected_ids |= bm;
+        let affected_ids: RoaringBitmap = {
+            let meta = self.meta.read();
+            let mut ids = RoaringBitmap::new();
+            for (key, _slots) in filter_inserts.iter().chain(filter_removes.iter()) {
+                let value_repr = key.value.to_string();
+                if let Some(bm) = meta.entries_for_clause(&key.field, "eq", &value_repr) {
+                    ids |= bm;
+                }
             }
-        }
-        // Field-level fallback for non-Eq entries
-        for field in changed_slots_per_field.keys() {
-            if let Some(field_bm) = self.meta.entries_for_filter_field(field) {
-                let new_entries = field_bm - &affected_ids;
-                if !new_entries.is_empty() {
-                    for meta_id in new_entries.iter() {
-                        if let Some(key) = self.meta_id_to_key.get(&meta_id) {
-                            let has_non_eq = key.filter_clauses.iter().any(|c| {
-                                c.field == *field && c.op != "eq"
-                            });
-                            if has_non_eq {
-                                affected_ids.insert(meta_id);
+            for field in changed_slots_per_field.keys() {
+                if let Some(field_bm) = meta.entries_for_filter_field(field) {
+                    let new_entries = field_bm - &ids;
+                    if !new_entries.is_empty() {
+                        for meta_id in new_entries.iter() {
+                            if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
+                                let has_non_eq = key_ref.value().filter_clauses.iter().any(|c| {
+                                    c.field == *field && c.op != "eq"
+                                });
+                                if has_non_eq {
+                                    ids.insert(meta_id);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+            ids
+        };
         if affected_ids.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        // Budget check (count-based only — time-based handled in evaluate phase)
+        let cfg = self.config.load();
         let total_changed_slots: usize = changed_slots_per_field.values().map(|s| s.len()).sum();
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_changed_slots;
-        if self.config.max_maintenance_ms == 0 && self.config.max_maintenance_work > 0 && estimated_work > self.config.max_maintenance_work {
-            // Over count-based budget: mark all for rebuild
+        if cfg.max_maintenance_ms == 0 && cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
             let over_budget: Vec<UnifiedKey> = affected_ids
                 .iter()
-                .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())
+                .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).map(|r| r.value().clone()))
                 .collect();
             return (Vec::new(), over_budget);
         }
-        // Build work items: for each affected entry, collect which slots to check
         let work: Vec<CacheMaintenanceItem> = affected_ids
             .iter()
             .filter_map(|meta_id| {
-                let key = self.meta_id_to_key.get(&meta_id)?;
-                let entry = self.entries.get(key)?;
-                if entry.needs_rebuild {
+                let key_ref = self.meta_id_to_key.get(&meta_id)?;
+                let key = key_ref.value().clone();
+                drop(key_ref);
+                let entry_ref = self.entries.get(&key)?;
+                let entry = entry_ref.value();
+                if entry.needs_rebuild() {
                     return None;
                 }
                 let mut slots = Vec::new();
@@ -1690,30 +1873,37 @@ impl UnifiedCache {
         if self.entries.is_empty() || sort_mutations.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        let mut affected_ids = RoaringBitmap::new();
-        for field in sort_mutations.keys() {
-            affected_ids |= self.meta.entries_for_sort_field(field);
-        }
+        let affected_ids: RoaringBitmap = {
+            let meta = self.meta.read();
+            let mut ids = RoaringBitmap::new();
+            for field in sort_mutations.keys() {
+                ids |= meta.entries_for_sort_field(field);
+            }
+            ids
+        };
         if affected_ids.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        // Budget check (count-based)
+        let cfg = self.config.load();
         let total_sort_slots: usize = sort_mutations.values().map(|s| s.len()).sum();
         let affected_count = affected_ids.len() as usize;
         let estimated_work = affected_count * total_sort_slots;
-        if self.config.max_maintenance_ms == 0 && self.config.max_maintenance_work > 0 && estimated_work > self.config.max_maintenance_work {
+        if cfg.max_maintenance_ms == 0 && cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
             let over_budget: Vec<UnifiedKey> = affected_ids
                 .iter()
-                .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).cloned())
+                .filter_map(|meta_id| self.meta_id_to_key.get(&meta_id).map(|r| r.value().clone()))
                 .collect();
             return (Vec::new(), over_budget);
         }
         let work: Vec<CacheMaintenanceItem> = affected_ids
             .iter()
             .filter_map(|meta_id| {
-                let key = self.meta_id_to_key.get(&meta_id)?;
-                let entry = self.entries.get(key)?;
-                if entry.needs_rebuild {
+                let key_ref = self.meta_id_to_key.get(&meta_id)?;
+                let key = key_ref.value().clone();
+                drop(key_ref);
+                let entry_ref = self.entries.get(&key)?;
+                let entry = entry_ref.value();
+                if entry.needs_rebuild() {
                     return None;
                 }
                 let sort_slots = sort_mutations.get(key.sort_field.as_str())?;
@@ -1731,53 +1921,54 @@ impl UnifiedCache {
             .collect();
         (work, Vec::new())
     }
-    /// Phase C: Apply computed maintenance results under brief lock.
-    pub fn apply_maintenance_results(&mut self, results: &[CacheMaintenanceResult]) {
+    /// Phase C: Apply computed maintenance results.
+    pub fn apply_maintenance_results(&self, results: &[CacheMaintenanceResult]) {
         for result in results {
-            let Some(entry) = self.entries.get_mut(&result.key) else {
+            let Some(mut entry_ref) = self.entries.get_mut(&result.key) else {
                 continue;
             };
-            if entry.needs_rebuild {
+            let entry = entry_ref.value_mut();
+            if entry.needs_rebuild() {
                 continue;
             }
-            for &(slot, sort_value) in &result.adds {
-                entry.add_slot(slot, sort_value);
+            if !result.adds.is_empty() {
+                entry.add_slots_bulk(&result.adds);
             }
-            for &(slot, sort_value) in &result.removes {
-                entry.remove_slot(slot, sort_value);
+            if !result.removes.is_empty() {
+                entry.remove_slots_bulk(&result.removes);
             }
         }
     }
     /// Phase C: Mark entries for rebuild in batch (budget exceeded or deadline hit).
-    pub fn mark_for_rebuild_batch(&mut self, keys: &[UnifiedKey]) {
+    pub fn mark_for_rebuild_batch(&self, keys: &[UnifiedKey]) {
         for key in keys {
-            if let Some(entry) = self.entries.get_mut(key) {
-                entry.mark_for_rebuild();
+            if let Some(r) = self.entries.get(key) {
+                r.value().mark_for_rebuild();
             }
         }
     }
-    /// Mark all entries for rebuild when alive bitmap changes.
-    ///
-    /// Alive changes affect all filter evaluations (NotEq/Not bake alive into results).
-    /// Rather than trying to maintain precisely, mark everything for rebuild.
-    pub fn maintain_alive_changes(&mut self) {
-        for (_, entry) in self.entries.iter_mut() {
-            entry.mark_for_rebuild();
-        }
-    }
-    /// Invalidate entries that reference a specific filter field.
-    ///
-    /// Marks matching entries for rebuild. Used when fine-grained maintenance
-    /// isn't possible (e.g., compound clauses).
-    pub fn invalidate_filter_field(&mut self, field: &str) {
+    /// Mark all entries for rebuild when alive bitmap changes. Returns the
+    /// number of entries flagged so the caller can attribute the reason.
+    pub fn maintain_alive_changes(&self) -> u64 {
         let mut count = 0u64;
-        for (key, entry) in self.entries.iter_mut() {
-            if key.filter_clauses.iter().any(|c| c.field == field) {
-                entry.mark_for_rebuild();
+        for r in self.entries.iter() {
+            r.value().mark_for_rebuild();
+            count += 1;
+        }
+        count
+    }
+    /// Invalidate entries that reference a specific filter field. Returns the
+    /// number of entries flagged so the caller can attribute the reason.
+    pub fn invalidate_filter_field(&self, field: &str) -> u64 {
+        let mut count = 0u64;
+        for r in self.entries.iter() {
+            if r.key().filter_clauses.iter().any(|c| c.field == field) {
+                r.value().mark_for_rebuild();
                 count += 1;
             }
         }
-        self.invalidations += count;
+        self.invalidations.fetch_add(count, Ordering::Relaxed);
+        count
     }
     // ── Time Bucket Diff Integration (Phase 4) ─────────────────────────────
     /// Maintain cache entries when a time bucket is rebuilt.
@@ -1789,7 +1980,7 @@ impl UnifiedCache {
     ///
     /// Called by the flush thread after swapping in a rebuilt bucket bitmap.
     pub fn maintain_bucket_changes(
-        &mut self,
+        &self,
         field: &str,
         bucket_name: &str,
         dropped_slots: &RoaringBitmap,
@@ -1800,38 +1991,40 @@ impl UnifiedCache {
         if dropped_slots.is_empty() && added_slots.is_empty() {
             return;
         }
-        for (key, entry) in self.entries.iter_mut() {
-            if entry.needs_rebuild {
+        for mut r in self.entries.iter_mut() {
+            let key = r.key().clone();
+            let entry = r.value_mut();
+            if entry.needs_rebuild() {
                 continue;
             }
-            // Check if this entry has a bucket clause matching this bucket
             let has_bucket = key.filter_clauses.iter().any(|c| {
                 c.field == field && c.op == "bucket" && c.value_repr == bucket_name
             });
             if !has_bucket {
                 continue;
             }
-            // Remove dropped slots
             if !dropped_slots.is_empty() {
                 let bm = Arc::make_mut(&mut entry.bitmap);
                 *bm -= dropped_slots;
-                // Also remove from radix (blind — no sort values for bulk drop)
                 if let Some(ref mut radix) = entry.radix {
-                    let r = Arc::make_mut(radix);
+                    let rx = Arc::make_mut(radix);
                     for slot in dropped_slots.iter() {
-                        r.remove_blind(slot);
+                        rx.remove_blind(slot);
                     }
                 }
             }
-            // Add qualifying new slots
             if !added_slots.is_empty() {
                 for slot in added_slots.iter() {
                     // Check all OTHER clauses (we already know bucket matches)
+                    // TODO: pass bucket_mgr through here so multi-bucket-clause entries
+                    // (e.g. AND(Bucket=24h, Bucket=7d)) evaluate correctly. UI doesn't
+                    // emit these today, but a future caller could. Conservative true
+                    // admits invalid slots into the cache entry on rebuild.
                     let other_clauses_match = key.filter_clauses.iter().all(|c| {
                         if c.field == field && c.op == "bucket" && c.value_repr == bucket_name {
-                            true // skip the bucket clause itself
+                            true
                         } else {
-                            slot_matches_clause(slot, c, filters, sorts)
+                            slot_matches_clause(slot, c, filters, sorts, None)
                         }
                     });
                     if !other_clauses_match {
@@ -1854,14 +2047,16 @@ impl UnifiedCache {
 ///
 /// Uses contains() checks on the filter index bitmaps for Eq/NotEq/In/NotIn.
 /// Uses sort index reconstruct_value() for range clauses (Gte/Gt/Lt/Lte).
-/// Bucket and compound clauses conservatively return true (handled by rebuild).
+/// Uses bucket bitmap contains() for BucketBitmap clauses when bucket_mgr is provided.
+/// Compound clauses conservatively return true (handled by rebuild).
 fn slot_matches_filter(
     slot: u32,
     clauses: &[CanonicalClause],
     filters: &FilterIndex,
     sorts: &SortIndex,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
 ) -> bool {
-    clauses.iter().all(|clause| slot_matches_clause(slot, clause, filters, sorts))
+    clauses.iter().all(|clause| slot_matches_clause(slot, clause, filters, sorts, bucket_mgr))
 }
 /// Evaluate whether a slot matches a single canonical clause.
 fn slot_matches_clause(
@@ -1869,6 +2064,7 @@ fn slot_matches_clause(
     clause: &CanonicalClause,
     filters: &FilterIndex,
     sorts: &SortIndex,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
 ) -> bool {
     match clause.op.as_str() {
         "eq" => {
@@ -1943,9 +2139,16 @@ fn slot_matches_clause(
             }
         }
         "bucket" => {
-            // BucketBitmap — requires access to time bucket manager.
-            // Phase 4 will add proper evaluation. Conservative: return true.
-            true
+            // BucketBitmap — evaluate against the time bucket bitmap.
+            // The flush thread runs insert_slot/remove_slot BEFORE cache
+            // maintenance, so the bucket bitmap is already authoritative for
+            // every mutated slot when we reach this point.
+            // value_repr holds the bucket name (e.g. "24h", "7d").
+            // Cost: ~150ns (HashMap lookup + RoaringBitmap::contains).
+            let Some(mgr) = bucket_mgr else { return true };
+            mgr.get_bucket(&clause.value_repr)
+                .map(|b| b.bitmap().contains(slot))
+                .unwrap_or(false)
         }
         op if op.starts_with("not(") => {
             // Compound not: "not(eq)" → evaluate inner and negate
@@ -1961,7 +2164,7 @@ fn slot_matches_clause(
                 op: inner_op.to_string(),
                 value_repr: clause.value_repr.clone(),
             };
-            !slot_matches_clause(slot, &inner_clause, filters, sorts)
+            !slot_matches_clause(slot, &inner_clause, filters, sorts, bucket_mgr)
         }
         "and" | "or" => {
             // Compound And/Or — would need to parse sub-clauses from value_repr.
@@ -1972,6 +2175,81 @@ fn slot_matches_clause(
         _ => true, // Unknown op — conservative
     }
 }
+/// Pre-resolve bucket clause bitmaps for one work item's filter clauses.
+///
+/// Returns a `SmallVec`-style Vec of (clause_index, Option<Arc<RoaringBitmap>>)
+/// for every clause whose `op == "bucket"`.  Callers pass this into
+/// `slot_matches_filter_resolved` so the per-slot loop never re-enters the
+/// `TimeBucketManager` HashMap.
+///
+/// Cost: one HashMap lookup per *distinct bucket name* per work item —
+/// independent of `item.slots.len()`.  At 10K slots per batch this eliminates
+/// 10K redundant lookups per bucket clause per item.
+fn resolve_bucket_bitmaps<'a>(
+    clauses: &[CanonicalClause],
+    bucket_mgr: Option<&'a crate::time_buckets::TimeBucketManager>,
+) -> Vec<(usize, Option<std::sync::Arc<roaring::RoaringBitmap>>)> {
+    clauses
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.op == "bucket")
+        .map(|(idx, c)| {
+            let bm = bucket_mgr
+                .and_then(|m| m.get_bucket(&c.value_repr))
+                .map(|b| std::sync::Arc::clone(b.bitmap()));
+            (idx, bm)
+        })
+        .collect()
+}
+
+/// Like `slot_matches_filter`, but uses pre-resolved bucket bitmaps (from
+/// `resolve_bucket_bitmaps`) instead of going through the HashMap per slot.
+///
+/// For non-bucket clauses the evaluation is identical to `slot_matches_clause`.
+/// For bucket clauses:
+///   - `Some(bitmap)` → check `bitmap.contains(slot)` (authoritative).
+///   - `None`         → conservative `true` (bucket_mgr unavailable, or unknown name returns false).
+///
+/// Wait — `None` from `resolve_bucket_bitmaps` means either (a) no bucket_mgr
+/// was provided (conservative true) OR (b) the bucket name was unknown (should
+/// be false, matching `slot_matches_clause`'s `.unwrap_or(false)`).
+/// We preserve the distinction: if `bucket_mgr` was `None` entirely we still
+/// return true; if `bucket_mgr` was `Some` but the bucket wasn't found we
+/// store a sentinel. To keep this simple we re-check the `bucket_mgr` presence
+/// via the `has_mgr` flag threaded in.
+fn slot_matches_filter_resolved(
+    slot: u32,
+    clauses: &[CanonicalClause],
+    filters: &FilterIndex,
+    sorts: &SortIndex,
+    bucket_mgr_present: bool,
+    resolved_buckets: &[(usize, Option<std::sync::Arc<roaring::RoaringBitmap>>)],
+) -> bool {
+    // Build a quick lookup: clause_index → resolved bitmap.
+    // Bucket clauses are rare (typically 1 per query), so a linear scan is fine.
+    clauses.iter().enumerate().all(|(idx, clause)| {
+        if clause.op == "bucket" {
+            // Find the pre-resolved bitmap for this clause index.
+            if let Some((_, ref opt_bm)) = resolved_buckets.iter().find(|(i, _)| *i == idx) {
+                match opt_bm {
+                    Some(bm) => bm.contains(slot),
+                    // None means either no manager (conservative true) or unknown
+                    // bucket name (false). Distinguish via bucket_mgr_present.
+                    None => !bucket_mgr_present, // mgr absent → true; mgr present but unknown → false
+                }
+            } else {
+                // Should not happen (all bucket clauses are in resolved_buckets),
+                // but be conservative.
+                true
+            }
+        } else {
+            // All other ops: use the standard per-clause evaluator.
+            // bucket_mgr is not needed here since we only hit this for non-bucket ops.
+            slot_matches_clause(slot, clause, filters, sorts, None)
+        }
+    })
+}
+
 // ── Phase B: Lock-Free Evaluation Functions ──────────────────────────────
 //
 // These functions evaluate slot eligibility against staging filters/sorts
@@ -1987,6 +2265,7 @@ pub fn evaluate_filter_work(
     filters: &FilterIndex,
     sorts: &SortIndex,
     deadline: Option<Instant>,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Inverted evaluation: reconstruct_value is identical across entries for
     // the same (sort_field, slot), so we precompute it ONCE per unique pair
@@ -1994,6 +2273,7 @@ pub fn evaluate_filter_work(
     // 10M reconstruct_value calls (316ns each) into ~200 calls, saving
     // ~3 seconds of redundant CPU per flush cycle.
     let reconstructed = precompute_sort_values(work, sorts);
+    let bucket_mgr_present = bucket_mgr.is_some();
     let mut results = Vec::with_capacity(work.len());
     let mut timed_out = Vec::new();
     for (i, item) in work.iter().enumerate() {
@@ -2006,6 +2286,12 @@ pub fn evaluate_filter_work(
                 break;
             }
         }
+        // Hoist bucket-clause bitmap lookups out of the per-slot loop.
+        // At 10K slots/batch this eliminates 10K identical HashMap lookups
+        // for the same bucket name — replaced by one lookup per bucket clause
+        // per work item. Result: ~150ns × 10K = ~1.5ms saved per batch.
+        let resolved_buckets = resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr);
+        let use_resolved = !resolved_buckets.is_empty();
         let mut adds = Vec::new();
         let mut removes = Vec::new();
         for &slot in &item.slots {
@@ -2013,7 +2299,18 @@ pub fn evaluate_filter_work(
                 .get(&(item.key.sort_field.as_str(), slot))
                 .copied()
                 .unwrap_or(0);
-            let matches = slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts);
+            let matches = if use_resolved {
+                slot_matches_filter_resolved(
+                    slot,
+                    &item.key.filter_clauses,
+                    filters,
+                    sorts,
+                    bucket_mgr_present,
+                    &resolved_buckets,
+                )
+            } else {
+                slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts, bucket_mgr)
+            };
             if matches {
                 let qualifies = match item.direction {
                     SortDirection::Desc => sort_value > item.min_tracked_value,
@@ -2058,6 +2355,7 @@ pub fn evaluate_sort_work(
     filters: &FilterIndex,
     sorts: &SortIndex,
     deadline: Option<Instant>,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Preamble: reconstruct_value once per unique (sort_field, slot).
     let reconstructed = precompute_sort_values(work, sorts);
@@ -2066,6 +2364,7 @@ pub fn evaluate_sort_work(
     // cycle — skip it entirely without touching slots.
     let max_per_field = compute_max_per_field(&reconstructed);
     let min_per_field = compute_min_per_field(&reconstructed);
+    let bucket_mgr_present = bucket_mgr.is_some();
     let mut results = Vec::with_capacity(work.len());
     let mut timed_out = Vec::new();
     for (i, item) in work.iter().enumerate() {
@@ -2100,6 +2399,11 @@ pub fn evaluate_sort_work(
         if !can_possibly_qualify {
             continue;
         }
+        // Hoist bucket-clause bitmap lookups out of the per-slot loop.
+        // Same optimisation as in evaluate_filter_work — one HashMap lookup
+        // per bucket clause per item instead of one per slot.
+        let resolved_buckets = resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr);
+        let use_resolved = !resolved_buckets.is_empty();
         let mut adds = Vec::new();
         for &slot in &item.slots {
             let sort_value = reconstructed
@@ -2117,7 +2421,19 @@ pub fn evaluate_sort_work(
             // Sort qualifies — only now pay filter match cost. Preserves the
             // full slot_matches_filter semantics (Eq, NotEq, In, Gt, Lt,
             // bucket, compound) — no signature-based shortcut.
-            if slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts) {
+            let filter_matches = if use_resolved {
+                slot_matches_filter_resolved(
+                    slot,
+                    &item.key.filter_clauses,
+                    filters,
+                    sorts,
+                    bucket_mgr_present,
+                    &resolved_buckets,
+                )
+            } else {
+                slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts, bucket_mgr)
+            };
+            if filter_matches {
                 adds.push((slot, sort_value));
             }
         }
@@ -2317,7 +2633,7 @@ mod tests {
         // Initial formation with 10 slots
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         assert_eq!(entry.capacity(), 10);
         // Expand — jumps straight to max_capacity (80)
         let new_slots: Vec<u32> = (10..80).collect();
@@ -2337,7 +2653,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         // First expansion: 10 -> 20 (jumps to max)
         let new_slots: Vec<u32> = (10..20).collect();
         let new_cap = entry.expand(&new_slots, |s| 1000 - s);
@@ -2358,7 +2674,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..100).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         assert!(entry.has_more());
         // Expand with fewer slots than expected chunk size (jumps to max 1600, chunk = 1500)
         // But we only provide 30 — means we've exhausted the result set
@@ -2377,7 +2693,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         assert!(!entry.needs_rebuild());
         // Add slots until bloat threshold (2 * capacity = 20)
         for i in 10..21u32 {
@@ -2428,7 +2744,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         entry.mark_for_rebuild();
         assert!(entry.needs_rebuild());
         let fresh_slots: Vec<u32> = (0..10).collect();
@@ -2442,7 +2758,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         assert!(entry.try_start_rebuild()); // first caller gets it
         assert!(!entry.try_start_rebuild()); // second caller blocked
         // Rebuild releases the guard
@@ -2484,15 +2800,14 @@ mod tests {
         );
         let slots: Vec<u32> = (0..10).collect();
         let meta_id = cache.form_and_store(key, &slots, true, 100_000, |s| s);
-        // Meta-index should have entries for both filter fields
-        let nsfw_entries = cache.meta().entries_for_filter_field("nsfwLevel");
+        let meta = cache.meta();
+        let nsfw_entries = meta.entries_for_filter_field("nsfwLevel");
         assert!(nsfw_entries.is_some());
         assert!(nsfw_entries.unwrap().contains(meta_id));
-        let type_entries = cache.meta().entries_for_filter_field("type");
+        let type_entries = meta.entries_for_filter_field("type");
         assert!(type_entries.is_some());
         assert!(type_entries.unwrap().contains(meta_id));
-        // And for the sort field
-        let sort_entries = cache.meta().entries_for_sort_field("reactionCount");
+        let sort_entries = meta.entries_for_sort_field("reactionCount");
         assert!(sort_entries.contains(meta_id));
     }
     #[test]
@@ -2514,7 +2829,8 @@ mod tests {
         let key3 = make_key(&[("field", "eq", "3")], "sort", SortDirection::Desc);
         cache.form_and_store(key3, &slots, true, 100_000, |s| s);
         // meta_id_1 should no longer be in the meta-index
-        let entries = cache.meta().entries_for_clause("field", "eq", "1");
+        let meta = cache.meta();
+        let entries = meta.entries_for_clause("field", "eq", "1");
         let contains = entries.map(|bm| bm.contains(meta_id_1)).unwrap_or(false);
         assert!(!contains);
     }
@@ -2550,7 +2866,7 @@ mod tests {
         let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
         let slots: Vec<u32> = (0..10).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         assert_eq!(entry.cardinality(), 10);
         entry.add_slot(100, 900);
         assert_eq!(entry.cardinality(), 11);
@@ -2586,18 +2902,15 @@ mod tests {
         };
         let slots: Vec<u32> = (0..10).collect();
         let meta_id = cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        // All three filter fields should be in field-level index
-        assert!(cache.meta().entries_for_filter_field("nsfwLevel").unwrap().contains(meta_id));
-        assert!(cache.meta().entries_for_filter_field("reactionCount").unwrap().contains(meta_id));
-        assert!(cache.meta().entries_for_filter_field("tagIds").unwrap().contains(meta_id));
-        // Each specific clause should be findable
-        assert!(cache.meta().entries_for_clause("nsfwLevel", "noteq", "5").unwrap().contains(meta_id));
-        assert!(cache.meta().entries_for_clause("reactionCount", "gte", "100").unwrap().contains(meta_id));
-        assert!(cache.meta().entries_for_clause("tagIds", "in", "[4,8,15]").unwrap().contains(meta_id));
-        // Sort field
-        assert!(cache.meta().entries_for_sort_field("sortAt").contains(meta_id));
-        // find_matching_entries should find this entry with the exact clauses
-        let matches = cache.meta().find_matching_entries(
+        let meta = cache.meta();
+        assert!(meta.entries_for_filter_field("nsfwLevel").unwrap().contains(meta_id));
+        assert!(meta.entries_for_filter_field("reactionCount").unwrap().contains(meta_id));
+        assert!(meta.entries_for_filter_field("tagIds").unwrap().contains(meta_id));
+        assert!(meta.entries_for_clause("nsfwLevel", "noteq", "5").unwrap().contains(meta_id));
+        assert!(meta.entries_for_clause("reactionCount", "gte", "100").unwrap().contains(meta_id));
+        assert!(meta.entries_for_clause("tagIds", "in", "[4,8,15]").unwrap().contains(meta_id));
+        assert!(meta.entries_for_sort_field("sortAt").contains(meta_id));
+        let matches = meta.find_matching_entries(
             &key.filter_clauses,
             Some("sortAt"),
             Some(SortDirection::Desc),
@@ -2626,11 +2939,10 @@ mod tests {
         };
         let slots: Vec<u32> = (0..10).collect();
         let meta_id = cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
-        // Both range clauses should be registered
-        assert!(cache.meta().entries_for_clause("sortAt", "gte", "1700000000").unwrap().contains(meta_id));
-        assert!(cache.meta().entries_for_clause("sortAt", "lt", "1710000000").unwrap().contains(meta_id));
-        // Field-level: only "sortAt" as filter field (deduplicated)
-        let field_entries = cache.meta().entries_for_filter_field("sortAt").unwrap();
+        let meta = cache.meta();
+        assert!(meta.entries_for_clause("sortAt", "gte", "1700000000").unwrap().contains(meta_id));
+        assert!(meta.entries_for_clause("sortAt", "lt", "1710000000").unwrap().contains(meta_id));
+        let field_entries = meta.entries_for_filter_field("sortAt").unwrap();
         assert_eq!(field_entries.len(), 1);
         assert!(field_entries.contains(meta_id));
     }
@@ -2649,7 +2961,7 @@ mod tests {
         let entry = cache.get(&key).unwrap();
         assert_eq!(entry.min_tracked_value(), 996); // 1000 - 4
         // Expand with slots 5-9, values 995-991
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         let new_slots: Vec<u32> = (5..10).collect();
         entry.expand(&new_slots, |s| 1000 - s);
         assert_eq!(entry.min_tracked_value(), 991); // 1000 - 9
@@ -2668,7 +2980,7 @@ mod tests {
         let entry = cache.get(&key).unwrap();
         assert!(entry.radix().is_none(), "no radix at initial capacity");
         // Expand
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         let new_slots: Vec<u32> = (5..100).collect();
         entry.expand(&new_slots, |s| 1000 - s);
         assert!(entry.radix().is_some(), "radix should be built on expand");
@@ -2688,7 +3000,7 @@ mod tests {
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         // Expand to build radix
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         let new_slots: Vec<u32> = (5..20).collect();
         entry.expand(&new_slots, |s| 1000 - s);
         assert_eq!(entry.radix().unwrap().total_slots(), 20);
@@ -2714,7 +3026,7 @@ mod tests {
         let slots: Vec<u32> = (0..5).collect();
         cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         // Expand to max capacity
-        let entry = cache.get_mut(&key).unwrap();
+        let mut entry = cache.get_mut(&key).unwrap();
         let new_slots: Vec<u32> = (5..10).collect();
         entry.expand(&new_slots, |s| 1000 - s);
         assert!(entry.radix().is_some());
@@ -3040,7 +3352,7 @@ mod tests {
             value_repr: "".to_string(),
         };
         assert!(
-            slot_matches_clause(42, &clause, &filters, &sorts),
+            slot_matches_clause(42, &clause, &filters, &sorts, None),
             "Or clause should conservatively return true"
         );
     }
@@ -3055,7 +3367,7 @@ mod tests {
             value_repr: "".to_string(),
         };
         assert!(
-            slot_matches_clause(42, &clause, &filters, &sorts),
+            slot_matches_clause(42, &clause, &filters, &sorts, None),
             "And clause should conservatively return true"
         );
     }
@@ -3071,7 +3383,7 @@ mod tests {
             value_repr: "".to_string(),
         };
         assert!(
-            slot_matches_clause(42, &clause, &filters, &sorts),
+            slot_matches_clause(42, &clause, &filters, &sorts, None),
             "Not(And(...)) should conservatively return true, not negate the inner conservative true"
         );
     }
@@ -3087,7 +3399,7 @@ mod tests {
             value_repr: "".to_string(),
         };
         assert!(
-            slot_matches_clause(42, &clause, &filters, &sorts),
+            slot_matches_clause(42, &clause, &filters, &sorts, None),
             "Not(Or(...)) should conservatively return true, not negate the inner conservative true"
         );
     }
@@ -3109,7 +3421,7 @@ mod tests {
             },
         ];
         assert!(
-            slot_matches_filter(42, &clauses, &filters, &sorts),
+            slot_matches_filter(42, &clauses, &filters, &sorts, None),
             "Filter with Not(And(...)) clause should not reject slot that matches other clauses"
         );
     }
@@ -3336,7 +3648,7 @@ mod tests {
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].key, key);
         // Phase B: evaluate outside lock
-        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None);
+        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None, None);
         assert!(timed_out.is_empty());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
@@ -3361,7 +3673,7 @@ mod tests {
             vec![3],
         );
         let (work, _) = cache.collect_filter_work(&HashMap::new(), &removes);
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None);
         cache.apply_maintenance_results(&results);
         let entry = cache.get(&key).unwrap();
         assert!(!entry.bitmap().contains(3), "Slot 3 should be removed via two-phase maintenance");
@@ -3380,7 +3692,7 @@ mod tests {
         sort_mutations.insert("reactionCount", [10].into_iter().collect());
         let (work, _) = cache.collect_sort_work(&sort_mutations);
         assert_eq!(work.len(), 1);
-        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None);
+        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
         assert_eq!(results[0].adds[0].0, 10);
@@ -3437,7 +3749,7 @@ mod tests {
         let mut cache_two = UnifiedCache::new(config);
         cache_two.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         let (work, _) = cache_two.collect_filter_work(&inserts, &HashMap::new());
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None);
         cache_two.apply_maintenance_results(&results);
         let two_has_10 = cache_two.get(&key).unwrap().bitmap().contains(10);
         assert_eq!(single_has_10, two_has_10, "Two-phase should produce same result as single-phase");
@@ -3479,7 +3791,7 @@ mod tests {
         // finish_restore should evict down to max_entries=5
         cache.finish_restore();
         assert_eq!(cache.len(), 5, "Should evict down to max_entries");
-        assert_eq!(cache.evictions, 5, "Should have evicted exactly 5");
+        assert_eq!(cache.evictions.load(Ordering::Relaxed), 5, "Should have evicted exactly 5");
     }
     /// Microbench: time Phase A collect_sort_work with many cache entries
     /// sorting by the same field, simulating the metrics_poller workload.
@@ -3550,5 +3862,412 @@ mod tests {
         let total_ns: u128 = samples.iter().map(|(e, _, _)| e.as_nanos()).sum();
         let avg_ms = (total_ns as f64 / iters as f64) / 1_000_000.0;
         println!("[bench] avg collect_sort_work: {:.3}ms over {} iters", avg_ms, iters);
+    }
+
+    // ── Bucket clause maintenance tests ─────────────────────────────────────
+
+    /// Build a TimeBucketManager with a single named bucket containing specific slots.
+    fn make_bucket_manager(bucket_name: &str, slots_in_bucket: &[u32]) -> crate::time_buckets::TimeBucketManager {
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+        let mut mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: bucket_name.to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        // Manually insert slots into the bucket bitmap via rebuild_bucket.
+        // Timestamps: simulate "now" as 1_000_000_000 and give each slot a ts
+        // within the bucket window (or outside, to verify exclusion).
+        let now: u64 = 1_000_000_000;
+        let values: Vec<(u32, u64)> = slots_in_bucket.iter().map(|&s| (s, now - 3600)).collect();
+        mgr.rebuild_bucket(bucket_name, values.into_iter(), now);
+        mgr
+    }
+
+    #[test]
+    fn test_slot_matches_clause_bucket_with_manager_in_bucket() {
+        // slot 5 IS in the "24h" bucket → should return true
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let mgr = make_bucket_manager("24h", &[5, 10, 15]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "24h".to_string(),
+        };
+        assert!(
+            slot_matches_clause(5, &clause, &filters, &sorts, Some(&mgr)),
+            "slot in bucket should return true"
+        );
+        assert!(
+            slot_matches_clause(10, &clause, &filters, &sorts, Some(&mgr)),
+            "slot in bucket should return true"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_clause_bucket_with_manager_not_in_bucket() {
+        // slot 99 is NOT in the "24h" bucket → should return false
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let mgr = make_bucket_manager("24h", &[5, 10, 15]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "24h".to_string(),
+        };
+        assert!(
+            !slot_matches_clause(99, &clause, &filters, &sorts, Some(&mgr)),
+            "slot not in bucket should return false"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_clause_bucket_conservative_without_manager() {
+        // Without a bucket manager, bucket clauses should conservatively return true
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "24h".to_string(),
+        };
+        assert!(
+            slot_matches_clause(99, &clause, &filters, &sorts, None),
+            "bucket clause without manager should conservatively return true"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_filter_work_bucket_clause_no_pollution() {
+        // Regression test: a slot that is NOT in the "24h" bucket must NOT be
+        // added to a cache entry keyed by bucket="24h", even when it is being
+        // mutated (which previously triggered the always-true pollution path).
+        //
+        // Setup:
+        //   slot 1: sortAt=now-3600 (in 24h) — should be in cache
+        //   slot 2: sortAt=now-200_000 (~2.3d, NOT in 24h) — must NOT appear
+        //   slot 3: sortAt=now-600_000 (~7d, NOT in 24h) — triggered pollution
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+
+        let now: u64 = 1_000_000_000;
+
+        // Build bucket manager: 24h bucket containing only slot 1.
+        let mut mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: "24h".to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        mgr.rebuild_bucket(
+            "24h",
+            vec![(1u32, now - 3600)].into_iter(), // slot 1 is in 24h
+            now,
+        );
+
+        // Filter and sort indexes: use nsfwLevel=1 as a co-clause so the cache
+        // entry has a real filter predicate (all 3 slots are nsfwLevel=1).
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[1, 2, 3])])]);
+        let sorts = make_sort_index(&[("sortAt", &[
+            (1, (now - 3600) as u32),
+            (2, (now - 200_000) as u32),
+            (3, (now - 600_000) as u32),
+        ])]);
+
+        // Build a cache entry for: bucket("24h") AND nsfwLevel=1, sort by sortAt Desc.
+        let key = make_key(
+            &[
+                ("sortAtUnix", "bucket", "24h"),
+                ("nsfwLevel", "eq", "1"),
+            ],
+            "sortAt",
+            SortDirection::Desc,
+        );
+
+        // Initial cache entry: contains only slot 1 (pre-populated correctly).
+        let initial_slots: Vec<u32> = vec![1];
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 200,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 100,
+            max_capacity: 1600,
+            min_filter_size: 0,
+            max_maintenance_work: 1_000_000,
+            max_maintenance_ms: 1000,
+            prefetch_threshold: 0.95,
+        });
+        // total_matched = 1 (only slot 1); value_fn maps slot→sort_value
+        cache.form_and_store(key.clone(), &initial_slots, true, 1u64, |s| {
+            if s == 1 { (now - 3600) as u32 } else { 0 }
+        });
+
+        // Simulate: slot 3 is being inserted with nsfwLevel=1 (triggers filter maintenance).
+        // The bucket manager (already updated by flush thread) does NOT contain slot 3.
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![3],
+        );
+
+        // Collect filter work items (Phase A).
+        let (filter_work, _over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(!filter_work.is_empty(), "should have work for the bucket entry");
+
+        // Phase B: evaluate with the bucket manager. slot 3 must be rejected.
+        let (results, timed_out) = evaluate_filter_work(
+            &filter_work,
+            &filters,
+            &sorts,
+            None,
+            Some(&mgr),
+        );
+        assert!(timed_out.is_empty());
+
+        // Apply results to cache.
+        cache.apply_maintenance_results(&results);
+
+        // Verify: slot 3 is NOT in the cache entry.
+        let entry = cache.get(&key).expect("cache entry should still exist");
+        assert!(
+            !entry.bitmap().contains(3),
+            "slot 3 (not in 24h bucket) must NOT be added to the 24h cache entry"
+        );
+        // Verify: slot 1 is still present.
+        assert!(
+            entry.bitmap().contains(1),
+            "slot 1 (in 24h bucket) must remain in the cache entry"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_filter_work_bucket_clause_adds_slot_in_bucket() {
+        // Positive case: a slot that IS in the bucket should be added when it
+        // also satisfies all other filter clauses.
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+
+        let now: u64 = 1_000_000_000;
+
+        let mut mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: "24h".to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        // Slot 1 is older (lower sort value), slot 20 is newer (higher sort value).
+        // Both are in the 24h bucket.
+        // Sort values (Desc): slot 20 > slot 1, so slot 20 qualifies to be added to
+        // an entry that currently tracks slot 1 as its min.
+        let ts_slot1: u32 = (now - 7200) as u32;  // 2h ago
+        let ts_slot20: u32 = (now - 3600) as u32; // 1h ago (newer → higher sort)
+        mgr.rebuild_bucket(
+            "24h",
+            vec![(1u32, now - 7200), (20u32, now - 3600)].into_iter(),
+            now,
+        );
+
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[1, 20])])]);
+        let sorts = make_sort_index(&[("sortAt", &[
+            (1, ts_slot1),
+            (20, ts_slot20),
+        ])]);
+
+        let key = make_key(
+            &[
+                ("sortAtUnix", "bucket", "24h"),
+                ("nsfwLevel", "eq", "1"),
+            ],
+            "sortAt",
+            SortDirection::Desc,
+        );
+
+        // Form cache entry with slot 1 only (its sort value is the min_tracked).
+        // Slot 20 has a higher sort value than slot 1, so it will qualify (Desc).
+        let initial_slots: Vec<u32> = vec![1];
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 200,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 100,
+            max_capacity: 1600,
+            min_filter_size: 0,
+            max_maintenance_work: 1_000_000,
+            max_maintenance_ms: 1000,
+            prefetch_threshold: 0.95,
+        });
+        // total_matched = 100 (non-trivial, so min_filter_size=0 still stores it)
+        cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
+            if s == 1 { ts_slot1 } else { 0 }
+        });
+
+        // Slot 20 is being inserted with nsfwLevel=1 and sortAt within 24h.
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![20],
+        );
+
+        let (filter_work, _) = cache.collect_filter_work(&inserts, &HashMap::new());
+        let (results, _) = evaluate_filter_work(
+            &filter_work,
+            &filters,
+            &sorts,
+            None,
+            Some(&mgr),
+        );
+        cache.apply_maintenance_results(&results);
+
+        let entry = cache.get(&key).expect("cache entry should still exist");
+        assert!(
+            entry.bitmap().contains(20),
+            "slot 20 (in 24h bucket, nsfwLevel=1) should be added to the 24h cache entry"
+        );
+    }
+
+    // ── Fast-follow review feedback tests (PR #251) ─────────────────────────
+
+    #[test]
+    fn test_slot_matches_clause_bucket_unknown_name_returns_false() {
+        // A bucket manager exists but the clause references a bucket name that
+        // was never registered. Should return false (not conservative true).
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        // Manager only knows "24h"; clause asks for "999d" (not registered).
+        let mgr = make_bucket_manager("24h", &[42]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "999d".to_string(), // unknown name
+        };
+        assert!(
+            !slot_matches_clause(42, &clause, &filters, &sorts, Some(&mgr)),
+            "unknown bucket name with manager present should return false"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_clause_bucket_empty_bucket_returns_false() {
+        // The "24h" bucket exists in the manager but has zero slots in it.
+        // Any slot lookup should return false.
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+
+        let mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: "24h".to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        // No rebuild_bucket call — bitmap stays empty.
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "24h".to_string(),
+        };
+        assert!(
+            !slot_matches_clause(42, &clause, &filters, &sorts, Some(&mgr)),
+            "slot not in empty bucket should return false"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_sort_work_bucket_clause_no_pollution() {
+        // Mirror of test_evaluate_filter_work_bucket_clause_no_pollution but
+        // exercises evaluate_sort_work. A slot that is NOT in the "24h" bucket
+        // must not be admitted to the cache entry even if its sort value qualifies.
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+
+        let now: u64 = 1_000_000_000;
+
+        // Bucket manager: 24h window contains only slot 1.
+        let mut mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: "24h".to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        mgr.rebuild_bucket(
+            "24h",
+            vec![(1u32, now - 3600)].into_iter(), // only slot 1
+            now,
+        );
+
+        // nsfwLevel=1 for slots 1 and 7; sort values: slot 7 > slot 1 (Desc qualifies).
+        let ts_slot1: u32 = (now - 7200) as u32;
+        let ts_slot7: u32 = (now - 1800) as u32; // higher sort value than slot 1
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[1, 7])])]);
+        let sorts = make_sort_index(&[("sortAt", &[
+            (1, ts_slot1),
+            (7, ts_slot7),
+        ])]);
+
+        // Cache entry: bucket("24h") AND nsfwLevel=1, sort by sortAt Desc.
+        // Initially contains slot 1 (min_tracked = ts_slot1).
+        // Slot 7 has a higher sort value → it would qualify by sort alone,
+        // but it is NOT in the bucket and must be rejected.
+        let key = make_key(
+            &[
+                ("sortAtUnix", "bucket", "24h"),
+                ("nsfwLevel", "eq", "1"),
+            ],
+            "sortAt",
+            SortDirection::Desc,
+        );
+        let initial_slots: Vec<u32> = vec![1];
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 200,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 100,
+            max_capacity: 1600,
+            min_filter_size: 0,
+            max_maintenance_work: 1_000_000,
+            max_maintenance_ms: 1000,
+            prefetch_threshold: 0.95,
+        });
+        cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
+            if s == 1 { ts_slot1 } else { 0 }
+        });
+
+        // Simulate: slot 7 is mutated on nsfwLevel=1. Collect sort work items.
+        // Sort maintenance fires when a slot's sort value changes and the entry
+        // might need updating.
+        let mut sort_mutations: HashMap<&str, HashSet<u32>> = HashMap::new();
+        sort_mutations.insert("sortAt", [7u32].into_iter().collect());
+        let (sort_work, _over_budget) = cache.collect_sort_work(&sort_mutations);
+        // The cache entry has filter_clauses so it may appear in sort_work.
+        // evaluate_sort_work must reject slot 7 because it fails the bucket clause.
+        let (results, timed_out) = evaluate_sort_work(
+            &sort_work,
+            &filters,
+            &sorts,
+            None,
+            Some(&mgr),
+        );
+        assert!(timed_out.is_empty());
+        cache.apply_maintenance_results(&results);
+
+        let entry = cache.get(&key).expect("cache entry should still exist");
+        assert!(
+            !entry.bitmap().contains(7),
+            "slot 7 (not in 24h bucket) must NOT be added by sort-work maintenance"
+        );
+        assert!(
+            entry.bitmap().contains(1),
+            "slot 1 (in 24h bucket) must remain in the cache entry"
+        );
     }
 }

@@ -33,6 +33,15 @@
       { "name": "id", "bits": 32 }
     ],
     "max_page_size": 200,
+    "cache": {
+      "async_maintenance": true,
+      "max_maintenance_ms": 10000,
+      "max_entries": 250000,
+      "max_bytes": 2147483648
+    },
+    "doc_cache": {
+      "max_bytes": 10737418240
+    },
     "deferred_alive": {
       "source_field": "publishedAt"
     },

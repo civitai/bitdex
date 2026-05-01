@@ -55,7 +55,7 @@ Source: `model-share/src/server/search-index/metrics-images.search-index.ts`
 | 8 | `availability` | `availability` | `single_value` | MappedString | Enum: "Public"=1, "Unsearchable"=2, "Private"=3, "EarlyAccess"=4. |
 | 9 | `blockedFor` | `blockedFor` | `single_value` | MappedString | BlockedReason enum: "tos"=1, "moderated"=2, "CSAM"=3, "AiNotVerified"=4. Nullable. |
 | 10 | `remixOfId` | `remixOfId` | `single_value` | Integer | Nullable. The source image ID for remixes. |
-| 11 | `sortAtUnix` | `sortAtUnix` | `single_value` | Integer | Unix timestamp (milliseconds). Used for time range filters. `truncate_u32: true` needed (ms timestamps exceed u32). |
+| 11 | `sortAtUnix` | `sortAtUnix` | (time bucket only) | — | Unix timestamp (milliseconds). Used by `time_buckets.filter_field` to drive the pre-computed `24h` / `7d` / `30d` / `1y` bucket bitmaps. **NOT registered as a regular `filter_field`** — too noisy and large to maintain a per-second filter shard at 100M+ records. Use `Bucket` filter on the named windows for time-range queries; raw `Gte/Lt/Lte` against `sortAtUnix` is unsupported and will return `FieldNotFound` once the defensive pass-all branch in `unified_cache.rs:2129` is tightened (follow-up). |
 | 12 | `publishedAtUnix` | `publishedAtUnix` | `single_value` | Integer | Unix timestamp (milliseconds). Nullable. `truncate_u32: true`. |
 | 13 | `existedAtUnix` | `existedAtUnix` | `single_value` | Integer | Unix timestamp (milliseconds). Currently unused in queries but indexed. `truncate_u32: true`. |
 | 14 | `hasMeta` | `hasMeta` | `boolean` | Boolean | True if image has non-null, non-hidden metadata. |
