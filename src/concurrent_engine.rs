@@ -1633,13 +1633,22 @@ impl ConcurrentEngine {
                             } else {
                                 None
                             };
+                            // Load the time bucket manager snapshot once for this
+                            // phase-B cycle. The flush thread already called
+                            // insert_slot/remove_slot on every mutated slot before
+                            // reaching here, so the bitmap is authoritative for all
+                            // slots we are about to evaluate.
+                            let tb_guard = flush_time_buckets
+                                .as_ref()
+                                .map(|arc| arc.load_full());
+                            let tb_ref = tb_guard.as_deref();
                             let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
-                                evaluate_filter_work(&filter_work, &staging.filters, &staging.sorts, deadline)
+                                evaluate_filter_work(&filter_work, &staging.filters, &staging.sorts, deadline, tb_ref)
                             } else {
                                 (Vec::new(), Vec::new())
                             };
                             let (sort_results, sort_timed_out) = if !sort_work.is_empty() {
-                                evaluate_sort_work(&sort_work, &staging.filters, &staging.sorts, deadline)
+                                evaluate_sort_work(&sort_work, &staging.filters, &staging.sorts, deadline, tb_ref)
                             } else {
                                 (Vec::new(), Vec::new())
                             };
@@ -3328,6 +3337,13 @@ impl ConcurrentEngine {
                 Arc::clone(&cache_worker_metrics),
                 Arc::clone(&shutdown),
             );
+            // Attach time buckets so the async worker evaluates bucket clauses
+            // correctly (bitmap.contains) rather than always returning true.
+            let worker = if let Some(ref tb_arc) = time_buckets {
+                worker.with_time_buckets(Arc::clone(tb_arc))
+            } else {
+                worker
+            };
             Some(
                 std::thread::Builder::new()
                     .name("bitdex-cache-worker".to_string())

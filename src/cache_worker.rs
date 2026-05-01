@@ -277,6 +277,10 @@ pub struct CacheWorker {
     shutdown: Arc<AtomicBool>,
     /// Counter for periodic `reconcile_bytes` calls — see Phase C in `run`.
     cycles_since_reconcile: u32,
+    /// Time bucket manager, if time buckets are configured. Used to evaluate
+    /// `bucket` clauses during cache maintenance — the bitmap.contains(slot)
+    /// check replaces the old always-true conservative fallback.
+    time_buckets: Option<Arc<arc_swap::ArcSwap<crate::time_buckets::TimeBucketManager>>>,
 }
 
 impl CacheWorker {
@@ -296,7 +300,18 @@ impl CacheWorker {
             metrics,
             shutdown,
             cycles_since_reconcile: 0,
+            time_buckets: None,
         }
+    }
+
+    /// Attach a time bucket manager so bucket clauses are evaluated precisely.
+    /// Call this before `run()`.
+    pub fn with_time_buckets(
+        mut self,
+        tb: Arc<arc_swap::ArcSwap<crate::time_buckets::TimeBucketManager>>,
+    ) -> Self {
+        self.time_buckets = Some(tb);
+        self
     }
 
     /// Main loop. Exits when the channel disconnects or `shutdown` is set.
@@ -411,8 +426,16 @@ impl CacheWorker {
             };
 
             // Phase B analogue — lock-free eval against the published snapshot.
+            // Load the time bucket manager snapshot once per cycle; the flush
+            // thread already ran insert_slot/remove_slot before enqueuing this
+            // work item, so the bucket bitmaps are authoritative.
+            let tb_guard = self
+                .time_buckets
+                .as_ref()
+                .map(|arc| arc.load_full());
+            let tb_ref = tb_guard.as_deref();
             let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
-                evaluate_filter_work(&filter_work, &snap.filters, &snap.sorts, deadline)
+                evaluate_filter_work(&filter_work, &snap.filters, &snap.sorts, deadline, tb_ref)
             } else {
                 (Vec::new(), Vec::new())
             };
@@ -423,6 +446,7 @@ impl CacheWorker {
                     &snap.filters,
                     &snap.sorts,
                     deadline,
+                    tb_ref,
                 )
             } else {
                 (Vec::new(), Vec::new())
