@@ -16,7 +16,7 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use arc_swap::ArcSwap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::concurrent_engine::InnerEngine;
@@ -75,6 +75,11 @@ impl CacheWorkItem {
 
 /// Metrics exposed by the cache worker. Owned by the engine, referenced by
 /// both the worker thread and the Prometheus metrics bridge.
+///
+/// The reason-attributed `marked_*_total` counters and the `rebuild_completed_total`
+/// counter are also incremented from `UnifiedCache` (the cache holds an Arc to this
+/// struct for those updates). The single shared struct keeps the prom-export side
+/// simple while letting both the worker and the cache contribute to the same totals.
 #[derive(Default)]
 pub struct CacheWorkerMetrics {
     pub queue_depth: AtomicU64,
@@ -84,6 +89,30 @@ pub struct CacheWorkerMetrics {
     pub over_budget_total: AtomicU64,
     pub backpressure_invalidations_total: AtomicU64,
     pub cycles_total: AtomicU64,
+    /// Cache entries marked for rebuild because the time deadline was hit
+    /// (`max_maintenance_ms` exceeded mid-cycle).
+    pub marked_for_rebuild_deadline_total: AtomicU64,
+    /// Cache entries marked for rebuild because the count budget was hit
+    /// (`max_maintenance_work` exceeded before evaluation started).
+    pub marked_for_rebuild_count_budget_total: AtomicU64,
+    /// Cache entries marked for rebuild because the worker backlog overflowed
+    /// `backlog_drop_limit` and we fell back to coarse invalidation.
+    pub marked_for_rebuild_backlog_drop_total: AtomicU64,
+    /// Cache entries marked for rebuild as a consequence of an alive-bitmap
+    /// mutation (delete) — every entry is invalidated since negation operators
+    /// bake alive into the result.
+    pub marked_for_rebuild_alive_change_total: AtomicU64,
+    /// Cache entries marked for rebuild via `invalidate_filter_field` (compound
+    /// or otherwise un-narrowable filter mutations).
+    pub marked_for_rebuild_filter_invalidation_total: AtomicU64,
+    /// Cache entries that successfully completed a rebuild — either via
+    /// `UnifiedEntry::rebuild` directly or by being replaced in `store()` when
+    /// the prior entry had `needs_rebuild=true`.
+    pub rebuild_completed_total: AtomicU64,
+    /// Histogram for per-cycle wall-clock time. Installed post-engine-construction
+    /// by `set_metrics_bridge` so the worker can see the prom-bound `Histogram`.
+    /// Optional — the worker no-ops when unset.
+    pub cycle_histogram: OnceLock<prometheus::Histogram>,
 }
 
 /// Cache worker configuration. Derived from `CacheConfig` + engine state.
@@ -403,6 +432,22 @@ impl CacheWorker {
             {
                 uc.apply_maintenance_results(&filter_results);
                 uc.apply_maintenance_results(&sort_results);
+                // Attribute the batch-mark calls by reason. `over_budget` keys
+                // come from `collect_*_work` (count-budget bail before eval);
+                // `timed_out` keys come from `evaluate_*_work` hitting the time
+                // deadline.
+                let cb = (filter_over_budget.len() + sort_over_budget.len()) as u64;
+                let dl = (filter_timed_out.len() + sort_timed_out.len()) as u64;
+                if cb > 0 {
+                    self.metrics
+                        .marked_for_rebuild_count_budget_total
+                        .fetch_add(cb, Ordering::Relaxed);
+                }
+                if dl > 0 {
+                    self.metrics
+                        .marked_for_rebuild_deadline_total
+                        .fetch_add(dl, Ordering::Relaxed);
+                }
                 uc.mark_for_rebuild_batch(&filter_over_budget);
                 uc.mark_for_rebuild_batch(&sort_over_budget);
                 uc.mark_for_rebuild_batch(&filter_timed_out);
@@ -427,9 +472,13 @@ impl CacheWorker {
                     .over_budget_total
                     .fetch_add(over_budget, Ordering::Relaxed);
             }
+            let elapsed = t.elapsed();
             self.metrics
                 .cycle_nanos
-                .store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                .store(elapsed.as_nanos() as u64, Ordering::Relaxed);
+            if let Some(h) = self.metrics.cycle_histogram.get() {
+                h.observe(elapsed.as_secs_f64());
+            }
             self.metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .queue_depth
@@ -455,15 +504,30 @@ impl CacheWorker {
             any_alive |= item.has_alive_mutations;
         }
         if any_alive {
-            uc.maintain_alive_changes();
+            let n = uc.maintain_alive_changes();
+            if n > 0 {
+                self.metrics
+                    .marked_for_rebuild_backlog_drop_total
+                    .fetch_add(n, Ordering::Relaxed);
+            }
             return;
         }
         for field in &affected_filter_fields {
-            uc.invalidate_filter_field(field);
+            let n = uc.invalidate_filter_field(field);
+            if n > 0 {
+                self.metrics
+                    .marked_for_rebuild_backlog_drop_total
+                    .fetch_add(n, Ordering::Relaxed);
+            }
         }
         let any_sort = pending.iter().any(|it| !it.sort_mutations.is_empty());
         if any_sort {
-            uc.maintain_alive_changes();
+            let n = uc.maintain_alive_changes();
+            if n > 0 {
+                self.metrics
+                    .marked_for_rebuild_backlog_drop_total
+                    .fetch_add(n, Ordering::Relaxed);
+            }
         }
     }
 }

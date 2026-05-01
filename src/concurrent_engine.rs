@@ -633,6 +633,11 @@ impl ConcurrentEngine {
             max_maintenance_ms: config.cache.max_maintenance_ms,
             prefetch_threshold: config.cache.prefetch_threshold,
         };
+        // Cache-worker metrics created early so the cache can hold an Arc to
+        // it for reason-attributed rebuild counters (alive_change,
+        // filter_invalidation, deadline, count_budget, rebuild_completed).
+        let cache_worker_metrics: Arc<crate::cache_worker::CacheWorkerMetrics> =
+            Arc::new(crate::cache_worker::CacheWorkerMetrics::default());
         let mut uc = UnifiedCache::new(uc_config);
         // Initialize BoundStore for unified cache persistence
         let bound_store = if let Some(ref path) = config.storage.bitmap_path {
@@ -711,6 +716,7 @@ impl ConcurrentEngine {
             None
         };
         let unified_cache = Arc::new(uc);
+        unified_cache.set_rebuild_metrics(Arc::clone(&cache_worker_metrics));
         let loading_mode = Arc::new(AtomicBool::new(false));
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
         let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
@@ -1028,9 +1034,7 @@ impl ConcurrentEngine {
         let boundstore_bytes_read = Arc::new(AtomicU64::new(0));
         let boundstore_entries_restored = Arc::new(AtomicU64::new(0));
         let boundstore_entries_skipped = Arc::new(AtomicU64::new(0));
-        // Async cache worker channel + metrics (always allocated; worker spawned below
-        // unless headless or async_maintenance=false).
-        let cache_worker_metrics = Arc::new(crate::cache_worker::CacheWorkerMetrics::default());
+        // Async cache worker channel (metrics created earlier — see above).
         let (cache_work_tx, pre_cache_rx): (
             Option<crossbeam_channel::Sender<crate::cache_worker::CacheWorkItem>>,
             Option<crossbeam_channel::Receiver<crate::cache_worker::CacheWorkItem>>,
@@ -1788,7 +1792,12 @@ impl ConcurrentEngine {
                                     if !uc.is_empty() && !coalescer.alive_removes().is_empty() {
                                         uc.remove_slots_from_all_batch(coalescer.alive_removes());
                                     }
-                                    uc.maintain_alive_changes();
+                                    let n = uc.maintain_alive_changes();
+                                    if n > 0 {
+                                        flush_cache_worker_metrics
+                                            .marked_for_rebuild_alive_change_total
+                                            .fetch_add(n, Ordering::Relaxed);
+                                    }
                                 }
                             }
                             // Mark fields touched by mutations or lazy loads as stale
@@ -6064,6 +6073,17 @@ impl ConcurrentEngine {
             self.flush_cache_unique_filter_shapes_max.load(Ordering::Relaxed),
             self.flush_cache_sort_work_items_max.load(Ordering::Relaxed),
         )
+    }
+    /// Direct handle to the cache-worker metrics struct. Used by the metrics
+    /// bridge to install the cycle-time histogram and to read the
+    /// reason-attributed rebuild counters at scrape time.
+    pub fn cache_worker_metrics(&self) -> &Arc<crate::cache_worker::CacheWorkerMetrics> {
+        &self.cache_worker_metrics
+    }
+    /// Count UnifiedCache entries currently flagged `needs_rebuild=true`.
+    /// O(entries) scan — call from the prom scrape path, not the hot path.
+    pub fn unified_cache_needs_rebuild_count(&self) -> u64 {
+        self.unified_cache.count_needs_rebuild()
     }
     /// Async cache worker metrics:
     /// `(queue_depth, cycle_nanos, items_coalesced_total, drops_total,

@@ -78,11 +78,24 @@ pub struct Metrics {
     // -- Async cache worker (Phase 1a) --
     pub cache_worker_queue_depth: IntGaugeVec,
     pub cache_worker_cycle_nanos: IntGaugeVec,
+    pub cache_worker_cycle_seconds: HistogramVec,
     pub cache_worker_items_coalesced_total: IntGaugeVec,
     pub cache_worker_drops_total: IntGaugeVec,
     pub cache_worker_over_budget_total: IntGaugeVec,
     pub cache_backpressure_invalidations_total: IntGaugeVec,
     pub cache_worker_cycles_total: IntGaugeVec,
+    /// Number of cache entries currently flagged `needs_rebuild=true`. Sampled
+    /// at scrape time. Gives Justin the live "shed backlog" depth the cache
+    /// is carrying — matching `marked_for_rebuild_total` minus
+    /// `rebuild_completed_total` (approximately, modulo evictions).
+    pub cache_entries_needs_rebuild: IntGaugeVec,
+    /// Cumulative count of cache entries marked for rebuild, attributed by
+    /// reason. Replaces the single-bucket semantics of `over_budget_total`
+    /// with reason labels so we can see WHY entries are being shed.
+    pub cache_marked_for_rebuild_total: IntGaugeVec,
+    /// Cumulative count of cache rebuilds that completed (entry replaced via
+    /// `store()` while the prior entry had `needs_rebuild=true`).
+    pub cache_rebuild_completed_total: IntGaugeVec,
 
     pub docstore_put_batch_fast_path_total: IntGaugeVec,
     pub docstore_put_batch_slow_path_total: IntGaugeVec,
@@ -530,6 +543,15 @@ impl Metrics {
             &["index"],
         )
         .unwrap();
+        let cache_worker_cycle_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_cache_worker_cycle_seconds",
+                "Wall-clock duration of each async cache worker cycle, in seconds.",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
+            &["index"],
+        )
+        .unwrap();
         let cache_worker_items_coalesced_total = IntGaugeVec::new(
             Opts::new(
                 "bitdex_cache_worker_items_coalesced_total",
@@ -566,6 +588,30 @@ impl Metrics {
             Opts::new(
                 "bitdex_cache_worker_cycles_total",
                 "Total number of completed async cache worker cycles.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_entries_needs_rebuild = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_entries_needs_rebuild",
+                "Number of UnifiedCache entries currently flagged needs_rebuild=true. Live backlog of stale entries that next access will treat as a miss.",
+            ),
+            &["index"],
+        )
+        .unwrap();
+        let cache_marked_for_rebuild_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_marked_for_rebuild_total",
+                "Cumulative count of cache entries marked for rebuild, labeled by the proximate reason.",
+            ),
+            &["index", "reason"],
+        )
+        .unwrap();
+        let cache_rebuild_completed_total = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_rebuild_completed_total",
+                "Cumulative count of cache rebuilds that completed (stale entry replaced via store()).",
             ),
             &["index"],
         )
@@ -1028,11 +1074,15 @@ impl Metrics {
         registry.register(Box::new(cache_maint_sort_work_items_max.clone())).unwrap();
         registry.register(Box::new(cache_worker_queue_depth.clone())).unwrap();
         registry.register(Box::new(cache_worker_cycle_nanos.clone())).unwrap();
+        registry.register(Box::new(cache_worker_cycle_seconds.clone())).unwrap();
         registry.register(Box::new(cache_worker_items_coalesced_total.clone())).unwrap();
         registry.register(Box::new(cache_worker_drops_total.clone())).unwrap();
         registry.register(Box::new(cache_worker_over_budget_total.clone())).unwrap();
         registry.register(Box::new(cache_backpressure_invalidations_total.clone())).unwrap();
         registry.register(Box::new(cache_worker_cycles_total.clone())).unwrap();
+        registry.register(Box::new(cache_entries_needs_rebuild.clone())).unwrap();
+        registry.register(Box::new(cache_marked_for_rebuild_total.clone())).unwrap();
+        registry.register(Box::new(cache_rebuild_completed_total.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_fast_path_total.clone())).unwrap();
         registry.register(Box::new(docstore_put_batch_slow_path_total.clone())).unwrap();
         registry
@@ -1157,11 +1207,15 @@ impl Metrics {
             cache_maint_sort_work_items_max,
             cache_worker_queue_depth,
             cache_worker_cycle_nanos,
+            cache_worker_cycle_seconds,
             cache_worker_items_coalesced_total,
             cache_worker_drops_total,
             cache_worker_over_budget_total,
             cache_backpressure_invalidations_total,
             cache_worker_cycles_total,
+            cache_entries_needs_rebuild,
+            cache_marked_for_rebuild_total,
+            cache_rebuild_completed_total,
             docstore_put_batch_fast_path_total,
             docstore_put_batch_slow_path_total,
             lazy_load_duration_seconds,

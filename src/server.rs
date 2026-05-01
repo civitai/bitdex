@@ -1711,6 +1711,17 @@ fn restore_index(state: &SharedState) -> Result<(), String> {
             query_total: state.metrics.query_total.clone(),
             index_name: def.name.clone(),
         });
+        // Install the cache-worker cycle-time histogram so the worker can
+        // observe per cycle. OnceLock — first set wins; idempotent on retries.
+        let _ = engine
+            .cache_worker_metrics()
+            .cycle_histogram
+            .set(
+                state
+                    .metrics
+                    .cache_worker_cycle_seconds
+                    .with_label_values(&[&def.name]),
+            );
         let phase4_elapsed = phase_start.elapsed();
         eprintln!("  Boot phase: metrics_bridge completed in {}ms", phase4_elapsed.as_millis());
         state.metrics.boot_phase_seconds
@@ -4989,6 +5000,29 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.cache_worker_over_budget_total.with_label_values(&[name]).set(cw_over_budget as i64);
             m.cache_backpressure_invalidations_total.with_label_values(&[name]).set(cw_backpressure as i64);
             m.cache_worker_cycles_total.with_label_values(&[name]).set(cw_cycles as i64);
+            // Reason-attributed rebuild counters + needs_rebuild backlog gauge.
+            let cwm = engine.cache_worker_metrics();
+            m.cache_entries_needs_rebuild
+                .with_label_values(&[name])
+                .set(engine.unified_cache_needs_rebuild_count() as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "deadline"])
+                .set(cwm.marked_for_rebuild_deadline_total.load(Ordering::Relaxed) as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "count_budget"])
+                .set(cwm.marked_for_rebuild_count_budget_total.load(Ordering::Relaxed) as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "backlog_drop"])
+                .set(cwm.marked_for_rebuild_backlog_drop_total.load(Ordering::Relaxed) as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "alive_change"])
+                .set(cwm.marked_for_rebuild_alive_change_total.load(Ordering::Relaxed) as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "filter_invalidation"])
+                .set(cwm.marked_for_rebuild_filter_invalidation_total.load(Ordering::Relaxed) as i64);
+            m.cache_rebuild_completed_total
+                .with_label_values(&[name])
+                .set(cwm.rebuild_completed_total.load(Ordering::Relaxed) as i64);
             // Iter 6 — put_batch fast/slow path counters
             let (fast_path, slow_path) = engine.docstore_put_batch_path_stats();
             m.docstore_put_batch_fast_path_total

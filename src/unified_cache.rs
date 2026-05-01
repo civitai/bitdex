@@ -13,7 +13,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, MutexGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// DashMap with the project's standard ahash hasher.
@@ -676,6 +676,10 @@ pub struct UnifiedCache {
     /// Reverse index: ShardKey → set of UnifiedKeys in that shard.
     /// Avoids O(all_entries) scan in entries_for_shard() and clear_shard_entry_dirty().
     shard_to_keys: AHashMap2<ShardKey, HashSet<UnifiedKey>>,
+    /// Optional shared metrics handle for reason-attributed rebuild counters.
+    /// Set by `ConcurrentEngine` after construction; tests leave it unset and
+    /// the cache silently skips the increments.
+    rebuild_metrics: OnceLock<Arc<crate::cache_worker::CacheWorkerMetrics>>,
 }
 impl UnifiedCache {
     pub fn new(config: UnifiedCacheConfig) -> Self {
@@ -703,7 +707,29 @@ impl UnifiedCache {
             prefetches: AtomicU64::new(0),
             restoring: AtomicBool::new(false),
             shard_to_keys: DashMap::with_hasher(ahash::RandomState::new()),
+            rebuild_metrics: OnceLock::new(),
         }
+    }
+    /// Install the rebuild-attribution metrics handle. Idempotent — only the
+    /// first call has effect. Called by `ConcurrentEngine` post-construction.
+    pub fn set_rebuild_metrics(&self, metrics: Arc<crate::cache_worker::CacheWorkerMetrics>) {
+        let _ = self.rebuild_metrics.set(metrics);
+    }
+    /// Internal helper — returns the metrics handle if set.
+    #[inline]
+    fn rmetrics(&self) -> Option<&Arc<crate::cache_worker::CacheWorkerMetrics>> {
+        self.rebuild_metrics.get()
+    }
+    /// Count cache entries currently in the `needs_rebuild=true` state.
+    /// O(entries) scan — call from the prom scrape path, not the hot path.
+    pub fn count_needs_rebuild(&self) -> u64 {
+        let mut count = 0u64;
+        for r in self.entries.iter() {
+            if r.value().needs_rebuild() {
+                count += 1;
+            }
+        }
+        count
     }
     /// Store persisted has_more flags from meta.bin, keyed by entry ID.
     /// Called during startup after loading meta.bin.
@@ -790,6 +816,13 @@ impl UnifiedCache {
         let new_bytes = entry.memory_bytes();
         // If replacing an existing entry, deregister the old one and subtract its bytes
         if let Some((_, old)) = self.entries.remove(&key) {
+            // The old entry was the stale one — replacing it counts as a
+            // rebuild completion.
+            if old.needs_rebuild() {
+                if let Some(m) = self.rmetrics() {
+                    m.rebuild_completed_total.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             self.total_bytes
                 .fetch_sub(old.memory_bytes().min(self.total_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
             self.meta_id_to_key.remove(&old.meta_id);
@@ -1505,13 +1538,21 @@ impl UnifiedCache {
         let deadline = if cfg.max_maintenance_ms > 0 {
             Some(Instant::now() + Duration::from_millis(cfg.max_maintenance_ms))
         } else if cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
+            let mut marked = 0u64;
             for meta_id in affected_ids.iter() {
                 if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
                     let key = key_ref.value().clone();
                     drop(key_ref);
                     if let Some(r) = self.entries.get(&key) {
                         r.value().mark_for_rebuild();
+                        marked += 1;
                     }
+                }
+            }
+            if marked > 0 {
+                if let Some(m) = self.rmetrics() {
+                    m.marked_for_rebuild_count_budget_total
+                        .fetch_add(marked, Ordering::Relaxed);
                 }
             }
             return;
@@ -1525,9 +1566,17 @@ impl UnifiedCache {
         for (i, key) in affected_keys.iter().enumerate() {
             if let Some(deadline) = deadline {
                 if i > 0 && i % 64 == 0 && Instant::now() > deadline {
+                    let mut marked = 0u64;
                     for remaining_key in &affected_keys[i..] {
                         if let Some(r) = self.entries.get(remaining_key) {
                             r.value().mark_for_rebuild();
+                            marked += 1;
+                        }
+                    }
+                    if marked > 0 {
+                        if let Some(m) = self.rmetrics() {
+                            m.marked_for_rebuild_deadline_total
+                                .fetch_add(marked, Ordering::Relaxed);
                         }
                     }
                     break;
@@ -1597,13 +1646,21 @@ impl UnifiedCache {
         let deadline = if cfg.max_maintenance_ms > 0 {
             Some(Instant::now() + Duration::from_millis(cfg.max_maintenance_ms))
         } else if cfg.max_maintenance_work > 0 && estimated_work > cfg.max_maintenance_work {
+            let mut marked = 0u64;
             for meta_id in affected_ids.iter() {
                 if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
                     let key = key_ref.value().clone();
                     drop(key_ref);
                     if let Some(r) = self.entries.get(&key) {
                         r.value().mark_for_rebuild();
+                        marked += 1;
                     }
+                }
+            }
+            if marked > 0 {
+                if let Some(m) = self.rmetrics() {
+                    m.marked_for_rebuild_count_budget_total
+                        .fetch_add(marked, Ordering::Relaxed);
                 }
             }
             return;
@@ -1617,9 +1674,17 @@ impl UnifiedCache {
         for (i, key) in affected_keys.iter().enumerate() {
             if let Some(deadline) = deadline {
                 if i > 0 && i % 64 == 0 && Instant::now() > deadline {
+                    let mut marked = 0u64;
                     for remaining_key in &affected_keys[i..] {
                         if let Some(r) = self.entries.get(remaining_key) {
                             r.value().mark_for_rebuild();
+                            marked += 1;
+                        }
+                    }
+                    if marked > 0 {
+                        if let Some(m) = self.rmetrics() {
+                            m.marked_for_rebuild_deadline_total
+                                .fetch_add(marked, Ordering::Relaxed);
                         }
                     }
                     break;
@@ -1881,14 +1946,19 @@ impl UnifiedCache {
             }
         }
     }
-    /// Mark all entries for rebuild when alive bitmap changes.
-    pub fn maintain_alive_changes(&self) {
+    /// Mark all entries for rebuild when alive bitmap changes. Returns the
+    /// number of entries flagged so the caller can attribute the reason.
+    pub fn maintain_alive_changes(&self) -> u64 {
+        let mut count = 0u64;
         for r in self.entries.iter() {
             r.value().mark_for_rebuild();
+            count += 1;
         }
+        count
     }
-    /// Invalidate entries that reference a specific filter field.
-    pub fn invalidate_filter_field(&self, field: &str) {
+    /// Invalidate entries that reference a specific filter field. Returns the
+    /// number of entries flagged so the caller can attribute the reason.
+    pub fn invalidate_filter_field(&self, field: &str) -> u64 {
         let mut count = 0u64;
         for r in self.entries.iter() {
             if r.key().filter_clauses.iter().any(|c| c.field == field) {
@@ -1897,6 +1967,7 @@ impl UnifiedCache {
             }
         }
         self.invalidations.fetch_add(count, Ordering::Relaxed);
+        count
     }
     // ── Time Bucket Diff Integration (Phase 4) ─────────────────────────────
     /// Maintain cache entries when a time bucket is rebuilt.
