@@ -21,6 +21,7 @@ use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
 // Test-only sync failure injection
@@ -130,7 +131,17 @@ pub(crate) const HEADER_OPS_COUNT_OFFSET: u64 = 20;
 /// Based on Ollie's final microbench results: 2x read overhead at 1,000 ops
 /// is acceptable. Configurable per-field: tagIds tolerates 50K+, low-cardinality
 /// fields like nsfwLevel should compact at ~5K.
-pub const DEFAULT_COMPACT_THRESHOLD: u32 = 500; // low-latency preset (was 1_000)
+///
+/// Bumped 500 → 100_000 in v1.0.196-jemalloc: prod observation (2026-05-01)
+/// showed hot tagIds shards (200-300 MB snapshots) hitting the 500-op threshold
+/// in <1s of steady-state pg-sync traffic, causing every 5s merge cycle to
+/// full-rewrite ~250 MB shards. This produced 500 MB/s sustained disk writes
+/// (1.82 TB in 1h pod uptime) and triggered kernel `balance_dirty_pages()`
+/// throttling — observed as ~17s pod-wide freezes every ~70s
+/// (`io.pressure full=0.39`). 100K ops = ~7-15% ops-log:snapshot ratio on hot
+/// shards, keeping compaction cost vs read replay cost in balance. Cold shards
+/// unaffected (they never hit even 500 ops/cycle anyway).
+pub const DEFAULT_COMPACT_THRESHOLD: u32 = 100_000;
 
 // ---------------------------------------------------------------------------
 // Shard file header
@@ -445,6 +456,10 @@ where
     sharding: Sh,
     /// Per-shard RwLock. Shared for readers/writers; exclusive for compactors.
     shard_locks: DashMap<Sh::Key, Arc<RwLock<()>>>,
+    /// Hot-tunable compaction threshold (ops_count > threshold triggers compaction).
+    /// Initialized to `DEFAULT_COMPACT_THRESHOLD`. Wired to runtime PATCH /config
+    /// `bitmap_compact_threshold` so prod can dial it without a restart.
+    compact_threshold: AtomicU32,
     _phantom_s: std::marker::PhantomData<S>,
     _phantom_o: std::marker::PhantomData<O>,
 }
@@ -470,6 +485,7 @@ where
             root,
             sharding,
             shard_locks: DashMap::new(),
+            compact_threshold: AtomicU32::new(DEFAULT_COMPACT_THRESHOLD),
             _phantom_s: std::marker::PhantomData,
             _phantom_o: std::marker::PhantomData,
         })
@@ -820,10 +836,24 @@ where
         }
     }
 
-    /// Check if a shard needs compaction using the default threshold (500 ops).
-    /// Based on microbench results: knee at 500 ops, <2x overhead below that.
+    /// Check if a shard needs compaction using the store's current threshold.
+    /// Threshold is initialized to `DEFAULT_COMPACT_THRESHOLD` and is hot-tunable
+    /// at runtime via `set_compact_threshold` (wired to PATCH /config
+    /// `bitmap_compact_threshold` from the server layer).
     pub fn needs_compaction(&self, key: &Sh::Key) -> io::Result<bool> {
-        self.should_compact(key, DEFAULT_COMPACT_THRESHOLD)
+        self.should_compact(key, self.compact_threshold.load(Ordering::Relaxed))
+    }
+
+    /// Set the compaction threshold (ops_count > threshold triggers compaction).
+    /// Atomic, lock-free — safe to call from any thread including the runtime
+    /// PATCH /config handler. Effects apply on the next merge cycle.
+    pub fn set_compact_threshold(&self, threshold: u32) {
+        self.compact_threshold.store(threshold, Ordering::Relaxed);
+    }
+
+    /// Read the current compaction threshold.
+    pub fn compact_threshold(&self) -> u32 {
+        self.compact_threshold.load(Ordering::Relaxed)
     }
 
     /// Compact a shard in-place: read snapshot + ops under an exclusive lock, write back
@@ -1399,6 +1429,29 @@ mod tests {
 
         // Threshold 2 → SHOULD compact (3 > 2)
         assert!(store.should_compact(&"doc1".to_string(), 2).unwrap());
+    }
+
+    #[test]
+    fn test_compact_threshold_runtime_tunable() {
+        let (_dir, store) = temp_store();
+
+        // Default threshold = DEFAULT_COMPACT_THRESHOLD
+        assert_eq!(store.compact_threshold(), DEFAULT_COMPACT_THRESHOLD);
+
+        // 3 ops, default threshold (100K) → not compactable
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "a".into(), value: "1".into() }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "b".into(), value: "2".into() }).unwrap();
+        store.append_op(&"doc1".to_string(), &TestOp::Set { key: "c".into(), value: "3".into() }).unwrap();
+        assert!(!store.needs_compaction(&"doc1".to_string()).unwrap());
+
+        // Drop threshold to 2 — same shard now triggers
+        store.set_compact_threshold(2);
+        assert_eq!(store.compact_threshold(), 2);
+        assert!(store.needs_compaction(&"doc1".to_string()).unwrap());
+
+        // Bump back high — no longer triggers
+        store.set_compact_threshold(1_000_000);
+        assert!(!store.needs_compaction(&"doc1".to_string()).unwrap());
     }
 
     #[test]

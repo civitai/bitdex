@@ -3501,6 +3501,25 @@ impl ConcurrentEngine {
     pub fn par_iter_min_threshold(&self) -> usize {
         self.par_iter_min_threshold.load(Ordering::Relaxed)
     }
+    /// Set the bitmap shard compaction threshold across all bitmap stores
+    /// (alive / filter / sort). ops_count > threshold triggers a per-shard
+    /// compaction on the next merge cycle. Atomic, takes effect immediately;
+    /// no merge thread restart needed. No-op if a given store isn't configured.
+    pub fn set_bitmap_compact_threshold(&self, threshold: u32) {
+        if let Some(ref s) = self.alive_store { s.set_compact_threshold(threshold); }
+        if let Some(ref s) = self.filter_store { s.set_compact_threshold(threshold); }
+        if let Some(ref s) = self.sort_store { s.set_compact_threshold(threshold); }
+    }
+    /// Read the current bitmap shard compaction threshold. Reads from the
+    /// alive store if present (all three are kept in sync via
+    /// `set_bitmap_compact_threshold`); falls back to filter, then sort, then
+    /// the static `DEFAULT_COMPACT_THRESHOLD` if no bitmap store is configured.
+    pub fn bitmap_compact_threshold(&self) -> u32 {
+        if let Some(ref s) = self.alive_store { return s.compact_threshold(); }
+        if let Some(ref s) = self.filter_store { return s.compact_threshold(); }
+        if let Some(ref s) = self.sort_store { return s.compact_threshold(); }
+        crate::shard_store::DEFAULT_COMPACT_THRESHOLD
+    }
     /// Get a reference to the bitmap memory cache (for metrics scraping).
     pub fn bitmap_memory_cache(&self) -> &crate::bitmap_memory_cache::BitmapMemoryCache {
         &self.bitmap_memory_cache

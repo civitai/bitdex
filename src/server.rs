@@ -1065,6 +1065,14 @@ struct ConfigPatch {
     /// Default 8.
     #[serde(default)]
     par_iter_min_threshold: Option<usize>,
+    /// Hot-reload knob for the bitmap shard compaction threshold (ops_count
+    /// above which a shard's ops-log is compacted into a fresh snapshot at
+    /// the next merge cycle). Applies to alive/filter/sort bitmap stores.
+    /// Default `DEFAULT_COMPACT_THRESHOLD = 100_000`. Bump higher (e.g. 500_000)
+    /// when hot tagIds shards are rewriting too aggressively; drop lower for
+    /// faster ops-replay on read at cost of more rewrite I/O.
+    #[serde(default)]
+    bitmap_compact_threshold: Option<u32>,
 }
 
 /// Patchable fields for a filter field.
@@ -2478,6 +2486,10 @@ async fn handle_patch_config(
                 if let Some(v) = patch.par_iter_min_threshold {
                     idx.engine.set_par_iter_min_threshold(v);
                     eprintln!("Config patch: par_iter_min_threshold set to {v}");
+                }
+                if let Some(v) = patch.bitmap_compact_threshold {
+                    idx.engine.set_bitmap_compact_threshold(v);
+                    eprintln!("Config patch: bitmap_compact_threshold set to {v}");
                 }
 
                 // Toggle trace collection (server-wide, not persisted with index config)
