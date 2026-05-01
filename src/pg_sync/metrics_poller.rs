@@ -7,7 +7,7 @@
 //! without touching the alive bitmap.
 
 use ahash::AHashMap as HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
 use serde_json::json;
@@ -121,6 +121,7 @@ pub async fn run_metrics_poller(
             continue;
         }
 
+        let cycle_start = Instant::now();
         match poll_metrics_and_push(
             &http,
             ch_config,
@@ -131,10 +132,25 @@ pub async fn run_metrics_poller(
         .await
         {
             Ok(count) => {
+                let cycle_secs = cycle_start.elapsed().as_secs_f64();
+                // Report timing to BitDex for `bitdex_pgsync_cycle_seconds`
+                // histogram. Reused with `replica="clickhouse-metrics"` label so
+                // the existing `pgsync_cycle_seconds` metric covers both the
+                // ops poller (replica="default") and this CH metrics poller.
+                bitdex_client
+                    .report_pgsync_metrics(
+                        "clickhouse-metrics",
+                        cycle_secs,
+                        count as u64,
+                        cycle_upper_ts,
+                    )
+                    .await;
                 if count > 0 {
                     eprintln!(
-                        "Metrics: pushed {count} ops batches (window {}..{}]",
-                        last_poll_ts, cycle_upper_ts
+                        "Metrics: pushed {count} ops batches in {:.1}ms (window {}..{}]",
+                        cycle_secs * 1000.0,
+                        last_poll_ts,
+                        cycle_upper_ts
                     );
                 }
                 // Persist BEFORE advancing in-memory state. If persist fails
@@ -150,7 +166,16 @@ pub async fn run_metrics_poller(
                 last_poll_ts = cycle_upper_ts;
             }
             Err(e) => {
-                eprintln!("Metrics poll error: {e}");
+                let cycle_secs = cycle_start.elapsed().as_secs_f64();
+                bitdex_client
+                    .report_pgsync_metrics(
+                        "clickhouse-metrics",
+                        cycle_secs,
+                        0,
+                        cycle_upper_ts,
+                    )
+                    .await;
+                eprintln!("Metrics poll error after {:.1}ms: {e}", cycle_secs * 1000.0);
                 // Don't advance — retry same window next cycle.
             }
         }
