@@ -1450,7 +1450,7 @@ impl UnifiedCache {
                     .get_field(&key.sort_field)
                     .map(|f| f.reconstruct_value(slot))
                     .unwrap_or(0);
-                let matches = slot_matches_filter(slot, &key.filter_clauses, filters, sorts);
+                let matches = slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None);
                 if matches {
                     if entry.sort_qualifies(sort_value, key.direction) {
                         entry.add_slot(slot, sort_value);
@@ -1542,7 +1542,7 @@ impl UnifiedCache {
                     continue;
                 }
                 // Sort qualifies — check filter match
-                if slot_matches_filter(slot, &key.filter_clauses, filters, sorts) {
+                if slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None) {
                     entry.add_slot(slot, sort_value);
                 }
             }
@@ -1831,7 +1831,7 @@ impl UnifiedCache {
                         if c.field == field && c.op == "bucket" && c.value_repr == bucket_name {
                             true // skip the bucket clause itself
                         } else {
-                            slot_matches_clause(slot, c, filters, sorts)
+                            slot_matches_clause(slot, c, filters, sorts, None)
                         }
                     });
                     if !other_clauses_match {
@@ -1854,14 +1854,16 @@ impl UnifiedCache {
 ///
 /// Uses contains() checks on the filter index bitmaps for Eq/NotEq/In/NotIn.
 /// Uses sort index reconstruct_value() for range clauses (Gte/Gt/Lt/Lte).
-/// Bucket and compound clauses conservatively return true (handled by rebuild).
+/// Uses bucket bitmap contains() for BucketBitmap clauses when bucket_mgr is provided.
+/// Compound clauses conservatively return true (handled by rebuild).
 fn slot_matches_filter(
     slot: u32,
     clauses: &[CanonicalClause],
     filters: &FilterIndex,
     sorts: &SortIndex,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
 ) -> bool {
-    clauses.iter().all(|clause| slot_matches_clause(slot, clause, filters, sorts))
+    clauses.iter().all(|clause| slot_matches_clause(slot, clause, filters, sorts, bucket_mgr))
 }
 /// Evaluate whether a slot matches a single canonical clause.
 fn slot_matches_clause(
@@ -1869,6 +1871,7 @@ fn slot_matches_clause(
     clause: &CanonicalClause,
     filters: &FilterIndex,
     sorts: &SortIndex,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
 ) -> bool {
     match clause.op.as_str() {
         "eq" => {
@@ -1943,9 +1946,16 @@ fn slot_matches_clause(
             }
         }
         "bucket" => {
-            // BucketBitmap — requires access to time bucket manager.
-            // Phase 4 will add proper evaluation. Conservative: return true.
-            true
+            // BucketBitmap — evaluate against the time bucket bitmap.
+            // The flush thread runs insert_slot/remove_slot BEFORE cache
+            // maintenance, so the bucket bitmap is already authoritative for
+            // every mutated slot when we reach this point.
+            // value_repr holds the bucket name (e.g. "24h", "7d").
+            // Cost: ~150ns (HashMap lookup + RoaringBitmap::contains).
+            let Some(mgr) = bucket_mgr else { return true };
+            mgr.get_bucket(&clause.value_repr)
+                .map(|b| b.bitmap().contains(slot))
+                .unwrap_or(false)
         }
         op if op.starts_with("not(") => {
             // Compound not: "not(eq)" → evaluate inner and negate
@@ -1961,7 +1971,7 @@ fn slot_matches_clause(
                 op: inner_op.to_string(),
                 value_repr: clause.value_repr.clone(),
             };
-            !slot_matches_clause(slot, &inner_clause, filters, sorts)
+            !slot_matches_clause(slot, &inner_clause, filters, sorts, bucket_mgr)
         }
         "and" | "or" => {
             // Compound And/Or — would need to parse sub-clauses from value_repr.
@@ -1987,6 +1997,7 @@ pub fn evaluate_filter_work(
     filters: &FilterIndex,
     sorts: &SortIndex,
     deadline: Option<Instant>,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Inverted evaluation: reconstruct_value is identical across entries for
     // the same (sort_field, slot), so we precompute it ONCE per unique pair
@@ -2013,7 +2024,7 @@ pub fn evaluate_filter_work(
                 .get(&(item.key.sort_field.as_str(), slot))
                 .copied()
                 .unwrap_or(0);
-            let matches = slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts);
+            let matches = slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts, bucket_mgr);
             if matches {
                 let qualifies = match item.direction {
                     SortDirection::Desc => sort_value > item.min_tracked_value,
@@ -2058,6 +2069,7 @@ pub fn evaluate_sort_work(
     filters: &FilterIndex,
     sorts: &SortIndex,
     deadline: Option<Instant>,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Preamble: reconstruct_value once per unique (sort_field, slot).
     let reconstructed = precompute_sort_values(work, sorts);
@@ -2117,7 +2129,7 @@ pub fn evaluate_sort_work(
             // Sort qualifies — only now pay filter match cost. Preserves the
             // full slot_matches_filter semantics (Eq, NotEq, In, Gt, Lt,
             // bucket, compound) — no signature-based shortcut.
-            if slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts) {
+            if slot_matches_filter(slot, &item.key.filter_clauses, filters, sorts, bucket_mgr) {
                 adds.push((slot, sort_value));
             }
         }
@@ -3040,7 +3052,7 @@ mod tests {
             value_repr: "".to_string(),
         };
         assert!(
-            slot_matches_clause(42, &clause, &filters, &sorts),
+            slot_matches_clause(42, &clause, &filters, &sorts, None),
             "Or clause should conservatively return true"
         );
     }
@@ -3055,7 +3067,7 @@ mod tests {
             value_repr: "".to_string(),
         };
         assert!(
-            slot_matches_clause(42, &clause, &filters, &sorts),
+            slot_matches_clause(42, &clause, &filters, &sorts, None),
             "And clause should conservatively return true"
         );
     }
@@ -3071,7 +3083,7 @@ mod tests {
             value_repr: "".to_string(),
         };
         assert!(
-            slot_matches_clause(42, &clause, &filters, &sorts),
+            slot_matches_clause(42, &clause, &filters, &sorts, None),
             "Not(And(...)) should conservatively return true, not negate the inner conservative true"
         );
     }
@@ -3087,7 +3099,7 @@ mod tests {
             value_repr: "".to_string(),
         };
         assert!(
-            slot_matches_clause(42, &clause, &filters, &sorts),
+            slot_matches_clause(42, &clause, &filters, &sorts, None),
             "Not(Or(...)) should conservatively return true, not negate the inner conservative true"
         );
     }
@@ -3109,7 +3121,7 @@ mod tests {
             },
         ];
         assert!(
-            slot_matches_filter(42, &clauses, &filters, &sorts),
+            slot_matches_filter(42, &clauses, &filters, &sorts, None),
             "Filter with Not(And(...)) clause should not reject slot that matches other clauses"
         );
     }
@@ -3336,7 +3348,7 @@ mod tests {
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].key, key);
         // Phase B: evaluate outside lock
-        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None);
+        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None, None);
         assert!(timed_out.is_empty());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
@@ -3361,7 +3373,7 @@ mod tests {
             vec![3],
         );
         let (work, _) = cache.collect_filter_work(&HashMap::new(), &removes);
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None);
         cache.apply_maintenance_results(&results);
         let entry = cache.get(&key).unwrap();
         assert!(!entry.bitmap().contains(3), "Slot 3 should be removed via two-phase maintenance");
@@ -3380,7 +3392,7 @@ mod tests {
         sort_mutations.insert("reactionCount", [10].into_iter().collect());
         let (work, _) = cache.collect_sort_work(&sort_mutations);
         assert_eq!(work.len(), 1);
-        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None);
+        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
         assert_eq!(results[0].adds[0].0, 10);
@@ -3437,7 +3449,7 @@ mod tests {
         let mut cache_two = UnifiedCache::new(config);
         cache_two.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         let (work, _) = cache_two.collect_filter_work(&inserts, &HashMap::new());
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None);
         cache_two.apply_maintenance_results(&results);
         let two_has_10 = cache_two.get(&key).unwrap().bitmap().contains(10);
         assert_eq!(single_has_10, two_has_10, "Two-phase should produce same result as single-phase");
@@ -3550,5 +3562,272 @@ mod tests {
         let total_ns: u128 = samples.iter().map(|(e, _, _)| e.as_nanos()).sum();
         let avg_ms = (total_ns as f64 / iters as f64) / 1_000_000.0;
         println!("[bench] avg collect_sort_work: {:.3}ms over {} iters", avg_ms, iters);
+    }
+
+    // ── Bucket clause maintenance tests ─────────────────────────────────────
+
+    /// Build a TimeBucketManager with a single named bucket containing specific slots.
+    fn make_bucket_manager(bucket_name: &str, slots_in_bucket: &[u32]) -> crate::time_buckets::TimeBucketManager {
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+        let mut mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: bucket_name.to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        // Manually insert slots into the bucket bitmap via rebuild_bucket.
+        // Timestamps: simulate "now" as 1_000_000_000 and give each slot a ts
+        // within the bucket window (or outside, to verify exclusion).
+        let now: u64 = 1_000_000_000;
+        let values: Vec<(u32, u64)> = slots_in_bucket.iter().map(|&s| (s, now - 3600)).collect();
+        mgr.rebuild_bucket(bucket_name, values.into_iter(), now);
+        mgr
+    }
+
+    #[test]
+    fn test_slot_matches_clause_bucket_with_manager_in_bucket() {
+        // slot 5 IS in the "24h" bucket → should return true
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let mgr = make_bucket_manager("24h", &[5, 10, 15]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "24h".to_string(),
+        };
+        assert!(
+            slot_matches_clause(5, &clause, &filters, &sorts, Some(&mgr)),
+            "slot in bucket should return true"
+        );
+        assert!(
+            slot_matches_clause(10, &clause, &filters, &sorts, Some(&mgr)),
+            "slot in bucket should return true"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_clause_bucket_with_manager_not_in_bucket() {
+        // slot 99 is NOT in the "24h" bucket → should return false
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let mgr = make_bucket_manager("24h", &[5, 10, 15]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "24h".to_string(),
+        };
+        assert!(
+            !slot_matches_clause(99, &clause, &filters, &sorts, Some(&mgr)),
+            "slot not in bucket should return false"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_clause_bucket_conservative_without_manager() {
+        // Without a bucket manager, bucket clauses should conservatively return true
+        let filters = make_filter_index(&[]);
+        let sorts = make_sort_index(&[]);
+        let clause = CanonicalClause {
+            field: "sortAtUnix".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "24h".to_string(),
+        };
+        assert!(
+            slot_matches_clause(99, &clause, &filters, &sorts, None),
+            "bucket clause without manager should conservatively return true"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_filter_work_bucket_clause_no_pollution() {
+        // Regression test: a slot that is NOT in the "24h" bucket must NOT be
+        // added to a cache entry keyed by bucket="24h", even when it is being
+        // mutated (which previously triggered the always-true pollution path).
+        //
+        // Setup:
+        //   slot 1: sortAt=now-3600 (in 24h) — should be in cache
+        //   slot 2: sortAt=now-200_000 (~2.3d, NOT in 24h) — must NOT appear
+        //   slot 3: sortAt=now-600_000 (~7d, NOT in 24h) — triggered pollution
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+
+        let now: u64 = 1_000_000_000;
+
+        // Build bucket manager: 24h bucket containing only slot 1.
+        let mut mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: "24h".to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        mgr.rebuild_bucket(
+            "24h",
+            vec![(1u32, now - 3600)].into_iter(), // slot 1 is in 24h
+            now,
+        );
+
+        // Filter and sort indexes: use nsfwLevel=1 as a co-clause so the cache
+        // entry has a real filter predicate (all 3 slots are nsfwLevel=1).
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[1, 2, 3])])]);
+        let sorts = make_sort_index(&[("sortAt", &[
+            (1, (now - 3600) as u32),
+            (2, (now - 200_000) as u32),
+            (3, (now - 600_000) as u32),
+        ])]);
+
+        // Build a cache entry for: bucket("24h") AND nsfwLevel=1, sort by sortAt Desc.
+        let key = make_key(
+            &[
+                ("sortAtUnix", "bucket", "24h"),
+                ("nsfwLevel", "eq", "1"),
+            ],
+            "sortAt",
+            SortDirection::Desc,
+        );
+
+        // Initial cache entry: contains only slot 1 (pre-populated correctly).
+        let initial_slots: Vec<u32> = vec![1];
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 200,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 100,
+            max_capacity: 1600,
+            min_filter_size: 0,
+            max_maintenance_work: 1_000_000,
+            max_maintenance_ms: 1000,
+            prefetch_threshold: 0.95,
+        });
+        // total_matched = 1 (only slot 1); value_fn maps slot→sort_value
+        cache.form_and_store(key.clone(), &initial_slots, true, 1u64, |s| {
+            if s == 1 { (now - 3600) as u32 } else { 0 }
+        });
+
+        // Simulate: slot 3 is being inserted with nsfwLevel=1 (triggers filter maintenance).
+        // The bucket manager (already updated by flush thread) does NOT contain slot 3.
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![3],
+        );
+
+        // Collect filter work items (Phase A).
+        let (filter_work, _over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+        assert!(!filter_work.is_empty(), "should have work for the bucket entry");
+
+        // Phase B: evaluate with the bucket manager. slot 3 must be rejected.
+        let (results, timed_out) = evaluate_filter_work(
+            &filter_work,
+            &filters,
+            &sorts,
+            None,
+            Some(&mgr),
+        );
+        assert!(timed_out.is_empty());
+
+        // Apply results to cache.
+        cache.apply_maintenance_results(&results);
+
+        // Verify: slot 3 is NOT in the cache entry.
+        let entry = cache.get(&key).expect("cache entry should still exist");
+        assert!(
+            !entry.bitmap().contains(3),
+            "slot 3 (not in 24h bucket) must NOT be added to the 24h cache entry"
+        );
+        // Verify: slot 1 is still present.
+        assert!(
+            entry.bitmap().contains(1),
+            "slot 1 (in 24h bucket) must remain in the cache entry"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_filter_work_bucket_clause_adds_slot_in_bucket() {
+        // Positive case: a slot that IS in the bucket should be added when it
+        // also satisfies all other filter clauses.
+        use crate::config::BucketConfig;
+        use crate::time_buckets::TimeBucketManager;
+
+        let now: u64 = 1_000_000_000;
+
+        let mut mgr = TimeBucketManager::new(
+            "sortAtUnix".to_string(),
+            vec![BucketConfig {
+                name: "24h".to_string(),
+                duration_secs: 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        // Slot 1 is older (lower sort value), slot 20 is newer (higher sort value).
+        // Both are in the 24h bucket.
+        // Sort values (Desc): slot 20 > slot 1, so slot 20 qualifies to be added to
+        // an entry that currently tracks slot 1 as its min.
+        let ts_slot1: u32 = (now - 7200) as u32;  // 2h ago
+        let ts_slot20: u32 = (now - 3600) as u32; // 1h ago (newer → higher sort)
+        mgr.rebuild_bucket(
+            "24h",
+            vec![(1u32, now - 7200), (20u32, now - 3600)].into_iter(),
+            now,
+        );
+
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[1, 20])])]);
+        let sorts = make_sort_index(&[("sortAt", &[
+            (1, ts_slot1),
+            (20, ts_slot20),
+        ])]);
+
+        let key = make_key(
+            &[
+                ("sortAtUnix", "bucket", "24h"),
+                ("nsfwLevel", "eq", "1"),
+            ],
+            "sortAt",
+            SortDirection::Desc,
+        );
+
+        // Form cache entry with slot 1 only (its sort value is the min_tracked).
+        // Slot 20 has a higher sort value than slot 1, so it will qualify (Desc).
+        let initial_slots: Vec<u32> = vec![1];
+        let mut cache = UnifiedCache::new(UnifiedCacheConfig {
+            max_entries: 200,
+            max_bytes: 64 * 1024 * 1024,
+            initial_capacity: 100,
+            max_capacity: 1600,
+            min_filter_size: 0,
+            max_maintenance_work: 1_000_000,
+            max_maintenance_ms: 1000,
+            prefetch_threshold: 0.95,
+        });
+        // total_matched = 100 (non-trivial, so min_filter_size=0 still stores it)
+        cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
+            if s == 1 { ts_slot1 } else { 0 }
+        });
+
+        // Slot 20 is being inserted with nsfwLevel=1 and sortAt within 24h.
+        let mut inserts = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("nsfwLevel"), value: 1 },
+            vec![20],
+        );
+
+        let (filter_work, _) = cache.collect_filter_work(&inserts, &HashMap::new());
+        let (results, _) = evaluate_filter_work(
+            &filter_work,
+            &filters,
+            &sorts,
+            None,
+            Some(&mgr),
+        );
+        cache.apply_maintenance_results(&results);
+
+        let entry = cache.get(&key).expect("cache entry should still exist");
+        assert!(
+            entry.bitmap().contains(20),
+            "slot 20 (in 24h bucket, nsfwLevel=1) should be added to the 24h cache entry"
+        );
     }
 }
