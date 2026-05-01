@@ -4729,11 +4729,16 @@ async fn handle_set_cursor(
         }
     };
 
-    engine.set_cursor(cursor_name.clone(), value.clone());
-
-    // Force persist to disk so the value survives restarts
-    if let Err(e) = engine.save_snapshot() {
-        eprintln!("Warning: cursor set but snapshot save failed: {e}");
+    // Persist the cursor synchronously via a small atomic file write to
+    // MetaStore. The previous code called `engine.save_snapshot()` here,
+    // which rewrote every bitmap shard (~10 GB, 14-20 s) on every cursor
+    // PATCH and was the dominant source of pod-wide IO-pressure freezes
+    // observed in v196-v198. The merge thread also batch-persists cursors
+    // every 5 s (concurrent_engine.rs flush loop), so even a transient
+    // MetaStore write failure here doesn't lose the cursor — it just
+    // delays durability by one merge cycle.
+    if let Err(e) = engine.persist_cursor(cursor_name.clone(), value.clone()) {
+        eprintln!("Warning: cursor set but persist failed: {e}");
     }
 
     Json(serde_json::json!({

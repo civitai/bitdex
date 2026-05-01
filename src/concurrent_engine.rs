@@ -6317,6 +6317,28 @@ impl ConcurrentEngine {
         // Mark dirty so the merge thread will write at next cycle.
         self.dirty_since_snapshot.store(true, Ordering::Release);
     }
+    /// Persist a single named cursor immediately (synchronous atomic file
+    /// write to MetaStore). Use this for callers that need the cursor durable
+    /// on return (e.g. `PUT /cursors/{name}` HTTP handler) instead of waiting
+    /// for the next merge cycle's batch persist.
+    ///
+    /// Sets the in-memory value first (via `set_cursor`), then writes the
+    /// MetaStore cursors/{name} file. ~ms cost — single small atomic file
+    /// write — vs. `save_snapshot()` which rewrites every bitmap shard
+    /// (gigabytes, 14-20s, blocks the runtime via disk I/O pressure).
+    ///
+    /// Returns `Err` if no `MetaStore` is configured (pure in-memory mode).
+    pub fn persist_cursor(&self, name: String, value: String) -> Result<()> {
+        self.set_cursor(name.clone(), value.clone());
+        match self.meta_store.as_ref() {
+            Some(ms) => ms.write_cursor(&name, &value).map_err(|e| {
+                crate::error::BitdexError::Storage(format!("write_cursor: {e}"))
+            }),
+            None => Err(crate::error::BitdexError::Storage(
+                "persist_cursor: no MetaStore configured (in-memory mode)".to_string(),
+            )),
+        }
+    }
     /// Get a named cursor value (in-memory, not from disk).
     pub fn get_cursor(&self, name: &str) -> Option<String> {
         self.cursors.lock().get(name).cloned()
