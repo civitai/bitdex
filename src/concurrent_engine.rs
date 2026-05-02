@@ -11295,6 +11295,219 @@ mod tests {
 
         engine.shutdown();
     }
+    /// Bug #16 §4d: ops-path inserts must populate `id` and exists_boolean
+    /// shadow targets in the docstore, not just bitmaps. Pre-fix, the
+    /// docstore was missing `id` for every steady-state-inserted slot and
+    /// `isPublished` for every slot whose publishedAt arrived via either
+    /// the Image trigger (direct path) or Post fan-out (queryOpSet path).
+    #[cfg(feature = "pg-sync")]
+    fn bug16_test_config() -> Config {
+        use crate::config::{DataSchema, FieldMapping, FieldValueType};
+        let mut config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "isPublished".into(),
+                field_type: FilterFieldType::Boolean,
+                behaviors: None,
+                eviction: None,
+                eager_load: false,
+                per_value_lazy: false,
+                max_range_scan_values: None,
+            }, FilterFieldConfig {
+                name: "postId".into(),
+                field_type: FilterFieldType::SingleValue,
+                behaviors: None,
+                eviction: None,
+                eager_load: false,
+                per_value_lazy: false,
+                max_range_scan_values: None,
+            }],
+            sort_fields: vec![SortFieldConfig {
+                name: "publishedAt".into(),
+                source_type: "uint32".into(),
+                encoding: "linear".into(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            }],
+            max_page_size: 100,
+            flush_interval_us: 50,
+            channel_capacity: 10_000,
+            ..Default::default()
+        };
+        config.data_schema = DataSchema {
+            id_field: "id".into(),
+            schema_version: 1,
+            fields: vec![
+                FieldMapping {
+                    source: "publishedAtUnix".into(),
+                    target: "publishedAt".into(),
+                    value_type: FieldValueType::Integer,
+                    fallback: None,
+                    string_map: None,
+                    doc_only: false,
+                    filter_only: false,
+                    ms_to_seconds: true,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: None,
+                    nullable: false,
+                },
+                FieldMapping {
+                    source: "publishedAtUnix".into(),
+                    target: "isPublished".into(),
+                    value_type: FieldValueType::ExistsBoolean,
+                    fallback: None,
+                    string_map: None,
+                    doc_only: false,
+                    filter_only: false,
+                    ms_to_seconds: false,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: None,
+                    nullable: false,
+                },
+                FieldMapping {
+                    source: "postId".into(),
+                    target: "postId".into(),
+                    value_type: FieldValueType::Integer,
+                    fallback: None,
+                    string_map: None,
+                    doc_only: false,
+                    filter_only: false,
+                    ms_to_seconds: false,
+                    truncate_u32: false,
+                    case_sensitive: false,
+                    default_value: None,
+                    nullable: false,
+                },
+            ],
+        };
+        config
+    }
+    /// Direct path: Image trigger creates_slot + Set publishedAt=<seconds>.
+    /// Pre-fix, the docstore was missing both `id` (never written by the ops
+    /// path on creates_slot) and `isPublished` (bitmap shadow at
+    /// `process_set_op:1115` had no docstore mirror).
+    #[cfg(feature = "pg-sync")]
+    #[test]
+    fn test_bug16_creates_slot_writes_id_and_shadow_doc_fields() {
+        use crate::pg_sync::ops::{EntityOps, Op};
+        use crate::ops_processor::{apply_ops_batch, DocWriter, FieldMeta};
+        use crate::ingester::CoalescerSink;
+        use crate::shard_store_doc::PackedValue;
+        use serde_json::json;
+        let mut engine = ConcurrentEngine::new(bug16_test_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let sender = engine.mutation_sender();
+        let mut sink = CoalescerSink::new(sender);
+        let mut doc_writer = DocWriter::new(engine.docstore_arc());
+        let slot: u32 = 100;
+        let mut entries = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![
+                Op::Set { field: "postId".into(), value: json!(42) },
+                Op::Set { field: "publishedAt".into(), value: json!(1_777_581_167i64) },
+            ],
+        }];
+        let (applied, skipped, errors) = apply_ops_batch(
+            &mut sink, &meta, &mut entries, Some(&engine), Some(&mut doc_writer),
+        );
+        assert_eq!(applied, 1);
+        assert_eq!(skipped, 0);
+        assert_eq!(errors, 0);
+        doc_writer.flush();
+        let doc = engine
+            .get_document(slot)
+            .unwrap()
+            .expect("slot should have a stored doc after creates_slot apply");
+        assert_eq!(
+            doc.fields.get("id"),
+            Some(&FieldValue::Single(Value::Integer(slot as i64))),
+            "creates_slot must persist id == slot in docstore (bug #16 §3a)"
+        );
+        match doc.fields.get("publishedAt") {
+            Some(FieldValue::Single(Value::Integer(v))) => assert_eq!(*v, 1_777_581_167),
+            other => panic!("publishedAt should be Integer; got {other:?}"),
+        }
+        assert_eq!(
+            doc.fields.get("isPublished"),
+            Some(&FieldValue::Single(Value::Bool(true))),
+            "exists_boolean shadow must write isPublished=true to docstore (bug #16 §3b)"
+        );
+        let _ = PackedValue::B(true);
+        engine.shutdown();
+    }
+    /// queryOpSet path: Post fan-out re-publishes a previously-inserted image.
+    /// Pre-fix, `apply_query_op_set` did not receive a `DocWriter`, so fan-out
+    /// updated the bitmap shadow but left the docstore at defaults — the
+    /// production reproducer that surfaced bug #16.
+    #[cfg(feature = "pg-sync")]
+    #[test]
+    fn test_bug16_query_op_set_writes_doc_and_shadow_fields() {
+        use crate::pg_sync::ops::{EntityOps, Op};
+        use crate::ops_processor::{apply_ops_batch, DocWriter, FieldMeta};
+        use crate::ingester::CoalescerSink;
+        use serde_json::json;
+        let mut engine = ConcurrentEngine::new(bug16_test_config()).unwrap();
+        let meta = FieldMeta::from_config(engine.config());
+        let sender = engine.mutation_sender();
+        let mut sink = CoalescerSink::new(sender);
+        let mut doc_writer = DocWriter::new(engine.docstore_arc());
+        let slot: u32 = 200;
+        let post_id: i64 = 4242;
+        // Phase 1: Image trigger inserts the slot with a postId but no publishedAt
+        // (the production scenario — Image table doesn't track publishedAt).
+        let mut insert = vec![EntityOps {
+            entity_id: slot as i64,
+            creates_slot: true,
+            ops: vec![Op::Set { field: "postId".into(), value: json!(post_id) }],
+        }];
+        let (applied, _, errors) = apply_ops_batch(
+            &mut sink, &meta, &mut insert, Some(&engine), Some(&mut doc_writer),
+        );
+        assert_eq!(applied, 1);
+        assert_eq!(errors, 0);
+        doc_writer.flush();
+        // Wait for the postId bitmap to be visible in the published snapshot
+        // so the queryOpSet's filter resolver can find the slot.
+        wait_for_flush(&engine, 1, 5000);
+        // Phase 2: Post fan-out fires (queryOpSet), Set publishedAt for any
+        // image with postId == post_id. Pre-fix this bypassed the docstore.
+        let mut fan_out = vec![EntityOps {
+            entity_id: post_id,
+            creates_slot: false,
+            ops: vec![Op::QueryOpSet {
+                query: Some(format!("postId eq {post_id}")),
+                ops: vec![Op::Set {
+                    field: "publishedAt".into(),
+                    value: json!(1_777_581_167i64),
+                }],
+            }],
+        }];
+        let (applied, _, errors) = apply_ops_batch(
+            &mut sink, &meta, &mut fan_out, Some(&engine), Some(&mut doc_writer),
+        );
+        assert!(applied >= 1, "fan-out should match the inserted slot");
+        assert_eq!(errors, 0);
+        doc_writer.flush();
+        let doc = engine
+            .get_document(slot)
+            .unwrap()
+            .expect("slot should have a stored doc");
+        match doc.fields.get("publishedAt") {
+            Some(FieldValue::Single(Value::Integer(v))) => assert_eq!(*v, 1_777_581_167),
+            other => panic!(
+                "queryOpSet must write publishedAt to docstore (bug #16 §3b); got {other:?}",
+            ),
+        }
+        assert_eq!(
+            doc.fields.get("isPublished"),
+            Some(&FieldValue::Single(Value::Bool(true))),
+            "queryOpSet must write isPublished shadow doc field (bug #16 §3b)"
+        );
+        engine.shutdown();
+    }
     #[test]
     fn test_patch_document_creates_new_slot() {
         // PATCH on a non-existent slot should fall through to PUT,
