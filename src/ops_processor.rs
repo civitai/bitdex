@@ -454,6 +454,13 @@ pub struct FieldMeta {
     /// trigger deferred alive instead of immediate alive. ms_to_seconds indicates
     /// whether the field value is in milliseconds (needs /1000 for epoch comparison).
     deferred_alive_field: Option<(String, bool)>,
+    /// Document field name to populate with the slot ID on `creates_slot=true`.
+    /// The dump path extracts `data_schema.id_field` from source JSON and stores
+    /// it as a Document field (`loader.rs:780`); steady-state ops never carry a
+    /// column-level Set for the PG primary key (it lives in `entity_id`). Without
+    /// a synthetic write here, every steady-state-inserted slot's docstore is
+    /// missing `id`. Empty string disables the synthetic write.
+    id_field: String,
     /// Field registry for Arc<str> interning (kept for future DocSink use)
     #[allow(dead_code)]
     registry: FieldRegistry,
@@ -549,12 +556,36 @@ impl FieldMeta {
             computed_deps,
             exists_boolean_shadows,
             deferred_alive_field,
+            id_field: config.data_schema.id_field.clone(),
             registry,
         }
     }
     /// Check if a sort field is a source for any computed field.
     fn has_computed_deps(&self, field: &str) -> bool {
         self.computed_deps.contains_key(field)
+    }
+}
+
+/// Mirror the `process_set_op` / `process_remove_op` exists_boolean shadow
+/// (lines ~1115 and ~1167) into the docstore. The bitmap update flips the
+/// derived target's bit; this writes the corresponding bool into the
+/// document so `GET /documents/{slot}` agrees with the bitmap state.
+///
+/// `is_null_or_remove` true → field is being cleared (Remove or null Set);
+/// the exists_boolean target stores `false`. False → non-null Set; target
+/// stores `true`.
+fn write_shadow_target_docs(
+    dw: &mut DocWriter,
+    meta: &FieldMeta,
+    slot: u32,
+    field: &str,
+    is_null_or_remove: bool,
+) {
+    if let Some(targets) = meta.exists_boolean_shadows.get(field) {
+        let bool_val = JsonValue::Bool(!is_null_or_remove);
+        for arc_target in targets {
+            dw.write_set(slot, arc_target.as_ref(), &bool_val);
+        }
     }
 }
 // ---------------------------------------------------------------------------
@@ -833,6 +864,22 @@ pub fn apply_ops_batch<S: BitmapSink>(
                 }
             }
         }
+        // §3a (bug #16): persist `id == slot` on creates_slot. The dump path
+        // does this from source JSON via `loader.rs:780`; ops never carry a
+        // column-level Set for the PG primary key, so without this every
+        // steady-state-inserted slot is missing `id` in its stored doc.
+        // Skip if any op in this batch already sets meta.id_field (defensive —
+        // no known trigger does, but preserves the contract).
+        if creates_slot && !meta.id_field.is_empty() {
+            if let Some(ref mut dw) = doc_writer {
+                let id_already_set = entry.ops.iter().any(|op| {
+                    matches!(op, Op::Set { field, .. } if field == &meta.id_field)
+                });
+                if !id_already_set {
+                    dw.write_set(slot, &meta.id_field, &serde_json::json!(slot));
+                }
+            }
+        }
         // [2.4] Check deferred alive BEFORE processing any ops.
         // If creates_slot=true and publishedAt is in the future, skip ALL bitmaps
         // (alive + filter + sort). Only write docstore so activate_due() can
@@ -871,7 +918,11 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     }
                 };
                 if let Some(eng) = engine {
-                    match apply_query_op_set(sink, meta, eng, query_str, ops) {
+                    // §3b (bug #16): pass doc_writer so fan-out ops update the
+                    // docstore alongside bitmaps. Without this, queryOpSet
+                    // (e.g. Post → Image fan-out for publishedAt) updates the
+                    // bitmap shadow but leaves the doc at default values.
+                    match apply_query_op_set(sink, meta, eng, query_str, ops, doc_writer.as_deref_mut()) {
                         Ok(count) => applied += count,
                         Err(e) => {
                             tracing::warn!("ops processor: queryOpSet '{query_str}' failed: {e}");
@@ -896,6 +947,12 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     process_set_op(sink, meta, slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_set(slot, field, value);
+                        // §3b (bug #16): mirror the bitmap shadow update at
+                        // process_set_op:1115 into the docstore. Without this,
+                        // exists_boolean targets (e.g. isPublished) only
+                        // appear in the bitmap; reads return the docstore
+                        // default and disagree with query results.
+                        write_shadow_target_docs(dw, meta, slot, field, value.is_null());
                     }
                     // Track sort value for computed field deps
                     if meta.has_computed_deps(field) || meta.sort_fields.contains_key(field.as_str()) {
@@ -910,6 +967,8 @@ pub fn apply_ops_batch<S: BitmapSink>(
                     process_remove_op(sink, meta, slot, field, value, dictionaries);
                     if let Some(ref mut dw) = doc_writer {
                         dw.write_remove(slot, field, value);
+                        // Mirror of process_remove_op:1167 shadow → docstore.
+                        write_shadow_target_docs(dw, meta, slot, field, true);
                     }
                     // [2.3] Track old sort values for computed field recomputation
                     if meta.has_computed_deps(field) || meta.sort_fields.contains_key(field.as_str()) {
@@ -1225,12 +1284,19 @@ fn process_delete<S: BitmapSink>(
 }
 /// Resolve a queryOpSet: execute the query to get matching slots,
 /// then apply the nested ops to each matching slot via the BitmapSink.
+///
+/// `doc_writer` is the same writer used by `apply_ops_batch` direct ops; passing
+/// it through keeps fan-out doc writes in sync with bitmap mutations. Without it
+/// (the pre-bug-#16 behavior) Post→Image fan-out updates the `publishedAt` /
+/// `isPublished` bitmaps for matching slots but leaves the docstore at defaults,
+/// so `GET /documents/{slot}` disagrees with query results.
 fn apply_query_op_set<S: BitmapSink>(
     sink: &mut S,
     meta: &FieldMeta,
     engine: &ConcurrentEngine,
     query_str: &str,
     ops: &[Op],
+    mut doc_writer: Option<&mut DocWriter>,
 ) -> std::result::Result<usize, String> {
     let filters = parse_filter_from_query_str(query_str)?;
     let query = BitdexQuery {
@@ -1303,15 +1369,28 @@ fn apply_query_op_set<S: BitmapSink>(
             match op {
                 Op::Set { field, value } => {
                     process_set_op(sink, meta, slot, field, value, dictionaries);
+                    if let Some(ref mut dw) = doc_writer {
+                        dw.write_set(slot, field, value);
+                        write_shadow_target_docs(dw, meta, slot, field, value.is_null());
+                    }
                 }
                 Op::Remove { field, value } => {
                     process_remove_op(sink, meta, slot, field, value, dictionaries);
+                    if let Some(ref mut dw) = doc_writer {
+                        dw.write_remove(slot, field, value);
+                        write_shadow_target_docs(dw, meta, slot, field, true);
+                    }
                 }
                 Op::Add { field, value } => {
                     process_add_op(sink, meta, slot, field, value, dictionaries);
+                    if let Some(ref mut dw) = doc_writer {
+                        dw.write_add(slot, field, value);
+                    }
                 }
                 Op::Delete => {
-                    // Delete within queryOpSet clears alive for each matched slot
+                    // Delete within queryOpSet clears alive for each matched slot.
+                    // Docstore cleanup is owned by autovac (no per-slot delete here);
+                    // bitmap clean-delete is handled at the EntityOps level.
                     sink.alive_remove(slot);
                 }
                 Op::QueryOpSet { .. } => {
