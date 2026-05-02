@@ -248,10 +248,12 @@ function step4_wipe() {
   kubectl(`run ${podName} --image=busybox:1.36 --overrides='${overrides}' --restart=Never`);
   run(`kubectl --context ${K8S_CONTEXT} -n ${NS} wait --for=condition=Ready pod/${podName} --timeout=60s`);
 
-  const wipeCmd =
-    `rm -rf ${INDEX_PATH}/bitmaps ${INDEX_PATH}/docs ${INDEX_PATH}/bounds ` +
-    `${INDEX_PATH}/slot_arena.bin ${INDEX_PATH}/snapshot.meta && ` +
-    `rm -rf ${LOAD_STAGE}/* && echo wiped`;
+  // Full PVC wipe. The `init-config` init container restores
+  // /data/indexes/civitai/{config,ui-config}.yaml from the configmap and
+  // re-creates /data/{indexes/civitai,wal,indexes/civitai/load_stage} on
+  // pod boot, so a top-level rm leaves the pod in a known-clean state with
+  // no stale shards, WAL bytes, or unknown future files lurking.
+  const wipeCmd = `rm -rf /data/* /data/.??* 2>/dev/null; echo wiped`;
 
   const out = run(
     `kubectl --context ${K8S_CONTEXT} -n ${NS} exec ${podName} -- sh -c '${wipeCmd}'`,
@@ -335,7 +337,7 @@ if (!step || !steps[step]) {
   console.log('  1. preflight  — verify shadow OFF, Flux suspended, note image');
   console.log('  2. suspend    — scale StatefulSet to 0');
   console.log('  3. nuke-pg    — drop triggers + truncate BitdexOps/bitdex_cursors');
-  console.log('  4. wipe       — wipe bitmaps + docs + load_stage on PVC');
+  console.log('  4. wipe       — full PVC wipe (rm -rf /data/*); init container restores configs');
   console.log('  5. start      — scale up; bitdex-sync auto-runs setup + dump + load');
   console.log('  6. monitor    — tail pg-sync logs until load completes');
   console.log('');
