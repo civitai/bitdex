@@ -187,12 +187,26 @@ export function csvServe({ pvcIndex = 0 } = {}) {
   });
 
   // Clean up any existing server pod
-  run(`kubectl delete pod -n ${NS} --context ${K8S_CONTEXT} ${DL_POD} --grace-period=0 2>/dev/null`, { throws: false });
-  run(`kubectl wait --for=delete pod/${DL_POD} -n ${NS} --context ${K8S_CONTEXT} --timeout=30s 2>/dev/null`, { throws: false });
+  run(`kubectl delete pod -n ${NS} --context ${K8S_CONTEXT} ${DL_POD} --grace-period=0`, { throws: false });
+  run(`kubectl wait --for=delete pod/${DL_POD} -n ${NS} --context ${K8S_CONTEXT} --timeout=30s`, { throws: false });
 
   console.error('Starting HTTP download server...');
-  run(`kubectl run ${DL_POD} -n ${NS} --context ${K8S_CONTEXT} --image=python:3.12-slim --overrides='${overrides}' --restart=Never 2>/dev/null`);
-  run(`kubectl wait --for=condition=Ready pod/${DL_POD} -n ${NS} --context ${K8S_CONTEXT} --timeout=120s 2>/dev/null`);
+  // Same Windows quirk as createTransferPod: PodSecurity warning on stderr can
+  // make `kubectl run` look like it failed even when the pod was created.
+  // Don't redirect stderr; verify pod existence after the run instead.
+  run(`kubectl run ${DL_POD} -n ${NS} --context ${K8S_CONTEXT} --image=python:3.12-slim --overrides='${overrides}' --restart=Never`,
+      { throws: false });
+  const podPhase = run(
+    `kubectl get pod ${DL_POD} -n ${NS} --context ${K8S_CONTEXT} -o jsonpath='{.status.phase}'`,
+    { throws: false },
+  );
+  if (!podPhase || podPhase.includes('NotFound') || podPhase.includes('error')) {
+    console.error(`csvServe: ${DL_POD} not found after kubectl run. phase=${podPhase || '<empty>'}`);
+    console.log(JSON.stringify({ error: `Pod ${DL_POD} did not start` }, null, 2));
+    process.exit(1);
+  }
+  run(`kubectl wait --for=condition=Ready pod/${DL_POD} -n ${NS} --context ${K8S_CONTEXT} --timeout=120s`,
+      { throws: false });
 
   // Port-forward
   console.error(`Port-forwarding ${DL_LOCAL_PORT} → ${DL_PORT}...`);
