@@ -1470,12 +1470,31 @@ pub fn reload_after_dumps(engine: &ConcurrentEngine, had_alive_phase: bool) {
     // field set (e.g., images-phase cache entries hide tagIds added by tags phase).
     engine.clear_doc_cache();
     let mut alive_s = 0.0;
+    let mut buckets_s = 0.0;
     if had_alive_phase {
         let t_alive = Instant::now();
         engine.reload_alive_from_disk();
         alive_s = t_alive.elapsed().as_secs_f64();
+        // Rebuild time buckets from the freshly-loaded alive bitmap. Dump path
+        // writes alive directly to disk and bypasses the coalescer, so the flush
+        // thread never observes alive_inserts and buckets stay empty. The
+        // rebuild lazy-loads the bucket sort field as a side effect.
+        if engine.config().time_buckets.is_some() {
+            let t_buckets = Instant::now();
+            match engine.rebuild_time_buckets() {
+                Ok((buckets, slots)) => {
+                    buckets_s = t_buckets.elapsed().as_secs_f64();
+                    eprintln!("  Dump reload: rebuilt {} time buckets from {} slots in {:.2}s",
+                        buckets, slots, buckets_s);
+                }
+                Err(e) => {
+                    eprintln!("  Dump reload: rebuild_time_buckets failed: {e}");
+                }
+            }
+        }
     }
-    eprintln!("  Dump reload: mark_pending={:.2}s alive_reload={:.2}s total={:.2}s", mark_s, alive_s, t.elapsed().as_secs_f64());
+    eprintln!("  Dump reload: mark_pending={:.2}s alive_reload={:.2}s buckets_rebuild={:.2}s total={:.2}s",
+        mark_s, alive_s, buckets_s, t.elapsed().as_secs_f64());
 }
 
 /// Process a dump phase with optional external progress counter.
@@ -4503,5 +4522,130 @@ mod tests {
         assert_eq!(query_tag(40), vec![2], "bitmap tagIds=40");
         assert_eq!(query_tag(50), vec![4], "bitmap tagIds=50");
         assert_eq!(query_tag(60), vec![4], "bitmap tagIds=60");
+    }
+
+    /// Baseline regression test for the multi_value dump-write path in the
+    /// resources-phase shape (slot_field=imageId, one (column→target)
+    /// mapping). At moderate N (~50K rows for a single value), the path is
+    /// expected to write the full bitmap — a bug here would mean we ship a
+    /// fundamentally broken dump.
+    ///
+    /// Note: production bug #15 (popular MVs with millions of rows producing
+    /// near-empty bitmaps) does NOT reproduce at this scale — see
+    /// `docs/_in/handoff-2026-05-01-post-v201.md` §2 for production patterns
+    /// (79K rows → 3 slots). Investigation continues with a prod-scale repro
+    /// rig; that work is separate from this baseline.
+    #[test]
+    fn test_dump_multi_value_resources_shape_writes_full_bitmap() {
+        use crate::config::{Config, FilterFieldConfig, FilterFieldType, SortFieldConfig};
+        use crate::query::{BitdexQuery, FilterClause, Value};
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let docs_path = dir.path().join("docs");
+        let bitmap_path = dir.path().join("bitmaps");
+        let mut config = Config {
+            filter_fields: vec![
+                FilterFieldConfig {
+                    name: "nsfwLevel".to_string(),
+                    field_type: FilterFieldType::SingleValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false,
+                    per_value_lazy: false,
+                    max_range_scan_values: None,
+                },
+                FilterFieldConfig {
+                    name: "modelVersionIds".to_string(),
+                    field_type: FilterFieldType::MultiValue,
+                    behaviors: None,
+                    eviction: None,
+                    eager_load: false,
+                    per_value_lazy: false,
+                    max_range_scan_values: None,
+                },
+            ],
+            sort_fields: vec![SortFieldConfig {
+                name: "id".to_string(),
+                source_type: "uint32".to_string(),
+                encoding: "linear".to_string(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            }],
+            max_page_size: 200_000,
+            flush_interval_us: 50,
+            merge_interval_ms: 100,
+            channel_capacity: 10_000,
+            ..Default::default()
+        };
+        config.storage.bitmap_path = Some(bitmap_path.clone());
+        let engine = crate::concurrent_engine::ConcurrentEngine::new_with_path(
+            config, docs_path.as_path(),
+        ).unwrap();
+        const POPULAR_N: u32 = 50_000;
+        const RARE_N: u32 = 50;
+        let total_n = POPULAR_N + RARE_N;
+        // Phase 1: images
+        let images_csv = dir.path().join("images.csv");
+        let mut buf = String::with_capacity(total_n as usize * 16);
+        buf.push_str("id,nsfwLevel\n");
+        for i in 1..=total_n {
+            writeln!(buf, "{},{}", i, 1).unwrap();
+        }
+        std::fs::write(&images_csv, &buf).unwrap();
+        let images_request: DumpRequest = serde_json::from_value(serde_json::json!({
+            "name": "images",
+            "csv_path": images_csv.to_str().unwrap(),
+            "format": "csv",
+            "slot_field": "id",
+            "sets_alive": true,
+            "fields": ["nsfwLevel"],
+        })).unwrap();
+        process_dump(&images_request, &engine, dir.path(), None, None, None, None)
+            .expect("images phase");
+        // Phase 2: resources — POPULAR_N rows for MV=42, RARE_N for MV=99
+        let resources_csv = dir.path().join("resources.csv");
+        let mut buf = String::with_capacity(total_n as usize * 16);
+        buf.push_str("imageId,modelVersionId\n");
+        for i in 1..=POPULAR_N {
+            writeln!(buf, "{},{}", i, 42).unwrap();
+        }
+        for i in (POPULAR_N + 1)..=total_n {
+            writeln!(buf, "{},{}", i, 99).unwrap();
+        }
+        std::fs::write(&resources_csv, &buf).unwrap();
+        let resources_request: DumpRequest = serde_json::from_value(serde_json::json!({
+            "name": "resources",
+            "csv_path": resources_csv.to_str().unwrap(),
+            "format": "csv",
+            "slot_field": "imageId",
+            "fields": [{"column": "modelVersionId", "target": "modelVersionIds"}],
+        })).unwrap();
+        process_dump(&resources_request, &engine, dir.path(), None, None, None, None)
+            .expect("resources phase");
+        let query_mv = |mv: i64, limit: usize| -> Vec<i64> {
+            let q = BitdexQuery {
+                filters: vec![FilterClause::Eq("modelVersionIds".to_string(), Value::Integer(mv))],
+                sort: None,
+                limit,
+                cursor: None,
+                offset: None,
+                skip_cache: true,
+            };
+            let mut ids = engine.execute_query(&q).unwrap().ids;
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            query_mv(99, RARE_N as usize + 10).len(),
+            RARE_N as usize,
+            "rare MV=99 should return {} slots", RARE_N
+        );
+        assert_eq!(
+            query_mv(42, POPULAR_N as usize + 10).len(),
+            POPULAR_N as usize,
+            "MV=42 should return {} slots — full bitmap survived dump+lazy-load",
+            POPULAR_N
+        );
     }
 }

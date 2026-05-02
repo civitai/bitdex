@@ -2307,6 +2307,20 @@ impl ConcurrentEngine {
                                         }
                                     }
                                 }
+                                // 2b. Rebuild time buckets from the published snapshot.
+                                //     This is the same fix as in `exit_loading_mode()`: the
+                                //     flush thread's live bucket maintenance is gated behind
+                                //     loading_mode and only triggers on coalescer.alive_inserts,
+                                //     so a bulk load leaves buckets empty. We must rebuild
+                                //     while the sort field is still loaded in `published` —
+                                //     after the unload step below it's gone, and rebuilding
+                                //     from outside the flush thread would have to wait for the
+                                //     next lazy load.
+                                if let Some(ref tb_arc) = flush_time_buckets {
+                                    if let Err(e) = ConcurrentEngine::rebuild_time_buckets_from_snapshot(&published, tb_arc) {
+                                        eprintln!("Warning: rebuild_time_buckets in ExitLoadingSaveUnload failed: {e}");
+                                    }
+                                }
                                 // 3. Build unloaded staging — reuse field configs, clear bitmaps
                                 let slots = published.slots.clone();
                                 let mut new_filters = crate::filter::FilterIndex::new();
@@ -6749,11 +6763,32 @@ impl ConcurrentEngine {
 
     /// Rebuild all time buckets from the alive bitmap and sort field.
     /// Returns (bucket_count, slots_scanned).
+    ///
+    /// Lazy-loads the bucket sort field if it's currently unloaded — necessary
+    /// after a fresh dump where `mark_fields_pending_reload` puts the sort
+    /// field back into pending.
     pub fn rebuild_time_buckets(&self) -> crate::error::Result<(usize, u64)> {
         let tb_arc = self.time_buckets.as_ref().ok_or_else(|| {
             crate::error::BitdexError::Config("no time_buckets configured".into())
         })?;
+        let sort_field_name = tb_arc.load().sort_field_name().to_string();
+        self.ensure_fields_loaded(&[], Some(&sort_field_name))?;
         let snap = self.snapshot();
+        let result = Self::rebuild_time_buckets_from_snapshot(&snap, tb_arc)?;
+        self.dirty_since_snapshot.store(true, std::sync::atomic::Ordering::Release);
+        self.unified_cache.clear();
+        Ok(result)
+    }
+
+    /// Static rebuild helper. Used by both `rebuild_time_buckets` (engine-side)
+    /// and the `ExitLoadingSaveUnload` flush handler (which only has access to
+    /// the published snapshot before unload, not `&self`).
+    ///
+    /// Caller is responsible for any post-rebuild cache invalidation.
+    pub(crate) fn rebuild_time_buckets_from_snapshot(
+        snap: &InnerEngine,
+        tb_arc: &Arc<ArcSwap<TimeBucketManager>>,
+    ) -> crate::error::Result<(usize, u64)> {
         let sort_field_name = tb_arc.load().sort_field_name().to_string();
         let sort_field = snap.sorts.get_field(&sort_field_name).ok_or_else(|| {
             crate::error::BitdexError::Config(format!(
@@ -6778,8 +6813,6 @@ impl ConcurrentEngine {
         }
         let bucket_count = bucket_names.len();
         tb_arc.store(Arc::new(tb));
-        self.dirty_since_snapshot.store(true, std::sync::atomic::Ordering::Release);
-        self.unified_cache.clear();
         eprintln!(
             "rebuild_time_buckets: rebuilt {} buckets from {} alive slots in sort field '{}'",
             bucket_count, slot_count, sort_field_name
@@ -6878,6 +6911,16 @@ impl ConcurrentEngine {
         }
         // Trigger initial population of bitmap memory cache after load completes.
         self.bitmap_memory_cache.mark_all_stale();
+        // Rebuild time buckets from the freshly-published snapshot. The flush
+        // thread's per-cycle bucket maintenance is gated behind `loading_mode`
+        // (and only triggers on coalescer.alive_inserts), so buckets receive
+        // no inserts during a bulk load. Without this rebuild they stay empty
+        // until the next mutation that touches their tracked sort field.
+        if self.time_buckets.is_some() {
+            if let Err(e) = self.rebuild_time_buckets() {
+                eprintln!("Warning: rebuild_time_buckets after exit_loading_mode failed: {e}");
+            }
+        }
     }
     /// Combined exit-loading + save + unload that avoids the memory spike.
     ///
@@ -10367,6 +10410,99 @@ mod tests {
             result.ids.len(),
             100,
             "query should return all 100 records immediately after exit_loading_mode"
+        );
+    }
+    /// Regression test for v1.0.202 bug #14: a bulk load via loading mode must
+    /// leave the time bucket bitmaps populated. Previously buckets stayed empty
+    /// because the flush thread's per-cycle bucket maintenance is gated behind
+    /// `loading_mode` and only fires on coalescer.alive_inserts.
+    #[test]
+    fn test_exit_loading_mode_rebuilds_time_buckets() {
+        use crate::config::{BucketConfig, TimeBucketFieldConfig};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let config = Config {
+            filter_fields: vec![FilterFieldConfig {
+                name: "nsfwLevel".to_string(),
+                field_type: FilterFieldType::SingleValue,
+                behaviors: None,
+                eviction: None,
+                eager_load: false,
+                per_value_lazy: false,
+                max_range_scan_values: None,
+            }],
+            sort_fields: vec![SortFieldConfig {
+                name: "sortAt".to_string(),
+                source_type: "uint32".to_string(),
+                encoding: "linear".to_string(),
+                bits: 32,
+                eager_load: false,
+                computed: None,
+            }],
+            time_buckets: Some(TimeBucketFieldConfig {
+                filter_field: "sortAt".to_string(),
+                sort_field: "sortAt".to_string(),
+                range_buckets: vec![
+                    BucketConfig {
+                        name: "24h".to_string(),
+                        duration_secs: 86400,
+                        refresh_interval_secs: 60,
+                    },
+                    BucketConfig {
+                        name: "7d".to_string(),
+                        duration_secs: 604800,
+                        refresh_interval_secs: 60,
+                    },
+                ],
+            }),
+            max_page_size: 100,
+            flush_interval_us: 50,
+            channel_capacity: 10_000,
+            ..Default::default()
+        };
+        let engine = ConcurrentEngine::new(config).unwrap();
+        // Bulk insert via loading mode (the prod NDJSON path).
+        // Slots 1-50: sortAt within last 24h. Slot 51-60: 3 days ago (outside 24h).
+        engine.enter_loading_mode();
+        for i in 1u32..=50 {
+            engine
+                .put(
+                    i,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("sortAt", FieldValue::Single(Value::Integer((now - 3600) as i64))),
+                    ]),
+                )
+                .unwrap();
+        }
+        for i in 51u32..=60 {
+            engine
+                .put(
+                    i,
+                    &make_doc(vec![
+                        ("nsfwLevel", FieldValue::Single(Value::Integer(1))),
+                        ("sortAt", FieldValue::Single(Value::Integer((now - 3 * 86400) as i64))),
+                    ]),
+                )
+                .unwrap();
+        }
+        engine.exit_loading_mode();
+        let stats = engine.time_bucket_stats();
+        let bucket_24h = stats.get("24h").expect("24h bucket must exist");
+        let slots_24h = bucket_24h.get("slots").and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(
+            slots_24h, 50,
+            "24h bucket must contain the 50 slots inserted within the last 24h \
+             (got {slots_24h}); buckets stay empty when bulk-load bypasses the \
+             flush-thread alive_inserts maintenance loop"
+        );
+        let bucket_7d = stats.get("7d").expect("7d bucket must exist");
+        let slots_7d = bucket_7d.get("slots").and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(
+            slots_7d, 60,
+            "7d bucket must contain all 60 slots (50 in last 24h + 10 in last 7d); got {slots_7d}"
         );
     }
     // ---- Regression tests for reliability fixes ----
