@@ -574,6 +574,21 @@ impl FieldMeta {
 /// `is_null_or_remove` true → field is being cleared (Remove or null Set);
 /// the exists_boolean target stores `false`. False → non-null Set; target
 /// stores `true`.
+///
+/// The lookup key is whatever `field` name the trigger emitted. The shadow
+/// map is built (`from_config`) so that BOTH the data_schema source name
+/// (e.g. `publishedAtUnix`) AND every sibling target sharing that source
+/// (e.g. `publishedAt`) resolve to the same `exists_boolean` target arc.
+/// Production triggers emit target-keyed payloads (`publishedAt` already
+/// in seconds via `extract(epoch from ...)`) — this covers them — and the
+/// source-keyed path stays correct for any future trigger that emits raw
+/// source values.
+///
+/// Latent gap (not in production today): a source-keyed op whose target is
+/// a numeric sort field with `ms_to_seconds: true` will write the raw
+/// source value to the docstore via `dw.write_set` (no derivation). The
+/// fix would parallel this helper for sort targets; deferred because the
+/// current Civitai trigger config never emits source-keyed sort ops.
 fn write_shadow_target_docs(
     dw: &mut DocWriter,
     meta: &FieldMeta,
