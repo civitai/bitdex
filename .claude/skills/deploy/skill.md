@@ -138,11 +138,15 @@ node .claude/skills/deploy/cli.mjs csv-download-watch <filename> [--poll <second
 ## Bulk Reload
 
 ```bash
-# Full reload orchestration (see reload.mjs for 9-step process)
+# Hard-nuke orchestration (6 steps, sync-v2 autonomous boot — see Hard nuke section below)
 node .claude/skills/deploy/reload.mjs <step>
 
-# Wipe bitmap/docstore data on both PVCs (keeps CSVs)
+# Soft nuke: wipe bitmap/docstore data (keeps CSVs in load_stage)
 node .claude/skills/deploy/cli.mjs wipe
+
+# Hard-nuke PG state without bouncing the pod (drop bitdex_* triggers + truncate BitdexOps/bitdex_cursors).
+# Pod must be at 0 replicas first — running this while triggers are firing corrupts state.
+node .claude/skills/deploy/cli.mjs nuke-pg
 ```
 
 ## Monitoring
@@ -210,9 +214,22 @@ node .claude/skills/deploy/cli.mjs scale <replicas>
 - **Namespace:** bitdex
 - **StatefulSet:** bitdex
 - **Containers:** bitdex (server), pg-sync (sidecar)
-- **PVCs:** data-bitdex-0, data-bitdex-1
-- **Node:** talos-fq9-f3k
+- **PVCs:** data-bitdex-0 (`data-bitdex-1` exists but unused in current single-replica layout)
+- **Node:** talos-wjh-tgy (verify before assuming — pod migrates with PVC re-binds; check via `kubectl get pv $(kubectl -n bitdex get pvc data-bitdex-0 -o jsonpath='{.spec.volumeName}') -o jsonpath='{.spec.nodeAffinity}'`)
 - **GHCR:** ghcr.io/civitai/bitdex
 - **K8s Context:** civit-datapacket
-- **PG replica:** cnpg-cluster-nvme0-1 in cnpg-database namespace
-- **Sync config:** config/sync-civitai.yaml (source of truth for dump queries)
+- **PG primary writer:** verify via `kubectl get pod -n cnpg-database -l role=primary` (currently `cnpg-cluster-nvme0-3`; CNPG failovers shift this)
+- **Sync config:** config/sync-civitai.yaml (source of truth for dump queries + trigger configs)
+
+## Hard nuke / reload (sync-v2 flow)
+
+```bash
+node .claude/skills/deploy/reload.mjs preflight
+node .claude/skills/deploy/reload.mjs suspend
+node .claude/skills/deploy/reload.mjs nuke-pg     # also: cli.mjs nuke-pg
+node .claude/skills/deploy/reload.mjs wipe
+node .claude/skills/deploy/reload.mjs start       # bitdex-sync drives setup + dump + load
+node .claude/skills/deploy/reload.mjs monitor     # tail pg-sync logs
+```
+
+See `docs/guide/deploy-nukes.md` for full pre-flight + post-load procedure.

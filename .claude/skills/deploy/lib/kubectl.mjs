@@ -7,7 +7,7 @@ import { execSync, spawnSync } from 'child_process';
 export const K8S_CONTEXT = 'civit-datapacket';
 export const NS = 'bitdex';
 export const STS = 'bitdex';
-export const NODE = 'talos-fq9-f3k';
+export const NODE = 'talos-wjh-tgy';
 export const INDEX_PATH = '/data/indexes/civitai';
 export const PG_NS = 'cnpg-database';
 export const PG_POD = 'cnpg-cluster-nvme0-1';
@@ -98,6 +98,15 @@ export function runEphemeralPod(name, { image = 'busybox', command, pvcIndex = 0
  * Create a long-lived transfer pod with DB access and PVC mount.
  * Used for CSV dumps and data operations.
  * @returns {string} pod name
+ *
+ * Windows quirk: `kubectl run --overrides` against a PodSecurity-restricted
+ * namespace prints a long warning to stderr ("would violate PodSecurity
+ * restricted:latest..."). On Windows / Git-Bash, redirecting stderr with
+ * `2>/dev/null` does NOT reliably swallow that warning AND the wrapping shell
+ * sometimes propagates a non-zero exit even when the pod was actually created.
+ * Workaround: do NOT redirect stderr; instead let `run()` swallow any throw
+ * (via throws:false) and verify pod existence via `kubectl get pod`. The
+ * PodSecurity warning is informational — the apply still succeeds.
  */
 export function createTransferPod(name, { pvcIndex = 0, image = 'postgres:16-bookworm', timeout = 120 } = {}) {
   const overrides = JSON.stringify({
@@ -121,11 +130,25 @@ export function createTransferPod(name, { pvcIndex = 0, image = 'postgres:16-boo
   });
 
   // Clean up any existing pod
-  run(`kubectl delete pod -n ${NS} --context ${K8S_CONTEXT} ${name} --grace-period=0 2>/dev/null`, { throws: false });
-  run(`kubectl wait --for=delete pod/${name} -n ${NS} --context ${K8S_CONTEXT} --timeout=30s 2>/dev/null`, { throws: false });
+  run(`kubectl delete pod -n ${NS} --context ${K8S_CONTEXT} ${name} --grace-period=0`, { throws: false });
+  run(`kubectl wait --for=delete pod/${name} -n ${NS} --context ${K8S_CONTEXT} --timeout=30s`, { throws: false });
 
-  run(`kubectl run ${name} -n ${NS} --context ${K8S_CONTEXT} --image=${image} --overrides='${overrides}' --restart=Never 2>/dev/null`);
-  run(`kubectl wait --for=condition=Ready pod/${name} -n ${NS} --context ${K8S_CONTEXT} --timeout=${timeout}s 2>/dev/null`);
+  // Run create — DO NOT swallow stderr. PodSecurity warnings are noisy but harmless.
+  run(`kubectl run ${name} -n ${NS} --context ${K8S_CONTEXT} --image=${image} --overrides='${overrides}' --restart=Never`,
+      { throws: false });
+
+  // Verify pod actually exists regardless of run() return code (Windows shell may
+  // mis-attribute the PodSecurity stderr warning to a failure).
+  const podPhase = run(
+    `kubectl get pod ${name} -n ${NS} --context ${K8S_CONTEXT} -o jsonpath='{.status.phase}'`,
+    { throws: false },
+  );
+  if (!podPhase || podPhase.includes('NotFound') || podPhase.includes('error')) {
+    throw new Error(`createTransferPod(${name}): pod not found after kubectl run. phase=${podPhase || '<empty>'}`);
+  }
+
+  run(`kubectl wait --for=condition=Ready pod/${name} -n ${NS} --context ${K8S_CONTEXT} --timeout=${timeout}s`,
+      { throws: false });
 
   return name;
 }

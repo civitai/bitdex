@@ -13,7 +13,7 @@
 import { readFileSync, writeFileSync, existsSync, createWriteStream, statSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { spawnSync } from 'child_process';
+import { spawnSync, execFileSync } from 'child_process';
 import http from 'http';
 import https from 'https';
 
@@ -456,6 +456,77 @@ function cleanup(target) {
   json({ target, label: t.label, cleaned: true, disk_used: used });
 }
 
+// --- PG Nuke (sql/nuke-pg-state.sql + retry pass) ---
+
+function nukePg() {
+  const sqlDir = resolve(__d, 'sql');
+  const sqlFile = resolve(sqlDir, 'nuke-pg-state.sql');
+  const retryFile = resolve(sqlDir, 'nuke-pg-state-retry.sql');
+
+  if (!existsSync(sqlFile)) {
+    json({ error: `Missing ${sqlFile}` });
+    process.exit(1);
+  }
+
+  const writerPod = process.env.BITDEX_PG_WRITER_POD || 'cnpg-cluster-nvme0-3';
+  err(`Targeting writer pod: ${writerPod} (override via BITDEX_PG_WRITER_POD)`);
+
+  function runSqlFile(file, label) {
+    const sql = readFileSync(file, 'utf8');
+    err(`\n--- ${label} ---`);
+    try {
+      const out = execFileSync(
+        'kubectl',
+        ['--context', 'civit-datapacket', 'exec', '-i', '-n', 'cnpg-database',
+         writerPod, '-c', 'postgres', '--',
+         'psql', '-U', 'postgres', '-d', 'civitai'],
+        { input: sql, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      err(out.split('\n').slice(-15).join('\n'));
+      return { ok: true, output: out };
+    } catch (e) {
+      err(`SQL run failed: ${e.message?.slice(0, 200)}`);
+      return { ok: false, error: e.message };
+    }
+  }
+
+  function countRemaining() {
+    try {
+      const out = execFileSync(
+        'kubectl',
+        ['--context', 'civit-datapacket', 'exec', '-n', 'cnpg-database', writerPod, '-c', 'postgres',
+         '--', 'psql', '-U', 'postgres', '-d', 'civitai', '-t', '-c',
+         `SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'bitdex_%' AND NOT tgisinternal`],
+        { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      return parseInt(out.trim(), 10) || 0;
+    } catch {
+      return -1;
+    }
+  }
+
+  const pass1 = runSqlFile(sqlFile, 'Pass 1 (lock_timeout=5s)');
+  let remaining = countRemaining();
+  err(`Triggers remaining after pass 1: ${remaining}`);
+
+  let pass2 = null;
+  if (remaining > 0 && existsSync(retryFile)) {
+    pass2 = runSqlFile(retryFile, 'Pass 2 (lock_timeout=10s, retry up to 8x)');
+    remaining = countRemaining();
+    err(`Triggers remaining after pass 2: ${remaining}`);
+  }
+
+  json({
+    writerPod,
+    pass1: pass1.ok,
+    pass2: pass2 ? pass2.ok : 'skipped',
+    remainingTriggers: remaining,
+    note: remaining <= 4
+      ? 'OK — bitdex-sync setup_v2 reconciles surviving triggers on boot.'
+      : 'WARN — investigate manually before running reload.mjs start.',
+  });
+}
+
 // --- Tunnels ---
 
 // bitdex user credentials — NOT cnpg-cluster-nvme0-app (that's the civitai user with 120s timeout)
@@ -761,6 +832,9 @@ switch (command) {
   // Tunnels
   case 'tunnel': tunnel(process.argv[3], process.argv[4]); break;
 
+  // Hard-nuke PG state (drop bitdex_* triggers + truncate BitdexOps/bitdex_cursors)
+  case 'nuke-pg': nukePg(); break;
+
   // Snapshots
   case 'snapshot-status': snapshotStatus(process.argv[3]); break;
   case 'snapshot-download': await snapshotDownload(process.argv[3]); break;
@@ -825,7 +899,7 @@ switch (command) {
         'Tunnels': ['tunnel pg [start|stop|status]', 'tunnel bitdex [start|stop|status]'],
         'Snapshots': ['snapshot-status <session_id>', 'snapshot-download <session_id> [--output <path>]'],
         'Metrics': ['metrics-now', 'metrics-trend [window]', 'metrics-query <promql>'],
-        'Data': ['wipe', 'cleanup <captures|load_stage|legacy|bounds>'],
+        'Data': ['wipe', 'cleanup <captures|load_stage|legacy|bounds>', 'nuke-pg'],
       },
     });
     process.exit(1);

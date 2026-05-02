@@ -1,37 +1,58 @@
 #!/usr/bin/env node
 /**
- * BitDex Full Reload Script
+ * BitDex Hard-Nuke Orchestrator (post-v201, sync-v2 autonomous boot)
  *
- * Usage: node .claude/skills/deploy/reload.mjs <step> [args]
+ * Usage: node .claude/skills/deploy/reload.mjs <step>
  *
- * Steps (run in order):
- *   1. suspend       — Suspend Flux, scale to 0, verify pods gone
- *   2. wipe          — Wipe bitmaps/docs/cursors/CSVs on both PVCs
- *   3. dump          — Dump fresh CSVs from PG directly to disk
- *   4. transfer      — Copy CSVs from PG pod to both PVCs
- *   5. load          — Run bulk load jobs on both PVCs
- *   6. cursor-reset  — Stop pods, write cursor files, update PG
- *   7. start         — Scale to 2, verify cursors + sync
- *   8. resume        — Unsuspend Flux, remove safety cursor
- *   9. cleanup       — Delete dump files from PG pod, old jobs
+ * Steps (run in order, verify each before continuing):
+ *   1. preflight    — verify shadow OFF, Flux suspended, image tag noted
+ *   2. suspend      — scale StatefulSet to 0, verify pods gone
+ *   3. nuke-pg      — drop bitdex_* triggers + functions, truncate
+ *                     BitdexOps + bitdex_cursors (handles deadlock retries)
+ *   4. wipe         — wipe bitmaps/docs/bounds/slot_arena/load_stage on the PVC
+ *   5. start        — scale StatefulSet up; bitdex-sync's run_setup_v2 +
+ *                     boot dump pipeline (src/bin/pg_sync.rs) autonomously
+ *                     reinstalls triggers, dumps CSVs, bulk-loads
+ *   6. monitor      — tail pg-sync container until /api/indexes/civitai/stats
+ *                     reports alive_count > 0 AND all dump phases complete
  *
- * Each step verifies preconditions before running and prints a
- * checklist-style report when done.
+ * Post-flow (manual, see docs/guide/deploy-nukes.md §Post-load):
+ *   - POST /api/indexes/civitai/compact -d '{"targets":["docs"]}'
+ *   - Run smoke tests (Archer's three queries from
+ *     docs/_in/correctness-handoff-2026-05-01.md)
+ *   - flipt skill shadow on (re-enable comparator)
+ *
+ * Why this is a thin wrapper, not the old 9-step orchestration:
+ *   bitdex-sync's `run_boot_sequence` (src/bin/pg_sync.rs:282) handles
+ *   setup_v2 (triggers + tables) → cursor capture → CSV download →
+ *   per-phase dump registration → pollers. The host-side orchestration
+ *   only needs to: scale down, reset PG-side state, wipe the PVC, and
+ *   scale back up. The sidecar drives the rest.
+ *
+ * For Flux suspend/resume, see docs/guide/prod-ops.md §6 — the durable
+ * lever is a git commit to talos-infra
+ * `clusters/production/flux-system/apps/bitdex/bitdex.yaml` `suspend: true`.
+ * `kubectl patch` and `flux suspend` are NOT sticky (Flux reconciles back
+ * from git within ~5 min). This script does NOT touch Flux state — pre-flight
+ * step asserts it's already suspended via git, and resume happens via git
+ * after the load completes.
  */
-import { execSync } from 'child_process';
-import { loadDumpQueries } from './lib/sync-config.mjs';
+import { execFileSync, execSync } from 'child_process';
+import { resolve, dirname } from 'path';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
 
 const NS = 'bitdex';
 const STS = 'bitdex';
-const NODE = 'talos-fq9-f3k';
-const PG_POD = 'cnpg-cluster-nvme0-1';
+const NODE = 'talos-wjh-tgy';
+const K8S_CONTEXT = 'civit-datapacket';
 const PG_NS = 'cnpg-database';
-const PG_DUMP_DIR = '/var/lib/postgresql/data/bitdex_dump';
+const PG_POD = 'cnpg-cluster-nvme0-3'; // current writer; verify via `kubectl get pod -n cnpg-database -l role=primary`
 const INDEX_PATH = '/data/indexes/civitai';
 const LOAD_STAGE = `${INDEX_PATH}/load_stage`;
 
-// ClickHouse (for metrics — handled by the bulk loader, not this script)
-// The loader reads CH credentials from K8s secrets.
+const __dir = dirname(fileURLToPath(import.meta.url));
+const SQL_DIR = resolve(__dir, 'sql');
 
 function run(cmd, opts = {}) {
   try {
@@ -48,465 +69,278 @@ function run(cmd, opts = {}) {
 }
 
 function kubectl(args, opts) {
-  return run(`kubectl ${args} -n ${NS} 2>/dev/null`, opts);
-}
-
-function pgExec(sql, opts) {
-  // Use execFileSync to avoid shell quoting issues entirely
-  try {
-    const result = require('child_process').execFileSync(
-      'kubectl', ['exec', '-n', PG_NS, PG_POD, '--', 'psql', '-U', 'postgres', '-d', 'civitai', '-t', '-c', sql],
-      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: opts?.timeout || 120000 },
-    );
-    return result.trim();
-  } catch (e) {
-    if (opts?.ignoreError) return '';
-    throw e;
-  }
-}
-
-function pgCopy(query, outFile) {
-  // CRITICAL: Use -q (--quiet) to suppress "SET" output from psql.
-  // Without -q, psql writes "SET\n" to stdout even with separate -c flags.
-  // Confirmed by Aidan — all 9 CSVs had SET prefix without -q.
-  const setCmd = 'SET statement_timeout = 0';
-  const copyCmd = `COPY (${query}) TO '${PG_DUMP_DIR}/${outFile}' CSV`;
-  return run(
-    `MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- psql -q -U postgres -d civitai -c "${setCmd}" -c "${copyCmd}" 2>/dev/null`,
-    { timeout: 600000 },
-  );
-}
-
-function mountPvc(name, pvcIndex) {
-  kubectl(
-    `run ${name} --image=busybox ` +
-    `--overrides='${JSON.stringify({
-      spec: {
-        containers: [{ name: 'm', image: 'busybox', command: ['sleep', '3600'],
-          volumeMounts: [{ name: 'd', mountPath: '/data' }] }],
-        volumes: [{ name: 'd', persistentVolumeClaim: { claimName: `data-bitdex-${pvcIndex}` } }],
-        nodeSelector: { 'kubernetes.io/hostname': NODE },
-      },
-    }).replace(/'/g, "\\'")}' --restart=Never`,
-    { ignoreError: true },
-  );
-}
-
-function execOnMount(name, cmd) {
-  return run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${NS} ${name} -- sh -c '${cmd}' 2>/dev/null`);
-}
-
-function deleteMount(name) {
-  kubectl(`delete pod ${name} --force --grace-period=0`, { ignoreError: true });
+  return run(`kubectl --context ${K8S_CONTEXT} ${args} -n ${NS}`, opts);
 }
 
 function log(msg) { console.log(`  ✓ ${msg}`); }
+function warn(msg) { console.error(`  ! ${msg}`); }
 function err(msg) { console.error(`  ✗ ${msg}`); }
 function heading(msg) { console.log(`\n=== ${msg} ===`); }
 
-// --- COPY queries from V2 sync config (config/sync-civitai.yaml) ---
-// Loaded dynamically to stay in sync with the dump processor.
-// Falls back to hardcoded V2 queries if config isn't available.
-let TABLES;
-try {
-  const queries = loadDumpQueries();
-  TABLES = {};
-  for (const q of queries) {
-    // Extract the SELECT portion from the COPY query
-    const selectMatch = q.query.match(/COPY\s*\(([\s\S]+?)\)\s*TO\s+STDOUT/i);
-    TABLES[q.file] = selectMatch ? selectMatch[1].trim() : q.query;
-  }
-} catch {
-  // Fallback: V2 queries hardcoded (keep in sync with sync-civitai.yaml)
-  TABLES = {
-    'tags.csv': `SELECT "tagId", "imageId", "attributes" FROM "TagsOnImageNew"`,
-    'images.csv': `SELECT id, url, "nsfwLevel", hash, flags, type::text, "userId", "blockedFor", extract(epoch from "scannedAt")::bigint, extract(epoch from "createdAt")::bigint, "postId", width, height FROM "Image"`,
-    'posts.csv': `SELECT id, extract(epoch from "publishedAt")::bigint, availability::text, "modelVersionId" FROM "Post"`,
-    'resources.csv': `SELECT "imageId", "modelVersionId", detected FROM "ImageResourceNew"`,
-    'model_versions.csv': `SELECT id, "baseModel", "modelId" FROM "ModelVersion"`,
-    'models.csv': `SELECT id, poi, type::text FROM "Model"`,
-    'tools.csv': `SELECT "toolId", "imageId" FROM "ImageTool"`,
-    'techniques.csv': `SELECT "techniqueId", "imageId" FROM "ImageTechnique"`,
-  };
-}
+// ---------------------------------------------------------------------------
+// Steps
+// ---------------------------------------------------------------------------
 
-// =========================================================================
-// STEPS
-// =========================================================================
+function step1_preflight() {
+  heading('Step 1: Pre-flight');
 
-function step1_suspend() {
-  heading('Step 1: Suspend Flux + Scale to 0');
-
-  // Check Flux suspend status
+  // Flux suspend state — read-only check, doesn't try to mutate it
   const suspended = run(
-    `kubectl get kustomization bitdex -n flux-system -o jsonpath='{.spec.suspend}' 2>/dev/null`,
+    `kubectl --context ${K8S_CONTEXT} get kustomization bitdex -n flux-system -o jsonpath='{.spec.suspend}'`,
     { ignoreError: true },
   );
   if (suspended === 'true') {
-    log('Flux already suspended');
+    log('Flux Kustomization bitdex.suspend = true');
   } else {
-    console.log('  Waiting for Flux to reconcile suspend from git...');
-    console.log('  (Arabella must push suspend:true to talos-infra first)');
-    // Try patching anyway in case it sticks
-    run(`kubectl patch kustomization bitdex -n flux-system --type=json -p='[{"op":"replace","path":"/spec/suspend","value":true}]' 2>/dev/null`, { ignoreError: true });
+    warn(`Flux Kustomization bitdex.suspend = ${suspended || '<unset>'}`);
+    warn('Suspend via talos-infra commit BEFORE proceeding:');
+    warn('  clusters/production/flux-system/apps/bitdex/bitdex.yaml: suspend: true');
+    warn('Otherwise Flux will fight any manifest changes during the nuke.');
   }
 
-  // Scale to 0
+  // Note current image tag for rollback awareness
+  const stsImage = kubectl(`get statefulset ${STS} -o jsonpath='{.spec.template.spec.containers[0].image}'`, { ignoreError: true });
+  log(`Current image: ${stsImage || '<unknown>'}`);
+
+  // Flipt shadow flag check — best-effort
+  warn('Confirm shadow flag is OFF in flipt-state before proceeding:');
+  warn('  node .claude/skills/flipt/flipt.mjs get bitdex-image-search');
+  warn('Mirrored prod traffic during a wiped pod = error storm on model-share side.');
+}
+
+function step2_suspend() {
+  heading('Step 2: Scale StatefulSet to 0');
+
   kubectl(`scale statefulset/${STS} --replicas=0`);
-  run('sleep 10');
-  kubectl(`delete pod bitdex-0 bitdex-1 --force --grace-period=0`, { ignoreError: true });
   run('sleep 5');
 
-  // Verify
-  const replicas = kubectl(`get statefulset ${STS} -o jsonpath='{.spec.replicas}'`);
-  const pods = kubectl(`get pods --no-headers`, { ignoreError: true })
-    .split('\n').filter(l => l.match(/^bitdex-[01]\s/) && !l.includes('Completed')).length;
+  // Force-delete in case StatefulSet termination grace is long
+  kubectl(`delete pod bitdex-0 --force --grace-period=0`, { ignoreError: true });
+  run('sleep 5');
 
-  if (replicas.includes('0') && pods === 0) {
+  const replicas = kubectl(`get statefulset ${STS} -o jsonpath='{.spec.replicas}'`);
+  const podCount = kubectl(`get pods --no-headers`, { ignoreError: true })
+    .split('\n')
+    .filter(l => l.match(/^bitdex-0\s/) && !l.includes('Completed'))
+    .length;
+
+  if (replicas.includes('0') && podCount === 0) {
     log(`Replicas: 0, Pods: 0`);
   } else {
-    err(`Replicas: ${replicas}, Pods: ${pods} — expected 0/0`);
+    err(`Replicas: ${replicas}, Pods: ${podCount} — expected 0/0`);
     process.exit(1);
-  }
-
-  // Set safety cursor in PG
-  pgExec(`INSERT INTO bitdex_cursors (replica_id, last_outbox_id, updated_at) VALUES ('safety-hold', 0, now()) ON CONFLICT (replica_id) DO UPDATE SET last_outbox_id = 0, updated_at = now();`);
-  log('Safety cursor set in PG (prevents outbox cleanup)');
-
-  // Record outbox head
-  const head = pgExec(`SELECT MAX(id) FROM "BitdexOutbox";`).trim();
-  log(`Current outbox head: ${head}`);
-
-  // Wait and verify Flux isn't bringing pods back
-  console.log('  Waiting 30s to verify Flux stays suspended...');
-  run('sleep 30');
-  const podsAfter = kubectl(`get pods --no-headers`, { ignoreError: true })
-    .split('\n').filter(l => l.match(/^bitdex-[01]\s/) && !l.includes('Completed')).length;
-  if (podsAfter > 0) {
-    err(`Flux brought pods back! (${podsAfter} pods). Flux must be suspended via git push.`);
-    process.exit(1);
-  }
-  log('Flux confirmed suspended — no pods came back after 30s');
-}
-
-function step2_wipe() {
-  heading('Step 2: Wipe both PVCs');
-
-  // Verify pods are down
-  const pods = kubectl(`get pods --no-headers`, { ignoreError: true })
-    .split('\n').filter(l => l.match(/^bitdex-[01]\s/)).length;
-  if (pods > 0) {
-    err('Pods still running — run step 1 first');
-    process.exit(1);
-  }
-
-  for (const i of [0, 1]) {
-    mountPvc(`wipe-${i}`, i);
-  }
-  run('sleep 10');
-
-  for (const i of [0, 1]) {
-    execOnMount(`wipe-${i}`,
-      `rm -rf ${INDEX_PATH}/bitmaps ${INDEX_PATH}/docs ${INDEX_PATH}/bounds ` +
-      `${INDEX_PATH}/slot_arena.bin ${INDEX_PATH}/snapshot.meta && ` +
-      `rm -rf ${LOAD_STAGE}/* && echo wiped-${i}`);
-    const contents = execOnMount(`wipe-${i}`, `ls ${INDEX_PATH}/`);
-    log(`PVC-${i} wiped: ${contents.replace(/\n/g, ', ')}`);
-    deleteMount(`wipe-${i}`);
   }
 }
 
-function step3_dump() {
-  heading('Step 3: Dump fresh CSVs from PG');
+function step3_nukePg() {
+  heading('Step 3: Reset PG state (drop triggers + truncate ops/cursors)');
 
-  // Create/clear dump dir
-  run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- sh -c 'mkdir -p ${PG_DUMP_DIR} && rm -f ${PG_DUMP_DIR}/*.csv ${PG_DUMP_DIR}/cursor.txt' 2>/dev/null`);
-  log('Dump directory cleared');
+  // Verify pods still down — running an in-flight write while we truncate
+  // BitdexOps would corrupt state.
+  const podCount = kubectl(`get pods --no-headers`, { ignoreError: true })
+    .split('\n')
+    .filter(l => l.match(/^bitdex-0\s/) && !l.includes('Completed'))
+    .length;
+  if (podCount > 0) {
+    err('bitdex-0 still running — run step 2 (suspend) first');
+    process.exit(1);
+  }
 
-  // Record outbox head BEFORE dump
-  const headBefore = pgExec(`SELECT MAX(id) FROM "BitdexOutbox";`).trim();
-  log(`Outbox head before dump: ${headBefore}`);
+  // Pass 1: short lock_timeout, accept partial drops
+  const sql = readFileSync(resolve(SQL_DIR, 'nuke-pg-state.sql'), 'utf8');
+  console.log('Running nuke-pg-state.sql (pass 1, lock_timeout=5s)...');
+  try {
+    const out = execFileSync(
+      'kubectl',
+      ['--context', K8S_CONTEXT, 'exec', '-i', '-n', PG_NS, PG_POD, '-c', 'postgres',
+       '--', 'psql', '-U', 'postgres', '-d', 'civitai'],
+      { input: sql, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    console.log(out.split('\n').slice(-12).join('\n'));
+  } catch (e) {
+    err(`Pass 1 failed: ${e.message?.slice(0, 200)}`);
+    process.exit(1);
+  }
 
-  // Dump each table
-  for (const [file, query] of Object.entries(TABLES)) {
-    console.log(`  Dumping ${file}...`);
+  // Check for stragglers and run retry pass if needed
+  const remaining = countRemainingTriggers();
+  if (remaining > 0) {
+    warn(`${remaining} triggers survived pass 1 — running retry pass`);
+    const retrySql = readFileSync(resolve(SQL_DIR, 'nuke-pg-state-retry.sql'), 'utf8');
     try {
-      const result = pgCopy(query, file);
-      const countMatch = result.match(/COPY (\d+)/);
-      log(`${file}: ${countMatch ? countMatch[1] + ' rows' : 'done'}`);
-    } catch (e) {
-      err(`${file} FAILED: ${e.message?.slice(0, 100)}`);
-      process.exit(1);
-    }
-  }
-
-  // Record outbox head AFTER dump
-  const headAfter = pgExec(`SELECT MAX(id) FROM "BitdexOutbox";`).trim();
-  log(`Outbox head after dump: ${headAfter}`);
-
-  // Save cursor (use the BEFORE value — CSVs reflect state at that point)
-  run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- sh -c 'echo -n ${headBefore} > ${PG_DUMP_DIR}/cursor.txt' 2>/dev/null`);
-  log(`Cursor saved: ${headBefore}`);
-
-  // Verify all files exist
-  const files = run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- ls -lh ${PG_DUMP_DIR}/ 2>/dev/null`);
-  console.log(files);
-}
-
-function step4_transfer() {
-  heading('Step 4: Transfer CSVs to both PVCs');
-
-  // Read cursor value
-  const cursor = run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- cat ${PG_DUMP_DIR}/cursor.txt 2>/dev/null`);
-  log(`Cursor from dump: ${cursor}`);
-
-  // Mount both PVCs
-  for (const i of [0, 1]) {
-    mountPvc(`xfer-${i}`, i);
-  }
-  run('sleep 10');
-
-  // Transfer each file + create .done markers
-  const allFiles = [...Object.keys(TABLES), 'cursor.txt'];
-  // Also need metrics.csv if it exists
-  const hasMetrics = run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- test -f ${PG_DUMP_DIR}/metrics.csv && echo yes || echo no 2>/dev/null`);
-
-  for (const file of allFiles) {
-    console.log(`  Transferring ${file}...`);
-    for (const i of [0, 1]) {
-      // Use kubectl cp from PG pod to a temp location, then to PVC
-      // Actually: both pods are on the same node, so we can use a direct copy via a helper pod
-      // Simplest: kubectl cp from PG pod to local, then kubectl cp to PVC mount
-      // But that's slow for big files. Better: create a pod that mounts BOTH the PG hostpath and the PVC.
-      // Simplest reliable approach: kubectl cp
-      run(
-        `kubectl cp ${PG_NS}/${PG_POD}:${PG_DUMP_DIR}/${file} ${NS}/xfer-${i}:${LOAD_STAGE}/${file} 2>/dev/null`,
-        { timeout: 600000 },
+      const out = execFileSync(
+        'kubectl',
+        ['--context', K8S_CONTEXT, 'exec', '-i', '-n', PG_NS, PG_POD, '-c', 'postgres',
+         '--', 'psql', '-U', 'postgres', '-d', 'civitai'],
+        { input: retrySql, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
       );
+      console.log(out.split('\n').slice(-12).join('\n'));
+    } catch (e) {
+      warn(`Retry pass returned non-zero — continuing anyway: ${e.message?.slice(0, 200)}`);
     }
-    // Create .done markers (skip for cursor.txt)
-    if (file !== 'cursor.txt') {
-      for (const i of [0, 1]) {
-        execOnMount(`xfer-${i}`, `echo ok > ${LOAD_STAGE}/${file}.done`);
-      }
-    }
-    log(`${file} transferred to both PVCs`);
-  }
 
-  // Verify
-  for (const i of [0, 1]) {
-    const listing = execOnMount(`xfer-${i}`, `ls ${LOAD_STAGE}/`);
-    log(`PVC-${i} load_stage: ${listing.split('\n').length} files`);
-    deleteMount(`xfer-${i}`);
-  }
-}
-
-function step5_load() {
-  heading('Step 5: Run bulk load on both PVCs');
-
-  // Verify pods are down
-  const pods = kubectl(`get pods --no-headers`, { ignoreError: true })
-    .split('\n').filter(l => l.match(/^bitdex-[01]\s/)).length;
-  if (pods > 0) {
-    err('Server pods still running — scale to 0 first');
-    process.exit(1);
-  }
-
-  // Delete any old jobs
-  kubectl('delete job fresh-load-0 fresh-load-1', { ignoreError: true });
-  run('sleep 5');
-
-  // Create load jobs
-  kubectl(`create job fresh-load-0 --from=cronjob/bitdex-bulk-load`);
-  log('Job fresh-load-0 created');
-
-  // Create job for PVC-1
-  const cjJson = run(`kubectl get cronjob -n ${NS} bitdex-bulk-load -o json 2>/dev/null`);
-  const cj = JSON.parse(cjJson);
-  const spec = cj.spec.jobTemplate.spec;
-  for (const v of spec.template.spec.volumes) {
-    if (v.persistentVolumeClaim?.claimName === 'data-bitdex-0')
-      v.persistentVolumeClaim.claimName = 'data-bitdex-1';
-  }
-  for (const c of spec.template.spec.containers) {
-    for (const e of (c.env || [])) {
-      if (e.name === 'BITDEX_REPLICA_ID') e.value = 'bitdex-1';
-    }
-  }
-  const job1 = JSON.stringify({
-    apiVersion: 'batch/v1', kind: 'Job',
-    metadata: { name: 'fresh-load-1', namespace: NS },
-    spec,
-  });
-  run(`echo '${job1.replace(/'/g, "\\'")}' | kubectl apply -f - 2>/dev/null`);
-  log('Job fresh-load-1 created');
-
-  console.log('  Waiting for both jobs to complete (~10 min)...');
-  while (true) {
-    const s0 = kubectl(`get job fresh-load-0 -o jsonpath='{.status.conditions[0].type}'`, { ignoreError: true });
-    const s1 = kubectl(`get job fresh-load-1 -o jsonpath='{.status.conditions[0].type}'`, { ignoreError: true });
-    if (s0.includes('Complete') && s1.includes('Complete')) break;
-    const tail = run(`kubectl logs -n ${NS} job/fresh-load-0 --tail=1 2>/dev/null`, { ignoreError: true });
-    console.log(`  ... ${tail}`);
-    run('sleep 30');
-  }
-  log('Both load jobs complete');
-
-  // Verify collectionIds
-  for (const i of [0, 1]) {
-    mountPvc(`verify-${i}`, i);
-  }
-  run('sleep 8');
-  for (const i of [0, 1]) {
-    const fpacks = execOnMount(`verify-${i}`, `ls ${INDEX_PATH}/bitmaps/filters/collectionIds/ 2>/dev/null | wc -l`);
-    if (parseInt(fpacks) > 0) {
-      log(`PVC-${i}: collectionIds has ${fpacks.trim()} fpack files`);
-    } else {
-      err(`PVC-${i}: collectionIds has 0 fpack files!`);
-    }
-    deleteMount(`verify-${i}`);
-  }
-
-  // Clean up jobs
-  kubectl('delete job fresh-load-0 fresh-load-1', { ignoreError: true });
-}
-
-function step6_cursorReset() {
-  heading('Step 6: Reset cursors on both PVCs');
-
-  // Verify pods are down
-  const pods = kubectl(`get pods --no-headers`, { ignoreError: true })
-    .split('\n').filter(l => l.match(/^bitdex-[01]\s/) && !l.includes('Completed')).length;
-  if (pods > 0) {
-    err(`${pods} server pods still running — scale to 0 first`);
-    kubectl(`scale statefulset/${STS} --replicas=0`);
-    run('sleep 10');
-    kubectl(`delete pod bitdex-0 bitdex-1 --force --grace-period=0`, { ignoreError: true });
-    run('sleep 5');
-  }
-
-  // Read cursor from PVC-0 load_stage
-  for (const i of [0, 1]) {
-    mountPvc(`cr-${i}`, i);
-  }
-  run('sleep 8');
-
-  const cursor = execOnMount('cr-0', `cat ${LOAD_STAGE}/cursor.txt`).trim();
-  if (!cursor || cursor.length < 5) {
-    err(`Invalid cursor: "${cursor}" — expected numeric value from dump`);
-    process.exit(1);
-  }
-  log(`Cursor from dump: ${cursor}`);
-
-  // Write cursor files
-  for (const i of [0, 1]) {
-    execOnMount(`cr-${i}`, `echo -n ${cursor} > ${INDEX_PATH}/bitmaps/cursors/pg-sync-bitdex-${i}`);
-    const verify = execOnMount(`cr-${i}`, `cat ${INDEX_PATH}/bitmaps/cursors/pg-sync-bitdex-${i}`);
-    if (verify.trim() === cursor) {
-      log(`PVC-${i} cursor: ${verify.trim()}`);
-    } else {
-      err(`PVC-${i} cursor mismatch: expected ${cursor}, got ${verify.trim()}`);
+    const finalRemaining = countRemainingTriggers();
+    if (finalRemaining > 4) {
+      err(`${finalRemaining} triggers still remaining after retry — investigate manually`);
+      err('Hot tables (Image, ImageResourceNew, Post, ModelVersion) are common offenders.');
+      err('Try: SELECT pg_blocking_pids(pid), query FROM pg_stat_activity WHERE state=\'active\';');
       process.exit(1);
+    } else if (finalRemaining > 0) {
+      warn(`${finalRemaining} triggers remain — bitdex-sync setup_v2 will reconcile them on boot`);
+    } else {
+      log('All triggers cleared on retry');
     }
-    deleteMount(`cr-${i}`);
-  }
-
-  // Update PG
-  pgExec(`UPDATE bitdex_cursors SET last_outbox_id = ${cursor} WHERE replica_id IN ('pg-sync-bitdex-0', 'pg-sync-bitdex-1');`);
-  log('PG cursors updated');
-}
-
-function step7_start() {
-  heading('Step 7: Start pods + verify');
-
-  kubectl(`scale statefulset/${STS} --replicas=2`);
-  console.log('  Waiting for rollout...');
-  run(`kubectl rollout status statefulset/${STS} -n ${NS} --timeout=300s 2>/dev/null`, { timeout: 310000 });
-  log('Both pods running');
-
-  // Wait for pg-sync to start
-  console.log('  Waiting 20s for pg-sync to boot...');
-  run('sleep 20');
-
-  // Check cursors
-  for (const i of [0, 1]) {
-    const cursor = run(`kubectl logs -n ${NS} bitdex-${i} -c pg-sync 2>/dev/null | grep starting_cursor`, { ignoreError: true });
-    log(`bitdex-${i}: ${cursor.trim()}`);
-  }
-
-  // Wait and check cursor advancement
-  console.log('  Waiting 60s to verify sync is processing...');
-  run('sleep 60');
-
-  for (const i of [0, 1]) {
-    const logs = run(`kubectl logs -n ${NS} bitdex-${i} -c pg-sync --tail=10 2>/dev/null`, { ignoreError: true });
-    const cursorMatch = logs.match(/cursor=(\d+)/g);
-    const lastCursor = cursorMatch ? cursorMatch[cursorMatch.length - 1] : 'unknown';
-    const processed = (logs.match(/processed \d+ changes/g) || []).length;
-    log(`bitdex-${i}: ${lastCursor}, ${processed} batches in last 10 lines`);
+  } else {
+    log('All triggers cleared on first pass');
   }
 }
 
-function step8_resume() {
-  heading('Step 8: Resume Flux + remove safety cursor');
-
-  // Unsuspend Flux
-  run(`kubectl patch kustomization bitdex -n flux-system --type=json -p='[{"op":"replace","path":"/spec/suspend","value":false}]' 2>/dev/null`, { ignoreError: true });
-  log('Flux unsuspended (notify Arabella to remove suspend:true from git)');
-
-  // Remove safety cursor
-  pgExec(`DELETE FROM bitdex_cursors WHERE replica_id = 'safety-hold';`);
-  log('Safety cursor removed from PG');
+function countRemainingTriggers() {
+  try {
+    const out = execFileSync(
+      'kubectl',
+      ['--context', K8S_CONTEXT, 'exec', '-n', PG_NS, PG_POD, '-c', 'postgres',
+       '--', 'psql', '-U', 'postgres', '-d', 'civitai', '-t', '-c',
+       `SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'bitdex_%' AND NOT tgisinternal`],
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    return parseInt(out.trim(), 10) || 0;
+  } catch {
+    return -1;
+  }
 }
 
-function step9_cleanup() {
-  heading('Step 9: Cleanup');
+function step4_wipe() {
+  heading('Step 4: Wipe PVC');
 
-  // Delete dump files from PG pod
-  run(`MSYS_NO_PATHCONV=1 kubectl exec -n ${PG_NS} ${PG_POD} -- rm -rf ${PG_DUMP_DIR} 2>/dev/null`, { ignoreError: true });
-  log('Dump files deleted from PG pod');
+  // Verify pods still down
+  const podCount = kubectl(`get pods --no-headers`, { ignoreError: true })
+    .split('\n')
+    .filter(l => l.match(/^bitdex-0\s/))
+    .length;
+  if (podCount > 0) {
+    err('bitdex-0 still running — must be at 0 replicas');
+    process.exit(1);
+  }
 
-  // Delete any lingering transfer/wipe/verify pods
-  for (const prefix of ['wipe', 'xfer', 'verify', 'cr', 'clean', 'pvc-mount', 'cursor-setter', 'cs', 'bf', 'check', 'config-writer', 'config-fix', 'cursor-reset']) {
-    for (const i of [0, 1, 2, 3]) {
-      kubectl(`delete pod ${prefix}-${i} --force --grace-period=0`, { ignoreError: true });
+  const podName = 'wipe-pvc';
+  const overrides = JSON.stringify({
+    spec: {
+      containers: [{
+        name: 'wipe',
+        image: 'busybox:1.36',
+        command: ['sleep', '600'],
+        volumeMounts: [{ name: 'data', mountPath: '/data' }],
+      }],
+      volumes: [{
+        name: 'data',
+        persistentVolumeClaim: { claimName: 'data-bitdex-0' },
+      }],
+      nodeSelector: { 'kubernetes.io/hostname': NODE },
+    },
+  }).replace(/'/g, "\\'");
+
+  // Cleanup any leftover wipe pod
+  kubectl(`delete pod ${podName} --force --grace-period=0`, { ignoreError: true });
+  run('sleep 3');
+
+  console.log('  Mounting PVC via ephemeral busybox...');
+  kubectl(`run ${podName} --image=busybox:1.36 --overrides='${overrides}' --restart=Never`);
+  run(`kubectl --context ${K8S_CONTEXT} -n ${NS} wait --for=condition=Ready pod/${podName} --timeout=60s`);
+
+  const wipeCmd =
+    `rm -rf ${INDEX_PATH}/bitmaps ${INDEX_PATH}/docs ${INDEX_PATH}/bounds ` +
+    `${INDEX_PATH}/slot_arena.bin ${INDEX_PATH}/snapshot.meta && ` +
+    `rm -rf ${LOAD_STAGE}/* && echo wiped`;
+
+  const out = run(
+    `kubectl --context ${K8S_CONTEXT} -n ${NS} exec ${podName} -- sh -c '${wipeCmd}'`,
+    { timeout: 60000 },
+  );
+  log(`Wipe result: ${out}`);
+
+  const remaining = run(
+    `kubectl --context ${K8S_CONTEXT} -n ${NS} exec ${podName} -- ls ${INDEX_PATH}`,
+    { timeout: 15000, ignoreError: true },
+  );
+  log(`PVC contents: ${remaining.replace(/\n/g, ', ') || '<empty>'}`);
+
+  kubectl(`delete pod ${podName} --force --grace-period=0`, { ignoreError: true });
+}
+
+function step5_start() {
+  heading('Step 5: Scale StatefulSet up — bitdex-sync drives the rest');
+
+  kubectl(`scale statefulset/${STS} --replicas=1`);
+  console.log('  Waiting for pod to schedule (up to 60s)...');
+  run(`kubectl --context ${K8S_CONTEXT} -n ${NS} wait --for=condition=PodScheduled pod/bitdex-0 --timeout=60s`,
+    { ignoreError: true });
+
+  log('Pod scheduled. The pg-sync sidecar will now run autonomously:');
+  log('  1. Wait for bitdex server health');
+  log('  2. setup_v2: install triggers + create BitdexOps/bitdex_cursors');
+  log('  3. Capture pre_dump_cursor from BitdexOps (will be 0 — clean slate)');
+  log('  4. Stream-download CSVs from PG');
+  log('  5. Per-phase: PUT /dumps + POST /dumps/{name}/loaded + poll completion');
+  log('  6. Seed cursor + transition to ops poller');
+  log('');
+  log('Run `node .claude/skills/deploy/reload.mjs monitor` to track progress.');
+}
+
+function step6_monitor() {
+  heading('Step 6: Monitor bulk-load progress');
+
+  console.log('Tailing pg-sync logs (Ctrl-C to detach; load continues regardless)...');
+  console.log('Look for: "All dump phases complete" and "transitioning to steady-state".');
+  console.log('Stats endpoint: GET /api/indexes/civitai/stats — watch alive_count climb.');
+  console.log('Tasks endpoint: GET /api/indexes/civitai/tasks — per-phase progress.');
+  console.log('');
+
+  // Stream logs (this blocks until user interrupts or pod restarts)
+  try {
+    execSync(
+      `kubectl --context ${K8S_CONTEXT} -n ${NS} logs -f bitdex-0 -c pg-sync --tail=200`,
+      { stdio: 'inherit', timeout: 0 },
+    );
+  } catch (e) {
+    // Either Ctrl-C or pod restart — surface the situation
+    if (e.signal === 'SIGINT' || e.code === 'SIGINT') {
+      log('Detached — load continues. Re-run `monitor` to reattach.');
+    } else {
+      warn(`Log stream ended: ${e.message?.slice(0, 200)}`);
     }
   }
-  log('Lingering pods cleaned up');
 }
 
-// =========================================================================
-// ROUTER
-// =========================================================================
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
 
 const step = process.argv[2];
 const steps = {
-  'suspend': step1_suspend,
-  'wipe': step2_wipe,
-  'dump': step3_dump,
-  'transfer': step4_transfer,
-  'load': step5_load,
-  'cursor-reset': step6_cursorReset,
-  'start': step7_start,
-  'resume': step8_resume,
-  'cleanup': step9_cleanup,
+  'preflight': step1_preflight,
+  'suspend': step2_suspend,
+  'nuke-pg': step3_nukePg,
+  'wipe': step4_wipe,
+  'start': step5_start,
+  'monitor': step6_monitor,
 };
 
 if (!step || !steps[step]) {
-  console.log('BitDex Full Reload Script');
+  console.log('BitDex Hard-Nuke Orchestrator (sync-v2 autonomous boot)');
   console.log('');
   console.log('Usage: node .claude/skills/deploy/reload.mjs <step>');
   console.log('');
   console.log('Steps (run in order):');
-  console.log('  1. suspend       — Suspend Flux, scale to 0, set safety cursor');
-  console.log('  2. wipe          — Wipe bitmaps/docs/cursors/CSVs on both PVCs');
-  console.log('  3. dump          — Dump fresh CSVs from PG directly to disk');
-  console.log('  4. transfer      — Copy CSVs from PG pod to both PVCs');
-  console.log('  5. load          — Run bulk load jobs on both PVCs');
-  console.log('  6. cursor-reset  — Write correct cursor to both PVCs + PG');
-  console.log('  7. start         — Scale to 2, verify cursors + sync');
-  console.log('  8. resume        — Unsuspend Flux, remove safety cursor');
-  console.log('  9. cleanup       — Delete dump files, lingering pods');
+  console.log('  1. preflight  — verify shadow OFF, Flux suspended, note image');
+  console.log('  2. suspend    — scale StatefulSet to 0');
+  console.log('  3. nuke-pg    — drop triggers + truncate BitdexOps/bitdex_cursors');
+  console.log('  4. wipe       — wipe bitmaps + docs + load_stage on PVC');
+  console.log('  5. start      — scale up; bitdex-sync auto-runs setup + dump + load');
+  console.log('  6. monitor    — tail pg-sync logs until load completes');
+  console.log('');
+  console.log('Post-flow: docstore compact, smoke tests, re-enable shadow.');
+  console.log('See docs/guide/deploy-nukes.md.');
   process.exit(1);
 }
 
