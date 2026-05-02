@@ -101,6 +101,32 @@ impl FilterField {
     fn mark_dirty(&self, value: u64) {
         self.dirty_values.lock().insert(value);
     }
+    /// True when this field's per-value bitmaps may live on disk and not be
+    /// resident in memory at any moment — i.e. multi_value or per_value_lazy
+    /// fields without `eager_load`. Mirrors the predicate at
+    /// `concurrent_engine.rs` that registers a field in `lazy_value_fields`.
+    /// Used to choose the initial `VersionedBitmap` state for ops that may
+    /// land on a never-loaded value: a lazy field must start `is_loaded=false`
+    /// so the lazy-load fence reads disk truth before queries see the bitmap.
+    #[inline]
+    fn is_lazy_field(&self) -> bool {
+        !self.config.eager_load
+            && (matches!(self.config.field_type, FilterFieldType::MultiValue)
+                || self.config.per_value_lazy)
+    }
+    /// Initial VB state for a value newly entering this field's HashMap via
+    /// an insert path. Lazy fields must seed `new_unloaded` so the lazy-load
+    /// fence still triggers a disk read. Non-lazy fields are fully resident,
+    /// so seeding `new_empty` (is_loaded=true) keeps merge() functional and
+    /// matches the historical contract.
+    #[inline]
+    fn new_inserted_vb(&self) -> VersionedBitmap {
+        if self.is_lazy_field() {
+            VersionedBitmap::new_unloaded()
+        } else {
+            VersionedBitmap::new_empty()
+        }
+    }
     /// Bulk-load bitmaps from a map of (value -> bitmap).
     /// Used during startup to restore Tier 1 filter state from redb.
     /// Each bitmap becomes a VersionedBitmap base (no dirty diff).
@@ -123,10 +149,15 @@ impl FilterField {
         &self.config.field_type
     }
     /// Set a slot's bit in the bitmap for the given value.
+    /// For lazy fields (multi_value or per_value_lazy without eager_load) a
+    /// brand-new HashMap entry is seeded as `new_unloaded` so the lazy-load
+    /// fence still reads disk truth before any query observes the bitmap —
+    /// otherwise the in-memory diff (~1 slot) would shadow the persisted
+    /// bitmap (potentially millions of slots). Symmetric with `remove`.
     pub fn insert(&self, value: u64, slot: u32) {
         let mut w = self.bitmaps.write();
         w.entry(value)
-            .or_insert_with(VersionedBitmap::new_empty)
+            .or_insert_with(|| self.new_inserted_vb())
             .insert(slot);
         drop(w);
         self.mark_dirty(value);
@@ -149,7 +180,7 @@ impl FilterField {
         let mut w = self.bitmaps.write();
         let lock_us = t_lock.elapsed().as_micros();
         let t_entry = std::time::Instant::now();
-        let entry = w.entry(value).or_insert_with(VersionedBitmap::new_empty);
+        let entry = w.entry(value).or_insert_with(|| self.new_inserted_vb());
         let entry_us = t_entry.elapsed().as_micros();
         let t_insert = std::time::Instant::now();
         entry.insert_bulk(slots);
@@ -679,6 +710,16 @@ mod tests {
             field_type: FilterFieldType::MultiValue,
             behaviors: None,
             eviction: None,
+            eager_load: true,
+            per_value_lazy: false, max_range_scan_values: None,
+        }
+    }
+    fn make_lazy_multi_value_config(name: &str) -> FilterFieldConfig {
+        FilterFieldConfig {
+            name: name.to_string(),
+            field_type: FilterFieldType::MultiValue,
+            behaviors: None,
+            eviction: None,
             eager_load: false,
             per_value_lazy: false, max_range_scan_values: None,
         }
@@ -854,5 +895,55 @@ mod tests {
         assert!(gated.contains(10));
         assert!(gated.contains(20));
         assert!(!gated.contains(30)); // Filtered out by alive gate
+    }
+    // Bug #15: insert / insert_bulk on a value not yet in memory must create
+    // an UNLOADED VersionedBitmap. Otherwise the lazy-load fence at
+    // concurrent_engine.rs ensure_fields_loaded sees `vb.is_loaded() == true`
+    // and skips the disk read, so subsequent queries return only the in-memory
+    // diff (~hundreds of slots) instead of the persisted bitmap (millions).
+    // `remove` and `remove_bulk` already use `new_unloaded`; insert paths must
+    // be symmetric.
+    #[test]
+    fn test_insert_creates_unloaded_vb_for_lazy_load_compat() {
+        let field = FilterField::new(make_lazy_multi_value_config("modelVersionIds"));
+        field.insert(290640, 999_999);
+        let vb = field.get_versioned(290640).unwrap();
+        assert!(
+            !vb.is_loaded(),
+            "insert created phantom is_loaded=true VB; lazy-load fence will skip disk read"
+        );
+    }
+    #[test]
+    fn test_insert_bulk_creates_unloaded_vb_for_lazy_load_compat() {
+        let field = FilterField::new(make_lazy_multi_value_config("modelVersionIds"));
+        field.insert_bulk(290640, vec![999_999, 1_000_000]);
+        let vb = field.get_versioned(290640).unwrap();
+        assert!(
+            !vb.is_loaded(),
+            "insert_bulk created phantom is_loaded=true VB; lazy-load fence will skip disk read"
+        );
+    }
+    #[test]
+    fn test_insert_then_remove_symmetric_unloaded() {
+        let a = FilterField::new(make_lazy_multi_value_config("modelVersionIds"));
+        a.insert(42, 1);
+        let b = FilterField::new(make_lazy_multi_value_config("modelVersionIds"));
+        b.remove(42, 1);
+        let va = a.get_versioned(42).unwrap();
+        let vb = b.get_versioned(42).unwrap();
+        assert_eq!(
+            va.is_loaded(), vb.is_loaded(),
+            "insert and remove must produce VBs with matching is_loaded state when value is not in memory"
+        );
+    }
+    #[test]
+    fn test_eager_multi_value_insert_remains_loaded_for_merge() {
+        let field = FilterField::new(make_multi_value_config("tagIds"));
+        field.insert(100, 5);
+        field.merge_all();
+        let bm = field.get(100).unwrap();
+        assert_eq!(bm.len(), 1);
+        assert!(bm.contains(5),
+            "eager multi_value field must produce a loaded VB so merge_all folds the diff into the base");
     }
 }

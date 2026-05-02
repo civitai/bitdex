@@ -150,7 +150,7 @@ node .claude/skills/deploy/reload.mjs monitor       # tail pg-sync logs until lo
 | 1 | `preflight` | Verify shadow OFF, Flux suspended, note current image. Read-only — does not mutate cluster state. |
 | 2 | `suspend` | Scale StatefulSet to 0, force-delete `bitdex-0` pod, verify pod count = 0. |
 | 3 | `nuke-pg` | Run `sql/nuke-pg-state.sql` (pass 1, lock_timeout=5s) + `sql/nuke-pg-state-retry.sql` (pass 2, retry up to 8x) against the PG primary writer. Drops every `bitdex_*` trigger + function, truncates `BitdexOps` + `bitdex_cursors`. |
-| 4 | `wipe` | Mount PVC via ephemeral busybox; `rm -rf` bitmaps/docs/bounds/slot_arena.bin/snapshot.meta + `load_stage/*`. |
+| 4 | `wipe` | Mount PVC via ephemeral busybox; `rm -rf /data/*` (full PVC wipe). The `init-config` init container restores `config.yaml` + `ui-config.yaml` from the configmap and recreates `/data/{indexes/civitai,wal,indexes/civitai/load_stage}` on next pod boot, so the wipe leaves no stale shards, WAL bytes, or unknown future files. |
 | 5 | `start` | `scale --replicas=1`. The bitdex-sync sidecar runs `run_boot_sequence` autonomously: setup_v2 (re-installs triggers from sync config + creates `BitdexOps`/`bitdex_cursors`) → captures pre-dump cursor → streams CSVs from PG → registers each phase via `PUT /dumps` + `POST /dumps/{name}/loaded` → polls completion → seeds cursor → transitions to ops poller. |
 | 6 | `monitor` | `kubectl logs -f bitdex-0 -c pg-sync`. Detach with Ctrl-C; load continues regardless. Re-run `monitor` to reattach. |
 
