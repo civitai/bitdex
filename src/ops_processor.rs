@@ -362,8 +362,6 @@ fn json_to_packed(v: &JsonValue) -> Option<PackedValue> {
 struct PostEnrichment {
     published_at_secs: Option<i64>,
     availability: String,
-    // postedToId is derived from Post.modelVersionId — not directly available
-    // We use post_id itself as postedToId (Post table's ID is the posted-to entity)
 }
 /// ModelVersion enrichment data, keyed by model_version_id.
 struct MvEnrichment {

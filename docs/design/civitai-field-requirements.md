@@ -29,7 +29,7 @@ These fields must have bitmap indexes for query filtering.
 | `baseModel` | string (LCS) | In | Resource enrichment | Only from Checkpoint model types |
 | `modelVersionIds` | int[] | In | resources.csv | **Must be in docstore** (post-query merge filter) |
 | `modelVersionIdsManual` | int[] | In | resources.csv | `detected=false` resources. Can be filter_only |
-| `postedToId` | int | Eq, Or | Post enrichment | Computed: Post.id (the lookup key) |
+| `postedToId` | int | Eq, Or | Post enrichment | `Post.modelVersionId` — the model version this post is attached to (nullable) |
 | `hasMeta` | bool | Eq | Computed | `(flags >> 13) & 1 == 1 && (flags >> 2) & 1 == 0` |
 | `onSite` | bool | Eq | images.csv | |
 | `poi` | bool | Eq, Not | Model enrichment | Person of interest flag |
