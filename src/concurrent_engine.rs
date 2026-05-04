@@ -249,6 +249,14 @@ pub struct ConcurrentEngine {
     case_sensitive_fields: Option<Arc<CaseSensitiveFields>>,
     /// Per-field dictionaries for LowCardinalityString fields.
     dictionaries: Arc<HashMap<String, crate::dictionary::FieldDictionary>>,
+    /// Shared string_maps handle for the flush thread and cache worker.
+    /// Updated by `set_string_maps` so background threads always see the latest.
+    shared_string_maps: Arc<ArcSwap<Option<StringMaps>>>,
+    /// Shared dictionaries handle for the flush thread and cache worker.
+    /// Updated by `set_dictionaries` so background threads see fresh values.
+    /// Wraps `Arc<HashMap<...>>` so the same allocation can be shared with
+    /// `self.dictionaries` without cloning the (non-Clone) `FieldDictionary` values.
+    shared_dictionaries: Arc<ArcSwap<Arc<HashMap<String, crate::dictionary::FieldDictionary>>>>,
     /// Unified cache: primary query result cache. Interior-mutable; callers
     /// invoke methods directly on the `Arc` (no outer `Mutex`/`RwLock`).
     unified_cache: Arc<UnifiedCache>,
@@ -717,6 +725,12 @@ impl ConcurrentEngine {
         };
         let unified_cache = Arc::new(uc);
         unified_cache.set_rebuild_metrics(Arc::clone(&cache_worker_metrics));
+        // Shared string_maps + dictionaries for native FilterClause eval (B2).
+        // Initialized empty; populated by set_string_maps / set_dictionaries.
+        let shared_string_maps: Arc<ArcSwap<Option<StringMaps>>> =
+            Arc::new(ArcSwap::from_pointee(None));
+        let shared_dictionaries: Arc<ArcSwap<Arc<HashMap<String, crate::dictionary::FieldDictionary>>>> =
+            Arc::new(ArcSwap::from_pointee(Arc::new(HashMap::new())));
         let loading_mode = Arc::new(AtomicBool::new(false));
         // S3.3: Instantiate TimeBucketManager from top-level time_buckets config
         let time_buckets = config.time_buckets.as_ref().map(|tb_config| {
@@ -1078,6 +1092,8 @@ impl ConcurrentEngine {
                 string_maps: None,
                 case_sensitive_fields: None,
                 dictionaries: Arc::new(HashMap::new()),
+                shared_string_maps: Arc::new(ArcSwap::from_pointee(None)),
+                shared_dictionaries: Arc::new(ArcSwap::from_pointee(Arc::new(HashMap::new()))),
                 unified_cache,
                 bound_store,
                 flush_publish_count,
@@ -1181,6 +1197,11 @@ impl ConcurrentEngine {
             let flush_mem_cache = Arc::clone(&bitmap_memory_cache);
             let flush_cache_work_tx = cache_work_tx.clone();
             let flush_cache_worker_metrics = Arc::clone(&cache_worker_metrics);
+            // Shared string_maps + dictionaries for native FilterClause eval (B2).
+            // Updated by set_string_maps/set_dictionaries via ArcSwap so the flush
+            // thread always sees the latest without holding a lock.
+            let flush_shared_string_maps: Arc<ArcSwap<Option<StringMaps>>> = Arc::clone(&shared_string_maps);
+            let flush_shared_dictionaries: Arc<ArcSwap<Arc<HashMap<String, crate::dictionary::FieldDictionary>>>> = Arc::clone(&shared_dictionaries);
             thread::Builder::new()
                 .name("bitdex-flush".to_string())
                 .spawn(move || {
@@ -1688,16 +1709,35 @@ impl ConcurrentEngine {
                                 .as_ref()
                                 .map(|arc| arc.load_full());
                             let tb_ref = tb_guard.as_deref();
+                            // Load string_maps + dictionaries for native FilterClause eval.
+                            let sm_guard = flush_shared_string_maps.load_full();
+                            let sm_ref = (*sm_guard).as_ref();
+                            let dict_guard = flush_shared_dictionaries.load_full();
+                            let dict_inner = Arc::clone(&*dict_guard);
+                            let dict_ref: &HashMap<String, crate::dictionary::FieldDictionary> = &*dict_inner;
+                            let flush_string_misses = std::sync::atomic::AtomicU64::new(0);
                             let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
-                                evaluate_filter_work(&filter_work, &staging.filters, &staging.sorts, deadline, tb_ref)
+                                evaluate_filter_work(
+                                    &filter_work, &staging.filters, &staging.sorts, deadline, tb_ref,
+                                    sm_ref, Some(dict_ref), &flush_string_misses,
+                                )
                             } else {
                                 (Vec::new(), Vec::new())
                             };
                             let (sort_results, sort_timed_out) = if !sort_work.is_empty() {
-                                evaluate_sort_work(&sort_work, &staging.filters, &staging.sorts, deadline, tb_ref)
+                                evaluate_sort_work(
+                                    &sort_work, &staging.filters, &staging.sorts, deadline, tb_ref,
+                                    sm_ref, Some(dict_ref), &flush_string_misses,
+                                )
                             } else {
                                 (Vec::new(), Vec::new())
                             };
+                            let flush_misses = flush_string_misses.load(Ordering::Relaxed);
+                            if flush_misses > 0 {
+                                flush_cache_worker_metrics
+                                    .string_lookup_misses_total
+                                    .fetch_add(flush_misses, Ordering::Relaxed);
+                            }
                             let phase_b_ns = t_phase_b.elapsed().as_nanos() as u64;
                             let ct_filter_results = filter_results.len();
                             let ct_sort_results = sort_results.len();
@@ -3398,6 +3438,8 @@ impl ConcurrentEngine {
                 },
                 Arc::clone(&cache_worker_metrics),
                 Arc::clone(&shutdown),
+                Arc::clone(&shared_string_maps),
+                Arc::clone(&shared_dictionaries),
             );
             // Attach time buckets so the async worker evaluates bucket clauses
             // correctly (bitmap.contains) rather than always returning true.
@@ -3445,6 +3487,8 @@ impl ConcurrentEngine {
             string_maps: None,
             case_sensitive_fields: None,
             dictionaries: Arc::new(HashMap::new()),
+            shared_string_maps: Arc::new(ArcSwap::from_pointee(None)),
+            shared_dictionaries: Arc::new(ArcSwap::from_pointee(Arc::new(HashMap::new()))),
             unified_cache,
             bound_store,
             flush_publish_count,
@@ -3544,6 +3588,7 @@ impl ConcurrentEngine {
     /// Set the string maps for MappedString field query resolution.
     /// Call after creating the engine with schema data that includes string_map entries.
     pub fn set_string_maps(&mut self, maps: StringMaps) {
+        self.shared_string_maps.store(Arc::new(Some(maps.clone())));
         self.string_maps = Some(Arc::new(maps));
     }
     /// Set the case-sensitive fields for string matching control.
@@ -3617,7 +3662,10 @@ impl ConcurrentEngine {
     }
     /// Set the per-field dictionaries for LowCardinalityString fields.
     pub fn set_dictionaries(&mut self, dicts: HashMap<String, crate::dictionary::FieldDictionary>) {
-        self.dictionaries = Arc::new(dicts);
+        let arc = Arc::new(dicts);
+        // Share the same Arc<HashMap> with background threads via ArcSwap.
+        self.shared_dictionaries.store(Arc::new(Arc::clone(&arc)));
+        self.dictionaries = arc;
     }
     /// Get a reference to the dictionaries (for loader and upsert paths).
     pub fn dictionaries(&self) -> &HashMap<String, crate::dictionary::FieldDictionary> {

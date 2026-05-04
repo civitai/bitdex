@@ -105,22 +105,22 @@ Zero correctness risk. Standalone-mergeable.
 ### B2 — Commit 3. Native per-slot `FilterClause` eval (the actual correctness fix)
 **Reviewer-flagged GAP — `slot_matches_clause` has no access to StringMaps/FieldDictionary today. Must thread.**
 
-- [ ] New `slot_matches_filter_native(slot, &[FilterClause], &FilterIndex, &SortIndex, Option<&TimeBucketManager>, Option<&PrefilterRegistry>, Option<&StringMaps>, Option<&HashMap<String, FieldDictionary>>) -> bool`.
-- [ ] Per-clause:
-  - [ ] `Eq/In/NotEq/NotIn`: resolve value→key via `string_maps`+`dictionaries` mirror of `executor.rs:121`. Then `FilterField::get_versioned(key).contains(slot)`. If unresolvable → bump `cache_maint_string_lookup_miss_total`, return false.
-  - [ ] `Gt/Gte/Lt/Lte`: `sort_field.reconstruct_value(slot)` then compare.
-  - [ ] `Not(inner)`: `!slot_matches(inner)`.
-  - [ ] `And(parts)`: all-match short-circuit.
-  - [ ] `Or(parts)`: any-match short-circuit.
-  - [ ] `IsNull/IsNotNull`: `NULL_BITMAP_KEY` contains check (with negate for IsNotNull).
-  - [ ] `BucketBitmap`: direct `bitmap.as_ref().contains(slot)` from the Arc on the clause.
-- [ ] Default fall-through → **false** (loud failure, not silent admit).
-- [ ] Replace all `slot_matches_filter(...CanonicalClause...)` call sites in:
-  - [ ] `evaluate_filter_work` (~line 2263) — use `Arc<Vec<FilterClause>>` from work item.
-  - [ ] `evaluate_sort_work` (parity site).
-  - [ ] `maintain_bucket_changes` (line 1982) — also fixes its TODO at line 2019.
+- [x] New `slot_matches_filter_native(slot, &[FilterClause], &FilterIndex, &SortIndex, Option<&TimeBucketManager>, Option<&PrefilterRegistry>, Option<&StringMaps>, Option<&HashMap<String, FieldDictionary>>) -> bool`.
+- [x] Per-clause:
+  - [x] `Eq/In/NotEq/NotIn`: resolve value→key via `string_maps`+`dictionaries` mirror of `executor.rs:121`. Then `FilterField::get_versioned(key).contains(slot)`. If unresolvable → bump `cache_maint_string_lookup_miss_total`, return false.
+  - [x] `Gt/Gte/Lt/Lte`: `sort_field.reconstruct_value(slot)` then compare.
+  - [x] `Not(inner)`: `!slot_matches(inner)`.
+  - [x] `And(parts)`: all-match short-circuit.
+  - [x] `Or(parts)`: any-match short-circuit.
+  - [x] `IsNull/IsNotNull`: `NULL_BITMAP_KEY` contains check (with negate for IsNotNull).
+  - [x] `BucketBitmap`: direct `bitmap.as_ref().contains(slot)` from the Arc on the clause.
+- [x] Default fall-through → **false** (loud failure, not silent admit).
+- [x] Replace all `slot_matches_filter(...CanonicalClause...)` call sites in:
+  - [x] `evaluate_filter_work` (~line 2263) — use `Arc<Vec<FilterClause>>` from work item.
+  - [x] `evaluate_sort_work` (parity site).
+  - [x] `maintain_bucket_changes` (line 1982) — also fixes its TODO at line 2019.
   - [ ] Old sync `maintain_filter_changes` (line 1479) — see B7.
-- [ ] Thread `string_maps` + `dictionaries` from snapshot through `cache_worker.rs:438` and `concurrent_engine.rs:1692` call sites.
+- [x] Thread `string_maps` + `dictionaries` from snapshot through `cache_worker.rs:438` and `concurrent_engine.rs:1692` call sites.
 
 ### B3 — Commit 5. Cheap-clause-first ordering
 - [ ] At `form_and_store`, sort `original_filter_clauses` by atom-cost ascending. Cost classes:

@@ -2148,10 +2148,15 @@ impl UnifiedCache {
         added_slots: &RoaringBitmap,
         filters: &FilterIndex,
         sorts: &SortIndex,
+        string_maps: Option<&crate::executor::StringMaps>,
+        dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
     ) {
         if dropped_slots.is_empty() && added_slots.is_empty() {
             return;
         }
+        // Reusable misses counter: we don't bump external metrics here since this
+        // path is called from the flush thread (no metrics handle available).
+        let _misses = std::sync::atomic::AtomicU64::new(0);
         for mut r in self.entries.iter_mut() {
             let key = r.key().clone();
             let entry = r.value_mut();
@@ -2175,19 +2180,39 @@ impl UnifiedCache {
                 }
             }
             if !added_slots.is_empty() {
+                let original = Arc::clone(entry.original_filter_clauses());
+                let use_native = !original.is_empty();
+                let misses = std::sync::atomic::AtomicU64::new(0);
                 for slot in added_slots.iter() {
-                    // Check all OTHER clauses (we already know bucket matches)
-                    // TODO: pass bucket_mgr through here so multi-bucket-clause entries
-                    // (e.g. AND(Bucket=24h, Bucket=7d)) evaluate correctly. UI doesn't
-                    // emit these today, but a future caller could. Conservative true
-                    // admits invalid slots into the cache entry on rebuild.
-                    let other_clauses_match = key.filter_clauses.iter().all(|c| {
-                        if c.field == field && c.op == "bucket" && c.value_repr == bucket_name {
-                            true
-                        } else {
-                            slot_matches_clause(slot, c, filters, sorts, None)
-                        }
-                    });
+                    let other_clauses_match = if use_native {
+                        // B2 native path: evaluate non-bucket clauses via the
+                        // original FilterClause tree (handles Not/And/Or correctly).
+                        // We still skip the matching bucket clause itself since the
+                        // caller guarantees the slot is in the new bucket bitmap.
+                        let non_bucket: Vec<&FilterClause> = original
+                            .iter()
+                            .filter(|c| !matches!(c,
+                                FilterClause::BucketBitmap { field: f, bucket_name: bn, .. }
+                                if f == field && bn == bucket_name))
+                            .collect();
+                        non_bucket.iter().all(|c| {
+                            slot_matches_clause_native(
+                                slot, c, filters, sorts,
+                                None, // no bucket_mgr: bucket clause already excluded above
+                                string_maps, dictionaries,
+                                &misses,
+                            )
+                        })
+                    } else {
+                        // Legacy canonical path.
+                        key.filter_clauses.iter().all(|c| {
+                            if c.field == field && c.op == "bucket" && c.value_repr == bucket_name {
+                                true
+                            } else {
+                                slot_matches_clause(slot, c, filters, sorts, None)
+                            }
+                        })
+                    };
                     if !other_clauses_match {
                         continue;
                     }
@@ -2411,6 +2436,227 @@ fn slot_matches_filter_resolved(
     })
 }
 
+// ── Native FilterClause Evaluator (B2) ───────────────────────────────────
+//
+// Evaluates the original `FilterClause` tree directly, threading StringMaps
+// and FieldDictionary so string-typed values (e.g. `In(baseModel, ["SD 3"])`)
+// resolve correctly.  Replaces the conservative-true canonical-only path for
+// compound clauses (Not/And/Or).  Default arm → `false` (loud failure, not
+// silent admit).
+
+/// Resolve a `Value` to a bitmap key, mirroring `executor.rs::resolve_value_key`.
+///
+/// - Integer / Bool: direct conversion, no map lookup needed.
+/// - String: try `string_maps[field]` first, then `dictionaries[field]`.
+/// - Float: not supported as a filter key → returns `None`.
+/// - If resolution fails → caller must bump `cache_maint_string_lookup_miss_total`.
+fn resolve_filter_value(
+    field: &str,
+    val: &crate::query::Value,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+) -> Option<u64> {
+    use crate::query::Value;
+    match val {
+        Value::Bool(b) => Some(if *b { 1 } else { 0 }),
+        Value::Integer(v) => Some(*v as u64),
+        Value::Float(_) => None,
+        Value::String(s) => {
+            // Try string_maps reverse lookup (case-insensitive: lowercase).
+            if let Some(maps) = string_maps {
+                if let Some(field_map) = maps.get(field) {
+                    let lower = s.to_lowercase();
+                    if let Some(&v) = field_map.get(lower.as_str()) {
+                        return Some(v as u64);
+                    }
+                    // Fall through to dictionary check even if field_map exists
+                    // but doesn't have this value — it may be newer than the snapshot.
+                }
+            }
+            // Fallback: live dictionary for LowCardinalityString fields.
+            if let Some(dicts) = dictionaries {
+                if let Some(dict) = dicts.get(field) {
+                    return dict.get(s).map(|v| v as u64);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Evaluate whether `slot` matches ALL clauses in a `FilterClause` slice.
+///
+/// AND-conjunction across the top-level clauses. Inner compound clauses are
+/// recursively evaluated via `slot_matches_clause_native`.
+///
+/// `string_maps` / `dictionaries` are required for correct evaluation of
+/// string-typed `In`/`Eq` fields (e.g. `baseModel`).  If neither is
+/// available the evaluator falls back to `false` on every string-key miss
+/// (safe: cache stays clean, no phantom admits).
+pub fn slot_matches_filter_native(
+    slot: u32,
+    clauses: &[FilterClause],
+    filters: &FilterIndex,
+    sorts: &SortIndex,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+    string_lookup_misses: &std::sync::atomic::AtomicU64,
+) -> bool {
+    clauses.iter().all(|clause| {
+        slot_matches_clause_native(slot, clause, filters, sorts, bucket_mgr, string_maps, dictionaries, string_lookup_misses)
+    })
+}
+
+/// Evaluate a single `FilterClause` against `slot`.  Default arm → `false`.
+fn slot_matches_clause_native(
+    slot: u32,
+    clause: &FilterClause,
+    filters: &FilterIndex,
+    sorts: &SortIndex,
+    bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+    string_lookup_misses: &std::sync::atomic::AtomicU64,
+) -> bool {
+    // Shorthand for recursive calls.
+    macro_rules! eval {
+        ($c:expr) => {
+            slot_matches_clause_native(slot, $c, filters, sorts, bucket_mgr, string_maps, dictionaries, string_lookup_misses)
+        };
+    }
+    match clause {
+        FilterClause::Eq(field, val) => {
+            let key = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => {
+                    string_lookup_misses.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            };
+            filters
+                .get_field(field)
+                .and_then(|f| f.get_versioned(key))
+                .map(|vb| vb.contains(slot))
+                .unwrap_or(false)
+        }
+        FilterClause::NotEq(field, val) => {
+            let key = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => {
+                    string_lookup_misses.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            };
+            let contained = filters
+                .get_field(field)
+                .and_then(|f| f.get_versioned(key))
+                .map(|vb| vb.contains(slot))
+                .unwrap_or(false);
+            !contained
+        }
+        FilterClause::In(field, vals) => {
+            vals.iter().any(|val| {
+                match resolve_filter_value(field, val, string_maps, dictionaries) {
+                    Some(key) => filters
+                        .get_field(field)
+                        .and_then(|f| f.get_versioned(key))
+                        .map(|vb| vb.contains(slot))
+                        .unwrap_or(false),
+                    None => {
+                        string_lookup_misses.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }
+                }
+            })
+        }
+        FilterClause::NotIn(field, vals) => {
+            vals.iter().all(|val| {
+                match resolve_filter_value(field, val, string_maps, dictionaries) {
+                    Some(key) => {
+                        let contained = filters
+                            .get_field(field)
+                            .and_then(|f| f.get_versioned(key))
+                            .map(|vb| vb.contains(slot))
+                            .unwrap_or(false);
+                        !contained
+                    }
+                    None => {
+                        string_lookup_misses.fetch_add(1, Ordering::Relaxed);
+                        // Can't resolve: can't confirm the slot IS in the excluded set.
+                        // Conservative: treat as "not contained" (slot passes).
+                        true
+                    }
+                }
+            })
+        }
+        FilterClause::Gt(field, val) => {
+            let threshold = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => return false,
+            };
+            sorts
+                .get_field(field)
+                .map(|f| f.reconstruct_value(slot) as u64 > threshold)
+                .unwrap_or(false)
+        }
+        FilterClause::Gte(field, val) => {
+            let threshold = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => return false,
+            };
+            sorts
+                .get_field(field)
+                .map(|f| f.reconstruct_value(slot) as u64 >= threshold)
+                .unwrap_or(false)
+        }
+        FilterClause::Lt(field, val) => {
+            let threshold = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => return false,
+            };
+            sorts
+                .get_field(field)
+                .map(|f| (f.reconstruct_value(slot) as u64) < threshold)
+                .unwrap_or(false)
+        }
+        FilterClause::Lte(field, val) => {
+            let threshold = match resolve_filter_value(field, val, string_maps, dictionaries) {
+                Some(k) => k,
+                None => return false,
+            };
+            sorts
+                .get_field(field)
+                .map(|f| f.reconstruct_value(slot) as u64 <= threshold)
+                .unwrap_or(false)
+        }
+        FilterClause::Not(inner) => !eval!(inner),
+        FilterClause::And(parts) => parts.iter().all(|c| eval!(c)),
+        FilterClause::Or(parts) => parts.iter().any(|c| eval!(c)),
+        FilterClause::IsNull(field) => {
+            filters
+                .get_field(field)
+                .and_then(|f| f.get_versioned(crate::filter::NULL_BITMAP_KEY))
+                .map(|vb| vb.contains(slot))
+                .unwrap_or(false)
+        }
+        FilterClause::IsNotNull(field) => {
+            let is_null = filters
+                .get_field(field)
+                .and_then(|f| f.get_versioned(crate::filter::NULL_BITMAP_KEY))
+                .map(|vb| vb.contains(slot))
+                .unwrap_or(false);
+            !is_null
+        }
+        FilterClause::BucketBitmap { bitmap, .. } => {
+            // The Arc<RoaringBitmap> is carried directly on the clause — no
+            // manager lookup needed.  Authoritative for this slot because the
+            // flush thread updates bucket bitmaps before enqueuing maintenance.
+            bitmap.contains(slot)
+        }
+    }
+}
+
 // ── Phase B: Lock-Free Evaluation Functions ──────────────────────────────
 //
 // These functions evaluate slot eligibility against staging filters/sorts
@@ -2421,12 +2667,21 @@ fn slot_matches_filter_resolved(
 /// Checks each slot against the filter predicate and sort qualification.
 /// Returns results to apply under a brief lock, plus any keys that exceeded
 /// the time-based deadline (to be marked for rebuild).
+///
+/// When `item.original_filter_clauses` is non-empty (set by B1 plumbing),
+/// uses `slot_matches_filter_native` which threads `string_maps` +
+/// `dictionaries` and evaluates compound clauses (Not/And/Or) correctly.
+/// Falls back to the canonical-only `slot_matches_filter` path when clauses
+/// are empty (legacy `form_and_store` callers, test paths).
 pub fn evaluate_filter_work(
     work: &[CacheMaintenanceItem],
     filters: &FilterIndex,
     sorts: &SortIndex,
     deadline: Option<Instant>,
     bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+    string_lookup_misses: &std::sync::atomic::AtomicU64,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Inverted evaluation: reconstruct_value is identical across entries for
     // the same (sort_field, slot), so we precompute it ONCE per unique pair
@@ -2447,11 +2702,14 @@ pub fn evaluate_filter_work(
                 break;
             }
         }
-        // Hoist bucket-clause bitmap lookups out of the per-slot loop.
-        // At 10K slots/batch this eliminates 10K identical HashMap lookups
-        // for the same bucket name — replaced by one lookup per bucket clause
-        // per work item. Result: ~150ns × 10K = ~1.5ms saved per batch.
-        let resolved_buckets = resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr);
+        let use_native = !item.original_filter_clauses.is_empty();
+        // For the canonical path: hoist bucket-clause bitmap lookups out of the
+        // per-slot loop (one HashMap lookup per bucket clause per work item).
+        let resolved_buckets = if !use_native {
+            resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr)
+        } else {
+            Vec::new()
+        };
         let use_resolved = !resolved_buckets.is_empty();
         let mut adds = Vec::new();
         let mut removes = Vec::new();
@@ -2460,7 +2718,19 @@ pub fn evaluate_filter_work(
                 .get(&(item.key.sort_field.as_str(), slot))
                 .copied()
                 .unwrap_or(0);
-            let matches = if use_resolved {
+            let matches = if use_native {
+                // B2 native path: evaluates compound clauses with StringMaps.
+                slot_matches_filter_native(
+                    slot,
+                    &item.original_filter_clauses,
+                    filters,
+                    sorts,
+                    bucket_mgr,
+                    string_maps,
+                    dictionaries,
+                    string_lookup_misses,
+                )
+            } else if use_resolved {
                 slot_matches_filter_resolved(
                     slot,
                     &item.key.filter_clauses,
@@ -2517,6 +2787,9 @@ pub fn evaluate_sort_work(
     sorts: &SortIndex,
     deadline: Option<Instant>,
     bucket_mgr: Option<&crate::time_buckets::TimeBucketManager>,
+    string_maps: Option<&crate::executor::StringMaps>,
+    dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
+    string_lookup_misses: &std::sync::atomic::AtomicU64,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Preamble: reconstruct_value once per unique (sort_field, slot).
     let reconstructed = precompute_sort_values(work, sorts);
@@ -2560,10 +2833,14 @@ pub fn evaluate_sort_work(
         if !can_possibly_qualify {
             continue;
         }
-        // Hoist bucket-clause bitmap lookups out of the per-slot loop.
-        // Same optimisation as in evaluate_filter_work — one HashMap lookup
-        // per bucket clause per item instead of one per slot.
-        let resolved_buckets = resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr);
+        let use_native = !item.original_filter_clauses.is_empty();
+        // For the canonical path: hoist bucket-clause bitmap lookups out of
+        // the per-slot loop — one HashMap lookup per bucket clause per item.
+        let resolved_buckets = if !use_native {
+            resolve_bucket_bitmaps(&item.key.filter_clauses, bucket_mgr)
+        } else {
+            Vec::new()
+        };
         let use_resolved = !resolved_buckets.is_empty();
         let mut adds = Vec::new();
         for &slot in &item.slots {
@@ -2579,10 +2856,19 @@ pub fn evaluate_sort_work(
             if !qualifies {
                 continue;
             }
-            // Sort qualifies — only now pay filter match cost. Preserves the
-            // full slot_matches_filter semantics (Eq, NotEq, In, Gt, Lt,
-            // bucket, compound) — no signature-based shortcut.
-            let filter_matches = if use_resolved {
+            // Sort qualifies — only now pay filter match cost.
+            let filter_matches = if use_native {
+                slot_matches_filter_native(
+                    slot,
+                    &item.original_filter_clauses,
+                    filters,
+                    sorts,
+                    bucket_mgr,
+                    string_maps,
+                    dictionaries,
+                    string_lookup_misses,
+                )
+            } else if use_resolved {
                 slot_matches_filter_resolved(
                     slot,
                     &item.key.filter_clauses,
@@ -2749,6 +3035,13 @@ mod tests {
             cache.form_and_store(key, &slots, true, 100_000, |s| s);
         }
         assert_eq!(cache.len(), 5);
+        // Force entry 0 to timestamp=0 so it is unambiguously the LRU
+        // regardless of how fast the test loop runs (sampled-LRU is random
+        // when all timestamps are equal, making the test flaky otherwise).
+        let key0 = make_key(&[("field", "eq", "0")], "sort", SortDirection::Desc);
+        if let Some(mut e) = cache.get_mut(&key0) {
+            e.last_used.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         // Touch entries 1-4 to make entry 0 the LRU
         for i in 1..5 {
             let key = make_key(
@@ -3444,7 +3737,7 @@ mod tests {
         dropped.insert(2);
         let filters = make_filter_index(&[("nsfwLevel", &[(1, &[])])]);
         let sorts = make_sort_index(&[("reactionCount", &[])]);
-        cache.maintain_bucket_changes("sortAt", "7d", &dropped, &RoaringBitmap::new(), &filters, &sorts);
+        cache.maintain_bucket_changes("sortAt", "7d", &dropped, &RoaringBitmap::new(), &filters, &sorts, None, None);
         let entry = cache.get(&key).unwrap();
         assert_eq!(entry.cardinality(), 7);
         assert!(!entry.bitmap().contains(0));
@@ -3479,7 +3772,7 @@ mod tests {
         added.insert(100);
         let filters = make_filter_index(&[("nsfwLevel", &[(1, &[100])])]);
         let sorts = make_sort_index(&[("reactionCount", &[(100, 1500)])]);
-        cache.maintain_bucket_changes("sortAt", "7d", &RoaringBitmap::new(), &added, &filters, &sorts);
+        cache.maintain_bucket_changes("sortAt", "7d", &RoaringBitmap::new(), &added, &filters, &sorts, None, None);
         assert!(cache.get(&key).unwrap().bitmap().contains(100));
     }
     #[test]
@@ -3809,7 +4102,8 @@ mod tests {
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].key, key);
         // Phase B: evaluate outside lock
-        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None, None);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m);
         assert!(timed_out.is_empty());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
@@ -3834,7 +4128,8 @@ mod tests {
             vec![3],
         );
         let (work, _) = cache.collect_filter_work(&HashMap::new(), &removes);
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m);
         cache.apply_maintenance_results(&results);
         let entry = cache.get(&key).unwrap();
         assert!(!entry.bitmap().contains(3), "Slot 3 should be removed via two-phase maintenance");
@@ -3853,7 +4148,8 @@ mod tests {
         sort_mutations.insert("reactionCount", [10].into_iter().collect());
         let (work, _) = cache.collect_sort_work(&sort_mutations);
         assert_eq!(work.len(), 1);
-        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None, None, None, &_m);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
         assert_eq!(results[0].adds[0].0, 10);
@@ -3910,7 +4206,8 @@ mod tests {
         let mut cache_two = UnifiedCache::new(config);
         cache_two.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         let (work, _) = cache_two.collect_filter_work(&inserts, &HashMap::new());
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None);
+        let _m = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m);
         cache_two.apply_maintenance_results(&results);
         let two_has_10 = cache_two.get(&key).unwrap().bitmap().contains(10);
         assert_eq!(single_has_10, two_has_10, "Two-phase should produce same result as single-phase");
@@ -4181,12 +4478,14 @@ mod tests {
         assert!(!filter_work.is_empty(), "should have work for the bucket entry");
 
         // Phase B: evaluate with the bucket manager. slot 3 must be rejected.
+        let _m = std::sync::atomic::AtomicU64::new(0);
         let (results, timed_out) = evaluate_filter_work(
             &filter_work,
             &filters,
             &sorts,
             None,
             Some(&mgr),
+            None, None, &_m,
         );
         assert!(timed_out.is_empty());
 
@@ -4276,12 +4575,14 @@ mod tests {
         );
 
         let (filter_work, _) = cache.collect_filter_work(&inserts, &HashMap::new());
+        let _m = std::sync::atomic::AtomicU64::new(0);
         let (results, _) = evaluate_filter_work(
             &filter_work,
             &filters,
             &sorts,
             None,
             Some(&mgr),
+            None, None, &_m,
         );
         cache.apply_maintenance_results(&results);
 
@@ -4411,12 +4712,14 @@ mod tests {
         let (sort_work, _over_budget) = cache.collect_sort_work(&sort_mutations);
         // The cache entry has filter_clauses so it may appear in sort_work.
         // evaluate_sort_work must reject slot 7 because it fails the bucket clause.
+        let _m = std::sync::atomic::AtomicU64::new(0);
         let (results, timed_out) = evaluate_sort_work(
             &sort_work,
             &filters,
             &sorts,
             None,
             Some(&mgr),
+            None, None, &_m,
         );
         assert!(timed_out.is_empty());
         cache.apply_maintenance_results(&results);
@@ -4563,5 +4866,180 @@ mod tests {
         cache.apply_maintenance_results(&results);
         let after = cache.stats().updates;
         assert!(after > before, "updates counter must increment after apply_maintenance_results with non-empty adds");
+    }
+
+    // ── B2 tests: native FilterClause evaluator ────────────────────────────
+
+    /// Helper: build a string_maps lookup for one field.
+    fn make_string_maps(field: &str, entries: &[(&str, i64)]) -> crate::executor::StringMaps {
+        let mut maps: crate::executor::StringMaps = HashMap::new();
+        let mut field_map = HashMap::new();
+        for (s, v) in entries {
+            field_map.insert(s.to_string(), *v);
+        }
+        maps.insert(field.to_string(), field_map);
+        maps
+    }
+
+    #[test]
+    fn test_slot_matches_filter_native_string_in() {
+        // Build a filter index with baseModel as a single-value field.
+        // Key 1 = "SD 1.5" (via string_maps), key 2 = "SDXL".
+        let filters = make_filter_index(&[
+            ("baseModel", &[(1, &[5u32]), (2, &[6u32])]),
+        ]);
+        let sorts = make_sort_index(&[]);
+        let string_maps = make_string_maps("baseModel", &[("sd 1.5", 1), ("sdxl", 2)]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let clauses = vec![FilterClause::In(
+            "baseModel".to_string(),
+            vec![crate::query::Value::String("SD 1.5".to_string())],
+        )];
+        // Slot 5 has baseModel key=1 ("SD 1.5") → should match.
+        assert!(
+            slot_matches_filter_native(5, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 5 should match In(baseModel, ['SD 1.5'])"
+        );
+        // Slot 6 has baseModel key=2 ("SDXL") → should NOT match.
+        assert!(
+            !slot_matches_filter_native(6, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 6 should not match In(baseModel, ['SD 1.5'])"
+        );
+        // No misses — all strings resolved.
+        assert_eq!(misses.load(Ordering::Relaxed), 0, "no string lookup misses expected");
+    }
+
+    #[test]
+    fn test_slot_matches_filter_native_compound_not_and() {
+        // Clause: Not(And(In(nsfwLevel, [4]), In(baseModel, ["SD XL"])))
+        // nsfwLevel key 4 in bitmap for slots [10, 20]; baseModel key 1 ("SD XL") for slot 20 only.
+        let filters = make_filter_index(&[
+            ("nsfwLevel", &[(4, &[10u32, 20u32])]),
+            ("baseModel",  &[(1, &[20u32])]),
+        ]);
+        let sorts = make_sort_index(&[]);
+        let string_maps = make_string_maps("baseModel", &[("sd xl", 1)]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let clause = FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("nsfwLevel".to_string(), vec![crate::query::Value::Integer(4)]),
+            FilterClause::In("baseModel".to_string(), vec![crate::query::Value::String("SD XL".to_string())]),
+        ])));
+        let clauses = vec![clause];
+        // Slot 10: nsfwLevel=4 ✓, baseModel≠"SD XL" ✗ → And=false → Not=true.
+        assert!(
+            slot_matches_filter_native(10, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 10: Not(And(true,false)) should be true"
+        );
+        // Slot 20: nsfwLevel=4 ✓, baseModel="SD XL" ✓ → And=true → Not=false.
+        assert!(
+            !slot_matches_filter_native(20, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 20: Not(And(true,true)) should be false"
+        );
+        // Slot 99: nsfwLevel≠4, baseModel missing → And=false → Not=true.
+        assert!(
+            slot_matches_filter_native(99, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "slot 99: Not(And(false,?)) should be true"
+        );
+    }
+
+    #[test]
+    fn test_slot_matches_filter_native_default_is_false() {
+        // String key that doesn't exist in string_maps → resolution fails → returns false.
+        let filters = make_filter_index(&[("baseModel", &[(1, &[5u32])])]);
+        let sorts = make_sort_index(&[]);
+        let string_maps = make_string_maps("baseModel", &[("sd 1.5", 1)]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let clauses = vec![FilterClause::In(
+            "baseModel".to_string(),
+            vec![crate::query::Value::String("does-not-exist".to_string())],
+        )];
+        // Even though slot 5 is in the field, the value doesn't resolve → false (not true).
+        assert!(
+            !slot_matches_filter_native(5, &clauses, &filters, &sorts, None, Some(&string_maps), None, &misses),
+            "unresolvable string key must return false, not true"
+        );
+        // Miss should be counted.
+        assert!(misses.load(Ordering::Relaxed) > 0, "string lookup miss must be recorded");
+    }
+
+    #[test]
+    fn test_evaluate_filter_work_uses_native_path() {
+        // Build cache entry via form_and_store_with_clauses with a compound clause.
+        // The compound clause is Not(And(In(nsfwLevel,[4]), In(nsfwLevel,[4]))).
+        // This is always false for slot 42 (nsfwLevel=4). The canonical path
+        // returns conservative true; the native path returns false → removes slot 42.
+        let cache = UnifiedCache::new(make_config());
+        let native_clauses = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("nsfwLevel".to_string(), vec![crate::query::Value::Integer(4)]),
+        ])))];
+        let key = make_key(&[("nsfwLevel", "neq", "4")], "reactionCount", SortDirection::Desc);
+        // Slot 42 is in the cache (initial formation included it).
+        cache.form_and_store_with_clauses(
+            key.clone(),
+            &[42u32, 1u32, 2u32],
+            false,
+            0,
+            Arc::new(native_clauses),
+            |s| 100 - s,
+        );
+        assert!(cache.get(&key).unwrap().bitmap().contains(42));
+        // Now run filter work: slot 42 has nsfwLevel=4 → Not(And(In(nsfwLevel,4))) = Not(true) = false.
+        let filters = make_filter_index(&[("nsfwLevel", &[(4, &[42u32])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[])]);
+        let item = {
+            let entry = cache.get(&key).unwrap();
+            CacheMaintenanceItem {
+                key: key.clone(),
+                slots: vec![42u32],
+                min_tracked_value: 0,
+                direction: SortDirection::Desc,
+                original_filter_clauses: Arc::clone(entry.original_filter_clauses()),
+            }
+        };
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let (results, _timed_out) = evaluate_filter_work(
+            &[item], &filters, &sorts, None, None, None, None, &misses,
+        );
+        // Slot 42 does NOT match the native clause → should be in removes.
+        let result = results.iter().find(|r| r.key == key);
+        assert!(result.is_some(), "should have a result for our key");
+        let r = result.unwrap();
+        assert!(
+            r.removes.iter().any(|(s, _)| *s == 42),
+            "slot 42 should be in removes (native eval returned false)"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_filter_work_falls_back_when_clauses_empty() {
+        // form_and_store (no _with_clauses) → original_filter_clauses is empty.
+        // evaluate_filter_work should fall back to canonical path (slot_matches_filter).
+        let cache = UnifiedCache::new(make_config());
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        // Slot 10 in cache; nsfwLevel=1 in filter index.
+        cache.form_and_store(key.clone(), &[10u32], false, 0, |s| 1000 - s);
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[10u32])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 1500)])]);
+        let item = {
+            let entry = cache.get(&key).unwrap();
+            CacheMaintenanceItem {
+                key: key.clone(),
+                slots: vec![10u32],
+                min_tracked_value: 0,
+                direction: SortDirection::Desc,
+                original_filter_clauses: Arc::clone(entry.original_filter_clauses()),
+            }
+        };
+        assert!(item.original_filter_clauses.is_empty(), "legacy path: clauses should be empty");
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let (results, _) = evaluate_filter_work(
+            &[item], &filters, &sorts, None, None, None, None, &misses,
+        );
+        // Slot 10 matches Eq(nsfwLevel, 1) via canonical path → added (sort qualifies).
+        let adds_slot_10 = results
+            .iter()
+            .flat_map(|r| r.adds.iter())
+            .any(|(s, _)| *s == 10);
+        assert!(adds_slot_10, "canonical fallback should add slot 10");
     }
 }

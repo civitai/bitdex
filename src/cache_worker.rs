@@ -109,6 +109,9 @@ pub struct CacheWorkerMetrics {
     /// `UnifiedEntry::rebuild` directly or by being replaced in `store()` when
     /// the prior entry had `needs_rebuild=true`.
     pub rebuild_completed_total: AtomicU64,
+    /// String-key resolution failures during native FilterClause evaluation.
+    /// Non-zero in prod means string_maps/dictionaries aren't threaded correctly.
+    pub string_lookup_misses_total: AtomicU64,
     /// Histogram for per-cycle wall-clock time. Installed post-engine-construction
     /// by `set_metrics_bridge` so the worker can see the prom-bound `Histogram`.
     /// Optional — the worker no-ops when unset.
@@ -281,6 +284,13 @@ pub struct CacheWorker {
     /// `bucket` clauses during cache maintenance — the bitmap.contains(slot)
     /// check replaces the old always-true conservative fallback.
     time_buckets: Option<Arc<arc_swap::ArcSwap<crate::time_buckets::TimeBucketManager>>>,
+    /// Shared string_maps from the engine. Updated by `set_string_maps` via ArcSwap.
+    /// Threaded to `evaluate_filter_work` / `evaluate_sort_work` for native
+    /// FilterClause eval (B2: string-typed In/Eq resolution).
+    shared_string_maps: Arc<arc_swap::ArcSwap<Option<crate::executor::StringMaps>>>,
+    /// Shared dictionaries from the engine. Updated by `set_dictionaries` via ArcSwap.
+    /// Wraps `Arc<HashMap<...>>` so no clone of (non-Clone) FieldDictionary is needed.
+    shared_dictionaries: Arc<arc_swap::ArcSwap<std::sync::Arc<ahash::AHashMap<String, crate::dictionary::FieldDictionary>>>>,
 }
 
 impl CacheWorker {
@@ -291,6 +301,8 @@ impl CacheWorker {
         config: CacheWorkerConfig,
         metrics: Arc<CacheWorkerMetrics>,
         shutdown: Arc<AtomicBool>,
+        shared_string_maps: Arc<arc_swap::ArcSwap<Option<crate::executor::StringMaps>>>,
+        shared_dictionaries: Arc<arc_swap::ArcSwap<std::sync::Arc<ahash::AHashMap<String, crate::dictionary::FieldDictionary>>>>,
     ) -> Self {
         Self {
             rx,
@@ -301,6 +313,8 @@ impl CacheWorker {
             shutdown,
             cycles_since_reconcile: 0,
             time_buckets: None,
+            shared_string_maps,
+            shared_dictionaries,
         }
     }
 
@@ -434,8 +448,18 @@ impl CacheWorker {
                 .as_ref()
                 .map(|arc| arc.load_full());
             let tb_ref = tb_guard.as_deref();
+            // Load string_maps + dictionaries for native FilterClause eval (B2).
+            let sm_guard = self.shared_string_maps.load_full();
+            let sm_ref = (*sm_guard).as_ref();
+            let dict_guard = self.shared_dictionaries.load_full();
+            let dict_inner = std::sync::Arc::clone(&*dict_guard);
+            let dict_ref: &ahash::AHashMap<String, crate::dictionary::FieldDictionary> = &*dict_inner;
+            let string_misses = std::sync::atomic::AtomicU64::new(0);
             let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
-                evaluate_filter_work(&filter_work, &snap.filters, &snap.sorts, deadline, tb_ref)
+                evaluate_filter_work(
+                    &filter_work, &snap.filters, &snap.sorts, deadline, tb_ref,
+                    sm_ref, Some(dict_ref), &string_misses,
+                )
             } else {
                 (Vec::new(), Vec::new())
             };
@@ -447,10 +471,17 @@ impl CacheWorker {
                     &snap.sorts,
                     deadline,
                     tb_ref,
+                    sm_ref,
+                    Some(dict_ref),
+                    &string_misses,
                 )
             } else {
                 (Vec::new(), Vec::new())
             };
+            let misses = string_misses.load(Ordering::Relaxed);
+            if misses > 0 {
+                self.metrics.string_lookup_misses_total.fetch_add(misses, Ordering::Relaxed);
+            }
 
             if !filter_results.is_empty()
                 || !sort_results.is_empty()
