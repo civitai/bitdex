@@ -3253,7 +3253,12 @@ impl ConcurrentEngine {
                 .name("bitdex-prefetch".to_string())
                 .spawn(move || {
                     while let Ok(ukey) = prefetch_rx.recv() {
-                        // Read entry state under lock, then drop lock before doing work
+                        // Read entry state under lock, then drop lock before doing work.
+                        // Also clone the original FilterClause Arc so compound clauses
+                        // (And/Or/Not/IsNull/IsNotNull/bucket) survive the lock release —
+                        // CanonicalClause::to_filter_clause returns None for those, so a
+                        // plain filter_map would silently drop them and produce a superset
+                        // filter bitmap, causing entry.expand to add wrong slots (B5 fix).
                         let work = {
                             let uc = &pf_cache;
                             if let Some(entry) = uc.get(&ukey) {
@@ -3265,14 +3270,15 @@ impl ConcurrentEngine {
                                     let cap = entry.capacity();
                                     let max_cap = entry.max_capacity();
                                     let min_val = entry.min_tracked_value();
+                                    let original_clauses = Arc::clone(entry.original_filter_clauses());
                                     entry.set_prefetching(true);
-                                    Some((cap, max_cap, min_val))
+                                    Some((cap, max_cap, min_val, original_clauses))
                                 }
                             } else {
                                 None
                             }
                         };
-                        let Some((capacity, max_capacity, min_tracked_value)) = work else {
+                        let Some((capacity, max_capacity, min_tracked_value, original_clauses)) = work else {
                             continue;
                         };
                         tracing::debug!(
@@ -3287,10 +3293,19 @@ impl ConcurrentEngine {
                             &snap.sorts,
                             pf_config.max_page_size,
                         );
-                        // Convert canonical clauses back to FilterClauses
-                        let filter_clauses: Vec<FilterClause> = ukey.filter_clauses.iter()
-                            .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
-                            .collect();
+                        // Use the original FilterClause tree stored on the entry (B5).
+                        // This preserves compound shapes (And/Or/Not/IsNull/IsNotNull/bucket)
+                        // that CanonicalClause::to_filter_clause cannot round-trip.
+                        // Fall back to canonical round-trip only for pre-B1 entries where
+                        // original_filter_clauses is empty (e.g. entries restored from disk
+                        // before the B8 meta.bin V2 upgrade).
+                        let filter_clauses: Vec<FilterClause> = if !original_clauses.is_empty() {
+                            (*original_clauses).clone()
+                        } else {
+                            ukey.filter_clauses.iter()
+                                .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
+                                .collect()
+                        };
                         // Resolve filters
                         let _now_unix = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)

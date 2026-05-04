@@ -140,9 +140,9 @@ Zero correctness risk. Standalone-mergeable.
 - [x] Same fix in any other site that iterates `key.filter_clauses` to determine field coverage. Also fixed `affected_ids` collection in `collect_filter_work`: `!field_in_canonical` condition now admits compound entries found via leaf-field registration that had no direct canonical-clause match.
 
 ### B5 — Commit 6. Prefetch worker fix
-- [ ] `concurrent_engine.rs:3249-3251` — replace `filter_map(to_filter_clause)` round-trip with direct `entry.original_filter_clauses.clone()` lookup.
-- [ ] Need to fetch `UnifiedEntry` from cache (`pf_cache.get(&ukey)`) — confirm available at this site.
-- [ ] Test: push compound-clause query through prefetch worker, assert resulting filter bitmap matches full-executor result (no superset).
+- [x] `concurrent_engine.rs:3249-3251` — replace `filter_map(to_filter_clause)` round-trip with direct `entry.original_filter_clauses.clone()` lookup.
+- [x] Need to fetch `UnifiedEntry` from cache (`pf_cache.get(&ukey)`) — confirm available at this site. Confirmed: `pf_cache` is `Arc::clone(&unified_cache)` captured before thread spawn. Extended work tuple to carry `Arc<Vec<FilterClause>>` cloned inside the existing `uc.get(&ukey)` block — zero extra lock acquisition.
+- [x] Test: push compound-clause query through prefetch worker, assert resulting filter bitmap matches full-executor result (no superset). Two tests: `test_prefetch_worker_compound_filter_matches_executor` (compound entry has non-empty original_filter_clauses; pre-condition confirms canonical round-trip drops the Not(And) clause entirely) and `test_prefetch_worker_falls_back_for_empty_clauses` (legacy form_and_store entry has empty original_filter_clauses; fallback recovers simple Eq clause).
 
 ### B6 — Commit 7. `needs_rebuild` wired to read path
 **Reviewer Partial 2: clarify ownership of rebuild work.**

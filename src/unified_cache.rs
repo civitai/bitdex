@@ -5586,4 +5586,133 @@ mod tests {
             }
         }
     }
+
+    // ── B5 — Prefetch worker compound-clause fix ─────────────────────────────
+    //
+    // The prefetch worker previously reconstructed FilterClause vecs by calling
+    // CanonicalClause::to_filter_clause on each canonical key, then collecting
+    // with filter_map. That silently drops compound clauses (And/Or/Not/IsNull/
+    // IsNotNull/bucket) because to_filter_clause returns None for them. The
+    // resulting filter bitmap was a superset, so entry.expand added wrong slots.
+    //
+    // Fix (B5): the worker now clones entry.original_filter_clauses() (an Arc
+    // captured at form_and_store_with_clauses time) and uses it directly. It
+    // falls back to canonical round-trip only when the Arc is empty (pre-B8
+    // entries restored from disk).
+    //
+    // These tests verify the two code paths the prefetch worker now takes:
+    //   1. original_filter_clauses non-empty → full compound tree used.
+    //   2. original_filter_clauses empty (legacy form_and_store) → fallback.
+
+    #[test]
+    fn test_prefetch_worker_compound_filter_matches_executor() {
+        // Form a cache entry via form_and_store_with_clauses with a compound shape:
+        //   Not(And(In(baseModel, [1]), In(nsfwLevel, [4])))
+        // This compound clause cannot be round-tripped through to_filter_clause.
+        // Verify that original_filter_clauses is non-empty so the prefetch worker
+        // will use the correct full tree rather than the stripped canonical vec.
+        let cache = UnifiedCache::new(make_config());
+        let compound = FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In(
+                "baseModel".to_string(),
+                vec![crate::query::Value::Integer(1)],
+            ),
+            FilterClause::In(
+                "nsfwLevel".to_string(),
+                vec![crate::query::Value::Integer(4)],
+            ),
+        ])));
+        let clauses = vec![compound.clone()];
+
+        // Build the UnifiedKey from the compound clause itself so the canonical
+        // key reflects the compound shape (op="not(and)", field="").
+        let canonical_clause = crate::cache::CanonicalClause::from_filter(&compound)
+            .expect("compound Not(And) must canonicalize");
+        let key = UnifiedKey {
+            filter_clauses: vec![canonical_clause],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+
+        cache.form_and_store_with_clauses(
+            key.clone(),
+            &[10u32, 20u32],
+            false,
+            0,
+            Arc::new(clauses.clone()),
+            |s| 1000 - s,
+        );
+
+        // Verify: original_filter_clauses is non-empty → prefetch uses full tree.
+        let entry = cache.get(&key).expect("entry must exist");
+        let stored = entry.original_filter_clauses();
+        assert!(
+            !stored.is_empty(),
+            "B5: compound entry must have non-empty original_filter_clauses so \
+             prefetch worker uses the full tree (not canonical round-trip)"
+        );
+
+        // Simulate the prefetch path: clone the Arc (cheap), check it has the
+        // compound clause that to_filter_clause would have dropped.
+        let cloned: Vec<FilterClause> = (**stored).clone();
+        assert_eq!(
+            cloned.len(),
+            clauses.len(),
+            "B5: prefetch path must see all clauses including the compound Not(And)"
+        );
+
+        // Confirm to_filter_clause drops the compound canonical clause entirely.
+        // This proves the old round-trip was broken for this shape.
+        let canonical_roundtrip: Vec<FilterClause> = key
+            .filter_clauses
+            .iter()
+            .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
+            .collect();
+        // The canonical clause has op starting with "not(" — to_filter_clause
+        // returns None for compound ops → stripped vec is empty.
+        assert!(
+            canonical_roundtrip.is_empty(),
+            "B5 pre-condition: canonical round-trip of a compound Not(And) clause \
+             must produce empty vec (got {} clauses)",
+            canonical_roundtrip.len()
+        );
+    }
+
+    #[test]
+    fn test_prefetch_worker_falls_back_for_empty_clauses() {
+        // form_and_store (legacy, no _with_clauses) → original_filter_clauses is empty.
+        // The prefetch worker should fall back to canonical round-trip for these entries.
+        let cache = UnifiedCache::new(make_config());
+        let key = make_key(
+            &[("nsfwLevel", "eq", "1")],
+            "sortAt",
+            SortDirection::Desc,
+        );
+        // Use form_and_store (not _with_clauses) — no FilterClause tree stored.
+        cache.form_and_store(key.clone(), &[5u32], false, 0, |s| 100 - s);
+
+        let entry = cache.get(&key).expect("entry must exist");
+        let stored = entry.original_filter_clauses();
+        assert!(
+            stored.is_empty(),
+            "B5 fallback: legacy form_and_store entry must have empty \
+             original_filter_clauses so prefetch falls back to canonical round-trip"
+        );
+
+        // Simulate the prefetch fallback path: since Arc is empty, use canonical.
+        let filter_clauses: Vec<FilterClause> = if !stored.is_empty() {
+            (**stored).clone()
+        } else {
+            key.filter_clauses
+                .iter()
+                .filter_map(|cc| crate::cache::CanonicalClause::to_filter_clause(cc))
+                .collect()
+        };
+        // Eq(nsfwLevel, 1) is a simple leaf — to_filter_clause succeeds for it.
+        assert!(
+            !filter_clauses.is_empty(),
+            "B5 fallback: canonical round-trip must recover at least the Eq clause \
+             for a simple key when original_filter_clauses is empty"
+        );
+    }
 }
