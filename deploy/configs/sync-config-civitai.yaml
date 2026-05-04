@@ -88,9 +88,8 @@ dump_phases:
         fields:
           - { column: publishedAtSecs, target: publishedAt }
           - { column: availability, target: availability }
+          - { column: modelVersionId, target: postedToId }
         computed_fields:
-          - target: postedToId
-            expression: "lookup_key"           # the Post.id itself
           - target: isPublished
             expression: "publishedAtSecs != null"
     # sortAt = GREATEST(existedAt, publishedAt) is defined in index config
@@ -253,6 +252,7 @@ triggers:
       # The {field} template resolves to OLD.field for remove ops, NEW.field for set ops.
       # When OLD is not null and NEW is null → remove. When NEW is not null → set.
       - { column: availability, target: availability, expression: "{availability}::text" }
+      - { column: modelVersionId, target: postedToId }
 
   - table: ModelVersion
     type: fan_out
