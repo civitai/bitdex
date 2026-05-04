@@ -25,7 +25,7 @@ use roaring::RoaringBitmap;
 use crate::cache::CanonicalClause;
 use crate::error::{BitdexError, Result};
 use crate::meta_index::CacheEntryId;
-use crate::query::SortDirection;
+use crate::query::{FilterClause, SortDirection};
 
 // ── Meta File Format ────────────────────────────────────────────────────────
 //
@@ -63,6 +63,11 @@ pub struct MetaEntry {
     pub min_tracked_value: u32,
     pub total_matched: u64,
     pub has_more: bool,
+    /// Original (pre-canonicalization) FilterClause tree for cache live-maintenance.
+    /// TODO(B8): bump META_VERSION to 2, persist this to meta.bin, and re-resolve
+    /// `BucketBitmap` clauses on restore. For now, populated in-memory from a live
+    /// `UnifiedEntry` and dropped on serialize; restore yields `Vec::new()`.
+    pub original_filter_clauses: Vec<FilterClause>,
 }
 
 /// Contents of a deserialized meta.bin file.
@@ -379,6 +384,8 @@ fn deserialize_meta(data: &[u8]) -> Result<MetaFile> {
             min_tracked_value,
             total_matched,
             has_more,
+            // TODO(B8): persist + restore the original FilterClause tree at META_VERSION 2.
+            original_filter_clauses: Vec::new(),
         });
     }
 
@@ -683,6 +690,7 @@ mod tests {
             min_tracked_value: 500,
             total_matched: 12345,
             has_more: true,
+            original_filter_clauses: Vec::new(),
         }
     }
 
@@ -768,6 +776,7 @@ mod tests {
                 min_tracked_value: 0,
                 total_matched: 999999,
                 has_more: false,
+                original_filter_clauses: Vec::new(),
             }],
             tombstones: RoaringBitmap::new(),
             next_entry_id: 8,

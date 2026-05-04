@@ -45,7 +45,7 @@ pub fn is_time_bucket_clause(c: &CanonicalClause) -> bool {
 }
 use crate::filter::FilterIndex;
 use crate::meta_index::{CacheEntryId, MetaIndex};
-use crate::query::SortDirection;
+use crate::query::{FilterClause, SortDirection};
 use crate::radix_sort::RadixSortIndex;
 use crate::sort::SortIndex;
 use crate::write_coalescer::FilterGroupKey;
@@ -61,6 +61,8 @@ pub struct CacheMaintenanceItem {
     pub slots: Vec<u32>,
     pub min_tracked_value: u32,
     pub direction: SortDirection,
+    /// Carried from UnifiedEntry; consumed in Commit 3 (B2).
+    pub original_filter_clauses: Arc<Vec<FilterClause>>,
 }
 /// Result of evaluating maintenance for one cache entry (computed without lock).
 pub struct CacheMaintenanceResult {
@@ -168,6 +170,11 @@ pub struct UnifiedEntry {
     bucket_cutoff: u64,
     /// Whether this entry's filter clauses include a time bucket clause.
     uses_bucket: bool,
+    /// Original FilterClause tree captured at entry formation.
+    /// Used by live maintenance (Phase B) to evaluate compound predicates natively.
+    /// Stored as Arc so per-cycle clones into CacheMaintenanceItem are cheap.
+    /// TODO(B8): account for original_filter_clauses bytes once persisted.
+    original_filter_clauses: Arc<Vec<FilterClause>>,
 }
 impl UnifiedEntry {
     /// Create a new entry from a sort traversal result.
@@ -175,6 +182,11 @@ impl UnifiedEntry {
     /// `sorted_slots` should be the top-N slots from the sort traversal, in sort order.
     /// `value_fn` returns the sort value for a given slot.
     /// At formation, capacity is initial_capacity (4K) — no radix needed.
+    ///
+    /// Test/legacy callers without a FilterClause tree call `new` (defaults to
+    /// empty Arc). Production callers with a FilterClause tree call
+    /// `new_with_clauses` so live maintenance can natively evaluate compound
+    /// predicates (Commit 3 / B2).
     pub fn new(
         sorted_slots: &[u32],
         capacity: usize,
@@ -183,6 +195,31 @@ impl UnifiedEntry {
         total_matched: u64,
         meta_id: CacheEntryId,
         direction: SortDirection,
+        value_fn: impl Fn(u32) -> u32,
+    ) -> Self {
+        Self::new_with_clauses(
+            sorted_slots,
+            capacity,
+            max_capacity,
+            has_more,
+            total_matched,
+            meta_id,
+            direction,
+            Arc::new(Vec::new()),
+            value_fn,
+        )
+    }
+    /// Like `new`, but accepts the original FilterClause tree to carry through
+    /// to live maintenance.
+    pub fn new_with_clauses(
+        sorted_slots: &[u32],
+        capacity: usize,
+        max_capacity: usize,
+        has_more: bool,
+        total_matched: u64,
+        meta_id: CacheEntryId,
+        direction: SortDirection,
+        original_filter_clauses: Arc<Vec<FilterClause>>,
         value_fn: impl Fn(u32) -> u32,
     ) -> Self {
         let mut bitmap = RoaringBitmap::new();
@@ -221,6 +258,7 @@ impl UnifiedEntry {
             direction,
             bucket_cutoff: 0, // Set by caller via set_bucket_cutoff() after creation
             uses_bucket: false, // Set by caller via set_uses_bucket() after creation
+            original_filter_clauses,
         }
     }
     /// Create an entry restored from disk (shard load).
@@ -238,6 +276,34 @@ impl UnifiedEntry {
         value_fn: impl Fn(u32) -> u32,
         has_more: bool,
         persisted_total_matched: u64,
+    ) -> Self {
+        // TODO(B8): populate FilterClause tree from persisted meta.bin once META_VERSION is bumped.
+        Self::from_restored_with_clauses(
+            bitmap,
+            meta_id,
+            initial_capacity,
+            max_capacity,
+            direction,
+            persisted_sorted_keys,
+            value_fn,
+            has_more,
+            persisted_total_matched,
+            Arc::new(Vec::new()),
+        )
+    }
+    /// Like `from_restored`, but accepts the persisted FilterClause tree.
+    /// Used post-B8 once meta.bin V2 carries the original clauses.
+    pub fn from_restored_with_clauses(
+        bitmap: RoaringBitmap,
+        meta_id: CacheEntryId,
+        initial_capacity: usize,
+        max_capacity: usize,
+        direction: SortDirection,
+        persisted_sorted_keys: Option<Vec<u64>>,
+        value_fn: impl Fn(u32) -> u32,
+        has_more: bool,
+        persisted_total_matched: u64,
+        original_filter_clauses: Arc<Vec<FilterClause>>,
     ) -> Self {
         let card = bitmap.len() as usize;
         let capacity = if card > initial_capacity {
@@ -286,6 +352,7 @@ impl UnifiedEntry {
             direction,
             bucket_cutoff: 0, // Set by caller after restore
             uses_bucket: false, // Set by caller after restore
+            original_filter_clauses,
         }
     }
     pub fn bitmap(&self) -> &Arc<RoaringBitmap> {
@@ -318,6 +385,10 @@ impl UnifiedEntry {
     /// Mark this entry as using a time bucket clause.
     pub fn set_uses_bucket(&mut self, uses: bool) {
         self.uses_bucket = uses;
+    }
+    /// The original FilterClause tree captured at entry formation.
+    pub fn original_filter_clauses(&self) -> &Arc<Vec<FilterClause>> {
+        &self.original_filter_clauses
     }
     /// Apply pending bucket diffs: subtract expired slots from the bitmap
     /// and update the bucket_cutoff to current.
@@ -867,13 +938,36 @@ impl UnifiedCache {
         meta_id
     }
     /// Register a new entry with the meta-index and create the entry.
-    /// This is the primary way to create and store entries.
+    ///
+    /// Test/legacy callers without an original FilterClause tree call
+    /// `form_and_store` (defaults to empty Arc). Production callers with a
+    /// FilterClause tree call `form_and_store_with_clauses` so live
+    /// maintenance can natively evaluate compound predicates (Commit 3 / B2).
     pub fn form_and_store(
         &self,
         key: UnifiedKey,
         sorted_slots: &[u32],
         has_more: bool,
         total_matched: u64,
+        value_fn: impl Fn(u32) -> u32,
+    ) -> CacheEntryId {
+        self.form_and_store_with_clauses(
+            key,
+            sorted_slots,
+            has_more,
+            total_matched,
+            Arc::new(Vec::new()),
+            value_fn,
+        )
+    }
+    /// Like `form_and_store`, but accepts the original FilterClause tree.
+    pub fn form_and_store_with_clauses(
+        &self,
+        key: UnifiedKey,
+        sorted_slots: &[u32],
+        has_more: bool,
+        total_matched: u64,
+        original_filter_clauses: Arc<Vec<FilterClause>>,
         value_fn: impl Fn(u32) -> u32,
     ) -> CacheEntryId {
         // Register with meta-index
@@ -885,7 +979,7 @@ impl UnifiedCache {
         let direction = key.direction;
         let uses_bucket = key.filter_clauses.iter().any(is_time_bucket_clause);
         let cfg = self.config.load();
-        let mut entry = UnifiedEntry::new(
+        let mut entry = UnifiedEntry::new_with_clauses(
             sorted_slots,
             cfg.initial_capacity,
             cfg.max_capacity,
@@ -893,6 +987,7 @@ impl UnifiedCache {
             total_matched,
             meta_id,
             direction,
+            Arc::clone(&original_filter_clauses),
             value_fn,
         );
         entry.set_uses_bucket(uses_bucket);
@@ -1887,6 +1982,7 @@ impl UnifiedCache {
                     slots,
                     min_tracked_value: entry.min_tracked_value,
                     direction: entry.direction,
+                    original_filter_clauses: Arc::clone(entry.original_filter_clauses()),
                 })
             })
             .collect();
@@ -1945,6 +2041,7 @@ impl UnifiedCache {
                     slots,
                     min_tracked_value: entry.min_tracked_value,
                     direction: entry.direction,
+                    original_filter_clauses: Arc::clone(entry.original_filter_clauses()),
                 })
             })
             .collect();

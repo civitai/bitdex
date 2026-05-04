@@ -96,11 +96,11 @@ Zero correctness risk. Standalone-mergeable.
 ### B1 — Commit 2. Carry original `FilterClause` tree from form_and_store through Phase A → B → C
 **Critical structural decision.** Reviewer flagged ambiguity: `UnifiedKey` has `Vec<CanonicalClause>` only; `CacheMaintenanceItem` (line 49) carries only `UnifiedKey`. The `FilterClause` tree must reach `evaluate_filter_work`.
 
-- [ ] Add `original_filter_clauses: Arc<Vec<FilterClause>>` to `UnifiedEntry` struct (`unified_cache.rs:117`). Wire through `UnifiedEntry::new` and `from_restored`.
-- [ ] Extend `CacheMaintenanceItem` (line 49) to carry `Arc<Vec<FilterClause>>` (cheap clone of the entry's Arc).
-- [ ] `collect_filter_work` (~line 1856) — pull `original_filter_clauses` from entry, attach to work item.
-- [ ] `collect_sort_work` (parity site) — same.
-- [ ] Audit any other `CacheMaintenanceItem` constructor.
+- [x] Add `original_filter_clauses: Arc<Vec<FilterClause>>` to `UnifiedEntry` struct (`unified_cache.rs:117`). Wire through `UnifiedEntry::new` and `from_restored`.
+- [x] Extend `CacheMaintenanceItem` (line 49) to carry `Arc<Vec<FilterClause>>` (cheap clone of the entry's Arc).
+- [x] `collect_filter_work` (~line 1856) — pull `original_filter_clauses` from entry, attach to work item.
+- [x] `collect_sort_work` (parity site) — same.
+- [x] Audit any other `CacheMaintenanceItem` constructor.
 
 ### B2 — Commit 3. Native per-slot `FilterClause` eval (the actual correctness fix)
 **Reviewer-flagged GAP — `slot_matches_clause` has no access to StringMaps/FieldDictionary today. Must thread.**

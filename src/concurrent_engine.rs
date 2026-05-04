@@ -2794,6 +2794,7 @@ impl ConcurrentEngine {
                                                 min_tracked_value: entry.min_tracked_value(),
                                                 total_matched: entry.total_matched(),
                                                 has_more: entry.has_more(),
+                                                original_filter_clauses: (**entry.original_filter_clauses()).clone(),
                                             }
                                         } else {
                                             crate::bound_store::MetaEntry {
@@ -2806,6 +2807,7 @@ impl ConcurrentEngine {
                                                 min_tracked_value: 0,
                                                 total_matched: 0,
                                                 has_more: true,
+                                                original_filter_clauses: Vec::new(),
                                             }
                                         }
                                     })
@@ -5398,13 +5400,17 @@ impl ConcurrentEngine {
         if unified_hit.is_none() && unified_key.is_some() && query.sort.is_some() {
             let ukey = unified_key.unwrap();
             let sort_clause = query.sort.as_ref().unwrap();
+            // Snapshot the original FilterClause tree so cache live-maintenance
+            // can natively evaluate compound predicates (B2 consumes this).
+            let original_clauses = Arc::new(snapped_filters.to_vec());
             if full_total_matched == 0 {
                 let value_fn = |_slot: u32| -> u32 { 0 };
-                self.unified_cache.form_and_store(
+                self.unified_cache.form_and_store_with_clauses(
                     ukey,
                     &[],
                     false,
                     full_total_matched,
+                    Arc::clone(&original_clauses),
                     value_fn,
                 );
                 let mut result = QueryResult {
@@ -5446,7 +5452,7 @@ impl ConcurrentEngine {
                 (i, m, id)
             };
             // Unlocked: build the entry (the expensive part).
-            let mut new_entry = UnifiedEntry::new(
+            let mut new_entry = UnifiedEntry::new_with_clauses(
                 &sorted_slots,
                 initial_cap,
                 max_cap,
@@ -5454,6 +5460,7 @@ impl ConcurrentEngine {
                 full_total_matched,
                 meta_id,
                 direction,
+                Arc::clone(&original_clauses),
                 value_fn,
             );
             new_entry.set_uses_bucket(uses_bucket);
@@ -5752,14 +5759,18 @@ impl ConcurrentEngine {
         if unified_hit.is_none() && unified_key.is_some() && query.sort.is_some() {
             let ukey = unified_key.unwrap();
             let sort_clause = query.sort.as_ref().unwrap();
+            // Snapshot the FilterClause tree so cache live-maintenance can
+            // natively evaluate compound predicates (B2 consumes this).
+            let original_clauses = Arc::new(snapped_filters.to_vec());
             if full_total_matched == 0 {
                 // Zero-result cache: empty bitmap, no sort traversal needed.
                 let value_fn = |_slot: u32| -> u32 { 0 };
-                self.unified_cache.form_and_store(
+                self.unified_cache.form_and_store_with_clauses(
                     ukey,
                     &[],
                     false,
                     full_total_matched,
+                    Arc::clone(&original_clauses),
                     value_fn,
                 );
                 let result = QueryResult {
@@ -5794,11 +5805,12 @@ impl ConcurrentEngine {
                 sort_field.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
             };
             let t0 = std::time::Instant::now();
-            self.unified_cache.form_and_store(
+            self.unified_cache.form_and_store_with_clauses(
                 ukey.clone(),
                 &sorted_slots,
                 has_more,
                 full_total_matched,
+                Arc::clone(&original_clauses),
                 value_fn,
             );
             let cache_elapsed = t0.elapsed();
