@@ -168,8 +168,15 @@ Zero correctness risk. Standalone-mergeable.
 ### B9 — Commit 9. Pathological cost safety valve (reviewer-flagged)
 **Compound `In` with high-cardinality inner values can blow `max_maintenance_ms` budget. Need fast-reject.**
 
-- [ ] In B2's compound eval, before per-slot loop: count total leaf atoms across entry's `original_filter_clauses`. If sum > config threshold (default 100), skip per-slot eval and `mark_for_rebuild` the entry directly. Log via `cache_marked_for_rebuild_total{reason="compound_too_large"}`.
-- [ ] Existing `max_maintenance_ms` deadline already catches over-budget entries via `mark_for_rebuild` fallback (line 1538) — keep as second backstop.
+- [x] In B2's compound eval, before per-slot loop: count total leaf atoms across entry's `original_filter_clauses`. If sum > config threshold (default 50), skip per-slot eval and push entry key to `timed_out` so caller marks for rebuild. Log via `cache_marked_for_rebuild_total{reason="compound_too_large"}`.
+- [x] Existing `max_maintenance_ms` deadline already catches over-budget entries via `mark_for_rebuild` fallback — keep as second backstop.
+- [x] `count_leaf_atoms` + `count_one_leaf_atom` free fns added near `clause_atom_cost`.
+- [x] `compound_eval_atom_limit: u32` added to `UnifiedCacheConfig` (default 50) and `CacheConfig` (config.rs).
+- [x] Threaded into both `evaluate_filter_work` and `evaluate_sort_work` (sort work also calls `slot_matches_filter_native` → same guard needed).
+- [x] `marked_for_rebuild_compound_too_large_total: AtomicU64` on `CacheWorkerMetrics`.
+- [x] Prom: `cache_marked_for_rebuild_total{reason="compound_too_large"}` wired in `server.rs` scrape.
+- [x] Runtime PATCH: `CachePatch.compound_eval_atom_limit` + `engine.set_compound_eval_atom_limit()` wired.
+- [x] Tests: `test_count_leaf_atoms_simple`, `test_count_leaf_atoms_compound`, `test_count_leaf_atoms_civitai_shape`, `test_evaluate_filter_work_skips_when_over_atom_limit`, `test_evaluate_filter_work_proceeds_when_under_limit`.
 
 ---
 

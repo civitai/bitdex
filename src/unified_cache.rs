@@ -80,6 +80,51 @@ pub fn clause_atom_cost(c: &FilterClause) -> u8 {
         },
     }
 }
+
+/// Count the total number of leaf atoms across a slice of `FilterClause`s.
+///
+/// A leaf atom is the smallest unit of per-slot evaluation work:
+/// - Scalar clauses (`Eq`, `NotEq`, ranges, `IsNull`, `IsNotNull`, `BucketBitmap`) = 1 atom each.
+/// - `In`/`NotIn` = `values.len()` atoms (one bitmap contains-check per value in the worst case).
+/// - `Not(inner)` = atoms of inner (recursed through).
+/// - `And(parts)` / `Or(parts)` = sum of part atoms (recursed).
+///
+/// Used by the B9 safety valve: if an entry's total leaf-atom count exceeds
+/// `UnifiedCacheConfig::compound_eval_atom_limit`, the entry is skipped and
+/// marked for rebuild instead of paying the per-slot evaluation cost.
+///
+/// Civitai's dominant compound shape (`Not(And(In(nsfwLevel, 4 vals), In(baseModel, 9 vals)))`)
+/// plus surrounding atoms totals approximately 24 atoms. The default limit of 50 gives 2× margin.
+pub fn count_leaf_atoms(clauses: &[FilterClause]) -> u32 {
+    let mut total = 0u32;
+    for c in clauses {
+        total = total.saturating_add(count_one_leaf_atom(c));
+    }
+    total
+}
+
+fn count_one_leaf_atom(c: &FilterClause) -> u32 {
+    match c {
+        FilterClause::Eq(..)
+        | FilterClause::NotEq(..)
+        | FilterClause::Gt(..)
+        | FilterClause::Gte(..)
+        | FilterClause::Lt(..)
+        | FilterClause::Lte(..)
+        | FilterClause::IsNull(_)
+        | FilterClause::IsNotNull(_)
+        | FilterClause::BucketBitmap { .. } => 1,
+        FilterClause::In(_, vs) | FilterClause::NotIn(_, vs) => vs.len() as u32,
+        FilterClause::Not(inner) => count_one_leaf_atom(inner),
+        FilterClause::And(parts) | FilterClause::Or(parts) => {
+            let mut s = 0u32;
+            for p in parts {
+                s = s.saturating_add(count_one_leaf_atom(p));
+            }
+            s
+        }
+    }
+}
 use crate::filter::FilterIndex;
 use crate::meta_index::{CacheEntryId, MetaIndex};
 use crate::query::{FilterClause, SortDirection};
@@ -136,6 +181,14 @@ pub struct UnifiedCacheConfig {
     /// this fraction of the cached entries (default 0.95 = 95% consumed, 5% remaining).
     /// Set to 0.0 or 1.0 to disable prefetching.
     pub prefetch_threshold: f64,
+    /// B9 safety valve: maximum total leaf-atom count an entry's `FilterClause` tree
+    /// can have before live maintenance bails and marks the entry for rebuild instead
+    /// of running per-slot evaluation.
+    ///
+    /// Civitai's dominant compound shape is ~24 atoms; the default 50 gives 2× margin.
+    /// Set to `0` to disable the guard (no limit). Hot-tunable via
+    /// `PATCH /indexes/{name}/config` → `cache.compound_eval_atom_limit`.
+    pub compound_eval_atom_limit: u32,
 }
 impl Default for UnifiedCacheConfig {
     fn default() -> Self {
@@ -148,6 +201,7 @@ impl Default for UnifiedCacheConfig {
             max_maintenance_work: 0, // 0 = unlimited
             max_maintenance_ms: 10,
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         }
     }
 }
@@ -1400,6 +1454,11 @@ impl UnifiedCache {
         let mut next = (*current).clone();
         f(&mut next);
         self.config.store(Arc::new(next));
+    }
+    /// Read the current `compound_eval_atom_limit` from the live config snapshot.
+    /// Returns 0 when the guard is disabled.
+    pub fn compound_eval_atom_limit(&self) -> u32 {
+        self.config.load().compound_eval_atom_limit
     }
     /// Get the key for a meta_id. O(1) via reverse index. Returns a cloned
     /// `UnifiedKey` (the underlying DashMap entry's shard lock can't escape).
@@ -2830,6 +2889,11 @@ pub fn evaluate_filter_work(
     string_maps: Option<&crate::executor::StringMaps>,
     dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
     string_lookup_misses: &std::sync::atomic::AtomicU64,
+    // B9 safety valve: if > 0, entries whose leaf-atom count exceeds this
+    // threshold are skipped and pushed to `timed_out` (caller marks for rebuild).
+    // Pass `0` to disable.
+    compound_atom_limit: u32,
+    compound_too_large_count: &std::sync::atomic::AtomicU64,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Inverted evaluation: reconstruct_value is identical across entries for
     // the same (sort_field, slot), so we precompute it ONCE per unique pair
@@ -2848,6 +2912,17 @@ pub fn evaluate_filter_work(
                     timed_out.push(remaining.key.clone());
                 }
                 break;
+            }
+        }
+        // B9 safety valve: bail on pathological compound shapes before entering
+        // the per-slot loop. Only active when `original_filter_clauses` is
+        // populated (native eval path) and the limit is non-zero.
+        if compound_atom_limit > 0 && !item.original_filter_clauses.is_empty() {
+            let atoms = count_leaf_atoms(&item.original_filter_clauses);
+            if atoms > compound_atom_limit {
+                timed_out.push(item.key.clone());
+                compound_too_large_count.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
         }
         let use_native = !item.original_filter_clauses.is_empty();
@@ -2938,6 +3013,11 @@ pub fn evaluate_sort_work(
     string_maps: Option<&crate::executor::StringMaps>,
     dictionaries: Option<&HashMap<String, crate::dictionary::FieldDictionary>>,
     string_lookup_misses: &std::sync::atomic::AtomicU64,
+    // B9 safety valve: if > 0, entries whose leaf-atom count exceeds this
+    // threshold are skipped and pushed to `timed_out` (caller marks for rebuild).
+    // Pass `0` to disable.
+    compound_atom_limit: u32,
+    compound_too_large_count: &std::sync::atomic::AtomicU64,
 ) -> (Vec<CacheMaintenanceResult>, Vec<UnifiedKey>) {
     // Preamble: reconstruct_value once per unique (sort_field, slot).
     let reconstructed = precompute_sort_values(work, sorts);
@@ -2980,6 +3060,17 @@ pub fn evaluate_sort_work(
         };
         if !can_possibly_qualify {
             continue;
+        }
+        // B9 safety valve: bail on pathological compound shapes before entering
+        // the per-slot loop. Checked after the cheap field-range fast-reject so
+        // that obviously-skippable entries don't even reach the atom count.
+        if compound_atom_limit > 0 && !item.original_filter_clauses.is_empty() {
+            let atoms = count_leaf_atoms(&item.original_filter_clauses);
+            if atoms > compound_atom_limit {
+                timed_out.push(item.key.clone());
+                compound_too_large_count.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         }
         let use_native = !item.original_filter_clauses.is_empty();
         // For the canonical path: hoist bucket-clause bitmap lookups out of
@@ -4168,6 +4259,7 @@ mod tests {
             max_maintenance_work: 500_000,
             max_maintenance_ms: 1, // 1ms — very short
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         };
         let mut cache = UnifiedCache::new(config);
         // Create 150 cache entries all referencing nsfwLevel=1
@@ -4241,6 +4333,7 @@ mod tests {
             max_maintenance_work: 500_000,
             max_maintenance_ms: 1000, // 1 second — very generous
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         };
         let mut cache = UnifiedCache::new(config);
         // Create 5 cache entries
@@ -4300,6 +4393,7 @@ mod tests {
             max_maintenance_work: 1, // Very low: 1 unit of work triggers rebuild
             max_maintenance_ms: 0,   // Disable time-based
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         };
         let mut cache = UnifiedCache::new(config);
         let slots: Vec<u32> = (0..10).collect();
@@ -4350,7 +4444,7 @@ mod tests {
         assert_eq!(work[0].key, key);
         // Phase B: evaluate outside lock
         let _m = std::sync::atomic::AtomicU64::new(0);
-        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m);
+        let (results, timed_out) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
         assert!(timed_out.is_empty());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
@@ -4376,7 +4470,7 @@ mod tests {
         );
         let (work, _) = cache.collect_filter_work(&HashMap::new(), &removes);
         let _m = std::sync::atomic::AtomicU64::new(0);
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
         cache.apply_maintenance_results(&results);
         let entry = cache.get(&key).unwrap();
         assert!(!entry.bitmap().contains(3), "Slot 3 should be removed via two-phase maintenance");
@@ -4396,7 +4490,7 @@ mod tests {
         let (work, _) = cache.collect_sort_work(&sort_mutations);
         assert_eq!(work.len(), 1);
         let _m = std::sync::atomic::AtomicU64::new(0);
-        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None, None, None, &_m);
+        let (results, _) = evaluate_sort_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].adds.len(), 1);
         assert_eq!(results[0].adds[0].0, 10);
@@ -4454,7 +4548,7 @@ mod tests {
         cache_two.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
         let (work, _) = cache_two.collect_filter_work(&inserts, &HashMap::new());
         let _m = std::sync::atomic::AtomicU64::new(0);
-        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m);
+        let (results, _) = evaluate_filter_work(&work, &filters, &sorts, None, None, None, None, &_m, 0, &std::sync::atomic::AtomicU64::new(0));
         cache_two.apply_maintenance_results(&results);
         let two_has_10 = cache_two.get(&key).unwrap().bitmap().contains(10);
         assert_eq!(single_has_10, two_has_10, "Two-phase should produce same result as single-phase");
@@ -4707,6 +4801,7 @@ mod tests {
             max_maintenance_work: 1_000_000,
             max_maintenance_ms: 1000,
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         });
         // total_matched = 1 (only slot 1); value_fn maps slot→sort_value
         cache.form_and_store(key.clone(), &initial_slots, true, 1u64, |s| {
@@ -4734,6 +4829,7 @@ mod tests {
             None,
             Some(&mgr),
             None, None, &_m,
+            0, &std::sync::atomic::AtomicU64::new(0),
         );
         assert!(timed_out.is_empty());
 
@@ -4809,6 +4905,7 @@ mod tests {
             max_maintenance_work: 1_000_000,
             max_maintenance_ms: 1000,
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         });
         // total_matched = 100 (non-trivial, so min_filter_size=0 still stores it)
         cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
@@ -4831,6 +4928,7 @@ mod tests {
             None,
             Some(&mgr),
             None, None, &_m,
+            0, &std::sync::atomic::AtomicU64::new(0),
         );
         cache.apply_maintenance_results(&results);
 
@@ -4947,6 +5045,7 @@ mod tests {
             max_maintenance_work: 1_000_000,
             max_maintenance_ms: 1000,
             prefetch_threshold: 0.95,
+            compound_eval_atom_limit: 50,
         });
         cache.form_and_store(key.clone(), &initial_slots, true, 100u64, |s| {
             if s == 1 { ts_slot1 } else { 0 }
@@ -4968,6 +5067,7 @@ mod tests {
             None,
             Some(&mgr),
             None, None, &_m,
+            0, &std::sync::atomic::AtomicU64::new(0),
         );
         assert!(timed_out.is_empty());
         cache.apply_maintenance_results(&results);
@@ -5247,6 +5347,7 @@ mod tests {
         let misses = std::sync::atomic::AtomicU64::new(0);
         let (results, _timed_out) = evaluate_filter_work(
             &[item], &filters, &sorts, None, None, None, None, &misses,
+            0, &std::sync::atomic::AtomicU64::new(0),
         );
         // Slot 42 does NOT match the native clause → should be in removes.
         let result = results.iter().find(|r| r.key == key);
@@ -5282,6 +5383,7 @@ mod tests {
         let misses = std::sync::atomic::AtomicU64::new(0);
         let (results, _) = evaluate_filter_work(
             &[item], &filters, &sorts, None, None, None, None, &misses,
+            0, &std::sync::atomic::AtomicU64::new(0),
         );
         // Slot 10 matches Eq(nsfwLevel, 1) via canonical path → added (sort qualifies).
         let adds_slot_10 = results
@@ -5860,5 +5962,158 @@ mod tests {
             "B5 fallback: canonical round-trip must recover at least the Eq clause \
              for a simple key when original_filter_clauses is empty"
         );
+    }
+
+    // ── B9 Tests: pathological-cost safety valve ─────────────────────────────
+
+    /// B9 test 1: count_leaf_atoms handles scalar and In clauses correctly.
+    ///
+    /// `[Eq, In(5 vals), IsNotNull]` → 1 + 5 + 1 = 7 atoms.
+    #[test]
+    fn test_count_leaf_atoms_simple() {
+        use crate::query::Value;
+        let five_vals: Vec<Value> = (0u64..5).map(|v| Value::Integer(v as i64)).collect();
+        let clauses = vec![
+            FilterClause::Eq("nsfwLevel".to_string(), Value::Integer(1)),
+            FilterClause::In("baseModel".to_string(), five_vals),
+            FilterClause::IsNotNull("postId".to_string()),
+        ];
+        assert_eq!(count_leaf_atoms(&clauses), 7, "Eq(1) + In(5) + IsNotNull(1) = 7");
+    }
+
+    /// B9 test 2: count_leaf_atoms recurses through Not/And/Or correctly.
+    ///
+    /// `Not(And(In(2 vals), In(3 vals)))` → 2 + 3 = 5 atoms.
+    #[test]
+    fn test_count_leaf_atoms_compound() {
+        use crate::query::Value;
+        let two_vals: Vec<Value> = (0i64..2).map(Value::Integer).collect();
+        let three_vals: Vec<Value> = (0i64..3).map(Value::Integer).collect();
+        let clauses = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("nsfwLevel".to_string(), two_vals),
+            FilterClause::In("baseModel".to_string(), three_vals),
+        ])))];
+        assert_eq!(count_leaf_atoms(&clauses), 5, "Not(And(In(2), In(3))) = 5 atoms");
+    }
+
+    /// B9 test 3: Civitai's dominant compound shape lands at ~24 atoms.
+    ///
+    /// Shape: `[IsNotNull(postId), In(nsfwLevel, 6 vals), Not(And(In(nsfwLevel, 4 vals),
+    ///   In(baseModel, 9 vals))), Or(Eq, In(2), In(2)), Eq(isPublished)]`
+    /// = 1 + 6 + (4 + 9) + (1 + 2 + 2) + 1 = 26 atoms.
+    /// The default limit of 50 should NOT reject this shape.
+    #[test]
+    fn test_count_leaf_atoms_civitai_shape() {
+        use crate::query::Value;
+        let nv6: Vec<Value> = (0i64..6).map(Value::Integer).collect();
+        let nv4: Vec<Value> = (0i64..4).map(Value::Integer).collect();
+        let bm9: Vec<Value> = (0i64..9).map(|i| Value::String(format!("model_{}", i))).collect();
+        let mv2a: Vec<Value> = (0i64..2).map(Value::Integer).collect();
+        let mv2b: Vec<Value> = (0i64..2).map(Value::Integer).collect();
+
+        let clauses = vec![
+            FilterClause::IsNotNull("postId".to_string()),
+            FilterClause::In("nsfwLevel".to_string(), nv6),
+            FilterClause::Not(Box::new(FilterClause::And(vec![
+                FilterClause::In("nsfwLevel".to_string(), nv4),
+                FilterClause::In("baseModel".to_string(), bm9),
+            ]))),
+            FilterClause::Or(vec![
+                FilterClause::Eq("postedToId".to_string(), Value::Integer(12345)),
+                FilterClause::In("modelVersionIds".to_string(), mv2a),
+                FilterClause::In("modelVersionIdsManual".to_string(), mv2b),
+            ]),
+            FilterClause::Eq("isPublished".to_string(), Value::Bool(true)),
+        ];
+        let atoms = count_leaf_atoms(&clauses);
+        // 1 + 6 + (4+9) + (1+2+2) + 1 = 26
+        assert_eq!(atoms, 26, "Civitai dominant shape should be ~26 atoms");
+        assert!(atoms < 50, "Default limit (50) should NOT reject the Civitai shape");
+    }
+
+    /// B9 test 4: evaluate_filter_work skips entry and increments metric when
+    /// atom count exceeds compound_eval_atom_limit.
+    #[test]
+    fn test_evaluate_filter_work_skips_when_over_atom_limit() {
+        use crate::query::Value;
+
+        // Build a clause with 6 atoms: In(field, 6 vals).
+        let six_vals: Vec<Value> = (0i64..6).map(Value::Integer).collect();
+        let original_clauses = Arc::new(vec![
+            FilterClause::In("nsfwLevel".to_string(), six_vals),
+        ]);
+        // Atom count = 6. Limit = 5 → should be skipped.
+        let limit = 5u32;
+        assert!(count_leaf_atoms(&original_clauses) > limit, "precondition: atom count > limit");
+
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let item = CacheMaintenanceItem {
+            key: key.clone(),
+            slots: vec![10u32, 20u32],
+            min_tracked_value: 0,
+            direction: SortDirection::Desc,
+            original_filter_clauses: Arc::clone(&original_clauses),
+        };
+
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[10u32, 20u32])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 100), (20, 200)])]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let too_large = std::sync::atomic::AtomicU64::new(0);
+
+        let (results, timed_out) = evaluate_filter_work(
+            &[item], &filters, &sorts, None, None, None, None, &misses,
+            limit, &too_large,
+        );
+
+        // Entry must end up in timed_out (caller marks for rebuild), not in results.
+        assert_eq!(timed_out.len(), 1, "over-limit entry should be in timed_out");
+        assert_eq!(timed_out[0], key, "timed_out should contain our key");
+        assert!(results.is_empty(), "results should be empty: per-slot eval must NOT run");
+        assert_eq!(too_large.load(Ordering::Relaxed), 1, "metric should be 1");
+    }
+
+    /// B9 test 5: evaluate_filter_work proceeds normally when atom count is under limit.
+    #[test]
+    fn test_evaluate_filter_work_proceeds_when_under_limit() {
+        use crate::query::Value;
+
+        // In(nsfwLevel, 6 vals) = 6 atoms. Limit = 100 → should proceed.
+        let six_vals: Vec<Value> = (0i64..6).map(Value::Integer).collect();
+        let original_clauses = Arc::new(vec![
+            FilterClause::In("nsfwLevel".to_string(), six_vals),
+        ]);
+        let limit = 100u32;
+        assert!(count_leaf_atoms(&original_clauses) <= limit, "precondition: atom count <= limit");
+
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        // Slot 10 is being inserted; min_tracked=0 so sort qualifies.
+        let item = CacheMaintenanceItem {
+            key: key.clone(),
+            slots: vec![10u32],
+            min_tracked_value: 0,
+            direction: SortDirection::Desc,
+            original_filter_clauses: Arc::clone(&original_clauses),
+        };
+
+        // nsfwLevel key 0 corresponds to Integer(0). Use key 0 and value 0 in the index.
+        // The native eval will try to look up "0" (Integer) via string_maps (None) and
+        // dictionaries (None), which will miss → string_lookup_misses incremented, slot
+        // returns false. That's fine — we only need to confirm the per-slot loop ran
+        // (results not empty OR misses > 0), not that the match was correct.
+        let filters = make_filter_index(&[("nsfwLevel", &[(1, &[10u32])])]);
+        let sorts = make_sort_index(&[("reactionCount", &[(10, 100)])]);
+        let misses = std::sync::atomic::AtomicU64::new(0);
+        let too_large = std::sync::atomic::AtomicU64::new(0);
+
+        let (results, timed_out) = evaluate_filter_work(
+            &[item], &filters, &sorts, None, None, None, None, &misses,
+            limit, &too_large,
+        );
+
+        assert!(timed_out.is_empty(), "under-limit entry must NOT be skipped");
+        assert_eq!(too_large.load(Ordering::Relaxed), 0, "metric should be 0");
+        // Per-slot loop ran: either produced a result (add/remove) or missed on string lookup.
+        let loop_ran = !results.is_empty() || misses.load(Ordering::Relaxed) > 0;
+        assert!(loop_ran, "per-slot eval must have executed (results or misses)");
     }
 }

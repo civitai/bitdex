@@ -640,6 +640,7 @@ impl ConcurrentEngine {
             max_maintenance_work: config.cache.max_maintenance_work,
             max_maintenance_ms: config.cache.max_maintenance_ms,
             prefetch_threshold: config.cache.prefetch_threshold,
+            compound_eval_atom_limit: config.cache.compound_eval_atom_limit,
         };
         // Cache-worker metrics created early so the cache can hold an Arc to
         // it for reason-attributed rebuild counters (alive_change,
@@ -1723,10 +1724,13 @@ impl ConcurrentEngine {
                             let dict_inner = Arc::clone(&*dict_guard);
                             let dict_ref: &HashMap<String, crate::dictionary::FieldDictionary> = &*dict_inner;
                             let flush_string_misses = std::sync::atomic::AtomicU64::new(0);
+                            let flush_compound_too_large = std::sync::atomic::AtomicU64::new(0);
+                            let compound_atom_limit = flush_unified_cache.compound_eval_atom_limit();
                             let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
                                 evaluate_filter_work(
                                     &filter_work, &staging.filters, &staging.sorts, deadline, tb_ref,
                                     sm_ref, Some(dict_ref), &flush_string_misses,
+                                    compound_atom_limit, &flush_compound_too_large,
                                 )
                             } else {
                                 (Vec::new(), Vec::new())
@@ -1735,6 +1739,7 @@ impl ConcurrentEngine {
                                 evaluate_sort_work(
                                     &sort_work, &staging.filters, &staging.sorts, deadline, tb_ref,
                                     sm_ref, Some(dict_ref), &flush_string_misses,
+                                    compound_atom_limit, &flush_compound_too_large,
                                 )
                             } else {
                                 (Vec::new(), Vec::new())
@@ -1744,6 +1749,12 @@ impl ConcurrentEngine {
                                 flush_cache_worker_metrics
                                     .string_lookup_misses_total
                                     .fetch_add(flush_misses, Ordering::Relaxed);
+                            }
+                            let flush_too_large = flush_compound_too_large.load(Ordering::Relaxed);
+                            if flush_too_large > 0 {
+                                flush_cache_worker_metrics
+                                    .marked_for_rebuild_compound_too_large_total
+                                    .fetch_add(flush_too_large, Ordering::Relaxed);
                             }
                             let phase_b_ns = t_phase_b.elapsed().as_nanos() as u64;
                             let ct_filter_results = filter_results.len();
@@ -6910,6 +6921,11 @@ impl ConcurrentEngine {
     /// Update the max_maintenance_work budget on the live unified cache.
     pub fn set_max_maintenance_work(&self, v: usize) {
         self.unified_cache.with_config_mut(|c| c.max_maintenance_work = v);
+    }
+    /// Update the B9 compound-eval atom limit on the live unified cache.
+    /// Set to 0 to disable the guard. Takes effect on the next maintenance cycle.
+    pub fn set_compound_eval_atom_limit(&self, v: u32) {
+        self.unified_cache.with_config_mut(|c| c.compound_eval_atom_limit = v);
     }
     /// Update the max_maintenance_ms time budget on the live unified cache and
     /// the async cache worker (if running). Takes effect on the worker's next

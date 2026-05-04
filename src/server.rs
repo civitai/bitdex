@@ -1121,6 +1121,10 @@ struct CachePatch {
     /// sends work to the channel; the thread itself is always present when
     /// async_maintenance=true was set at startup.
     async_maintenance: Option<bool>,
+    /// B9 safety valve: maximum leaf-atom count before an entry is skipped and
+    /// marked for rebuild. Set to 0 to disable. Hot-tunable; takes effect on the
+    /// next maintenance cycle.
+    compound_eval_atom_limit: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2429,6 +2433,10 @@ async fn handle_patch_config(
                     if let Some(v) = cache_patch.max_maintenance_ms {
                         idx.definition.config.cache.max_maintenance_ms = v;
                         idx.engine.set_max_maintenance_ms(v);
+                    }
+                    if let Some(v) = cache_patch.compound_eval_atom_limit {
+                        idx.definition.config.cache.compound_eval_atom_limit = v;
+                        idx.engine.set_compound_eval_atom_limit(v);
                     }
                     if let Some(v) = cache_patch.async_maintenance {
                         // Updates the stored config (persisted on next save).
@@ -5290,6 +5298,9 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.cache_marked_for_rebuild_total
                 .with_label_values(&[name, "filter_invalidation"])
                 .set(cwm.marked_for_rebuild_filter_invalidation_total.load(Ordering::Relaxed) as i64);
+            m.cache_marked_for_rebuild_total
+                .with_label_values(&[name, "compound_too_large"])
+                .set(cwm.marked_for_rebuild_compound_too_large_total.load(Ordering::Relaxed) as i64);
             m.cache_rebuild_completed_total
                 .with_label_values(&[name])
                 .set(cwm.rebuild_completed_total.load(Ordering::Relaxed) as i64);

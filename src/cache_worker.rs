@@ -112,6 +112,9 @@ pub struct CacheWorkerMetrics {
     /// String-key resolution failures during native FilterClause evaluation.
     /// Non-zero in prod means string_maps/dictionaries aren't threaded correctly.
     pub string_lookup_misses_total: AtomicU64,
+    /// Cache entries skipped and marked for rebuild because their compound
+    /// FilterClause tree exceeded `compound_eval_atom_limit` (B9 safety valve).
+    pub marked_for_rebuild_compound_too_large_total: AtomicU64,
     /// Histogram for per-cycle wall-clock time. Installed post-engine-construction
     /// by `set_metrics_bridge` so the worker can see the prom-bound `Histogram`.
     /// Optional — the worker no-ops when unset.
@@ -455,10 +458,13 @@ impl CacheWorker {
             let dict_inner = std::sync::Arc::clone(&*dict_guard);
             let dict_ref: &ahash::AHashMap<String, crate::dictionary::FieldDictionary> = &*dict_inner;
             let string_misses = std::sync::atomic::AtomicU64::new(0);
+            let compound_too_large = std::sync::atomic::AtomicU64::new(0);
+            let compound_atom_limit = uc.compound_eval_atom_limit();
             let (filter_results, filter_timed_out) = if !filter_work.is_empty() {
                 evaluate_filter_work(
                     &filter_work, &snap.filters, &snap.sorts, deadline, tb_ref,
                     sm_ref, Some(dict_ref), &string_misses,
+                    compound_atom_limit, &compound_too_large,
                 )
             } else {
                 (Vec::new(), Vec::new())
@@ -474,6 +480,7 @@ impl CacheWorker {
                     sm_ref,
                     Some(dict_ref),
                     &string_misses,
+                    compound_atom_limit, &compound_too_large,
                 )
             } else {
                 (Vec::new(), Vec::new())
@@ -481,6 +488,12 @@ impl CacheWorker {
             let misses = string_misses.load(Ordering::Relaxed);
             if misses > 0 {
                 self.metrics.string_lookup_misses_total.fetch_add(misses, Ordering::Relaxed);
+            }
+            let too_large = compound_too_large.load(Ordering::Relaxed);
+            if too_large > 0 {
+                self.metrics
+                    .marked_for_rebuild_compound_too_large_total
+                    .fetch_add(too_large, Ordering::Relaxed);
             }
 
             if !filter_results.is_empty()
