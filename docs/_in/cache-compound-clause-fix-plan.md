@@ -147,10 +147,10 @@ Zero correctness risk. Standalone-mergeable.
 ### B6 — Commit 7. `needs_rebuild` wired to read path
 **Reviewer Partial 2: clarify ownership of rebuild work.**
 
-- [ ] **Mechanism:** `lookup_for_read` already returns `None` on `needs_rebuild=true` (line 789). Cache miss → slow path → `form_and_store` → new entry replaces old. **Nothing extra needed on read path itself.**
-- [ ] Wire `try_start_rebuild` at the slow-path call site so concurrent flagged-entry queries don't all stampede `compute_filters`. First caller: `try_start_rebuild() == true`, runs slow path, calls `form_and_store`. Others: hit `needs_rebuild`, fall through, await new entry on next read or also run slow-path naturally.
-- [ ] Increment `cache_rebuild_completed_total` correctly inside `store()` when replacing an entry that had `needs_rebuild=true`.
-- [ ] Test: `add_slot` past 2× capacity → `needs_rebuild=true`. Next read returns slow-path. Subsequent reads see fresh entry, `needs_rebuild=false`.
+- [x] **Mechanism:** `lookup_for_read` already returns `None` on `needs_rebuild=true` (line 789). Cache miss → slow path → `form_and_store` → new entry replaces old. **Nothing extra needed on read path itself.**
+- [x] Wire `try_start_rebuild` at the slow-path call site so concurrent flagged-entry queries don't all stampede `compute_filters`. First caller: `try_start_rebuild() == true`, runs slow path, calls `form_and_store`. Others: hit `needs_rebuild`, fall through, await new entry on next read or also run slow-path naturally. Implemented via `should_rebuild_single_flight(&ukey)` helper on `UnifiedCache`. Wired at both slow-path sites in `concurrent_engine.rs` (execute_query_with_collector ~5463 and execute_query_slow_path ~5825). Non-winning callers execute directly from filter bitmap without storing.
+- [x] Increment `cache_rebuild_completed_total` correctly inside `store()` when replacing an entry that had `needs_rebuild=true`. Already present from Commit 1 (A3). Confirmed at `unified_cache.rs:939-943`.
+- [x] Test: `test_needs_rebuild_triggers_slow_path_on_read` — sanity-checks `lookup_for_read` returns None on flagged entry. `test_store_increments_rebuild_completed_when_replacing_flagged_entry` — verifies rebuild_completed_total increments only on flagged replacements. `test_concurrent_slow_path_single_flight` — verifies `should_rebuild_single_flight` serializes callers (first→true, second→false while guard held, true again after release).
 
 ### B7 — Commit 10. Port old sync `maintain_filter_changes` to native eval
 - [x] **Verified test-only via grep.** 12 callers, all in `#[cfg(test)]` blocks (`unified_cache.rs:3104, 3123, 3144, 3170, 3189, 3252, 3340, 3449, 3505, 3572, 3623, 3746`). Zero production callers.

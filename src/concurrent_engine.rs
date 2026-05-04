@@ -5466,6 +5466,23 @@ impl ConcurrentEngine {
             // Snapshot the original FilterClause tree so cache live-maintenance
             // can natively evaluate compound predicates (B2 consumes this).
             let original_clauses = Arc::new(snapped_filters.to_vec());
+            // Single-flight guard: when a flagged entry (needs_rebuild=true) triggered
+            // this miss, only the first concurrent caller does the seed + store. Others
+            // skip the write and serve directly from the executor to avoid stampeding
+            // compute_filters with redundant sort traversals.
+            if !self.unified_cache.should_rebuild_single_flight(&ukey) {
+                let mut result = executor.execute_from_bitmap(
+                    &filter_arc,
+                    query.sort.as_ref(),
+                    fetch_limit,
+                    query.cursor.as_ref(),
+                    use_simple_sort,
+                )?;
+                result.total_matched = full_total_matched;
+                collector.sort_us = sort_start.elapsed().as_micros() as u64;
+                self.post_validate(&mut result, &query.filters, executor)?;
+                return Ok(result);
+            }
             if full_total_matched == 0 {
                 let value_fn = |_slot: u32| -> u32 { 0 };
                 self.unified_cache.form_and_store_with_clauses(
@@ -5828,6 +5845,22 @@ impl ConcurrentEngine {
             // Snapshot the FilterClause tree so cache live-maintenance can
             // natively evaluate compound predicates (B2 consumes this).
             let original_clauses = Arc::new(snapped_filters.to_vec());
+            // Single-flight guard: when a flagged entry (needs_rebuild=true) triggered
+            // this miss, only the first concurrent caller does the seed + store. Others
+            // skip the write and serve directly from the executor to avoid stampeding
+            // compute_filters with redundant sort traversals.
+            if !self.unified_cache.should_rebuild_single_flight(&ukey) {
+                let mut result = executor.execute_from_bitmap(
+                    &filter_arc,
+                    query.sort.as_ref(),
+                    fetch_limit,
+                    query.cursor.as_ref(),
+                    use_simple_sort,
+                )?;
+                result.total_matched = full_total_matched;
+                self.post_validate(&mut result, &query.filters, executor)?;
+                return Ok(result);
+            }
             if full_total_matched == 0 {
                 // Zero-result cache: empty bitmap, no sort traversal needed.
                 let value_fn = |_slot: u32| -> u32 { 0 };

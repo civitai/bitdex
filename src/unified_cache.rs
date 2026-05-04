@@ -925,6 +925,33 @@ impl UnifiedCache {
     ) -> Option<dashmap::mapref::one::Ref<'a, UnifiedKey, UnifiedEntry>> {
         self.entries.get(key)
     }
+    /// Single-flight guard for `needs_rebuild` entries at the slow-path call
+    /// site in `ConcurrentEngine`.
+    ///
+    /// Returns `true` if the caller should run the full slow path (seed sort +
+    /// `form_and_store_with_clauses`).  Returns `false` if another concurrent
+    /// caller already claimed the rebuild — this caller should execute the
+    /// query directly against the executor bitmaps without touching the cache.
+    ///
+    /// Two cases both return `true` (proceed):
+    /// - No entry exists yet for `key` → normal first-time insert.
+    /// - Entry exists but is NOT flagged → entry vanished between `lookup_for_read`
+    ///   returning `None` and this call (eviction race); safe to re-insert.
+    ///
+    /// The one case that returns `false`:
+    /// - Entry exists AND `needs_rebuild=true` AND `try_start_rebuild()` lost
+    ///   the CAS → another caller claimed the rebuild; skip.
+    ///
+    /// Uses `get` (no hit/miss counters) so the stat path is not double-counted.
+    pub fn should_rebuild_single_flight(&self, key: &UnifiedKey) -> bool {
+        match self.entries.get(key) {
+            Some(r) if r.value().needs_rebuild() => {
+                // Entry flagged — first caller wins the CAS, others skip.
+                r.value().try_start_rebuild()
+            }
+            _ => true, // No entry, or fresh entry (not flagged) — proceed normally.
+        }
+    }
     /// Store a new entry, evicting LRU if over budget. Returns the meta_id assigned.
     ///
     /// Uses batch eviction: when over budget, evicts ~10% of entries in one O(n)
@@ -3320,6 +3347,105 @@ mod tests {
         let fresh_slots: Vec<u32> = (0..10).collect();
         entry.rebuild(&fresh_slots, |s| 1000 - s);
         assert!(entry.try_start_rebuild()); // available again
+    }
+    /// `lookup_for_read` returns `None` when `needs_rebuild=true` — sanity check
+    /// that the read-path miss gate is in place before the single-flight guard relies on it.
+    #[test]
+    fn test_needs_rebuild_triggers_slow_path_on_read() {
+        let config = make_config();
+        let mut cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        // Entry is healthy — lookup_for_read succeeds.
+        assert!(cache.lookup_for_read(&key).is_some());
+        // Flag for rebuild.
+        cache.get_mut(&key).unwrap().mark_for_rebuild();
+        // lookup_for_read must return None so callers fall through to the slow path.
+        assert!(
+            cache.lookup_for_read(&key).is_none(),
+            "needs_rebuild=true must produce a cache miss on lookup_for_read"
+        );
+    }
+    /// `store()` increments `rebuild_completed_total` when it replaces a flagged entry,
+    /// and only when it replaces a flagged entry.
+    #[test]
+    fn test_store_increments_rebuild_completed_when_replacing_flagged_entry() {
+        use crate::cache_worker::CacheWorkerMetrics;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        let config = make_config();
+        let mut cache = UnifiedCache::new(config);
+        let metrics = Arc::new(CacheWorkerMetrics::default());
+        cache.set_rebuild_metrics(Arc::clone(&metrics));
+        let key1 = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let key2 = make_key(&[("nsfwLevel", "eq", "2")], "reactionCount", SortDirection::Desc);
+        let key3 = make_key(&[("nsfwLevel", "eq", "3")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..5).collect();
+        // Form entry on key1 and mark for rebuild — replacing it via store() should count.
+        cache.form_and_store(key1.clone(), &slots, true, 100, |s| s);
+        cache.get_mut(&key1).unwrap().mark_for_rebuild();
+        assert_eq!(metrics.rebuild_completed_total.load(Ordering::Relaxed), 0);
+        cache.form_and_store(key1.clone(), &slots, true, 100, |s| s);
+        assert_eq!(
+            metrics.rebuild_completed_total.load(Ordering::Relaxed),
+            1,
+            "replacing a needs_rebuild entry must increment rebuild_completed_total"
+        );
+        // Form entry on key2 — replacing it WITHOUT flagging should NOT increment.
+        cache.form_and_store(key2.clone(), &slots, true, 100, |s| s);
+        cache.form_and_store(key2.clone(), &slots, true, 100, |s| s);
+        assert_eq!(
+            metrics.rebuild_completed_total.load(Ordering::Relaxed),
+            1,
+            "replacing a healthy entry must NOT increment rebuild_completed_total"
+        );
+        // Form entry on key3, flag it, replace — should increment to 2.
+        cache.form_and_store(key3.clone(), &slots, true, 100, |s| s);
+        cache.get_mut(&key3).unwrap().mark_for_rebuild();
+        cache.form_and_store(key3.clone(), &slots, true, 100, |s| s);
+        assert_eq!(
+            metrics.rebuild_completed_total.load(Ordering::Relaxed),
+            2,
+            "second flagged replacement must bring total to 2"
+        );
+    }
+    /// `should_rebuild_single_flight` serializes concurrent callers: first returns true,
+    /// second returns false while the rebuild guard is held, then true again after release.
+    #[test]
+    fn test_concurrent_slow_path_single_flight() {
+        let config = make_config();
+        let mut cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        // No entry — first call proceeds normally.
+        assert!(
+            cache.should_rebuild_single_flight(&key),
+            "no entry: should proceed"
+        );
+        // Form and store, leave healthy — also proceeds.
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        assert!(
+            cache.should_rebuild_single_flight(&key),
+            "healthy entry: should proceed"
+        );
+        // Flag for rebuild — first caller wins the CAS, second is blocked.
+        cache.get_mut(&key).unwrap().mark_for_rebuild();
+        assert!(
+            cache.should_rebuild_single_flight(&key),
+            "flagged entry, first caller: should proceed (wins CAS)"
+        );
+        assert!(
+            !cache.should_rebuild_single_flight(&key),
+            "flagged entry, second caller: should skip (loses CAS)"
+        );
+        // After the winning caller stores the new entry (simulated by form_and_store),
+        // the flag is gone and the next caller proceeds again.
+        cache.form_and_store(key.clone(), &slots, true, 100_000, |s| 1000 - s);
+        assert!(
+            cache.should_rebuild_single_flight(&key),
+            "fresh entry after rebuild: should proceed"
+        );
     }
     #[test]
     fn test_clear() {
