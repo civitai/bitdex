@@ -123,13 +123,13 @@ Zero correctness risk. Standalone-mergeable.
 - [x] Thread `string_maps` + `dictionaries` from snapshot through `cache_worker.rs:438` and `concurrent_engine.rs:1692` call sites.
 
 ### B3 — Commit 5. Cheap-clause-first ordering
-- [ ] At `form_and_store`, sort `original_filter_clauses` by atom-cost ascending. Cost classes:
+- [x] At `form_and_store`, sort `original_filter_clauses` by atom-cost ascending. Cost classes:
   1. Eq, IsNull, IsNotNull, BucketBitmap (1 contains)
   2. NotEq, Range (1 contains + 1 reconstruct)
   3. In/NotIn (≤K contains)
-  4. And/Or (sum of children, recursive)
+  4. And/Or (max child class, clamped to 4)
   5. Not(And/Or) (deepest — last)
-- [ ] Property test: per-slot eval result invariant under any ordering.
+- [x] Property test: per-slot eval result invariant under any ordering.
 
 ### B4 — Commit 4. Recursive meta-index registration + slot-gather fix
 **Reviewer flagged Partial 1: meta-index fix alone is no-op without also fixing the slot-gather loop.**

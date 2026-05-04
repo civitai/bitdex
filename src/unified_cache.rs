@@ -43,6 +43,43 @@ use crate::cache::CanonicalClause;
 pub fn is_time_bucket_clause(c: &CanonicalClause) -> bool {
     c.op == "bucket" && c.field != "__prefilter"
 }
+
+/// Assign a cost class (1–5) to a `FilterClause` for cheap-first ordering.
+///
+/// Lower cost = cheaper to evaluate = checked first by the per-slot evaluator,
+/// enabling short-circuit on the most selective/cheapest clause.
+///
+/// | Class | Variants                        | Why                                          |
+/// |-------|---------------------------------|----------------------------------------------|
+/// | 1     | Eq, IsNull, IsNotNull, BucketBitmap | 1 hash lookup + 1 contains               |
+/// | 2     | NotEq, Gt, Gte, Lt, Lte        | 1 contains + 1 reconstruct_value, or 1 lookup + negate |
+/// | 3     | In, NotIn                       | ≤K contains (K = values.len())               |
+/// | 4     | And, Or                         | max child class (recursive compound)         |
+/// | 5     | Not(And/Or)                     | deepest compound — pushed last               |
+///
+/// For `And`/`Or`, the class is the **max** of children — gives a stable, predictable
+/// bucket assignment without summing (which would depend on arity).
+/// For `Not`, if the inner clause is `And`/`Or` the class is bumped to 5 (push last);
+/// otherwise the inner class is inherited (e.g. `Not(Eq)` → class 1).
+pub fn clause_atom_cost(c: &FilterClause) -> u8 {
+    match c {
+        FilterClause::Eq(..) | FilterClause::IsNull(..) | FilterClause::IsNotNull(..) => 1,
+        FilterClause::BucketBitmap { .. } => 1,
+        FilterClause::NotEq(..)
+        | FilterClause::Gt(..)
+        | FilterClause::Gte(..)
+        | FilterClause::Lt(..)
+        | FilterClause::Lte(..) => 2,
+        FilterClause::In(..) | FilterClause::NotIn(..) => 3,
+        FilterClause::And(parts) | FilterClause::Or(parts) => {
+            parts.iter().map(clause_atom_cost).max().unwrap_or(1).max(4)
+        }
+        FilterClause::Not(inner) => match inner.as_ref() {
+            FilterClause::And(_) | FilterClause::Or(_) => 5,
+            other => clause_atom_cost(other),
+        },
+    }
+}
 use crate::filter::FilterIndex;
 use crate::meta_index::{CacheEntryId, MetaIndex};
 use crate::query::{FilterClause, SortDirection};
@@ -970,6 +1007,19 @@ impl UnifiedCache {
         original_filter_clauses: Arc<Vec<FilterClause>>,
         value_fn: impl Fn(u32) -> u32,
     ) -> CacheEntryId {
+        // B3: stable-sort the original FilterClause tree by atom cost (ascending)
+        // so the per-slot evaluator in `slot_matches_filter_native` short-circuits
+        // on the cheapest clause first.  Stable sort preserves user intent within
+        // each cost bucket.  The UnifiedKey (canonical-clause hash key) is NOT
+        // affected — canonical ordering is independently deterministic.
+        let original_filter_clauses = if original_filter_clauses.len() > 1 {
+            let mut sorted: Vec<FilterClause> = (*original_filter_clauses).clone();
+            sorted.sort_by_key(|c| clause_atom_cost(c));
+            Arc::new(sorted)
+        } else {
+            original_filter_clauses
+        };
+
         // Register with meta-index. Pass the original FilterClause tree so
         // compound clauses get registered under their real leaf field names
         // (not just FieldKey("") from the canonical representation).
@@ -5266,5 +5316,274 @@ mod tests {
             mi.entries_for_filter_field("nsfwLevel").is_none(),
             "nsfwLevel must NOT be registered when original_filter_clauses=None"
         );
+    }
+
+    // ── B3 Tests: cheap-clause-first ordering ────────────────────────────────
+
+    /// B3 test 1: `clause_atom_cost` returns the correct cost class for each
+    /// FilterClause variant.
+    #[test]
+    fn test_clause_atom_cost_class_assignment() {
+        use crate::query::Value;
+
+        // Class 1 — cheapest
+        assert_eq!(clause_atom_cost(&FilterClause::Eq("a".into(), Value::Integer(1))), 1);
+        assert_eq!(clause_atom_cost(&FilterClause::IsNull("x".into())), 1);
+        assert_eq!(clause_atom_cost(&FilterClause::IsNotNull("x".into())), 1);
+        assert_eq!(
+            clause_atom_cost(&FilterClause::BucketBitmap {
+                field: "sortAt".into(),
+                bucket_name: "7d".into(),
+                bitmap: Arc::new(roaring::RoaringBitmap::new()),
+            }),
+            1
+        );
+
+        // Class 2 — one negation / range
+        assert_eq!(clause_atom_cost(&FilterClause::NotEq("a".into(), Value::Integer(1))), 2);
+        assert_eq!(clause_atom_cost(&FilterClause::Gt("ts".into(), Value::Integer(0))), 2);
+        assert_eq!(clause_atom_cost(&FilterClause::Gte("ts".into(), Value::Integer(0))), 2);
+        assert_eq!(clause_atom_cost(&FilterClause::Lt("ts".into(), Value::Integer(0))), 2);
+        assert_eq!(clause_atom_cost(&FilterClause::Lte("ts".into(), Value::Integer(0))), 2);
+
+        // Class 3 — In / NotIn
+        assert_eq!(
+            clause_atom_cost(&FilterClause::In("f".into(), vec![Value::Integer(1), Value::Integer(2)])),
+            3
+        );
+        assert_eq!(
+            clause_atom_cost(&FilterClause::NotIn("f".into(), vec![Value::Integer(1)])),
+            3
+        );
+
+        // Class 4 — And/Or: max(child classes); min bucket is 4
+        // And(Eq, In) → max(1, 3) = 3, clamped to 4
+        let and_eq_in = FilterClause::And(vec![
+            FilterClause::Eq("a".into(), Value::Integer(1)),
+            FilterClause::In("b".into(), vec![Value::Integer(2)]),
+        ]);
+        assert_eq!(clause_atom_cost(&and_eq_in), 4);
+
+        // Or(Eq, NotEq) → max(1, 2) = 2, clamped to 4
+        let or_eq_noteq = FilterClause::Or(vec![
+            FilterClause::Eq("a".into(), Value::Integer(1)),
+            FilterClause::NotEq("a".into(), Value::Integer(2)),
+        ]);
+        assert_eq!(clause_atom_cost(&or_eq_noteq), 4);
+
+        // Class 5 — Not(And/Or)
+        let not_and = FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("x".into(), vec![Value::Integer(1)]),
+            FilterClause::In("y".into(), vec![Value::Integer(2)]),
+        ])));
+        assert_eq!(clause_atom_cost(&not_and), 5);
+
+        let not_or = FilterClause::Not(Box::new(FilterClause::Or(vec![
+            FilterClause::Eq("x".into(), Value::Integer(1)),
+        ])));
+        assert_eq!(clause_atom_cost(&not_or), 5);
+
+        // Not(leaf) inherits leaf class — Not(Eq) → class 1
+        let not_eq = FilterClause::Not(Box::new(FilterClause::Eq("a".into(), Value::Integer(1))));
+        assert_eq!(clause_atom_cost(&not_eq), 1);
+
+        // Not(In) → class 3
+        let not_in = FilterClause::Not(Box::new(FilterClause::In("a".into(), vec![Value::Integer(1)])));
+        assert_eq!(clause_atom_cost(&not_in), 3);
+    }
+
+    /// B3 test 2: `form_and_store_with_clauses` stores clauses in cheap-first
+    /// order even when the caller passes expensive clauses first.
+    #[test]
+    fn test_form_and_store_sorts_clauses_cheap_first() {
+        use crate::query::Value;
+
+        let cache = UnifiedCache::new(make_config());
+        let key = make_key(&[], "sortAt", SortDirection::Desc);
+
+        // Input order: [Not(And(In,In)), IsNotNull, Eq] — costs [5, 1, 1]
+        // Expected stored order (stable sort): [IsNotNull, Eq, Not(And(In,In))]
+        // (class-1 items first, class-5 last; within class 1 the original
+        //  relative order IsNotNull→Eq is preserved by stable sort)
+        let expensive_first = vec![
+            FilterClause::Not(Box::new(FilterClause::And(vec![
+                FilterClause::In("baseModel".into(), vec![Value::String("SD XL".into())]),
+                FilterClause::In("nsfwLevel".into(), vec![Value::Integer(4)]),
+            ]))),
+            FilterClause::IsNotNull("postId".into()),
+            FilterClause::Eq("isPublished".into(), Value::Bool(true)),
+        ];
+
+        cache.form_and_store_with_clauses(
+            key.clone(),
+            &[1u32, 2u32],
+            false,
+            2,
+            Arc::new(expensive_first),
+            |s| s,
+        );
+
+        let entry = cache.get(&key).expect("entry must exist");
+        let stored = entry.original_filter_clauses();
+        assert_eq!(stored.len(), 3, "all 3 clauses must be stored");
+
+        // First two must be class-1 (IsNotNull, Eq in any order within class 1)
+        let cost0 = clause_atom_cost(&stored[0]);
+        let cost1 = clause_atom_cost(&stored[1]);
+        let cost2 = clause_atom_cost(&stored[2]);
+        assert!(cost0 <= cost1, "clauses must be in non-decreasing cost order (0 vs 1)");
+        assert!(cost1 <= cost2, "clauses must be in non-decreasing cost order (1 vs 2)");
+        assert_eq!(cost0, 1, "cheapest clause must be class 1");
+        assert_eq!(cost2, 5, "most expensive clause must be class 5");
+
+        // Stable sort: within class 1, IsNotNull comes before Eq (original order)
+        assert!(
+            matches!(stored[0], FilterClause::IsNotNull(_)),
+            "stable sort: IsNotNull should precede Eq within class 1"
+        );
+        assert!(
+            matches!(stored[1], FilterClause::Eq(..)),
+            "stable sort: Eq should be second within class 1"
+        );
+    }
+
+    /// B3 test 3 (proptest): per-slot eval result is invariant under any
+    /// reordering of the top-level FilterClause list.
+    ///
+    /// Generates random FilterClause trees, builds a FilterIndex with random
+    /// bitmap state for each key, evaluates with both original and
+    /// cheap-first-sorted orderings, and asserts the results are identical.
+    mod b3_proptest {
+        use super::*;
+        use proptest::prelude::*;
+        use crate::query::Value;
+
+        /// Simple leaf clause strategies for proptest.
+        /// All clauses reference field "f" with integer keys 1..=4, or field "g"
+        /// for IsNull/IsNotNull so the two semantics don't collide.
+        fn arb_leaf_clause() -> impl Strategy<Value = FilterClause> {
+            prop_oneof![
+                // Eq with integer key 1..=4 (field "f")
+                (1i64..=4i64).prop_map(|v| FilterClause::Eq("f".into(), Value::Integer(v))),
+                // NotEq with integer key 1..=4 (field "f")
+                (1i64..=4i64).prop_map(|v| FilterClause::NotEq("f".into(), Value::Integer(v))),
+                // In with 1..=3 integer values drawn from 1..=4 (field "f")
+                proptest::collection::vec(1i64..=4i64, 1..=3usize)
+                    .prop_map(|vals| FilterClause::In("f".into(), vals.into_iter().map(Value::Integer).collect())),
+                // IsNotNull on field "g"
+                Just(FilterClause::IsNotNull("g".into())),
+                // IsNull on field "g"
+                Just(FilterClause::IsNull("g".into())),
+            ]
+        }
+
+        /// Strategy for a FilterClause tree of depth ≤ 2, up to 6 leaves.
+        fn arb_clause() -> impl Strategy<Value = FilterClause> {
+            prop_oneof![
+                3 => arb_leaf_clause(),
+                1 => proptest::collection::vec(arb_leaf_clause(), 1..=3usize)
+                    .prop_map(|parts| FilterClause::And(parts)),
+                1 => proptest::collection::vec(arb_leaf_clause(), 1..=3usize)
+                    .prop_map(|parts| FilterClause::Or(parts)),
+                1 => arb_leaf_clause().prop_map(|c| FilterClause::Not(Box::new(c))),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+            #[test]
+            fn test_eval_invariant_under_clause_reordering(
+                clauses in proptest::collection::vec(arb_clause(), 1..=6usize),
+                // Test a slot in 1..=4
+                slot in 1u32..=4u32,
+                // Bitmask per key 1..=4: bit i set → slot (i+1) in that key's bitmap for field "f"
+                bm1 in 0u8..=15u8,
+                bm2 in 0u8..=15u8,
+                bm3 in 0u8..=15u8,
+                bm4 in 0u8..=15u8,
+                // Bitmask for NULL_BITMAP_KEY in field "g": which slots (1..=4) are "null"
+                null_mask in 0u8..=15u8,
+            ) {
+                // Build filter index for field "f" with keys 1..=4.
+                // Decode each bitmask: bit i set → slot (i+1) is in that key's bitmap.
+                let mut f_values: Vec<(u64, Vec<u32>)> = Vec::new();
+                for (key, mask) in [(1u64, bm1), (2, bm2), (3, bm3), (4, bm4)] {
+                    let slots: Vec<u32> = (0..4u32)
+                        .filter(|&bit| mask & (1 << bit) != 0)
+                        .map(|bit| bit + 1)
+                        .collect();
+                    if !slots.is_empty() {
+                        f_values.push((key, slots));
+                    }
+                }
+                // Build field "g" where NULL_BITMAP_KEY is set for certain slots.
+                let null_slots: Vec<u32> = (0..4u32)
+                    .filter(|&bit| null_mask & (1 << bit) != 0)
+                    .map(|bit| bit + 1)
+                    .collect();
+
+                // Use the test helper that correctly constructs FilterIndex.
+                let f_pairs: Vec<(u64, Vec<u32>)> = f_values;
+                let f_refs: Vec<(u64, &[u32])> = f_pairs.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+                let fi = {
+                    let mut index = FilterIndex::new();
+                    index.add_field(FilterFieldConfig {
+                        name: "f".to_string(),
+                        field_type: FilterFieldType::SingleValue,
+                        behaviors: None,
+                        eviction: None,
+                        eager_load: false,
+                        per_value_lazy: false,
+                        max_range_scan_values: None,
+                    });
+                    {
+                        let field = index.get_field("f").unwrap();
+                        for &(key, slots) in &f_refs {
+                            field.insert_bulk(key, slots.iter().copied());
+                        }
+                    }
+                    // Field "g" for IsNull/IsNotNull
+                    index.add_field(FilterFieldConfig {
+                        name: "g".to_string(),
+                        field_type: FilterFieldType::SingleValue,
+                        behaviors: None,
+                        eviction: None,
+                        eager_load: false,
+                        per_value_lazy: false,
+                        max_range_scan_values: None,
+                    });
+                    if !null_slots.is_empty() {
+                        let field_g = index.get_field("g").unwrap();
+                        field_g.insert_bulk(crate::filter::NULL_BITMAP_KEY, null_slots.iter().copied());
+                    }
+                    index
+                };
+
+                let si = SortIndex::new();
+                let misses = std::sync::atomic::AtomicU64::new(0);
+
+                // Evaluate with original order
+                let result_original = slot_matches_filter_native(
+                    slot, &clauses, &fi, &si, None, None, None, &misses,
+                );
+
+                // Evaluate with cheap-first sort (B3 ordering)
+                let mut sorted = clauses.clone();
+                sorted.sort_by_key(|c| clause_atom_cost(c));
+
+                let misses2 = std::sync::atomic::AtomicU64::new(0);
+                let result_sorted = slot_matches_filter_native(
+                    slot, &sorted, &fi, &si, None, None, None, &misses2,
+                );
+
+                prop_assert_eq!(
+                    result_original,
+                    result_sorted,
+                    "eval result must be invariant under clause reordering: slot={:?}, clauses={:?}",
+                    slot,
+                    clauses
+                );
+            }
+        }
     }
 }
