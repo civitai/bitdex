@@ -970,9 +970,12 @@ impl UnifiedCache {
         original_filter_clauses: Arc<Vec<FilterClause>>,
         value_fn: impl Fn(u32) -> u32,
     ) -> CacheEntryId {
-        // Register with meta-index
+        // Register with meta-index. Pass the original FilterClause tree so
+        // compound clauses get registered under their real leaf field names
+        // (not just FieldKey("") from the canonical representation).
         let meta_id = self.meta.write().register(
             &key.filter_clauses,
+            Some(&original_filter_clauses),
             Some(&key.sort_field),
             Some(key.direction),
         );
@@ -1009,9 +1012,28 @@ impl UnifiedCache {
 
     /// Register a meta-index id without building or inserting an entry.
     /// Pairs with `store` to split form_and_store into three phases.
+    /// Canonical-only registration (no leaf-field walk). Use
+    /// `allocate_meta_id_with_clauses` when the FilterClause tree is available.
     pub fn allocate_meta_id(&self, key: &UnifiedKey) -> CacheEntryId {
         self.meta.write().register(
             &key.filter_clauses,
+            None,
+            Some(&key.sort_field),
+            Some(key.direction),
+        )
+    }
+
+    /// Like `allocate_meta_id` but also registers leaf fields from the
+    /// original FilterClause tree, enabling write-path lookup for compound
+    /// clauses (And/Or/Not) whose inner fields have `field=""` in canonical form.
+    pub fn allocate_meta_id_with_clauses(
+        &self,
+        key: &UnifiedKey,
+        original_filter_clauses: &[FilterClause],
+    ) -> CacheEntryId {
+        self.meta.write().register(
+            &key.filter_clauses,
+            Some(original_filter_clauses),
             Some(&key.sort_field),
             Some(key.direction),
         )
@@ -1928,10 +1950,18 @@ impl UnifiedCache {
                     if !new_entries.is_empty() {
                         for meta_id in new_entries.iter() {
                             if let Some(key_ref) = self.meta_id_to_key.get(&meta_id) {
-                                let has_non_eq = key_ref.value().filter_clauses.iter().any(|c| {
+                                let clauses = &key_ref.value().filter_clauses;
+                                // Include this entry if:
+                                // (a) It has a non-eq canonical clause for this field —
+                                //     not already covered by entries_for_clause (eq-only), OR
+                                // (b) No canonical clause directly names this field — meaning
+                                //     it was registered via compound-clause leaf-field walk
+                                //     (And/Or/Not inner fields have field="" in canonical form).
+                                let field_in_canonical = clauses.iter().any(|c| c.field == *field);
+                                let has_non_eq = field_in_canonical && clauses.iter().any(|c| {
                                     c.field == *field && c.op != "eq"
                                 });
-                                if has_non_eq {
+                                if has_non_eq || !field_in_canonical {
                                     ids.insert(meta_id);
                                 }
                             }
@@ -1967,9 +1997,30 @@ impl UnifiedCache {
                     return None;
                 }
                 let mut slots = Vec::new();
-                for clause in &key.filter_clauses {
-                    if let Some(field_slots) = changed_slots_per_field.get(clause.field.as_str()) {
-                        slots.extend(field_slots.iter().copied());
+                let orig = entry.original_filter_clauses();
+                if !orig.is_empty() {
+                    // Walk leaf fields from the original FilterClause tree.
+                    // Canonical clauses have field="" for compound (And/Or/Not)
+                    // shapes, so changed_slots_per_field.get("") returns nothing.
+                    // The leaf walk reaches the actual inner fields (baseModel,
+                    // nsfwLevel, etc.) that compound predicates reference.
+                    let mut leaf_fields = ahash::AHashSet::new();
+                    for clause in orig.iter() {
+                        crate::meta_index::collect_leaf_fields(clause, &mut leaf_fields);
+                    }
+                    for field in &leaf_fields {
+                        if let Some(field_slots) = changed_slots_per_field.get(field.as_str()) {
+                            slots.extend(field_slots.iter().copied());
+                        }
+                    }
+                } else {
+                    // Fallback: canonical loop for entries without an original
+                    // clause tree (e.g. legacy form_and_store, restored entries
+                    // pre-B8, or simple non-compound shapes).
+                    for clause in &key.filter_clauses {
+                        if let Some(field_slots) = changed_slots_per_field.get(clause.field.as_str()) {
+                            slots.extend(field_slots.iter().copied());
+                        }
                     }
                 }
                 slots.sort_unstable();
@@ -4236,6 +4287,7 @@ mod tests {
             );
             let meta_id = cache.meta_mut().register(
                 &key.filter_clauses,
+                None,
                 Some(&key.sort_field),
                 Some(key.direction),
             );
@@ -5041,5 +5093,178 @@ mod tests {
             .flat_map(|r| r.adds.iter())
             .any(|(s, _)| *s == 10);
         assert!(adds_slot_10, "canonical fallback should add slot 10");
+    }
+
+    // ── B4 Tests: recursive meta-index registration + slot-gather fix ──────
+
+    /// B4 test 1: registering an entry with a compound clause registers it
+    /// under each leaf field name, not just FieldKey("").
+    ///
+    /// Pre-B4: entries_for_filter_field("baseModel") and
+    /// entries_for_filter_field("nsfwLevel") would both return None (only
+    /// FieldKey("") was registered for compound canonical clauses).
+    #[test]
+    fn test_meta_index_registers_inner_compound_fields() {
+        use crate::meta_index::MetaIndex;
+
+        let mut mi = MetaIndex::new();
+
+        // Canonical clauses for Not(And(In(baseModel, ...), In(nsfwLevel, ...)))
+        // have field="" — the inner fields are invisible to canonical registration.
+        let canonical = vec![CanonicalClause {
+            field: String::new(), // compound canonical: field=""
+            op: "not_and".to_string(),
+            value_repr: "compound".to_string(),
+        }];
+
+        // Original FilterClause tree exposes the real leaf fields.
+        let original: Vec<FilterClause> = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("baseModel".to_string(), vec![crate::query::Value::String("SD XL".to_string())]),
+            FilterClause::In("nsfwLevel".to_string(), vec![crate::query::Value::Integer(4)]),
+        ])))];
+
+        let id = mi.register(
+            &canonical,
+            Some(&original),
+            Some("sortAt"),
+            Some(SortDirection::Desc),
+        );
+
+        // Both leaf fields must be registered.
+        let bm_base = mi.entries_for_filter_field("baseModel");
+        assert!(bm_base.is_some(), "baseModel should be in meta-index");
+        assert!(bm_base.unwrap().contains(id), "entry id should be under baseModel");
+
+        let bm_nsfw = mi.entries_for_filter_field("nsfwLevel");
+        assert!(bm_nsfw.is_some(), "nsfwLevel should be in meta-index");
+        assert!(bm_nsfw.unwrap().contains(id), "entry id should be under nsfwLevel");
+
+        // Canonical compound field ("") also still registered (belt-and-suspenders).
+        let bm_empty = mi.entries_for_filter_field("");
+        assert!(bm_empty.is_some(), "canonical FieldKey('') still registered");
+        assert!(bm_empty.unwrap().contains(id));
+    }
+
+    /// B4 test 2: the slot-gather loop in collect_filter_work gathers slots for
+    /// fields that appear inside compound clauses.
+    ///
+    /// Pre-B4: mutating baseModel for slot 42 would NOT appear in slots_to_check
+    /// because the canonical clause for the compound shape has field="".
+    #[test]
+    fn test_collect_filter_work_finds_compound_fields() {
+        let cache = UnifiedCache::new(make_config());
+
+        // Compound clause: Not(And(In(baseModel, ...), In(nsfwLevel, ...)))
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: String::new(), // compound canonical
+                op: "not_and".to_string(),
+                value_repr: "compound".to_string(),
+            }],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+
+        let original: Vec<FilterClause> = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::In("baseModel".to_string(), vec![crate::query::Value::String("SD XL".to_string())]),
+            FilterClause::In("nsfwLevel".to_string(), vec![crate::query::Value::Integer(4)]),
+        ])))];
+
+        // Form an entry that includes slot 42.
+        cache.form_and_store_with_clauses(
+            key.clone(),
+            &[42u32, 1u32, 2u32],
+            false,
+            3,
+            Arc::new(original),
+            |s| 100 - s,
+        );
+
+        // Stage a mutation on baseModel for slot 42.
+        let mut inserts: HashMap<FilterGroupKey, Vec<u32>> = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("baseModel"), value: 999 },
+            vec![42u32],
+        );
+
+        let (work, _over_budget) = cache.collect_filter_work(&inserts, &HashMap::new());
+
+        // There should be exactly one work item for our entry.
+        assert_eq!(work.len(), 1, "compound-clause entry should appear in work items");
+        let item = &work[0];
+        assert!(
+            item.slots.contains(&42),
+            "slot 42 (mutated baseModel field) must appear in slots_to_check"
+        );
+    }
+
+    /// B4 test 3: collect_filter_work falls back to canonical clause iteration
+    /// when original_filter_clauses is empty (legacy form_and_store path).
+    /// Simple non-compound shapes still work via the fallback.
+    #[test]
+    fn test_collect_filter_work_falls_back_to_canonical_when_clauses_empty() {
+        let cache = UnifiedCache::new(make_config());
+
+        // Simple Eq clause — has a real field name in canonical form.
+        let key = make_key(&[("baseModel", "eq", "999")], "sortAt", SortDirection::Desc);
+
+        // form_and_store (not _with_clauses) → original_filter_clauses is empty.
+        cache.form_and_store(key.clone(), &[42u32, 1u32], false, 2, |s| 100 - s);
+
+        // Stage a mutation on baseModel for slot 42.
+        let mut inserts: HashMap<FilterGroupKey, Vec<u32>> = HashMap::new();
+        inserts.insert(
+            FilterGroupKey { field: Arc::from("baseModel"), value: 999 },
+            vec![42u32],
+        );
+
+        let (work, _) = cache.collect_filter_work(&inserts, &HashMap::new());
+
+        // The canonical fallback path should still find this entry because
+        // the canonical clause has field="baseModel" (non-compound shape).
+        assert_eq!(work.len(), 1, "non-compound entry should be found via canonical fallback");
+        assert!(
+            work[0].slots.contains(&42),
+            "slot 42 should appear via canonical fallback"
+        );
+    }
+
+    /// B4 test 4: calling register with None for original_filter_clauses
+    /// behaves identically to pre-B4 (canonical-only field registration).
+    /// Compound canonical clause only registers FieldKey(""), not inner fields.
+    #[test]
+    fn test_meta_index_register_with_none_clauses_is_canonical_only() {
+        use crate::meta_index::MetaIndex;
+
+        let mut mi = MetaIndex::new();
+
+        let canonical = vec![CanonicalClause {
+            field: String::new(), // compound canonical
+            op: "not_and".to_string(),
+            value_repr: "compound".to_string(),
+        }];
+
+        // Pass None — canonical-only behavior (same as pre-B4).
+        let id = mi.register(
+            &canonical,
+            None, // no original FilterClause tree
+            Some("sortAt"),
+            Some(SortDirection::Desc),
+        );
+
+        // Only FieldKey("") registered — inner fields NOT visible.
+        let bm_empty = mi.entries_for_filter_field("");
+        assert!(bm_empty.is_some(), "FieldKey('') must be registered");
+        assert!(bm_empty.unwrap().contains(id));
+
+        // Inner fields NOT registered (None → canonical-only).
+        assert!(
+            mi.entries_for_filter_field("baseModel").is_none(),
+            "baseModel must NOT be registered when original_filter_clauses=None"
+        );
+        assert!(
+            mi.entries_for_filter_field("nsfwLevel").is_none(),
+            "nsfwLevel must NOT be registered when original_filter_clauses=None"
+        );
     }
 }

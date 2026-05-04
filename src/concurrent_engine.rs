@@ -5493,10 +5493,13 @@ impl ConcurrentEngine {
             let direction = ukey.direction;
             let uses_bucket = ukey.filter_clauses.iter().any(crate::unified_cache::is_time_bucket_clause);
             // Brief lock 1: read capacity config + allocate meta_id.
+            // Use allocate_meta_id_with_clauses so compound clauses (And/Or/Not)
+            // get registered under their real leaf field names in the meta-index,
+            // not just FieldKey("") from the canonical representation (B4).
             let (initial_cap, max_cap, meta_id) = {
                 let uc = &self.unified_cache;
                 let (i, m) = uc.capacity_config();
-                let id = uc.allocate_meta_id(&ukey);
+                let id = uc.allocate_meta_id_with_clauses(&ukey, &original_clauses);
                 (i, m, id)
             };
             // Unlocked: build the entry (the expensive part).

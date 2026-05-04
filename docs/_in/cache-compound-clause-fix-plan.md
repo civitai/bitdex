@@ -134,10 +134,10 @@ Zero correctness risk. Standalone-mergeable.
 ### B4 — Commit 4. Recursive meta-index registration + slot-gather fix
 **Reviewer flagged Partial 1: meta-index fix alone is no-op without also fixing the slot-gather loop.**
 
-- [ ] `meta_index.rs::register` + `register_with_id` — walk inner FilterClause leaf fields recursively. Register every leaf `FieldKey`.
-- [ ] **Critical:** Cannot rely on `CanonicalClause` alone for inner-field discovery (compound canonical has flat `value_repr`). Must take the `FilterClause` tree as a separate input — extend `register` signature to take `Option<&[FilterClause]>` for the original tree, fall back to canonical-only behavior if absent (test paths).
-- [ ] **Slot-gather loop in `collect_filter_work`** (line 1845-1851 area): replace `changed_slots_per_field.get(clause.field.as_str())` with a leaf-field walk over the entry's `original_filter_clauses`. Test: mutate `baseModel` for slot 42, confirm `slots_to_check` includes 42 for an entry with `Not(And(In(baseModel), ...))`.
-- [ ] Same fix in any other site that iterates `key.filter_clauses` to determine field coverage.
+- [x] `meta_index.rs::register` + `register_with_id` — walk inner FilterClause leaf fields recursively. Register every leaf `FieldKey`.
+- [x] **Critical:** Cannot rely on `CanonicalClause` alone for inner-field discovery (compound canonical has flat `value_repr`). Must take the `FilterClause` tree as a separate input — extend `register` signature to take `Option<&[FilterClause]>` for the original tree, fall back to canonical-only behavior if absent (test paths).
+- [x] **Slot-gather loop in `collect_filter_work`** (line 1845-1851 area): replace `changed_slots_per_field.get(clause.field.as_str())` with a leaf-field walk over the entry's `original_filter_clauses`. Test: mutate `baseModel` for slot 42, confirm `slots_to_check` includes 42 for an entry with `Not(And(In(baseModel), ...))`.
+- [x] Same fix in any other site that iterates `key.filter_clauses` to determine field coverage. Also fixed `affected_ids` collection in `collect_filter_work`: `!field_in_canonical` condition now admits compound entries found via leaf-field registration that had no direct canonical-clause match.
 
 ### B5 — Commit 6. Prefetch worker fix
 - [ ] `concurrent_engine.rs:3249-3251` — replace `filter_map(to_filter_clause)` round-trip with direct `entry.original_filter_clauses.clone()` lookup.
