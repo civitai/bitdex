@@ -100,6 +100,27 @@ pub struct Metrics {
     pub docstore_put_batch_fast_path_total: IntGaugeVec,
     pub docstore_put_batch_slow_path_total: IntGaugeVec,
 
+    // -- Compound-clause cache maintenance observability (Commit 1, A3) --
+    /// Per-entry compound-clause evaluation latency in microseconds.
+    /// Buckets span 1μs (trivial) → 10ms (budget limit). Populated from
+    /// Commit 3 (B2) once native FilterClause eval is wired.
+    // TODO(plan A5): add Prom alert in monitoring repo: cache_entries_needs_rebuild > 0 for > 5m
+    pub cache_maint_compound_eval_us: HistogramVec,
+    /// Current count of cache entries containing a `__prefilter` clause.
+    /// Sampled at scrape time alongside other cache_* gauges.
+    pub cache_substituted_entries: IntGaugeVec,
+    /// Conservative skip counter: incremented when slot_matches_clause hits a
+    /// fall-through arm rather than explicitly evaluating the clause. Buckets by
+    /// reason so we can distinguish compound_and, compound_or, compound_not,
+    /// isnull, isnotnull, unknown_op. Must read zero in prod after B2 ships.
+    pub cache_maint_conservative_total: IntCounterVec,
+    /// Incremented when an `In`-arm string value can't be resolved to a u64 key
+    /// (requires StringMaps/FieldDictionary not yet threaded). Goes to zero after B2.
+    pub cache_maint_string_lookup_miss_total: IntCounter,
+    /// Current count of entries with at least one canonical clause whose op is
+    /// one of: and, or, not, isnull, isnotnull. Sampled at scrape time.
+    pub cache_entries_compound_clause_count: IntGaugeVec,
+
     // -- Tier 2: Lazy loading --
     pub lazy_load_duration_seconds: HistogramVec,
     pub pending_fields: IntGaugeVec,
@@ -1039,6 +1060,45 @@ impl Metrics {
             &["phase"],
         ).unwrap();
 
+        // Compound-clause cache maintenance observability (Commit 1, A3)
+        let cache_maint_compound_eval_us = HistogramVec::new(
+            HistogramOpts::new(
+                "bitdex_cache_maint_compound_eval_us",
+                "Per-entry compound-clause evaluation latency (microseconds). Populated after B2.",
+            )
+            .buckets(vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10_000.0]),
+            &["index"],
+        ).unwrap();
+
+        let cache_substituted_entries = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_substituted_entries",
+                "Cache entries containing a __prefilter clause (sampled at scrape)",
+            ),
+            &["index"],
+        ).unwrap();
+
+        let cache_maint_conservative_total = IntCounterVec::new(
+            Opts::new(
+                "bitdex_cache_maint_conservative_total",
+                "Conservative skip count by reason: compound_and|compound_or|compound_not|isnull|isnotnull|unknown_op. Must be 0 in prod after B2.",
+            ),
+            &["reason"],
+        ).unwrap();
+
+        let cache_maint_string_lookup_miss_total = IntCounter::new(
+            "bitdex_cache_maint_string_lookup_miss_total",
+            "In-arm string value unresolvable to u64 key. Goes to zero after B2 threads StringMaps.",
+        ).unwrap();
+
+        let cache_entries_compound_clause_count = IntGaugeVec::new(
+            Opts::new(
+                "bitdex_cache_entries_compound_clause_count",
+                "Cache entries with at least one compound clause (and/or/not/isnull/isnotnull). Sampled at scrape.",
+            ),
+            &["index"],
+        ).unwrap();
+
         // Register all metrics
         registry.register(Box::new(alive_documents.clone())).unwrap();
         registry.register(Box::new(slot_high_water.clone())).unwrap();
@@ -1194,6 +1254,11 @@ impl Metrics {
         registry.register(Box::new(query_op_set_rejected_total.clone())).unwrap();
         registry.register(Box::new(query_op_set_applied_slots_total.clone())).unwrap();
         registry.register(Box::new(boot_phase_seconds.clone())).unwrap();
+        registry.register(Box::new(cache_maint_compound_eval_us.clone())).unwrap();
+        registry.register(Box::new(cache_substituted_entries.clone())).unwrap();
+        registry.register(Box::new(cache_maint_conservative_total.clone())).unwrap();
+        registry.register(Box::new(cache_maint_string_lookup_miss_total.clone())).unwrap();
+        registry.register(Box::new(cache_entries_compound_clause_count.clone())).unwrap();
 
         Self {
             registry,
@@ -1321,6 +1386,11 @@ impl Metrics {
             wal_apply_batch_seconds,
             bitmap_mem_scan_tick_seconds,
             boot_phase_seconds,
+            cache_maint_compound_eval_us,
+            cache_substituted_entries,
+            cache_maint_conservative_total,
+            cache_maint_string_lookup_miss_total,
+            cache_entries_compound_clause_count,
         }
     }
 

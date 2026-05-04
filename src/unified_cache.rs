@@ -33,6 +33,16 @@ fn now_ms() -> u64 {
 use roaring::RoaringBitmap;
 use crate::bound_store::ShardKey;
 use crate::cache::CanonicalClause;
+
+/// Returns true when `c` is a genuine time-bucket clause (e.g. `sortAt:bucket:7d`).
+///
+/// `op == "bucket"` alone is not sufficient: `prefilter.rs::substitute` injects a
+/// `BucketBitmap { field: "__prefilter", … }` clause that also canonicalises to
+/// `op = "bucket"`. Those prefilter-substituted entries must NOT enter the time-bucket
+/// diff path, so we gate on `field != "__prefilter"` as the sentinel exclusion.
+pub fn is_time_bucket_clause(c: &CanonicalClause) -> bool {
+    c.op == "bucket" && c.field != "__prefilter"
+}
 use crate::filter::FilterIndex;
 use crate::meta_index::{CacheEntryId, MetaIndex};
 use crate::query::SortDirection;
@@ -873,7 +883,7 @@ impl UnifiedCache {
             Some(key.direction),
         );
         let direction = key.direction;
-        let uses_bucket = key.filter_clauses.iter().any(|c| c.op == "bucket");
+        let uses_bucket = key.filter_clauses.iter().any(is_time_bucket_clause);
         let cfg = self.config.load();
         let mut entry = UnifiedEntry::new(
             sorted_slots,
@@ -1122,6 +1132,25 @@ impl UnifiedCache {
                 min_tracked_value: entry.min_tracked_value,
             }
         }).collect()
+    }
+    /// Count entries by clause type for scrape-time gauges (A3).
+    ///
+    /// Returns `(substituted, compound)` where:
+    /// - `substituted` = entries with a `__prefilter` clause (op="bucket", field="__prefilter")
+    /// - `compound` = entries with at least one op ∈ {and, or, not, isnull, isnotnull}
+    pub fn count_by_clause_type(&self) -> (u64, u64) {
+        let mut substituted = 0u64;
+        let mut compound = 0u64;
+        for r in self.entries.iter() {
+            let clauses = &r.key().filter_clauses;
+            let has_prefilter = clauses.iter().any(|c| c.field == "__prefilter" && c.op == "bucket");
+            let has_compound = clauses.iter().any(|c| {
+                matches!(c.op.as_str(), "and" | "or" | "not" | "isnull" | "isnotnull")
+            });
+            if has_prefilter { substituted += 1; }
+            if has_compound { compound += 1; }
+        }
+        (substituted, compound)
     }
     /// Reset hit/miss counters without clearing entries.
     pub fn reset_counters(&self) {
@@ -1931,11 +1960,17 @@ impl UnifiedCache {
             if entry.needs_rebuild() {
                 continue;
             }
+            let mut modified = false;
             if !result.adds.is_empty() {
                 entry.add_slots_bulk(&result.adds);
+                modified = true;
             }
             if !result.removes.is_empty() {
                 entry.remove_slots_bulk(&result.removes);
+                modified = true;
+            }
+            if modified {
+                self.record_update();
             }
         }
     }
@@ -1968,6 +2003,35 @@ impl UnifiedCache {
             }
         }
         self.invalidations.fetch_add(count, Ordering::Relaxed);
+        count
+    }
+    /// Invalidate every cache entry that referenced a prefilter by name.
+    ///
+    /// When a prefilter is removed from the registry, any entry whose
+    /// `BucketBitmap{field:"__prefilter", bucket_name}` clause referenced it
+    /// is now holding a dangling bitmap pointer.  Mark them for rebuild so the
+    /// slow path re-evaluates against the live index on the next read.
+    ///
+    /// Returns the number of entries flagged.
+    pub fn invalidate_prefilter(&self, name: &str) -> u64 {
+        let ids: Option<roaring::RoaringBitmap> = {
+            let meta = self.meta.read();
+            // "__prefilter" clauses canonicalise to op="bucket", value=name.
+            meta.entries_for_clause("__prefilter", "bucket", name).cloned()
+        };
+        let Some(ids) = ids else { return 0 };
+        let mut count = 0u64;
+        for id in ids.iter() {
+            if let Some(key) = self.meta_id_to_key.get(&id) {
+                if let Some(entry) = self.entries.get(key.value()) {
+                    entry.value().mark_for_rebuild();
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            self.invalidations.fetch_add(count, Ordering::Relaxed);
+        }
         count
     }
     // ── Time Bucket Diff Integration (Phase 4) ─────────────────────────────
@@ -4269,5 +4333,138 @@ mod tests {
             entry.bitmap().contains(1),
             "slot 1 (in 24h bucket) must remain in the cache entry"
         );
+    }
+
+    // ── A1 tests: is_time_bucket_clause helper ────────────────────────────
+
+    #[test]
+    fn test_is_time_bucket_clause_prefilter_excluded() {
+        // A prefilter-substituted clause (field="__prefilter") must NOT be treated
+        // as a time-bucket clause — it must not enter the bucket-diff path.
+        let c = CanonicalClause {
+            field: "__prefilter".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "auto_xxx".to_string(),
+        };
+        assert!(
+            !crate::unified_cache::is_time_bucket_clause(&c),
+            "prefilter sentinel (field=__prefilter) must return false"
+        );
+    }
+
+    #[test]
+    fn test_is_time_bucket_clause_real_bucket() {
+        // A genuine time-bucket clause (field = sort field name) must return true.
+        let c = CanonicalClause {
+            field: "sortAt".to_string(),
+            op: "bucket".to_string(),
+            value_repr: "7d".to_string(),
+        };
+        assert!(
+            crate::unified_cache::is_time_bucket_clause(&c),
+            "sortAt:bucket:7d must return true"
+        );
+    }
+
+    #[test]
+    fn test_uses_bucket_false_for_prefilter_substituted_entry() {
+        // An entry formed with a __prefilter clause must have uses_bucket=false.
+        let mut cache = UnifiedCache::new(make_config());
+        // Simulates what prefilter.rs::substitute produces canonically
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "__prefilter".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "auto_safe".to_string(),
+            }],
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+        };
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+        let entry = cache.get(&key).unwrap();
+        assert!(!entry.uses_bucket(), "prefilter-substituted entry must have uses_bucket=false");
+    }
+
+    #[test]
+    fn test_uses_bucket_true_for_time_bucket_entry() {
+        // An entry formed with a genuine sortAt:bucket:7d clause must have uses_bucket=true.
+        let mut cache = UnifiedCache::new(make_config());
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "sortAt".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "7d".to_string(),
+            }],
+            sort_field: "sortAt".to_string(),
+            direction: SortDirection::Desc,
+        };
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+        let entry = cache.get(&key).unwrap();
+        assert!(entry.uses_bucket(), "genuine sortAt:bucket:7d entry must have uses_bucket=true");
+    }
+
+    // ── A2 tests: invalidate_prefilter hook ───────────────────────────────
+
+    #[test]
+    fn test_invalidate_prefilter_marks_referencing_entry() {
+        // Form a cache entry that references a __prefilter clause with name "safe".
+        // Calling invalidate_prefilter("safe") must mark that entry needs_rebuild=true.
+        let mut cache = UnifiedCache::new(make_config());
+        let key = UnifiedKey {
+            filter_clauses: vec![CanonicalClause {
+                field: "__prefilter".to_string(),
+                op: "bucket".to_string(),
+                value_repr: "safe".to_string(),
+            }],
+            sort_field: "reactionCount".to_string(),
+            direction: SortDirection::Desc,
+        };
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        // Sanity: not flagged before invalidation
+        assert!(!cache.get(&key).unwrap().needs_rebuild());
+
+        let count = cache.invalidate_prefilter("safe");
+        assert_eq!(count, 1, "exactly one entry should be flagged");
+        assert!(
+            cache.get(&key).unwrap().needs_rebuild(),
+            "entry must be marked needs_rebuild after invalidate_prefilter"
+        );
+    }
+
+    #[test]
+    fn test_invalidate_prefilter_nonexistent_name_is_noop() {
+        let mut cache = UnifiedCache::new(make_config());
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        let count = cache.invalidate_prefilter("does_not_exist");
+        assert_eq!(count, 0, "no entries should be flagged for a name that was never registered");
+        assert!(!cache.get(&key).unwrap().needs_rebuild());
+    }
+
+    // ── A3 tests: apply_maintenance_results increments updates counter ────
+
+    #[test]
+    fn test_apply_maintenance_results_increments_updates() {
+        let config = make_config();
+        let cache = UnifiedCache::new(config);
+        let key = make_key(&[("nsfwLevel", "eq", "1")], "reactionCount", SortDirection::Desc);
+        let slots: Vec<u32> = (0..10).collect();
+        cache.form_and_store(key.clone(), &slots, false, 10, |s| s);
+
+        let before = cache.stats().updates;
+        let results = vec![crate::unified_cache::CacheMaintenanceResult {
+            key: key.clone(),
+            adds: vec![(99u32, 500u32)],
+            removes: vec![],
+        }];
+        cache.apply_maintenance_results(&results);
+        let after = cache.stats().updates;
+        assert!(after > before, "updates counter must increment after apply_maintenance_results with non-empty adds");
     }
 }

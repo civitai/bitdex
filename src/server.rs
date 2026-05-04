@@ -1531,6 +1531,7 @@ impl BitdexServer {
             .route("/api/indexes/{name}/snapshot", post(handle_save_snapshot))
             .route("/api/indexes/{name}/cursors/{cursor_name}", put(handle_set_cursor))
             // Capture endpoints (Phase 2)
+            .route("/api/indexes/{name}/cache/entry", get(handle_cache_entry_inspect))
             .route("/api/indexes/{name}/prefilters", get(handle_list_prefilters).post(handle_register_prefilter))
             .route("/api/indexes/{name}/prefilters/{prefilter_name}", delete(handle_remove_prefilter))
             .route("/api/indexes/{name}/prefilters/refresh", post(handle_refresh_prefilters))
@@ -3940,6 +3941,128 @@ async fn handle_refresh_prefilters(
 }
 
 // ---------------------------------------------------------------------------
+// Handlers: Cache entry diagnostic
+// ---------------------------------------------------------------------------
+
+/// Query params for GET /api/indexes/{name}/cache/entry
+#[derive(Deserialize, Default)]
+struct CacheEntryParams {
+    /// URL-encoded JSON array of FilterClause (same format as query `filters`)
+    filters: Option<String>,
+    sort_field: Option<String>,
+    direction: Option<String>,
+}
+
+async fn handle_cache_entry_inspect(
+    State(state): State<SharedState>,
+    AxumPath(name): AxumPath<String>,
+    AxumQuery(params): AxumQuery<CacheEntryParams>,
+) -> impl IntoResponse {
+    use crate::cache::{canonicalize, CanonicalClause};
+    use crate::query::{FilterClause, SortDirection};
+    use crate::unified_cache::{is_time_bucket_clause, UnifiedKey};
+
+    let engine = {
+        let guard = state.index.lock();
+        match guard.as_ref() {
+            Some(idx) if idx.definition.name == name => Arc::clone(&idx.engine),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Index '{}' not found", name)})),
+                ).into_response();
+            }
+        }
+    };
+
+    // Parse filters from URL-encoded JSON array
+    let filter_clauses: Vec<FilterClause> = match &params.filters {
+        Some(json_str) => match serde_json::from_str(json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Invalid filters JSON: {e}")})),
+                ).into_response();
+            }
+        },
+        None => vec![],
+    };
+
+    // Canonicalize
+    let canonical = match canonicalize(&filter_clauses) {
+        Some(c) => c,
+        None => vec![],
+    };
+
+    // Parse direction
+    let direction = match params.direction.as_deref().unwrap_or("Desc") {
+        "Asc" | "asc" => SortDirection::Asc,
+        _ => SortDirection::Desc,
+    };
+
+    let key = UnifiedKey {
+        filter_clauses: canonical.clone(),
+        sort_field: params.sort_field.unwrap_or_default(),
+        direction,
+    };
+
+    let uses_bucket = canonical.iter().any(is_time_bucket_clause);
+    let clause_json: Vec<_> = canonical.iter().map(|c: &CanonicalClause| {
+        serde_json::json!({"field": c.field, "op": c.op, "value": c.value_repr})
+    }).collect();
+
+    // Extract entry data under the dashmap shard lock, then drop the Ref
+    // before engine is dropped (Ref borrows engine's unified_cache).
+    let entry_data = {
+        let uc = engine.unified_cache_ref();
+        uc.get(&key).map(|entry| {
+            (
+                entry.cardinality(),
+                entry.total_matched(),
+                entry.capacity(),
+                entry.max_capacity(),
+                entry.needs_rebuild(),
+                entry.bucket_cutoff(),
+                entry.last_used_ms(),
+                format!("{:?}", entry.direction()),
+                entry.is_persist_dirty(),
+                entry.sorted_keys().map(|k| k.len()).unwrap_or(0),
+                entry.radix().is_some(),
+                entry.has_more(),
+            )
+        })
+    };
+
+    match entry_data {
+        Some((bitmap_len, total_matched, capacity, max_capacity, needs_rebuild,
+              bucket_cutoff, last_used_ms, direction_str, persist_dirty,
+              sorted_keys_len, has_radix, has_more)) => {
+            Json(serde_json::json!({
+                "filter_clauses": clause_json,
+                "bitmap_len": bitmap_len,
+                "total_matched": total_matched,
+                "capacity": capacity,
+                "max_capacity": max_capacity,
+                "needs_rebuild": needs_rebuild,
+                "uses_bucket": uses_bucket,
+                "bucket_cutoff": bucket_cutoff,
+                "last_used_ms": last_used_ms,
+                "direction": direction_str,
+                "persist_dirty": persist_dirty,
+                "sorted_keys_len": sorted_keys_len,
+                "has_radix": has_radix,
+                "has_more": has_more,
+            })).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "cache entry not found for the given key"})),
+        ).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handlers: Rebuild
 // ---------------------------------------------------------------------------
 
@@ -5062,6 +5185,18 @@ async fn handle_metrics(State(state): State<SharedState>) -> impl IntoResponse {
             m.cache_prefetch_total
                 .with_label_values(&[name])
                 .set(uc.prefetches as i64);
+
+            // Compound-clause cache entry gauges (A3).
+            // Walk entries once and count substituted + compound entries.
+            {
+                let (substituted, compound) = engine.unified_cache_entry_counts();
+                m.cache_substituted_entries
+                    .with_label_values(&[name])
+                    .set(substituted as i64);
+                m.cache_entries_compound_clause_count
+                    .with_label_values(&[name])
+                    .set(compound as i64);
+            }
 
             // Per-field bitmap memory gauges.
             // Uses cached scanner totals instead of iterating all bitmaps (52s at 107M).

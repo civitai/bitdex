@@ -3600,6 +3600,15 @@ impl ConcurrentEngine {
     pub fn bitmap_memory_cache(&self) -> &crate::bitmap_memory_cache::BitmapMemoryCache {
         &self.bitmap_memory_cache
     }
+    /// Count cache entries by clause type for scrape-time gauges (A3).
+    /// Returns (substituted_entries, compound_clause_entries).
+    pub fn unified_cache_entry_counts(&self) -> (u64, u64) {
+        self.unified_cache.count_by_clause_type()
+    }
+    /// Access the unified cache for diagnostic reads (A4).
+    pub fn unified_cache_ref(&self) -> &UnifiedCache {
+        &self.unified_cache
+    }
     /// Get the cumulative count of compaction operations skipped due to channel backpressure.
     pub fn compaction_skipped_count(&self) -> u64 {
         self.compaction_skipped.load(Ordering::Relaxed)
@@ -5428,7 +5437,7 @@ impl ConcurrentEngine {
             // were the dominant remaining cache_lock_us contributor on
             // v1.0.189 (LOCK p99 ~1-2 s under load).
             let direction = ukey.direction;
-            let uses_bucket = ukey.filter_clauses.iter().any(|c| c.op == "bucket");
+            let uses_bucket = ukey.filter_clauses.iter().any(crate::unified_cache::is_time_bucket_clause);
             // Brief lock 1: read capacity config + allocate meta_id.
             let (initial_cap, max_cap, meta_id) = {
                 let uc = &self.unified_cache;
@@ -6266,8 +6275,16 @@ impl ConcurrentEngine {
     }
 
     /// Remove a prefilter by name. Returns true if it existed.
+    ///
+    /// After removal, any cache entry whose filter included this prefilter
+    /// holds a dangling bitmap reference. Mark those entries for rebuild so
+    /// the slow path regenerates them on the next read.
     pub fn remove_prefilter(&self, name: &str) -> bool {
-        self.prefilter_registry.remove(name)
+        let removed = self.prefilter_registry.remove(name);
+        if removed {
+            self.unified_cache.invalidate_prefilter(name);
+        }
+        removed
     }
 
     /// Number of filter + sort fields still pending lazy load.
