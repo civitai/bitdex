@@ -5,6 +5,12 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
+/// Default value for the skipped `BucketBitmap::bitmap` field on deserialization.
+/// The Arc contains an empty bitmap; callers must re-resolve via `resolve_bucket_clauses`.
+fn default_empty_arc_bitmap() -> Arc<RoaringBitmap> {
+    Arc::new(RoaringBitmap::new())
+}
+
 /// A parsed query ready for execution by the bitmap engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BitdexQuery {
@@ -53,12 +59,14 @@ pub enum FilterClause {
     /// - `bucket_name` — the human-readable bucket name (e.g. "7d"), used as the stable cache key
     /// - `bitmap` — the pre-computed roaring bitmap for the bucket
     ///
-    /// This variant is produced internally by `snap_range_clauses` and is never serialized
-    /// to or from user-facing query input.
-    #[serde(skip)]
+    /// This variant is produced internally by `snap_range_clauses`. It serializes with
+    /// `field` + `bucket_name` preserved for persistence (meta.bin V2), but `bitmap` is
+    /// skipped — the Arc is never persisted. On deserialization the bitmap defaults to an
+    /// empty Arc; callers must re-resolve via `resolve_bucket_clauses` at restore time.
     BucketBitmap {
         field: String,
         bucket_name: String,
+        #[serde(skip, default = "default_empty_arc_bitmap")]
         bitmap: Arc<RoaringBitmap>,
     },
 }

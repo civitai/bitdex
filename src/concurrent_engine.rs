@@ -684,6 +684,13 @@ impl ConcurrentEngine {
                                 .map(|e| (e.entry_id, e.total_matched))
                                 .collect();
                             uc.set_meta_total_matched(total_matched_map);
+                            // Store original FilterClause trees (V2 only; V1 entries have Vec::new()).
+                            let original_fc_map: HashMap<crate::meta_index::CacheEntryId, Vec<crate::query::FilterClause>> = meta.entries
+                                .iter()
+                                .filter(|e| !e.original_filter_clauses.is_empty())
+                                .map(|e| (e.entry_id, e.original_filter_clauses.clone()))
+                                .collect();
+                            uc.set_meta_original_filter_clauses(original_fc_map);
                             // Record pending shards from registered entries
                             let mut shard_keys = HashSet::new();
                             for entry in &meta.entries {
@@ -4622,12 +4629,15 @@ impl ConcurrentEngine {
             let boundstore_entries_restored = Arc::clone(&self.boundstore_entries_restored);
             let boundstore_shard_loads = Arc::clone(&self.boundstore_shard_loads);
             let boundstore_entries_skipped = Arc::clone(&self.boundstore_entries_skipped);
+            let time_buckets_clone = self.time_buckets.as_ref().map(Arc::clone);
+            let prefilter_registry_clone = Arc::clone(&self.prefilter_registry);
             std::thread::Builder::new()
                 .name(format!("shard-load-{}_{:?}", sort_field, direction))
                 .spawn(move || {
                     Self::load_shard_background(
                         &bs, &uc_arc, &inner, &sort_field, direction,
                         &boundstore_entries_restored, &boundstore_shard_loads, &boundstore_entries_skipped,
+                        time_buckets_clone, prefilter_registry_clone,
                     );
                 })
                 .map_err(|e| {
@@ -4647,6 +4657,8 @@ impl ConcurrentEngine {
         boundstore_entries_restored: &Arc<AtomicU64>,
         boundstore_shard_loads: &Arc<AtomicU64>,
         boundstore_entries_skipped: &Arc<AtomicU64>,
+        time_buckets: Option<Arc<ArcSwap<TimeBucketManager>>>,
+        prefilter_registry: Arc<crate::prefilter::PrefilterRegistry>,
     ) {
             let t0 = std::time::Instant::now();
             let shard_key = crate::bound_store::ShardKey::new(
@@ -4659,8 +4671,12 @@ impl ConcurrentEngine {
                     let snap = inner.load();
                     let sf = snap.sorts.get_field(sort_field);
                     let uc = &**uc_arc;
+                    // Load TimeBucketManager snapshot once for BucketBitmap re-resolve.
+                    let tb_guard = time_buckets.as_ref().map(|tb| tb.load_full());
+                    let tb_ref: Option<&TimeBucketManager> = tb_guard.as_deref();
                     let mut loaded = 0usize;
                     let mut skipped = 0usize;
+                    let mut tombstoned_unresolvable = 0usize;
                     uc.begin_restore();
                     let config = uc.config();
                     for se in shard_entries {
@@ -4682,23 +4698,72 @@ impl ConcurrentEngine {
                         let value_fn = |slot: u32| -> u32 {
                             sf.map(|f| f.reconstruct_value(slot)).unwrap_or(0)
                         };
-                        let entry = UnifiedEntry::from_restored(
-                            se.bitmap,
-                            se.entry_id,
-                            config.initial_capacity,
-                            config.max_capacity,
-                            direction,
-                            se.sorted_keys,
-                            &value_fn,
-                            has_more,
-                            persisted_total,
-                        );
+                        // Fetch persisted original FilterClause tree (V2 meta.bin only).
+                        let mut original_clauses = uc.get_meta_original_filter_clauses(se.entry_id);
+                        let entry = if !original_clauses.is_empty() {
+                            // Re-resolve BucketBitmap Arcs from live engine state.
+                            let all_resolved = resolve_bucket_clauses(
+                                &mut original_clauses,
+                                tb_ref,
+                                &prefilter_registry,
+                            );
+                            if !all_resolved {
+                                // Some bucket names are gone (bucket config changed, prefilter
+                                // evicted). Mark for rebuild so the next read re-forms correctly.
+                                tombstoned_unresolvable += 1;
+                                let mut entry = UnifiedEntry::from_restored(
+                                    se.bitmap,
+                                    se.entry_id,
+                                    config.initial_capacity,
+                                    config.max_capacity,
+                                    direction,
+                                    se.sorted_keys,
+                                    &value_fn,
+                                    has_more,
+                                    persisted_total,
+                                );
+                                entry.mark_for_rebuild();
+                                entry
+                            } else {
+                                UnifiedEntry::from_restored_with_clauses(
+                                    se.bitmap,
+                                    se.entry_id,
+                                    config.initial_capacity,
+                                    config.max_capacity,
+                                    direction,
+                                    se.sorted_keys,
+                                    &value_fn,
+                                    has_more,
+                                    persisted_total,
+                                    Arc::new(original_clauses),
+                                )
+                            }
+                        } else {
+                            // V1 meta.bin or entry with no persisted FC tree — legacy path.
+                            UnifiedEntry::from_restored(
+                                se.bitmap,
+                                se.entry_id,
+                                config.initial_capacity,
+                                config.max_capacity,
+                                direction,
+                                se.sorted_keys,
+                                &value_fn,
+                                has_more,
+                                persisted_total,
+                            )
+                        };
                         uc.insert_restored_entry(key, entry);
                         loaded += 1;
                         boundstore_entries_restored.fetch_add(1, Ordering::Relaxed);
                     }
                     uc.finish_restore();
                     uc.mark_shard_loaded(sort_field, direction);
+                    if tombstoned_unresolvable > 0 {
+                        tracing::info!(
+                            "BoundStore: tombstoned {tombstoned_unresolvable} entries (unresolvable BucketBitmap clauses) in shard {}_{:?}",
+                            sort_field, direction,
+                        );
+                    }
                     boundstore_shard_loads.fetch_add(1, Ordering::Relaxed);
                     boundstore_entries_skipped.fetch_add(skipped as u64, Ordering::Relaxed);
                     let total_elapsed = t0.elapsed();
@@ -8823,6 +8888,91 @@ impl Drop for ConcurrentEngine {
         self.shutdown();
     }
 }
+
+// ── BucketBitmap restore helpers ─────────────────────────────────────────────
+//
+// These free functions are `pub(crate)` so `#[cfg(test)]` modules can test them
+// directly without spawning a full ConcurrentEngine.
+
+/// Re-resolve `BucketBitmap` clauses from live engine state after deserialization.
+///
+/// `BucketBitmap::bitmap` is skipped on msgpack serialize (the Arc can't cross restarts).
+/// On deserialize it defaults to an empty Arc. This helper fills it from the engine's
+/// `TimeBucketManager` or `PrefilterRegistry` by matching `bucket_name`.
+///
+/// Returns `true` if every `BucketBitmap` clause in the tree was resolved successfully.
+/// Returns `false` if any clause could not be resolved (unknown bucket name) — caller
+/// should tombstone the entry so it rebuilds on next access.
+///
+/// Non-`BucketBitmap` clauses pass through untouched. `Not`/`And`/`Or` are walked
+/// recursively. An empty `clauses` slice always returns `true` (nothing to resolve).
+pub(crate) fn resolve_bucket_clauses(
+    clauses: &mut Vec<crate::query::FilterClause>,
+    time_buckets: Option<&TimeBucketManager>,
+    prefilter_registry: &crate::prefilter::PrefilterRegistry,
+) -> bool {
+    let mut all_ok = true;
+    for c in clauses.iter_mut() {
+        resolve_bucket_clause_one(c, time_buckets, prefilter_registry, &mut all_ok);
+    }
+    all_ok
+}
+
+fn resolve_bucket_clause_one(
+    c: &mut crate::query::FilterClause,
+    time_buckets: Option<&TimeBucketManager>,
+    prefilter_registry: &crate::prefilter::PrefilterRegistry,
+    all_ok: &mut bool,
+) {
+    use crate::query::FilterClause;
+    match c {
+        FilterClause::BucketBitmap { field, bucket_name, bitmap } => {
+            if field == "__prefilter" {
+                // Prefilter-substituted BucketBitmap — resolve via registry
+                if let Some(entry) = prefilter_registry.get(bucket_name) {
+                    *bitmap = entry.bitmap.load_full();
+                } else {
+                    tracing::debug!(
+                        "resolve_bucket_clauses: prefilter '{}' not in registry — tombstoning entry",
+                        bucket_name
+                    );
+                    *all_ok = false;
+                }
+            } else {
+                // Time-bucket BucketBitmap — resolve via TimeBucketManager
+                if let Some(tb) = time_buckets {
+                    if let Some(bucket) = tb.get_bucket(bucket_name) {
+                        *bitmap = Arc::clone(bucket.bitmap());
+                    } else {
+                        tracing::debug!(
+                            "resolve_bucket_clauses: time bucket '{}' not in manager — tombstoning entry",
+                            bucket_name
+                        );
+                        *all_ok = false;
+                    }
+                } else {
+                    // No TimeBucketManager configured — can't resolve time-bucket clause
+                    tracing::debug!(
+                        "resolve_bucket_clauses: time bucket '{}' present but no TimeBucketManager — tombstoning entry",
+                        bucket_name
+                    );
+                    *all_ok = false;
+                }
+            }
+        }
+        FilterClause::Not(inner) => {
+            resolve_bucket_clause_one(inner, time_buckets, prefilter_registry, all_ok);
+        }
+        FilterClause::And(parts) | FilterClause::Or(parts) => {
+            for p in parts.iter_mut() {
+                resolve_bucket_clause_one(p, time_buckets, prefilter_registry, all_ok);
+            }
+        }
+        // All leaf clauses without a bitmap Arc pass through.
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12403,5 +12553,159 @@ mod tests {
         }
 
         engine.shutdown();
+    }
+
+    // ── B8: resolve_bucket_clauses tests ────────────────────────────────
+
+    fn make_time_bucket_manager_with(bucket_name: &str, slots: &[u32]) -> TimeBucketManager {
+        use crate::config::BucketConfig;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut tb = TimeBucketManager::new(
+            "sortAt".to_string(),
+            vec![BucketConfig {
+                name: bucket_name.to_string(),
+                duration_secs: 7 * 86400,
+                refresh_interval_secs: 300,
+            }],
+        );
+        let mut bm = RoaringBitmap::new();
+        for &s in slots {
+            bm.insert(s);
+        }
+        tb.rebuild_bucket_from_bitmap(bucket_name, bm, now);
+        tb
+    }
+
+    fn make_prefilter_registry_with(name: &str, slots: &[u32]) -> crate::prefilter::PrefilterRegistry {
+        let reg = crate::prefilter::PrefilterRegistry::new();
+        let mut bm = RoaringBitmap::new();
+        for &s in slots {
+            bm.insert(s);
+        }
+        // insert() requires at least one clause — use a minimal placeholder
+        let dummy_clause = vec![FilterClause::IsNotNull("__placeholder".to_string())];
+        let _ = reg.insert(name.to_string(), dummy_clause, bm, 300, 0);
+        reg
+    }
+
+    /// A BucketBitmap referencing a known time bucket is resolved to a non-empty Arc.
+    #[test]
+    fn test_resolve_bucket_clauses_re_resolves_time_bucket() {
+        let tb = make_time_bucket_manager_with("7d", &[10, 20, 30]);
+        let pf = crate::prefilter::PrefilterRegistry::new();
+
+        let mut clauses = vec![FilterClause::BucketBitmap {
+            field: "sortAt".to_string(),
+            bucket_name: "7d".to_string(),
+            bitmap: Arc::new(RoaringBitmap::new()), // empty — simulates post-deserialize state
+        }];
+
+        let ok = resolve_bucket_clauses(&mut clauses, Some(&tb), &pf);
+        assert!(ok, "resolve should succeed when bucket exists");
+
+        match &clauses[0] {
+            FilterClause::BucketBitmap { bitmap, .. } => {
+                assert!(!bitmap.is_empty(), "bitmap should be non-empty after resolve");
+                assert!(bitmap.contains(10));
+                assert!(bitmap.contains(20));
+            }
+            other => panic!("expected BucketBitmap, got {other:?}"),
+        }
+    }
+
+    /// A BucketBitmap with field="__prefilter" is resolved via PrefilterRegistry.
+    #[test]
+    fn test_resolve_bucket_clauses_re_resolves_prefilter() {
+        let tb = make_time_bucket_manager_with("7d", &[]);
+        let pf = make_prefilter_registry_with("safe", &[100, 200, 300]);
+
+        let mut clauses = vec![FilterClause::BucketBitmap {
+            field: "__prefilter".to_string(),
+            bucket_name: "safe".to_string(),
+            bitmap: Arc::new(RoaringBitmap::new()), // empty
+        }];
+
+        let ok = resolve_bucket_clauses(&mut clauses, Some(&tb), &pf);
+        assert!(ok, "resolve should succeed when prefilter exists");
+
+        match &clauses[0] {
+            FilterClause::BucketBitmap { bitmap, .. } => {
+                assert!(!bitmap.is_empty(), "bitmap should be non-empty after resolve");
+                assert!(bitmap.contains(100));
+            }
+            other => panic!("expected BucketBitmap, got {other:?}"),
+        }
+    }
+
+    /// A BucketBitmap referencing an unknown bucket name returns false — caller tombstones.
+    #[test]
+    fn test_resolve_bucket_clauses_unresolved_returns_false() {
+        let tb = make_time_bucket_manager_with("7d", &[10]);
+        let pf = crate::prefilter::PrefilterRegistry::new();
+
+        let mut clauses = vec![FilterClause::BucketBitmap {
+            field: "sortAt".to_string(),
+            bucket_name: "unknown_bucket".to_string(), // does not exist in manager
+            bitmap: Arc::new(RoaringBitmap::new()),
+        }];
+
+        let ok = resolve_bucket_clauses(&mut clauses, Some(&tb), &pf);
+        assert!(!ok, "resolve should fail when bucket name is unknown");
+    }
+
+    /// Leaf clauses (Eq, In, IsNotNull) pass through untouched — all_ok stays true.
+    #[test]
+    fn test_resolve_bucket_clauses_leaf_clauses_pass_through() {
+        let pf = crate::prefilter::PrefilterRegistry::new();
+        let mut clauses = vec![
+            FilterClause::Eq("nsfwLevel".to_string(), crate::query::Value::Integer(1)),
+            FilterClause::In(
+                "baseModel".to_string(),
+                vec![crate::query::Value::Integer(42)],
+            ),
+            FilterClause::IsNotNull("postId".to_string()),
+        ];
+        let original = clauses.clone();
+
+        let ok = resolve_bucket_clauses(&mut clauses, None, &pf);
+        assert!(ok, "leaf-only clauses should always resolve successfully");
+        assert_eq!(clauses, original, "leaf clauses must not be modified");
+    }
+
+    /// resolve_bucket_clauses recurses into Not(And(...)) and resolves inner BucketBitmaps.
+    #[test]
+    fn test_resolve_bucket_clauses_recurses_into_compound() {
+        let tb = make_time_bucket_manager_with("7d", &[5, 10, 15]);
+        let pf = crate::prefilter::PrefilterRegistry::new();
+
+        let mut clauses = vec![FilterClause::Not(Box::new(FilterClause::And(vec![
+            FilterClause::BucketBitmap {
+                field: "sortAt".to_string(),
+                bucket_name: "7d".to_string(),
+                bitmap: Arc::new(RoaringBitmap::new()),
+            },
+            FilterClause::Eq("nsfwLevel".to_string(), crate::query::Value::Integer(1)),
+        ])))];
+
+        let ok = resolve_bucket_clauses(&mut clauses, Some(&tb), &pf);
+        assert!(ok);
+
+        // Verify the inner BucketBitmap was resolved
+        match &clauses[0] {
+            FilterClause::Not(inner) => match inner.as_ref() {
+                FilterClause::And(parts) => match &parts[0] {
+                    FilterClause::BucketBitmap { bitmap, .. } => {
+                        assert!(!bitmap.is_empty(), "inner BucketBitmap should be resolved");
+                        assert!(bitmap.contains(5));
+                    }
+                    other => panic!("expected BucketBitmap, got {other:?}"),
+                },
+                other => panic!("expected And, got {other:?}"),
+            },
+            other => panic!("expected Not, got {other:?}"),
+        }
     }
 }

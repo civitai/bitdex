@@ -158,12 +158,12 @@ Zero correctness risk. Standalone-mergeable.
 - [ ] Follow-up cleanup PR can delete the function entirely + migrate tests to Phase A/B/C path.
 
 ### B8 — Commit 8. meta.bin V2 + restore
-- [ ] Bump `META_VERSION = 2` (`bound_store.rs:51`).
-- [ ] Add `original_filter_clauses: Vec<FilterClause>` to `MetaEntry` (line 56). msgpack with `#[serde(default)]` if backward-read needed; otherwise rely on existing purge-on-mismatch.
-- [ ] Custom `Serialize`/`Deserialize` for `FilterClause::BucketBitmap` to drop the bitmap Arc on serialize, leave name+field. (`#[serde(skip)]` on the Arc field already covers serialize; verify deserialize default.)
-- [ ] **Restore-time BucketBitmap re-resolve:** in `BoundStore::restore` path, walk loaded `original_filter_clauses` for each `MetaEntry`. For every `BucketBitmap` clause, look up bitmap by name in `TimeBucketManager` first, then `PrefilterRegistry`. If neither found → tombstone the entry (mark for rebuild on next access).
-- [ ] Plumbing: confirm `TimeBucketManager` + `PrefilterRegistry` available at `BoundStore::restore` callsite. If not, restore signature needs them.
-- [ ] Document expected ~30s cold-cache window post-deploy in PR description.
+- [x] Bump `META_VERSION = 2` (`bound_store.rs:51`).
+- [x] Add `original_filter_clauses: Vec<FilterClause>` to `MetaEntry` (line 56). Persisted as `[u32 fc_len][u8... fc_bytes]` appended after `has_more` per entry. V1 files deserialize `original_filter_clauses` as `Vec::new()` (graceful upgrade).
+- [x] Custom `Serialize`/`Deserialize` for `FilterClause::BucketBitmap`: moved `#[serde(skip)]` from variant to `bitmap` field only (`#[serde(skip, default = "default_empty_arc_bitmap")]`). `field` + `bucket_name` round-trip; bitmap defaults to empty Arc on deserialize.
+- [x] **Restore-time BucketBitmap re-resolve:** `resolve_bucket_clauses` + `resolve_bucket_clause_one` free functions in `concurrent_engine.rs`. Called in `load_shard_background` per entry. Unresolvable → `mark_for_rebuild()` (tombstone path). `time_buckets` + `prefilter_registry` cloned at spawn site + passed through function signature.
+- [x] Plumbing: `meta_original_filter_clauses` Mutex map on `UnifiedCache` (same pattern as `meta_has_more`). Populated from meta.bin entries at startup, consumed per-entry during shard restore.
+- [x] Document expected ~30s cold-cache window post-deploy in PR description.
 
 ### B9 — Commit 9. Pathological cost safety valve (reviewer-flagged)
 **Compound `In` with high-cardinality inner values can blow `max_maintenance_ms` budget. Need fast-reject.**

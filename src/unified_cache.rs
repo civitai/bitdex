@@ -783,6 +783,9 @@ pub struct UnifiedCache {
     /// Persisted total_matched values keyed by entry ID, populated from meta.bin on startup.
     /// Consumed during shard restore to get the real total instead of bitmap cardinality.
     meta_total_matched: Mutex<HashMap<CacheEntryId, u64>>,
+    /// Persisted original FilterClause trees keyed by entry ID, from meta.bin V2.
+    /// V1 meta.bin files produce empty Vecs; shard restore falls back to legacy from_restored.
+    meta_original_filter_clauses: Mutex<HashMap<CacheEntryId, Vec<crate::query::FilterClause>>>,
     /// Cumulative count of entry expansions from initial to expanded capacity.
     extensions: AtomicU64,
     /// Cumulative count of cache wall hits (cursor past cached entries, triggering slow path).
@@ -820,6 +823,7 @@ impl UnifiedCache {
             persistence_enabled: AtomicBool::new(false),
             meta_has_more: Mutex::new(HashMap::new()),
             meta_total_matched: Mutex::new(HashMap::new()),
+            meta_original_filter_clauses: Mutex::new(HashMap::new()),
             extensions: AtomicU64::new(0),
             wall_hits: AtomicU64::new(0),
             prefetches: AtomicU64::new(0),
@@ -866,6 +870,22 @@ impl UnifiedCache {
     /// Look up persisted total_matched for a given entry ID. Falls back to 0 if not found.
     pub fn get_meta_total_matched(&self, entry_id: CacheEntryId) -> u64 {
         self.meta_total_matched.lock().get(&entry_id).copied().unwrap_or(0)
+    }
+    /// Store persisted original FilterClause trees from meta.bin V2, keyed by entry ID.
+    /// Called during startup after loading meta.bin. V1 files produce empty Vecs.
+    pub fn set_meta_original_filter_clauses(
+        &self,
+        map: HashMap<CacheEntryId, Vec<crate::query::FilterClause>>,
+    ) {
+        *self.meta_original_filter_clauses.lock() = map;
+    }
+    /// Look up persisted original FilterClause tree for a given entry ID.
+    /// Returns an empty Vec if not found (v1 meta.bin or no persisted tree).
+    pub fn get_meta_original_filter_clauses(
+        &self,
+        entry_id: CacheEntryId,
+    ) -> Vec<crate::query::FilterClause> {
+        self.meta_original_filter_clauses.lock().get(&entry_id).cloned().unwrap_or_default()
     }
     /// Look up a cache entry by key for mutation. Returns `None` on miss.
     /// Increments hit/miss counters and refreshes LRU.
