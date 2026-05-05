@@ -53,6 +53,9 @@ tar = "0.4"
 # Parallel sort / iteration
 rayon = "1"
 
+# Stack-allocated small vectors (avoids heap alloc for small paginated result sets)
+smallvec = "1"
+
 # Allocator (handles concurrent allocation much better than Windows CRT)
 rpmalloc = "0.2"
 
