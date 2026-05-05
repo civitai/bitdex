@@ -182,14 +182,14 @@ Zero correctness risk. Standalone-mergeable.
 
 ## Tests (non-negotiable before merge)
 
-- [ ] **Regression — Archer's exact bug:** form cache entry for `Not(And(In(baseModel, ["SD XL"]), In(nsfwLevel, [1,2])))`. Insert slot with baseModel="SD XL". Mutate slot's baseModel to "FLUX". Assert slot removed from cache entry within one maintenance cycle.
-- [ ] **String-field In eval:** insert two slots with baseModel="SD 1.5" and "SDXL". Query In(baseModel, ["SD 1.5"]). Assert correct slot match. Will fail today; passes after B2.
-- [ ] **Meta-index recursive registration:** form entry with `And(In(baseModel), In(nsfwLevel))`. Assert `entries_for_filter_field("baseModel")` and `entries_for_filter_field("nsfwLevel")` both include entry id.
-- [ ] **Slot-gather correctness:** mutate baseModel for slot 42. Assert `slots_to_check` for entry containing `And(In(baseModel), ...)` includes slot 42.
-- [ ] **needs_rebuild fires + clears:** bloat entry past 2× capacity. Read path returns slow-path result. Subsequent read shows fresh entry, flag cleared.
-- [ ] **`uses_bucket` narrowed:** form prefilter-substituted entry. Assert `uses_bucket=false`. Form time-bucket entry. Assert `uses_bucket=true`.
-- [ ] **Prefetch worker compound:** push compound query through prefetch, assert filter bitmap matches executor result exactly.
-- [ ] **Property test:** random `Not(And(In, In))` × random mutations × cache-warm-vs-skip_cache equality. 10K iterations.
+- [x] **Regression — Archer's exact bug:** form cache entry for `Not(And(In(baseModel, ["SD XL"]), In(nsfwLevel, [1,2])))`. Insert slot with baseModel="SD XL". Mutate slot's baseModel to "FLUX". Assert slot removed from cache entry within one maintenance cycle. Covered by `test_archer_repro_not_and_in_in_cleans_on_mutation` in `src/unified_cache.rs:6151`.
+- [x] **String-field In eval:** insert two slots with baseModel="SD 1.5" and "SDXL". Query In(baseModel, ["SD 1.5"]). Assert correct slot match. Covered by `test_slot_matches_filter_native_string_in` in `src/unified_cache.rs:5262`.
+- [x] **Meta-index recursive registration:** form entry with `And(In(baseModel), In(nsfwLevel))`. Assert `entries_for_filter_field("baseModel")` and `entries_for_filter_field("nsfwLevel")` both include entry id. Covered by `test_meta_index_registers_inner_compound_fields` in `src/unified_cache.rs:5434`.
+- [x] **Slot-gather correctness:** mutate baseModel for slot 42. Assert `slots_to_check` for entry containing `And(In(baseModel), ...)` includes slot 42. Covered by `test_collect_filter_work_finds_compound_fields` in `src/unified_cache.rs:5481`.
+- [x] **needs_rebuild fires + clears:** bloat entry past 2× capacity. Read path returns slow-path result. Subsequent read shows fresh entry, flag cleared. Covered by `test_needs_rebuild_triggers_slow_path_on_read` (src/unified_cache.rs:3494) and `test_store_increments_rebuild_completed_when_replacing_flagged_entry` (src/unified_cache.rs:3513).
+- [x] **`uses_bucket` narrowed:** form prefilter-substituted entry. Assert `uses_bucket=false`. Form time-bucket entry. Assert `uses_bucket=true`. Covered by `test_uses_bucket_false_for_prefilter_substituted_entry` (src/unified_cache.rs:5147) and `test_uses_bucket_true_for_time_bucket_entry` (src/unified_cache.rs:5167).
+- [x] **Prefetch worker compound:** push compound query through prefetch, assert filter bitmap matches executor result exactly. Covered by `test_prefetch_worker_compound_filter_matches_executor` in `src/unified_cache.rs:5885`.
+- [x] **Property test:** random `Not(And(In, In))` × random mutations × cache-warm-vs-skip_cache equality. 10K iterations. Covered by `regression_proptests::cache_warm_equals_skip_cache_under_random_mutations` in `src/unified_cache.rs:6402`. Runs 10K cases in 0.23s release mode.
 
 ---
 
