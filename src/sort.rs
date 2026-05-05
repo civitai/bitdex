@@ -1,4 +1,5 @@
 use ahash::AHashMap as HashMap;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -304,8 +305,11 @@ impl SortField {
     ///
     /// Reconstructs sort values ONLY for the small result set (not all candidates),
     /// then sorts by value with slot ID tiebreaker.
+    ///
+    /// Uses a SmallVec with inline capacity 64 so typical paginated pages (≤64 slots)
+    /// avoid heap allocation entirely.
     fn order_results(&self, result_bitmap: &RoaringBitmap, descending: bool) -> Vec<u32> {
-        let mut entries: Vec<(u32, u32)> = result_bitmap
+        let mut entries: SmallVec<[(u32, u32); 64]> = result_bitmap
             .iter()
             .map(|slot| (slot, self.reconstruct_value(slot)))
             .collect();
