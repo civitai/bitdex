@@ -197,8 +197,9 @@ impl SortField {
         let top_n_bitmap = self.bifurcate_with_layers(candidates, limit, descending, &layers);
         let t_bifurcate = t_start.elapsed() - t_fuse - t_cursor;
 
-        // Reconstruct values ONLY for the final top-N slots and sort them
-        let result = self.order_results(&top_n_bitmap, descending);
+        // Reconstruct values ONLY for the final top-N slots and sort them.
+        // Thread the already-fused layer slice through so we don't re-fuse per bit per slot.
+        let result = self.order_results_with_layers(&top_n_bitmap, descending, &layers);
         let t_order = t_start.elapsed() - t_fuse - t_cursor - t_bifurcate;
 
         if t_start.elapsed().as_millis() > 10 {
@@ -303,15 +304,22 @@ impl SortField {
 
     /// Order the top-N result bitmap into a sorted Vec.
     ///
-    /// Reconstructs sort values ONLY for the small result set (not all candidates),
-    /// then sorts by value with slot ID tiebreaker.
+    /// Accepts the pre-fused layer slice produced by `top_n` so we don't
+    /// re-fuse base+diff per bit per slot.  On dirty layers that saves
+    /// `limit × num_bits` redundant fused_cow() / fused_contains() calls
+    /// (e.g. limit=20 × 32 bits = 640 ops → 0).
     ///
     /// Uses a SmallVec with inline capacity 64 so typical paginated pages (≤64 slots)
     /// avoid heap allocation entirely.
-    fn order_results(&self, result_bitmap: &RoaringBitmap, descending: bool) -> Vec<u32> {
+    fn order_results_with_layers(
+        &self,
+        result_bitmap: &RoaringBitmap,
+        descending: bool,
+        layers: &[Cow<'_, RoaringBitmap>],
+    ) -> Vec<u32> {
         let mut entries: SmallVec<[(u32, u32); 64]> = result_bitmap
             .iter()
-            .map(|slot| (slot, self.reconstruct_value(slot)))
+            .map(|slot| (slot, self.reconstruct_value_with_layers(slot, layers)))
             .collect();
 
         if descending {
@@ -410,6 +418,22 @@ impl SortField {
         let mut value = 0u32;
         for bit in 0..self.num_bits {
             if self.bit_layers[bit].fused_contains(slot) {
+                value |= 1 << bit;
+            }
+        }
+        value
+    }
+
+    /// Reconstruct the sort value for a given slot using pre-fused layer bitmaps.
+    ///
+    /// Callers that already hold a `Vec<Cow<RoaringBitmap>>` (e.g. `top_n`) should
+    /// use this variant to avoid re-fusing base+diff for every bit on every slot.
+    /// On dirty layers, `fused_cow()` materializes a new owned bitmap; calling it
+    /// once per query and sharing the result is O(bits) cheaper per slot.
+    fn reconstruct_value_with_layers(&self, slot: u32, layers: &[Cow<'_, RoaringBitmap>]) -> u32 {
+        let mut value = 0u32;
+        for (bit, layer) in layers.iter().enumerate() {
+            if layer.contains(slot) {
                 value |= 1 << bit;
             }
         }
