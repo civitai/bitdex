@@ -47,7 +47,7 @@ const STS = 'bitdex';
 const NODE = 'talos-wjh-tgy';
 const K8S_CONTEXT = 'civit-datapacket';
 const PG_NS = 'cnpg-database';
-const PG_POD = 'cnpg-cluster-nvme0-3'; // current writer; verify via `kubectl get pod -n cnpg-database -l role=primary`
+const PG_POD = process.env.BITDEX_PG_WRITER_POD || 'cnpg-cluster-nvme0-2'; // current writer; verify via `kubectl get pod -n cnpg-database -l role=primary`
 const INDEX_PATH = '/data/indexes/civitai';
 const LOAD_STAGE = `${INDEX_PATH}/load_stage`;
 
