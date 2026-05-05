@@ -2698,12 +2698,20 @@ fn resolve_filter_value(
         Value::Integer(v) => Some(*v as u64),
         Value::Float(_) => None,
         Value::String(s) => {
-            // Try string_maps reverse lookup (case-insensitive: lowercase).
+            // Mirror executor::resolve_value_key: try exact (case-sensitive) first,
+            // then lowercase fallback. The executor's case-sensitive set isn't
+            // threaded here (cache maintenance doesn't have access to per-index
+            // config), so we always try both forms — exact wins, lowercase backstops.
             if let Some(maps) = string_maps {
                 if let Some(field_map) = maps.get(field) {
-                    let lower = s.to_lowercase();
-                    if let Some(&v) = field_map.get(lower.as_str()) {
+                    if let Some(&v) = field_map.get(s.as_str()) {
                         return Some(v as u64);
+                    }
+                    let lower = s.to_lowercase();
+                    if lower != *s {
+                        if let Some(&v) = field_map.get(lower.as_str()) {
+                            return Some(v as u64);
+                        }
                     }
                     // Fall through to dictionary check even if field_map exists
                     // but doesn't have this value — it may be newer than the snapshot.
@@ -2781,7 +2789,8 @@ fn slot_matches_clause_native(
                 Some(k) => k,
                 None => {
                     string_lookup_misses.fetch_add(1, Ordering::Relaxed);
-                    return false;
+                    // Value doesn't exist in the database — slot definitely doesn't equal it.
+                    return true;
                 }
             };
             let contained = filters

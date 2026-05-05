@@ -367,12 +367,15 @@ impl MetaIndex {
     /// `original_filter_clauses`: pass `None` here for now — the FilterClause
     /// tree is not yet persisted in meta.bin (B8 will add that). On restore,
     /// only canonical-clause field registration happens. Leaf-field registration
-    /// for compound clauses will be added once B8 persists the tree.
-    /// TODO(B8): pass restored FilterClause tree once persisted.
+    /// Compound clauses with `field=""` register under FieldKey(""); when the
+    /// caller has the restored `FilterClause` tree (B8 V2 meta.bin), pass it as
+    /// `original_clauses` so leaf fields of compound shapes are also registered
+    /// — matching the live `register()` path. V1 meta.bin and tests pass `None`.
     pub fn register_with_id(
         &mut self,
         id: CacheEntryId,
         filter_clauses: &[CanonicalClause],
+        original_clauses: Option<&[crate::query::FilterClause]>,
         sort_field: Option<&str>,
         sort_direction: Option<SortDirection>,
     ) {
@@ -400,6 +403,28 @@ impl MetaIndex {
                     .or_default()
                     .insert(id);
                 field_keys.push(fk);
+            }
+        }
+
+        // B4-equivalent leaf-field walk for restore: when the caller persisted
+        // the FilterClause tree (B8 V2), extract every leaf field name and
+        // register it. Without this, compound shapes restored from disk would
+        // only register the canonical-empty-string FieldKey and be invisible
+        // to write-path lookups.
+        if let Some(originals) = original_clauses {
+            let mut leaves = HashSet::new();
+            for clause in originals {
+                collect_leaf_fields(clause, &mut leaves);
+            }
+            for field in leaves {
+                if seen_fields.insert(field.clone()) {
+                    let fk = FieldKey(field);
+                    self.field_bitmaps
+                        .entry(fk.clone())
+                        .or_default()
+                        .insert(id);
+                    field_keys.push(fk);
+                }
             }
         }
 

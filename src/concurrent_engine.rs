@@ -662,11 +662,21 @@ impl ConcurrentEngine {
                                 meta.tombstones.len(),
                                 meta.next_entry_id
                             );
-                            // Restore meta-index registrations
+                            // Restore meta-index registrations. Pass the
+                            // persisted FilterClause tree (V2 only; V1 entries
+                            // have empty Vec which becomes None) so leaf fields
+                            // of compound shapes get registered for write-path
+                            // discovery — matches the B4 live-register behavior.
                             for entry in &meta.entries {
+                                let originals = if entry.original_filter_clauses.is_empty() {
+                                    None
+                                } else {
+                                    Some(entry.original_filter_clauses.as_slice())
+                                };
                                 uc.meta_mut().register_with_id(
                                     entry.entry_id,
                                     &entry.filter_clauses,
+                                    originals,
                                     Some(&entry.sort_field),
                                     Some(entry.direction),
                                 );
@@ -4763,6 +4773,19 @@ impl ConcurrentEngine {
                                 persisted_total,
                             )
                         };
+                        // Recompute uses_bucket from the canonical key. If the
+                        // entry has a real time-bucket clause (excluding the
+                        // __prefilter sentinel), bucket maintenance must apply.
+                        let mut entry = entry;
+                        let restored_uses_bucket = key.filter_clauses.iter().any(crate::unified_cache::is_time_bucket_clause);
+                        entry.set_uses_bucket(restored_uses_bucket);
+                        if restored_uses_bucket {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            entry.set_bucket_cutoff(now);
+                        }
                         uc.insert_restored_entry(key, entry);
                         loaded += 1;
                         boundstore_entries_restored.fetch_add(1, Ordering::Relaxed);
