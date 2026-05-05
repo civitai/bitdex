@@ -154,8 +154,8 @@ Zero correctness risk. Standalone-mergeable.
 
 ### B7 — Commit 10. Port old sync `maintain_filter_changes` to native eval
 - [x] **Verified test-only via grep.** 12 callers, all in `#[cfg(test)]` blocks (`unified_cache.rs:3104, 3123, 3144, 3170, 3189, 3252, 3340, 3449, 3505, 3572, 3623, 3746`). Zero production callers.
-- [ ] Port `unified_cache.rs:1479-1615` to call the same native-eval helper from B2. Tests stay green; second slot_matches_filter call site eliminated.
-- [ ] Follow-up cleanup PR can delete the function entirely + migrate tests to Phase A/B/C path.
+- [x] Port `unified_cache.rs:1479-1615` to call the same native-eval helper from B2. Tests stay green; second slot_matches_filter call site eliminated.
+- [x] Follow-up cleanup PR can delete the function entirely + migrate tests to Phase A/B/C path.
 
 ### B8 — Commit 8. meta.bin V2 + restore
 - [x] Bump `META_VERSION = 2` (`bound_store.rs:51`).

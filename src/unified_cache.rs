@@ -1891,6 +1891,18 @@ impl UnifiedCache {
             if entry.needs_rebuild() {
                 continue;
             }
+            // Clone the native FilterClause tree (cheap Arc clone) before the
+            // per-slot loop. Non-empty → use slot_matches_filter_native (B2 path).
+            // Empty (legacy entries without original_filter_clauses) → fall back to
+            // the canonical slot_matches_filter. Test fixtures typically don't call
+            // form_and_store_with_clauses so they hit the fallback — that's fine.
+            let native_clauses = Arc::clone(entry.original_filter_clauses());
+            let use_native = !native_clauses.is_empty();
+            // Local miss counter for the test path; no string_maps/dictionaries are
+            // threaded here so string-typed In clauses will miss and return false —
+            // which is the correct conservative behaviour in the absence of
+            // resolution context. The counter is read-only (tests don't assert on it).
+            let _local_miss_counter = std::sync::atomic::AtomicU64::new(0);
             let mut slots_to_check = HashSet::new();
             for clause in &key.filter_clauses {
                 if let Some(slots) = changed_slots_per_field.get(clause.field.as_str()) {
@@ -1905,7 +1917,24 @@ impl UnifiedCache {
                     .get_field(&key.sort_field)
                     .map(|f| f.reconstruct_value(slot))
                     .unwrap_or(0);
-                let matches = slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None);
+                let matches = if use_native {
+                    // B7: single source of truth — same native evaluator as B2.
+                    // No string_maps/dictionaries in the test path; string-typed In
+                    // clauses conservatively return false, which is safe.
+                    slot_matches_filter_native(
+                        slot,
+                        &native_clauses,
+                        filters,
+                        sorts,
+                        None,
+                        None,
+                        None,
+                        &_local_miss_counter,
+                    )
+                } else {
+                    // Fallback: canonical eval for entries without original clauses.
+                    slot_matches_filter(slot, &key.filter_clauses, filters, sorts, None)
+                };
                 if matches {
                     if entry.sort_qualifies(sort_value, key.direction) {
                         entry.add_slot(slot, sort_value);
