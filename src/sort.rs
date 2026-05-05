@@ -362,32 +362,40 @@ impl SortField {
             let cursor_bit_set = (cursor_value >> bit) & 1 == 1;
             let layer: &RoaringBitmap = &layers[bit];
 
-            let equal_with_bit_set = &equal & layer;
-            let equal_with_bit_clear = &equal - layer;
-
+            // In-place ops: materialize at most one side per bit instead of two.
+            // `equal` is updated in-place; the confirmed-feeder side is computed
+            // as a single AND or SUB only when it will be OR'd into `confirmed`.
             if descending {
-                // Descending: we want slots with value LESS than cursor (they come after cursor)
+                // Descending: slots after cursor have a LOWER sort value.
                 if cursor_bit_set {
-                    // Cursor has bit set. Slots with bit clear have LOWER value → confirmed (after cursor).
-                    // Slots with bit set are still equal.
-                    confirmed |= &equal_with_bit_clear;
-                    equal = equal_with_bit_set;
+                    // Cursor bit is 1.  Slots with bit=0 have lower value → confirmed.
+                    // Slots with bit=1 remain equal.
+                    // confirmed_feeder = equal - layer  (bit=0 side)
+                    // new equal       = equal & layer   (bit=1 side)
+                    let confirmed_feeder = &equal - layer; // one allocation
+                    equal &= layer;                        // in-place, no alloc
+                    confirmed |= confirmed_feeder;
                 } else {
-                    // Cursor has bit clear. Slots with bit set have HIGHER value → exclude (before cursor).
-                    // Slots with bit clear are still equal.
-                    equal = equal_with_bit_clear;
+                    // Cursor bit is 0.  Slots with bit=1 have higher value → exclude.
+                    // Slots with bit=0 remain equal.
+                    // new equal = equal - layer  (bit=0 side)
+                    equal -= layer; // in-place, no alloc
                 }
             } else {
-                // Ascending: we want slots with value GREATER than cursor (they come after cursor)
+                // Ascending: slots after cursor have a HIGHER sort value.
                 if cursor_bit_set {
-                    // Cursor has bit set. Slots with bit clear have LOWER value → exclude (before cursor).
-                    // Slots with bit set are still equal.
-                    equal = equal_with_bit_set;
+                    // Cursor bit is 1.  Slots with bit=0 have lower value → exclude.
+                    // Slots with bit=1 remain equal.
+                    // new equal = equal & layer  (bit=1 side)
+                    equal &= layer; // in-place, no alloc
                 } else {
-                    // Cursor has bit clear. Slots with bit set have HIGHER value → confirmed (after cursor).
-                    // Slots with bit clear are still equal.
-                    confirmed |= &equal_with_bit_set;
-                    equal = equal_with_bit_clear;
+                    // Cursor bit is 0.  Slots with bit=1 have higher value → confirmed.
+                    // Slots with bit=0 remain equal.
+                    // confirmed_feeder = equal & layer  (bit=1 side)
+                    // new equal        = equal - layer  (bit=0 side)
+                    let confirmed_feeder = &equal & layer; // one allocation
+                    equal -= layer;                        // in-place, no alloc
+                    confirmed |= confirmed_feeder;
                 }
             }
         }
